@@ -63,6 +63,8 @@ ports_get() {
   case "$2" in
     kimi_wss) printf '12001\n' ;;
     kimi_health) printf '12002\n' ;;
+    opencode_wss) printf '11001\n' ;;
+    opencode_health) printf '11002\n' ;;
   esac
 }
 MT_ROOTLESS=true
@@ -70,6 +72,16 @@ render_worker_quadlet root kimi 8443
 quadlet="$fixture/quadlets/lunarwing-kimi-root.container"
 assert_contains "$quadlet" 'UserNS=keep-id:uid=10002,gid=10002' 'systemd Kimi keeps rootless UID mapping'
 assert_contains "$quadlet" "EnvironmentFile=$fixture/env/kimi-runtime.env" 'systemd Kimi loads protected runtime env'
+# WI#206: the kimi lane must not mount the tenant SSH-agent socket or expose
+# SSH_AUTH_SOCK, and must set no-new-privileges.
+assert_not_contains "$quadlet" 'ssh-agent.sock' 'systemd Kimi quadlet has no SSH agent mount (WI#206)'
+assert_not_contains "$quadlet" 'SSH_AUTH_SOCK' 'systemd Kimi quadlet has no SSH_AUTH_SOCK env (WI#206)'
+assert_contains "$quadlet" 'SecurityOpt=no-new-privileges' 'systemd Kimi quadlet sets no-new-privileges (WI#206)'
+# The failure-callback lane keeps the mount: render opencode and confirm.
+render_worker_quadlet root opencode 8443
+opencode_quadlet="$fixture/quadlets/lunarwing-opencode-root.container"
+assert_contains "$opencode_quadlet" 'ssh-agent.sock' 'opencode quadlet keeps the SSH agent mount'
+render_worker_quadlet root kimi 8443
 minted="$(sed -n 's/^WORKER_AUTH_TOKEN=//p' "$env_file" | tail -1)"
 if [[ -n "$minted" && "$minted" != "gate%token" ]]; then
   pass 'missing scoped token is minted and persisted (WI#210)'
@@ -240,6 +252,39 @@ if grep -Fq 'env_flags+=(-e "KIMI_API_KEY=' "$WORKER_LIB"; then
   fail 'Kimi API key still enters container runtime argv'
 else
   pass 'Kimi API key stays out of container runtime argv'
+fi
+
+# WI#206: the kimi imperative launch path must not mount the SSH agent socket
+# and must set no-new-privileges. Scope the check to the kimi container block:
+# from start_tenant_kimi to the next worker section.
+KIMI_BLOCK="$(awk '/^start_tenant_kimi\(\)/,/^stop_tenant_kimi\(\)/' "$WORKER_LIB")"
+if grep -Fq 'ssh-agent.sock' <<<"$KIMI_BLOCK"; then
+  fail 'kimi imperative launch still mounts the SSH agent socket (WI#206)'
+else
+  pass 'kimi imperative launch has no SSH agent mount (WI#206)'
+fi
+if grep -Fq -- '--security-opt no-new-privileges' <<<"$KIMI_BLOCK"; then
+  pass 'kimi imperative launch sets no-new-privileges (WI#206)'
+else
+  fail 'kimi imperative launch missing no-new-privileges (WI#206)'
+fi
+# The launch contract must carry the policy change so existing containers
+# force-recreate instead of surviving with the old mount.
+ROOT_SCRIPT="$(dirname "$MT_ADMIN")/lunarwing-mt-admin.sh"
+assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges"' \
+  'kimi launch contract records the WI#206 policy change'
+# The baked worker policy (WI#206): guard back on + PreToolUse hook shipped.
+KIMI_CONFIG="$LUNARWING_ROOT/kimicode4lunarwing/config/config.toml"
+assert_contains "$KIMI_CONFIG" 'dangerous_command_guard = true' \
+  'baked kimi config re-enables the dangerous-command guard'
+assert_contains "$KIMI_CONFIG" 'headless_command_guard.mjs' \
+  'baked kimi config wires the PreToolUse guard hook'
+assert_contains "$LUNARWING_ROOT/kimicode4lunarwing/entrypoint.sh" 'unset KIMI_CODE_DANGEROUS_COMMAND_GUARD' \
+  'entrypoint scrubs the guard-disable env var'
+if [[ -f "$LUNARWING_ROOT/kimicode4lunarwing/hooks/headless_command_guard.mjs" ]]; then
+  pass 'headless command guard hook ships with the worker'
+else
+  fail 'headless command guard hook missing'
 fi
 
 if [[ "$failures" -ne 0 ]]; then

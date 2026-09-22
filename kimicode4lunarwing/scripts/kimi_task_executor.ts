@@ -235,14 +235,21 @@ export async function executeTask(
   try {
     const workDir = resolvedWorkDir ?? resolveWorkDir(request.context?.project_dir || workspaceRoot())
     const promptText = buildTaskPrompt(request)
-    // No --yolo flag: this kimi-code version rejects it in combination with
-    // -p (print mode). Auto-approval comes from the baked config.toml
-    // (default_permission_mode = "yolo") instead.
+    // No --yolo/--auto flags: this kimi-code version rejects them in
+    // combination with -p (print mode), which forces the auto permission
+    // policy on its own. Dangerous-command enforcement comes from the baked
+    // PreToolUse hook (WI#206), not a permission-mode flag.
     const args = ["-p", promptText, "--output-format", "stream-json"]
     // Per-task env is assembled, never injected into the bridge's shared
     // process.env — concurrent tasks in different workspaces must not see
     // each other's variables (no mutation means nothing to leak or restore).
     const env: NodeJS.ProcessEnv = { ...process.env, ...request.context?.environment }
+    // WI#206: a task (or a prompt-injected command inside it) must not be able
+    // to lower its own approval policy. These are stripped per task even
+    // though the entrypoint also unsets them — request.context.environment is
+    // attacker-controllable task input, not operator config.
+    delete env.KIMI_CODE_DANGEROUS_COMMAND_GUARD
+    delete env.KIMI_CODE_PERMISSION_MODE_REMINDER
     const kimiHome = kimiCodeHome()
     if (kimiHome) {
       env.KIMI_CODE_HOME = kimiHome

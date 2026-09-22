@@ -7,7 +7,7 @@ import { join } from "node:path"
 import { executeTask } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -39,6 +39,19 @@ process.exit(1)
       script = `#!/usr/bin/env node
 const messages = [
   { role: "assistant", content: "env=" + (process.env.MOCK_LEAK_CHECK || "<unset>") },
+]
+for (const m of messages) {
+  process.stdout.write(JSON.stringify(m) + "\\n")
+}
+process.exit(0)
+`
+      break
+    case "guard-env":
+      script = `#!/usr/bin/env node
+const guard = process.env.KIMI_CODE_DANGEROUS_COMMAND_GUARD || "<unset>"
+const reminder = process.env.KIMI_CODE_PERMISSION_MODE_REMINDER || "<unset>"
+const messages = [
+  { role: "assistant", content: "guard=" + guard + " reminder=" + reminder },
 ]
 for (const m of messages) {
   process.stdout.write(JSON.stringify(m) + "\\n")
@@ -187,6 +200,27 @@ test("executeTask: context.environment reaches child env without polluting proce
   // The bridge's own process must never see the per-task variable — with
   // concurrent tasks, mutation of shared process.env would leak across tasks.
   assert.equal(process.env.MOCK_LEAK_CHECK, undefined)
+})
+
+test("executeTask: task environment cannot disable the dangerous-command guard (WI#206)", async () => {
+  const bin = makeMockKimi("guard-env")
+  const request: TaskRequest = {
+    task_id: "guard-env-test",
+    prompt: "try to disable the guard",
+    timeout_ms: 10_000,
+    // Attacker-controllable task input attempting to lower the approval
+    // policy for its own run.
+    context: {
+      environment: {
+        KIMI_CODE_DANGEROUS_COMMAND_GUARD: "false",
+        KIMI_CODE_PERMISSION_MODE_REMINDER: "1",
+      },
+    },
+  }
+  const { result } = await runExecutor(request, bin)
+  assert.ok(result, "result was not emitted")
+  assert.equal(result!.status, "success")
+  assert.equal(result!.output, "guard=<unset> reminder=<unset>")
 })
 
 test("executeTask: pre-aborted signal returns cancelled without spawning", async () => {

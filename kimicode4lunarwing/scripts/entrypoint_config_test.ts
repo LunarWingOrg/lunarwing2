@@ -69,7 +69,10 @@ test("entrypoint accepts a missing Kimi API key", () => {
   })
 
   assert.equal(result.status, 0, result.stderr)
-  assert.equal(readFileSync(join(home, "config.toml"), "utf8"), 'api_key = ""\n')
+  // The fail-closed policy (WI#206) is injected into any source config.
+  const generated = readFileSync(join(home, "config.toml"), "utf8")
+  assert.match(generated, /dangerous_command_guard = true/)
+  assert.match(generated, /headless_command_guard\.mjs/)
 })
 
 test("entrypoint retargets the baked model entry when KIMI_MODEL is a new model id", () => {
@@ -135,4 +138,64 @@ test("entrypoint rejects missing config source instead of reusing stale config",
   assert.notEqual(result.status, 0)
   assert.match(result.stderr, /Kimi config source not found/)
   assert.equal(readFileSync(stale, "utf8"), 'api_key = "stale-secret"\n')
+})
+
+test("entrypoint injects the fail-closed policy into hostile sources (WI#206)", () => {
+  assert.ok(configSectionEnd > 0)
+  const root = mkdtempSync(join(tmpdir(), "kimi-policy-"))
+  const home = join(root, "home")
+  const source = join(root, "source.toml")
+  // A custom KIMI_CONFIG_SOURCE that disables the guard and ships no
+  // PreToolUse hook: the worker hardens it instead of running it as-is.
+  writeFileSync(source, `default_model = "m"
+default_permission_mode = "auto"
+
+[providers.p]
+type = "openai"
+base_url = "http://127.0.0.1:1/v1"
+api_key = "k"
+
+[permission]
+dangerous_command_guard = false
+`)
+
+  const hardened = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env: { ...process.env, KIMI_CODE_HOME: home, KIMI_CONFIG_SOURCE: source },
+  })
+  assert.equal(hardened.status, 0, hardened.stderr)
+  const generated = readFileSync(join(home, "config.toml"), "utf8")
+  assert.match(generated, /dangerous_command_guard = true/)
+  assert.doesNotMatch(generated, /dangerous_command_guard = false/)
+  assert.match(generated, /headless_command_guard\.mjs/)
+  // A hookless guard-disabled config gets both the guard and the hook.
+  writeFileSync(source, `default_model = "m"
+
+[providers.p]
+type = "openai"
+base_url = "http://127.0.0.1:1/v1"
+api_key = "k"
+`)
+  const noPolicy = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env: { ...process.env, KIMI_CODE_HOME: home, KIMI_CONFIG_SOURCE: source },
+  })
+  assert.equal(noPolicy.status, 0, noPolicy.stderr)
+  const injected = readFileSync(join(home, "config.toml"), "utf8")
+  assert.match(injected, /dangerous_command_guard = true/)
+  assert.match(injected, /headless_command_guard\.mjs/)
+
+  // With the full baked policy present, generation preserves both as-is.
+  writeFileSync(
+    source,
+    readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
+  )
+  const ok = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env: { ...process.env, KIMI_CODE_HOME: home, KIMI_CONFIG_SOURCE: source },
+  })
+  assert.equal(ok.status, 0, ok.stderr)
+  const baked = readFileSync(join(home, "config.toml"), "utf8")
+  assert.equal(baked.match(/dangerous_command_guard = true/g)?.length, 1)
+  assert.equal(baked.match(/headless_command_guard\.mjs/g)?.length, 1)
 })
