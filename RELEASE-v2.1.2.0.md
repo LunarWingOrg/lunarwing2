@@ -2,7 +2,7 @@
 
 ## Codename: Yoroi (鎧, armor)
 
-**Release date** 2026-09-19
+**Release date** 2026-09-22
 
 > After the lacing, the plates
 >
@@ -33,10 +33,20 @@ tenant scopes (work item #181/#178). External workers gained a new opencode2
 lane (v2 line, pinned at v2.0.11 on a reviewed upstream commit) with a
 reproducible-build bridge over the `@opencode/client/promise` SDK, full
 mt-admin mirroring, CI/CD publication jobs, and its own ports-registry v17
-block. The Pebble worker confines daemon-supplied project directories to the
-workspace root and keeps its WebSocket read loop live so mid-task cancels
-finally land. Session secrets are scrubbed from sandboxed and direct
-workloads alike (work item #141).
+block. The kimi worker adopted CLI `2.0.2` behind a deterministic real-CLI
+contract gate with headless-safe permission defaults (work item #195). The
+Pebble worker confines daemon-supplied project directories to the
+workspace root, keeps its WebSocket read loop live so mid-task cancels
+finally land, and no longer leaks cancel-map entries on task completion.
+Session secrets are scrubbed from sandboxed and direct
+workloads alike (work item #141), and credential containment now covers the
+mount surface and the worker lanes too (work item #205): agent-chosen
+sandbox working directories are validated against the protected tenant
+directories (`env/`, `state/`, `run/`) — masked inside legitimate mounts,
+refused outright otherwise — and external workers no longer hold the
+tenant's full gateway bearer; a new scoped `WORKER_AUTH_TOKEN` authenticates
+only the task-dispatch handshake, migrating in place on the next lifecycle
+pass.
 
 The host health pipeline was rebuilt for multi-tenant scale: a report
 model with staleness alerts, per-instance monitor-only diagnostic components
@@ -45,10 +55,13 @@ tolerance under sweep deadlines, opencode2/voice unit resolution, and
 self-heal escalation that never restarts on observability gaps. Conversation
 insights — the release's largest reliability investigation — received a
 nine-finding hardening program (goal 8) against confabulation and feedback
-incidents. Durable cross-channel attachments, a pre-execution stale
-tool-output sanitizer, keyset-paginated full-store knowledge sweeps that no
-longer depend on the heartbeat, and a compact-schema fix for
-discriminated-union WASM tools round out the correctness work.
+incidents. Mission threads gained automatic retry with exponential backoff
+(work item #188), a daily thread budget default sized for hourly cadences
+(30, work item #189), and validated tool parameters with a settable
+`current_focus` (work item #203). Durable cross-channel attachments, a
+pre-execution stale tool-output sanitizer, keyset-paginated full-store
+knowledge sweeps that no longer depend on the heartbeat, and a compact-schema
+fix for discriminated-union WASM tools round out the correctness work.
 
 The release identifier is `2.1.2.0`; LunarWing-owned Rust crates and channel
 packages use `2.1.2`. Rust 2024 and MSRV `1.96.1` are unchanged. There are no
@@ -75,6 +88,32 @@ previous compatibility baseline.
   in-code default is now `none`, matching what mt-admin renders into tenant
   environments. New knobs: `SANDBOX_RUNTIME` / `SANDBOX_NETWORK` /
   `SANDBOX_ENFORCE`.
+- **Sandbox and worker credential containment (WI#205).** The sandbox's one
+  bind mount — an unvalidated, agent-chosen working directory — could be
+  pointed at the tenant config directory to read the plaintext
+  `GATEWAY_AUTH_TOKEN`. New `ic/src/sandbox/mount_guard.rs` canonicalizes the
+  requested mount (symlinks, `..`) and then refuses it (`mount_path_denied`,
+  fail-closed) when it targets or sits inside the protected tenant
+  directories (`env/`, `state/`, `run/`) or a credential-bearing file name,
+  or reports the protected dirs inside a legitimate mount so the runner
+  shadows each with an empty read-only bind — work at a repo or tenant root
+  keeps working while `env/` reads empty. External workers, previously
+  launched with the tenant's full gateway bearer (readable via
+  `podman inspect` and tenant-readable units), now authenticate the
+  task-dispatch handshake with a distinct per-tenant `WORKER_AUTH_TOKEN`;
+  existing tenants migrate in place on the next lifecycle pass. Follow-up
+  design: `docs/ops/v2.1.2.0_WI205_SANDBOX_SCOPED_CREDENTIAL_DESIGN.md`.
+- **Mission retries and budget (WI#188, WI#189).** Mission threads that end
+  without completing — signal-stopped mid-run, lost join handle, terminal
+  failure — no longer mean a permanently lost fire: a `MissionRetryPolicy`
+  (default 3 retries, 60s initial delay, 2× backoff capped at 1h) schedules
+  a delayed re-fire, `ThreadOutcome::Stopped` records the interruption in
+  `approach_history`, event/webhook fires release their dedup key so an
+  external redelivery can re-fire, and a daemon restart re-arms pending
+  retries from the failing thread's metadata. The default daily thread
+  budget rises from 10 to 30 so an hourly mission covers the full day with
+  retry headroom; retries draw from the same budget. Set via
+  `mission_create`/`mission_update` (`max_retries=0` disables).
 - **Workload processes are manager-forked transient services (WI#181).**
   `ic/src/tools/process.rs` replaces `systemd-run --user --scope` with
   `systemd-run --user --wait --pipe --quiet --collect` transient services
@@ -100,7 +139,21 @@ previous compatibility baseline.
   workspace subtree. The WebSocket read loop stays live for the whole
   connection — `dispatch_task` spawns the executor in the background and
   cancels route through a per-connection oneshot map keyed by `task_id`, so
-  mid-task cancels actually kill the pebble subprocess (work item #101).
+  mid-task cancels actually kill the pebble subprocess (work item #101) —
+  and completed tasks now clean up their own cancel-map entries, so
+  long-lived connections no longer leak a dead sender per finished task
+  (work item #158).
+- **Kimi worker: CLI 2.0.2 with headless-safe permissions (WI#195).** The
+  worker's default permission mode moves yolo→auto with
+  `dangerous_command_guard = false`, and the entrypoint suppresses the
+  permission-mode reminder in both modes, so headless task runs no longer
+  stall on interactive prompts. A deterministic real-CLI contract gate now
+  runs inside the image build (`npm ci` of the locked pin, then just the
+  "real CLI" tests): it seeds a minimal config so model resolution succeeds
+  in clean builds and asserts the headless flag surface
+  (`-p --output-format stream-json` accepted, `--yolo` rejected alongside
+  `-p`) against the shipped version, not a mock. Stream parsing warn-logs
+  unrecognized roles instead of silently dropping them.
 - **Conversation insights hardening (goal 8).** A nine-finding program
   against confabulation and generated-history feedback: authority checks on
   insight writes, automatic-recall isolation, generated-history feedback
@@ -156,11 +209,13 @@ previous compatibility baseline.
 | Tool registry patches | gitlab 0.1.5 (was 0.1.4); cavepony 0.4.2, llm-context 0.1.1, multica-bridge 0.1.2, ssh 0.1.1, vision-analyze 0.1.3, voice-transcribe 0.1.1, web-search 0.2.2, gotify 0.1.0 (no change) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (no change) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; no external version changed, so the vendor snapshot regenerated with no diff |
-| Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `0.43.1`; opencode2 `v2.0.11` at `9eb6902aaf3c35ce985b67c605a775992249066b`; pebble at upstream HEAD `2d0f3786` |
+| Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `2.0.2`; opencode2 `v2.0.11` at `9eb6902aaf3c35ce985b67c605a775992249066b`; pebble at upstream HEAD `2d0f3786` |
 | Sandbox default | `SANDBOX_NETWORK=none` is the in-code and mt-admin-rendered default; podman is the preferred runtime (`SANDBOX_RUNTIME`) |
 | Worker image publication | Digest-bound reproducible candidates/promotions for kimi, pebble, opencode, and opencode2 |
 | ShellCheck floor | 0.11.0 (checksum-pinned installer; CI gate remains blocking) |
 | Gateway mascot default | Disabled; `MASCOT_ENABLED=true` per tenant opts in |
+| Bundled skills | Exactly seven product skills (cavepony, delegation, lunarwing-workflow-orchestrator, multica-poll, plan-mode, routine-advisor, study-notes); contributor-dev skills removed from tenant defaults (WI#185) |
+| Mission defaults | Daily thread budget 30 (was 10); automatic retry 3× with 60s→2× backoff capped at 1h (WI#188/#189) |
 | CI scope | Protected worker-image candidate publication/promotion is supported for kimi, pebble, opencode, and opencode2; daemon/package publication and tenant deployment remain deferred |
 
 ## Changes
@@ -244,6 +299,55 @@ manager now applies the same allowlist scrub as the container lanes:
 `SANDBOX_POLICY`/`SANDBOX_ALLOW_FULL_ACCESS` from the child. Regression tests
 pin both the leak and the passthrough contract.
 
+### Sandbox and Worker Credential Containment (work item #205, #215)
+
+Two credential exposures fixed:
+
+- **Sandbox mount containment.** The generic sandbox mounts exactly one host
+  directory — the agent-chosen working directory, previously unvalidated —
+  so pointing it at the tenant config directory exposed the 0600
+  `lunarwing.env` and its plaintext `GATEWAY_AUTH_TOKEN`. New
+  `ic/src/sandbox/mount_guard.rs`, enforced at both the manager and runner
+  boundaries, canonicalizes the requested path (symlinks, `..`) and then
+  refuses it outright — `mount_path_denied`, fail-closed, never an
+  unsandboxed fallback — when it targets or sits inside the protected
+  tenant directories (`env/` with `GATEWAY_AUTH_TOKEN`,
+  `WORKER_AUTH_TOKEN`, `LLM_API_KEY` and the PostgreSQL password;
+  `state/` with per-worker `auth_token`s, pending gates and coordination
+  violations; `run/` with `lunarwing.sock` and the world-writable
+  `ssh-agent.sock`) or a credential-bearing file name (`*.env`, `.env`,
+  `pg.secret`). A protected directory *inside* an otherwise legitimate
+  mount is shadowed with an empty read-only directory bind (a `--tmpfs`
+  mask was tested and does not shadow), so work at a repo or tenant root
+  keeps working while `env/` reads empty. `SANDBOX_PROTECTED_PATHS` feeds
+  the set explicitly (the MT layout is not derivable); mt-admin renders it
+  during env generation, and single-node base-dir defaults cover
+  non-MT installs.
+- **MT sibling derivation (WI#215).** When the daemon base dir ends in
+  `state/` (the MT layout `<tenant root>/lunarwing/state`), the guard now
+  also derives the tenant-root `env/` and `run/` siblings defensively, so a
+  tenant rendered before its protected-set was populated still gets them
+  covered; non-MT bases are unchanged. A regression pins the
+  protected-dir-created-concurrently-with-planning case from WI#209.
+- **Scoped worker credential.** External workers were launched with the
+  tenant's *full* gateway bearer as `AGENT_AUTH_TOKEN` — readable via
+  `podman inspect` and tenant-readable unit files — while the only
+  capability the handshake needs is authenticating one worker's inbound
+  task-dispatch socket. A new per-tenant `WORKER_AUTH_TOKEN`, deliberately
+  distinct from `GATEWAY_AUTH_TOKEN`, is resolved through one helper for
+  every consumer (daemon `config.toml`, all four worker container envs,
+  systemd Quadlet `Environment=`); the gateway never accepts it, so a
+  leaked worker secret grants no API access. `upgrade_external_worker_auth_token()`
+  rewrites legacy four-place configurations in place on the next lifecycle
+  pass (two-pass awk, so `auth_token` is replaced rather than duplicated),
+  and tenants without the new value yet fall back to the gateway token
+  until their env regenerates.
+
+Evidence: `docs/ops/v2.1.2.0_WI205_CREDENTIAL_EXPOSURE_FIX.md`; follow-up
+design for a fully scoped gateway credential:
+`docs/ops/v2.1.2.0_WI205_SANDBOX_SCOPED_CREDENTIAL_DESIGN.md`. WI#209/#210/#211
+review findings on the lane are fixed (`113eb2af5`).
+
 ### Shell Output Truncation Visibility (work item #162)
 
 `ShellTool` discarded the sandbox manager's `truncated` flag (32,768 bytes
@@ -267,6 +371,32 @@ the persisted-state write site. Sanitized state is written back with a
 first model call of every thread — an ordering a mission trigger cannot
 satisfy. WI#126 was re-verified (fleet remains terminal-event-driven);
 WI#163, a re-file, was reverified with no code change.
+
+### Mission Runtime: Retries, Budget, and Tool Contracts (WI#188, WI#189, WI#203)
+
+- **Automatic retry (WI#188).** A mission thread ending without completing —
+  signal-stopped mid-run, lost join handle, terminal model/orchestrator
+  failure — no longer means a permanently lost fire. `MissionRetryPolicy`
+  (default: 3 retries, 60s initial delay, 2× backoff, capped at 1h; exposed
+  via `mission_create`/`mission_update` params, `max_retries=0` disables)
+  schedules a delayed re-fire. `ThreadOutcome::Stopped` records the
+  interruption in `approach_history` and notifies channels as an error;
+  `MaxIterations` is deliberately never auto-retried. Event/webhook fires
+  release their trigger dedup key on failure so an external redelivery can
+  re-fire, and a successful retry re-records it. Retry state lives in the
+  failing thread's metadata, so a daemon restart re-arms pending retries
+  after checkpoint recovery.
+- **Daily budget default 30 (WI#189).** `DEFAULT_MAX_THREADS_PER_DAY` rises
+  10 → 30 in `Mission::new`: an hourly mission needs 24 fires of coverage,
+  so the old default went dark after 10 hours. Every retry respawn draws
+  from the same budget; spawn-failure rollback refunds the slot.
+  Budget exhaustion stays visible (`budget_exhausted` flag, warn log,
+  explicit `mission_fire` reason).
+- **Mission tool parameters (WI#203).** `mission_create` rejects a missing
+  or non-string `name`/`goal` instead of silently minting "unnamed
+  mission"; the `manual` cadence default is now logged with the user and
+  mission name; and `current_focus` is tool-settable through
+  `mission_update` (absent leaves it, `null` clears it, a string sets it).
 
 ### Conversation Insights Investigation and Hardening (goal 8, WI#132, WI#143, WI#183)
 
@@ -320,6 +450,21 @@ source dir directly with an `is_file()` → `parent()` fallback for legacy
 file-shaped sources; registry provenance stamps into `V2SkillMetadata`
 end-to-end.
 
+### Bundled Tenant Skill Catalog Trimmed (goal 30, work item #185)
+
+Three contributor-workflow skills no longer ship as tenant defaults:
+`web-ui-test` (proprietary Claude-for-Chrome UI walkthroughs),
+`local-test` (build/test LunarWing from source), and `review-checklist`
+(this repo's pre-merge checklist referencing Copilot/Gemini reviewers) are
+removed from the compile-time embedded catalog, per the WI and the
+manifesto's stance against proprietary tooling as product defaults. Fresh
+tenants now receive exactly the seven product skills (cavepony,
+delegation, lunarwing-workflow-orchestrator, multica-poll, plan-mode,
+routine-advisor, study-notes); operator opt-in is unaffected — user and
+workspace skills always override bundled ones. A regression pins the
+catalog to exactly that set. Record:
+`docs/ops/v2.1.2.0_ITEM30_WI185_BUNDLED_SKILLS.md`.
+
 ### Host Health Pipeline Rebuild (work item #180)
 
 All eight findings addressed, then all six review findings:
@@ -345,7 +490,7 @@ All eight findings addressed, then all six review findings:
 - Verified: `tests/run-all.sh` 926 passed / 0 failed across all 19 suites;
   repo-wide ShellCheck exit 0.
 
-### External Workers: opencode2 Lane (goals 13, 17, 21, 30, 48)
+### External Workers: opencode2 Lane (goals 13, 17, 21, 48)
 
 The OpenCode v2 lane is a full first-class worker:
 
@@ -366,7 +511,7 @@ The OpenCode v2 lane is a full first-class worker:
   (goal 13) → v2.0.11 (goal 13), tag SHA-verified against both upstream
   remotes; upstream bridge-relevant SDK files confirmed unchanged between refs.
 
-### Pebble Worker Hardening (goals 17, 20, work items #101, #149)
+### Pebble Worker Hardening (goals 17, 20, work items #101, #149, #158)
 
 - **Workspace confinement.** `pebble4lunarwing/src/workspace_path.rs` ports
   kimi's `resolveWorkspacePath` + workspace-overlap check: the bridge
@@ -380,13 +525,33 @@ The OpenCode v2 lane is a full first-class worker:
   envelopes flow through an mpsc channel drained by a single writer task;
   cancel envelopes are keyed by `task_id` in a per-connection map and kill
   the pebble subprocess (`Outcome::Cancelled` → `task_result` `cancelled`).
+- **No cancel-map leak (WI#158).** Task handlers now remove their own
+  cancel-map entry after the task finishes; previously only the cancel path
+  removed entries, so every naturally-completed or errored task leaked a
+  dead sender plus task-id string for the life of the connection. Cancels
+  against dead entries log "cancel entry stale" instead of falsely claiming
+  the signal was sent.
 
-### Kimi Worker and OpenCode Pins (goals 12, 13)
+### Kimi Worker and OpenCode Pins (goals 12, 13; work item #195)
 
-- kimi-code `0.42.0` → `0.43.0` → `0.43.1` (npm `latest`; the 2.x line
-  deliberately not adopted; package-lock integrity matches the npm registry
-  per bump). Dockerfile ARG, build-args, package-lock, mt-admin harness
-  assertion, and docs synchronized per bump.
+- kimi-code `0.42.0` → `0.43.0` → `0.43.1` → `2.0.2` (npm `latest`;
+  package-lock integrity matches the npm registry per bump). Dockerfile ARG,
+  build-args, package-lock, mt-admin harness assertion (now deriving the
+  pinned version instead of hard-coding it), and docs synchronized per bump.
+  The 2.0.2 adoption also fixed the baked TensorZero `base_url` to the
+  NetBird hostname the comments already described and hardened the contract
+  gate: 2.0.2 retries provider connection errors with backoff instead of
+  exiting 0, so the gate asserts on the first provider-layer retry event.
+- Headless permission contract (WI#195): `default_permission_mode` yolo→auto
+  with `dangerous_command_guard = false`; entrypoint exports
+  `KIMI_CODE_PERMISSION_MODE_REMINDER=0` and
+  `KIMI_CODE_DANGEROUS_COMMAND_GUARD=false` (operator-overridable); the
+  Dockerfile runs just the real-CLI contract lane against the locked pin
+  post-`npm test`; unrecognized stream-json roles are warn-logged, not
+  silently dropped. Evidence:
+  `docs/ops/v2.1.2.0_ITEM10_WI195_KIMI_HEADLESS.md`. WI#194 (the symptom
+  report) stays open — the stall mechanism is removed but a live `inttest`
+  repro is still wanted.
 - opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` at reviewed commit
   `9eb6902aaf3c35ce985b67c605a775992249066b` (tag SHA verified against both
   upstream remotes; upstream build script byte-identical between refs, so
@@ -396,7 +561,7 @@ The OpenCode v2 lane is a full first-class worker:
   regressions remain disqualifying. Pebble remains at upstream HEAD
   `2d0f3786`.
 
-### CI/CD Improvements (goals 28, 30, 21)
+### CI/CD Improvements (goal 28)
 
 - Giant-crate compile concurrency is runner-managed: the project-wide
   `rust-compile-16gb` resource-group serialization trialled during the
@@ -440,7 +605,7 @@ see `project`/`title`/etc. without needing the tool_info hint. Registry
 to move when tool sources change — hence the 0.1.5 bump rather than a no-op
 realigned 0.1.4.
 
-### Approval Delivery and Gate Recovery (goal 31, work item #164)
+### Approval Delivery and Gate Recovery (work item #164)
 
 Authenticated pending-gate recovery with race-safe browser reconciliation;
 resolved auto-approve configuration with legacy env alias/diagnostics;
@@ -453,7 +618,7 @@ durable. Evidence: `docs/ops/v2.1.2.0_GOAL31_WI164_APPROVAL_DELIVERY.md`.
 Final live release acceptance for this thread is carried on the goals
 checklist.
 
-### REPL Argument Integrity (goal 34, work item #161)
+### REPL Argument Integrity (work item #161)
 
 Fixed name-only/final argument assembly and CodeAct nested-fence
 truncation; added pre-execution REPL argument validation, a distinct
@@ -468,17 +633,23 @@ The opencode2 port map is now included in the collision probe, doctor
 duplicate check, and `ports list`, so v17 allocations are probed and
 duplicated-checked alongside the other tenant port maps.
 
-### Documentation Parity (goals 38, 42, 43, 45)
+### Documentation Parity (goals 38, 42, 43, 45, 47, 49)
 
-- All 31 current guides revalidated against the 2.1.2.0 tree;
-  `MT-ADMIN-QUICKSTART` gained `fix-podman-userns`; `ENABLING_DEV_TOOLS`
-  rewritten for the podman-first sandbox and WI#141 scrub; `TESTING_GUIDE`
-  gained the attachment tier and worker cancel-ack note;
-  `TENANT_KNOWLEDGE_SEED` notes the sweep rework.
-- All architecture docs revalidated; `SEMANTIC-MEMORY-SEARCH` gained the
-  V27 outbox and mission-subtree exclusion; `ENGINE-V2` gained attachment
-  input, data-retention, and insights sections; `SELF_HEAL_*` docs gained
-  2.1.2.0 lifecycle notes.
+- All 31 current guides revalidated against the 2.1.2.0 tree, then
+  re-revalidated after the late worker and sandbox changes (goals 42, 47);
+  `MT-ADMIN-QUICKSTART` gained `fix-podman-userns` and the opencode2
+  restart-worker example; `ENABLING_DEV_TOOLS` rewritten for the
+  podman-first sandbox and WI#141 scrub; `TESTING_GUIDE` gained the
+  attachment tier, the worker cancel-ack note, the three sandbox network
+  modes, and the OpenCode 2 worker lane; `TENANT_KNOWLEDGE_SEED` notes the
+  sweep rework.
+- All architecture docs revalidated (goals 43, 49); `SEMANTIC-MEMORY-SEARCH`
+  gained the V27 outbox and mission-subtree exclusion; `ENGINE-V2` gained
+  attachment input, data-retention, and insights sections;
+  `SELF_HEAL_COVERAGE_AUDIT` suite count corrected for the four new WI#180
+  suites; `SELF_HEAL_DEPLOYMENT_WIRING` gained the WI#180 health-parity
+  subsection; the SSH harness/delivery docs now cover all four worker types
+  including the opencode2 lane.
 - `MULTITENANCY-PRODUCTION` port blocks now cover the v15 LunarVoice, v16
   health_metrics, and v17 opencode2 blocks; `TENANT-CONFIGURATION` registry
   schema corrected to v17.
@@ -513,20 +684,32 @@ duplicated-checked alongside the other tenant port maps.
    `KNOWLEDGE_SWEEP_ENABLED`; multi-tenant fleets that relied on the
    (disabled) heartbeat sweep will now actually sweep — review
    `KNOWLEDGE_SWEEP_*` cadence knobs before enabling at scale.
-8. Worker tool pins: opencode `v1.18.25` (`cb7d8b2f…`), kimi-code `0.43.1`,
+8. Worker tool pins: opencode `v1.18.25` (`cb7d8b2f…`), kimi-code `2.0.2`,
    opencode2 `v2.0.11` (`9eb6902a…`), pebble `2d0f3786`. Do not adopt the
-   opencode 2.x line for the opencode lane or the opencode v1.18.29 image;
-   do not adopt the kimi-code 2.x line this cycle. Pull worker images by
-   the digest recorded in `worker-image-evidence.json`.
+   opencode 2.x line for the opencode lane or the opencode v1.18.29 image.
+   Pull worker images by the digest recorded in `worker-image-evidence.json`.
 9. To deploy opencode2 for a tenant, use the mt-admin opencode2 verbs and
    CI-published `worker-opencode2` images; the lane defaults remain
    eval-tenant-scoped per the rollout plan until Phase E acceptance.
 10. Pebble workers enforce workspace-path confinement and concurrent-task
     exclusivity; daemon-supplied `project_dir` values outside
     `WORKSPACE_ROOT` are now rejected by design.
-11. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
+11. **Worker credential migration (WI#205).** On the next lifecycle pass
+    (any mt-admin tenant start/build/upgrade), a per-tenant
+    `WORKER_AUTH_TOKEN` is generated and converged into the daemon
+    `config.toml`, all worker container envs, and the systemd Quadlet at
+    once; tenants without the new value fall back to the gateway token
+    until their env file regenerates. No manual action is required, but
+    expect `auth_token` in tenant `config.toml` to change to the scoped
+    value.
+12. **Mission defaults (WI#188/#189).** Missions now retry automatically
+    (3 retries, 60s → 2× backoff capped at 1h) and the default daily
+    thread budget is 30. Operators who depended on the old 10-fire ceiling
+    or on no-retry behavior should set `max_threads_per_day` and
+    `max_retries=0` explicitly per mission.
+13. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
     installer is at `.gitlab/scripts/install-shellcheck.sh`.
-12. Conversation-insights changes add durable cursors, batch identity, and
+14. Conversation-insights changes add durable cursors, batch identity, and
     deletion-as-opt-out state; on upgrade, existing insight stores are
     migrated in place by the production store tests' covered paths — no
     operator action required, but review `docs/ops/v2.1.2.0_GOAL8_INSIGHTS_HARDENING.md`
@@ -543,8 +726,8 @@ duplicated-checked alongside the other tenant port maps.
 - WI#155's `proxy-enforced` mode is implemented and gated; live docker-
   runtime e2e was not run on the dev VM (no docker). The acceptance file
   carries the exact commands for a runtime host.
-- Live release acceptance remains for goal 31 (WI#164 approval delivery) and
-  goal 34 (WI#161 REPL argument integrity) fresh-tenant threads; evidence
+- Live release acceptance remains for WI#164 (approval delivery) and
+  WI#161 (REPL argument integrity) fresh-tenant threads; evidence
   and limits are in their linked ops records.
 - MCP does not auto-install npm/pip packages and does not pass configured
   MCP servers into `lunarwing-agent-v1` external workers.
@@ -559,8 +742,8 @@ duplicated-checked alongside the other tenant port maps.
 - GitLab CI publishes protected, digest-bound worker images but does not
   publish daemon packages or deploy tenants automatically; mt-admin still
   performs tenant-local activation.
-- OpenCode v1.18.29/kimi 2.x remain deliberately un-adopted pending upstream
-  proof.
+- OpenCode v1.18.29 remains deliberately un-adopted pending upstream proof;
+  kimi-code 2.0.2 is the adopted worker pin as of this release.
 
 ### Resolved or Source-Fixed Since v2.1.1.0
 
@@ -581,17 +764,31 @@ duplicated-checked alongside the other tenant port maps.
   heartbeat on multi-tenant fleets (WI#121).
 - Skill registry sidecar provenance is read correctly; registry-installed
   skills no longer re-import on every restart.
+- Bundled tenant skill catalog is exactly the seven product skills;
+  contributor-dev skills no longer ship as tenant defaults (WI#185).
 - GitLab WASM tool no longer collapses to the bare `action` discriminator
   under schema compaction (WI#150).
 - Health pipeline: eight WI#180 findings plus six review findings fixed;
   runtime/knowledge are monitor-only diagnostics that escalate without
   restarts (WI#180).
+- Mission threads retry automatically with backoff and a restart-safe
+  pending-retry re-arm (WI#188); the default daily thread budget covers
+  hourly cadences (30, WI#189); mission tool parameters are validated and
+  `current_focus` is settable (WI#203).
 - Conversation insights: nine-finding hardening program complete (goal 8,
   WI#132/WI#143/WI#183); durable cross-channel attachments; corrupted
   blocking tool responses demoted to text (WI#139 follow-up).
+- Sandbox credential containment: agent-chosen mounts are validated against
+  protected tenant directories (masked or refused fail-closed) and external
+  workers authenticate with a scoped `WORKER_AUTH_TOKEN` instead of the
+  full gateway bearer (WI#205, WI#215).
+- Pebble workers clean up their cancel-map entries on task completion
+  (WI#158).
 - CI/CD: giant-crate compile concurrency is runner-managed with OOM/ENOSPC
   runbooks for the known signal-9 class (promotion locks are the only
   serializing resource groups); opencode2
-  publication jobs; ShellCheck 0.11.0 floor.
-- Worker pins updated: kimi-code 0.43.1, opencode2 v2.0.11, gitlab tool
+  publication jobs; ShellCheck 0.11.0 floor; all locally runnable gates
+  re-verified green at release HEAD.
+- Worker pins updated: kimi-code 2.0.2 (headless permission contract per
+  WI#195), opencode2 v2.0.11, gitlab tool
   registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
