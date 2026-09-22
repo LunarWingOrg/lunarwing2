@@ -30,6 +30,13 @@ COPY scripts/*.ts ./scripts/
 # entrypoint_config_test.js reads ../entrypoint.sh — ship it in the build
 # stage so the in-build test gate validates the actual shipped entrypoint.
 COPY entrypoint.sh /build/entrypoint.sh
+# WI#206 fixtures: the headless-guard tests read /build/hooks/ and
+# /build/config/ during the in-build npm test gate (same builder-stage
+# pattern as entrypoint.sh above). Without these COPYs the 7 new
+# headless_command_guard / entrypoint policy tests fail with ENOENT and
+# the image build gate fails (inttest 2026-09-22 15:16, barracuda).
+COPY hooks/ /build/hooks/
+COPY config/ /build/config/
 
 WORKDIR /build/scripts
 RUN npm ci --ignore-scripts && \
