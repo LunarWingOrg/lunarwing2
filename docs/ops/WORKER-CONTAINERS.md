@@ -98,8 +98,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.11** at reviewed full commit
-`9eb6902aaf3c35ce985b67c605a775992249066b`; the v2 bridge uses
+**v2.0.14** at reviewed full commit
+`08462140ec0de1e4b17d4a353d8d5827f53cf7b0`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -197,6 +197,19 @@ above applies unchanged; client/schema/protocol SDK changes in
 `session.execution.{succeeded,failed,interrupted}`, `session.idle`,
 `session.message.list`, and `session.text.delta` all confirmed present.
 Whole-image reproducibility remains CI-verified per revision.
+
+v2.0.14 bump (2026-09-22): tag SHA `08462140ec0de1e4b17d4a353d8d5827f53cf7b0`
+verified against both anomalyco/opencode and sst/opencode remotes. Upstream
+`packages/cli/script/build.ts` is byte-identical between v2.0.11 and v2.0.14,
+so the checked reproducible-build patch applies unchanged. The generated
+promise client (`packages/client/src/promise/generated/client.ts`) is
+byte-identical between the two tags; the only client/schema/protocol diffs are
+an additive `method: "key" | "oauth"` field on `Connection.CredentialInfo` and
+the version bumps — no removals against the bridge's `@opencode/client/promise`
+usage (`OpenCode.make`, `session.create/prompt/interrupt`, `session.message.list`,
+`session.permission.reply`, `session.execution.*`, `session.idle`,
+`session.text.delta` all present at v2.0.14). The promise exports map is
+unchanged. Whole-image reproducibility remains CI-verified per revision.
 
 Goal-35 verification (2026-09-18): the #177 root cause was reproduced
 host-side with the pinned Bun — two full self-test sequences with a scratch
