@@ -279,11 +279,15 @@ arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
 `2.0.2` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
-`0.43.0` → `0.43.1` and then to the 2.x line at `2.0.2`, adopted 2026-09-21
-after the deterministic CLI contract gate proved the 2.x headless surface); an
-override without a
-matching reviewed lock fails closed. The pinned version is baked into
-`KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`. Base images,
+`0.43.0` → `0.43.1` early in the v2.1.2.0 cycle, then `0.43.1` → `2.0.2` on
+2026-09-21 with `53ccb8377`, adopting the npm-latest 2.x line together with a
+deterministic CLI contract gate so clean image builds resolve a model without
+host config; the 2.x behavior changes the worker cares about are the headless
+permission-contract findings below, all verified on 2.0.2); an override
+without a matching reviewed lock fails closed. The pinned version is baked
+into `KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`, and
+`ic/scripts/tests/test-mt-admin-kimi.sh` cross-checks Dockerfile default, CI
+build script, and committed lock version-agnostically. Base images,
 Debian indexes, and optional toolchain downloads are also pinned.
 
 For every persistent worker, `add-tenant --with-<worker>` controls the tenant's
