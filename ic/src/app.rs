@@ -1421,10 +1421,11 @@ impl AppBuilder {
                         }
                         // Start the SSH agent server so workers can use it via
                         // SSH_AUTH_SOCK. The socket path is predictable:
-                        // /home/<owner_id>/lunarwing/run/ssh-agent.sock
+                        // /home/<owner_id>/lunarwing/run/ssh-agent/ssh-agent.sock
                         // (not /tmp — the daemon runs PrivateTmp=true, so the
-                        // socket lives in the tenant run dir to be bind-mountable
-                        // into worker containers).
+                        // socket lives in the tenant run dir's dedicated
+                        // ssh-agent subdir; mt-admin mounts that DIRECTORY so
+                        // daemon restarts self-heal the stale-inode issue).
                         if let Err(e) = bridge.start_agent_server().await {
                             tracing::warn!(error = %e, "SSH agent server failed to start");
                         } else {

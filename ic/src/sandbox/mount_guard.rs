@@ -76,8 +76,9 @@ pub fn resolve_protected_paths() -> Vec<PathBuf> {
 /// siblings of it, not children — the tenant's `<root>/env` and `<root>/run`
 /// directories are added defensively. A tenant that has not been re-rendered
 /// since `SANDBOX_PROTECTED_PATHS` was introduced (WI#205) would otherwise
-/// leave `<root>/run` (the world-writable `ssh-agent.sock`, the tenant's SSH
-/// identity) unmasked to any sandboxed command mounting the tenant root. The
+/// leave `<root>/run` (the world-writable `ssh-agent/ssh-agent.sock`, the
+/// tenant's SSH identity) unmasked to any sandboxed command mounting the tenant
+/// root. The
 /// added paths are inert subdirectories of already-protected single-node
 /// bases, so default protection behaviour is unchanged.
 fn resolve_protected_paths_from(env_raw: Option<&str>, base: &Path) -> Vec<PathBuf> {
