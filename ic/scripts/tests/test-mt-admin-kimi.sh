@@ -77,10 +77,16 @@ assert_contains "$quadlet" "EnvironmentFile=$fixture/env/kimi-runtime.env" 'syst
 assert_not_contains "$quadlet" 'ssh-agent.sock' 'systemd Kimi quadlet has no SSH agent mount (WI#206)'
 assert_not_contains "$quadlet" 'SSH_AUTH_SOCK' 'systemd Kimi quadlet has no SSH_AUTH_SOCK env (WI#206)'
 assert_contains "$quadlet" 'SecurityOpt=no-new-privileges' 'systemd Kimi quadlet sets no-new-privileges (WI#206)'
-# The failure-callback lane keeps the mount: render opencode and confirm.
+# The failure-callback lane keeps the mount: render opencode and confirm it is
+# the DIRECTORY mount (stale-inode fix), not the legacy socket-file mount.
 render_worker_quadlet root opencode 8443
 opencode_quadlet="$fixture/quadlets/lunarwing-opencode-root.container"
-assert_contains "$opencode_quadlet" 'ssh-agent.sock' 'opencode quadlet keeps the SSH agent mount'
+assert_contains "$opencode_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:z' \
+  'opencode quadlet mounts the ssh-agent DIRECTORY (stale-inode fix)'
+assert_contains "$opencode_quadlet" 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' \
+  'opencode quadlet points SSH_AUTH_SOCK inside the mounted directory'
+assert_not_contains "$opencode_quadlet" 'ssh-agent.sock:z' \
+  'opencode quadlet no longer mounts the socket FILE'
 render_worker_quadlet root kimi 8443
 minted="$(sed -n 's/^WORKER_AUTH_TOKEN=//p' "$env_file" | tail -1)"
 if [[ -n "$minted" && "$minted" != "gate%token" ]]; then
@@ -268,11 +274,30 @@ if grep -Fq -- '--security-opt no-new-privileges' <<<"$KIMI_BLOCK"; then
 else
   fail 'kimi imperative launch missing no-new-privileges (WI#206)'
 fi
+# The non-kimi imperative lanes must mount the ssh-agent DIRECTORY (not the
+# socket file) so daemon restarts self-heal the stale-inode defect.
+for lane in opencode opencode2 pebble; do
+  LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
+  if grep -Fq -- '-v "${ssh_agent_dir}:/tmp/ssh-agent:z"' <<<"$LANE_BLOCK" \
+    && grep -Fq -- 'SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' <<<"$LANE_BLOCK"; then
+    pass "$lane imperative launch mounts the ssh-agent directory"
+  else
+    fail "$lane imperative launch missing the ssh-agent directory mount"
+  fi
+done
 # The launch contract must carry the policy change so existing containers
 # force-recreate instead of surviving with the old mount.
 ROOT_SCRIPT="$(dirname "$MT_ADMIN")/lunarwing-mt-admin.sh"
 assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges"' \
   'kimi launch contract records the WI#206 policy change'
+# The non-kimi lanes record the directory-mount switch (stale-inode fix) so
+# existing containers force-recreate off the legacy socket-file mount.
+assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir"' \
+  'opencode launch contract records the ssh-agent directory mount'
+assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir"' \
+  'opencode2 launch contract records the ssh-agent directory mount'
+assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir"' \
+  'pebble launch contract records the ssh-agent directory mount'
 # The baked worker policy (WI#206): guard back on + PreToolUse hook shipped.
 KIMI_CONFIG="$LUNARWING_ROOT/kimicode4lunarwing/config/config.toml"
 assert_contains "$KIMI_CONFIG" 'dangerous_command_guard = true' \
