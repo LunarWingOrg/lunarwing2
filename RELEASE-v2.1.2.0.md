@@ -377,6 +377,12 @@ WI#163, a re-file, was reverified with no code change.
   external redelivery can re-fire (at-least-once); a successful retry
   re-records the key, restoring dedup. `MaxIterations` is deliberately never
   auto-retried — it is notified with a model-facing suggestion instead.
+  Post-landing audit (goal 9, `docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`)
+  flagged two HIGH follow-ups that remain open and are carried in the
+  limitations section: the retry re-fire path still injects a
+  `retry_attempt` key into the trigger payload (F1), and the at-least-once
+  dedup release is not scoped — a `GatePaused` outcome also releases the
+  key, so an event redelivery during an approval window can double-fire (F2).
 - **Daily thread budget default 10 → 30 (WI#189).** An hourly mission
   without an explicit `max_threads_per_day` now covers a full 24-hour day
   plus retry headroom instead of going dark after ten hours. Retry respawns
@@ -768,6 +774,18 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   (kimi-code 2.0.2 was adopted 2026-09-21 after the CLI contract gate
   proved the 2.x headless surface; if 2.x upstream regressions appear, the
   documented fallback is the last-proven 0.43.1 pin).
+- Mission retry (WI#188) carries two open HIGH follow-ups from the goal-9
+  commit audit (`docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`): F1 — the retry
+  re-fire path injects an internal `retry_attempt` key into the trigger
+  payload, leaking into mission meta-prompts and the persisted
+  `last_trigger_payload` despite the sufficient top-level metadata marker;
+  F2 — the at-least-once dedup release fires for every non-Completed
+  outcome including `GatePaused`, so an event redelivery during an approval
+  window can double-fire the mission. Both verified still present at
+  `ic/crates/lunarwing_engine/src/runtime/mission.rs` at release time; the
+  lower-severity audit findings (F3 restart-sweep ordering, F10 missing
+  retry params in the `mission_update` schema) are recorded in the audit
+  report.
 
 ### Resolved or Source-Fixed Since v2.1.1.0
 
@@ -792,7 +810,9 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   workers no longer receive the full gateway bearer (WI#205, incl. the
   WI#209/#210/#211 review findings and WI#215 sibling derivation).
 - Interrupted mission fires retry with backoff and survive daemon restarts;
-  event/webhook delivery is at-least-once (WI#188). Daily mission budget
+  event/webhook delivery is at-least-once (WI#188 — two HIGH audit
+  follow-ups carried: `retry_attempt` payload injection and unscoped dedup
+  release incl. `GatePaused`). Daily mission budget
   defaults to 30 (WI#189); mission tools reject nameless/goalless creates
   and expose `current_focus` (WI#203).
 - Fresh tenants receive only the seven product skills, not contributor
