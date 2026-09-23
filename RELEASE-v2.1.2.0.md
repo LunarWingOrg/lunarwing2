@@ -823,13 +823,15 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   lower-severity audit findings (F3 restart-sweep ordering, F10 missing
   retry params in the `mission_update` schema) are recorded in the audit
   report.
-- Worker SSH-agent sockets can go stale after daemon-only restarts (the
-  bind-mount inode is captured at container creation, and voice/vision
-  consumer reloads do not recreate worker containers), with an unexplained
-  `Permission denied` on fresh binds — raised in cmc's WI#206 verification
-  comment and now tracked as its own follow-up. Incidental for the kimi
-  lane (the mount was removed), but it affects the lanes that still mount
-  the socket.
+- Worker SSH-agent sockets after daemon-only restarts: fixed in this release
+  — workers now bind-mount the socket's parent directory
+  (`run/ssh-agent` → `/tmp/ssh-agent`), so a daemon restart's fresh socket
+  inode is picked up at connect time and existing containers force-recreate
+  off the legacy file mount via the `ssh-agent-dir` launch contract (item 40;
+  see `docs/ops/2.1.2_FINDINGS.md`). The unexplained `Permission denied` on
+  fresh binds from cmc's WI#206 verification comment is covered by the same
+  change (the socket directory is now explicitly `0o755`; the daemon's
+  `UMask=0077` previously left daemon-created parents `0700`).
 - WI#159 (open): the engine event listener's terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
   for Research child threads — only Mission threads are filtered — so
@@ -859,6 +861,11 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - Sandbox cannot mount the tenant `env`/`state`/`run` directories, and
   workers no longer receive the full gateway bearer (WI#205, incl. the
   WI#209/#210/#211 review findings and WI#215 sibling derivation).
+- Worker SSH auth survives daemon restarts: the agent socket lives in a
+  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts (not the
+  socket file), so a fresh daemon-bound inode resolves at connect time and
+  the `ssh-agent-dir` launch contracts migrate existing containers
+  automatically (item 40 / WI#206 stale-socket follow-up).
 - Interrupted mission fires retry with backoff and survive daemon restarts;
   event/webhook delivery is at-least-once (WI#188 — two HIGH audit
   follow-ups carried: `retry_attempt` payload injection and unscoped dedup

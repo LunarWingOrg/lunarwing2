@@ -319,7 +319,8 @@ pub struct SSHBridge {
     /// Tenant ID (UUID, derived from owner_id)
     tenant_id: Uuid,
     /// Tenant name (owner_id) — used for the agent socket path so the
-    /// mt-admin script can predict it: /home/<tenant_name>/lunarwing/run/ssh-agent.sock
+    /// mt-admin script can predict it:
+    /// /home/<tenant_name>/lunarwing/run/ssh-agent/ssh-agent.sock
     tenant_name: String,
     /// Host configurations (non-sensitive)
     hosts: Arc<RwLock<HashMap<String, SSHHostConfig>>>,
@@ -456,18 +457,23 @@ impl SSHBridge {
 
     /// Start the SSH agent server (for worker integration)
     ///
-    /// Creates a Unix socket at `/home/<tenant_name>/lunarwing/run/ssh-agent.sock`
+    /// Creates a Unix socket at
+    /// `/home/<tenant_name>/lunarwing/run/ssh-agent/ssh-agent.sock`
     /// that workers can connect to for SSH authentication. Keys are loaded from
-    /// the secrets store and never written to disk. The socket path uses the
-    /// tenant's run directory (not /tmp) because the daemon runs with
-    /// PrivateTmp=true — a /tmp socket would be invisible to podman containers
-    /// and couldn't be bind-mounted into workers. The mt-admin script predicts
-    /// this path for mounting: <tenant_home>/lunarwing/run/ssh-agent.sock.
+    /// the secrets store and never written to disk. The socket lives in a
+    /// DEDICATED `run/ssh-agent/` subdirectory (not /tmp, because the daemon
+    /// runs with PrivateTmp=true — a /tmp socket would be invisible to podman
+    /// containers — and not directly in run/, whose siblings include the
+    /// daemon's REPL control socket `lunarwing.sock`). mt-admin bind-mounts
+    /// that DIRECTORY into worker containers, so a daemon restart that binds a
+    /// fresh socket inode is picked up without recreating the workers:
+    /// <tenant_home>/lunarwing/run/ssh-agent.
     #[instrument(skip(self))]
     pub async fn start_agent_server(&mut self) -> Result<()> {
-        // Use the tenant's run directory instead of /tmp (PrivateTmp-safe).
+        // Use the tenant's run directory (PrivateTmp-safe) with a dedicated
+        // ssh-agent subdir so the directory mount exposes only the agent.
         let run_dir = format!("/home/{}/lunarwing/run", self.tenant_name);
-        let socket_path = PathBuf::from(format!("{run_dir}/ssh-agent.sock"));
+        let socket_path = PathBuf::from(format!("{run_dir}/ssh-agent/ssh-agent.sock"));
 
         // Load keys from the secrets store for each configured host.
         let hosts = self.hosts.read().await;

@@ -50,19 +50,21 @@ and how to enable it.
 **What it is.** The agent creates a background job on an external worker
 (pebble/opencode/opencode2; the kimi lane no longer mounts the agent socket —
 WI#206) with `create_job(mode="opencode", …)`. The worker
-container has the harness's ssh-agent socket bind-mounted and `SSH_AUTH_SOCK`
-set, so ordinary `git`/`ssh` inside the container authenticate through the
-daemon's agent. Keys stay in the daemon; the worker only gets signing capability
-via the socket.
+container has the harness's ssh-agent socket directory bind-mounted and
+`SSH_AUTH_SOCK` set, so ordinary `git`/`ssh` inside the container authenticate
+through the daemon's agent. Keys stay in the daemon; the worker only gets
+signing capability via the socket.
 
 **How it's enabled.** `ic/scripts/lunarwing-mt-admin.sh` wires this (post-split
 implementation in `mt-admin-lib/04-tenant-lifecycle.sh` and
 `mt-admin-lib/09-worker-config.sh`): it
-pre-creates the socket path, starts the daemon (which binds the real socket),
-then starts workers with `-v <run_dir>/ssh-agent.sock:/tmp/ssh-agent.sock:z -e
-SSH_AUTH_SOCK=/tmp/ssh-agent.sock`. `<run_dir>` is
-`/home/<tenant>/lunarwing/run`. Nothing for the operator to do beyond
-provisioning the host + key (see the ops guide).
+pre-creates the socket directory, starts the daemon (which binds the real
+socket inside it), then starts workers with `-v <run_dir>/ssh-agent:/tmp/ssh-agent:z
+-e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock`. `<run_dir>` is
+`/home/<tenant>/lunarwing/run`. The directory mount means a daemon restart's
+fresh socket inode is picked up at connect time — no worker recreate needed.
+Nothing for the operator to do beyond provisioning the host + key (see the ops
+guide).
 
 **Security.** Highest process/filesystem isolation — the SSH operation runs in a
 separate container. Host-key verification is whatever the worker's own `ssh`
@@ -238,7 +240,7 @@ All three mechanisms sit on the same harness (see
   consult this map.
 - **Private keys** in the AES-256-GCM secrets store; decrypted only inside the
   daemon; workers/guests never receive raw key bytes.
-- **In-process ssh-agent** at `/home/<tenant>/lunarwing/run/ssh-agent.sock`.
+- **In-process ssh-agent** at `/home/<tenant>/lunarwing/run/ssh-agent/ssh-agent.sock`.
 - **`HostKeyVerifier`** — consulted directly by the built-in/WASM russh paths;
   AcceptFirst pins are tenant-scoped in the encrypted secrets store and loaded
   when `SSHBridge` starts. `ssh_git` preflights through the same verifier when it

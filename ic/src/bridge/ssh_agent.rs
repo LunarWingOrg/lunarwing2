@@ -103,6 +103,32 @@ impl SshAgentServer {
         socket_path: PathBuf,
         keys: HashMap<String, SSHCredentials>,
     ) -> Result<Arc<Self>> {
+        // Workers bind-mount the socket's PARENT DIRECTORY (not the socket
+        // file), so a daemon restart that binds a fresh socket inode is picked
+        // up without recreating the worker containers. That only works if the
+        // directory exists, so create it here — the caller only guarantees the
+        // run dir root. Explicit 0o755: the daemon unit runs with UMask=0077,
+        // and a daemon-created directory would otherwise be 0700, blocking
+        // worker UIDs (which differ from the daemon's) from traversing to the
+        // 0o666 socket.
+        #[cfg(unix)]
+        let socket_dir_permissions = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(0o755)
+        };
+        #[cfg(not(unix))]
+        let socket_dir_permissions = std::fs::Permissions::from(0o755);
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                warn!(
+                    "Failed to create SSH agent socket directory {}: {}",
+                    parent.display(),
+                    e
+                );
+                SshBridgeError::AgentSocketUnavailable
+            })?;
+            let _ = std::fs::set_permissions(parent, socket_dir_permissions);
+        }
         if socket_path.exists() {
             warn!(
                 "SSH agent socket exists, removing: {}",
@@ -242,5 +268,29 @@ mod tests {
         let server = SshAgentServer::start(socket_path.clone(), keys).await;
         assert!(server.is_ok());
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn test_agent_server_creates_missing_parent_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        // Workers mount the socket's parent directory, so the server must be
+        // able to create it when only the run-dir root exists.
+        let socket_path = temp_dir.path().join("ssh-agent/ssh-agent.sock");
+        assert!(!socket_path.parent().unwrap().exists());
+        let keys: HashMap<String, SSHCredentials> = HashMap::new();
+        let server = SshAgentServer::start(socket_path.clone(), keys).await;
+        assert!(server.is_ok());
+        assert!(socket_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(socket_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(dir_mode & 0o777, 0o755, "socket dir must be traversable");
+        }
+        drop(server);
+        assert!(!socket_path.exists());
     }
 }
