@@ -98,8 +98,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.14** at reviewed full commit
-`08462140ec0de1e4b17d4a353d8d5827f53cf7b0`; the v2 bridge uses
+**v2.0.15** at reviewed full commit
+`6f3639d82ed0760091792189b78f8eeb44f699b1`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -210,6 +210,16 @@ usage (`OpenCode.make`, `session.create/prompt/interrupt`, `session.message.list
 `session.permission.reply`, `session.execution.*`, `session.idle`,
 `session.text.delta` all present at v2.0.14). The promise exports map is
 unchanged. Whole-image reproducibility remains CI-verified per revision.
+
+v2.0.15 bump (2026-09-23): tag SHA `6f3639d82ed0760091792189b78f8eeb44f699b1`
+verified against anomalyco/opencode. The upstream CLI build script and
+`@opencode/client/promise` exports map are unchanged from v2.0.14, so the
+checked reproducible-build patch still applies. The generated promise client
+now preserves base-URL path prefixes and throws declared HTTP errors as
+`Error` objects; neither change alters the bridge's localhost root-base-URL
+calls. The new session metadata event and update field are additive to the
+bridge's session execution, message, and permission calls. Whole-image
+reproducibility must still pass the CI candidate-versus-clean-rebuild gate.
 
 Goal-35 verification (2026-09-18): the #177 root cause was reproduced
 host-side with the pinned Bun — two full self-test sequences with a scratch

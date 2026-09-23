@@ -45,9 +45,9 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='opencode2.4lunarwing/Dockerfile
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts'
-        source_ref=08462140ec0de1e4b17d4a353d8d5827f53cf7b0
-        build_args="OPENCODE_VERSION=v2.0.14
-OPENCODE_REF=08462140ec0de1e4b17d4a353d8d5827f53cf7b0
+        source_ref=6f3639d82ed0760091792189b78f8eeb44f699b1
+        build_args="OPENCODE_VERSION=v2.0.15
+OPENCODE_REF=6f3639d82ed0760091792189b78f8eeb44f699b1
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;

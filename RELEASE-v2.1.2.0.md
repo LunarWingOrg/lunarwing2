@@ -36,7 +36,7 @@ authenticate their inbound dispatch handshake with a new scoped
 processes on systemd multi-tenant hosts now spawn as manager-forked transient
 services, structurally fixing rootless Podman user-namespace joins from
 tenant scopes (work item #181/#178). External workers gained a new opencode2
-lane (v2 line, pinned at v2.0.14 on a reviewed upstream commit) with a
+lane (v2 line, pinned at v2.0.15 on a reviewed upstream commit) with a
 reproducible-build bridge over the `@opencode/client/promise` SDK, full
 mt-admin mirroring, CI/CD publication jobs, and its own ports-registry v17
 block; the kimi worker moved to the 2.x line (`2.0.2`) with a headless-safe
@@ -119,8 +119,8 @@ previous compatibility baseline.
   TypeScript bridge over `@opencode/client/promise`, ports-registry v17
   slots (51000-51999), mt-admin mirroring with a 34-assertion harness, and
   protected CI publication jobs (candidate/scan/promote) with the
-  digest-bound reproducible contract. Pinned at `v2.0.14` on reviewed
-  upstream commit `08462140ec0de1e4b17d4a353d8d5827f53cf7b0`; the v1 lane
+  digest-bound reproducible contract. Pinned at `v2.0.15` on reviewed
+  upstream commit `6f3639d82ed0760091792189b78f8eeb44f699b1`; the v1 lane
   stays pinned at proven `v1.18.25` and remains the default.
 - **Kimi worker fail-closed headless policy (WI#206).** The pinned CLI's
   print mode auto-approves commands and skips the upstream dangerous-command
@@ -222,7 +222,7 @@ previous compatibility baseline.
 | Tool registry patches | gitlab 0.1.5 (was 0.1.4); cavepony 0.4.2, llm-context 0.1.1, multica-bridge 0.1.2, ssh 0.1.1, vision-analyze 0.1.3, voice-transcribe 0.1.1, web-search 0.2.2, gotify 0.1.0 (no change) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (no change) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; no external version changed, so the vendor snapshot regenerated with no diff |
-| Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `2.0.2` (adopted 2026-09-21 after the 2.x line proved out); opencode2 `v2.0.14` at `08462140ec0de1e4b17d4a353d8d5827f53cf7b0`; pebble at upstream HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` |
+| Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `2.0.2` (adopted 2026-09-21 after the 2.x line proved out); opencode2 `v2.0.15` at `6f3639d82ed0760091792189b78f8eeb44f699b1`; pebble at upstream HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` |
 | Sandbox default | `SANDBOX_NETWORK=none` is the in-code and mt-admin-rendered default; podman is the preferred runtime (`SANDBOX_RUNTIME`) |
 | Kimi worker lane | No longer mounts the tenant SSH-agent socket and runs with `no-new-privileges` (WI#206); the fail-closed `PreToolUse` command guard is baked into the image |
 | Worker image publication | Digest-bound reproducible candidates/promotions for kimi, pebble, opencode, and opencode2 |
@@ -560,8 +560,12 @@ The OpenCode v2 lane is a full first-class worker:
   gained the opencode2 case; `validate_config.py` and
   `promote-worker-image.py` guard the lane.
 - Pin history this cycle: v2.0.4 → v2.0.5 (goal 21/MR !988) → v2.0.8
-  → v2.0.14, tag SHA-verified against both upstream
-  remotes; upstream bridge-relevant SDK files confirmed unchanged between refs.
+  → v2.0.11 → v2.0.14 → v2.0.15. The v2.0.15 tag resolves to reviewed
+  commit `6f3639d82ed0760091792189b78f8eeb44f699b1`; the upstream CLI
+  build script is unchanged from v2.0.14. The promise client adds base-URL
+  path-prefix preservation and declared-error wrapping, and session metadata
+  support is additive to the bridge's existing API calls. Image digest
+  reproducibility remains a CI gate for publication.
 
 ### Pebble Worker Hardening (goals 17, 20, work items #101, #149)
 
@@ -621,10 +625,10 @@ The OpenCode v2 lane is a full first-class worker:
   2.0.2: `sudo`, `shutdown`, `curl … | sh`, and `rm -rf` of non-temp paths
   deny in ~3s with an explicit reason while ordinary builds and tests run
   unchanged.
-- opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` → `v2.0.14` at reviewed commit
-  `08462140ec0de1e4b17d4a353d8d5827f53cf7b0` (tag SHA verified against both
-  upstream remotes; upstream build script byte-identical between refs, so
-  the reproducible-build patch applies unchanged).
+- opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` → `v2.0.14` → `v2.0.15` at reviewed
+  commit `6f3639d82ed0760091792189b78f8eeb44f699b1` (tag SHA verified
+  against anomalyco/opencode; upstream build script byte-identical to v2.0.14,
+  so the reproducible-build patch applies unchanged).
 - opencode v1 stays deliberately pinned at `v1.18.25`
   (`cb7d8b2f5e44876ef98b661dc10590c915af3a9f`) — v1.18.29's live upstream
   regressions remain disqualifying. Pebble remains at upstream HEAD
@@ -813,7 +817,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
    `KNOWLEDGE_SWEEP_*` cadence knobs before enabling at scale.
 8. Worker tool pins: opencode `v1.18.25` (`cb7d8b2f…`), kimi-code `2.0.2`
    (the 2.x line is now the adopted pin — rebuild the kimi worker image; the
-   0.4x line is superseded), opencode2 `v2.0.14` (`08462140e…`), pebble
+   0.4x line is superseded), opencode2 `v2.0.15` (`6f3639d82…`), pebble
    `2d0f3786`. Do not adopt the opencode 2.x line for the opencode lane or
    the opencode v1.18.29 image. Pull worker images by
    the digest recorded in `worker-image-evidence.json`.
@@ -968,5 +972,5 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   publication jobs; ShellCheck 0.11.0 floor.
 - Worker pins updated: kimi-code 2.0.2 (with the WI#195 headless permission
   contract, the WI#206 fail-closed PreToolUse command guard, and the
-  deterministic CLI contract gate), opencode2 v2.0.14, gitlab
+  deterministic CLI contract gate), opencode2 v2.0.15, gitlab
   tool registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
