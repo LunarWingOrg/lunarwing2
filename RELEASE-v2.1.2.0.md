@@ -823,6 +823,13 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   lower-severity audit findings (F3 restart-sweep ordering, F10 missing
   retry params in the `mission_update` schema) are recorded in the audit
   report.
+- Worker SSH-agent sockets can go stale after daemon-only restarts (the
+  bind-mount inode is captured at container creation, and voice/vision
+  consumer reloads do not recreate worker containers), with an unexplained
+  `Permission denied` on fresh binds — raised in cmc's WI#206 verification
+  comment and now tracked as its own follow-up. Incidental for the kimi
+  lane (the mount was removed), but it affects the lanes that still mount
+  the socket.
 
 ### Resolved or Source-Fixed Since v2.1.1.0
 
