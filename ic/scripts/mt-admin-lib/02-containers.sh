@@ -98,7 +98,17 @@ _ensure_tenant_image() {
   if [[ -n "$tenant_id" && "$tenant_id" == "$admin_id" ]]; then
     return 0   # tenant already has the current image
   fi
-  [[ -n "$admin_id" ]] || return 1   # rootless, but the admin store has no source image to copy
+
+  # No source image in the admin store. A tenant that already holds one under
+  # this name can still run: the admin store gates *distribution* (so a rebuilt
+  # image reaches tenants), not whether an already-provisioned tenant may start.
+  # Returning 1 here stranded LunarVoice after `upgrade-tenant` emptied the
+  # admin store, because the caller aborts before reaching its reset-failed +
+  # start and the unit stayed failed until an operator intervened (WI#229).
+  if [[ -z "$admin_id" ]]; then
+    [[ -n "$tenant_id" ]] && return 0
+    return 1   # absent everywhere -> caller tells the operator to build first
+  fi
 
   if [[ -n "$tenant_id" ]]; then
     say "refreshing stale image $image in ${name}'s rootless store (save|load — minutes for large images) ..."
