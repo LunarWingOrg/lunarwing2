@@ -1314,6 +1314,14 @@ stop_tenant_opencode() {
     _deregister_babysitter "$container_name"
     rc-service "$container_name" stop >/dev/null 2>&1 || true
     say "opencode worker stopped ($container_name)"
+  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    # Quadlet owns the container: stop the unit, not the container, or
+    # Restart=on-failure resurrects it (goal #10; pebble parity from WI#128).
+    if _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 \
+        || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
+      say "opencode worker stopped ($container_name)"
+    fi
   elif _ctr "$name" inspect "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "opencode worker stopped ($container_name)"
@@ -1489,6 +1497,14 @@ stop_tenant_opencode2() {
     _deregister_babysitter "$container_name"
     rc-service "$container_name" stop >/dev/null 2>&1 || true
     say "opencode2 worker stopped ($container_name)"
+  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    # Quadlet owns the container: stop the unit, not the container, or
+    # Restart=on-failure resurrects it (goal #10; pebble parity from WI#128).
+    if _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 \
+        || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
+      say "opencode2 worker stopped ($container_name)"
+    fi
   elif _ctr "$name" inspect "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "opencode2 worker stopped ($container_name)"
@@ -1747,6 +1763,14 @@ stop_tenant_kimi() {
     _deregister_babysitter "$container_name"
     rc-service "$container_name" stop >/dev/null 2>&1 || true
     say "kimi worker stopped ($container_name)"
+  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    # Quadlet owns the container: stop the unit, not the container, or
+    # Restart=on-failure resurrects it (goal #10; pebble parity from WI#128).
+    if _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 \
+        || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
+      say "kimi worker stopped ($container_name)"
+    fi
   elif _ctr "$name" inspect "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "kimi worker stopped ($container_name)"
