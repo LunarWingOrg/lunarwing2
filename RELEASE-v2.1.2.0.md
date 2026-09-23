@@ -55,9 +55,11 @@ self-heal escalation that never restarts on observability gaps. Conversation
 insights — the release's largest reliability investigation — received a
 nine-finding hardening program (goal 8) against confabulation and feedback
 incidents. Missions gained a retry policy with exponential backoff,
-restart-safe re-arming, and at-least-once event delivery (work item #188), a
-daily thread budget default raised from 10 to 30 (work item #189), and
-honest mission-tool parameters (work item #203). Durable cross-channel
+restart-safe re-arming, and at-least-once event delivery (work item #188),
+a daily thread budget default raised from 10 to 30 (work item #189), and
+honest mission-tool parameters (work item #203); the release-cycle audit's
+mission-retry and sanitizer follow-ups were closed in-cycle (goals 38/39).
+Durable cross-channel
 attachments, a pre-execution stale
 tool-output sanitizer, keyset-paginated full-store knowledge sweeps that no
 longer depend on the heartbeat, a compact-schema fix for
