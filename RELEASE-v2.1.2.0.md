@@ -752,14 +752,22 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 11. Pebble workers enforce workspace-path confinement and concurrent-task
     exclusivity; daemon-supplied `project_dir` values outside
     `WORKSPACE_ROOT` are now rejected by design.
-12. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
+12. **Kimi worker lane hardening (WI#206).** Rebuild the kimi worker image
+    (2.0.2) and let the `KIMI_ROOTLESS_LAUNCH_CONTRACT` bump force-recreate
+    existing containers: the tenant SSH-agent socket is no longer mounted,
+    `no-new-privileges` is applied, and the baked fail-closed command guard
+    ships. Tenants that legitimately need SSH from kimi worker tasks must
+    move that work to the pebble/opencode/opencode2 lanes or a scoped
+    credential broker — the shared tenant agent is no longer exposed to the
+    headless executor.
+13. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
     installer is at `.gitlab/scripts/install-shellcheck.sh`.
-13. Conversation-insights changes add durable cursors, batch identity, and
+14. Conversation-insights changes add durable cursors, batch identity, and
     deletion-as-opt-out state; on upgrade, existing insight stores are
     migrated in place by the production store tests' covered paths — no
     operator action required, but review `docs/ops/v2.1.2.0_GOAL8_INSIGHTS_HARDENING.md`
     for the new authority/eligibility contracts.
-14. **Mission defaults changed.** The daily thread budget default is now 30
+15. **Mission defaults changed.** The daily thread budget default is now 30
     (was 10), and interrupted mission fires retry automatically with
     exponential backoff (3 retries default; `max_retries=0` opts out per
     mission). Tenants with explicit `max_threads_per_day` are unaffected.
