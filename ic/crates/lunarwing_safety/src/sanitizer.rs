@@ -5,7 +5,7 @@ use std::ops::Range;
 use aho_corasick::AhoCorasick;
 use regex::Regex;
 
-use crate::Severity;
+use crate::{Severity, neutralize_role_token_openers};
 
 /// Result of sanitizing external content.
 #[derive(Debug, Clone)]
@@ -230,15 +230,21 @@ impl Sanitizer {
         // Determine if we need to modify content
         let has_critical = warnings.iter().any(|w| w.severity == Severity::Critical);
 
-        let (content, was_modified) = if has_critical {
-            // For critical issues, escape the entire content
-            (self.escape_content(content), true)
+        let escaped = if has_critical {
+            // Preserve the legacy critical-only transformations for non-token
+            // patterns (null bytes, line-start role labels, [INST] markers).
+            self.escape_content(content)
         } else {
-            (content.to_string(), false)
+            content.to_string()
         };
+        // Special-token openers must be broken even when detection is absent
+        // or below Critical. A preceding backslash does not break the <|
+        // substring recognized by chat-template tokenizers.
+        let sanitized_content = neutralize_role_token_openers(&escaped);
+        let was_modified = sanitized_content != content;
 
         SanitizedOutput {
-            content,
+            content: sanitized_content,
             warnings,
             was_modified,
         }
@@ -255,7 +261,6 @@ impl Sanitizer {
         let mut escaped = content.to_string();
 
         // Escape special tokens
-        escaped = escaped.replace("<|", "\\<|");
         escaped = escaped.replace("|>", "|\\>");
         escaped = escaped.replace("[INST]", "\\[INST]");
         escaped = escaped.replace("[/INST]", "\\[/INST]");
@@ -328,6 +333,16 @@ mod tests {
         let result = sanitizer.sanitize("Some text <|endoftext|> more text");
         assert!(result.warnings.iter().any(|w| w.pattern == "<|"));
         assert!(result.was_modified); // Critical severity triggers modification
+    }
+
+    #[test]
+    fn special_token_escape_breaks_opener_without_backslash_dependency() {
+        let sanitizer = Sanitizer::new();
+        let output = sanitizer.sanitize("quoted \\<|im_start|> and <|im_end|>");
+        assert!(output.was_modified);
+        assert!(!output.content.contains("<|"));
+        assert!(output.content.contains("\\<\u{200B}|im_start"));
+        assert!(output.content.contains("<\u{200B}|im_end"));
     }
 
     #[test]
