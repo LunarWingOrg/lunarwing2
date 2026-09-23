@@ -409,8 +409,10 @@ already-backslashed role delimiters
   `max_retries`, `initial_delay_secs`, `backoff_multiplier`, `max_delay_secs`).
   Retry state is durable on the failing thread's metadata (`RetryState`), so
   a daemon restart re-arms pending retries after checkpoint recovery.
-  Event/webhook fires release their trigger dedup key on non-completion so an
-  external redelivery can re-fire (at-least-once); a successful retry
+  Event/webhook fires release their trigger dedup key on terminal
+  non-completion (`Failed`/`Stopped`/`MaxIterations`) so an external
+  redelivery can re-fire (at-least-once); a `GatePaused` fire retains its
+  key while awaiting approval, and a successful retry
   re-records the key, restoring dedup. `MaxIterations` is deliberately never
   auto-retried — it is notified with a model-facing suggestion instead.
   Post-landing audit (goal 9, `docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`)
