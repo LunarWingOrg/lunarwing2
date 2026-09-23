@@ -19,7 +19,6 @@ ok() { printf 'PASS: %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf 'FAIL: %s (%s)\n' "$1" "$2"; fail=$((fail + 1)); }
 
 # shellcheck source=../lunarwing-mt-admin.sh
-# shellcheck disable=SC2034  # store/model state is read by the sourced mt-admin functions.
 source "$SCRIPTS_DIR/lunarwing-mt-admin.sh"
 
 # Exercise the real function with store probes stubbed. `admin_id`/`tenant_id`
@@ -30,9 +29,13 @@ source "$SCRIPTS_DIR/lunarwing-mt-admin.sh"
 # directly, but the tenant-store probe goes through `_ctr <tenant> <verb...>` —
 # the tenant name is $1, so the verb check must start at $2 for that stub.
 run_case() {  # <admin_id> <tenant_id> [rootless]
-  ADMIN_ID="$1" TENANT_ID="$2" MT_ROOTLESS="${3:-true}"
+  ADMIN_ID="$1" TENANT_ID="$2"
+  # MT_ROOTLESS and CONTAINER_RT are read by _ensure_tenant_image from the
+  # sourced mt-admin lib, so this file never references them again.
+  # shellcheck disable=SC2034
+  MT_ROOTLESS="${3:-true}"
+  # shellcheck disable=SC2034
   CONTAINER_RT="podman"
-  SAVE_CALLED=false
   RETURNED_RC=0
   SAVE_CALLED_MIRROR=false
   SAVE_MARKER="$(mktemp)"
