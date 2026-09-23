@@ -81,12 +81,14 @@ key for retry; they are never treated as successful rotation.
 2. Starts the **daemon first** — it binds the real Unix socket inside it.
 3. Starts **workers** with:
    ```
-   -v /home/<tenant>/lunarwing/run/ssh-agent:/tmp/ssh-agent \
+   -v /home/<tenant>/lunarwing/run/ssh-agent:/tmp/ssh-agent:ro,z \
    -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
    ```
    Because the mount is the directory (not the socket file), a daemon restart
    that binds a fresh socket inode is picked up at connect time — workers never
-   need recreating after a daemon-only restart.
+   need recreating after a daemon-only restart. Read-only prevents workers
+   from unlinking or replacing the host socket; `:z` preserves shared SELinux
+   access for multiple workers.
 
 ---
 
@@ -353,7 +355,7 @@ pin, so use this reset procedure whenever switching from an explicit pin back to
 | Worker: "agent has no identities" | Same as above — restart the daemon after uploading. |
 | Worker: `SSH_AUTH_SOCK` unset / socket missing | Worker container was created before the socket existed, or the bind-mount is a stale touch-file. Recreate the worker container **after** the daemon is up (mt-admin orders this for you; a plain `restart` may reuse a stale container). |
 | Socket exists but worker can't use it | Permissions: the socket is `0o666`, but its parent `run/ssh-agent` directory (mode 0755) and the run dir must be traversable by the worker's UID. |
-| Worker SSH broke after a daemon-only restart (legacy tenants) | Pre-fix containers bind-mounted the socket **file**, so a daemon restart left them pinned to the dead inode. Re-render the worker (`mt-admin start-tenant <t>` or restart-worker) so it picks up the directory mount; the `ssh-agent-dir` launch contract forces this automatically. |
+| Worker SSH broke after a daemon-only restart (legacy tenants) | Pre-fix containers bind-mounted the socket **file**, so a daemon restart left them pinned to the dead inode. Re-render the worker (`mt-admin start-tenant <t>` or restart-worker) so it picks up the read-only directory mount; the `ssh-agent-dir-ro` launch contract forces this automatically. |
 | `git`/`ssh` prompts about host authenticity (worker mode) | In **worker mode** host-key verification is the worker's own `ssh` client — manage its `known_hosts`, or pin `known_host_key` per host. (The in-process `ssh`/`ssh_git` tools instead use the harness's `HostKeyVerifier`; a Strict host with no known key is *refused*, not prompted.) |
 
 ### Where things live

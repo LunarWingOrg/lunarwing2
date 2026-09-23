@@ -545,9 +545,9 @@ EOF
       # and SSH commands from the worker will fail with a clear "no agent"
       # error). Mounting the directory (not the socket file) means a daemon
       # restart's fresh socket inode is picked up automatically — no worker
-      # recreate needed. :z label so SELinux (Enforcing on Fedora) permits
-      # container_t access to the tenant-home-labeled directory.
-      printf 'Volume=%s:/tmp/ssh-agent:z\n' "$ssh_agent_dir"
+      # recreate needed. :ro prevents workers from unlinking or replacing the
+      # host socket; :z shares its SELinux label across the worker lanes.
+      printf 'Volume=%s:/tmp/ssh-agent:ro,z\n' "$ssh_agent_dir"
       printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock\n'
     fi
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so

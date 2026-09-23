@@ -1120,7 +1120,8 @@ start_tenant_opencode() {
   local name="$1"
   ensure_container_runtime
 
-  local opencode_launch_contract=""
+  # Record the mount policy even for rootful/OpenRC imperative containers.
+  local opencode_launch_contract="ssh-agent-dir-ro"
   local -a opencode_userns_args=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     opencode_launch_contract="$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"
@@ -1274,7 +1275,7 @@ start_tenant_opencode() {
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
     local ssh_agent_dir
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
-    local -a ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
+    local -a ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
@@ -1332,7 +1333,8 @@ start_tenant_opencode2() {
   local name="$1"
   ensure_container_runtime
 
-  local launch_contract=""
+  # Record the mount policy even for rootful/OpenRC imperative containers.
+  local launch_contract="ssh-agent-dir-ro"
   local -a userns_args=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     launch_contract="$OPENCODE2_ROOTLESS_LAUNCH_CONTRACT"
@@ -1457,7 +1459,7 @@ start_tenant_opencode2() {
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
     local ssh_agent_dir
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
-    local -a ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
+    local -a ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
@@ -1886,11 +1888,12 @@ start_tenant_pebble() {
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
     # SSH agent socket (always included — daemon creates it at startup).
     # Directory mount so daemon restarts self-heal (fresh socket inode is
-    # resolved at connect time). :z label for SELinux (Enforcing on Fedora).
+    # resolved at connect time). :ro blocks socket replacement by workers;
+    # :z shares the SELinux label across worker lanes.
     local -a ssh_mount=()
     local ssh_agent_dir
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
-    ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
+    ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \

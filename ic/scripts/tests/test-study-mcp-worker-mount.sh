@@ -158,6 +158,7 @@ ctr_calls="$fixture/container-calls"
 CONTAINER_RT="podman"
 MT_ROOTLESS="true"
 start_tenant_opencode test
+grep -Fq -- "-v $(tenant_run_dir test)/ssh-agent:/tmp/ssh-agent:ro,z" "$ctr_calls"
 grep -Fqx -- "-R test:test $(tenant_lw_root test)/opencode-workspace" "$chown_calls"
 grep -Fq -- "-v $study_home:/opt/lw2studymcp:ro,z" "$ctr_calls"
 grep -Fq -- "-e LW2STUDYMCP_HOME=/opt/lw2studymcp" "$ctr_calls"
@@ -178,6 +179,7 @@ fi
 
 render_worker_quadlet test opencode 8443
 opencode_unit="$(tenant_quadlet_dir test)/lunarwing-opencode-test.container"
+grep -Fq "Volume=$(tenant_run_dir test)/ssh-agent:/tmp/ssh-agent:ro,z" "$opencode_unit"
 grep -Fqx -- "-R test:test $(tenant_lw_root test)/opencode-workspace" "$chown_calls"
 grep -Fq "Volume=$study_home:/opt/lw2studymcp:ro,z" "$opencode_unit"
 grep -Fq "Environment=LW2STUDYMCP_HOME=/opt/lw2studymcp" "$opencode_unit"
