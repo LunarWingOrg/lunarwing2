@@ -66,7 +66,12 @@ command -v jq >/dev/null 2>&1 || _die "jq required"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MT="$SCRIPT_DIR/lunarwing-mt-admin.sh"
 [[ -r "$MT" ]] || _die "mt-admin not found at $MT"
-grep -q 'ensure_health_pipeline()' "$MT" || _die "mt-admin at $MT has no ensure_health_pipeline (too old?)"
+# The function lives in the mt-admin-lib module the dispatcher sources, not in
+# the dispatcher itself (see the module map at the top of $MT): searching only
+# $MT fails on every current tree and made this installer unrunnable.
+{ grep -q 'ensure_health_pipeline()' "$MT" \
+    || grep -rq 'ensure_health_pipeline()' "$SCRIPT_DIR/mt-admin-lib/"; } \
+  || _die "mt-admin at $MT has no ensure_health_pipeline (too old?)"
 
 # Seed Gotify creds via the env vars mt-admin reads (only used when writing a fresh
 # health.env; an existing file is preserved). Export BEFORE sourcing.

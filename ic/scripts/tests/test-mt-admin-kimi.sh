@@ -65,6 +65,10 @@ ports_get() {
     kimi_health) printf '12002\n' ;;
     opencode_wss) printf '11001\n' ;;
     opencode_health) printf '11002\n' ;;
+    opencode2_wss) printf '13001\n' ;;
+    opencode2_health) printf '13002\n' ;;
+    pebble_wss) printf '14001\n' ;;
+    pebble_health) printf '14002\n' ;;
   esac
 }
 MT_ROOTLESS=true
@@ -77,16 +81,27 @@ assert_contains "$quadlet" "EnvironmentFile=$fixture/env/kimi-runtime.env" 'syst
 assert_not_contains "$quadlet" 'ssh-agent.sock' 'systemd Kimi quadlet has no SSH agent mount (WI#206)'
 assert_not_contains "$quadlet" 'SSH_AUTH_SOCK' 'systemd Kimi quadlet has no SSH_AUTH_SOCK env (WI#206)'
 assert_contains "$quadlet" 'SecurityOpt=no-new-privileges' 'systemd Kimi quadlet sets no-new-privileges (WI#206)'
-# The failure-callback lane keeps the mount: render opencode and confirm it is
-# the DIRECTORY mount (stale-inode fix), not the legacy socket-file mount.
-render_worker_quadlet root opencode 8443
-opencode_quadlet="$fixture/quadlets/lunarwing-opencode-root.container"
-assert_contains "$opencode_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:z' \
-  'opencode quadlet mounts the ssh-agent DIRECTORY (stale-inode fix)'
-assert_contains "$opencode_quadlet" 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' \
-  'opencode quadlet points SSH_AUTH_SOCK inside the mounted directory'
-assert_not_contains "$opencode_quadlet" 'ssh-agent.sock:z' \
-  'opencode quadlet no longer mounts the socket FILE'
+# Non-kimi lanes mount only the socket directory (restart-safe), read-only so
+# a compromised worker cannot unlink/rebind the host agent socket (WI#226).
+for lane in opencode opencode2 pebble; do
+  render_worker_quadlet root "$lane" 8443
+  worker_quadlet="$fixture/quadlets/lunarwing-${lane}-root.container"
+  assert_contains "$worker_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:ro,z' \
+    "$lane quadlet mounts the ssh-agent directory read-only"
+  assert_contains "$worker_quadlet" 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' \
+    "$lane quadlet points SSH_AUTH_SOCK inside the mounted directory"
+  assert_not_contains "$worker_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:z' \
+    "$lane quadlet does not mount the agent directory read-write"
+done
+# Quadlet's full-file hash must also notice the mount policy change.
+legacy_quadlet="$fixture/quadlets/legacy-rw.container"
+sed 's#ssh-agent:ro,z#ssh-agent:z#' "$worker_quadlet" > "$legacy_quadlet"
+_store_container_hash root old-quadlet "$legacy_quadlet"
+if _container_config_changed root old-quadlet "$worker_quadlet"; then
+  pass 'quadlet legacy RW mount triggers recreation'
+else
+  fail 'quadlet legacy RW mount survived config check'
+fi
 render_worker_quadlet root kimi 8443
 minted="$(sed -n 's/^WORKER_AUTH_TOKEN=//p' "$env_file" | tail -1)"
 if [[ -n "$minted" && "$minted" != "gate%token" ]]; then
@@ -274,15 +289,15 @@ if grep -Fq -- '--security-opt no-new-privileges' <<<"$KIMI_BLOCK"; then
 else
   fail 'kimi imperative launch missing no-new-privileges (WI#206)'
 fi
-# The non-kimi imperative lanes must mount the ssh-agent DIRECTORY (not the
-# socket file) so daemon restarts self-heal the stale-inode defect.
+# The non-kimi imperative lanes mount the directory read-only, preserving
+# daemon restart recovery while blocking worker-side socket replacement.
 for lane in opencode opencode2 pebble; do
   LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
-  if grep -Fq -- '-v "${ssh_agent_dir}:/tmp/ssh-agent:z"' <<<"$LANE_BLOCK" \
+  if grep -Fq -- '-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z"' <<<"$LANE_BLOCK" \
     && grep -Fq -- 'SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' <<<"$LANE_BLOCK"; then
-    pass "$lane imperative launch mounts the ssh-agent directory"
+    pass "$lane imperative launch mounts the ssh-agent directory read-only"
   else
-    fail "$lane imperative launch missing the ssh-agent directory mount"
+    fail "$lane imperative launch missing the read-only ssh-agent directory mount"
   fi
 done
 # The launch contract must carry the policy change so existing containers
@@ -290,14 +305,37 @@ done
 ROOT_SCRIPT="$(dirname "$MT_ADMIN")/lunarwing-mt-admin.sh"
 assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges"' \
   'kimi launch contract records the WI#206 policy change'
-# The non-kimi lanes record the directory-mount switch (stale-inode fix) so
-# existing containers force-recreate off the legacy socket-file mount.
-assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir"' \
-  'opencode launch contract records the ssh-agent directory mount'
-assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir"' \
-  'opencode2 launch contract records the ssh-agent directory mount'
-assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir"' \
-  'pebble launch contract records the ssh-agent directory mount'
+# Contract changes recreate old RW-mount containers on rootless AND rootful
+# imperative lanes. Quadlet recreations hash the rendered Volume= line.
+assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro"' \
+  'opencode rootless launch contract records the read-only SSH mount'
+assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"' \
+  'opencode2 rootless launch contract records the read-only SSH mount'
+assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"' \
+  'pebble launch contract records the read-only SSH mount'
+assert_contains "$WORKER_LIB" 'local opencode_launch_contract="ssh-agent-dir-ro"' \
+  'rootful opencode includes the SSH mount in its launch contract'
+assert_contains "$WORKER_LIB" 'local launch_contract="ssh-agent-dir-ro"' \
+  'rootful opencode2 includes the SSH mount in its launch contract'
+
+_store_container_hash root old-rootless "$env_file" "userns=${OPENCODE_USERNS};ssh-agent-dir"
+if _container_config_changed root old-rootless "$env_file" "$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"; then
+  pass 'rootless legacy RW mount triggers recreation'
+else
+  fail 'rootless legacy RW mount survived config check'
+fi
+_store_container_hash root old-rootless "$env_file" "$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"
+if _container_config_changed root old-rootless "$env_file" "$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"; then
+  fail 'rootless read-only mount triggers unnecessary recreation'
+else
+  pass 'rootless read-only mount has stable config hash'
+fi
+_store_container_hash root old-rootful "$env_file"
+if _container_config_changed root old-rootful "$env_file" 'ssh-agent-dir-ro'; then
+  pass 'rootful legacy RW mount triggers recreation'
+else
+  fail 'rootful legacy RW mount survived config check'
+fi
 # The baked worker policy (WI#206): guard back on + PreToolUse hook shipped.
 KIMI_CONFIG="$LUNARWING_ROOT/kimicode4lunarwing/config/config.toml"
 assert_contains "$KIMI_CONFIG" 'dangerous_command_guard = true' \

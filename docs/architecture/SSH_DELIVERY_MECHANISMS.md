@@ -59,10 +59,12 @@ signing capability via the socket.
 implementation in `mt-admin-lib/04-tenant-lifecycle.sh` and
 `mt-admin-lib/09-worker-config.sh`): it
 pre-creates the socket directory, starts the daemon (which binds the real
-socket inside it), then starts workers with `-v <run_dir>/ssh-agent:/tmp/ssh-agent:z
+socket inside it), then starts workers with `-v <run_dir>/ssh-agent:/tmp/ssh-agent:ro,z
 -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock`. `<run_dir>` is
 `/home/<tenant>/lunarwing/run`. The directory mount means a daemon restart's
 fresh socket inode is picked up at connect time — no worker recreate needed.
+Read-only prevents a worker from unlinking/replacing the host socket while
+preserving connections to the socket inode.
 Nothing for the operator to do beyond provisioning the host + key (see the ops
 guide).
 
