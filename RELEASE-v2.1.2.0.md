@@ -843,6 +843,13 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
     (was 10), and interrupted mission fires retry automatically with
     exponential backoff (3 retries default; `max_retries=0` opts out per
     mission). Tenants with explicit `max_threads_per_day` are unaffected.
+16. **mt-admin worker stops now target the systemd unit.** On systemd +
+    rootless hosts, `stop-worker`/`stop` for the kimi, opencode, opencode2,
+    and postgres containers stop the owning Quadlet user unit first —
+    previously a bare container stop could be resurrected by the unit's
+    `Restart=on-failure`, leaving a worker running after a stop/upgrade.
+    No operator action is needed beyond the normal mt-admin update; the
+    behavior converges on the next lifecycle pass.
 
 ### Security, Deployment, and Release Limitations (carried)
 
