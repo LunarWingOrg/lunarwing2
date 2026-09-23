@@ -374,6 +374,25 @@ first model call of every thread — an ordering a mission trigger cannot
 satisfy. WI#126 was re-verified (fleet remains terminal-event-driven);
 WI#163, a re-file, was reverified with no code change.
 
+### Sanitizer Role-Token Neutralization Hardening (goal 39)
+
+The legacy sanitizer (`ic/crates/lunarwing_safety/src/sanitizer.rs`) had a
+gap the source audit called out: its critical-only escape prepended a
+backslash before `<|`, leaving the special-token opener intact for
+chat-template tokenizers, and role-token neutralization was gated on
+scanner severity. `Sanitizer::sanitize` now runs
+`neutralize_role_token_openers` unconditionally — a zero-width space (U+200B)
+is inserted after `<` in every `<|` opener independently of detection
+severity — and `SafetyLayer::sanitize_tool_output` applies the same
+neutralizer even when injection scanning is disabled, with `was_modified`
+accurately reflecting either transformation. This is defense in depth on
+top of the existing prompt sinks (e.g. the rig adapter and provider), which
+already neutralized role-token openers. Note for byte-for-byte consumers:
+token openers in returned tool text now carry U+200B; the raw tool response
+is unchanged. Regression tests cover both injection-scan settings and
+already-backslashed role delimiters
+(`docs/ops/2.1.2_FINDINGS.md`).
+
 ### Mission Reliability: Retry, Budget, and Honest Parameters (work items #188, #189, #203; goals 22, 29, 31, 38)
 
 - **Retry with exponential backoff (WI#188).** An interrupted (signal-stopped)
