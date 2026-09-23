@@ -527,15 +527,38 @@ The OpenCode v2 lane is a full first-class worker:
   instead of exit 0; `--yolo` still rejected alongside `-p`; seeded minimal
   config so model resolution succeeds in clean image builds).
 - **Headless permission contract (WI#195, goal 10).** The worker's default
-  permission mode moved yolo → auto with a new
-  `[permission] dangerous_command_guard = false`; both entrypoint modes
-  export `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (operator-overridable) so
-  headless `-p` runs no longer stall on interactive prompts. A real-CLI
-  contract test lane (`scripts/kimi_cli_contract_test.ts`) executes the
-  installed kimi binary — asserting `-p --output-format stream-json` is
-  accepted and `--yolo` is rejected — and the Dockerfile runs that lane
-  against the pinned version post-`npm test`. Unknown stream-json roles are
-  warn-logged instead of silently dropped.
+  permission mode moved yolo → auto and both entrypoint modes export
+  `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (operator-overridable) so headless
+  `-p` runs no longer stall on interactive prompts. A real-CLI contract test
+  lane (`scripts/kimi_cli_contract_test.ts`) executes the installed kimi
+  binary — asserting `-p --output-format stream-json` is accepted and
+  `--yolo` is rejected — and the Dockerfile runs that lane against the
+  pinned version post-`npm test`. Unknown stream-json roles are warn-logged
+  instead of silently dropped.
+- **Fail-closed headless command guard (WI#206, goal 36).** Empirical
+  verification against the pinned CLI (2.0.2) showed that print mode forces
+  the auto permission policy, that the upstream dangerous-command guard is
+  skipped entirely in auto mode, and that `[[permission.rules]]` never load
+  from config — so auto-approve meant no approval boundary at all. The
+  worker now ships a baked `PreToolUse` Bash guard
+  (`hooks/headless_command_guard.mjs`, wired via `[[hooks]]` in
+  `config.toml`) that denies privilege escalation, power/disk destruction,
+  fork bombs, remote-content-piped-to-shell, recursive chmod/chown on
+  system roots, block-device writes, SSH-agent socket use, and recursive or
+  forced `rm` outside temp roots; unparseable payloads deny. `config.toml`
+  keeps `dangerous_command_guard = true` so a future upstream change fails
+  closed, the entrypoint re-injects guard+hook into any operator-supplied
+  `KIMI_CONFIG_SOURCE` that lacks them (and unsets
+  `KIMI_CODE_DANGEROUS_COMMAND_GUARD`), the task executor scrubs
+  guard-disabling env vars from per-task environments, and `/app/config` +
+  `/app/hooks` are read-only to the runtime user so a task cannot edit its
+  own guard. mt-admin no longer mounts the tenant SSH-agent socket into the
+  kimi lane (both launch paths), adds `--security-opt no-new-privileges`,
+  and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing containers
+  force-recreate; other worker lanes keep the socket. Verified live on
+  2.0.2: `sudo`, `shutdown`, `curl … | sh`, and `rm -rf` of non-temp paths
+  deny in ~3s with an explicit reason while ordinary builds and tests run
+  unchanged.
 - opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` → `v2.0.14` at reviewed commit
   `08462140ec0de1e4b17d4a353d8d5827f53cf7b0` (tag SHA verified against both
   upstream remotes; upstream build script byte-identical between refs, so
