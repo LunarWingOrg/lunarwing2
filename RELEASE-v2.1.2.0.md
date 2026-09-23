@@ -675,6 +675,20 @@ see `project`/`title`/etc. without needing the tool_info hint. Registry
 to move when tool sources change — hence the 0.1.5 bump rather than a no-op
 realigned 0.1.4.
 
+### GitLab WASM Always-Allow Grants Unified (goal 13)
+
+"Always allow" for the GitLab WASM tool did not work in all cases: the
+persisted permission key was written as `gitlab_tool` in some paths and
+`gitlab-tool` in others, so a grant recorded under one spelling was not
+honored when the tool registered under the other (across both legacy chat
+and Engine V2). Both paths now share one canonical key while still reading
+historical grants under either spelling — including session-only mode —
+and an independently registered tool with the colliding name can no longer
+inherit a grant meant for the GitLab tool. Diagnosis, security boundaries,
+and live-tenant acceptance steps are in
+`docs/ops/v2.1.2.0_GOAL13_GITLAB_ALWAYS_ALLOW.md`. Live-tenant
+confirmation of the installed GitLab WASM tool remains for the operator.
+
 ### Approval Delivery and Gate Recovery (work item #164)
 
 Authenticated pending-gate recovery with race-safe browser reconciliation;
@@ -914,7 +928,9 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - Fresh tenants receive only the seven product skills, not contributor
   workflows (WI#185).
 - GitLab WASM tool no longer collapses to the bare `action` discriminator
-  under schema compaction (WI#150).
+  under schema compaction (WI#150), and its "always allow" grants now work
+  across both permission-key spellings in legacy chat and Engine V2
+  (goal 13).
 - Health pipeline: eight WI#180 findings plus six review findings fixed;
   runtime/knowledge are monitor-only diagnostics that escalate without
   restarts (WI#180).
