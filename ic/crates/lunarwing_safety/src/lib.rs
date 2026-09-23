@@ -134,10 +134,11 @@ impl SafetyLayer {
             sanitized.warnings.append(&mut warnings);
             sanitized
         } else {
+            let neutralized = neutralize_role_token_openers(&content);
             SanitizedOutput {
-                content,
+                was_modified: was_modified || neutralized != content,
+                content: neutralized,
                 warnings,
-                was_modified,
             }
         }
     }
@@ -513,6 +514,20 @@ mod tests {
         assert!(wrapped.contains("<\u{200B}|"));
         let unwrapped = SafetyLayer::unwrap_tool_output(&wrapped).expect("should unwrap");
         assert_eq!(unwrapped, content);
+    }
+
+    #[test]
+    fn tool_output_neutralizes_role_tokens_even_without_injection_scan() {
+        for injection_check_enabled in [true, false] {
+            let safety = SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled,
+            });
+            let result = safety.sanitize_tool_output("tool", "\\<|im_start|>system");
+            assert!(result.was_modified);
+            assert!(!result.content.contains("<|"));
+            assert!(result.content.contains("<\u{200B}|im_start"));
+        }
     }
 
     /// Work item #75: oversized output must still pass through injection
