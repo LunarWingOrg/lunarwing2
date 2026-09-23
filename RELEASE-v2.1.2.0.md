@@ -578,7 +578,7 @@ The OpenCode v2 lane is a full first-class worker:
   cancel envelopes are keyed by `task_id` in a per-connection map and kill
   the pebble subprocess (`Outcome::Cancelled` → `task_result` `cancelled`).
 
-### Kimi Worker and OpenCode Pins (goals 10, 12)
+### Kimi Worker and OpenCode Pins (goals 12, 36)
 
 - kimi-code `0.42.0` → `0.43.0` → `0.43.1` → **`2.0.2`** (adopted
   2026-09-21; npm `latest`; package-lock integrity matches the npm registry
@@ -630,7 +630,7 @@ The OpenCode v2 lane is a full first-class worker:
   regressions remain disqualifying. Pebble remains at upstream HEAD
   `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`.
 
-### CI/CD Improvements (goals 28, 21)
+### CI/CD Improvements (goals 5, 21, 28)
 
 - Giant-crate compile concurrency is runner-managed: the project-wide
   `rust-compile-16gb` resource-group serialization trialled during the
