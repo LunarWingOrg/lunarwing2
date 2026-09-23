@@ -16,8 +16,10 @@ verification, see the operator guide linked above.
 
 ## 1. What it is
 
-The SSH Agent harness gives LunarWing worker containers (Pebble, OpenCode, Kimi
-Code, and OpenCode 2) a signing socket and gives interactive chat the built-in `ssh`,
+The SSH Agent harness gives LunarWing worker containers (Pebble, OpenCode, and
+OpenCode 2; the Kimi Code lane no longer mounts the socket — WI#206 removed it
+because a headless auto-approved executor must not hold host credentials) a
+signing socket and gives interactive chat the built-in `ssh`,
 `ssh_git`, and WASM `ssh` delivery paths. `ssh`, `ssh_git`, and `create_job` are
 excluded from autonomous jobs and routines; the harness does not make direct SSH
 an autonomous routine capability.
