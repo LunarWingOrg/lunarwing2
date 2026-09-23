@@ -176,6 +176,70 @@ else
   fail "Pebble Quadlet tenant bounce recovery"
 fi
 
+# Goal #10: kimi/opencode/opencode2 stop paths must prefer their Quadlet
+# systemd unit on systemd+rootless, with a container fallback when the unit
+# stop fails — the same contract WI#128 gave pebble. A bare container stop
+# under an active unit would be resurrected by Restart=on-failure.
+test_worker_quadlet_stop_parity() (
+  local worker unit_stop_seen container_stop_seen call
+
+  ensure_container_runtime() {
+    CONTAINER_RT="podman"
+    MT_ROOTLESS="true"
+  }
+  ensure_init_system() { INIT_SYSTEM="systemd"; }
+  _systemctl_user() {
+    CALLS+=("systemctl:$*")
+    [[ "$systemctl_stop_fails" != "true" || "${2:-}" != "stop" ]]
+  }
+  _ctr() {
+    CALLS+=("ctr:$*")
+    return 0
+  }
+
+  for worker in kimi opencode opencode2; do
+    systemctl_stop_fails="false"
+    unit_stop_seen="false"
+    container_stop_seen="false"
+    CALLS=()
+    "stop_tenant_${worker}" alice
+    for call in "${CALLS[@]}"; do
+      [[ "$call" == "systemctl:alice stop lunarwing-${worker}-alice.service" ]] \
+        && unit_stop_seen="true"
+      [[ "$call" == "ctr:alice stop lunarwing-${worker}-alice" ]] \
+        && container_stop_seen="true"
+    done
+    if [[ "$unit_stop_seen" != "true" || "$container_stop_seen" == "true" ]]; then
+      printf '%s Quadlet stop did not prefer its systemd unit\n' "$worker" >&2
+      return 1
+    fi
+
+    # Unit stop failing must fall back to the container stop, never leave the
+    # worker running under a live unit.
+    systemctl_stop_fails="true"
+    unit_stop_seen="false"
+    container_stop_seen="false"
+    CALLS=()
+    "stop_tenant_${worker}" alice
+    for call in "${CALLS[@]}"; do
+      [[ "$call" == "systemctl:alice stop lunarwing-${worker}-alice.service" ]] \
+        && unit_stop_seen="true"
+      [[ "$call" == "ctr:alice stop lunarwing-${worker}-alice" ]] \
+        && container_stop_seen="true"
+    done
+    if [[ "$unit_stop_seen" != "true" || "$container_stop_seen" != "true" ]]; then
+      printf '%s Quadlet stop omitted the container fallback\n' "$worker" >&2
+      return 1
+    fi
+  done
+)
+
+if test_worker_quadlet_stop_parity; then
+  printf 'PASS: worker Quadlet stop parity (kimi/opencode/opencode2)\n'
+else
+  fail "worker Quadlet stop parity (kimi/opencode/opencode2)"
+fi
+
 # Override consumed by sourced stop_tenant dispatcher.
 # shellcheck disable=SC2034
 INIT_SYSTEM="openrc"

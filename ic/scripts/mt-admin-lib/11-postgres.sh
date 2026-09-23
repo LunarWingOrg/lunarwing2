@@ -184,6 +184,15 @@ stop_tenant_postgres() {
   ensure_container_runtime
 
   local container_name="lunarwing-pg-$name"
+  ensure_init_system
+  # Quadlet owns the container on systemd+rootless: stop the unit first, or
+  # Restart=on-failure resurrects the container mid-shutdown (goal #10). The
+  # container fallback covers a unit that is not loaded/active.
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 \
+      || _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+  fi
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "PostgreSQL stopped ($container_name)"

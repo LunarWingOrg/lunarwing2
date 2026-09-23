@@ -738,7 +738,12 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     preflight.push((tc, PreflightOutcome::Rejected(reject_msg)));
                     continue;
                 }
-                let allow_always = tool.allows_always_approval(&tc.arguments);
+                let allow_always = tool.allows_always_approval(&tc.arguments)
+                    && !(matches!(tc.name.as_str(), "gitlab_tool" | "gitlab-tool")
+                        && crate::tools::permissions::gitlab_permission_alias_conflict(
+                            &self.agent.deps.tools,
+                        )
+                        .await);
                 let session_auto_approved = if allow_always {
                     self.agent
                         .has_tool_always_grant(&self.session, &tc.name)
