@@ -16,7 +16,7 @@
 
 LunarWing v2.1.2.0 is an isolation, sandboxing, worker-contract, health
 system, and confabulation-hardening release — the largest goals checklist in
-the project's history at fifty-four items, worked by the widest herd yet. Its
+the project's history at fifty-nine items, worked by the widest herd yet. Its
 headline work is the generic Podman-first agent-shell sandbox: daemonless
 per-command execution with fail-closed defaults, daemon-socket-free operation
 (works rootless and on OpenRC), non-root UID mapping, all capabilities
@@ -536,7 +536,7 @@ All eight findings addressed, then all six review findings:
 - Verified: `tests/run-all.sh` 926 passed / 0 failed across all 19 suites;
   repo-wide ShellCheck exit 0.
 
-### External Workers: opencode2 Lane (goals 13, 17, 21)
+### External Workers: opencode2 Lane (goals 21, 43)
 
 The OpenCode v2 lane is a full first-class worker:
 
@@ -554,7 +554,7 @@ The OpenCode v2 lane is a full first-class worker:
   gained the opencode2 case; `validate_config.py` and
   `promote-worker-image.py` guard the lane.
 - Pin history this cycle: v2.0.4 → v2.0.5 (goal 21/MR !988) → v2.0.8
-  (goal 13) → v2.0.14 (goal 13), tag SHA-verified against both upstream
+  → v2.0.14, tag SHA-verified against both upstream
   remotes; upstream bridge-relevant SDK files confirmed unchanged between refs.
 
 ### Pebble Worker Hardening (goals 17, 20, work items #101, #149)
@@ -572,7 +572,7 @@ The OpenCode v2 lane is a full first-class worker:
   cancel envelopes are keyed by `task_id` in a per-connection map and kill
   the pebble subprocess (`Outcome::Cancelled` → `task_result` `cancelled`).
 
-### Kimi Worker and OpenCode Pins (goals 10, 12, 13)
+### Kimi Worker and OpenCode Pins (goals 10, 12)
 
 - kimi-code `0.42.0` → `0.43.0` → `0.43.1` → **`2.0.2`** (adopted
   2026-09-21; npm `latest`; package-lock integrity matches the npm registry
@@ -582,7 +582,7 @@ The OpenCode v2 lane is a full first-class worker:
   contract test for 2.x behavior (provider-connection retries with backoff
   instead of exit 0; `--yolo` still rejected alongside `-p`; seeded minimal
   config so model resolution succeeds in clean image builds).
-- **Headless permission contract (WI#195, goal 10).** The worker's default
+- **Headless permission contract (WI#195).** The worker's default
   permission mode moved yolo → auto and both entrypoint modes export
   `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (operator-overridable) so headless
   `-p` runs no longer stall on interactive prompts. A real-CLI contract test
@@ -675,7 +675,7 @@ see `project`/`title`/etc. without needing the tool_info hint. Registry
 to move when tool sources change — hence the 0.1.5 bump rather than a no-op
 realigned 0.1.4.
 
-### Approval Delivery and Gate Recovery (goal 31, work item #164)
+### Approval Delivery and Gate Recovery (work item #164)
 
 Authenticated pending-gate recovery with race-safe browser reconciliation;
 resolved auto-approve configuration with legacy env alias/diagnostics;
@@ -709,8 +709,23 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   on the next lifecycle pass. The kimi mt-admin harness derives the pinned
   CLI version instead of hard-coding it, so pin bumps can no longer leave
   the assertion stale.
+- **Worker stop now goes through the owning systemd unit (goal 10).** On
+  systemd + rootless hosts, `stop_tenant_kimi` stops the Quadlet
+  `lunarwing-kimi-<t>.service` user unit first (with a container-stop
+  fallback) instead of stopping the container directly — a bare container
+  stop under a live unit is resurrected by the quadlet's `Restart=on-failure`,
+  so stop-tenant/upgrade-tenant could previously leave the kimi worker
+  running. This is the WI#128 pebble contract applied to kimi. A parity
+  sweep found the identical gap in `stop_tenant_opencode`,
+  `stop_tenant_opencode2`, and `stop_tenant_postgres` (its quadlet has
+  `Restart=on-failure` too); all received the same unit-first branch.
+  Vision/voice sidecars and the full-tenant path already stopped their
+  units first. Regression coverage:
+  `test_worker_quadlet_stop_parity` in
+  `ic/scripts/tests/test-mt-admin-worker-lifecycle.sh` asserts unit-first
+  stop + container fallback for kimi/opencode/opencode2.
 
-### Documentation Parity (goals 38, 42, 43, 45, 46, 47, 49)
+### Documentation Parity (goals 41, 45, 46, 48, 49, 50, 52)
 
 - All 31 current guides revalidated against the 2.1.2.0 tree;
   `MT-ADMIN-QUICKSTART` gained `fix-podman-userns`; `ENABLING_DEV_TOOLS`
@@ -724,7 +739,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - `MULTITENANCY-PRODUCTION` port blocks now cover the v15 LunarVoice, v16
   health_metrics, and v17 opencode2 blocks; `TENANT-CONFIGURATION` registry
   schema corrected to v17.
-- Goal 47 (guides repass) and goal 49 (architecture repass) revalidated all
+- Goal 50 (guides repass) and goal 52 (architecture repass) revalidated all
   current docs against the WI#179/181/180/154/155 hardening and worker-pin
   changes; `TESTING_GUIDE` gained the three sandbox network modes and the
   opencode2 worker lane; `MT-ADMIN-QUICKSTART` gained
@@ -733,7 +748,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   WI#206: the kimi lane no longer mounts the agent socket);
   `SELF_HEAL_*` docs
   carry the WI#180 parity subsections.
-- Goal 46 (open work items audit repass, 2026-09-22) re-queried the live
+- Goal 49 (open work items audit repass, 2026-09-22) re-queried the live
   tracker — every open item's body and full comment thread — and rewrote
   `docs/ops/v2.1.2.0_OPEN_WORK_ITEMS_STATUS.md` with the 27-item
   disposition table; all fourteen items from the 09-14 audit are closed.
@@ -820,7 +835,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - WI#155's `proxy-enforced` mode is implemented and gated; live docker-
   runtime e2e was not run on the dev VM (no docker). The acceptance file
   carries the exact commands for a runtime host.
-- Live release acceptance remains for goal 31 (WI#164 approval delivery) and
+- Live release acceptance remains for WI#164 (approval delivery) and
   goal 34 (WI#161 REPL argument integrity) fresh-tenant threads; evidence
   and limits are in their linked ops records. Goal 33's live acceptance
   (WI#162 shell truncation on fresh tenant `wi162verify`) completed
