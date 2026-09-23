@@ -2,7 +2,7 @@
 
 ## Codename: Yoroi (鎧, armor)
 
-**Release date** 2026-09-22
+**Release date** 2026-09-23
 
 > After the lacing, the plates
 >
@@ -16,7 +16,7 @@
 
 LunarWing v2.1.2.0 is an isolation, sandboxing, worker-contract, health
 system, and confabulation-hardening release — the largest goals checklist in
-the project's history at fifty items, worked by the widest herd yet. Its
+the project's history at fifty-four items, worked by the widest herd yet. Its
 headline work is the generic Podman-first agent-shell sandbox: daemonless
 per-command execution with fail-closed defaults, daemon-socket-free operation
 (works rootless and on OpenRC), non-root UID mapping, all capabilities
@@ -40,7 +40,8 @@ lane (v2 line, pinned at v2.0.14 on a reviewed upstream commit) with a
 reproducible-build bridge over the `@opencode/client/promise` SDK, full
 mt-admin mirroring, CI/CD publication jobs, and its own ports-registry v17
 block; the kimi worker moved to the 2.x line (`2.0.2`) with a headless-safe
-permission contract and a deterministic CLI contract gate. The Pebble
+permission contract, a fail-closed PreToolUse command guard (work item #206),
+and a deterministic CLI contract gate. The Pebble
 worker confines daemon-supplied project directories to the
 workspace root and keeps its WebSocket read loop live so mid-task cancels
 finally land. Session secrets are scrubbed from sandboxed and direct
@@ -119,6 +120,17 @@ previous compatibility baseline.
   digest-bound reproducible contract. Pinned at `v2.0.14` on reviewed
   upstream commit `08462140ec0de1e4b17d4a353d8d5827f53cf7b0`; the v1 lane
   stays pinned at proven `v1.18.25` and remains the default.
+- **Kimi worker fail-closed headless policy (WI#206).** The pinned CLI's
+  print mode auto-approves commands and skips the upstream dangerous-command
+  guard, so the worker now enforces its own baked `PreToolUse` Bash guard —
+  privilege escalation, power/disk destruction, fork bombs,
+  curl-pipe-shell, recursive chmod/chown on system roots, block-device
+  writes, SSH-agent use, and `rm -rf` outside temp roots are denied with an
+  explicit reason; unparseable input denies. The guard config is
+  read-only in-container, re-injected over operator config overrides, and
+  its env-var bypass is scrubbed from every task environment. The tenant
+  SSH-agent socket is no longer mounted into the kimi lane and containers
+  run with `no-new-privileges`.
 - **Pebble worker confinement and live cancellation.** The Pebble worker
   now resolves and confines `project_dir` to the workspace root before
   dispatch (kimi's `resolveWorkspacePath` ported to Rust, with a
@@ -208,6 +220,7 @@ previous compatibility baseline.
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; no external version changed, so the vendor snapshot regenerated with no diff |
 | Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `2.0.2` (adopted 2026-09-21 after the 2.x line proved out); opencode2 `v2.0.14` at `08462140ec0de1e4b17d4a353d8d5827f53cf7b0`; pebble at upstream HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` |
 | Sandbox default | `SANDBOX_NETWORK=none` is the in-code and mt-admin-rendered default; podman is the preferred runtime (`SANDBOX_RUNTIME`) |
+| Kimi worker lane | No longer mounts the tenant SSH-agent socket and runs with `no-new-privileges` (WI#206); the fail-closed `PreToolUse` command guard is baked into the image |
 | Worker image publication | Digest-bound reproducible candidates/promotions for kimi, pebble, opencode, and opencode2 |
 | ShellCheck floor | 0.11.0 (checksum-pinned installer; CI gate remains blocking) |
 | Bundled skills | Exactly seven product skills ship to fresh tenants: cavepony, delegation, lunarwing-workflow-orchestrator, multica-poll, plan-mode, routine-advisor, study-notes (WI#185; three contributor-dev skills removed from the embedded catalog) |
@@ -377,6 +390,12 @@ WI#163, a re-file, was reverified with no code change.
   external redelivery can re-fire (at-least-once); a successful retry
   re-records the key, restoring dedup. `MaxIterations` is deliberately never
   auto-retried — it is notified with a model-facing suggestion instead.
+  Post-landing audit (goal 9, `docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`)
+  flagged two HIGH follow-ups that remain open and are carried in the
+  limitations section: the retry re-fire path still injects a
+  `retry_attempt` key into the trigger payload (F1), and the at-least-once
+  dedup release is not scoped — a `GatePaused` outcome also releases the
+  key, so an event redelivery during an approval window can double-fire (F2).
 - **Daily thread budget default 10 → 30 (WI#189).** An hourly mission
   without an explicit `max_threads_per_day` now covers a full 24-hour day
   plus retry headroom instead of going dark after ten hours. Retry respawns
@@ -527,15 +546,38 @@ The OpenCode v2 lane is a full first-class worker:
   instead of exit 0; `--yolo` still rejected alongside `-p`; seeded minimal
   config so model resolution succeeds in clean image builds).
 - **Headless permission contract (WI#195, goal 10).** The worker's default
-  permission mode moved yolo → auto with a new
-  `[permission] dangerous_command_guard = false`; both entrypoint modes
-  export `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (operator-overridable) so
-  headless `-p` runs no longer stall on interactive prompts. A real-CLI
-  contract test lane (`scripts/kimi_cli_contract_test.ts`) executes the
-  installed kimi binary — asserting `-p --output-format stream-json` is
-  accepted and `--yolo` is rejected — and the Dockerfile runs that lane
-  against the pinned version post-`npm test`. Unknown stream-json roles are
-  warn-logged instead of silently dropped.
+  permission mode moved yolo → auto and both entrypoint modes export
+  `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (operator-overridable) so headless
+  `-p` runs no longer stall on interactive prompts. A real-CLI contract test
+  lane (`scripts/kimi_cli_contract_test.ts`) executes the installed kimi
+  binary — asserting `-p --output-format stream-json` is accepted and
+  `--yolo` is rejected — and the Dockerfile runs that lane against the
+  pinned version post-`npm test`. Unknown stream-json roles are warn-logged
+  instead of silently dropped.
+- **Fail-closed headless command guard (WI#206, goal 36).** Empirical
+  verification against the pinned CLI (2.0.2) showed that print mode forces
+  the auto permission policy, that the upstream dangerous-command guard is
+  skipped entirely in auto mode, and that `[[permission.rules]]` never load
+  from config — so auto-approve meant no approval boundary at all. The
+  worker now ships a baked `PreToolUse` Bash guard
+  (`hooks/headless_command_guard.mjs`, wired via `[[hooks]]` in
+  `config.toml`) that denies privilege escalation, power/disk destruction,
+  fork bombs, remote-content-piped-to-shell, recursive chmod/chown on
+  system roots, block-device writes, SSH-agent socket use, and recursive or
+  forced `rm` outside temp roots; unparseable payloads deny. `config.toml`
+  keeps `dangerous_command_guard = true` so a future upstream change fails
+  closed, the entrypoint re-injects guard+hook into any operator-supplied
+  `KIMI_CONFIG_SOURCE` that lacks them (and unsets
+  `KIMI_CODE_DANGEROUS_COMMAND_GUARD`), the task executor scrubs
+  guard-disabling env vars from per-task environments, and `/app/config` +
+  `/app/hooks` are read-only to the runtime user so a task cannot edit its
+  own guard. mt-admin no longer mounts the tenant SSH-agent socket into the
+  kimi lane (both launch paths), adds `--security-opt no-new-privileges`,
+  and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing containers
+  force-recreate; other worker lanes keep the socket. Verified live on
+  2.0.2: `sudo`, `shutdown`, `curl … | sh`, and `rm -rf` of non-temp paths
+  deny in ~3s with an explicit reason while ordinary builds and tests run
+  unchanged.
 - opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` → `v2.0.14` at reviewed commit
   `08462140ec0de1e4b17d4a353d8d5827f53cf7b0` (tag SHA verified against both
   upstream remotes; upstream build script byte-identical between refs, so
@@ -561,6 +603,13 @@ The OpenCode v2 lane is a full first-class worker:
 - ShellCheck floor raised to 0.11.0 via a checksum-pinned installer
   (`.gitlab/scripts/install-shellcheck.sh`), clearing the SC2218 class that
   Bookworm's 0.9.0 misreported; the blocking gate stays zero-warning.
+- The kimi worker image's in-build `npm test` gate failed on CI (barracuda,
+  2026-09-22: 43/53) because the WI#206 regression fixtures
+  (`hooks/headless_command_guard.mjs`, `config/config.toml`) were only
+  COPYed into the final runtime stage — the builder-stage gate never saw
+  them. The fixtures now ship into the builder stage (master `43eb871d3`),
+  and the full gate re-verified green end-to-end from a clean state
+  mirroring the Dockerfile builder context (53/53).
 
 ### Version Bumps and Supply Chain (goal 1)
 
@@ -624,7 +673,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   CLI version instead of hard-coding it, so pin bumps can no longer leave
   the assertion stale.
 
-### Documentation Parity (goals 38, 42, 43, 45, 47, 49)
+### Documentation Parity (goals 38, 42, 43, 45, 46, 47, 49)
 
 - All 31 current guides revalidated against the 2.1.2.0 tree;
   `MT-ADMIN-QUICKSTART` gained `fix-podman-userns`; `ENABLING_DEV_TOOLS`
@@ -643,8 +692,17 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   changes; `TESTING_GUIDE` gained the three sandbox network modes and the
   opencode2 worker lane; `MT-ADMIN-QUICKSTART` gained
   `restart-worker <tenant> opencode2`; `SSH_AGENT_HARNESS`/
-  `SSH_DELIVERY_MECHANISMS` cover all four worker types; `SELF_HEAL_*` docs
+  `SSH_DELIVERY_MECHANISMS` cover all four worker types (since corrected for
+  WI#206: the kimi lane no longer mounts the agent socket);
+  `SELF_HEAL_*` docs
   carry the WI#180 parity subsections.
+- Goal 46 (open work items audit repass, 2026-09-22) re-queried the live
+  tracker — every open item's body and full comment thread — and rewrote
+  `docs/ops/v2.1.2.0_OPEN_WORK_ITEMS_STATUS.md` with the 27-item
+  disposition table; all fourteen items from the 09-14 audit are closed.
+  WI#206's contract is also documented in `docs/ops/WORKER-CONTAINERS.md`
+  (headless permission contract section) and the worker's own AGENTS.md
+  invariants.
 
 ## Upgrade Notes
 
@@ -694,14 +752,22 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 11. Pebble workers enforce workspace-path confinement and concurrent-task
     exclusivity; daemon-supplied `project_dir` values outside
     `WORKSPACE_ROOT` are now rejected by design.
-12. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
+12. **Kimi worker lane hardening (WI#206).** Rebuild the kimi worker image
+    (2.0.2) and let the `KIMI_ROOTLESS_LAUNCH_CONTRACT` bump force-recreate
+    existing containers: the tenant SSH-agent socket is no longer mounted,
+    `no-new-privileges` is applied, and the baked fail-closed command guard
+    ships. Tenants that legitimately need SSH from kimi worker tasks must
+    move that work to the pebble/opencode/opencode2 lanes or a scoped
+    credential broker — the shared tenant agent is no longer exposed to the
+    headless executor.
+13. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
     installer is at `.gitlab/scripts/install-shellcheck.sh`.
-13. Conversation-insights changes add durable cursors, batch identity, and
+14. Conversation-insights changes add durable cursors, batch identity, and
     deletion-as-opt-out state; on upgrade, existing insight stores are
     migrated in place by the production store tests' covered paths — no
     operator action required, but review `docs/ops/v2.1.2.0_GOAL8_INSIGHTS_HARDENING.md`
     for the new authority/eligibility contracts.
-14. **Mission defaults changed.** The daily thread budget default is now 30
+15. **Mission defaults changed.** The daily thread budget default is now 30
     (was 10), and interrupted mission fires retry automatically with
     exponential backoff (3 retries default; `max_retries=0` opts out per
     mission). Tenants with explicit `max_threads_per_day` are unaffected.
@@ -745,6 +811,31 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   (kimi-code 2.0.2 was adopted 2026-09-21 after the CLI contract gate
   proved the 2.x headless surface; if 2.x upstream regressions appear, the
   documented fallback is the last-proven 0.43.1 pin).
+- Mission retry (WI#188) carries two open HIGH follow-ups from the goal-9
+  commit audit (`docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`): F1 — the retry
+  re-fire path injects an internal `retry_attempt` key into the trigger
+  payload, leaking into mission meta-prompts and the persisted
+  `last_trigger_payload` despite the sufficient top-level metadata marker;
+  F2 — the at-least-once dedup release fires for every non-Completed
+  outcome including `GatePaused`, so an event redelivery during an approval
+  window can double-fire the mission. Both verified still present at
+  `ic/crates/lunarwing_engine/src/runtime/mission.rs` at release time; the
+  lower-severity audit findings (F3 restart-sweep ordering, F10 missing
+  retry params in the `mission_update` schema) are recorded in the audit
+  report.
+- Worker SSH-agent sockets can go stale after daemon-only restarts (the
+  bind-mount inode is captured at container creation, and voice/vision
+  consumer reloads do not recreate worker containers), with an unexplained
+  `Permission denied` on fresh binds — raised in cmc's WI#206 verification
+  comment and now tracked as its own follow-up. Incidental for the kimi
+  lane (the mount was removed), but it affects the lanes that still mount
+  the socket.
+- WI#159 (open): the engine event listener's terminal triggers
+  (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
+  for Research child threads — only Mission threads are filtered — so
+  event-triggered missions can self-sustain via their own research
+  children; with the WI#189 budget the blast radius is 30 spawns per day
+  per mission.
 
 ### Resolved or Source-Fixed Since v2.1.1.0
 
@@ -769,7 +860,9 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   workers no longer receive the full gateway bearer (WI#205, incl. the
   WI#209/#210/#211 review findings and WI#215 sibling derivation).
 - Interrupted mission fires retry with backoff and survive daemon restarts;
-  event/webhook delivery is at-least-once (WI#188). Daily mission budget
+  event/webhook delivery is at-least-once (WI#188 — two HIGH audit
+  follow-ups carried: `retry_attempt` payload injection and unscoped dedup
+  release incl. `GatePaused`). Daily mission budget
   defaults to 30 (WI#189); mission tools reject nameless/goalless creates
   and expose `current_focus` (WI#203).
 - Fresh tenants receive only the seven product skills, not contributor
@@ -787,5 +880,6 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   serializing resource groups); opencode2
   publication jobs; ShellCheck 0.11.0 floor.
 - Worker pins updated: kimi-code 2.0.2 (with the WI#195 headless permission
-  contract and deterministic CLI contract gate), opencode2 v2.0.14, gitlab
+  contract, the WI#206 fail-closed PreToolUse command guard, and the
+  deterministic CLI contract gate), opencode2 v2.0.14, gitlab
   tool registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
