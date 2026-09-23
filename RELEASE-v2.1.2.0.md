@@ -220,6 +220,7 @@ previous compatibility baseline.
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; no external version changed, so the vendor snapshot regenerated with no diff |
 | Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `2.0.2` (adopted 2026-09-21 after the 2.x line proved out); opencode2 `v2.0.14` at `08462140ec0de1e4b17d4a353d8d5827f53cf7b0`; pebble at upstream HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` |
 | Sandbox default | `SANDBOX_NETWORK=none` is the in-code and mt-admin-rendered default; podman is the preferred runtime (`SANDBOX_RUNTIME`) |
+| Kimi worker lane | No longer mounts the tenant SSH-agent socket and runs with `no-new-privileges` (WI#206); the fail-closed `PreToolUse` command guard is baked into the image |
 | Worker image publication | Digest-bound reproducible candidates/promotions for kimi, pebble, opencode, and opencode2 |
 | ShellCheck floor | 0.11.0 (checksum-pinned installer; CI gate remains blocking) |
 | Bundled skills | Exactly seven product skills ship to fresh tenants: cavepony, delegation, lunarwing-workflow-orchestrator, multica-poll, plan-mode, routine-advisor, study-notes (WI#185; three contributor-dev skills removed from the embedded catalog) |
