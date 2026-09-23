@@ -924,7 +924,8 @@ SANDBOX_NETWORK=$sandbox_network
 #
 #   env/    GATEWAY_AUTH_TOKEN, WORKER_AUTH_TOKEN, LLM_API_KEY, DB password
 #   state/  config.toml (worker auth_tokens), pending-gates, workspace-template
-#   run/    lunarwing.sock, and a world-writable ssh-agent.sock (tenant identity)
+#   run/    lunarwing.sock, and the world-writable ssh-agent/ dir holding
+#          ssh-agent.sock (tenant identity)
 #
 # Deliberately NOT the whole tenant root: the daemon's WorkingDirectory is
 # <root>/ic, and the shell tool defaults to the daemon cwd, so protecting the
