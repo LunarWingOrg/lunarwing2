@@ -1618,7 +1618,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
             },
             lunarwing_engine::ActionDef {
                 name: "mission_update".into(),
-                description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, success criteria, or steering focus.".into(),
+                description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, retry policy, success criteria, or steering focus.".into(),
                 parameters_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1629,6 +1629,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                         "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
                         "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
+                        "max_retries": {"type": "integer", "minimum": 0, "description": "Maximum retry attempts after an interrupted or failed fire (0 disables retries). Omit all retry parameters to leave the policy unchanged."},
+                        "initial_delay_secs": {"type": "integer", "minimum": 0, "description": "Initial retry backoff delay in seconds"},
+                        "backoff_multiplier": {"type": "number", "exclusiveMinimum": 0, "description": "Positive multiplier applied to each subsequent retry delay"},
+                        "max_delay_secs": {"type": "integer", "minimum": 0, "description": "Maximum retry backoff delay in seconds"},
                         "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"},
                         "current_focus": {"type": ["string", "null"], "description": "Steering focus for the next thread. Omit to leave unchanged; pass null to clear."}
                     },
