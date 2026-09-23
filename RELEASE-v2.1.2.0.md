@@ -2,7 +2,7 @@
 
 ## Codename: Yoroi (鎧, armor)
 
-**Release date** 2026-09-22
+**Release date** 2026-09-23
 
 > After the lacing, the plates
 >
@@ -680,7 +680,9 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   changes; `TESTING_GUIDE` gained the three sandbox network modes and the
   opencode2 worker lane; `MT-ADMIN-QUICKSTART` gained
   `restart-worker <tenant> opencode2`; `SSH_AGENT_HARNESS`/
-  `SSH_DELIVERY_MECHANISMS` cover all four worker types; `SELF_HEAL_*` docs
+  `SSH_DELIVERY_MECHANISMS` cover all four worker types (since corrected for
+  WI#206: the kimi lane no longer mounts the agent socket);
+  `SELF_HEAL_*` docs
   carry the WI#180 parity subsections.
 - Goal 46 (open work items audit repass, 2026-09-22) re-queried the live
   tracker — every open item's body and full comment thread — and rewrote
