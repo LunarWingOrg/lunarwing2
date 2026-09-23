@@ -254,6 +254,17 @@ pub trait Store: Send + Sync {
         })
     }
 
+    /// Enumerate persisted missions across all projects, including ones that
+    /// did not enter the in-memory active index during startup. Retry recovery
+    /// must not silently drop a project's pending fires on a listing failure.
+    async fn list_all_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
+        let mut missions = Vec::new();
+        for project in self.list_all_projects().await? {
+            missions.extend(self.list_all_missions(project.id).await?);
+        }
+        Ok(missions)
+    }
+
     /// List all active missions across all projects/users.
     ///
     /// Used by startup bootstrap to load missions that don't belong to the
