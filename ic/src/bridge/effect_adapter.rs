@@ -259,10 +259,6 @@ impl EffectBridgeAdapter {
 
     /// Parse the retry-policy tool params (WI#188): `max_retries` on its own
     /// flips retry on/off, the four scalars together tune the full backoff
-    /// curve; absent leaves the policy untouched. All-or-nothing errors so a
-    /// typo fails loudly instead of silently taking the default.
-    /// Parse the retry-policy tool params (WI#188): `max_retries` on its own
-    /// flips retry on/off, the four scalars together tune the full backoff
     /// curve; absent params leave the policy untouched. All-or-nothing errors
     /// so a typo fails loudly instead of silently taking the default.
     fn mission_retry_policy_from_params(
@@ -362,9 +358,7 @@ impl EffectBridgeAdapter {
         let current_focus = params
             .get("current_focus")
             .map(|value| value.as_str().map(str::to_string));
-        // WI#188: mission_update may tune the retry policy with up to 2
-        // scalars; rich tuning (backoff curve) is deliberately a direct
-        // `mission.json` shape, not a per-call tool surface.
+        // WI#188: all four retry-policy scalars are advertised by the tool.
         let retry_policy = Self::mission_retry_policy_from_params(params)?;
         Ok(lunarwing_engine::MissionUpdate {
             name,
@@ -3576,6 +3570,31 @@ FINAL(echoed + "|" + http_result["error"])"#,
         assert!(
             matches!(cleared.current_focus, Some(None)),
             "explicit null must map to an explicit clear"
+        );
+    }
+
+    #[test]
+    fn mission_updates_accepts_all_retry_policy_fields() {
+        let absent = EffectBridgeAdapter::mission_updates(&serde_json::json!({})).unwrap();
+        assert!(absent.retry_policy.is_none());
+
+        let updates = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "max_retries": 4,
+            "initial_delay_secs": 15,
+            "backoff_multiplier": 1.5,
+            "max_delay_secs": 120
+        }))
+        .unwrap();
+        let policy = updates.retry_policy.unwrap();
+        assert_eq!(policy.max_retries, 4);
+        assert_eq!(policy.initial_delay_secs, 15);
+        assert_eq!(policy.backoff_multiplier, 1.5);
+        assert_eq!(policy.max_delay_secs, 120);
+        assert!(
+            EffectBridgeAdapter::mission_updates(&serde_json::json!({
+                "backoff_multiplier": 0
+            }))
+            .is_err()
         );
     }
 

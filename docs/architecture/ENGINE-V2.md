@@ -497,16 +497,21 @@ approach history, notifies the mission's `notify_channels` as an error, and,
 when the mission's `retry_policy` has attempts left, schedules a delayed
 re-fire with exponential backoff (default 1m → 2m → 4m, capped at 1h;
 `initial_delay_secs = 60`, `backoff_multiplier = 2.0`, `max_delay_secs = 3600`,
-`max_retries = 3`; tunable per mission via `mission_update`'s retry policy
-params or the mission's persisted `retry_policy`). Each retry respawn passes
+`max_retries = 3`; all four scalars are exposed by `mission_update`, or can
+be set through the persisted `retry_policy`). Each retry respawn passes
 the normal budget gate and increments `threads_today`, so retries draw from
 the same daily budget — a budget-exhausted re-fire is abandoned, and a paused
-or terminal mission suppresses its own pending retry. A non-completed fire
-also releases its trigger dedup key so an external redelivery of the same
-event/webhook payload can fire the mission again (at-least-once for
-`event:`/webhook cadences); if the daemon restarts mid-backoff, the pending
-retry marker on the failed thread's metadata lets the post-restart sweep
-re-arm the re-fire with a fresh full backoff window (work item #188).
+or terminal mission suppresses its own pending retry. A terminal
+non-completion (`Failed`, `Stopped`, or `MaxIterations`) releases its trigger
+dedup key so an external redelivery of the same event/webhook payload can fire
+the mission again (at-least-once for
+`event:`/webhook cadences). `GatePaused` retains the key while approval is
+pending, preventing a duplicate fire on redelivery. Retry attempt numbers
+are stored on the spawned thread's metadata, not in model-visible trigger
+payloads. If the daemon restarts mid-backoff, the pending retry marker on the
+failed thread's metadata lets the post-restart sweep enumerate persisted
+missions (even ones missing from the in-memory active index) and re-arm the
+re-fire with a fresh full backoff window (work items #188 and goal #38).
 
 `MissionManager::ensure_learning_missions()` provisions two baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement

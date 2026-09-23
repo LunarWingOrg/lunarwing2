@@ -143,7 +143,9 @@
 
 
 ## Phase 6 - Fix Reviewed findings
-38. [ ] take care of first 4 fndings from docs/ops/2.1.2_FINDINGS.md - work on all of these 4 and document fixes
+38. [x] take care of first 4 fndings from docs/ops/2.1.2_FINDINGS.md - work on all of these 4 and document fixes
+    - DONE 2026-09-23 (`212g38`): F1 retry re-fire no longer injects `retry_attempt` into trigger payload (attempt stays on thread metadata); F2 GatePaused retains its dedup key while awaiting approval, with terminal non-completions preserving at-least-once redelivery; F3 restart retry sweep enumerates persisted missions across projects, independent of the in-memory active index; F10 the `mission_update` tool schema now advertises all four already-parsed retry-policy scalars. Details and compatibility notes: [findings remediation](2.1.2_FINDINGS.md#goal-38-remediation-2026-09-23) and [engine retry contract](../architecture/ENGINE-V2.md).
+    - Verified: 110/110 mission runtime tests and the targeted bridge retry-policy test pass; cargo check default and rustfmt/diff checks clean. Live tenant restart acceptance remains an operator step.
 39. [ ] work on the 5th item from docs/ops/2.1.2_FINDINGS.md - document fix
 40. [ ] work on the 6th item from docs/ops/2.1.2_FINDINGS.md - document fix - the first suggestion from sweetiebot is preferable here
 

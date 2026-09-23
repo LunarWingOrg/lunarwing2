@@ -2262,9 +2262,9 @@ impl MissionManager {
         self.store.save_thread(&thread).await
     }
 
-    /// Execute a scheduled re-fire: persist the retry lineage on the new
-    /// thread's metadata before spawning (so the post-restart sweep can
-    /// find it), then fire normally.
+    /// Execute a scheduled re-fire with the original trigger payload intact.
+    /// The attempt counter belongs in thread metadata, never model-visible
+    /// trigger data or the mission's persisted last_trigger_payload.
     async fn refire_mission_thread(&self, pending: PendingMissionRetry) {
         let PendingMissionRetry {
             mission_id,
@@ -2273,20 +2273,8 @@ impl MissionManager {
             payload,
             ..
         } = pending;
-        // Persist the attempt marker first: if the daemon dies between the
-        // fire's reservation and the spawn, the sweep can still attach the
-        // attempt history to the reserved thread rather than losing it.
-        let mut payload = payload.map(|mut p| {
-            if let serde_json::Value::Object(map) = &mut p {
-                map.insert(
-                    RETRY_ATTEMPT_METADATA_KEY.to_string(),
-                    serde_json::json!(attempt),
-                );
-            }
-            p
-        });
         let spawned = self
-            .fire_mission_inner(mission_id, &user_id, payload.take(), false)
+            .fire_mission_inner(mission_id, &user_id, payload, false)
             .await;
         match spawned {
             Ok(Some(thread_id)) => {
@@ -2337,15 +2325,14 @@ impl MissionManager {
 
     pub async fn recover_pending_mission_retries(&self) -> Result<Vec<MissionId>, EngineError> {
         let mut scheduled = Vec::new();
-        for mission_id in self.active.read().await.clone() {
-            let mission = match self.store.load_mission(mission_id).await {
-                Ok(Some(mission)) => mission,
-                Ok(None) => continue,
-                Err(error) => {
-                    warn!(%mission_id, %error, "failed to load mission for retry recovery");
-                    continue;
-                }
-            };
+        // A previously scheduled retry can outlive this process's active
+        // index (e.g. bootstrap skips a project). Discover from durable
+        // mission records instead; paused and terminal missions stay inert.
+        for mission in self.store.list_all_missions_global().await? {
+            if mission.status != MissionStatus::Active {
+                continue;
+            }
+            let mission_id = mission.id;
             let policy = mission.retry_policy;
             for &thread_id in mission.thread_history.iter().rev() {
                 let thread = match self.store.load_thread(thread_id).await {
@@ -2929,21 +2916,22 @@ async fn process_mission_outcome_and_notify(
         _ => {}
     }
 
-    // WI#188 at-least-once: release the failing fire's trigger dedup key so
-    // an external redelivery of the same event/webhook payload can fire the
-    // mission again. Retried fires re-record the key, so a successful retry
-    // restores the dedup for the same payload.
-    if !matches!(outcome, ThreadOutcome::Completed { .. })
-        && let Some(key) = mission
-            .last_trigger_payload
-            .as_ref()
-            .and_then(trigger_dedup_key)
+    // Only terminal non-completions relinquish the trigger. GatePaused still
+    // owns a resumable thread: redelivery during approval must not double-fire.
+    // A retried fire re-records the key when it eventually spawns.
+    if matches!(
+        outcome,
+        ThreadOutcome::Failed { .. } | ThreadOutcome::Stopped | ThreadOutcome::MaxIterations
+    ) && let Some(key) = mission
+        .last_trigger_payload
+        .as_ref()
+        .and_then(trigger_dedup_key)
         && mission.has_processed_trigger(&key)
     {
         mission
             .processed_trigger_keys
             .retain(|candidate| candidate != &key);
-        debug!(mission_id = %mission_id, dedup_key = %key, "released trigger dedup key after non-completed fire");
+        debug!(mission_id = %mission_id, dedup_key = %key, "released trigger dedup key after terminal non-completion");
     }
 
     // Best-effort metadata marker on the failing thread so the post-restart
@@ -3525,6 +3513,9 @@ mod tests {
                 .filter(|m| m.project_id == project_id)
                 .cloned()
                 .collect())
+        }
+        async fn list_all_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
+            Ok(self.missions.read().await.values().cloned().collect())
         }
         async fn list_all_active_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
             Ok(self
@@ -8805,5 +8796,137 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             pending.is_none(),
             "max_retries=0 disables the lineage (pre-WI#188 behavior)"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_payload_does_not_contain_internal_attempt_marker() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "retry-payload",
+                "goal",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let original = serde_json::json!({"source_thread_id": "source-1", "data": "original"});
+        mgr.refire_mission_thread(PendingMissionRetry {
+            mission_id: id,
+            user_id: "test-user".into(),
+            attempt: 2,
+            payload: Some(original.clone()),
+            not_before: Utc::now(),
+        })
+        .await;
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.last_trigger_payload, Some(original.clone()));
+        let thread = store
+            .load_thread(*mission.thread_history.last().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.metadata[RETRY_ATTEMPT_METADATA_KEY], 2);
+        assert!(thread.metadata.get("trigger_payload").is_none());
+    }
+
+    #[tokio::test]
+    async fn gate_paused_outcome_retains_trigger_dedup_key() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store));
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "approval",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.last_trigger_payload = Some(serde_json::json!({"source_thread_id": "source-1"}));
+        mission.record_processed_trigger("src:source-1".into());
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+        let outcome = ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "shell".into(),
+            call_id: "call-1".into(),
+            parameters: serde_json::json!({}),
+            resume_kind: crate::gate::ResumeKind::Approval {
+                allow_always: false,
+            },
+            resume_output: None,
+        };
+        let pending = process_mission_outcome(&store, id, ThreadId::new(), &outcome)
+            .await
+            .unwrap();
+        assert!(pending.is_none());
+        assert!(
+            store
+                .load_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .has_processed_trigger("src:source-1")
+        );
+        assert!(
+            mgr.fire_mission(
+                id,
+                "test-user",
+                Some(serde_json::json!({"source_thread_id": "source-1"}))
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "redelivery while approval is pending must not spawn another thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_recovery_discovers_persisted_mission_outside_active_index() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "pending",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Failed;
+        let pending = PendingMissionRetry::new(
+            mission.id,
+            "test-user",
+            1,
+            None,
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        thread.metadata = serde_json::json!({RetryState::METADATA_KEY: pending.to_retry_state()});
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        assert!(!mgr.active.read().await.contains(&mission.id));
+
+        assert_eq!(
+            mgr.recover_pending_mission_retries().await.unwrap(),
+            vec![mission.id]
+        );
+        let recovered = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&recovered.metadata).is_none());
+        mgr.shutdown().await;
     }
 }
