@@ -906,7 +906,9 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   bind-mount inode is captured at container creation, and voice/vision
   consumer reloads do not recreate worker containers), with an unexplained
   `Permission denied` on fresh binds — raised in cmc's WI#206 verification
-  comment and now tracked as its own follow-up. Incidental for the kimi
+  comment and now tracked as its own follow-up (goal 40, open at release;
+  the preferred fix shape is mounting the socket's parent directory so
+  workers resolve a fresh inode at connect time). Incidental for the kimi
   lane (the mount was removed), but it affects the lanes that still mount
   the socket.
 - WI#159 (open): the engine event listener's terminal triggers
