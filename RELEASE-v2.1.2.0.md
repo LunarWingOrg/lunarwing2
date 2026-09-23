@@ -591,6 +591,13 @@ The OpenCode v2 lane is a full first-class worker:
 - ShellCheck floor raised to 0.11.0 via a checksum-pinned installer
   (`.gitlab/scripts/install-shellcheck.sh`), clearing the SC2218 class that
   Bookworm's 0.9.0 misreported; the blocking gate stays zero-warning.
+- The kimi worker image's in-build `npm test` gate failed on CI (barracuda,
+  2026-09-22: 43/53) because the WI#206 regression fixtures
+  (`hooks/headless_command_guard.mjs`, `config/config.toml`) were only
+  COPYed into the final runtime stage — the builder-stage gate never saw
+  them. The fixtures now ship into the builder stage (master `43eb871d3`),
+  and the full gate re-verified green end-to-end from a clean state
+  mirroring the Dockerfile builder context (53/53).
 
 ### Version Bumps and Supply Chain (goal 1)
 
