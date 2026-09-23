@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::registry::ToolRegistry;
 use super::tool::Tool;
 
 /// User-visible reason shown when a tool's permission cannot be set to
@@ -26,6 +27,60 @@ pub enum PermissionState {
     AskEachTime,
     /// Refuse to run the tool at all.
     Disabled,
+}
+
+/// Spellings used by persisted GitLab tool permissions. Do not normalize
+/// arbitrary names: two distinct installed tools may legitimately differ only
+/// by a hyphen/underscore, and sharing their grants would cross an authority
+/// boundary. Only the known GitLab extension alias shares a permission key.
+pub fn permission_setting_keys(tool_name: &str) -> Vec<String> {
+    if matches!(tool_name, "gitlab_tool" | "gitlab-tool") {
+        return vec![
+            permission_setting_key(tool_name),
+            "tool_permissions.gitlab-tool".to_string(),
+        ];
+    }
+    vec![permission_setting_key(tool_name)]
+}
+
+pub fn permission_setting_key(tool_name: &str) -> String {
+    format!("tool_permissions.{}", permission_cache_name(tool_name))
+}
+
+pub fn permission_cache_name(tool_name: &str) -> &str {
+    if matches!(tool_name, "gitlab_tool" | "gitlab-tool") {
+        "gitlab_tool"
+    } else {
+        tool_name
+    }
+}
+
+/// Refuse to share a GitLab grant if two distinct installed tools claim the
+/// two spellings. Name resolution prioritizes an exact registration, so in
+/// that case these are not aliases and neither may inherit the other's grant.
+pub async fn gitlab_permission_alias_conflict(tools: &ToolRegistry) -> bool {
+    tools.get("gitlab_tool").await.is_some() && tools.get("gitlab-tool").await.is_some()
+}
+
+#[cfg(test)]
+mod permission_key_tests {
+    use super::permission_setting_keys;
+
+    #[test]
+    fn gitlab_aliases_share_canonical_key_and_legacy_fallback() {
+        let keys = vec![
+            "tool_permissions.gitlab_tool".to_string(),
+            "tool_permissions.gitlab-tool".to_string(),
+        ];
+        assert_eq!(permission_setting_keys("gitlab_tool"), keys);
+        assert_eq!(permission_setting_keys("gitlab-tool"), keys);
+        assert_eq!(super::permission_cache_name("gitlab-tool"), "gitlab_tool");
+        assert_eq!(permission_setting_keys("ssh"), vec!["tool_permissions.ssh"]);
+        assert_eq!(
+            permission_setting_keys("other_tool"),
+            vec!["tool_permissions.other_tool"]
+        );
+    }
 }
 
 /// Seed-time baseline for well-known built-in tool permissions.

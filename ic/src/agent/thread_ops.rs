@@ -71,35 +71,44 @@ impl Agent {
         session: &Arc<Mutex<Session>>,
         tool_name: &str,
     ) -> bool {
+        if matches!(tool_name, "gitlab_tool" | "gitlab-tool")
+            && crate::tools::permissions::gitlab_permission_alias_conflict(&self.deps.tools).await
+        {
+            return false;
+        }
+        let cache_name = crate::tools::permissions::permission_cache_name(tool_name);
         let (user_id, cached) = {
             let session = session.lock().await;
             (
                 session.user_id.clone(),
-                session.is_tool_auto_approved(tool_name),
+                session.is_tool_auto_approved(cache_name)
+                    || session.is_tool_auto_approved(tool_name),
             )
         };
         let Some(store) = self.deps.store.as_ref() else {
             return cached;
         };
-        let key = format!("tool_permissions.{tool_name}");
-        match store.get_setting(&user_id, &key).await {
-            Ok(Some(value)) => {
-                serde_json::from_value::<PermissionState>(value).ok()
-                    == Some(PermissionState::AlwaysAllow)
-            }
-            // Configured persistence is authoritative. Deleting a grant must
-            // revoke any session cache entry rather than reveal it again.
-            Ok(None) => false,
-            Err(error) => {
-                tracing::warn!(
-                    user_id,
-                    tool = tool_name,
-                    %error,
-                    "Failed to read persistent tool approval; denying cached grant"
-                );
-                false
+        for key in crate::tools::permissions::permission_setting_keys(tool_name) {
+            match store.get_setting(&user_id, &key).await {
+                Ok(Some(value)) => {
+                    return serde_json::from_value::<PermissionState>(value).ok()
+                        == Some(PermissionState::AlwaysAllow);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        tool = tool_name,
+                        %error,
+                        "Failed to read persistent tool approval; denying cached grant"
+                    );
+                    return false;
+                }
             }
         }
+        // Configured persistence is authoritative. Deleting a grant must
+        // revoke any session cache entry rather than reveal it again.
+        false
     }
 
     async fn persist_tool_always_grant(
@@ -107,9 +116,14 @@ impl Agent {
         session: &Arc<Mutex<Session>>,
         tool_name: &str,
     ) -> bool {
+        if matches!(tool_name, "gitlab_tool" | "gitlab-tool")
+            && crate::tools::permissions::gitlab_permission_alias_conflict(&self.deps.tools).await
+        {
+            return false;
+        }
         let user_id = session.lock().await.user_id.clone();
         if let Some(store) = self.deps.store.as_ref() {
-            let key = format!("tool_permissions.{tool_name}");
+            let key = crate::tools::permissions::permission_setting_key(tool_name);
             if let Err(error) = store
                 .set_setting(&user_id, &key, &serde_json::json!("always_allow"))
                 .await
@@ -124,7 +138,10 @@ impl Agent {
             }
         }
 
-        session.lock().await.auto_approve_tool(tool_name);
+        session
+            .lock()
+            .await
+            .auto_approve_tool(crate::tools::permissions::permission_cache_name(tool_name));
         true
     }
 
@@ -1597,7 +1614,12 @@ impl Agent {
             for (idx, tc) in deferred_tool_calls.iter().enumerate() {
                 if let Some(tool) = self.tools().get(&tc.name).await {
                     let requirement = tool.requires_approval(&tc.arguments);
-                    let allow_always = tool.allows_always_approval(&tc.arguments);
+                    let allow_always = tool.allows_always_approval(&tc.arguments)
+                        && !(matches!(tc.name.as_str(), "gitlab_tool" | "gitlab-tool")
+                            && crate::tools::permissions::gitlab_permission_alias_conflict(
+                                &self.deps.tools,
+                            )
+                            .await);
                     let session_auto_approved = if allow_always {
                         self.has_tool_always_grant(&session, &tc.name).await
                     } else {
@@ -2346,6 +2368,64 @@ mod tests {
             .await
             .expect("delete persisted grant");
         assert!(!agent.has_tool_always_grant(&session, "ssh").await);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn gitlab_always_grant_survives_tool_name_spellings() {
+        let (agent, db, _temp_dir) = tool_approval_test_agent().await;
+        let session = Arc::new(Mutex::new(Session::new("alice")));
+
+        assert!(
+            agent
+                .persist_tool_always_grant(&session, "gitlab-tool")
+                .await
+        );
+        assert_eq!(
+            db.get_setting("alice", "tool_permissions.gitlab_tool")
+                .await
+                .expect("read canonical grant"),
+            Some(serde_json::json!("always_allow"))
+        );
+        assert!(agent.has_tool_always_grant(&session, "gitlab_tool").await);
+        assert!(agent.has_tool_always_grant(&session, "gitlab-tool").await);
+
+        db.set_setting(
+            "alice",
+            "tool_permissions.gitlab_tool",
+            &serde_json::json!("ask_each_time"),
+        )
+        .await
+        .expect("revoke grant");
+        assert!(!agent.has_tool_always_grant(&session, "gitlab-tool").await);
+        assert!(!agent.has_tool_always_grant(&session, "gitlab_tool").await);
+
+        db.delete_setting("alice", "tool_permissions.gitlab_tool")
+            .await
+            .expect("remove canonical row");
+        db.set_setting(
+            "alice",
+            "tool_permissions.gitlab-tool",
+            &serde_json::json!("always_allow"),
+        )
+        .await
+        .expect("persist historical grant");
+        assert!(agent.has_tool_always_grant(&session, "gitlab_tool").await);
+        assert!(agent.has_tool_always_grant(&session, "gitlab-tool").await);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn gitlab_session_only_always_grant_survives_alias() {
+        let (mut agent, _db, _temp_dir) = tool_approval_test_agent().await;
+        agent.deps.store = None;
+        let session = Arc::new(Mutex::new(Session::new("alice")));
+        assert!(
+            agent
+                .persist_tool_always_grant(&session, "gitlab-tool")
+                .await
+        );
+        assert!(agent.has_tool_always_grant(&session, "gitlab_tool").await);
     }
 
     #[test]
