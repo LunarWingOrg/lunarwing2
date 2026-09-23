@@ -12,9 +12,10 @@ For the design and internals, see
 - SSH **private keys** in the encrypted secrets store (AES-256-GCM, never on
   disk in plaintext).
 - An in-process **ssh-agent** on a per-tenant Unix socket
-  (`/home/<tenant>/lunarwing/run/ssh-agent.sock`), bind-mounted into worker
-  containers as `SSH_AUTH_SOCK`. Workers run plain `git`/`ssh`; signing happens
-  inside the daemon and keys never enter the container.
+  (`/home/<tenant>/lunarwing/run/ssh-agent/ssh-agent.sock`), whose parent
+  directory is bind-mounted into worker containers as `SSH_AUTH_SOCK`. Workers
+  run plain `git`/`ssh`; signing happens inside the daemon and keys never enter
+  the container.
 
 ## Prerequisites
 
@@ -75,15 +76,17 @@ key for retry; they are never treated as successful rotation.
 
 `mt-admin` handles this for you, in this order (order matters):
 
-1. Pre-creates the socket path as a touch-file so podman bind-mounts a **file**,
-   not a directory.
-2. Starts the **daemon first** — it removes the touch-file and binds the real
-   Unix socket.
-3. Starts **workers after**, each with:
+1. Pre-creates the socket directory (`run/ssh-agent`, mode 0755) so podman
+   bind-mounts a directory.
+2. Starts the **daemon first** — it binds the real Unix socket inside it.
+3. Starts **workers** with:
    ```
-   -v /home/<tenant>/lunarwing/run/ssh-agent.sock:/tmp/ssh-agent.sock \
-   -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
+   -v /home/<tenant>/lunarwing/run/ssh-agent:/tmp/ssh-agent \
+   -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
    ```
+   Because the mount is the directory (not the socket file), a daemon restart
+   that binds a fresh socket inode is picked up at connect time — workers never
+   need recreating after a daemon-only restart.
 
 ---
 
@@ -202,7 +205,7 @@ So the reliable sequence for a brand-new key is: **upload → restart daemon**.
 # Agent status: running, socket path, and how many keys are loaded.
 curl -s http://127.0.0.1:<http-port>/agent/status | jq
 # => {"success":true,"data":{"running":true,
-#      "socket_path":"/home/<tenant>/lunarwing/run/ssh-agent.sock",
+#      "socket_path":"/home/<tenant>/lunarwing/run/ssh-agent/ssh-agent.sock",
 #      "keys_loaded":1}}
 
 # List configured hosts (has_key reflects the secrets store):
@@ -215,16 +218,17 @@ curl -s http://127.0.0.1:<http-port>/hosts/git.example.com/key/status | jq
 Confirm the socket exists and is a socket:
 
 ```bash
-ls -l /home/<tenant>/lunarwing/run/ssh-agent.sock   # should show a 's' (socket) type
+ls -l /home/<tenant>/lunarwing/run/ssh-agent/ssh-agent.sock   # should show a 's' (socket) type
 ```
 
 ### Inside a worker (e.g. OpenCode)
 
-The socket is mounted at `/tmp/ssh-agent.sock` with `SSH_AUTH_SOCK` pointing at
-it. Standard SSH tooling picks it up automatically:
+The socket directory is mounted at `/tmp/ssh-agent` with `SSH_AUTH_SOCK`
+pointing at the socket inside it. Standard SSH tooling picks it up
+automatically:
 
 ```bash
-echo "$SSH_AUTH_SOCK"          # => /tmp/ssh-agent.sock
+echo "$SSH_AUTH_SOCK"          # => /tmp/ssh-agent/ssh-agent.sock
 ssh-add -l                     # lists the loaded identity/identities
 ssh -T git@git.example.com     # authenticates via the daemon's agent
 git clone git@git.example.com:org/repo.git
@@ -348,15 +352,16 @@ pin, so use this reset procedure whenever switching from an explicit pin back to
 | `keys_loaded: 0` but key was uploaded | Upload happened while the agent was running; **restart the daemon** (mt-admin's start-tenant does this automatically after upload). |
 | Worker: "agent has no identities" | Same as above — restart the daemon after uploading. |
 | Worker: `SSH_AUTH_SOCK` unset / socket missing | Worker container was created before the socket existed, or the bind-mount is a stale touch-file. Recreate the worker container **after** the daemon is up (mt-admin orders this for you; a plain `restart` may reuse a stale container). |
-| Socket exists but worker can't use it | Permissions: the socket is `0o666`, but the run dir must be tenant-owned and readable by the worker's UID. |
+| Socket exists but worker can't use it | Permissions: the socket is `0o666`, but its parent `run/ssh-agent` directory (mode 0755) and the run dir must be traversable by the worker's UID. |
+| Worker SSH broke after a daemon-only restart (legacy tenants) | Pre-fix containers bind-mounted the socket **file**, so a daemon restart left them pinned to the dead inode. Re-render the worker (`mt-admin start-tenant <t>` or restart-worker) so it picks up the directory mount; the `ssh-agent-dir` launch contract forces this automatically. |
 | `git`/`ssh` prompts about host authenticity (worker mode) | In **worker mode** host-key verification is the worker's own `ssh` client — manage its `known_hosts`, or pin `known_host_key` per host. (The in-process `ssh`/`ssh_git` tools instead use the harness's `HostKeyVerifier`; a Strict host with no known key is *refused*, not prompted.) |
 
 ### Where things live
 
 | Item | Path |
 |---|---|
-| Agent socket | `/home/<tenant>/lunarwing/run/ssh-agent.sock` |
-| Socket inside worker | `/tmp/ssh-agent.sock` (`SSH_AUTH_SOCK`) |
+| Agent socket | `/home/<tenant>/lunarwing/run/ssh-agent/ssh-agent.sock` |
+| Socket inside worker | `/tmp/ssh-agent/ssh-agent.sock` (`SSH_AUTH_SOCK`; the `run/ssh-agent` directory is mounted at `/tmp/ssh-agent`) |
 | Host config | `LUNARWING_BASE_DIR/config.toml` → `[[ssh.hosts]]` |
 | Private key (at rest) | encrypted secrets store, secret name `ssh_key_<sanitized-host>` |
 | Passphrase (at rest) | secret name `ssh_key_<sanitized-host>_passphrase` |

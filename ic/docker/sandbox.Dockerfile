@@ -8,7 +8,7 @@
 # work out of the box.
 #
 # Build (rootless podman):
-#   podman build -t lunarwing-sandbox:latest -f docker/sandbox.Dockerfile docker/
+#   podman build -t lunarwing-sandbox:latest -f ic/docker/sandbox.Dockerfile ic/
 #
 # The default configured image remains `lunarwing-worker:latest`; point
 # SANDBOX_IMAGE (or [sandbox].image) at lunarwing-sandbox:latest to use this
@@ -39,7 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Non-root user; UID/GID 1000 must match the sandbox runner's `--user
 # 1000:1000` (with podman >= 5 the runner also pins keep-id:uid=1000,gid=1000
 # so the mounted /workspace is owned by this user regardless of host UID).
-RUN useradd -m -u 1000 -g 1000 sandbox \
+RUN groupadd -g 1000 sandbox \
+    && useradd -m -u 1000 -g sandbox sandbox \
     && mkdir -p /workspace /home/sandbox/.cargo/registry \
     && chown -R sandbox:sandbox /workspace /home/sandbox
 

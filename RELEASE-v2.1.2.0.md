@@ -16,7 +16,7 @@
 
 LunarWing v2.1.2.0 is an isolation, sandboxing, worker-contract, health
 system, and confabulation-hardening release — the largest goals checklist in
-the project's history at fifty-four items, worked by the widest herd yet. Its
+the project's history at fifty-nine items, worked by the widest herd yet. Its
 headline work is the generic Podman-first agent-shell sandbox: daemonless
 per-command execution with fail-closed defaults, daemon-socket-free operation
 (works rootless and on OpenRC), non-root UID mapping, all capabilities
@@ -55,9 +55,11 @@ self-heal escalation that never restarts on observability gaps. Conversation
 insights — the release's largest reliability investigation — received a
 nine-finding hardening program (goal 8) against confabulation and feedback
 incidents. Missions gained a retry policy with exponential backoff,
-restart-safe re-arming, and at-least-once event delivery (work item #188), a
-daily thread budget default raised from 10 to 30 (work item #189), and
-honest mission-tool parameters (work item #203). Durable cross-channel
+restart-safe re-arming, and at-least-once event delivery (work item #188),
+a daily thread budget default raised from 10 to 30 (work item #189), and
+honest mission-tool parameters (work item #203); the release-cycle audit's
+mission-retry and sanitizer follow-ups were closed in-cycle (goals 38/39).
+Durable cross-channel
 attachments, a pre-execution stale
 tool-output sanitizer, keyset-paginated full-store knowledge sweeps that no
 longer depend on the heartbeat, a compact-schema fix for
@@ -176,8 +178,10 @@ previous compatibility baseline.
   3 retries, 60s initial delay, ×2 backoff, capped at 1h; `max_retries=0`
   disables). Retry state is durable on the failing thread's metadata and
   re-armed after daemon restart; event/webhook fires release their trigger
-  dedup key on non-completion so external redelivery can re-fire (at-least-
-  once). `MaxIterations` is deliberately never auto-retried.
+  dedup key on terminal non-completion so external redelivery can re-fire
+  (at-least-once; an approval-paused fire keeps its key, so redelivery
+  cannot double-fire — goal 38 audit fix). `MaxIterations` is deliberately
+  never auto-retried.
 - **Honest mission-tool parameters (WI#203).** `mission_create` rejects
   missing/non-string `name` and `goal` instead of silently minting "unnamed
   mission" or empty-goal missions; the manual-cadence default is logged; and
@@ -374,7 +378,26 @@ first model call of every thread — an ordering a mission trigger cannot
 satisfy. WI#126 was re-verified (fleet remains terminal-event-driven);
 WI#163, a re-file, was reverified with no code change.
 
-### Mission Reliability: Retry, Budget, and Honest Parameters (work items #188, #189, #203; goals 22, 29, 31)
+### Sanitizer Role-Token Neutralization Hardening (goal 39)
+
+The legacy sanitizer (`ic/crates/lunarwing_safety/src/sanitizer.rs`) had a
+gap the source audit called out: its critical-only escape prepended a
+backslash before `<|`, leaving the special-token opener intact for
+chat-template tokenizers, and role-token neutralization was gated on
+scanner severity. `Sanitizer::sanitize` now runs
+`neutralize_role_token_openers` unconditionally — a zero-width space (U+200B)
+is inserted after `<` in every `<|` opener independently of detection
+severity — and `SafetyLayer::sanitize_tool_output` applies the same
+neutralizer even when injection scanning is disabled, with `was_modified`
+accurately reflecting either transformation. This is defense in depth on
+top of the existing prompt sinks (e.g. the rig adapter and provider), which
+already neutralized role-token openers. Note for byte-for-byte consumers:
+token openers in returned tool text now carry U+200B; the raw tool response
+is unchanged. Regression tests cover both injection-scan settings and
+already-backslashed role delimiters
+(`docs/ops/2.1.2_FINDINGS.md`).
+
+### Mission Reliability: Retry, Budget, and Honest Parameters (work items #188, #189, #203; goals 22, 29, 31, 38)
 
 - **Retry with exponential backoff (WI#188).** An interrupted (signal-stopped)
   mission fire no longer loses its work permanently: `ThreadOutcome::Stopped`
@@ -386,16 +409,36 @@ WI#163, a re-file, was reverified with no code change.
   `max_retries`, `initial_delay_secs`, `backoff_multiplier`, `max_delay_secs`).
   Retry state is durable on the failing thread's metadata (`RetryState`), so
   a daemon restart re-arms pending retries after checkpoint recovery.
-  Event/webhook fires release their trigger dedup key on non-completion so an
-  external redelivery can re-fire (at-least-once); a successful retry
+  Event/webhook fires release their trigger dedup key on terminal
+  non-completion (`Failed`/`Stopped`/`MaxIterations`) so an external
+  redelivery can re-fire (at-least-once); a `GatePaused` fire retains its
+  key while awaiting approval, and a successful retry
   re-records the key, restoring dedup. `MaxIterations` is deliberately never
   auto-retried — it is notified with a model-facing suggestion instead.
   Post-landing audit (goal 9, `docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`)
-  flagged two HIGH follow-ups that remain open and are carried in the
-  limitations section: the retry re-fire path still injects a
-  `retry_attempt` key into the trigger payload (F1), and the at-least-once
-  dedup release is not scoped — a `GatePaused` outcome also releases the
-  key, so an event redelivery during an approval window can double-fire (F2).
+  flagged follow-ups F1/F2/F3/F10; all four were remediated in-cycle at goal
+  38 (`212g38`, see below) before release.
+- **Audit follow-ups remediated (goal 38, `212g38`).** The goal-9 commit
+  audit's four mission-retry findings were closed in-cycle:
+  **F1** — the retry re-fire path no longer injects the internal
+  `retry_attempt` key into the trigger payload; the attempt counter stays in
+  the spawned thread's top-level metadata (`persist_retry_attempt_marker`)
+  and `refire_mission_thread` forwards the original payload unchanged, so
+  neither the model's trigger context nor `Mission::last_trigger_payload`
+  sees it. **F2** — dedup keys are released only on terminal
+  non-completions (`Failed`/`Stopped`/`MaxIterations`); `GatePaused` retains
+  the key while the original thread awaits approval, so a redelivered
+  trigger during an approval window can no longer double-fire. **F3** —
+  startup retry recovery enumerates persisted missions across projects via
+  `Store::list_all_missions_global` instead of the in-memory active index,
+  so retries scheduled in a previous daemon life are re-armed; project
+  listing failures propagate rather than silently skipping. **F10** — the
+  `mission_update` tool schema now advertises all four retry-policy scalars
+  (`max_retries`, `initial_delay_secs`, `backoff_multiplier`,
+  `max_delay_secs`) the effect adapter already parsed. Targeted engine
+  tests cover unchanged retry payloads, paused-gate dedup, and recovery
+  without an active-index entry; live tenant restart acceptance remains an
+  operator step (`docs/ops/2.1.2_FINDINGS.md`).
 - **Daily thread budget default 10 → 30 (WI#189).** An hourly mission
   without an explicit `max_threads_per_day` now covers a full 24-hour day
   plus retry headroom instead of going dark after ten hours. Retry respawns
@@ -499,7 +542,7 @@ All eight findings addressed, then all six review findings:
 - Verified: `tests/run-all.sh` 926 passed / 0 failed across all 19 suites;
   repo-wide ShellCheck exit 0.
 
-### External Workers: opencode2 Lane (goals 13, 17, 21)
+### External Workers: opencode2 Lane (goals 21, 43)
 
 The OpenCode v2 lane is a full first-class worker:
 
@@ -517,7 +560,7 @@ The OpenCode v2 lane is a full first-class worker:
   gained the opencode2 case; `validate_config.py` and
   `promote-worker-image.py` guard the lane.
 - Pin history this cycle: v2.0.4 → v2.0.5 (goal 21/MR !988) → v2.0.8
-  (goal 13) → v2.0.14 (goal 13), tag SHA-verified against both upstream
+  → v2.0.14, tag SHA-verified against both upstream
   remotes; upstream bridge-relevant SDK files confirmed unchanged between refs.
 
 ### Pebble Worker Hardening (goals 17, 20, work items #101, #149)
@@ -535,7 +578,7 @@ The OpenCode v2 lane is a full first-class worker:
   cancel envelopes are keyed by `task_id` in a per-connection map and kill
   the pebble subprocess (`Outcome::Cancelled` → `task_result` `cancelled`).
 
-### Kimi Worker and OpenCode Pins (goals 10, 12, 13)
+### Kimi Worker and OpenCode Pins (goals 12, 36)
 
 - kimi-code `0.42.0` → `0.43.0` → `0.43.1` → **`2.0.2`** (adopted
   2026-09-21; npm `latest`; package-lock integrity matches the npm registry
@@ -545,7 +588,7 @@ The OpenCode v2 lane is a full first-class worker:
   contract test for 2.x behavior (provider-connection retries with backoff
   instead of exit 0; `--yolo` still rejected alongside `-p`; seeded minimal
   config so model resolution succeeds in clean image builds).
-- **Headless permission contract (WI#195, goal 10).** The worker's default
+- **Headless permission contract (WI#195).** The worker's default
   permission mode moved yolo → auto and both entrypoint modes export
   `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (operator-overridable) so headless
   `-p` runs no longer stall on interactive prompts. A real-CLI contract test
@@ -587,7 +630,7 @@ The OpenCode v2 lane is a full first-class worker:
   regressions remain disqualifying. Pebble remains at upstream HEAD
   `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`.
 
-### CI/CD Improvements (goals 28, 21)
+### CI/CD Improvements (goals 5, 21, 28)
 
 - Giant-crate compile concurrency is runner-managed: the project-wide
   `rust-compile-16gb` resource-group serialization trialled during the
@@ -610,6 +653,11 @@ The OpenCode v2 lane is a full first-class worker:
   them. The fixtures now ship into the builder stage (master `43eb871d3`),
   and the full gate re-verified green end-to-end from a clean state
   mirroring the Dockerfile builder context (53/53).
+- The `rust-clippy-all` gate (zero-warning policy, `-D warnings`) failed on
+  the WI#188 retry regression tests — two shadowed duplicate `store`
+  bindings and an unneeded `mut` in `runtime/mission.rs` tests. The dead
+  bindings were removed and the gate restored to green (`36e5a8197`,
+  goal 5).
 
 ### Version Bumps and Supply Chain (goal 1)
 
@@ -638,7 +686,21 @@ see `project`/`title`/etc. without needing the tool_info hint. Registry
 to move when tool sources change — hence the 0.1.5 bump rather than a no-op
 realigned 0.1.4.
 
-### Approval Delivery and Gate Recovery (goal 31, work item #164)
+### GitLab WASM Always-Allow Grants Unified (goal 13)
+
+"Always allow" for the GitLab WASM tool did not work in all cases: the
+persisted permission key was written as `gitlab_tool` in some paths and
+`gitlab-tool` in others, so a grant recorded under one spelling was not
+honored when the tool registered under the other (across both legacy chat
+and Engine V2). Both paths now share one canonical key while still reading
+historical grants under either spelling — including session-only mode —
+and an independently registered tool with the colliding name can no longer
+inherit a grant meant for the GitLab tool. Diagnosis, security boundaries,
+and live-tenant acceptance steps are in
+`docs/ops/v2.1.2.0_GOAL13_GITLAB_ALWAYS_ALLOW.md`. Live-tenant
+confirmation of the installed GitLab WASM tool remains for the operator.
+
+### Approval Delivery and Gate Recovery (work item #164)
 
 Authenticated pending-gate recovery with race-safe browser reconciliation;
 resolved auto-approve configuration with legacy env alias/diagnostics;
@@ -672,8 +734,23 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   on the next lifecycle pass. The kimi mt-admin harness derives the pinned
   CLI version instead of hard-coding it, so pin bumps can no longer leave
   the assertion stale.
+- **Worker stop now goes through the owning systemd unit (goal 10).** On
+  systemd + rootless hosts, `stop_tenant_kimi` stops the Quadlet
+  `lunarwing-kimi-<t>.service` user unit first (with a container-stop
+  fallback) instead of stopping the container directly — a bare container
+  stop under a live unit is resurrected by the quadlet's `Restart=on-failure`,
+  so stop-tenant/upgrade-tenant could previously leave the kimi worker
+  running. This is the WI#128 pebble contract applied to kimi. A parity
+  sweep found the identical gap in `stop_tenant_opencode`,
+  `stop_tenant_opencode2`, and `stop_tenant_postgres` (its quadlet has
+  `Restart=on-failure` too); all received the same unit-first branch.
+  Vision/voice sidecars and the full-tenant path already stopped their
+  units first. Regression coverage:
+  `test_worker_quadlet_stop_parity` in
+  `ic/scripts/tests/test-mt-admin-worker-lifecycle.sh` asserts unit-first
+  stop + container fallback for kimi/opencode/opencode2.
 
-### Documentation Parity (goals 38, 42, 43, 45, 46, 47, 49)
+### Documentation Parity (goals 41, 45, 46, 48, 49, 50, 52)
 
 - All 31 current guides revalidated against the 2.1.2.0 tree;
   `MT-ADMIN-QUICKSTART` gained `fix-podman-userns`; `ENABLING_DEV_TOOLS`
@@ -687,7 +764,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - `MULTITENANCY-PRODUCTION` port blocks now cover the v15 LunarVoice, v16
   health_metrics, and v17 opencode2 blocks; `TENANT-CONFIGURATION` registry
   schema corrected to v17.
-- Goal 47 (guides repass) and goal 49 (architecture repass) revalidated all
+- Goal 50 (guides repass) and goal 52 (architecture repass) revalidated all
   current docs against the WI#179/181/180/154/155 hardening and worker-pin
   changes; `TESTING_GUIDE` gained the three sandbox network modes and the
   opencode2 worker lane; `MT-ADMIN-QUICKSTART` gained
@@ -696,7 +773,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   WI#206: the kimi lane no longer mounts the agent socket);
   `SELF_HEAL_*` docs
   carry the WI#180 parity subsections.
-- Goal 46 (open work items audit repass, 2026-09-22) re-queried the live
+- Goal 49 (open work items audit repass, 2026-09-22) re-queried the live
   tracker — every open item's body and full comment thread — and rewrote
   `docs/ops/v2.1.2.0_OPEN_WORK_ITEMS_STATUS.md` with the 27-item
   disposition table; all fourteen items from the 09-14 audit are closed.
@@ -771,6 +848,13 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
     (was 10), and interrupted mission fires retry automatically with
     exponential backoff (3 retries default; `max_retries=0` opts out per
     mission). Tenants with explicit `max_threads_per_day` are unaffected.
+16. **mt-admin worker stops now target the systemd unit.** On systemd +
+    rootless hosts, `stop-worker`/`stop` for the kimi, opencode, opencode2,
+    and postgres containers stop the owning Quadlet user unit first —
+    previously a bare container stop could be resurrected by the unit's
+    `Restart=on-failure`, leaving a worker running after a stop/upgrade.
+    No operator action is needed beyond the normal mt-admin update; the
+    behavior converges on the next lifecycle pass.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -783,7 +867,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - WI#155's `proxy-enforced` mode is implemented and gated; live docker-
   runtime e2e was not run on the dev VM (no docker). The acceptance file
   carries the exact commands for a runtime host.
-- Live release acceptance remains for goal 31 (WI#164 approval delivery) and
+- Live release acceptance remains for WI#164 (approval delivery) and
   goal 34 (WI#161 REPL argument integrity) fresh-tenant threads; evidence
   and limits are in their linked ops records. Goal 33's live acceptance
   (WI#162 shell truncation on fresh tenant `wi162verify`) completed
@@ -811,25 +895,21 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   (kimi-code 2.0.2 was adopted 2026-09-21 after the CLI contract gate
   proved the 2.x headless surface; if 2.x upstream regressions appear, the
   documented fallback is the last-proven 0.43.1 pin).
-- Mission retry (WI#188) carries two open HIGH follow-ups from the goal-9
-  commit audit (`docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`): F1 — the retry
-  re-fire path injects an internal `retry_attempt` key into the trigger
-  payload, leaking into mission meta-prompts and the persisted
-  `last_trigger_payload` despite the sufficient top-level metadata marker;
-  F2 — the at-least-once dedup release fires for every non-Completed
-  outcome including `GatePaused`, so an event redelivery during an approval
-  window can double-fire the mission. Both verified still present at
-  `ic/crates/lunarwing_engine/src/runtime/mission.rs` at release time; the
-  lower-severity audit findings (F3 restart-sweep ordering, F10 missing
-  retry params in the `mission_update` schema) are recorded in the audit
-  report.
-- Worker SSH-agent sockets can go stale after daemon-only restarts (the
-  bind-mount inode is captured at container creation, and voice/vision
-  consumer reloads do not recreate worker containers), with an unexplained
-  `Permission denied` on fresh binds — raised in cmc's WI#206 verification
-  comment and now tracked as its own follow-up. Incidental for the kimi
-  lane (the mount was removed), but it affects the lanes that still mount
-  the socket.
+- The goal-9 commit audit's four mission-retry findings
+  (`docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`: F1 `retry_attempt` payload
+  injection, F2 unscoped dedup release incl. `GatePaused`, F3 restart-sweep
+  ordering, F10 missing retry params in the `mission_update` schema) were
+  all remediated in-cycle at goal 38 before release; live tenant restart
+  acceptance of the recovery sweep remains an operator step
+  (`docs/ops/2.1.2_FINDINGS.md`).
+- The stale SSH-agent socket inode after daemon-only restarts was addressed
+  in goal 40 by mounting the socket's dedicated parent directory rather
+  than the socket file; existing worker containers switch mount shape on
+  their next lifecycle pass. The separately reported `Permission denied`
+  on fresh binds has not yet been confirmed fixed on a live tenant. The
+  directory is now explicitly `0o755` for worker traversal; verify the
+  fresh-bind and restart scenarios on a live tenant before closing that
+  residual (`docs/ops/2.1.2_FINDINGS.md`).
 - WI#159 (open): the engine event listener's terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
   for Research child threads — only Mission threads are filtered — so
@@ -859,16 +939,23 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - Sandbox cannot mount the tenant `env`/`state`/`run` directories, and
   workers no longer receive the full gateway bearer (WI#205, incl. the
   WI#209/#210/#211 review findings and WI#215 sibling derivation).
+- Worker SSH-agent stale-inode fix: the agent socket lives in a
+  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts (not the
+  socket file), so a fresh daemon-bound inode resolves at connect time and
+  the `ssh-agent-dir` launch contracts recreate legacy file-mounted worker
+  containers on their next lifecycle pass (item 40 / WI#206 stale-socket
+  follow-up; live-tenant validation remains outstanding).
 - Interrupted mission fires retry with backoff and survive daemon restarts;
-  event/webhook delivery is at-least-once (WI#188 — two HIGH audit
-  follow-ups carried: `retry_attempt` payload injection and unscoped dedup
-  release incl. `GatePaused`). Daily mission budget
-  defaults to 30 (WI#189); mission tools reject nameless/goalless creates
-  and expose `current_focus` (WI#203).
+  event/webhook delivery is at-least-once (WI#188; the goal-9 audit's
+  follow-ups F1/F2/F3/F10 were remediated in-cycle at goal 38). Daily
+  mission budget defaults to 30 (WI#189); mission tools reject
+  nameless/goalless creates and expose `current_focus` (WI#203).
 - Fresh tenants receive only the seven product skills, not contributor
   workflows (WI#185).
 - GitLab WASM tool no longer collapses to the bare `action` discriminator
-  under schema compaction (WI#150).
+  under schema compaction (WI#150), and its "always allow" grants now work
+  across both permission-key spellings in legacy chat and Engine V2
+  (goal 13).
 - Health pipeline: eight WI#180 findings plus six review findings fixed;
   runtime/knowledge are monitor-only diagnostics that escalate without
   restarts (WI#180).

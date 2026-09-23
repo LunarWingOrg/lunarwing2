@@ -894,16 +894,16 @@ start_tenant() {
     migrate_owner_scope "$name" || say "WARNING: owner-scope migration failed (run 'migrate-owner-scope $name' manually)"
   fi
 
-  # Pre-create the SSH agent socket path so podman can bind-mount it into
-  # worker containers. The daemon creates the actual Unix socket here at
-  # startup; without a pre-existing path, podman would create it as a
-  # directory (breaking the daemon's socket bind). A touch-file is safe —
-  # the daemon removes it and binds the real socket.
-  local ssh_socket_path
-  ssh_socket_path="$(tenant_run_dir "$name")/ssh-agent.sock"
-  if [[ ! -S "$ssh_socket_path" ]]; then
-    sudo -u "$name" mkdir -p "$(tenant_run_dir "$name")" 2>/dev/null || true
-    sudo -u "$name" touch "$ssh_socket_path" 2>/dev/null || true
+  # Pre-create the SSH agent socket DIRECTORY so podman can bind-mount it into
+  # worker containers. The daemon creates the actual Unix socket inside it at
+  # startup; mounting the directory (not the socket file) means workers resolve
+  # the socket fresh at connect time, so daemon restarts no longer leave them
+  # pinned to a dead inode. 0o755 so worker UIDs (which differ from the
+  # daemon's) can traverse to the 0o666 socket.
+  local ssh_agent_dir
+  ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
+  if [[ ! -d "$ssh_agent_dir" ]]; then
+    sudo -u "$name" mkdir -p -m 755 "$ssh_agent_dir" 2>/dev/null || true
   fi
 
   # Existing tenants may predate SSH_API_TOKEN. Backfill before daemon start so
@@ -917,11 +917,11 @@ start_tenant() {
       || die "failed to provision SSH API credential for tenant '$name'"
   fi
 
-  # Start the daemon BEFORE the workers so the SSH agent socket exists when
-  # the worker containers are created (podman bind-mounts the file at creation
-  # time; if the socket doesn't exist yet, the mount is a stale touch-file).
-  # The daemon's SSH agent creates the real Unix socket at
-  # <run_dir>/ssh-agent.sock, which the workers bind-mount.
+  # Start the daemon before the workers so the SSH agent socket exists when
+  # the worker containers are created. The daemon's SSH agent creates the
+  # socket at <run_dir>/ssh-agent/ssh-agent.sock; the workers bind-mount the
+  # containing DIRECTORY, so they pick up a fresh daemon-created inode at
+  # connect time and never sit on a stale one.
   start_tenant_postgres "$name"
   start_tenant_vision "$name"
   start_tenant_voice "$name"
@@ -940,8 +940,9 @@ start_tenant() {
   # Upload the staged SSH key to the secrets store (if one was provisioned by
   # add-tenant but not yet uploaded), BEFORE the workers start. If a key was
   # actually ingested, bounce the daemon once so the agent loads it (keys are
-  # only read from the secrets store at startup); the workers then bind-mount
-  # the post-bounce socket inode, so they are never left on a stale socket.
+  # only read from the secrets store at startup). Workers mount the agent
+  # socket's parent directory, so the post-bounce socket inode is picked up
+  # at connect time — no worker recreate is needed.
   warn_if_sshd_unreachable "$name"
   if [[ -f "$staged_key" ]]; then
     upload_tenant_ssh_key "$name" \

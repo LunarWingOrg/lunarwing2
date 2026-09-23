@@ -55,7 +55,7 @@ provisioning may have different disk behavior.
 │                                       ▼                                         │
 │                             SshAgentServer  ──► russh::keys agent protocol     │
 │                             Unix socket at                                      │
-│                     /home/<tenant>/lunarwing/run/ssh-agent.sock                 │
+│                /home/<tenant>/lunarwing/run/ssh-agent/ssh-agent.sock        │
 │                                       ▲                                         │
 │   HTTP mgmt API  (/hosts, /agent) ────┘  (mounted into the webhook server)      │
 └───────────────────────────────────────┬─────────────────────────────────────────┘
@@ -170,11 +170,14 @@ does **not** check that a key secret exists (keys may be uploaded later).
 `start_agent_server()`:
 
 1. Computes the socket path
-   **`/home/<tenant_name>/lunarwing/run/ssh-agent.sock`**.
+   **`/home/<tenant_name>/lunarwing/run/ssh-agent/ssh-agent.sock`**.
    This is deliberately **not** in `/tmp`: the daemon runs with
    `PrivateTmp=true`, so a `/tmp` socket would be invisible to podman workers
-   and could not be bind-mounted. The `mt-admin` script predicts this exact
-   path.
+   and could not be bind-mounted. It also lives in a **dedicated `ssh-agent/`
+   subdirectory** of the run dir, not directly in `run/`: `mt-admin` mounts
+   that directory into workers (see §4.3), and `run/` itself also holds the
+   daemon's REPL control socket `lunarwing.sock`, which workers must not
+   reach. The `mt-admin` script predicts this exact path.
 2. For each configured host, derives the secret name
    `ssh_key_<sanitized-host>` (non-alphanumerics → `_`), calls
    `secrets_store.get_decrypted(tenant_name, secret_name)`, copies the bytes
@@ -182,6 +185,9 @@ does **not** check that a key secret exists (keys may be uploaded later).
    and builds an `SSHCredentials`. **Fail-soft:** a missing or unreadable key is
    logged and skipped; the agent still starts for the remaining hosts.
 3. `SshAgentServer::start(socket_path, keys)`:
+   - creates the socket's parent directory if missing and chmods it `0o755`
+      (the daemon unit runs with `UMask=0077`, and a daemon-created `0700`
+      directory would block worker UIDs from traversing to the socket);
    - removes any stale socket, `UnixListener::bind`, then **chmods the socket
       `0o666`** so the worker's OS user (different from the daemon UID) can
       read/write it;
@@ -215,23 +221,32 @@ socket pre-creation and daemon-first ordering live in
 `mt-admin-lib/09-worker-config.sh`, and the unit-level mounts in
 `mt-admin-lib/07-units-systemd.sh` / `08-units-openrc.sh`):
 
-1. **Pre-create** the socket path as a touch-file before the daemon starts, so
-   podman does not materialize it as a directory.
-2. **Start the daemon first** — it removes the touch-file and binds the real
-   socket.
+1. **Pre-create** the socket directory (`run/ssh-agent`, mode 0755) before the
+   daemon starts, so podman can bind-mount it even before the first socket
+   exists.
+2. **Start the daemon first** — it creates the directory if missing and binds
+   the real socket inside it.
 3. If `add-tenant` left `env/ssh_key_staged`, upload it to the local SSH API.
    A successful upload deletes that staging copy, then mt-admin restarts the
    daemon and waits for its gateway so `start_agent_server()` loads the key into
    russh's signing keystore. Before daemon start, mt-admin preserves or
    atomically backfills the tenant's dedicated `SSH_API_TOKEN`; an upload
    failure retains the staged key and stops startup before workers launch.
-4. **Start workers only after that restart**, each with the current socket inode
-   bind-mounted and `SSH_AUTH_SOCK` set (including generated container service
-   definitions):
+4. **Start workers** with the socket **directory** bind-mounted and
+   `SSH_AUTH_SOCK` set (including generated container service definitions):
 
    ```
-   -v <run_dir>/ssh-agent.sock:/tmp/ssh-agent.sock:z -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
+   -v <run_dir>/ssh-agent:/tmp/ssh-agent:z -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
    ```
+
+   Mounting the directory — not the socket file — is the fix for the stale
+   inode defect: a daemon restart binds a **fresh socket inode** at the same
+   path, while a file-mount keeps the worker pinned to the old, dead inode
+   until the container is recreated. With the directory mount the worker
+   resolves `ssh-agent.sock` fresh at connect time, so a daemon-only restart
+   self-heals. The launch contracts (`OPENCODE_/OPENCODE2_/PEBBLE_ROOTLESS_LAUNCH_CONTRACT`,
+   marker `ssh-agent-dir`) force-recreate containers still carrying the legacy
+   file mount.
 
 Inside the container, ordinary `git` and `ssh` read `SSH_AUTH_SOCK` and talk the
 agent protocol back to the daemon. `<run_dir>` resolves to

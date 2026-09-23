@@ -1272,9 +1272,9 @@ start_tenant_opencode() {
     local host_health_port
     host_health_port="$(ports_get "$name" opencode_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
-    local ssh_agent_socket
-    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
-    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+    local ssh_agent_dir
+    ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
+    local -a ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
@@ -1455,9 +1455,9 @@ start_tenant_opencode2() {
     local host_health_port
     host_health_port="$(ports_get "$name" opencode2_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
-    local ssh_agent_socket
-    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
-    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+    local ssh_agent_dir
+    ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
+    local -a ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
@@ -1830,19 +1830,19 @@ start_tenant_pebble() {
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
-    if _container_config_changed "$name" "$container_name" "$env_file_for_hash"; then
+    if _container_config_changed "$name" "$container_name" "$env_file_for_hash" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT"; then
       say "config changed for $container_name; force-recreating"
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
     elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "pebble worker already running ($container_name, WSS port $wss_port)"
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
+      _store_container_hash "$name" "$container_name" "$env_file_for_hash" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT"
       _register_worker_unit "$name" pebble
       return 0
     else
       say "starting existing pebble worker container $container_name"
       _ctr "$name" start "$container_name" >/dev/null
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
+      _store_container_hash "$name" "$container_name" "$env_file_for_hash" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT"
       _register_worker_unit "$name" pebble
       say "pebble worker ready ($container_name, WSS port $wss_port)"
       return 0
@@ -1885,11 +1885,12 @@ start_tenant_pebble() {
     host_health_port="$(ports_get "$name" pebble_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
     # SSH agent socket (always included — daemon creates it at startup).
-    # :z label for SELinux (Enforcing on Fedora).
+    # Directory mount so daemon restarts self-heal (fresh socket inode is
+    # resolved at connect time). :z label for SELinux (Enforcing on Fedora).
     local -a ssh_mount=()
-    local ssh_agent_socket
-    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
-    ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+    local ssh_agent_dir
+    ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
+    ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
@@ -1906,7 +1907,7 @@ start_tenant_pebble() {
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
       lunarwing-worker-pebble:latest >/dev/null
-    _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env"
+    _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT"
   fi
 
   _register_worker_unit "$name" pebble

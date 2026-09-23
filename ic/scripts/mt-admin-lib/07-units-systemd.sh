@@ -462,19 +462,25 @@ render_worker_quadlet() {
   tz_key="${tz_key//%/%%}"
 
   # SSH agent socket: the gateway creates an SSH agent server at startup,
-  # with its socket at <tenant_home>/lunarwing/run/ssh-agent.sock (NOT /tmp,
-  # because the daemon runs with PrivateTmp=true — a /tmp socket would be
-  # invisible to podman containers). Non-kimi workers always include the
-  # volume mount + env var in the quadlet, even if the socket doesn't exist
-  # yet at render time — the daemon creates it before the worker needs it
-  # (workers only use SSH when a create_job with SSH commands is invoked,
-  # well after startup). If SSH is not configured for the tenant, the socket
-  # simply won't exist and SSH commands from the worker will fail with a
-  # clear "no agent" error. The kimi lane no longer mounts it (WI#206): it
-  # is an auto-approved headless executor, and forwarded host credentials
-  # are an unacceptable blast radius there.
-  local ssh_agent_socket
-  ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+  # with its socket at <tenant_home>/lunarwing/run/ssh-agent/ssh-agent.sock
+  # (NOT /tmp, because the daemon runs with PrivateTmp=true — a /tmp socket
+  # would be invisible to podman containers; and in a dedicated run/ssh-agent/
+  # subdir so mounting the directory exposes ONLY the agent — run/ also holds
+  # the daemon's REPL control socket lunarwing.sock, which workers must not
+  # reach). Non-kimi workers always include the DIRECTORY mount + env var in
+  # the quadlet, even if the socket doesn't exist yet at render time — the
+  # daemon creates it before the worker needs it (workers only use SSH when a
+  # create_job with SSH commands is invoked, well after startup). Workers
+  # resolve the socket fresh at connect time, so a daemon restart that binds
+  # a new socket inode needs NO worker recreate (the stale-inode fix; the
+  # file-mount shape pinned the dead inode until recreation). If SSH is not
+  # configured for the tenant, the socket simply won't exist and SSH commands
+  # from the worker will fail with a clear "no agent" error. The kimi lane
+  # does not mount it at all (WI#206): it is an auto-approved headless
+  # executor, and forwarded host credentials are an unacceptable blast radius
+  # there.
+  local ssh_agent_dir
+  ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
   local study_notes_home="" study_notes_state_home="" study_notes_allow_write=""
   if [[ "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
     study_notes_home="$(tenant_study_notes_home "$name")"
@@ -534,13 +540,15 @@ EOF
     if [[ "$worker" == "kimi" ]]; then
       printf 'SecurityOpt=no-new-privileges\n'
     else
-      # SSH agent socket mount + env (always included — the daemon creates the
-      # socket at startup; if SSH isn't configured, the socket won't exist and
-      # SSH commands from the worker will fail with a clear "no agent" error).
-      # :z label so SELinux (Enforcing on Fedora) permits container_t access to
-      # the tenant-home-labeled socket.
-      printf 'Volume=%s:/tmp/ssh-agent.sock:z\n' "$ssh_agent_socket"
-      printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent.sock\n'
+      # SSH agent DIRECTORY mount + env (always included — the daemon creates
+      # the socket at startup; if SSH isn't configured, the socket won't exist
+      # and SSH commands from the worker will fail with a clear "no agent"
+      # error). Mounting the directory (not the socket file) means a daemon
+      # restart's fresh socket inode is picked up automatically — no worker
+      # recreate needed. :z label so SELinux (Enforcing on Fedora) permits
+      # container_t access to the tenant-home-labeled directory.
+      printf 'Volume=%s:/tmp/ssh-agent:z\n' "$ssh_agent_dir"
+      printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock\n'
     fi
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so
     # the host self-heal pipeline can probe the worker directly. Container still
