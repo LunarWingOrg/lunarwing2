@@ -902,15 +902,14 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   all remediated in-cycle at goal 38 before release; live tenant restart
   acceptance of the recovery sweep remains an operator step
   (`docs/ops/2.1.2_FINDINGS.md`).
-- Worker SSH-agent sockets can go stale after daemon-only restarts (the
-  bind-mount inode is captured at container creation, and voice/vision
-  consumer reloads do not recreate worker containers), with an unexplained
-  `Permission denied` on fresh binds — raised in cmc's WI#206 verification
-  comment and now tracked as its own follow-up (goal 40, open at release;
-  the preferred fix shape is mounting the socket's parent directory so
-  workers resolve a fresh inode at connect time). Incidental for the kimi
-  lane (the mount was removed), but it affects the lanes that still mount
-  the socket.
+- The stale SSH-agent socket inode after daemon-only restarts was addressed
+  in goal 40 by mounting the socket's dedicated parent directory rather
+  than the socket file; existing worker containers switch mount shape on
+  their next lifecycle pass. The separately reported `Permission denied`
+  on fresh binds has not yet been confirmed fixed on a live tenant. The
+  directory is now explicitly `0o755` for worker traversal; verify the
+  fresh-bind and restart scenarios on a live tenant before closing that
+  residual (`docs/ops/2.1.2_FINDINGS.md`).
 - WI#159 (open): the engine event listener's terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
   for Research child threads — only Mission threads are filtered — so
@@ -940,6 +939,12 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - Sandbox cannot mount the tenant `env`/`state`/`run` directories, and
   workers no longer receive the full gateway bearer (WI#205, incl. the
   WI#209/#210/#211 review findings and WI#215 sibling derivation).
+- Worker SSH-agent stale-inode fix: the agent socket lives in a
+  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts (not the
+  socket file), so a fresh daemon-bound inode resolves at connect time and
+  the `ssh-agent-dir` launch contracts recreate legacy file-mounted worker
+  containers on their next lifecycle pass (item 40 / WI#206 stale-socket
+  follow-up; live-tenant validation remains outstanding).
 - Interrupted mission fires retry with backoff and survive daemon restarts;
   event/webhook delivery is at-least-once (WI#188; the goal-9 audit's
   follow-ups F1/F2/F3/F10 were remediated in-cycle at goal 38). Daily
