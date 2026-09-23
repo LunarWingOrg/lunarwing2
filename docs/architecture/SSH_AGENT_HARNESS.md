@@ -236,7 +236,7 @@ socket pre-creation and daemon-first ordering live in
    `SSH_AUTH_SOCK` set (including generated container service definitions):
 
    ```
-   -v <run_dir>/ssh-agent:/tmp/ssh-agent:z -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
+   -v <run_dir>/ssh-agent:/tmp/ssh-agent:ro,z -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
    ```
 
    Mounting the directory — not the socket file — is the fix for the stale
@@ -244,9 +244,14 @@ socket pre-creation and daemon-first ordering live in
    path, while a file-mount keeps the worker pinned to the old, dead inode
    until the container is recreated. With the directory mount the worker
    resolves `ssh-agent.sock` fresh at connect time, so a daemon-only restart
-   self-heals. The launch contracts (`OPENCODE_/OPENCODE2_/PEBBLE_ROOTLESS_LAUNCH_CONTRACT`,
-   marker `ssh-agent-dir`) force-recreate containers still carrying the legacy
-   file mount.
+   self-heals. The read-only mount prevents a compromised worker from unlinking
+   the host socket and binding a fake agent for sibling workers; `connect(2)`
+   still uses the socket inode's `0o666` permission. Shared `:z` relabeling
+   continues to allow multiple worker containers to access the socket. The
+   bumped launch contracts (`OPENCODE_/OPENCODE2_/PEBBLE_ROOTLESS_LAUNCH_CONTRACT`,
+   marker `ssh-agent-dir-ro`) force-recreate imperative containers still
+   carrying the old writable mount, including rootful/OpenRC launches. A
+   changed Quadlet `Volume=` line forces recreation on systemd user managers.
 
 Inside the container, ordinary `git` and `ssh` read `SSH_AUTH_SOCK` and talk the
 agent protocol back to the daemon. `<run_dir>` resolves to

@@ -150,10 +150,10 @@ KNOWLEDGE_SYNC_SNAPSHOT_KEEP="${LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP:-5}"
 OPENCODE_CONTAINER_UID="10001"
 OPENCODE_CONTAINER_GID="10001"
 OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_GID}"
-# ssh-agent-dir: the worker now mounts the run/ssh-agent DIRECTORY (not the
-# socket file) so daemon restarts self-heal the stale-inode defect; bumping
-# the contract force-recreates containers still carrying the file mount.
-OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir"
+# ssh-agent-dir-ro: keep the restart-safe directory mount, but make it
+# read-only so workers cannot unlink/rebind the host agent socket (WI#226).
+# Bumping the contract recreates imperative containers still using RW mounts.
+OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro"
 
 KIMI_CONTAINER_UID="10002"
 KIMI_CONTAINER_GID="10002"
@@ -170,13 +170,12 @@ KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privile
 OPENCODE2_CONTAINER_UID="10003"
 OPENCODE2_CONTAINER_GID="10003"
 OPENCODE2_USERNS="keep-id:uid=${OPENCODE2_CONTAINER_UID},gid=${OPENCODE2_CONTAINER_GID}"
-# ssh-agent-dir: same directory-mount switch as the opencode lane above.
-OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir"
+# Same read-only directory mount and recreation contract as opencode.
+OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"
 
 # The pebble lane mounts the SSH agent directory like the other non-kimi
-# workers; the contract records the mount shape so existing containers
-# force-recreate off the old socket-file mount.
-PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir"
+# workers; bump the contract to recreate existing containers with RW mounts.
+PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"
 
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #
