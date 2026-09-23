@@ -40,7 +40,8 @@ lane (v2 line, pinned at v2.0.14 on a reviewed upstream commit) with a
 reproducible-build bridge over the `@opencode/client/promise` SDK, full
 mt-admin mirroring, CI/CD publication jobs, and its own ports-registry v17
 block; the kimi worker moved to the 2.x line (`2.0.2`) with a headless-safe
-permission contract and a deterministic CLI contract gate. The Pebble
+permission contract, a fail-closed PreToolUse command guard (work item #206),
+and a deterministic CLI contract gate. The Pebble
 worker confines daemon-supplied project directories to the
 workspace root and keeps its WebSocket read loop live so mid-task cancels
 finally land. Session secrets are scrubbed from sandboxed and direct
@@ -830,5 +831,6 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   serializing resource groups); opencode2
   publication jobs; ShellCheck 0.11.0 floor.
 - Worker pins updated: kimi-code 2.0.2 (with the WI#195 headless permission
-  contract and deterministic CLI contract gate), opencode2 v2.0.14, gitlab
+  contract, the WI#206 fail-closed PreToolUse command guard, and the
+  deterministic CLI contract gate), opencode2 v2.0.14, gitlab
   tool registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
