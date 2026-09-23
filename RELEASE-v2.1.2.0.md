@@ -653,6 +653,11 @@ The OpenCode v2 lane is a full first-class worker:
   them. The fixtures now ship into the builder stage (master `43eb871d3`),
   and the full gate re-verified green end-to-end from a clean state
   mirroring the Dockerfile builder context (53/53).
+- The `rust-clippy-all` gate (zero-warning policy, `-D warnings`) failed on
+  the WI#188 retry regression tests — two shadowed duplicate `store`
+  bindings and an unneeded `mut` in `runtime/mission.rs` tests. The dead
+  bindings were removed and the gate restored to green (`36e5a8197`,
+  goal 5).
 
 ### Version Bumps and Supply Chain (goal 1)
 
