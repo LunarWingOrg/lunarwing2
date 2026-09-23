@@ -16,7 +16,7 @@
 
 LunarWing v2.1.2.0 is an isolation, sandboxing, worker-contract, health
 system, and confabulation-hardening release — the largest goals checklist in
-the project's history at fifty items, worked by the widest herd yet. Its
+the project's history at fifty-four items, worked by the widest herd yet. Its
 headline work is the generic Podman-first agent-shell sandbox: daemonless
 per-command execution with fail-closed defaults, daemon-socket-free operation
 (works rootless and on OpenRC), non-root UID mapping, all capabilities
