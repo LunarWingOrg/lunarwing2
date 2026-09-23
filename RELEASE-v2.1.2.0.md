@@ -120,6 +120,17 @@ previous compatibility baseline.
   digest-bound reproducible contract. Pinned at `v2.0.14` on reviewed
   upstream commit `08462140ec0de1e4b17d4a353d8d5827f53cf7b0`; the v1 lane
   stays pinned at proven `v1.18.25` and remains the default.
+- **Kimi worker fail-closed headless policy (WI#206).** The pinned CLI's
+  print mode auto-approves commands and skips the upstream dangerous-command
+  guard, so the worker now enforces its own baked `PreToolUse` Bash guard —
+  privilege escalation, power/disk destruction, fork bombs,
+  curl-pipe-shell, recursive chmod/chown on system roots, block-device
+  writes, SSH-agent use, and `rm -rf` outside temp roots are denied with an
+  explicit reason; unparseable input denies. The guard config is
+  read-only in-container, re-injected over operator config overrides, and
+  its env-var bypass is scrubbed from every task environment. The tenant
+  SSH-agent socket is no longer mounted into the kimi lane and containers
+  run with `no-new-privileges`.
 - **Pebble worker confinement and live cancellation.** The Pebble worker
   now resolves and confines `project_dir` to the workspace root before
   dispatch (kimi's `resolveWorkspacePath` ported to Rust, with a
