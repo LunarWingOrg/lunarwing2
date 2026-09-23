@@ -178,8 +178,10 @@ previous compatibility baseline.
   3 retries, 60s initial delay, ×2 backoff, capped at 1h; `max_retries=0`
   disables). Retry state is durable on the failing thread's metadata and
   re-armed after daemon restart; event/webhook fires release their trigger
-  dedup key on non-completion so external redelivery can re-fire (at-least-
-  once). `MaxIterations` is deliberately never auto-retried.
+  dedup key on terminal non-completion so external redelivery can re-fire
+  (at-least-once; an approval-paused fire keeps its key, so redelivery
+  cannot double-fire — goal 38 audit fix). `MaxIterations` is deliberately
+  never auto-retried.
 - **Honest mission-tool parameters (WI#203).** `mission_create` rejects
   missing/non-string `name` and `goal` instead of silently minting "unnamed
   mission" or empty-goal missions; the manual-cadence default is logged; and
