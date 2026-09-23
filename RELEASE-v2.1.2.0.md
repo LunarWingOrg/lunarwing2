@@ -661,7 +661,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   CLI version instead of hard-coding it, so pin bumps can no longer leave
   the assertion stale.
 
-### Documentation Parity (goals 38, 42, 43, 45, 47, 49)
+### Documentation Parity (goals 38, 42, 43, 45, 46, 47, 49)
 
 - All 31 current guides revalidated against the 2.1.2.0 tree;
   `MT-ADMIN-QUICKSTART` gained `fix-podman-userns`; `ENABLING_DEV_TOOLS`
@@ -682,6 +682,13 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   `restart-worker <tenant> opencode2`; `SSH_AGENT_HARNESS`/
   `SSH_DELIVERY_MECHANISMS` cover all four worker types; `SELF_HEAL_*` docs
   carry the WI#180 parity subsections.
+- Goal 46 (open work items audit repass, 2026-09-22) re-queried the live
+  tracker — every open item's body and full comment thread — and rewrote
+  `docs/ops/v2.1.2.0_OPEN_WORK_ITEMS_STATUS.md` with the 27-item
+  disposition table; all fourteen items from the 09-14 audit are closed.
+  WI#206's contract is also documented in `docs/ops/WORKER-CONTAINERS.md`
+  (headless permission contract section) and the worker's own AGENTS.md
+  invariants.
 
 ## Upgrade Notes
 
