@@ -481,7 +481,7 @@ async fn persist_always_allow(state: &EngineState, pending: &PendingGate) {
         return;
     };
 
-    let key = format!("tool_permissions.{}", pending.action_name);
+    let key = crate::tools::permissions::permission_setting_key(&pending.action_name);
     let value = serde_json::to_value(crate::tools::permissions::PermissionState::AlwaysAllow)
         .unwrap_or_else(|_| serde_json::json!("always_allow"));
     match store.set_setting(&pending.user_id, &key, &value).await {
@@ -498,6 +498,12 @@ async fn persist_always_allow(state: &EngineState, pending: &PendingGate) {
 }
 
 async fn enable_always_allow(state: &EngineState, pending: &PendingGate) {
+    if matches!(pending.action_name.as_str(), "gitlab_tool" | "gitlab-tool")
+        && crate::tools::permissions::gitlab_permission_alias_conflict(state.effect_adapter.tools())
+            .await
+    {
+        return;
+    }
     state
         .effect_adapter
         .auto_approve_tool(&pending.user_id, &pending.action_name)

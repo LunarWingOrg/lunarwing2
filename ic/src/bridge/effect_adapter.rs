@@ -22,7 +22,6 @@ use lunarwing_engine::{
 use crate::bridge::auth_manager::{AuthCheckResult, AuthManager};
 use crate::context::JobContext;
 use crate::db::{Database, SettingsStore};
-use crate::extensions::naming::legacy_extension_alias;
 use crate::hooks::{HookEvent, HookOutcome, HookRegistry};
 use crate::tools::permissions::PermissionState;
 use crate::tools::rate_limiter::RateLimiter;
@@ -197,22 +196,38 @@ impl EffectBridgeAdapter {
         user_id: &str,
         lookup_name: &str,
     ) -> Option<PermissionState> {
+        let alias_conflict = matches!(lookup_name, "gitlab_tool" | "gitlab-tool")
+            && crate::tools::permissions::gitlab_permission_alias_conflict(&self.tools).await;
         let mut persisted = None;
         if let Some(store) = self.settings_store().await {
-            for key in permission_setting_keys(lookup_name) {
+            let mut keys = if alias_conflict {
+                vec![format!("tool_permissions.{lookup_name}")]
+            } else {
+                crate::tools::permissions::permission_setting_keys(lookup_name)
+            };
+            if let Some(alias) = crate::extensions::naming::legacy_extension_alias(lookup_name)
+                && !matches!(lookup_name, "gitlab_tool" | "gitlab-tool")
+            {
+                keys.push(format!("tool_permissions.{alias}"));
+            }
+            for key in keys {
                 match store.get_setting(user_id, &key).await {
                     Ok(Some(value)) => {
                         persisted = permission_state_from_value(&value);
+                        if alias_conflict && persisted == Some(PermissionState::AlwaysAllow) {
+                            persisted = Some(PermissionState::AskEachTime);
+                        }
                         break;
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        tracing::debug!(
+                        tracing::warn!(
                             user_id,
                             tool = lookup_name,
                             %error,
-                            "engine v2: failed to read persisted tool permission"
+                            "engine v2: failed to read persisted tool permission; denying grant"
                         );
+                        return None;
                     }
                 }
             }
@@ -220,6 +235,10 @@ impl EffectBridgeAdapter {
             // Configured settings storage is authoritative. A deleted grant
             // revokes any process-lifetime cache entry immediately.
             return persisted;
+        }
+
+        if alias_conflict {
+            return None;
         }
 
         if self
@@ -793,7 +812,12 @@ impl EffectBridgeAdapter {
             // call. Later calls enter with `approval_already_granted = false`
             // and are gated again by supervision.
             if context.supervised_mode && !approval_already_granted {
-                let allow_always = tool.allows_always_approval(&parameters);
+                let allow_always = tool.allows_always_approval(&parameters)
+                    && !(matches!(lookup_name, "gitlab_tool" | "gitlab-tool")
+                        && crate::tools::permissions::gitlab_permission_alias_conflict(
+                            &self.tools,
+                        )
+                        .await);
                 return Err(Self::gate_paused(
                     "approval",
                     action_name,
@@ -804,7 +828,10 @@ impl EffectBridgeAdapter {
                 ));
             }
 
-            let allow_always = tool.allows_always_approval(&parameters);
+            let allow_always = tool.allows_always_approval(&parameters)
+                && !(matches!(lookup_name, "gitlab_tool" | "gitlab-tool")
+                    && crate::tools::permissions::gitlab_permission_alias_conflict(&self.tools)
+                        .await);
             let user_auto_approved = permission_state == Some(PermissionState::AlwaysAllow);
             if !approval_already_granted
                 && requirement.needs_prompt_with_user_grant(
@@ -1337,14 +1364,6 @@ fn permission_state_from_value(value: &serde_json::Value) -> Option<PermissionSt
     serde_json::from_value(value.clone()).ok()
 }
 
-fn permission_setting_keys(tool_name: &str) -> Vec<String> {
-    let mut keys = vec![format!("tool_permissions.{tool_name}")];
-    if let Some(alias) = legacy_extension_alias(tool_name) {
-        keys.push(format!("tool_permissions.{alias}"));
-    }
-    keys
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1635,6 +1654,38 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     struct PersistableAlwaysApprovalTestTool;
+
+    struct NamedGitlabApprovalTestTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedGitlabApprovalTestTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "GitLab approval test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({"ok": true}),
+                std::time::Duration::ZERO,
+            ))
+        }
+
+        fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+            ApprovalRequirement::UnlessAutoApproved
+        }
+    }
 
     #[async_trait]
     impl Tool for PersistableAlwaysApprovalTestTool {
@@ -2482,6 +2533,143 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 })
             ),
             "persisted AlwaysAllow should bypass approval gate, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gitlab_permission_aliases_share_grant_and_canonical_revocation_wins() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(NamedGitlabApprovalTestTool("gitlab-tool")))
+            .await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.gitlab-tool",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .expect("legacy grant");
+        adapter
+            .set_settings_store(settings.clone() as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+        assert_eq!(
+            adapter
+                .tool_permission_state("test_user", "gitlab_tool")
+                .await,
+            Some(PermissionState::AlwaysAllow)
+        );
+        assert_eq!(
+            adapter
+                .tool_permission_state("test_user", "gitlab-tool")
+                .await,
+            Some(PermissionState::AlwaysAllow)
+        );
+        let context = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_gitlab_alias"));
+        let result = adapter
+            .execute_action("gitlab_tool", serde_json::json!({}), &lease(), &context)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Ok(ActionResult {
+                    is_error: false,
+                    ..
+                })
+            ),
+            "historical hyphen grant must allow canonical GitLab call: {result:?}"
+        );
+
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.gitlab_tool",
+                &serde_json::json!("ask_each_time"),
+            )
+            .await
+            .expect("canonical revocation");
+        assert_eq!(
+            adapter
+                .tool_permission_state("test_user", "gitlab-tool")
+                .await,
+            Some(PermissionState::AskEachTime)
+        );
+        let result = adapter
+            .execute_action("gitlab_tool", serde_json::json!({}), &lease(), &context)
+            .await;
+        assert!(
+            matches!(result, Err(EngineError::GatePaused { .. })),
+            "canonical revocation must restore the approval gate: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_gitlab_named_tools_do_not_share_permission_grants() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(NamedGitlabApprovalTestTool("gitlab_tool")))
+            .await;
+        tools
+            .register(Arc::new(NamedGitlabApprovalTestTool("gitlab-tool")))
+            .await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.gitlab_tool",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .expect("persist grant");
+        adapter
+            .set_settings_store(settings.clone() as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+        assert_eq!(
+            adapter
+                .tool_permission_state("test_user", "gitlab_tool")
+                .await,
+            Some(PermissionState::AskEachTime)
+        );
+        assert_eq!(
+            adapter
+                .tool_permission_state("test_user", "gitlab-tool")
+                .await,
+            None
+        );
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.gitlab-tool",
+                &serde_json::json!("disabled"),
+            )
+            .await
+            .expect("disable independent tool");
+        assert_eq!(
+            adapter
+                .tool_permission_state("test_user", "gitlab-tool")
+                .await,
+            Some(PermissionState::Disabled)
         );
     }
 
