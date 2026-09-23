@@ -48,7 +48,8 @@ and how to enable it.
 ## Mechanism 1 — Worker mode (Option 1)
 
 **What it is.** The agent creates a background job on an external worker
-(pebble/opencode/kimi/opencode2) with `create_job(mode="opencode", …)`. The worker
+(pebble/opencode/opencode2; the kimi lane no longer mounts the agent socket —
+WI#206) with `create_job(mode="opencode", …)`. The worker
 container has the harness's ssh-agent socket bind-mounted and `SSH_AUTH_SOCK`
 set, so ordinary `git`/`ssh` inside the container authenticate through the
 daemon's agent. Keys stay in the daemon; the worker only gets signing capability
