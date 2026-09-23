@@ -830,6 +830,12 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   comment and now tracked as its own follow-up. Incidental for the kimi
   lane (the mount was removed), but it affects the lanes that still mount
   the socket.
+- WI#159 (open): the engine event listener's terminal triggers
+  (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
+  for Research child threads — only Mission threads are filtered — so
+  event-triggered missions can self-sustain via their own research
+  children; with the WI#189 budget the blast radius is 30 spawns per day
+  per mission.
 
 ### Resolved or Source-Fixed Since v2.1.1.0
 
