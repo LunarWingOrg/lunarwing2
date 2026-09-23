@@ -29,7 +29,12 @@ tenant_quadlet_dir() { printf '%s/quadlets\n' "$fixture"; }
 tenant_run_dir() { printf '%s/run\n' "$fixture"; }
 tenant_exists_in_registry() { return 0; }
 _ctr() { return 1; }
-chown() { CHOWN_CALL="$*"; }
+chown() {
+  CHOWN_CALL="$*"
+  # Preserve real --reference ownership updates in the env-file fixture;
+  # workspace chowns are still intercepted below.
+  [[ "${1:-}" != --reference=* ]] || command chown "$@"
+}
 # CI containers run with no-new-privileges, so real sudo dies mid-harness;
 # strip the `-u <tenant>` prefix and run the wrapped command directly.
 sudo() {
@@ -183,9 +188,31 @@ LLM_API_KEY=llm%key
 OPENCODE2_MODEL=new-model
 OPENCODE2_BASE_URL=https://old.example/v1
 EOF
+# The admin runs as root but the env file belongs to the tenant. Simulate a
+# different file owner (as root) or group (as an unprivileged CI user) so a
+# mktemp-owned replacement cannot pass this check accidentally.
+command chmod 600 "$env_file"
+different_group=""
+for group in $(id -G); do
+  if [[ "$group" != "$(id -g)" ]]; then
+    different_group="$group"
+    break
+  fi
+done
+if [[ "$(id -u)" -eq 0 ]]; then
+  command chown 65534:65534 "$env_file"
+elif [[ -n "$different_group" ]]; then
+  command chgrp "$different_group" "$env_file"
+fi
+owner_before="$(stat -c '%u:%g' "$env_file")"
 render_worker_quadlet root opencode2 8443
 assert_contains "$env_file" 'WORKER_AUTH_TOKEN=' \
   'upgrade path persists a scoped WORKER_AUTH_TOKEN'
+if [[ "$(stat -c '%u:%g:%a' "$env_file")" == "$owner_before:600" ]]; then
+  pass 'scoped-token backfill preserves tenant env ownership and 0600 mode'
+else
+  fail 'scoped-token backfill changed tenant env ownership or mode'
+fi
 minted="$(sed -n 's/^WORKER_AUTH_TOKEN=//p' "$env_file" | tail -1)"
 if [[ -n "$minted" && "$minted" != "gate%token" ]]; then
   pass 'minted worker credential differs from the gateway bearer'

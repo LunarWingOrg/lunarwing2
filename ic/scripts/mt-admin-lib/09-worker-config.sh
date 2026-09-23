@@ -179,8 +179,9 @@ resolve_worker_auth_token() {
     return 0
   fi
 
-  # Mint and persist the scoped token. Requires a writable env file; the
-  # caller owns 0600 semantics (same as every other env write).
+  # Mint and persist the scoped token. Preserve the tenant's ownership when
+  # replacing the file: mt-admin runs as root, and a root-owned 0600 replacement
+  # cannot be read by the tenant's systemd user services.
   if [[ -w "$env_path" ]] && command -v mktemp >/dev/null 2>&1; then
     local fresh tmp
     fresh="$(generate_token)"
@@ -189,6 +190,7 @@ resolve_worker_auth_token() {
       if cat "$env_path" >"$tmp" 2>/dev/null \
         && printf 'WORKER_AUTH_TOKEN=%s\n' "$fresh" >>"$tmp" \
         && chmod 600 "$tmp" \
+        && chown --reference="$env_path" "$tmp" \
         && mv -f "$tmp" "$env_path"; then
         echo "WARNING: WORKER_AUTH_TOKEN was missing in $env_path; generated and persisted a scoped worker credential (WI#210)." >&2
         printf '%s' "$fresh"
