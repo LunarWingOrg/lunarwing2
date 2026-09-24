@@ -26,6 +26,7 @@ cron-wrapper.sh
   │     ├── health-netbird.sh          (opt-in host tunnel readiness)
   │     ├── health-runtime.sh          (tenant gateway/bridge runtime diagnostics)
   │     ├── health-knowledge.sh         (knowledge sync/sweep progress monitoring)
+  │     ├── health-pipeline.sh          (deployed-pipeline version/drift — WI#232)
   │     └── health-{systemd,openrc,launchd}.sh  (service manager — one, auto-detected)
   │
   └── lunarwing-self-heal.sh           (reads report → restarts → verifies → escalates)
@@ -156,6 +157,8 @@ checks can instead be **disabled** so they report `healthy` with
 | `HEALTH_LLM_STREAMS_ISSUE_WINDOW_SECS` | health-llm-streams.sh | `900` | A retry, abort, decode failure, or corruption observed this many seconds ago makes the monitor-only component degraded |
 | `HEALTH_LLM_STREAMS_FILE` | health-llm-streams.sh | _(unset)_ | Test/single-target snapshot override; normal MT operation discovers tenant state paths from `SELF_HEAL_TENANTS_FILE` |
 | `HEALTH_LUNARVISION_ENABLED` | health-lunarvision.sh | `true` | Non-`true` disables (reports healthy/disabled) |
+| `HEALTH_PIPELINE_CHECK_ENABLED` | health-pipeline.sh | `true` | Non-`true` disables the deployed-pipeline drift check (reports healthy/disabled) |
+| `HEALTH_PIPELINE_EXPECTED_VERSION` | health-pipeline.sh | written by mt-admin | Content-hash of the tree the deploy came from; a mismatch with the deployed scripts' live hash degrades the report (WI#232). Unset/absent also degrades (provenance unrecorded) until the next `upgrade-tenant`/`enable-health-fleet.sh` refresh. |
 | `HEALTH_LUNARVISION_URL` | health-lunarvision.sh | _(unset)_ → each registry tenant's external HTTPS origin or local `vision_health` port, else `http://127.0.0.1:8089` | Optional single-URL override targeting a listener that serves `/health` and `/vision/metrics`. On multi-tenant hosts leave unset so mixed local/external targets are discovered from the ports registry. |
 | `HEALTH_LUNARVISION_TIMEOUT` | health-lunarvision.sh | `5` | curl timeout (seconds) for `/health` and `/vision/metrics` |
 | `HEALTH_LUNARVISION_FETCH_METRICS` | health-lunarvision.sh | `true` | Also probe `/vision/metrics` for request counts, cache stats, rate limiting |
@@ -256,6 +259,23 @@ and retains `/health` only as a pre-v10 compatibility alias. Only set
 
 Put these in a shared env file (e.g. `/etc/lunarwing/health.env`) loaded by the
 timer/cron unit so every run picks them up.
+
+## Deployed pipeline versioning (WI#232)
+
+The scheduled pipeline runs from a deployed copy (`/usr/local/lib/lunarwing-health/`),
+installed and refreshed by `lunarwing-mt-admin.sh`'s `ensure_health_pipeline`
+(`add-tenant` and, since WI#232, every `upgrade-tenant` refresh it — a deploy
+frozen at the tenant's birth was the latent-drift hazard behind WI#225/WI#228).
+The installer stamps the deployed copy with a content hash of the scripts it
+synced (`.pipeline-version`) and records the same hash as
+`HEALTH_PIPELINE_EXPECTED_VERSION` in `/etc/lunarwing/health.env` (operator edits
+to that file are preserved; only the one line is reconciled).
+
+`health-pipeline.sh` compares the deployed scripts' live hash against that stamp
+every run and degrades the report on any mismatch — a deploy that skipped the
+refresh, a hand-edited `/usr/local/lib` file, a pre-WI#232 deploy with no stamp
+at all (upgrade it with `upgrade-tenant` or `enable-health-fleet.sh` to refresh
+and stamp it). Drift is monitor-only in self-heal: it pages, it never restarts.
 
 ## Report Output
 
@@ -368,6 +388,15 @@ rate, report staleness) plus unit/self-heal alerting.
 7. **Tracks state** in `$LUNARWING_BASE_DIR/workspace/reports/self-heal/state.json`,
    clears any service the latest report calls healthy ("report as truth"), and
    auto-prunes stale, non-escalated entries.
+8. **Gates tenant-unit remediation on tenant lifecycle** (WI#231): before
+   restarting a tenant-scoped unit, self-heal verifies the tenant is STARTED —
+   its primary daemon `lunarwing-<tenant>` observed active — or the unit itself
+   is in a fault state (systemd `SubState`/`ActiveState` failed/auto-restart,
+   OpenRC `rc-service status` reporting `crashed`). A deliberately-stopped
+   tenant's inactive units are never remediated and never accumulate
+   retries/escalations. The gate fails OPEN on inconclusive probes (unresolvable
+   tenant user, wedged bus, registry gap): a broken probe degrades to the old
+   behavior rather than masking a real outage.
 
 A single-instance `flock` guard (fd 200) prevents overlapping runs; the lock fd
 is closed across restarts so a long-lived `supervise-daemon` can't inherit and
@@ -386,6 +415,7 @@ wedge it.
 | netbird | `netbird` (monitor-only unless explicitly delegated) | health-netbird.sh |
 | runtime | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `runtime@<tenant>`; escalates with tenant attribution, never restarts | health-runtime.sh |
 | knowledge | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `knowledge@<tenant>`; escalates with tenant attribution, never restarts | health-knowledge.sh |
+| pipeline | _(none — monitor-only)_ deployed-pipeline drift; escalates with a version-mismatch issue, never restarts (WI#232) | health-pipeline.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
 `runtime`/`knowledge` failures become synthetic monitor-only targets: a failing
