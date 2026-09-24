@@ -1849,11 +1849,13 @@ doctor() {
     _check "opencode worker image exists" docker image inspect lunarwing-worker-opencode:latest
     _check "kimi worker image exists" docker image inspect lunarwing-worker-kimi:latest
     _check "vision sidecar image exists" docker image inspect "$VISION_SIDECAR_IMAGE"
+    _check "sandbox image exists" docker image inspect "$SANDBOX_IMAGE_TAG"
   elif command -v podman >/dev/null 2>&1; then
     _check "pebble worker image exists" podman image inspect lunarwing-worker-pebble:latest
     _check "opencode worker image exists" podman image inspect lunarwing-worker-opencode:latest
     _check "kimi worker image exists" podman image inspect lunarwing-worker-kimi:latest
     _check "vision sidecar image exists" podman image inspect "$VISION_SIDECAR_IMAGE"
+    _check "sandbox image exists" podman image inspect "$SANDBOX_IMAGE_TAG"
   fi
 
   say ""
