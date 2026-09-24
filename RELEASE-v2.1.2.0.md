@@ -45,7 +45,11 @@ and a deterministic CLI contract gate. The Pebble
 worker confines daemon-supplied project directories to the
 workspace root and keeps its WebSocket read loop live so mid-task cancels
 finally land. Session secrets are scrubbed from sandboxed and direct
-workloads alike (work item #141).
+workloads alike (work item #141). Late-cycle mt-admin hardening closed the
+remaining operator-facing gaps: worker SSH-agent directory mounts are
+read-only (WI#226), the kimi Quadlet renders its security option in a
+generator-valid spelling, LunarVoice survives `upgrade-tenant` (WI#228/#229),
+and the scoped-token backfill preserves tenant env-file ownership.
 
 The host health pipeline was rebuilt for multi-tenant scale: a report
 model with staleness alerts, per-instance monitor-only diagnostic components
@@ -309,7 +313,10 @@ config directory exposed `lunarwing.env` (0600, readable through podman
   the gateway never accepts it. Legacy tenants converge via
   `upgrade_external_worker_auth_token()` on the next lifecycle pass
   (WI#210: it mints and persists the scoped token instead of silently
-  substituting the gateway bearer on the upgrade path).
+  substituting the gateway bearer on the upgrade path; a follow-up fix
+  preserves the tenant's ownership of `lunarwing.env` when the backfill
+  rewrites it — a root-owned replacement is unreadable by the tenant's
+  systemd user manager).
 - WI#209 review fixes: masking planning is existence-independent (a
   protected dir absent at plan time — e.g. `run/` on a fresh tenant — is
   still planned for masking), and an unresolvable mount root is a hard
@@ -969,12 +976,14 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   (`docs/ops/2.1.2_FINDINGS.md`).
 - The stale SSH-agent socket inode after daemon-only restarts was addressed
   in goal 40 by mounting the socket's dedicated parent directory rather
-  than the socket file; existing worker containers switch mount shape on
+  than the socket file (read-only since WI#226, so workers also cannot
+  unlink/rebind it); existing worker containers switch mount shape on
   their next lifecycle pass. The separately reported `Permission denied`
   on fresh binds has not yet been confirmed fixed on a live tenant. The
   directory is now explicitly `0o755` for worker traversal; verify the
-  fresh-bind and restart scenarios on a live tenant before closing that
-  residual (`docs/ops/2.1.2_FINDINGS.md`).
+  fresh-bind and restart scenarios (and a live worker `ssh-add -l` after
+  recreation) on a live tenant before closing that residual
+  (`docs/ops/2.1.2_FINDINGS.md`).
 - WI#159 (open): the engine event listener's terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
   for Research child threads — only Mission threads are filtered — so
