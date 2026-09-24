@@ -633,6 +633,23 @@ add_tenant() {
   fi
   say ""
 
+  # Generic sandbox image (WI#223): new tenants default to the lean
+  # lunarwing-sandbox image (written to lunarwing.env above), so build it if
+  # the admin store lacks it and distribute it into the tenant's rootless
+  # store. Non-fatal: a build failure leaves the sandboxed shell unavailable
+  # (commands fail with the structured sandbox error) but must not strand the
+  # base tenant; recovery: sudo $0 build-sandbox-image + start-tenant.
+  local sandbox_image_ok="built"
+  if ! "$CONTAINER_RT" image inspect "$SANDBOX_IMAGE_TAG" &>/dev/null; then
+    build_sandbox_image || sandbox_image_ok="needs recovery"
+  fi
+  if [[ "$sandbox_image_ok" == "built" ]] \
+      && ! ensure_tenant_sandbox_image "$name"; then
+    sandbox_image_ok="needs recovery"
+    say "WARNING: sandbox image $SANDBOX_IMAGE_TAG could not be made available to '$name'." >&2
+  fi
+  say ""
+
   say "--- Starting PostgreSQL ---"
   start_tenant_postgres "$name"
   say ""
@@ -687,6 +704,7 @@ add_tenant() {
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say "  weechat relay:    $weechat_bootstrap_ok"
   say "  study mcp:        $study_mcp_bootstrap_ok"
+  say "  sandbox image:    $sandbox_image_ok ($SANDBOX_IMAGE_TAG)"
   say ""
   say "Next steps:"
   say "  sudo $0 build-tenant $name --with-wasm"
