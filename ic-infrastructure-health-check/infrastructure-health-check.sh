@@ -134,6 +134,7 @@ run_check "health-lunarvoice.sh" "lunarvoice" > "$WORKDIR/check-lunarvoice.tmp" 
 run_check "health-netbird.sh" "netbird" > "$WORKDIR/check-netbird.tmp" 2> "$WORKDIR/log-netbird.tmp" &
 run_check "health-runtime.sh" "runtime" > "$WORKDIR/check-runtime.tmp" 2> "$WORKDIR/log-runtime.tmp" &
 run_check "health-knowledge.sh" "knowledge" > "$WORKDIR/check-knowledge.tmp" 2> "$WORKDIR/log-knowledge.tmp" &
+run_check "health-pipeline.sh" "pipeline" > "$WORKDIR/check-pipeline.tmp" 2> "$WORKDIR/log-pipeline.tmp" &
 case "$SERVICE_MANAGER" in
   systemd) run_check "health-systemd.sh" "systemd" > "$WORKDIR/check-svcmgr.tmp" 2> "$WORKDIR/log-svcmgr.tmp" & ;;
   openrc)  run_check "health-openrc.sh"  "openrc"  > "$WORKDIR/check-svcmgr.tmp" 2> "$WORKDIR/log-svcmgr.tmp" & ;;
@@ -145,7 +146,7 @@ esac
 wait || true
 
 # Append logs to main log file
-for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird runtime knowledge svcmgr; do
+for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird runtime knowledge pipeline svcmgr; do
     [ -f "$WORKDIR/log-${comp}.tmp" ] && cat "$WORKDIR/log-${comp}.tmp" >> "$LOG_FILE" && rm -f "$WORKDIR/log-${comp}.tmp"
 done
 
@@ -163,6 +164,7 @@ check_lunarvoice=$(cat "$WORKDIR/check-lunarvoice.tmp" 2>/dev/null || echo)
 check_netbird=$(cat "$WORKDIR/check-netbird.tmp" 2>/dev/null || echo)
 check_runtime=$(cat "$WORKDIR/check-runtime.tmp" 2>/dev/null || echo)
 check_knowledge=$(cat "$WORKDIR/check-knowledge.tmp" 2>/dev/null || echo)
+check_pipeline=$(cat "$WORKDIR/check-pipeline.tmp" 2>/dev/null || echo)
 check_svcmgr=$(cat "$WORKDIR/check-svcmgr.tmp" 2>/dev/null || echo)
 
 # Cleanup temp files (the WORKDIR itself is removed by the EXIT trap)
@@ -182,6 +184,7 @@ components=(
     "$check_netbird"
     "$check_runtime"
     "$check_knowledge"
+    "$check_pipeline"
     "${check_svcmgr:-}"
 )
 
@@ -223,6 +226,7 @@ for comp in "$check_gateway" "$check_xmpp" \
     "$check_clickhouse" "$check_tensorzero" \
     "$check_models" "$check_llm_streams" \
     "$check_lunarvision" "$check_lunarvoice" "$check_netbird" "$check_runtime" "$check_knowledge" \
+    "$check_pipeline" \
     "${check_svcmgr:-}"; do
     if [ -n "$comp" ] && echo "$comp" | jq . >/dev/null 2>&1; then
         if [ -n "$components_json" ]; then

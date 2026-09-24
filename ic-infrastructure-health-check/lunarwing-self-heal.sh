@@ -456,6 +456,7 @@ declare -A NO_REMEDY=(
     [ratelimit]=1
     [models]=1
     [llm_streams]=1
+    [pipeline]=1
 )
 
 # Components where detection is useful but automatic restart is unsafe. These
@@ -464,6 +465,7 @@ declare -A MONITOR_ONLY=()
 MONITOR_ONLY[lunarvoice]=1
 MONITOR_ONLY[runtime]=1
 MONITOR_ONLY[knowledge]=1
+MONITOR_ONLY[pipeline]=1
 if [[ "$NETBIRD_REMEDIATE" != true ]]; then
     MONITOR_ONLY[netbird]=1
 fi

@@ -149,17 +149,22 @@ UNITEOF
 health_pipeline_tree_hash() {
   local dir="$1" digest
   [[ -d "$dir" ]] || return 1
+  # Each file is hashed from INSIDE the dir (via a subshell cd) so the digest
+  # stream carries bare basenames: hashing "$dir/$f" directly would embed the
+  # directory path in sha256sum's output and make the stamp differ between the
+  # source tree and the deployed copy of identical content. Sorted with
+  # LC_ALL=C for a stable order across hosts.
   if command -v sha256sum >/dev/null 2>&1; then
-    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | sort \
-      | while IFS= read -r f; do sha256sum "$dir/$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done \
+    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | LC_ALL=C sort \
+      | ( cd "$dir" && while IFS= read -r f; do sha256sum "$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done ) \
       | sha256sum)"
   elif command -v shasum >/dev/null 2>&1; then
-    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | sort \
-      | while IFS= read -r f; do shasum -a 256 "$dir/$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done \
+    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | LC_ALL=C sort \
+      | ( cd "$dir" && while IFS= read -r f; do shasum -a 256 "$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done ) \
       | shasum -a 256)"
   elif command -v openssl >/dev/null 2>&1; then
-    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | sort \
-      | while IFS= read -r f; do openssl dgst -sha256 "$dir/$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done \
+    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | LC_ALL=C sort \
+      | ( cd "$dir" && while IFS= read -r f; do openssl dgst -sha256 "$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done ) \
       | openssl dgst -sha256)"
   else
     return 1
@@ -172,14 +177,16 @@ health_pipeline_tree_hash() {
 # Stamp the DEPLOYED copy (post-sync) with the hash of the SOURCE tree it was
 # copied from. Written after cp -a so the stamp always matches what was just
 # laid down; a stale/absent stamp (pre-WI#232 deploy) is itself reportable drift.
+# Also exported as HEALTH_PIPELINE_STAMP for the env-file write/reconcile below
+# (the expected-version line the health check compares against).
 health_pipeline_stamp_tree() {
-  local stamp
-  stamp="$(health_pipeline_tree_hash "$HEALTH_SRC_DIR")" || {
+  HEALTH_PIPELINE_STAMP="$(health_pipeline_tree_hash "$HEALTH_SRC_DIR")" || {
+    HEALTH_PIPELINE_STAMP=""
     say "WARNING: could not hash health pipeline source ($HEALTH_SRC_DIR); skipping version stamp"
     return 0
   }
-  printf '%s\n' "$stamp" > "$HEALTH_LIB_DIR/.pipeline-version"
-  say "stamped pipeline version $stamp"
+  printf '%s\n' "$HEALTH_PIPELINE_STAMP" > "$HEALTH_LIB_DIR/.pipeline-version"
+  say "stamped pipeline version $HEALTH_PIPELINE_STAMP"
 }
 
 ensure_health_pipeline() {
@@ -253,6 +260,12 @@ SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 # Escalation notifications (fill in to enable Gotify pushes).
 GOTIFY_URL=$HEALTH_GOTIFY_URL
 GOTIFY_TOKEN=$HEALTH_GOTIFY_TOKEN
+
+# WI#232 G2: the content-hash of the tree this pipeline was deployed from.
+# health-pipeline.sh compares it against the deployed scripts' live hash and
+# degrades the report on mismatch, so a deploy that skips the refresh (or a
+# hand-edited /usr/local/lib file) becomes visible instead of latent.
+HEALTH_PIPELINE_EXPECTED_VERSION=$HEALTH_PIPELINE_STAMP
 ENVEOF
     )
     chmod 0600 "$HEALTH_ENV_FILE"
@@ -291,6 +304,22 @@ ENVEOF
       cat "$_tmp2" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
       rm -f "$_tmp2"
       say "reconciled SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY in $HEALTH_ENV_FILE"
+    fi
+    # Reconcile the expected pipeline version (WI#232 G2) with the tree this
+    # run just deployed. An upgrade that refreshed the deploy but left the old
+    # expected stamp would false-degrade forever; an operator's other edits are
+    # preserved — targeted one-line rewrite, same as above.
+    if ! grep -q "^HEALTH_PIPELINE_EXPECTED_VERSION=${HEALTH_PIPELINE_STAMP}$" "$HEALTH_ENV_FILE"; then
+      local _tmp3; _tmp3="$(mktemp)"
+      if grep -q '^HEALTH_PIPELINE_EXPECTED_VERSION=' "$HEALTH_ENV_FILE"; then
+        awk -v v="$HEALTH_PIPELINE_STAMP" '/^HEALTH_PIPELINE_EXPECTED_VERSION=/{print "HEALTH_PIPELINE_EXPECTED_VERSION=" v; next} {print}' "$HEALTH_ENV_FILE" > "$_tmp3"
+      else
+        cp "$HEALTH_ENV_FILE" "$_tmp3"
+        printf 'HEALTH_PIPELINE_EXPECTED_VERSION=%s\n' "$HEALTH_PIPELINE_STAMP" >> "$_tmp3"
+      fi
+      cat "$_tmp3" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
+      rm -f "$_tmp3"
+      say "reconciled HEALTH_PIPELINE_EXPECTED_VERSION in $HEALTH_ENV_FILE"
     fi
   fi
 
