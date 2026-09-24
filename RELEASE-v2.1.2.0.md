@@ -721,7 +721,7 @@ durable. Evidence: `docs/ops/v2.1.2.0_GOAL31_WI164_APPROVAL_DELIVERY.md`.
 Final live release acceptance for this thread is carried on the goals
 checklist.
 
-### REPL Argument Integrity (goal 34, work item #161)
+### REPL Argument Integrity (WI#161, pre-renumber goal 34)
 
 Fixed name-only/final argument assembly and CodeAct nested-fence
 truncation; added pre-execution REPL argument validation, a distinct
@@ -824,8 +824,9 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   changes; `TESTING_GUIDE` gained the three sandbox network modes and the
   opencode2 worker lane; `MT-ADMIN-QUICKSTART` gained
   `restart-worker <tenant> opencode2`; `SSH_AGENT_HARNESS`/
-  `SSH_DELIVERY_MECHANISMS` cover all four worker types (since corrected for
-  WI#206: the kimi lane no longer mounts the agent socket);
+  `SSH_DELIVERY_MECHANISMS` cover all four worker types (since corrected
+  for WI#206 — the kimi lane no longer mounts the agent socket — and
+  WI#226, which made the remaining mounts read-only directory mounts);
   `SELF_HEAL_*` docs
   carry the WI#180 parity subsections.
 - Goal 49 (open work items audit repass, 2026-09-22) re-queried the live
@@ -931,7 +932,8 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   runtime e2e was not run on the dev VM (no docker). The acceptance file
   carries the exact commands for a runtime host.
 - Live release acceptance remains for WI#164 (approval delivery) and
-  goal 34 (WI#161 REPL argument integrity) fresh-tenant threads; evidence
+  the WI#161 REPL argument-integrity fresh-tenant thread (originally goal 34
+  before the checklist tail was renumbered 2026-09-23); evidence
   and limits are in their linked ops records. Goal 33's live acceptance
   (WI#162 shell truncation on fresh tenant `wi162verify`) completed
   2026-09-18 and is not carried.
