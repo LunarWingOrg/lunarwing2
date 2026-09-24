@@ -1358,6 +1358,33 @@ stop_tenant_openrc() {
   # Postgres last: the daemon depends on it, so it stops after its consumers.
   _openrc_stop_service_if_installed "lunarwing-pg-${name}-sup" || stop_failed=true
   _openrc_stop_service "lunarwing-pg-${name}" || stop_failed=true
+  # WI#231 F2 (OpenRC parity): remove boot persistence for the stopped tenant's
+  # units. start_tenant's boot-enable pass re-adds them on the way up. Without
+  # this, a stopped tenant's units stay in the runlevel: health-openrc's
+  # tenant_started() (primary in a runlevel) classifies the tenant as started,
+  # its down units read critical, and self-heal resurrects them — the WI#225
+  # wiper. Removing the primary's runlevel entries flips tenant_started() to
+  # false, so the whole stopped tenant grades `skipped` (F3).
+  local disable_failed=false svc
+  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" \
+             "lunarwing-vision-${name}" "lunarwing-vision-${name}-sup" \
+             "lunarwing-voice-${name}" "lunarwing-voice-${name}-sup" \
+             "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}" \
+             "lunarwing-proxy-${name}" \
+             "lunarwing-darkirc-${name}" "lunarwing-darkirc-adapter-${name}" \
+             "lunarwing-pebble-${name}" "lunarwing-pebble-${name}-sup" \
+             "lunarwing-opencode-${name}" "lunarwing-opencode-${name}-sup" \
+             "lunarwing-opencode2-${name}" "lunarwing-opencode2-${name}-sup" \
+             "lunarwing-kimi-${name}" "lunarwing-kimi-${name}-sup"; do
+    if openrc_service_in_any_runlevel "$svc"; then
+      openrc_service_remove_runlevels "$svc" || disable_failed=true
+    fi
+  done
+  if [[ "$disable_failed" == true ]]; then
+    say "WARNING: failed to remove some runlevel entries for '$name' (WI#231 F2); self-heal may still see them" >&2
+  else
+    say "removed (WI#231 F2) runlevel persistence for $name's stopped services"
+  fi
   if [[ "$stop_failed" == true ]]; then
     say "OpenRC tenant shutdown completed with service stop errors for $name"
     return 1
@@ -1421,4 +1448,15 @@ openrc_service_remove_runlevels() {
     rc-update del "$svc" "$runlevel" >/dev/null 2>&1 \
       || { say "failed to remove $svc from OpenRC runlevel $runlevel" >&2; return 1; }
   done
+}
+
+# Is the service present in ANY runlevel? (boot persistence). Used by the
+# WI#231 F2 stop path so rc-update del only runs when there is something to
+# remove — keeping stop-tenant output quiet on never-started tenants.
+openrc_service_in_any_runlevel() {
+  local svc="$1" link
+  for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+    [[ -e "$link" || -L "$link" ]] && return 0
+  done
+  return 1
 }

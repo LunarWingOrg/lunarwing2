@@ -14,6 +14,8 @@ source "$MT_ADMIN"
 # tenant_writers_active dependency is stubbed per-case.
 _TWA_REAL_DEF="$(declare -f tenant_writers_active)"
 _AWAIT_QUIESCE_REAL_DEF="$(declare -f await_writer_quiescence)"
+_STOP_SYSTEMD_REAL_DEF="$(declare -f stop_tenant_systemd)"
+_STOP_OPENRC_REAL_DEF="$(declare -f stop_tenant_openrc)"
 
 failures=0
 CALLS=()
@@ -736,6 +738,154 @@ test_quiesce_wait_active_then_settled
 test_quiesce_wait_never_settles_fails_after_deadline
 test_quiesce_wait_unclassifiable_fails_closed
 test_writers_active_openrc_weechat_wording
+
+# ── WI#231 F2: stop-tenant disables units (boot + health pipeline) ──────────
+# stop-tenant must leave the tenant durably stopped: on systemd the enable-list
+# units are disabled (F3-B then grades them `skipped`), on OpenRC the runlevel
+# entries are removed (tenant_started() then reads not-started → `skipped`).
+# start-tenant re-enables on the way up (existing start paths already do).
+
+test_stop_tenant_disables_systemd_units() (
+  local disable_calls=0 primary_disabled=0 call
+  eval "$_STOP_SYSTEMD_REAL_DEF"
+  id() {
+    if [[ "${1:-}" == "-u" ]]; then printf '1000\n'; return 0; fi
+    return 1
+  }
+  _systemctl_user() {
+    CALLS+=("systemctl:$*")
+    return 0   # is-active true (stop runs) + is-enabled true (disable runs)
+  }
+  CALLS=()
+  stop_tenant_systemd alice
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == "systemctl:alice disable "* ]] && disable_calls=$((disable_calls + 1))
+    [[ "$call" == "systemctl:alice disable lunarwing-alice.service" ]] && primary_disabled=1
+  done
+  # The whole enable-list (primary, bridge, weechat, proxy, darkirc) is
+  # disabled — 7 units on a fully-featured tenant; floor of 2 keeps the
+  # assertion robust to list trimming, plus the primary must be among them.
+  if (( disable_calls < 2 )) || (( primary_disabled == 0 )); then
+    printf 'stop-tenant systemd: expected enable-list units disabled, saw %d (primary=%d)\n' \
+      "$disable_calls" "$primary_disabled" >&2
+    return 1
+  fi
+)
+
+test_stop_tenant_systemd_skips_disable_when_not_enabled() (
+  local disable_calls=0 call
+  eval "$_STOP_SYSTEMD_REAL_DEF"
+  id() {
+    if [[ "${1:-}" == "-u" ]]; then printf '1000\n'; return 0; fi
+    return 1
+  }
+  _systemctl_user() {
+    CALLS+=("systemctl:$*")
+    [[ "${2:-}" == "is-enabled" ]] && return 1   # nothing enabled
+    return 0
+  }
+  CALLS=()
+  stop_tenant_systemd alice
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == *" disable "* ]] && disable_calls=$((disable_calls + 1))
+  done
+  if (( disable_calls != 0 )); then
+    printf 'stop-tenant systemd: disable ran on not-enabled units (%d)\n' \
+      "$disable_calls" >&2
+    return 1
+  fi
+)
+
+test_stop_tenant_openrc_strips_runlevels() (
+  local removed=0 link
+  eval "$_STOP_OPENRC_REAL_DEF"
+  tenant_darkirc_enabled() { return 1; }
+  tenant_weechat_enabled() { return 0; }
+  tenant_proxy_enabled() { return 0; }
+  rc-service() { return 0; }
+  rc-update() {
+    CALLS+=("rc-update:$*")
+    # Mirror the real rc-update del: remove the symlink if present.
+    if [[ "${1:-}" == "del" ]]; then
+      for link in "$OPENRC_RUNLEVELS_DIR"/*/"$2"; do
+        [[ -e "$link" || -L "$link" ]] && command rm -f -- "$link"
+      done
+    fi
+    return 0
+  }
+  # Seed the default runlevel with the tenant's persistence.
+  ln -s "$OPENRC_INITD_DIR/lunarwing-alice" "$OPENRC_RUNLEVELS_DIR/default/lunarwing-alice" 2>/dev/null || true
+  touch "$OPENRC_INITD_DIR/lunarwing-alice" 2>/dev/null || true
+  ln -s "$OPENRC_INITD_DIR/xmpp-bridge-alice" "$OPENRC_RUNLEVELS_DIR/default/xmpp-bridge-alice" 2>/dev/null || true
+  touch "$OPENRC_INITD_DIR/xmpp-bridge-alice" 2>/dev/null || true
+
+  CALLS=()
+  stop_tenant_openrc alice
+  for link in "$OPENRC_RUNLEVELS_DIR"/default/*; do
+    [[ -e "$link" || -L "$link" ]] && removed=$((removed + 1))
+  done
+  if (( removed != 0 )); then
+    printf 'stop-tenant openrc: %d runlevel entry(ies) survived the stop\n' \
+      "$removed" >&2
+    return 1
+  fi
+  # The primary + bridge must both have gone through rc-update del.
+  local primary_del=0 bridge_del=0 call
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == "rc-update:del lunarwing-alice "*(default) ]] && primary_del=1
+    [[ "$call" == "rc-update:del xmpp-bridge-alice "*(default) ]] && bridge_del=1
+  done
+  if (( primary_del == 0 || bridge_del == 0 )); then
+    printf 'stop-tenant openrc: rc-update del missing (primary=%d bridge=%d)\n' \
+      "$primary_del" "$bridge_del" >&2
+    return 1
+  fi
+)
+
+test_stop_tenant_openrc_quiet_on_never_started() (
+  local del_calls=0 call
+  eval "$_STOP_OPENRC_REAL_DEF"
+  tenant_darkirc_enabled() { return 1; }
+  tenant_weechat_enabled() { return 0; }
+  tenant_proxy_enabled() { return 0; }
+  rc-service() { return 0; }
+  rc-update() { CALLS+=("rc-update:$*"); return 0; }
+  # No runlevel entries at all (never-started tenant): no rc-update del churn.
+  CALLS=()
+  stop_tenant_openrc alice
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == "rc-update:del "* ]] && del_calls=$((del_calls + 1))
+  done
+  if (( del_calls != 0 )); then
+    printf 'stop-tenant openrc: rc-update del ran on a never-started tenant (%d)\n' \
+      "$del_calls" >&2
+    return 1
+  fi
+)
+
+if test_stop_tenant_disables_systemd_units; then
+  printf 'PASS: WI#231 F2 stop-tenant disables systemd enable-list units\n'
+else
+  fail "WI#231 F2 stop-tenant disables systemd enable-list units"
+fi
+
+if test_stop_tenant_systemd_skips_disable_when_not_enabled; then
+  printf 'PASS: WI#231 F2 stop-tenant systemd skips not-enabled units\n'
+else
+  fail "WI#231 F2 stop-tenant systemd skips not-enabled units"
+fi
+
+if test_stop_tenant_openrc_strips_runlevels; then
+  printf 'PASS: WI#231 F2 stop-tenant openrc strips runlevel persistence\n'
+else
+  fail "WI#231 F2 stop-tenant openrc strips runlevel persistence"
+fi
+
+if test_stop_tenant_openrc_quiet_on_never_started; then
+  printf 'PASS: WI#231 F2 stop-tenant openrc quiet on never-started tenants\n'
+else
+  fail "WI#231 F2 stop-tenant openrc quiet on never-started tenants"
+fi
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"

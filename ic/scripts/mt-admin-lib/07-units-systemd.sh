@@ -955,6 +955,28 @@ stop_tenant_systemd() {
       say "stopped $svc"
     fi
   done
+  # WI#231 F2: disable the enable-list units so the stopped state is durable
+  # against BOTH boot (no autostart on the next user-manager start) and the
+  # health pipeline (health-systemd F3-B's lazy probe grades a disabled inactive
+  # unit `skipped`, so self-heal never judges — let alone restarts — a
+  # deliberately-stopped tenant; the lifecycle gate is the second belt).
+  # Quadlet-generated units (pg/workers/vision/voice) are excluded: `disable`
+  # fails on generated units and their liveness is owned by their start paths.
+  # start_tenant_systemd re-enables on the way up.
+  local disable_failed=false svc
+  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" \
+             "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service" \
+             "lunarwing-proxy-${name}.service" \
+             "lunarwing-darkirc-${name}.service" "lunarwing-darkirc-adapter-${name}.service"; do
+    if _systemctl_user "$name" is-enabled --quiet "$svc" 2>/dev/null; then
+      _systemctl_user "$name" disable "$svc" 2>/dev/null || disable_failed=true
+    fi
+  done
+  if [[ "$disable_failed" == true ]]; then
+    say "WARNING: failed to disable some units for '$name' (WI#231 F2); self-heal may still see them" >&2
+  else
+    say "disabled (WI#231 F2) boot+health enablement for $name's stopped units"
+  fi
 }
 
 uninstall_tenant_systemd() {
