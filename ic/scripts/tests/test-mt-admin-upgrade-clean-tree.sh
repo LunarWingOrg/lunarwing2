@@ -214,7 +214,7 @@ fi
 # The fleet opt-out controls first-time auto-install; an existing host-global
 # schedule still needs its scripts refreshed from the current admin tree.
 : >"$HEALTH_LAUNCHER"
-DEFAULT_HEALTH_ENABLED=false
+export DEFAULT_HEALTH_ENABLED=false
 if output="$(upgrade_tenant fixture moving '' false false 2>&1)" \
   && [[ "$(wc -l <"$health_refresh_log")" -eq 1 ]]; then
   pass 'upgrade refreshes an installed health pipeline once despite auto-install opt-out'
