@@ -2,7 +2,7 @@
 
 ## Codename: Yoroi (鎧, armor)
 
-**Release date** 2026-09-23
+**Release date** 2026-09-24
 
 > After the lacing, the plates
 >
@@ -753,6 +753,53 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   `test_worker_quadlet_stop_parity` in
   `ic/scripts/tests/test-mt-admin-worker-lifecycle.sh` asserts unit-first
   stop + container fallback for kimi/opencode/opencode2.
+- **Worker SSH-agent directory mounts are read-only (WI#226).** The
+  directory bind-mount introduced by goal 40 (socket parent dir instead of
+  the socket file) is now mounted `:ro,z` on every non-kimi lane — the
+  Quadlet renderer plus the imperative opencode/opencode2/pebble launches.
+  A worker can no longer unlink or rebind the shared host agent socket,
+  while connect access, `:z` SELinux relabeling, and the daemon-restart
+  fresh-inode behavior are preserved. Bumped `ssh-agent-dir-ro` imperative
+  launch contracts (including rootful/OpenRC launches) and the changed
+  Quadlet file hash force-recreate legacy read-write-mount containers on
+  their next start. The kimi lane still mounts nothing (WI#206).
+- **Kimi Quadlet security option fixed (WI#206 follow-up).** The
+  no-new-privileges hardening initially rendered as `SecurityOpt=` — a key
+  the Quadlet generator rejects, which silently suppressed the entire
+  `lunarwing-kimi-<t>.service` unit after any daemon-reload (dispatches
+  failed with `connection refused`). The renderer now emits
+  `PodmanArgs=--security-opt=no-new-privileges`, the spelling the other
+  quadlets already use; verified live on tenant brightdawn (unit generates,
+  container starts, `/ready` OK, `create_job(mode:"kimi")` round-trips).
+  The kimi harness pins both the valid spelling and the absence of the
+  unsupported key.
+- **LunarVoice no longer strands after upgrade-tenant (WI#228, WI#229).**
+  Found diagnosing a live outage on tenant brightdawn. WI#229:
+  `_ensure_tenant_image` treated the admin (root) container store as the
+  sole source of truth and refused to start a tenant whose own rootless
+  store already held the image — but `upgrade-tenant` empties the admin
+  store, so the voice unit was left failed with no supported recovery and a
+  misleading "run build-voice-sidecar first" message. The admin store now
+  gates distribution only (a newer admin image still refreshes the tenant
+  store); absent-everywhere still fails so the caller can tell the operator
+  to build first. New `test-mt-admin-tenant-image.sh` (8 assertions) pins
+  the store-selection contract. WI#228: `enable-health-fleet.sh`'s guard
+  grepped only the top-level dispatcher for `ensure_health_pipeline()`,
+  which actually lives in an mt-admin-lib module — the guard could never
+  pass, so the documented standalone installer was dead and the deployed
+  pipeline silently drifted to a copy whose `unit_tenant()` lacked the
+  voice/pg/vision/opencode2 cases (those units fell through to bare
+  system-bus `systemctl` where tenant units do not exist). It now greps the
+  modules too; `--dry-run` runs again.
+- **Worker-token backfill preserves tenant env ownership (WI#210
+  follow-up).** `resolve_worker_auth_token()`'s mktemp replacement now
+  `chown --reference`s the original env file: mt-admin runs as root, and a
+  root-owned `0600` `lunarwing.env` cannot be read by the tenant's systemd
+  user manager (`EnvironmentFile=` fails with `Result: resources`, stopping
+  LunarWing and its WeeChat adapter before launch). The opencode2 harness
+  asserts ownership and mode survive the backfill. Existing affected
+  tenants need their env file restored to tenant ownership before
+  restarting through mt-admin.
 
 ### Documentation Parity (goals 41, 45, 46, 48, 49, 50, 52)
 
