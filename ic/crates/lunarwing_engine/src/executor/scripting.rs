@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{Datelike, Timelike};
 use futures::future::{BoxFuture, join_all};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -905,13 +906,42 @@ async fn execute_code_with_skills_and_action_limit(
             }
 
             RunProgress::OsCall(os_call) => {
-                debug!(function = ?os_call.function, "Monty: OS call denied");
-                let err = ExtFunctionResult::Error(MontyException::new(
-                    ExcType::OSError,
-                    Some("OS operations are not permitted in CodeAct scripts".into()),
-                ));
+                // `date.today()` / `datetime.now(tz)` are pure host-clock reads:
+                // Monty yields them as OS calls because it has no clock. The
+                // CodeAct preamble documents `import datetime` as the supported
+                // way to get the current date, so serving these two here keeps
+                // the date honest instead of making the model fall back to
+                // stale cached dates (WI#227). Every other OS call (filesystem,
+                // network, environment) is still denied — the sandbox contract
+                // is unchanged for anything reaching beyond the wall clock.
+                let result = match os_call.function {
+                    monty::OsFunction::DateToday => {
+                        let today = chrono::Utc::now().date_naive();
+                        ExtFunctionResult::Return(MontyObject::Date(monty::MontyDate {
+                            year: today.year(),
+                            month: u8::try_from(today.month()).unwrap_or_default(),
+                            day: u8::try_from(today.day()).unwrap_or_default(),
+                        }))
+                    }
+                    monty::OsFunction::DateTimeNow => {
+                        ExtFunctionResult::Return(datetime_now_object(
+                            os_call.args.first(),
+                            os_call.kwargs.iter().find_map(|(key, value)| {
+                                matches!(key, MontyObject::String(name) if name == "tz")
+                                    .then_some(value)
+                            }),
+                        ))
+                    }
+                    _ => {
+                        debug!(function = ?os_call.function, "Monty: OS call denied");
+                        ExtFunctionResult::Error(MontyException::new(
+                            ExcType::OSError,
+                            Some("OS operations are not permitted in CodeAct scripts".into()),
+                        ))
+                    }
+                };
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    os_call.resume(err, PrintWriter::CollectString(&mut stdout))
+                    os_call.resume(result, PrintWriter::CollectString(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -1235,6 +1265,40 @@ fn unknown_pending_result(monty_call_id: u32) -> ExtFunctionResult {
         ExcType::RuntimeError,
         Some(format!("unknown pending call_id {monty_call_id}")),
     ))
+}
+
+/// Build the host-clock `datetime.now()` result for the `DateTimeNow` OS call.
+///
+/// Mirrors CPython's semantics: a naive UTC datetime when no timezone is given,
+/// an aware datetime shifted to the provided fixed offset when one is. The
+/// timezone arrives either positionally or as the `tz` keyword (the VM
+/// normalizes keyword names to strings; non-string keys cannot occur for this
+/// call because Monty compiles `tz=` in the method signature).
+fn datetime_now_object(
+    positional_tz: Option<&MontyObject>,
+    keyword_tz: Option<&MontyObject>,
+) -> MontyObject {
+    let tz = keyword_tz.or(positional_tz);
+    let now_utc = chrono::Utc::now();
+    let (instant, offset_seconds, timezone_name) = match tz {
+        Some(MontyObject::TimeZone(tz)) => {
+            let shifted = now_utc + chrono::Duration::seconds(i64::from(tz.offset_seconds));
+            (shifted, Some(tz.offset_seconds), tz.name.clone())
+        }
+        _ => (now_utc, None, None),
+    };
+
+    MontyObject::DateTime(monty::MontyDateTime {
+        year: instant.year(),
+        month: u8::try_from(instant.month()).unwrap_or_default(),
+        day: u8::try_from(instant.day()).unwrap_or_default(),
+        hour: u8::try_from(instant.hour()).unwrap_or_default(),
+        minute: u8::try_from(instant.minute()).unwrap_or_default(),
+        second: u8::try_from(instant.second()).unwrap_or_default(),
+        microsecond: instant.nanosecond() / 1_000,
+        offset_seconds,
+        timezone_name,
+    })
 }
 
 async fn resolve_pending_futures(
