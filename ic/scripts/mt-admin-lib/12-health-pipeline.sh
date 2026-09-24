@@ -131,6 +131,57 @@ UNITEOF
   fi
 }
 
+# WI#232 G2 — deployed-pipeline drift detection. The deployed copy under
+# $HEALTH_LIB_DIR is a plain `cp -a` of the tree's ic-infrastructure-health-check/,
+# so nothing tied the deployed bytes to the tree that produced them: an upgrade
+# that skipped the refresh (WI#228's guard was broken; upgrade-tenant never ran
+# the installer at all) left the host silently running stale self-heal code —
+# the exact class of failure that masqueraded as podman store corruption on
+# ajhermes (WI#225). The stamp closes that: a content hash of the pipeline
+# scripts, written next to the deployed copy at install/refresh time, compared
+# by the health checks against the tree they run from, surfaced as `degraded`
+# with a visible issue (never silent).
+#
+# Hashed set: the executable pipeline surface only (top-level *.sh + tests/ is
+# excluded — tests don't run from the deploy). Sorted for stable output across
+# filesystems; sha256 via sha256sum with shasum/openssl fallbacks (same ladder
+# as self-heal's _service_hash).
+health_pipeline_tree_hash() {
+  local dir="$1" digest
+  [[ -d "$dir" ]] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | sort \
+      | while IFS= read -r f; do sha256sum "$dir/$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done \
+      | sha256sum)"
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | sort \
+      | while IFS= read -r f; do shasum -a 256 "$dir/$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done \
+      | shasum -a 256)"
+  elif command -v openssl >/dev/null 2>&1; then
+    digest="$(find "$dir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | sort \
+      | while IFS= read -r f; do openssl dgst -sha256 "$dir/$f" 2>/dev/null || printf 'MISSING %s\n' "$f"; done \
+      | openssl dgst -sha256)"
+  else
+    return 1
+  fi
+  digest="${digest%% *}"
+  [[ "$digest" =~ ^[[:xdigit:]]{16,}$ ]] || return 1
+  printf '%s' "${digest,,}"
+}
+
+# Stamp the DEPLOYED copy (post-sync) with the hash of the SOURCE tree it was
+# copied from. Written after cp -a so the stamp always matches what was just
+# laid down; a stale/absent stamp (pre-WI#232 deploy) is itself reportable drift.
+health_pipeline_stamp_tree() {
+  local stamp
+  stamp="$(health_pipeline_tree_hash "$HEALTH_SRC_DIR")" || {
+    say "WARNING: could not hash health pipeline source ($HEALTH_SRC_DIR); skipping version stamp"
+    return 0
+  }
+  printf '%s\n' "$stamp" > "$HEALTH_LIB_DIR/.pipeline-version"
+  say "stamped pipeline version $stamp"
+}
+
 ensure_health_pipeline() {
   # Idempotently install + schedule the host-global health-check -> self-heal
   # pipeline. Auto-discovers all tenants, so one install covers every tenant.
@@ -149,6 +200,13 @@ ensure_health_pipeline() {
   cp -a "$HEALTH_SRC_DIR/." "$HEALTH_LIB_DIR/"
   chmod 0755 "$HEALTH_LIB_DIR"/*.sh 2>/dev/null || true
   say "synced pipeline scripts -> $HEALTH_LIB_DIR"
+
+  # 1b) WI#232 G2: stamp the deployed copy with a content hash of the pipeline
+  # scripts it was installed FROM, so drift (an upgrade that never refreshed the
+  # deploy, a hand-edited /usr/local/lib file) becomes a visible health signal
+  # instead of a latent defect. The health checks compare the stamp against the
+  # tree they run from and degrade on mismatch (never silent).
+  health_pipeline_stamp_tree
 
   # 2) Host-level report/state dir.
   mkdir -p "$HEALTH_BASE_DIR/workspace/reports/health"
