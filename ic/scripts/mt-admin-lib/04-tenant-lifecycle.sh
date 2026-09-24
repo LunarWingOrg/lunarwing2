@@ -1469,6 +1469,7 @@ upgrade_tenant_locked() {
 
   patch_tenant_env "$name"
   start_tenant "$name"
+  refresh_deployed_health_pipeline
 
   # Pre-1.1.9 units embed renamed adapter paths that only keep working through
   # the 1.1.9-only compat symlinks — warn (don't fail) if any remain.
