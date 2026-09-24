@@ -47,6 +47,58 @@ is an explicit opt-in (`SANDBOX_NETWORK=proxy`) for tenants that genuinely
 need allowlisted web access. The enforced-proxy middle ground is tracked in
 WI#155. See `ic/src/NETWORK_SECURITY.md` §5 for the tier table.
 
+### Generic sandbox image + tenant defaults (WI#223)
+
+For new multi-tenant tenants, the generic sandbox's image is the lean
+**`lunarwing-sandbox:latest`**, built from `ic/docker/sandbox.Dockerfile`
+(common build tooling only — no lunarwing binary, much smaller than
+`lunarwing-worker:latest`). mt-admin renders these defaults into every
+tenant's `lunarwing.env` during `add-tenant` (existing values are preserved
+if that command is explicitly re-run):
+
+```bash
+SANDBOX_RUNTIME=podman
+SANDBOX_IMAGE=lunarwing-sandbox:latest
+SANDBOX_AUTO_PULL=false
+```
+
+`add-tenant` builds the image into the selected admin store when absent. For
+rootless Podman it distributes the image into the tenant's own store
+(`_ensure_tenant_image` semantics — a rebuilt admin image is re-distributed);
+for Docker it checks the shared store. `start-tenant` also reconciles the
+image before daemon startup, so a failed add-tenant build or distribution can
+be retried. On hosts with both CLIs, the generic shell sandbox prefers Podman
+even when mt-admin runs its worker containers with Docker; an explicit
+`SANDBOX_RUNTIME=docker` still chooses Docker. Provisioning uses the tenant's
+selected runtime and prepares its rootless Podman store when needed.
+Only tenants configured with this managed image are reconciled;
+an operator-selected custom image is left alone. `SANDBOX_AUTO_PULL=false` is
+deliberate: the tag exists only in local stores, so an auto-pull would fail
+against a registry that has never hosted it. Single-node hosts keep the
+in-code defaults (`auto` runtime preference, `lunarwing-worker:latest`,
+auto-pull on).
+
+Manual build/recovery:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image <name>
+sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <name>
+```
+
+`build-sandbox-image <name>` builds into the admin store of that tenant's
+selected sandbox runtime (the argument may be omitted for the new-tenant
+Podman-first default); `start-tenant` makes it available in the daemon's
+runtime store. If either step fails, mt-admin warns
+and the generic shell sandbox fails closed with `ImageUnavailable`; base tenant
+provisioning remains available. `upgrade-tenant` **does not** add these keys to
+existing tenants or switch their existing sandbox image. To opt in an older
+tenant, set the three variables in its `lunarwing.env`, build the image, then
+`restart-tenant <name>` so both its daemon configuration and image store update.
+
+The build context is `ic/docker/`, not `ic/`: the Dockerfile has no
+COPY/ADD, and `ic/` carries the vendored crate tree that must stay
+in-context for `Dockerfile.worker`'s offline build.
+
 ## Pebble Worker
 
 Rust-based Pebble agentic coding harness. Bridges the NanoGPT community `pebble` binary to the WebSocket protocol. Health on 8443, WebSocket on 9090.

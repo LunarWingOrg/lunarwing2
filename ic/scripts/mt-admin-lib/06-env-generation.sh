@@ -790,6 +790,22 @@ write_tenant_lunarwing_env() {
   sandbox_network="$(_env_existing "$path" SANDBOX_NETWORK)"
   sandbox_network="${sandbox_network:-none}"
 
+  # Generic sandbox defaults (WI#223): MT tenants pin the runtime and image so
+  # `auto` detection cannot drift away from the host's managed choice, the
+  # lean lunarwing-sandbox image (built from ic/docker/sandbox.Dockerfile) is
+  # used instead of the heavy lunarwing-worker image, and auto-pull is off
+  # because the image is local-only (a pull attempt would fail against a
+  # registry that has never hosted it). Existing values are preserved on
+  # re-render; the daemon still falls back podman->docker when SANDBOX_RUNTIME
+  # names a binary the host lacks.
+  local sandbox_runtime sandbox_image sandbox_auto_pull
+  sandbox_runtime="$(_env_existing "$path" SANDBOX_RUNTIME)"
+  sandbox_runtime="${sandbox_runtime:-podman}"
+  sandbox_image="$(_env_existing "$path" SANDBOX_IMAGE)"
+  sandbox_image="${sandbox_image:-lunarwing-sandbox:latest}"
+  sandbox_auto_pull="$(_env_existing "$path" SANDBOX_AUTO_PULL)"
+  sandbox_auto_pull="${sandbox_auto_pull:-false}"
+
   (
     umask 077
     cat >"$path" <<ENVEOF
@@ -917,6 +933,15 @@ ENGINE_V2_CHANNELS=$engine_v2_channels
 # loopback). Set SANDBOX_NETWORK=proxy explicitly for tenants that need
 # allowlisted web access.
 SANDBOX_NETWORK=$sandbox_network
+
+# Generic sandbox runtime/image (WI#223): pin podman (the MT-managed runtime;
+# the daemon falls back to docker when podman is absent), use the lean
+# locally-built lunarwing-sandbox image (add-tenant builds it from
+# ic/docker/sandbox.Dockerfile), and never auto-pull — the tag only exists in
+# local stores, not in any registry.
+SANDBOX_RUNTIME=$sandbox_runtime
+SANDBOX_IMAGE=$sandbox_image
+SANDBOX_AUTO_PULL=$sandbox_auto_pull
 
 # Directories the generic sandbox must never expose (WI#205). The sandbox
 # mounts an agent-chosen working directory, so anything reachable from a mount

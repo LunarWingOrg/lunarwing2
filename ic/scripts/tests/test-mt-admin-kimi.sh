@@ -80,7 +80,8 @@ assert_contains "$quadlet" "EnvironmentFile=$fixture/env/kimi-runtime.env" 'syst
 # SSH_AUTH_SOCK, and must set no-new-privileges.
 assert_not_contains "$quadlet" 'ssh-agent.sock' 'systemd Kimi quadlet has no SSH agent mount (WI#206)'
 assert_not_contains "$quadlet" 'SSH_AUTH_SOCK' 'systemd Kimi quadlet has no SSH_AUTH_SOCK env (WI#206)'
-assert_contains "$quadlet" 'SecurityOpt=no-new-privileges' 'systemd Kimi quadlet sets no-new-privileges (WI#206)'
+assert_contains "$quadlet" 'PodmanArgs=--security-opt=no-new-privileges' 'systemd Kimi quadlet sets no-new-privileges (WI#206)'
+assert_not_contains "$quadlet" 'SecurityOpt=' 'systemd Kimi quadlet avoids unsupported SecurityOpt key'
 # Non-kimi lanes mount only the socket directory (restart-safe), read-only so
 # a compromised worker cannot unlink/rebind the host agent socket (WI#226).
 for lane in opencode opencode2 pebble; do

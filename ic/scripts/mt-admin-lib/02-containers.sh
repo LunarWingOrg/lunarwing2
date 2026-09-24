@@ -270,6 +270,87 @@ build_vision_sidecar_image() {
   fi
 }
 
+# ── Generic podman sandbox image (WI#223) ────────────────────────────────────
+
+SANDBOX_IMAGE_TAG=lunarwing-sandbox:latest
+SANDBOX_DOCKERFILE="$REPO_ROOT/docker/sandbox.Dockerfile"
+
+tenant_uses_managed_sandbox_image() {  # <tenant>
+  local env_path
+  env_path="$(tenant_env_dir "$1")/lunarwing.env"
+  [[ "$(_env_existing "$env_path" SANDBOX_IMAGE)" == "$SANDBOX_IMAGE_TAG" ]]
+}
+
+# Match CliRunner::detect's probe order: Podman first for auto/podman, Docker
+# first when a tenant explicitly set SANDBOX_RUNTIME=docker. mt-admin's worker
+# runtime is independent and may be Docker on a host with both CLIs.
+sandbox_container_runtime() {  # [tenant]
+  local preferred=podman runtime
+  if [[ -n "${1:-}" ]]; then
+    preferred="$(_env_existing "$(tenant_env_dir "$1")/lunarwing.env" SANDBOX_RUNTIME)"
+  fi
+  local -a order=(podman docker)
+  [[ "$preferred" == docker ]] && order=(docker podman)
+  for runtime in "${order[@]}"; do
+    if command -v "$runtime" >/dev/null 2>&1; then
+      printf '%s' "$runtime"
+      return 0
+    fi
+  done
+  ensure_container_runtime
+  printf '%s' "$CONTAINER_RT"
+}
+
+tenant_sandbox_rootless_prereqs_ready() {  # <tenant>
+  local name="$1" uid
+  uid="$(id -u "$name")" || return 1
+  grep -q "^${name}:" /etc/subuid 2>/dev/null \
+    && grep -q "^${name}:" /etc/subgid 2>/dev/null \
+    && [[ -d "/run/user/$uid" ]] \
+    && [[ "$(stat -c %u "/run/user/$uid" 2>/dev/null)" == "$uid" ]]
+}
+
+# Build the lean generic sandbox image into the admin (root) store. Rootless
+# tenants get it distributed into their own store by
+# ensure_tenant_sandbox_image. The Dockerfile has no COPY/ADD, so the build
+# context is ic/docker/ rather than ic/: the work item's illustrative command
+# used `ic/` as context, but ic/ carries the 1.3G vendor/ tree (which must
+# stay in-context for Dockerfile.worker's offline cargo build and so cannot be
+# dockerignored), and podman stages the whole context before starting.
+build_sandbox_image() {
+  [[ -f "$SANDBOX_DOCKERFILE" ]] \
+    || { say "WARNING: $SANDBOX_DOCKERFILE missing; cannot build sandbox image"; return 1; }
+  local runtime
+  runtime="$(sandbox_container_runtime "${1:-}")" || return 1
+  "$runtime" build -t "$SANDBOX_IMAGE_TAG" \
+    -f "$SANDBOX_DOCKERFILE" "$REPO_ROOT/docker" >/dev/null \
+    || { say "WARNING: sandbox image build failed (run 'build-sandbox-image' to retry)"; return 1; }
+  say "sandbox image built: $SANDBOX_IMAGE_TAG"
+}
+
+# Make the sandbox image available to the tenant that will run the daemon's
+# sandboxed shell commands (rootless podman keeps a per-tenant store). Wraps
+# _ensure_tenant_image so the same current-image distribution rules apply.
+ensure_tenant_sandbox_image() {  # <tenant>
+  local name="$1" runtime
+  runtime="$(sandbox_container_runtime "$name")" || return 1
+  ensure_container_runtime
+  # A host that selected Docker for mt-admin workers may still have Podman on
+  # the tenant PATH. Set up missing prerequisites before attempting save|load.
+  # `system migrate` in ensure_rootless_prereqs stops Podman containers; never
+  # run it on every start-tenant for an already-prepared user.
+  if [[ "$runtime" == "podman" && "$MT_ROOTLESS" != "true" ]] \
+      && ! tenant_sandbox_rootless_prereqs_ready "$name"; then
+    if ! ( CONTAINER_RT=podman MT_ROOTLESS=true ensure_rootless_prereqs "$name" ); then
+      say "WARNING: rootless Podman prerequisites failed for sandbox tenant '$name'" >&2
+      return 1
+    fi
+  fi
+  local CONTAINER_RT="$runtime" MT_ROOTLESS
+  if [[ "$runtime" == "podman" ]]; then MT_ROOTLESS=true; else MT_ROOTLESS=false; fi
+  _ensure_tenant_image "$name" "$SANDBOX_IMAGE_TAG"
+}
+
 write_tenant_vision_env() {
   local name="$1"
   local env_dir env_path

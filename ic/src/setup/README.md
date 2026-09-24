@@ -34,6 +34,17 @@ bootstrap `.env` / database setup that the wizard creates.
 
 The `--no-onboard` CLI flag suppresses auto-detection.
 
+## Multi-tenant provisioning (separate from the wizard)
+
+`ic/scripts/lunarwing-mt-admin.sh add-tenant` provisions managed tenants
+without going through `lunarwing onboard`. For **new** tenants, its env writer
+defaults `SANDBOX_RUNTIME=podman`, `SANDBOX_IMAGE=lunarwing-sandbox:latest`,
+and `SANDBOX_AUTO_PULL=false`; mt-admin builds the image in the admin container
+store and distributes it to rootless tenant stores. `start-tenant` reconciles
+that image before daemon startup so a failed distribution can be retried after
+`build-sandbox-image`. Existing tenants are not changed by `upgrade-tenant`;
+see `docs/ops/WORKER-CONTAINERS.md` for manual opt-in and recovery.
+
 ---
 
 ## Startup Sequence (main.rs)
