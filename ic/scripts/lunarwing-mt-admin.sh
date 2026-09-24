@@ -352,6 +352,10 @@ Commands:
     --no-cache                     Force a full rebuild without Docker cache
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
+  build-sandbox-image [name]       Build the lean generic sandbox image
+                                    (lunarwing-sandbox:latest from
+                                    ic/docker/sandbox.Dockerfile; optional
+                                    tenant selects its configured runtime)
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
   configure-vision-external <name> Use an operator-managed remote LunarVision instance
     --url <https-origin>             Base origin routing API and health endpoints
@@ -832,6 +836,19 @@ main() {
     build-vision-sidecar)
       require_root
       build_vision_sidecar_image
+      ;;
+
+    build-sandbox-image)
+      require_root
+      [[ $# -le 1 ]] || die "usage: $0 build-sandbox-image [name]"
+      if [[ $# -eq 1 ]]; then
+        local sandbox_tenant
+        sandbox_tenant="$(sanitize_name "$1")"
+        tenant_exists_in_registry "$sandbox_tenant" || die "tenant '$sandbox_tenant' not found in registry"
+        build_sandbox_image "$sandbox_tenant"
+      else
+        build_sandbox_image
+      fi
       ;;
 
     configure-vision-external)

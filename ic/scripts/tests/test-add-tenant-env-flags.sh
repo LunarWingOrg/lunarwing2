@@ -149,6 +149,11 @@ assert_eq "default ENGINE_V2" "$(envval ENGINE_V2)" "true"
 assert_eq "default ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
 # WI#154: MT tenants default to kernel-enforced no-egress sandbox networking.
 assert_eq "default SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "none"
+# WI#223: MT tenants pin the podman runtime, the lean locally-built sandbox
+# image, and no auto-pull (the tag exists only in local stores).
+assert_eq "default SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "podman"
+assert_eq "default SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "lunarwing-sandbox:latest"
+assert_eq "default SANDBOX_AUTO_PULL" "$(envval SANDBOX_AUTO_PULL)" "false"
 # Legacy IRONCLAW_* aliases must NOT be generated for new tenants (v2.0.8.0);
 # the daemon still accepts them for existing tenants.
 assert_eq "base dir written" "$(envval LUNARWING_BASE_DIR)" "$MT_FIXTURE/state"
@@ -187,6 +192,9 @@ sed -i \
   -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
   -e 's/^ENGINE_V2_CHANNELS=.*/ENGINE_V2_CHANNELS=xmpp/' \
   -e 's/^SANDBOX_NETWORK=.*/SANDBOX_NETWORK=proxy/' \
+  -e 's/^SANDBOX_RUNTIME=.*/SANDBOX_RUNTIME=docker/' \
+  -e 's/^SANDBOX_IMAGE=.*/SANDBOX_IMAGE=custom-sandbox:v2/' \
+  -e 's/^SANDBOX_AUTO_PULL=.*/SANDBOX_AUTO_PULL=true/' \
   "$MT_FIXTURE/env/lunarwing.env"
 cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
@@ -228,21 +236,30 @@ assert_eq "rerun preserves LW2STUDYMCP_ALLOW_WRITE" \
 assert_eq "rerun preserves ENGINE_V2" "$(envval ENGINE_V2)" "false"
 assert_eq "rerun preserves ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp"
 assert_eq "rerun preserves SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "proxy"
+assert_eq "rerun preserves SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "docker"
+assert_eq "rerun preserves SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "custom-sandbox:v2"
+assert_eq "rerun preserves SANDBOX_AUTO_PULL" "$(envval SANDBOX_AUTO_PULL)" "true"
 
-# Case 3b: upgrade path — an env written by an older version gains defaults
-# for settings introduced after it was provisioned.
+# Case 3b: explicit add-tenant re-run — the full env writer fills missing keys
+# from an older file. upgrade-tenant calls patch_tenant_env, not this writer.
 sed -i \
   -e '/^MASCOT_ENABLED=/d' \
   -e '/^ENGINE_V2=/d' \
   -e '/^ENGINE_V2_CHANNELS=/d' \
   -e '/^SANDBOX_NETWORK=/d' \
+  -e '/^SANDBOX_RUNTIME=/d' \
+  -e '/^SANDBOX_IMAGE=/d' \
+  -e '/^SANDBOX_AUTO_PULL=/d' \
   "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant
-assert_eq "upgrade adds MASCOT_ENABLED default" "$(envval MASCOT_ENABLED)" "false"
-assert_eq "upgrade adds ENGINE_V2 default" "$(envval ENGINE_V2)" "true"
-assert_eq "upgrade adds ENGINE_V2_CHANNELS default" \
+assert_eq "re-run adds MASCOT_ENABLED default" "$(envval MASCOT_ENABLED)" "false"
+assert_eq "re-run adds ENGINE_V2 default" "$(envval ENGINE_V2)" "true"
+assert_eq "re-run adds ENGINE_V2_CHANNELS default" \
   "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
-assert_eq "upgrade adds SANDBOX_NETWORK default" "$(envval SANDBOX_NETWORK)" "none"
+assert_eq "re-run adds SANDBOX_NETWORK default" "$(envval SANDBOX_NETWORK)" "none"
+assert_eq "re-run adds SANDBOX_RUNTIME default" "$(envval SANDBOX_RUNTIME)" "podman"
+assert_eq "re-run adds SANDBOX_IMAGE default" "$(envval SANDBOX_IMAGE)" "lunarwing-sandbox:latest"
+assert_eq "re-run adds SANDBOX_AUTO_PULL default" "$(envval SANDBOX_AUTO_PULL)" "false"
 
 # Case 3c: external LunarVision mode must survive every full env re-render.
 VISION_MODE_FIXTURE=external

@@ -4,17 +4,22 @@
 # the `shell` tool inside hardened containers using this kind of image. It is
 # intentionally smaller than the full worker image (`ic/Dockerfile.worker`,
 # which contains the lunarwing binary): the sandbox only needs common build
-# tooling so commands like `cargo check`, `npm test`, or `python -m pytest`
-# work out of the box.
+# tooling for commands like `make`, `npm test`, or `python3` (language-specific
+# toolchains such as Rust/Cargo can be added in derived images when needed).
 #
-# Build (rootless podman):
-#   podman build -t lunarwing-sandbox:latest -f ic/docker/sandbox.Dockerfile ic/
+# Manual build from the repository root (mt-admin builds in the admin store):
+#   podman build -t lunarwing-sandbox:latest -f ic/docker/sandbox.Dockerfile ic/docker/
 #
-# The default configured image remains `lunarwing-worker:latest`; point
-# SANDBOX_IMAGE (or [sandbox].image) at lunarwing-sandbox:latest to use this
-# one. Auto-pull only works for registry-hosted images — local images like
-# this must be built (or shipped via `podman save | podman load`) into each
-# tenant store.
+# mt-admin builds this image for every new tenant (WI#223) and writes
+# SANDBOX_IMAGE=lunarwing-sandbox:latest + SANDBOX_AUTO_PULL=false into the
+# tenant env; manual build is available via
+# `sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image`. The in-code
+# default for single-node hosts remains `lunarwing-worker:latest`. Auto-pull
+# only works for registry-hosted images — local images like this must be built
+# (or shipped via `podman save | podman load`) into each tenant store; mt-admin
+# distributes it into each rootless tenant store on add-tenant. The build
+# context is ic/docker/ (not ic/): this Dockerfile has no COPY/ADD, and ic/
+# carries the vendor/ tree that must stay in-context for Dockerfile.worker.
 
 FROM debian:bookworm-slim
 

@@ -633,6 +633,25 @@ add_tenant() {
   fi
   say ""
 
+  # WI#223 applies only to tenants with the mt-admin-managed sandbox image.
+  # Preserve existing custom images; do not build or distribute the default
+  # tag for tenants that opted into another image. A failed build is non-fatal
+  # for base provisioning; start-tenant can retry distribution after a manual
+  # `build-sandbox-image` recovery.
+  local sandbox_image_ok="operator-managed" sandbox_image
+  sandbox_image="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" SANDBOX_IMAGE)"
+  if tenant_uses_managed_sandbox_image "$name"; then
+    sandbox_image_ok="ready"
+    if ! "$(sandbox_container_runtime "$name")" image inspect "$SANDBOX_IMAGE_TAG" &>/dev/null; then
+      build_sandbox_image "$name" || sandbox_image_ok="needs recovery"
+    fi
+    if ! ensure_tenant_sandbox_image "$name"; then
+      sandbox_image_ok="needs recovery"
+      say "WARNING: sandbox image $SANDBOX_IMAGE_TAG is unavailable for '$name'. Recovery: sudo $0 build-sandbox-image $name; sudo $0 start-tenant $name" >&2
+    fi
+  fi
+  say ""
+
   say "--- Starting PostgreSQL ---"
   start_tenant_postgres "$name"
   say ""
@@ -687,6 +706,7 @@ add_tenant() {
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say "  weechat relay:    $weechat_bootstrap_ok"
   say "  study mcp:        $study_mcp_bootstrap_ok"
+  say "  sandbox image:    $sandbox_image_ok (${sandbox_image:-daemon default})"
   say ""
   say "Next steps:"
   say "  sudo $0 build-tenant $name --with-wasm"
@@ -892,6 +912,14 @@ start_tenant() {
   if grep -q '^LUNARWING_OWNER_ID=' "$env_path" 2>/dev/null && _owner_scope_needs_migration "$name"; then
     say "found orphaned 'default'-scoped DB data; auto-migrating to '$name' scope"
     migrate_owner_scope "$name" || say "WARNING: owner-scope migration failed (run 'migrate-owner-scope $name' manually)"
+  fi
+
+  # WI#223: a failed add-tenant build/distribution can be recovered by
+  # build-sandbox-image + start-tenant. Reconcile the rootless tenant store
+  # before the daemon starts; skip legacy and custom-image tenants unchanged.
+  if tenant_uses_managed_sandbox_image "$name" \
+      && ! ensure_tenant_sandbox_image "$name"; then
+    say "WARNING: sandbox image $SANDBOX_IMAGE_TAG is unavailable for '$name'. Recovery: sudo $0 build-sandbox-image $name; sudo $0 start-tenant $name" >&2
   fi
 
   # Pre-create the SSH agent socket DIRECTORY so podman can bind-mount it into
@@ -1837,6 +1865,7 @@ doctor() {
     _check "kimi worker image exists" podman image inspect lunarwing-worker-kimi:latest
     _check "vision sidecar image exists" podman image inspect "$VISION_SIDECAR_IMAGE"
   fi
+  _check "default sandbox image exists" "$(sandbox_container_runtime)" image inspect "$SANDBOX_IMAGE_TAG"
 
   say ""
   say "passed: $pass, failed: $fail"

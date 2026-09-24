@@ -111,9 +111,9 @@ impl SandboxError {
                  SANDBOX_ENABLED=false",
             ),
             Self::ImageUnavailable { .. } => Some(
-                "build the image locally (e.g. `podman build -t lunarwing-worker:latest \
-                 ic/ -f ic/docker/sandbox.Dockerfile`) or point SANDBOX_IMAGE at an \
-                 existing image / enable SANDBOX_AUTO_PULL for registry images",
+                "build SANDBOX_IMAGE in the daemon's container store (multi-tenant: \
+                 `lunarwing-mt-admin.sh build-sandbox-image <name>` then `start-tenant <name>`), \
+                 or use an existing image / enable SANDBOX_AUTO_PULL for registry images",
             ),
             _ => None,
         }

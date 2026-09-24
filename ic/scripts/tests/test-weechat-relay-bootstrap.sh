@@ -807,16 +807,46 @@ clone_tenant_repo()    { :; }
 create_tenant_user()   { :; }
 warn_if_adapter_deps_missing() { :; }
 write_tenant_vision_env() { :; }
-write_tenant_lunarwing_env() { echo "env-created" >>"$call_order_log"; }
+write_tenant_lunarwing_env() {
+  echo "env-created" >>"$call_order_log"
+  mkdir -p "$(tenant_env_dir "$1")"
+  printf 'SANDBOX_IMAGE=%s\n' "${sandbox_image_fixture:-lunarwing-sandbox:latest}" \
+    >"$(tenant_env_dir "$1")/lunarwing.env"
+}
 write_tenant_bridge_env() { :; }
 write_tenant_gotify_config() { :; }
 ensure_external_worker_config() { :; }
 retire_tenant_nanocode() { :; }
 ensure_container_runtime() { :; }
 build_vision_sidecar_image() { :; }
+# WI#223: the sandbox image step must be stubbed too — the real
+# build_sandbox_image runs podman build against this checkout. The admin-store
+# presence probe goes through "$CONTAINER_RT image inspect"; shadow podman with
+# a recording function so the harness is deterministic regardless of whether
+# the host store happens to hold lunarwing-sandbox:latest.
+podman() {
+  echo "podman-inspect" >>"$call_order_log"
+  [[ "${1:-}" == "image" ]] || return 0
+  return 1   # image absent -> add_tenant must call build_sandbox_image
+}
+build_sandbox_image() {
+  echo "sandbox-image-built" >>"$call_order_log"
+  [[ "${sandbox_build_fail_mode:-}" != "true" ]]
+}
+ensure_tenant_sandbox_image() { echo "sandbox-image-distributed:$1" >>"$call_order_log"; return 0; }
+# Consumed by the sourced add_tenant body.
+# shellcheck disable=SC2034
+SANDBOX_IMAGE_TAG="lunarwing-sandbox:latest"
+tenant_vision_external() { return 1; }
 ensure_init_system() { :; }
 ensure_health_pipeline() { :; }
-_read_env_value() { echo "fixture-pass"; }
+_read_env_value() {
+  if [[ "$2" == SANDBOX_IMAGE ]]; then
+    sed -n 's/^SANDBOX_IMAGE=//p' "$1"
+  else
+    echo "fixture-pass"
+  fi
+}
 _write_weechat_env() { echo "weechat-env" >>"$call_order_log"; }
 
 # Stub render functions
@@ -878,6 +908,59 @@ if [[ "$pg_line" -gt 0 && "$weechat_line" -gt 0 && "$pg_line" -gt "$weechat_line
 else
   echo "  FAIL: postgres not called after weechat bootstrap"
   echo "        order: $order_result"
+  failures=$((failures + 1))
+fi
+
+# WI#223: the sandbox image build+distribute must run during add_tenant
+# (before postgres), so a new tenant starts with the image its env pins.
+if grep -q 'sandbox-image-built' "$call_order_log" \
+    && grep -q "sandbox-image-distributed:auto-boot-tenant" "$call_order_log"; then
+  echo "  PASS: add_tenant builds and distributes the sandbox image"
+else
+  echo "  FAIL: add_tenant skipped the sandbox image step"
+  echo "        order: $order_result"
+  failures=$((failures + 1))
+fi
+sandbox_line=$(echo "$order_result" | grep -n 'sandbox-image-built' | cut -d: -f1 || echo 0)
+if [[ "$sandbox_line" -gt 0 && "$pg_line" -gt "$sandbox_line" ]]; then
+  echo "  PASS: sandbox image step runs before postgres startup"
+else
+  echo "  FAIL: sandbox image step not before postgres"
+  echo "        order: $order_result"
+  failures=$((failures + 1))
+fi
+
+: >"$call_order_log"
+sandbox_image_fixture="custom-sandbox:v2"
+DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
+  VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
+  DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
+  add_tenant "custom-sandbox-tenant" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  >"$MT_FIXTURE/custom-sandbox.out" 2>&1 || true
+sandbox_image_fixture=""
+if ! grep -q 'sandbox-image-built\|sandbox-image-distributed' "$call_order_log" \
+    && grep -q 'sandbox image:.*operator-managed (custom-sandbox:v2)' "$MT_FIXTURE/custom-sandbox.out"; then
+  echo "  PASS: add_tenant respects a custom sandbox image"
+else
+  echo "  FAIL: add_tenant built the managed image for a custom-image tenant"
+  failures=$((failures + 1))
+fi
+
+# An image-build failure must not strand base provisioning; the summary
+# surfaces the recovery state for the operator.
+: >"$call_order_log"
+sandbox_build_fail_mode="true"
+DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
+  VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
+  DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
+  add_tenant "sandbox-build-fail" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  >"$MT_FIXTURE/sandbox-build-fail.out" 2>&1 || true
+sandbox_build_fail_mode=""
+if grep -q 'postgres' "$call_order_log" \
+    && grep -q 'sandbox image:.*needs recovery' "$MT_FIXTURE/sandbox-build-fail.out"; then
+  echo "  PASS: sandbox build failure leaves base tenant available with recovery status"
+else
+  echo "  FAIL: sandbox build failure hid the recovery state or stranded the tenant"
   failures=$((failures + 1))
 fi
 
