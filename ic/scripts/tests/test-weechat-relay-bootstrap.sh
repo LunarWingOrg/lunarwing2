@@ -826,6 +826,8 @@ podman() {
 }
 build_sandbox_image() { echo "sandbox-image-built" >>"$call_order_log"; }
 ensure_tenant_sandbox_image() { echo "sandbox-image-distributed:$1" >>"$call_order_log"; return 0; }
+# Consumed by the sourced add_tenant body.
+# shellcheck disable=SC2034
 SANDBOX_IMAGE_TAG="lunarwing-sandbox:latest"
 tenant_vision_external() { return 1; }
 ensure_init_system() { :; }
