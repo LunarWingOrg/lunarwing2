@@ -270,6 +270,44 @@ build_vision_sidecar_image() {
   fi
 }
 
+# ── Generic podman sandbox image (WI#223) ────────────────────────────────────
+
+SANDBOX_IMAGE_TAG=lunarwing-sandbox:latest
+SANDBOX_DOCKERFILE="$REPO_ROOT/docker/sandbox.Dockerfile"
+
+# Build the lean generic sandbox image into the admin (root) store. Rootless
+# tenants get it distributed into their own store by
+# ensure_tenant_sandbox_image. The Dockerfile has no COPY/ADD, so the build
+# context is ic/docker/ rather than ic/: the work item's illustrative command
+# used `ic/` as context, but ic/ carries the 1.3G vendor/ tree (which must
+# stay in-context for Dockerfile.worker's offline cargo build and so cannot be
+# dockerignored), and podman stages the whole context before starting.
+build_sandbox_image() {
+  ensure_container_runtime
+  [[ -f "$SANDBOX_DOCKERFILE" ]] \
+    || { say "WARNING: $SANDBOX_DOCKERFILE missing; cannot build sandbox image"; return 1; }
+  local context="$REPO_ROOT/docker"
+  if [[ "$CONTAINER_RT" == "podman" ]]; then
+    # --format docker: keep Dockerfile HEALTHCHECK semantics (OCI drops them).
+    "$CONTAINER_RT" build --network=host --format docker -t "$SANDBOX_IMAGE_TAG" \
+      -f "$SANDBOX_DOCKERFILE" "$context" >/dev/null \
+      || { say "WARNING: sandbox image build failed (run 'build-sandbox-image' to retry)"; return 1; }
+  else
+    "$CONTAINER_RT" build -t "$SANDBOX_IMAGE_TAG" \
+      -f "$SANDBOX_DOCKERFILE" "$context" >/dev/null \
+      || { say "WARNING: sandbox image build failed (run 'build-sandbox-image' to retry)"; return 1; }
+  fi
+  say "sandbox image built: $SANDBOX_IMAGE_TAG"
+}
+
+# Make the sandbox image available to the tenant that will run the daemon's
+# sandboxed shell commands (rootless podman keeps a per-tenant store). Wraps
+# _ensure_tenant_image so the same current-image distribution rules apply.
+ensure_tenant_sandbox_image() {  # <tenant>
+  local name="$1"
+  _ensure_tenant_image "$name" "$SANDBOX_IMAGE_TAG"
+}
+
 write_tenant_vision_env() {
   local name="$1"
   local env_dir env_path
