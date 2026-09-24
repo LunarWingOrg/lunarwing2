@@ -256,6 +256,17 @@ LAUNCHEOF
   say "health pipeline ready (every ${HEALTH_INTERVAL_MIN} min; covers all tenants)"
 }
 
+# Upgrade only an already-installed host-global pipeline. Removal leaves the
+# script copy behind, so the managed launcher (removed by remove_health_pipeline)
+# is the install marker; a leftover copy must not re-arm the schedule.
+refresh_deployed_health_pipeline() {
+  if [[ ! -f "$HEALTH_LAUNCHER" ]]; then
+    say "health pipeline: not installed; skipping upgrade refresh"
+    return 0
+  fi
+  ensure_health_pipeline
+}
+
 remove_health_pipeline() {
   ensure_init_system
   local begin="# BEGIN lunarwing-mt-health managed block"
