@@ -117,7 +117,7 @@ previous compatibility baseline.
 - **New external worker: opencode2.** The OpenCode v2 lane runs alongside
   v1 as a separate worker: reproducible-build-hardened worker image, a
   TypeScript bridge over `@opencode/client/promise`, ports-registry v17
-  slots (51000-51999), mt-admin mirroring with a 34-assertion harness, and
+  slots (51000-51999), mt-admin mirroring with a 48-assertion harness, and
   protected CI publication jobs (candidate/scan/promote) with the
   digest-bound reproducible contract. Pinned at `v2.0.15` on reviewed
   upstream commit `6f3639d82ed0760091792189b78f8eeb44f699b1`; the v1 lane
@@ -539,7 +539,8 @@ All eight findings addressed, then all six review findings:
   escalation, never a restart, on observability gaps. The gateway check
   reports an absent legacy sessions dir as healthy-with-note, never
   degraded, so obsolete telemetry cannot schedule daemon restarts.
-- Verified: `tests/run-all.sh` 926 passed / 0 failed across all 19 suites;
+- Verified: `tests/run-all.sh` 924 passed / 0 failed across all 19 suites
+  (re-run 2026-09-24 on the release tree);
   repo-wide ShellCheck exit 0.
 
 ### External Workers: opencode2 Lane (goals 21, 43)
@@ -550,7 +551,7 @@ The OpenCode v2 lane is a full first-class worker:
   for deterministic output; byte-identical digest contract between candidate
   and clean rebuild), a TypeScript bridge over `@opencode/client/promise`,
   ports-registry v17 slots (51000-51999), mt-admin mirroring with a
-  34-assertion harness, and workspace confinement ported from the kimi
+  48-assertion harness, and workspace confinement ported from the kimi
   bridge. The daemon side needed zero Rust change — the external-worker
   surface was already generic.
 - CI/CD: `worker-opencode2-candidate/scan/promote` jobs extend the shared
@@ -619,9 +620,12 @@ The OpenCode v2 lane is a full first-class worker:
   guard-disabling env vars from per-task environments, and `/app/config` +
   `/app/hooks` are read-only to the runtime user so a task cannot edit its
   own guard. mt-admin no longer mounts the tenant SSH-agent socket into the
-  kimi lane (both launch paths), adds `--security-opt no-new-privileges`,
-  and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing containers
-  force-recreate; other worker lanes keep the socket. Verified live on
+  kimi lane (both launch paths), adds `--security-opt no-new-privileges`
+  (via a Quadlet-valid `PodmanArgs=` spelling after the initial
+  `SecurityOpt=` key was found to suppress the whole unit — see the mt-admin
+  fixes section), and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing
+  containers force-recreate; other worker lanes keep the socket (mounted
+  read-only since WI#226). Verified live on
   2.0.2: `sudo`, `shutdown`, `curl … | sh`, and `rm -rf` of non-temp paths
   deny in ~3s with an explicit reason while ordinary builds and tests run
   unchanged.
