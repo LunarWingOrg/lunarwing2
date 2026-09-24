@@ -711,6 +711,14 @@ must not force any single-node target. Without registry targets the dedicated
 single-node operational listener is `127.0.0.1:8089`; `8088` is the API listener.
 `SERVICES="svc1 svc2"` remains an intentional OpenRC override.
 
+`upgrade-tenant` refreshes the host-global health/self-heal scripts from the
+current mt-admin tree when the managed health launcher is installed. A removed
+pipeline leaves its old script copy on disk; that copy alone does not cause an
+upgrade to reinstall or schedule it. The existing `health.env` retains operator
+settings (the installer only reconciles its managed init-system and registry
+paths). `LUNARWING_MT_HEALTH_ENABLED=false` disables new auto-installs, not
+refreshes of an already-installed host-global pipeline.
+
 Force init detection only when necessary with
 `LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`.
 

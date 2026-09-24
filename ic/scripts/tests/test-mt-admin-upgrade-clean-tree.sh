@@ -123,6 +123,14 @@ restarted_marker="$fixture/restarted"
 build_args_file="$fixture/build-args"
 fixture_repo="$repo"
 export BUILD_LOCK="$fixture/build.lock"
+HEALTH_LAUNCHER="$fixture/health-launcher"
+HEALTH_LIB_DIR="$fixture/health-lib"
+health_refresh_log="$fixture/health-refresh.log"
+mkdir -p "$HEALTH_LIB_DIR"
+# remove_health_pipeline leaves the copy in place; that alone must not trigger
+# a fresh host-global install during a tenant upgrade.
+: >"$HEALTH_LIB_DIR/cron-wrapper.sh"
+ensure_health_pipeline() { printf 'refreshed\n' >>"$health_refresh_log"; }
 move_ref_on_stop=false
 tenant_lw_root() { printf '%s\n' "$fixture_repo"; }
 tenant_repo() { printf '%s/ic\n' "$fixture_repo"; }
@@ -196,6 +204,22 @@ if [[ -f "$build_args_file" ]] \
   pass 'upgrade rebuilds selected OpenCode and Kimi workers with strict WASM build'
 else
   fail "upgrade forwarded wrong build flags: $(cat "$build_args_file" 2>/dev/null || true)"
+fi
+if [[ ! -e "$health_refresh_log" ]]; then
+  pass 'upgrade leaves a removed host-global health pipeline uninstalled'
+else
+  fail 'upgrade refreshed a removed host-global health pipeline'
+fi
+
+# The fleet opt-out controls first-time auto-install; an existing host-global
+# schedule still needs its scripts refreshed from the current admin tree.
+: >"$HEALTH_LAUNCHER"
+DEFAULT_HEALTH_ENABLED=false
+if output="$(upgrade_tenant fixture moving '' false false 2>&1)" \
+  && [[ "$(wc -l <"$health_refresh_log")" -eq 1 ]]; then
+  pass 'upgrade refreshes an installed health pipeline once despite auto-install opt-out'
+else
+  fail "upgrade did not refresh an installed health pipeline: $output"
 fi
 
 if [[ "$failures" -ne 0 ]]; then
