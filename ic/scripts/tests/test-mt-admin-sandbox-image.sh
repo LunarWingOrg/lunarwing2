@@ -15,6 +15,8 @@ ok()   { printf 'PASS: %s\n' "$1"; }
 bad()  { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
 
 CALLS=()
+# Consumed by the sourced mt-admin lib functions.
+# shellcheck disable=SC2034
 SANDBOX_IMAGE_TAG="lunarwing-sandbox:latest"
 # NOTE: sourcing mt-admin redefines SCRIPT_DIR to ic/scripts, so derive the
 # Dockerfile from the repo root the sourced script exports.
@@ -34,6 +36,7 @@ say() { :; }
 FAIL_BUILD=""
 
 # ── build_sandbox_image: podman path ─────────────────────────────────────────
+# shellcheck disable=SC2034
 CONTAINER_RT="podman"
 CALLS=()
 if build_sandbox_image; then
@@ -49,6 +52,7 @@ else
 fi
 
 # ── build_sandbox_image: docker path has no podman-only flags ────────────────
+# shellcheck disable=SC2034
 CONTAINER_RT="docker"
 CALLS=()
 build_sandbox_image >/dev/null
@@ -59,6 +63,7 @@ else
 fi
 
 # ── build_sandbox_image: failure is reported, not fatal ──────────────────────
+# shellcheck disable=SC2034
 CONTAINER_RT="podman"
 FAIL_BUILD="true"
 CALLS=()
