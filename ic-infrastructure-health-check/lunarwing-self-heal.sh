@@ -408,6 +408,103 @@ check_service_active() {
     esac
 }
 
+# ── Tenant lifecycle gate (WI#231 F1) ───────────────────────────────────────
+#
+# Self-heal's remediation used to key on the report's critical verdict with no
+# coordination against tenant lifecycle state: a unit reported down was
+# restarted, even when its tenant had been deliberately stopped with
+# `mt-admin stop-tenant` — the "wiper" that tore fresh containers down mid-run
+# and masqueraded as podman store corruption (WI#225 Addenda 3-7; verdict key:
+# inactive != failed). The gate below implements Addendum 7's minimal fix
+# dimension: remediation of a tenant-scoped unit requires evidence the tenant
+# is STARTED — its primary daemon (lunarwing-<t>) being active — OR the unit
+# itself being in a fault state (failed / auto-restart), which is a crash even
+# on a running tenant and must never be masked. A cleanly-stopped tenant's
+# inactive units get reporting-only treatment.
+#
+# Init-agnostic by dispatch (Addendum 6: the OpenRC path shares the flaw):
+#   systemd → tenant user bus: ActiveState of lunarwing-<t>.service
+#   openrc  → rc-service status of lunarwing-<t>
+# Unknown/unresolvable states fail OPEN (gate allows remediation): the gate must
+# never become a new way to mask a real outage.
+
+# Tenant-scoped unit? (unit_tenant resolves per-tenant names; base units and
+# foreign services return "" and bypass the gate entirely.)
+unit_is_tenant_scoped() {
+    [[ -n "$(unit_tenant "$1")" ]]
+}
+
+# Is this unit itself in a fault state that must be remediated regardless of
+# tenant state? A failed/auto-restart substate is a crash, not a stop.
+unit_in_fault_state() {
+    local svc="$1" sub
+    [[ "$SERVICE_MANAGER" == systemd ]] || return 1
+    sub="$(service_substate "$svc")"
+    case "$sub" in
+        failed|auto-restart) return 0 ;;
+        *)                  return 1 ;;
+    esac
+}
+
+# Is the tenant that owns this unit STARTED? (primary daemon active)
+# Fails OPEN on any inconclusive probe (user unresolvable, bus unreachable,
+# unknown manager): the gate must never become a new way to mask a real outage.
+# Only a POSITIVE observation of the primary daemon being inactive closes it.
+tenant_is_started() {
+    local svc="$1" tenant user primary uid
+    tenant="$(unit_tenant "$svc")"
+    [[ -n "$tenant" ]] || return 0   # not tenant-scoped: no lifecycle to consult
+    primary="lunarwing-${tenant}"
+    case "$SERVICE_MANAGER" in
+        systemd)
+            user="$(tenant_user "$tenant")"
+            if [[ -n "$user" ]]; then
+                uid="$(id -u "$user" 2>/dev/null || printf '?')"
+                [[ "$uid" == '?' ]] && return 0   # unresolvable: fail open
+                _systemd_user_active "$user" "${primary}.service" && return 0
+                # is-active exit alone is ambiguous on a wedged bus; confirm with
+                # an explicit ActiveState read so only a definitive "inactive"
+                # (not a failed probe) gates remediation.
+                [[ "$(_systemd_user_show "$user" "$uid" ActiveState "${primary}.service")" == inactive ]] || return 0
+                return 1
+            fi
+            return 0   # registry gap: fail open
+            ;;
+        openrc)
+            _openrc_active "$primary" && return 0
+            # rc-service status is the definitive probe; only a real, failing
+            # status call (init script present, service observed stopped) closes
+            # the gate. rc-service absent entirely (no OpenRC host) stays open.
+            command -v rc-service >/dev/null 2>&1 || return 0
+            return 1
+            ;;
+        *)
+            return 0   # unknown manager: fail open (never mask)
+            ;;
+    esac
+}
+
+# Tenant-user-bus property read (single place so the mock harness only has to
+# model one invocation shape).
+_systemd_user_show() {
+    local user="$1" uid="$2" prop="$3" unit="$4"
+    _sh_timeout sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" \
+        systemctl --user show --value -p "$prop" "$unit" 2>/dev/null || printf '?'
+}
+
+# The gate itself: return 0 (allow remediation) or 1 (reporting-only).
+# Non-tenant units, fault-state units, and started tenants all pass.
+remediation_allowed() {
+    local svc="$1"
+    unit_is_tenant_scoped "$svc" || return 0
+    unit_in_fault_state "$svc" && return 0
+    if tenant_is_started "$svc"; then
+        return 0
+    fi
+    log "LIFECYCLE: $svc belongs to a stopped tenant (primary daemon inactive); not remediating"
+    return 1
+}
+
 # Tenant-aware SubState for a systemd unit (crash-loop detection in verify).
 # Empty when unavailable (non-systemd, or a mock that doesn't model `show`).
 service_substate() {
@@ -883,6 +980,16 @@ remediate_component() {
         old_obs="$(state_get_num "$state" "$svc" consecutive_unhealthy 0)"
         obs=$((old_obs + 1))
         state="$(record_unhealthy "$state" "$svc" "$now")"
+
+        # Tenant lifecycle gate (WI#231 F1): a unit of a deliberately-stopped
+        # tenant is reported-down, not failed. Skip the whole remediation path —
+        # flap/max-retries escalation included, so state never accumulates for
+        # stopped tenants (the perpetual re-judging of antelope) — and leave the
+        # observation itself recorded so a later start sees a fresh streak.
+        if ! remediation_allowed "$svc"; then
+            log_action "LIFECYCLE_SKIP target=$svc"
+            continue
+        fi
 
         if [[ "$escalated" == true ]]; then
             log "SKIP: $svc already escalated (manual intervention pending)"
