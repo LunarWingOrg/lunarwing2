@@ -891,19 +891,27 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
     ships. Tenants that legitimately need SSH from kimi worker tasks must
     move that work to the pebble/opencode/opencode2 lanes or a scoped
     credential broker — the shared tenant agent is no longer exposed to the
-    headless executor.
-13. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
+    headless executor. If a kimi worker currently reports
+    `connection refused` after a daemon-reload, re-render its Quadlet: the
+    initial `SecurityOpt=` spelling suppressed the whole unit (fixed above).
+13. **Worker SSH-agent mounts went read-only (WI#226).** Non-kimi worker
+    containers recreate on their next start (Quadlet hash change plus the
+    `ssh-agent-dir-ro` imperative launch contracts, rootful/OpenRC
+    included); no daemon restart is needed just for the mount-policy
+    change. Live worker SSH (`ssh-add -l`) after recreation remains an
+    operator acceptance check.
+14. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
     installer is at `.gitlab/scripts/install-shellcheck.sh`.
-14. Conversation-insights changes add durable cursors, batch identity, and
+15. Conversation-insights changes add durable cursors, batch identity, and
     deletion-as-opt-out state; on upgrade, existing insight stores are
     migrated in place by the production store tests' covered paths — no
     operator action required, but review `docs/ops/v2.1.2.0_GOAL8_INSIGHTS_HARDENING.md`
     for the new authority/eligibility contracts.
-15. **Mission defaults changed.** The daily thread budget default is now 30
+16. **Mission defaults changed.** The daily thread budget default is now 30
     (was 10), and interrupted mission fires retry automatically with
     exponential backoff (3 retries default; `max_retries=0` opts out per
     mission). Tenants with explicit `max_threads_per_day` are unaffected.
-16. **mt-admin worker stops now target the systemd unit.** On systemd +
+17. **mt-admin worker stops now target the systemd unit.** On systemd +
     rootless hosts, `stop-worker`/`stop` for the kimi, opencode, opencode2,
     and postgres containers stop the owning Quadlet user unit first —
     previously a bare container stop could be resurrected by the unit's
@@ -995,9 +1003,10 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   workers no longer receive the full gateway bearer (WI#205, incl. the
   WI#209/#210/#211 review findings and WI#215 sibling derivation).
 - Worker SSH-agent stale-inode fix: the agent socket lives in a
-  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts (not the
-  socket file), so a fresh daemon-bound inode resolves at connect time and
-  the `ssh-agent-dir` launch contracts recreate legacy file-mounted worker
+  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts read-only
+  (not the socket file; WI#226), so a fresh daemon-bound inode resolves at
+  connect time and workers cannot unlink or rebind the host socket; the
+  `ssh-agent-dir(-ro)` launch contracts recreate legacy file-mounted worker
   containers on their next lifecycle pass (item 40 / WI#206 stale-socket
   follow-up; live-tenant validation remains outstanding).
 - Interrupted mission fires retry with backoff and survive daemon restarts;
@@ -1025,3 +1034,9 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   contract, the WI#206 fail-closed PreToolUse command guard, and the
   deterministic CLI contract gate), opencode2 v2.0.15, gitlab
   tool registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
+- mt-admin: the kimi Quadlet security option renders in a generator-valid
+  spelling (the invalid `SecurityOpt=` key silently suppressed the unit);
+  LunarVoice survives `upgrade-tenant` (WI#229 store check) and the
+  standalone `enable-health-fleet.sh` installer runs again (WI#228);
+  scoped-worker-token backfill preserves tenant env ownership (WI#210
+  follow-up).
