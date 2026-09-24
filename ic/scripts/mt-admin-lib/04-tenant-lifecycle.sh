@@ -1470,6 +1470,19 @@ upgrade_tenant_locked() {
   patch_tenant_env "$name"
   start_tenant "$name"
 
+  # WI#232 G1: refresh the deployed host-global health/self-heal pipeline from
+  # this tree. Nothing else in the upgrade path ever re-ran ensure_health_pipeline,
+  # so /usr/local/lib/lunarwing-health/ stayed frozen at whatever the tenant was
+  # born with — the drift WI#228 warned about, by omission. Idempotent by design;
+  # preserves an existing /etc/lunarwing/health.env (operator creds survive).
+  if [[ "$DEFAULT_HEALTH_ENABLED" == "true" && "$HEALTH_OPT_OUT" != "true" ]]; then
+    if [[ -f "$HEALTH_LIB_DIR/cron-wrapper.sh" ]] || [[ -f "$HEALTH_LAUNCHER" ]]; then
+      ensure_health_pipeline
+    else
+      say "health pipeline: not currently deployed (install with enable-health-fleet.sh); skipping refresh"
+    fi
+  fi
+
   # Pre-1.1.9 units embed renamed adapter paths that only keep working through
   # the 1.1.9-only compat symlinks — warn (don't fail) if any remain.
   local stale
