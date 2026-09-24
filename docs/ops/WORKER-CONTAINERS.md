@@ -47,6 +47,39 @@ is an explicit opt-in (`SANDBOX_NETWORK=proxy`) for tenants that genuinely
 need allowlisted web access. The enforced-proxy middle ground is tracked in
 WI#155. See `ic/src/NETWORK_SECURITY.md` §5 for the tier table.
 
+### Generic sandbox image + tenant defaults (WI#223)
+
+The generic sandbox's image on multi-tenant hosts is the lean
+**`lunarwing-sandbox:latest`**, built from `ic/docker/sandbox.Dockerfile`
+(common build tooling only — no lunarwing binary, much smaller than
+`lunarwing-worker:latest`). mt-admin renders these defaults into every
+tenant's `lunarwing.env` (existing values preserved on re-render, defaults
+added on upgrade re-render):
+
+```bash
+SANDBOX_RUNTIME=podman
+SANDBOX_IMAGE=lunarwing-sandbox:latest
+SANDBOX_AUTO_PULL=false
+```
+
+`add-tenant` builds the image into the admin store when absent and distributes
+it into each rootless tenant's own store (`_ensure_tenant_image` semantics —
+a rebuilt admin image is re-distributed). `SANDBOX_AUTO_PULL=false` is
+deliberate: the tag exists only in local stores, so an auto-pull would fail
+against a registry that has never hosted it. Single-node hosts keep the
+in-code defaults (`auto` runtime preference, `lunarwing-worker:latest`,
+auto-pull on).
+
+Manual build/recovery:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image
+```
+
+The build context is `ic/docker/`, not `ic/`: the Dockerfile has no
+COPY/ADD, and `ic/` carries the vendored crate tree that must stay
+in-context for `Dockerfile.worker`'s offline build.
+
 ## Pebble Worker
 
 Rust-based Pebble agentic coding harness. Bridges the NanoGPT community `pebble` binary to the WebSocket protocol. Health on 8443, WebSocket on 9090.
