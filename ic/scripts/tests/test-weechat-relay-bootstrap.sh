@@ -814,6 +814,20 @@ ensure_external_worker_config() { :; }
 retire_tenant_nanocode() { :; }
 ensure_container_runtime() { :; }
 build_vision_sidecar_image() { :; }
+# WI#223: the sandbox image step must be stubbed too — the real
+# build_sandbox_image runs podman build against this checkout. The admin-store
+# presence probe goes through "$CONTAINER_RT image inspect"; shadow podman with
+# a recording function so the harness is deterministic regardless of whether
+# the host store happens to hold lunarwing-sandbox:latest.
+podman() {
+  echo "podman-inspect" >>"$call_order_log"
+  [[ "${1:-}" == "image" ]] || return 0
+  return 1   # image absent -> add_tenant must call build_sandbox_image
+}
+build_sandbox_image() { echo "sandbox-image-built" >>"$call_order_log"; }
+ensure_tenant_sandbox_image() { echo "sandbox-image-distributed:$1" >>"$call_order_log"; return 0; }
+SANDBOX_IMAGE_TAG="lunarwing-sandbox:latest"
+tenant_vision_external() { return 1; }
 ensure_init_system() { :; }
 ensure_health_pipeline() { :; }
 _read_env_value() { echo "fixture-pass"; }
@@ -877,6 +891,25 @@ if [[ "$pg_line" -gt 0 && "$weechat_line" -gt 0 && "$pg_line" -gt "$weechat_line
   echo "  PASS: weechat bootstrap called before postgres"
 else
   echo "  FAIL: postgres not called after weechat bootstrap"
+  echo "        order: $order_result"
+  failures=$((failures + 1))
+fi
+
+# WI#223: the sandbox image build+distribute must run during add_tenant
+# (before postgres), so a new tenant starts with the image its env pins.
+if grep -q 'sandbox-image-built' "$call_order_log" \
+    && grep -q "sandbox-image-distributed:auto-boot-tenant" "$call_order_log"; then
+  echo "  PASS: add_tenant builds and distributes the sandbox image"
+else
+  echo "  FAIL: add_tenant skipped the sandbox image step"
+  echo "        order: $order_result"
+  failures=$((failures + 1))
+fi
+sandbox_line=$(echo "$order_result" | grep -n 'sandbox-image-built' | cut -d: -f1 || echo 0)
+if [[ "$sandbox_line" -gt 0 && "$pg_line" -gt "$sandbox_line" ]]; then
+  echo "  PASS: sandbox image step runs before postgres startup"
+else
+  echo "  FAIL: sandbox image step not before postgres"
   echo "        order: $order_result"
   failures=$((failures + 1))
 fi
