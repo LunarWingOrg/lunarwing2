@@ -113,6 +113,7 @@ if $DRY_RUN; then
   _banner "[dry-run] would run: ensure_health_pipeline"
   [[ ${#DOWN[@]} -gt 0 ]] && _say "  (note: tenant daemons currently down: ${DOWN[*]} — a real run would refuse without --allow-down)"
   _say "  - sync $HEALTH_SRC_DIR -> $HEALTH_LIB_DIR"
+  _say "  - stamp the deployed copy with the pipeline version (.pipeline-version; WI#232)"
   _say "  - write $HEALTH_ENV_FILE (mode 0600) if absent"
   _say "  - install launcher $HEALTH_LAUNCHER"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then

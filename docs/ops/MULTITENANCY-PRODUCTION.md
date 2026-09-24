@@ -172,7 +172,9 @@ Then access `http://localhost:10000`, `http://localhost:10010`, etc.
 ### Step 7: Manage
 
 ```bash
-# Stop a tenant
+# Stop a tenant (also disables its units / removes runlevel persistence so the
+# host self-heal pipeline grades the stopped tenant `skipped` and never
+# resurrects it — WI#231; start-tenant re-enables)
 sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant sparkie
 
 # Restart a tenant
@@ -190,6 +192,10 @@ sudo ic/scripts/lunarwing-mt-admin.sh list-backups sparkie
 sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant sparkie
 sudo ic/scripts/lunarwing-mt-admin.sh restore-tenant sparkie /var/lib/lunarwing-backups/sparkie/sparkie-<ts>.dump --yes
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant sparkie
+
+# Upgrade a tenant in place (since WI#232 the upgrade also refreshes the
+# deployed host-global health/self-heal pipeline from the new tree)
+sudo ic/scripts/lunarwing-mt-admin.sh upgrade-tenant sparkie --target v2.1.2.0
 
 # Remove a tenant (stop services, deallocate ports, preserve user home)
 sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant sparkie
