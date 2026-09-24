@@ -175,7 +175,7 @@ src_fn() {
 
 mk_mockbin() {
     local sb="$1" bin="$1/bin" ss="$1/svcstate"
-    mkdir -p "$bin" "$ss/restarts" "$ss/fail" "$ss/stuck" "$ss/sub"
+    mkdir -p "$bin" "$ss/restarts" "$ss/fail" "$ss/stuck" "$ss/sub" "$ss/kw"
 
     cat > "$bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -190,9 +190,13 @@ case "$sub" in
     svc=""; for a in "$@"; do case "$a" in --user) ;; *) svc="$a";; esac; done
     [[ -f "$SS/fail/$svc" ]] && { echo "mock systemctl: restart $svc failed" >&2; exit 1; }
     n=$(cat "$SS/restarts/$svc" 2>/dev/null || echo 0); echo $((n+1)) > "$SS/restarts/$svc"
-    [[ -f "$SS/stuck/$svc" ]] || echo up > "$SS/$svc" ;;
-  show)                                          # mock: only SubState is modeled (F5 crash-loop verify)
-    prop=""; svc=""
+    [[ -f "$SS/stuck/$svc" ]] || echo up > "$SS/$svc"
+    # SubState overrides (svc_substate) are explicit unit-fault declarations and
+    # survive restarts: a crash-looping unit re-enters its fault substate (F5),
+    # while a healthy one-off crash heals and is modeled WITHOUT an override.
+    rm -f "$SS/active/$svc" 2>/dev/null ;;
+  show)                                          # mock: SubState (F5 crash-loop verify)
+    prop=""; svc=""                               #   and ActiveState (WI#231 lifecycle gate)
     while [[ $# -gt 0 ]]; do
       case "$1" in
         -p) prop="$2"; shift 2 ;;
@@ -200,7 +204,19 @@ case "$sub" in
         *) svc="$1"; shift ;;
       esac
     done
-    [[ "$prop" == SubState ]] && cat "$SS/sub/$svc" 2>/dev/null
+    # SubState reads <svcstate>/sub/<svc> (legacy F5 layout). ActiveState reads
+    # <svcstate>/active/<svc>, falling back to up/down liveness so the primary-
+    # daemon probe of the WI#231 gate works without touching F5 fixtures.
+    case "$prop" in
+      SubState)   cat "$SS/sub/$svc" 2>/dev/null ;;
+      ActiveState)
+        if [[ -f "$SS/active/$svc" ]]; then
+          cat "$SS/active/$svc"
+        else
+          [[ "$(cat "$SS/$svc" 2>/dev/null)" == up ]] && printf 'active' || printf 'inactive'
+        fi
+        ;;
+    esac
     exit 0 ;;
   *) exit 0 ;;
 esac
@@ -211,7 +227,23 @@ EOF
 SS="${SVC_STATE_DIR:?}"
 svc="${1:-}"; action="${2:-}"
 case "$action" in
-  status) [[ "$(cat "$SS/$svc" 2>/dev/null)" == up ]] ;;
+  status)
+    # OpenRC-style keyword output (the WI#231 gate greps for these words, the
+    # same vocabulary mt-admin's openrc_service_state parses). An explicit
+    # <svcstate>/kw/<svc> override wins; otherwise up/down liveness maps to
+    # started/crashed|stopped.
+    if [[ -f "$SS/kw/$svc" ]]; then
+      printf 'status: %s\n' "$(cat "$SS/kw/$svc")"
+      grep -qi '^started$' "$SS/kw/$svc" && exit 0
+      exit 1
+    fi
+    if [[ "$(cat "$SS/$svc" 2>/dev/null)" == up ]]; then
+      printf 'status: started\n'; exit 0
+    elif [[ "$(cat "$SS/$svc" 2>/dev/null)" == down ]]; then
+      printf 'status: stopped\n'; exit 1
+    else
+      printf 'status: stopped\n'; exit 1
+    fi ;;
   restart)
     [[ -f "$SS/fail/$svc" ]] && { echo "mock rc-service: restart $svc failed" >&2; exit 1; }
     n=$(cat "$SS/restarts/$svc" 2>/dev/null || echo 0); echo $((n+1)) > "$SS/restarts/$svc"
@@ -277,6 +309,13 @@ svc_fail()  { : > "$1/svcstate/fail/$2"; }     # restart command will fail
 svc_stuck() { : > "$1/svcstate/stuck/$2"; }    # restart "succeeds" but stays down
 restarts_of() { cat "$1/svcstate/restarts/$2" 2>/dev/null || echo 0; }
 svc_substate() { mkdir -p "$1/svcstate/sub"; echo "$3" > "$1/svcstate/sub/$2"; }  # SubState for crash-loop verify (F5)
+# Explicit ActiveState override (WI#231 lifecycle gate): the primary-daemon probe
+# reads this when present; otherwise up/down liveness maps to active/inactive.
+svc_active() { mkdir -p "$1/svcstate/active"; echo "$3" > "$1/svcstate/active/$2"; }
+# OpenRC keyword override (WI#231): forces rc-service status to print
+# started|stopped|crashed regardless of liveness — models a cleanly-stopped vs
+# crashed primary.
+svc_keyword() { mkdir -p "$1/svcstate/kw"; echo "$3" > "$1/svcstate/kw/$2"; }
 
 # run_chaos <sb> <manager> [ENV=VAL ...] [-- <script args>]
 #   Real run (NO --dry-run) against the mock init system. Settle 0 so verify is

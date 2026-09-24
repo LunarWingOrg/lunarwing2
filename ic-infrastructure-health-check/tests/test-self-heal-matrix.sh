@@ -720,4 +720,120 @@ assert_contains "$oN3" "backoff=linear"  "N3: --backoff-strategy parsed"
 assert_contains "$oN3" "base=123s"       "N3: --backoff-base parsed"
 assert_contains "$oN3" "verify=false"    "N3: --verify-health parsed"
 
+echo "=== Section P: Tenant lifecycle gate (WI#231 F1) ==="
+
+# The gate consults the TENANT's primary daemon (lunarwing-<t>) before
+# remediating any tenant-scoped unit. Fixtures map tenants to the CURRENT OS
+# user (so `id -u` resolves and the mock sudo/systemctl path is exercised for
+# real) and drive the primary's liveness via the mock service state.
+
+p_ports() { jq -n --arg u "$(id -un)" '{tenants:{acme:{user:$u},stopped:{user:$u}}}' > "$1/ports.json"; }
+p_report() {  # p_report <sb> <unit-name>
+    report "$1" "{components:[{component:\"systemd\",status:\"critical\",metrics:{units:[
+      {name:\"$2\",status:\"critical\"}]}}]}"
+}
+
+# P1 — STOPPED tenant: unit reported critical, primary daemon observed inactive
+# → NO restart (reporting-only). The exact WI#225 wiper scenario: stop-tenant,
+# health still judges the leftover units, self-heal must not resurrect them.
+p1="$(sb)"; p_ports "$p1"; mk_mockbin "$p1"
+svc_down "$p1" "lunarwing-stopped.service"    # primary daemon: observed inactive
+svc_down "$p1" "lunarwing-pg-stopped.service"  # its unit, reported critical below
+p_report "$p1" "lunarwing-pg-stopped.service"
+oP1="$(run_chaos "$p1" systemd SELF_HEAL_TENANTS_FILE="$p1/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oP1" "LIFECYCLE: lunarwing-pg-stopped.service belongs to a stopped tenant" "P1: stopped tenant is not remediated"
+assert_absent   "$oP1" "RESTART: lunarwing-pg-stopped.service"                                "P1: no restart for stopped tenant's unit"
+assert_eq "$(restarts_of "$p1" "lunarwing-pg-stopped.service")" "0"                            "P1: restart counter untouched"
+assert_eq "$(state_of "$p1" '.["lunarwing-pg-stopped.service"].retries // 0')" "0"              "P1: no retries accumulated for stopped tenant"
+
+# P2 — repeated ticks on a stopped tenant never accumulate retries/escalation
+# (acceptance criterion 2: the antelope `retries: 3` condition stays clear).
+p2="$(sb)"; p_ports "$p2"; mk_mockbin "$p2"
+svc_down "$p2" "lunarwing-stopped.service"
+svc_down "$p2" "lunarwing-vision-stopped.service"
+p_report "$p2" "lunarwing-vision-stopped.service"
+for _ in 1 2 3 4 5; do
+    run_chaos "$p2" systemd SELF_HEAL_TENANTS_FILE="$p2/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false >/dev/null
+done
+assert_eq "$(state_of "$p2" '.["lunarwing-vision-stopped.service"].retries // 0')" "0"          "P2: 5 ticks accumulate no retries for stopped tenant"
+assert_eq "$(state_of "$p2" '.["lunarwing-vision-stopped.service"].escalated // false')" "false" "P2: stopped tenant never escalates"
+
+# P3 — STARTED tenant with a genuinely failed unit → still remediated
+# (acceptance criterion 3: never-mask preserved). Primary is up.
+p3="$(sb)"; p_ports "$p3"; mk_mockbin "$p3"
+svc_up "$p3" "lunarwing-acme.service"
+svc_down "$p3" "lunarwing-pg-acme.service"
+p_report "$p3" "lunarwing-pg-acme.service"
+oP3="$(run_chaos "$p3" systemd SELF_HEAL_TENANTS_FILE="$p3/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oP3" "RESTART: lunarwing-pg-acme.service"                                    "P3: started tenant's failed unit is remediated"
+assert_absent   "$oP3" "LIFECYCLE: lunarwing-pg-acme.service"                                   "P3: no lifecycle skip for a started tenant"
+
+# P4 — STOPPED tenant but the unit is in a FAULT state (failed/auto-restart):
+# a crash is a crash even on a stopped tenant — remediated (never masked).
+p4="$(sb)"; p_ports "$p4"; mk_mockbin "$p4"
+svc_down "$p4" "lunarwing-stopped.service"
+svc_down "$p4" "lunarwing-pebble-stopped.service"
+svc_substate "$p4" "lunarwing-pebble-stopped.service" "failed"
+p_report "$p4" "lunarwing-pebble-stopped.service"
+oP4="$(run_chaos "$p4" systemd SELF_HEAL_TENANTS_FILE="$p4/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oP4" "RESTART: lunarwing-pebble-stopped.service"                             "P4: fault-state unit remediated even on stopped tenant"
+assert_absent   "$oP4" "LIFECYCLE: lunarwing-pebble-stopped.service"                            "P4: fault state bypasses the lifecycle gate"
+
+# P4b — same, via ActiveState=failed (a SIGKILLed daemon before systemd settles
+# a substate): also a fault, also remediated.
+p4b="$(sb)"; p_ports "$p4b"; mk_mockbin "$p4b"
+svc_down "$p4b" "lunarwing-stopped.service"
+svc_down "$p4b" "lunarwing-kimi-stopped.service"
+svc_active "$p4b" "lunarwing-kimi-stopped.service" "failed"
+p_report "$p4b" "lunarwing-kimi-stopped.service"
+oP4b="$(run_chaos "$p4b" systemd SELF_HEAL_TENANTS_FILE="$p4b/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oP4b" "RESTART: lunarwing-kimi-stopped.service"                             "P4b: ActiveState=failed unit remediated on stopped tenant"
+assert_absent   "$oP4b" "LIFECYCLE: lunarwing-kimi-stopped.service"                            "P4b: ActiveState fault bypasses the lifecycle gate"
+
+# P4c — OpenRC parity of the fault bypass: a CRASHED unit on a stopped tenant
+# (rc-service says crashed) is remediated, not gated.
+p4c="$(sb)"; p_ports "$p4c"; mk_mockbin "$p4c"
+svc_keyword "$p4c" "lunarwing-stopped" "stopped"
+svc_keyword "$p4c" "lunarwing-opencode-stopped" "crashed"
+report "$p4c" '{components:[{component:"openrc",status:"critical",metrics:{services:[
+  {name:"lunarwing-opencode-stopped",status:"critical"}]}}]}'
+oP4c="$(run_chaos "$p4c" openrc SELF_HEAL_TENANTS_FILE="$p4c/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oP4c" "RESTART: lunarwing-opencode-stopped"                                 "P4c: OpenRC crashed unit remediated on stopped tenant"
+assert_absent   "$oP4c" "LIFECYCLE: lunarwing-opencode-stopped"                               "P4c: OpenRC crash bypasses the lifecycle gate"
+
+# P5 — OpenRC parity (acceptance criterion 4): the gate's rc-service branch.
+p5="$(sb)"; p_ports "$p5"; mk_mockbin "$p5"
+svc_down "$p5" "lunarwing-stopped"      # OpenRC mock reads bare names
+svc_down "$p5" "lunarwing-pg-stopped"
+report "$p5" '{components:[{component:"openrc",status:"critical",metrics:{services:[
+  {name:"lunarwing-pg-stopped",status:"critical"}]}}]}'
+oP5="$(run_chaos "$p5" openrc SELF_HEAL_TENANTS_FILE="$p5/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oP5" "LIFECYCLE: lunarwing-pg-stopped belongs to a stopped tenant"           "P5: OpenRC stopped tenant is not remediated"
+assert_absent   "$oP5" "rc-service lunarwing-pg-stopped restart"                               "P5: no OpenRC restart for stopped tenant"
+
+# P6 — OpenRC started tenant: failed unit still remediated.
+p6="$(sb)"; p_ports "$p6"; mk_mockbin "$p6"
+svc_up "$p6" "lunarwing-acme"
+svc_down "$p6" "lunarwing-pg-acme"
+report "$p6" '{components:[{component:"openrc",status:"critical",metrics:{services:[
+  {name:"lunarwing-pg-acme",status:"critical"}]}}]}'
+oP6="$(run_chaos "$p6" openrc SELF_HEAL_TENANTS_FILE="$p6/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oP6" "RESTART: lunarwing-pg-acme"                                              "P6: OpenRC started tenant still remediated"
+
+# P7 — fail-open contract: tenant whose OS user cannot be resolved (registry
+# names a nonexistent user) must NOT be gated — an unresolvable tenant can never
+# mask a real outage. Dry-run still previews the restart (tenant-user bus path,
+# uid '?'); the gate must not have skipped it.
+p7="$(sb)"; echo '{"tenants":{"ghost":{"user":"no-such-os-user"}}}' > "$p7/ports.json"
+report "$p7" '{components:[{component:"systemd",status:"critical",metrics:{units:[
+  {name:"lunarwing-pg-ghost.service",status:"critical"}]}}]}'
+oP7="$(run_dry "$p7" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_TENANTS_FILE="$p7/ports.json" SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oP7" "would run: sudo -n -u no-such-os-user"                                "P7: unresolvable tenant user fails open"
+assert_absent   "$oP7" "LIFECYCLE: lunarwing-pg-ghost.service"                                  "P7: no lifecycle skip on unresolvable user"
+
+# P8 — pure-function harness: unit_is_tenant_scoped / unit_in_fault_state.
+assert_eq "$(src_fn LUNARWING_SERVICE_MANAGER=systemd -- unit_is_tenant_scoped lunarwing-pg-acme.service; echo rc=$?)" "rc=0" "P8: tenant unit is tenant-scoped"
+assert_eq "$(src_fn LUNARWING_SERVICE_MANAGER=systemd -- unit_is_tenant_scoped clickhouse-server.service; echo rc=$?)" "rc=1" "P8: foreign unit is not tenant-scoped"
+assert_eq "$(src_fn LUNARWING_SERVICE_MANAGER=systemd -- unit_is_tenant_scoped lunarwing.service; echo rc=$?)" "rc=1"        "P8: base unit is not tenant-scoped"
+
 finish

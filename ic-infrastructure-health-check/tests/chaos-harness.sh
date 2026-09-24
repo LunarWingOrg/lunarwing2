@@ -117,6 +117,11 @@ c="$(sb)"; mk_mockbin "$c"
 me="$(id -un)"
 jq -n --arg u "$me" '{tenants:{acme:{user:$u}}}' > "$c/ports.json"
 svc_down "$c" "lunarwing-acme.service"
+# WI#231: a CRASHED unit reads ActiveState=failed (a SIGKILLed daemon); a merely
+# inactive unit of a stopped tenant is deliberately-stopped and is NOT
+# remediated. Model the crash so the lifecycle gate (correctly) lets it through;
+# the mock restart clears the override so verify sees it healthy.
+svc_active "$c" "lunarwing-acme.service" failed
 report "$c" '{components:[{component:"systemd",status:"critical",metrics:{units:[
   {name:"lunarwing-acme.service",status:"critical"}]}}]}'
 o="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_TENANTS_FILE="$c/ports.json")"
@@ -130,6 +135,7 @@ echo "=== CH11: one tenant down, another healthy → blast-radius isolation ==="
 c="$(sb)"; mk_mockbin "$c"
 jq -n --arg u "$me" '{tenants:{acme:{user:$u},globex:{user:$u}}}' > "$c/ports.json"
 svc_down "$c" "lunarwing-acme.service"
+svc_active "$c" "lunarwing-acme.service" failed   # WI#231: crashed, not stopped
 svc_up   "$c" "lunarwing-globex.service"
 report "$c" '{components:[{component:"systemd",status:"critical",metrics:{units:[
   {name:"lunarwing-acme.service",  status:"critical"},

@@ -434,16 +434,69 @@ unit_is_tenant_scoped() {
     [[ -n "$(unit_tenant "$1")" ]]
 }
 
+# OpenRC primary-daemon classification from ONE bounded rc-service status call:
+#   started  → tenant is up
+#   crashed  → the primary itself crashed: a fault, never a lifecycle stop
+#   stopped  → cleanly stopped (operator stop-tenant)
+#   unknown  → probe failed/ambiguous: caller fails open
+# rc-service prints these keywords itself (the same words mt-admin's
+# openrc_service_state parses), so the gate uses the manager's own vocabulary
+# instead of inferring from exit codes.
+_openrc_primary_class() {
+    local primary="$1" out rc=0
+    [[ "$DRY_RUN" == true ]] && { printf 'unknown'; return 0; }
+    out="$(_sh_timeout rc-service "$primary" status 2>/dev/null)" || rc=$?
+    if   grep -qi 'started' <<<"$out"; then printf 'started'
+    elif grep -qi 'crashed' <<<"$out"; then printf 'crashed'
+    elif grep -qi 'stopped' <<<"$out"; then printf 'stopped'
+    elif [[ "$rc" -eq 0 && -n "$out" ]]; then printf 'started'   # rc reported success
+    else printf 'unknown'; fi
+}
+
 # Is this unit itself in a fault state that must be remediated regardless of
-# tenant state? A failed/auto-restart substate is a crash, not a stop.
+# tenant state? A crash is a crash even on a stopped tenant.
+#   systemd → SubState failed/auto-restart, or ActiveState failed (a SIGKILLed
+#             unit shows ActiveState=failed before systemd settles a substate)
+#   openrc  → rc-service status output says crashed
 unit_in_fault_state() {
-    local svc="$1" sub
-    [[ "$SERVICE_MANAGER" == systemd ]] || return 1
-    sub="$(service_substate "$svc")"
-    case "$sub" in
-        failed|auto-restart) return 0 ;;
-        *)                  return 1 ;;
+    local svc="$1" sub bare out user uid act
+    case "$SERVICE_MANAGER" in
+        systemd)
+            sub="$(service_substate "$svc")"
+            case "$sub" in
+                failed|auto-restart) return 0 ;;
+                *)                  ;;
+            esac
+            user="$(_resolve_systemd_tenant_user "$svc")"
+            if [[ -n "$user" ]]; then
+                uid="$(id -u "$user" 2>/dev/null || printf '?')"
+                [[ "$uid" != '?' ]] && act="$(_systemd_user_show "$user" "$uid" ActiveState "$svc")" || act=""
+            else
+                act="$(_systemd_show_system ActiveState "$svc")"
+            fi
+            [[ "$act" == "failed" ]] && return 0
+            return 1
+            ;;
+        openrc)
+            bare="${svc%.service}"
+            [[ "$DRY_RUN" == true ]] && return 1
+            out="$(_sh_timeout rc-service "$bare" status 2>/dev/null || true)"
+            grep -qi 'crashed' <<<"$out"
+            ;;
+        *)
+            return 1
+            ;;
     esac
+}
+
+# System-bus property read (mirrors _systemd_user_show for non-tenant units).
+_systemd_show_system() {
+    local prop="$1" unit="$2"
+    if _systemd_use_user_bus "$unit"; then
+        systemctl --user show --value -p "$prop" "$unit" 2>/dev/null || printf '?'
+    else
+        systemctl show --value -p "$prop" "$unit" 2>/dev/null || printf '?'
+    fi
 }
 
 # Is the tenant that owns this unit STARTED? (primary daemon active)
@@ -451,7 +504,7 @@ unit_in_fault_state() {
 # unknown manager): the gate must never become a new way to mask a real outage.
 # Only a POSITIVE observation of the primary daemon being inactive closes it.
 tenant_is_started() {
-    local svc="$1" tenant user primary uid
+    local svc="$1" tenant user primary uid class
     tenant="$(unit_tenant "$svc")"
     [[ -n "$tenant" ]] || return 0   # not tenant-scoped: no lifecycle to consult
     primary="lunarwing-${tenant}"
@@ -471,12 +524,11 @@ tenant_is_started() {
             return 0   # registry gap: fail open
             ;;
         openrc)
-            _openrc_active "$primary" && return 0
-            # rc-service status is the definitive probe; only a real, failing
-            # status call (init script present, service observed stopped) closes
-            # the gate. rc-service absent entirely (no OpenRC host) stays open.
-            command -v rc-service >/dev/null 2>&1 || return 0
-            return 1
+            class="$(_openrc_primary_class "$primary")"
+            # "crashed" is a fault (handled by unit_in_fault_state too, but the
+            # belt keeps a crashed primary remediable); "unknown" fails open.
+            [[ "$class" == stopped ]] && return 1
+            return 0
             ;;
         *)
             return 0   # unknown manager: fail open (never mask)
