@@ -538,7 +538,11 @@ EOF
     # mounted host agent turns prompt injection into credential use. Other
     # worker lanes keep the socket (their permission model is interactive).
     if [[ "$worker" == "kimi" ]]; then
-      printf 'SecurityOpt=no-new-privileges\n'
+      # Quadlet has no `SecurityOpt` key: the generator rejects the whole file
+      # ("unsupported key 'SecurityOpt' in group 'Container'"), so the unit is
+      # never created and the worker is unreachable (connection refused). Use
+      # the spelling the other quadlets in this file already use.
+      printf 'PodmanArgs=--security-opt=no-new-privileges\n'
     else
       # SSH agent DIRECTORY mount + env (always included — the daemon creates
       # the socket at startup; if SSH isn't configured, the socket won't exist
