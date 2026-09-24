@@ -4371,4 +4371,107 @@ FINAL("must not reach normally")
             result.stdout
         );
     }
+
+    // ── Host clock OS calls (WI#227) ──────────────────────────
+
+    fn utc_today_components() -> (i32, u8, u8) {
+        let today = chrono::Utc::now().date_naive();
+        (
+            today.year(),
+            u8::try_from(today.month()).unwrap_or_default(),
+            u8::try_from(today.day()).unwrap_or_default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn date_today_is_served_from_the_host_clock() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let code = r#"
+import datetime
+today = datetime.date.today()
+FINAL(str(today))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        let (year, month, day) = utc_today_components();
+        assert_eq!(
+            result.final_answer.as_deref(),
+            Some(format!("{year:04}-{month:02}-{day:02}").as_str()),
+            "date.today() must return the real host date, not a stale or denied value; stdout: {}",
+            result.stdout
+        );
+        assert!(
+            !result.stdout.contains("OS operations are not permitted"),
+            "the OS denial error must not appear in step output: {}",
+            result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn datetime_now_is_served_from_the_host_clock() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let code = r#"
+import datetime
+now = datetime.datetime.now().replace(microsecond=0)
+FINAL(str(now))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        let now = chrono::Utc::now();
+        // Allow the same second or an immediately adjacent second so the
+        // wall-clock tick between code execution and assertion cannot flake.
+        let answer = result.final_answer.as_deref().unwrap_or_default();
+        let parsed = chrono::NaiveDateTime::parse_from_str(answer, "%Y-%m-%d %H:%M:%S");
+        assert!(
+            parsed.is_ok_and(|parsed| (parsed - now.naive_utc()).num_seconds().abs() <= 2),
+            "datetime.now() must return the real host time; answer: {answer:?}, stdout: {}",
+            result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn datetime_now_with_timezone_is_offset_aware() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let code = r#"
+import datetime
+now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+FINAL(str(now))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        let answer = result.final_answer.as_deref().unwrap_or_default();
+        assert!(
+            answer.ends_with("+00:00"),
+            "datetime.now(timezone.utc) must be an aware UTC datetime, got: {answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_clock_os_calls_still_denied() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let code = r#"
+import os
+value = os.getenv("PATH")
+FINAL("unexpected")
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+
+        assert!(result.had_error, "stdout: {}", result.stdout);
+        assert!(
+            result.stdout.contains("OS operations are not permitted"),
+            "os.getenv must stay denied — the sandbox contract is unchanged; stdout: {}",
+            result.stdout
+        );
+    }
 }
