@@ -433,6 +433,14 @@ impl Thread {
 
     /// Add a message to this thread's conversation.
     pub fn add_message(&mut self, message: ThreadMessage) {
+        if message.role == crate::types::message::MessageRole::SealedStepRecord {
+            // WI#227: a sealed machine step record is inference-only data.
+            // Route it into the internal transcript so it can never appear in
+            // the user-visible conversation, whatever path called this.
+            self.internal_messages.push(message);
+            self.updated_at = Utc::now();
+            return;
+        }
         if self.thread_type == ThreadType::Foreground
             && self.parent_id.is_none()
             && !self.config.mission_child
@@ -458,7 +466,7 @@ impl Thread {
             message.content.clone()
         };
         self.add_event(EventKind::MessageAdded {
-            role: format!("{:?}", message.role),
+            role: message.role.wire_name().to_string(),
             content_preview: preview,
         });
         self.messages.push(message);

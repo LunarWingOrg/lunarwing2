@@ -4401,7 +4401,7 @@ pub async fn get_engine_thread(
         .iter()
         .map(|m| {
             serde_json::json!({
-                "role": format!("{:?}", m.role),
+                "role": m.role.wire_name(),
                 "content": m.content,
                 "timestamp": m.timestamp.to_rfc3339(),
             })

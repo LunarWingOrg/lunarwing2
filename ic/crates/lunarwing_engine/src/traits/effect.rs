@@ -57,8 +57,12 @@ pub fn prompt_context_from_thread_messages(
                 MessageRole::Assistant if message.action_calls.is_none() => {
                     PromptContextRole::Assistant
                 }
-                MessageRole::Assistant => return None,
-                MessageRole::System | MessageRole::ActionResult => return None,
+                // Sealed machine step records are inference-only data
+                // (WI#227): never delegate them to a worker prompt.
+                MessageRole::Assistant
+                | MessageRole::System
+                | MessageRole::ActionResult
+                | MessageRole::SealedStepRecord => return None,
             };
             Some((role, message.content.as_str()))
         },
