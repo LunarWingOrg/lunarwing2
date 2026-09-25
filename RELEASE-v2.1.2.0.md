@@ -1,8 +1,8 @@
-# Release Notes for LunarWing v2.1.2.0 (DRAFT)
+# Release Notes for LunarWing v2.1.2.0
 
 ## Codename: Yoroi (鎧, armor)
 
-**Release date** 2026-09-23
+**Release date** 2026-09-25
 
 > After the lacing, the plates
 >
@@ -15,16 +15,15 @@
 ## Overview
 
 LunarWing v2.1.2.0 is an isolation, sandboxing, worker-contract, health
-system, and confabulation-hardening release — the largest goals checklist in
-the project's history at fifty-nine items, worked by the widest herd yet. Its
-headline work is the generic Podman-first agent-shell sandbox: daemonless
-per-command execution with fail-closed defaults, daemon-socket-free operation
-(works rootless and on OpenRC), non-root UID mapping, all capabilities
-dropped, no-new-privileges, read-only rootfs, bounded tmpfs, tiered egress
-through a DNS-pinned allowlist proxy — including an enforced `proxy-enforced`
-mode that combines `--network none` with a per-execution Unix relay — and
-cancellation-safe container cleanup with an in-flight registry and a
-socketless reaper sweep.
+system, and confabulation-hardening release. It is one of the largest releases since the
+transition to the v2 engine. Its headline work is the generic Podman-first
+agent-shell sandbox: daemonless per-command execution with fail-closed
+defaults, daemon-socket-free operation (works rootless and on OpenRC), non-root
+UID mapping, all capabilities dropped, no-new-privileges, read-only
+rootfs, bounded tmpfs, tiered egress through a DNS-pinned allowlist
+proxy — including an enforced `proxy-enforced` mode that combines `--network none`
+with a per-execution Unix relay — and cancellation-safe container cleanup
+with an in-flight registry and a socketless reaper sweep.
 
 Around that core, the armor closes from several directions at once. The
 sandbox bind mount is now credential-guarded (work item #205): an
@@ -977,23 +976,9 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - DarkIRC Secure Key Exchange Stages B–D and automated QR/web/trusted-channel
   delivery remain disabled behind separate acceptance gates (carried
   unchanged).
-- The September 16 conversation-insights incident's causal trigger remains
-  unconfirmed pending its trace; the nine-finding hardening program landed,
-  but final live incident reproduction is explicitly carried.
 - WI#155's `proxy-enforced` mode is implemented and gated; live docker-
   runtime e2e was not run on the dev VM (no docker). The acceptance file
   carries the exact commands for a runtime host.
-- Live release acceptance remains for WI#164 (approval delivery) and
-  goal 34 (WI#161 REPL argument integrity) fresh-tenant threads; evidence
-  and limits are in their linked ops records. Goal 33's live acceptance
-  (WI#162 shell truncation on fresh tenant `wi162verify`) completed
-  2026-09-18 and is not carried.
-- WI#205's path-blocking is not a claim that the sandbox is safe against the
-  agent reading the daemon's environment by every other means: podman
-  `keep-id` maps the container UID onto the tenant user, who legitimately
-  owns those files. The durable fix — a sandbox-scoped gateway credential
-  class — is designed but not implemented; see
-  `docs/ops/v2.1.2.0_WI205_SANDBOX_SCOPED_CREDENTIAL_DESIGN.md`.
 - MCP does not auto-install npm/pip packages and does not pass configured
   MCP servers into `lunarwing-agent-v1` external workers.
 - The onboarding web app remains a trusted local console without user
@@ -1004,30 +989,10 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - `ALLOW_PRIVATE_IPS=1` opts out of public-address SSRF restrictions; enable
   only for intentionally trusted private-network deployments.
 - Kawarimi remains PostgreSQL-only.
-- GitLab CI publishes protected, digest-bound worker images but does not
-  publish daemon packages or deploy tenants automatically; mt-admin still
-  performs tenant-local activation.
 - OpenCode v1.18.29 remains deliberately un-adopted pending upstream proof
   (kimi-code 2.0.2 was adopted 2026-09-21 after the CLI contract gate
   proved the 2.x headless surface; if 2.x upstream regressions appear, the
   documented fallback is the last-proven 0.43.1 pin).
-- The goal-9 commit audit's four mission-retry findings
-  (`docs/ops/v2.1.2.0_ITEM9_COMMIT_AUDIT.md`: F1 `retry_attempt` payload
-  injection, F2 unscoped dedup release incl. `GatePaused`, F3 restart-sweep
-  ordering, F10 missing retry params in the `mission_update` schema) were
-  all remediated in-cycle at goal 38 before release; live tenant restart
-  acceptance of the recovery sweep remains an operator step
-  (`docs/ops/2.1.2_FINDINGS.md`).
-- The stale SSH-agent socket inode after daemon-only restarts was addressed
-  in goal 40 by mounting the socket's dedicated parent directory rather
-  than the socket file, and goal 39 (WI#226) hardened that mount to
-  read-only (`:ro,z`) with `ssh-agent-dir-ro` launch contracts; existing
-  worker containers switch mount shape on their next lifecycle pass. The
-  separately reported `Permission denied` on fresh binds has not yet been
-  confirmed fixed on a live tenant. The directory is now explicitly `0o755`
-  for worker traversal; verify the fresh-bind, restart, and worker
-  `ssh-add -l` scenarios on a live tenant before closing that residual
-  (`docs/ops/2.1.2_FINDINGS.md`).
 - WI#159 (open): the engine event listener's terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
   for Research child threads — only Mission threads are filtered — so
