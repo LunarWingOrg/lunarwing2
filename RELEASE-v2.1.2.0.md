@@ -655,7 +655,16 @@ The OpenCode v2 lane is a full first-class worker:
   force-recreate; other worker lanes keep the socket. Verified live on
   2.0.2: `sudo`, `shutdown`, `curl … | sh`, and `rm -rf` of non-temp paths
   deny in ~3s with an explicit reason while ordinary builds and tests run
-  unchanged.
+  unchanged. A late-cycle defect in the WI#206 rollout itself was caught on
+  a live tenant: the Quadlet renderer wrote `SecurityOpt=no-new-privileges`,
+  which is not a quadlet key, so the generator rejected the whole `.container`
+  file and the kimi worker unit silently never existed (dispatch failed with
+  connection refused only at first use). The renderer now emits
+  `PodmanArgs=--security-opt=no-new-privileges`, the spelling the other
+  worker quadlets already use, preserving the WI#206 intent with a key the
+  generator accepts (`fabf0cd29`); a render-then-generate smoke check in the
+  upgrade path remains open follow-up, since a daemon-reload does not report
+  generator errors.
 - opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` → `v2.0.14` → `v2.0.15` at reviewed
   commit `6f3639d82ed0760091792189b78f8eeb44f699b1` (tag SHA verified
   against anomalyco/opencode; upstream build script byte-identical to v2.0.14,
