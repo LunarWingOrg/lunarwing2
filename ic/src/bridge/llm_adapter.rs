@@ -295,6 +295,10 @@ fn thread_msg_to_chat(msg: &ThreadMessage) -> ChatMessage {
         MessageRole::User => Role::User,
         MessageRole::Assistant => Role::Assistant,
         MessageRole::ActionResult => Role::Tool,
+        // Sealed machine step records (WI#227) reach the model as user-turn
+        // step output: they are inference data the model must still read,
+        // without ever claiming human authorship.
+        MessageRole::SealedStepRecord => Role::User,
     };
 
     let content_parts = if role == Role::User {
