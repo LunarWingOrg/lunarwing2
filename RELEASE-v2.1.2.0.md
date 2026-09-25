@@ -1088,6 +1088,15 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   runbooks for the known signal-9 class (promotion locks are the only
   serializing resource groups); opencode2
   publication jobs; ShellCheck 0.11.0 floor.
+- New mt-admin tenants provision a lean per-tenant sandbox image by default
+  (`SANDBOX_IMAGE=lunarwing-sandbox:latest`, WI#223); upgrade-tenant
+  refreshes the deployed health pipeline (WI#232); LunarVoice no longer
+  strands after upgrade-tenant (WI#229); the standalone health-fleet
+  installer works again (WI#228); the kimi Quadlet renders a valid
+  `no-new-privileges` key so the unit actually exists; worker-token backfill
+  preserves tenant env ownership.
+- CodeAct `date.today()`/`datetime.now()` are served from the host clock
+  instead of erroring (WI#227).
 - Worker pins updated: kimi-code 2.0.2 (with the WI#195 headless permission
   contract, the WI#206 fail-closed PreToolUse command guard, and the
   deterministic CLI contract gate), opencode2 v2.0.15, gitlab
