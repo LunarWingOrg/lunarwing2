@@ -943,6 +943,29 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
     `Restart=on-failure`, leaving a worker running after a stop/upgrade.
     No operator action is needed beyond the normal mt-admin update; the
     behavior converges on the next lifecycle pass.
+17. **New-tenant sandbox image (WI#223).** Newly provisioned tenants get
+    `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_AUTO_PULL=false`;
+    upgrade-tenant deliberately does not add these keys to existing tenants
+    or switch their image. To opt an older tenant in, set the three
+    variables in its `lunarwing.env`, build the image
+    (`build-sandbox-image <name>`), and `restart-tenant <name>`.
+    Single-node hosts keep the in-code defaults and need nothing.
+18. **Worker SSH-agent directory mount is read-only (WI#226).** The bumped
+    `ssh-agent-dir-ro` imperative launch contracts and the changed Quadlet
+    `Volume=` line force-recreate existing non-kimi worker containers on
+    their next lifecycle pass; no operator action beyond letting mt-admin
+    converge. Verify `ssh-add -l` from a worker task after recreation.
+19. **upgrade-tenant refreshes the deployed health pipeline (WI#232).** When
+    the managed host-global health/self-heal launcher is installed, each
+    upgrade re-renders its scripts from the current mt-admin tree. A removed
+    pipeline is never re-armed by a leftover script copy;
+    `LUNARWING_MT_HEALTH_ENABLED=false` blocks new installs, not refreshes.
+20. Tenants upgraded during the 09-23 window may have lost tenant ownership
+    of `lunarwing.env` via the worker-token backfill; mt-admin preserves the
+    owner from that fix forward, but an affected env file must be restored
+    to the tenant user (with mode `0600`) before restarting through
+    mt-admin — symptoms were `Result: resources` on the daemon unit and a
+    stopped WeeChat adapter.
 
 ### Security, Deployment, and Release Limitations (carried)
 
