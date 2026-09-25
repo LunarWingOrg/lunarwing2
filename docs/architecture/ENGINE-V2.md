@@ -224,6 +224,14 @@ Key characteristics:
 - **Action limit**: each model step can attempt at most 50 tool actions. The cap
   applies independently to structured batches, CodeAct blocks, and the combined
   single/parallel action host calls made by the Python orchestrator.
+- **Host-clock OS calls**: `date.today()` and `datetime.now(tz)` are served from
+  the host clock (`OsFunction::DateToday`/`DateTimeNow` — Monty has no clock, so
+  these suspend to the host like tool calls). Naive `datetime.now()` returns UTC;
+  passing a `datetime.timezone` shifts to that fixed offset. Every other OS call
+  (filesystem, `os.getenv`, network) is still denied with `OSError` (WI#227: the
+  denial used to fire for the date functions too, pushing a "stale date system
+  error" `OSError` line into the step output that the orchestrator renders as a
+  user-visible message).
 
 ### Python Orchestrator
 
