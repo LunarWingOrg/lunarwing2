@@ -35,7 +35,21 @@ authenticate their inbound dispatch handshake with a new scoped
 `WORKER_AUTH_TOKEN` instead of the full gateway bearer. Workload
 processes on systemd multi-tenant hosts now spawn as manager-forked transient
 services, structurally fixing rootless Podman user-namespace joins from
-tenant scopes (work item #181/#178). External workers gained a new opencode2
+tenant scopes (work item #181/#178). Multi-tenant provisioning now defaults
+every new tenant to a lean per-tenant Podman sandbox image — mt-admin builds
+`lunarwing-sandbox:latest` and renders `SANDBOX_RUNTIME=podman`,
+`SANDBOX_IMAGE=lunarwing-sandbox:latest`, and `SANDBOX_AUTO_PULL=false` at
+add-tenant time (work item #223; upgrade-tenant deliberately leaves older
+tenants untouched). A late-cycle mt-admin hardening pass fixed four
+operator-facing defects found on live tenants: an invalid Quadlet key that
+silently prevented the kimi worker unit from ever existing (WI#206
+follow-up), LunarVoice stranded after upgrade-tenant by an admin-store image
+gate (WI#229), a dead standalone health-pipeline installer (WI#228), and a
+tenant-environment ownership loss during worker token backfill (WI#205
+follow-up); upgrade-tenant now also refreshes the deployed host-global
+health pipeline (WI#232). CodeAct scripting serves
+`date.today()`/`datetime.now()` from the host clock instead of denying
+every OS call (work item #227). External workers gained a new opencode2
 lane (v2 line, pinned at v2.0.15 on a reviewed upstream commit) with a
 reproducible-build bridge over the `@opencode/client/promise` SDK, full
 mt-admin mirroring, CI/CD publication jobs, and its own ports-registry v17
@@ -224,7 +238,8 @@ previous compatibility baseline.
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; no external version changed, so the vendor snapshot regenerated with no diff |
 | Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `2.0.2` (adopted 2026-09-21 after the 2.x line proved out); opencode2 `v2.0.15` at `6f3639d82ed0760091792189b78f8eeb44f699b1`; pebble at upstream HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` |
 | Sandbox default | `SANDBOX_NETWORK=none` is the in-code and mt-admin-rendered default; podman is the preferred runtime (`SANDBOX_RUNTIME`) |
-| Kimi worker lane | No longer mounts the tenant SSH-agent socket and runs with `no-new-privileges` (WI#206); the fail-closed `PreToolUse` command guard is baked into the image |
+| Sandbox image (WI#223) | New mt-admin tenants default to a lean local `lunarwing-sandbox:latest` (`SANDBOX_RUNTIME=podman`, `SANDBOX_AUTO_PULL=false`; image built and distributed by add-tenant, reconciled by start-tenant, recovered by `build-sandbox-image`); single-node hosts keep the in-code defaults (`lunarwing-worker:latest`, auto-pull on); upgrade-tenant does not change an existing tenant's sandbox image |
+| Kimi worker lane | No longer mounts the tenant SSH-agent socket and runs with `no-new-privileges` via a valid Quadlet key (`PodmanArgs=--security-opt=no-new-privileges`; WI#206); the fail-closed `PreToolUse` command guard is baked into the image |
 | Worker image publication | Digest-bound reproducible candidates/promotions for kimi, pebble, opencode, and opencode2 |
 | ShellCheck floor | 0.11.0 (checksum-pinned installer; CI gate remains blocking) |
 | Bundled skills | Exactly seven product skills ship to fresh tenants: cavepony, delegation, lunarwing-workflow-orchestrator, multica-poll, plan-mode, routine-advisor, study-notes (WI#185; three contributor-dev skills removed from the embedded catalog) |
@@ -277,6 +292,22 @@ is now the supported runtime:
   tenant `wi162verify` (OpenRC). Rootless builds keep `docker/sandbox.Dockerfile`
   lean. Evidence: `docs/ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md` and
   `docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md`.
+- **Per-tenant sandbox image provisioning (WI#223, late cycle).** mt-admin
+  now defaults every new tenant to the lean sandbox image instead of the full
+  worker image: add-tenant renders `SANDBOX_RUNTIME=podman`,
+  `SANDBOX_IMAGE=lunarwing-sandbox:latest`, and `SANDBOX_AUTO_PULL=false`
+  (explicit operator values preserved), builds the image into the admin store
+  when absent, and distributes it into the tenant's rootless Podman store;
+  `start-tenant` reconciles the image so a failed add-tenant build can be
+  retried, and `build-sandbox-image <tenant>` is the manual recovery step.
+  Image failures warn without stranding base tenant provisioning; the generic
+  shell sandbox fails closed with `ImageUnavailable`. Docker coexistence: on
+  hosts with both CLIs, mt-admin selects the same runtime the sandbox will
+  use. Upgrade-tenant deliberately adds none of this to existing tenants; the
+  build context moved to `ic/docker/` so the vendored crate tree stays
+  out of the lean image's context. Record:
+  `docs/ops/WORKER-CONTAINERS.md` (WI#223 section); harness
+  `test-mt-admin-sandbox-image.sh`.
 
 ### Sandbox Credential Containment (work items #205, #209, #210, #211, #215)
 
@@ -364,6 +395,23 @@ Combined-display clipping is flagged; exact-limit captures stay complete;
 real exit codes and `success` semantics are preserved. Live acceptance on
 fresh tenant `wi162verify` (OpenRC) passed the real-container regression
 through podman 5.8.2.
+
+### CodeAct Host-Clock OS Calls (work item #227)
+
+The CodeAct preamble documents `import datetime` as the supported way to get
+the current date, but the scripting executor denied every Monty OS call —
+including `DateToday`/`DateTimeNow`, which are pure host-clock reads. Agent
+code asking for the date got `OSError: OS operations are not permitted in
+CodeAct scripts` in step output, which the orchestrator appends to the
+working transcript as a User message; the model then fell back to stale
+cached dates — a self-inflicted staleness loop adjacent to the WI#109
+sanitizer work. The executor now serves `date.today()` and
+`datetime.now(tz)` from `chrono::Utc` (naive `datetime.now()` returns UTC; a
+fixed-offset timezone shifts to that offset); every other OS call
+(filesystem, `os.getenv`, network) remains denied, so the sandbox contract
+is unchanged. Verified: `cargo test -p lunarwing_engine` scripting suite,
+clippy `-D warnings`; contract documented in `docs/architecture/ENGINE-V2.md`
+(host-clock OS calls subsection).
 
 ### Pre-Execution Stale Tool-Output Sanitizer (work items #109, #126)
 
@@ -624,7 +672,16 @@ The OpenCode v2 lane is a full first-class worker:
   force-recreate; other worker lanes keep the socket. Verified live on
   2.0.2: `sudo`, `shutdown`, `curl … | sh`, and `rm -rf` of non-temp paths
   deny in ~3s with an explicit reason while ordinary builds and tests run
-  unchanged.
+  unchanged. A late-cycle defect in the WI#206 rollout itself was caught on
+  a live tenant: the Quadlet renderer wrote `SecurityOpt=no-new-privileges`,
+  which is not a quadlet key, so the generator rejected the whole `.container`
+  file and the kimi worker unit silently never existed (dispatch failed with
+  connection refused only at first use). The renderer now emits
+  `PodmanArgs=--security-opt=no-new-privileges`, the spelling the other
+  worker quadlets already use, preserving the WI#206 intent with a key the
+  generator accepts (`fabf0cd29`); a render-then-generate smoke check in the
+  upgrade path remains open follow-up, since a daemon-reload does not report
+  generator errors.
 - opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` → `v2.0.14` → `v2.0.15` at reviewed
   commit `6f3639d82ed0760091792189b78f8eeb44f699b1` (tag SHA verified
   against anomalyco/opencode; upstream build script byte-identical to v2.0.14,
@@ -753,6 +810,33 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   `test_worker_quadlet_stop_parity` in
   `ic/scripts/tests/test-mt-admin-worker-lifecycle.sh` asserts unit-first
   stop + container fallback for kimi/opencode/opencode2.
+- **Late-cycle live-tenant fixes (2026-09-23/24).** Four defects found while
+  diagnosing real tenants, all mt-admin-side:
+  - LunarVoice stranded after upgrade-tenant: `start_tenant_voice` gated on
+    the admin (root) container store as the sole image source and aborted
+    when upgrade-tenant had emptied it, even when the tenant's own rootless
+    store already held the image — leaving the unit failed with no supported
+    recovery path. The admin store now gates distribution only; an
+    already-provisioned tenant can start what it already has (WI#229,
+    `74da5a59e`; regression suite `test-mt-admin-tenant-image.sh`).
+  - The standalone `enable-health-fleet.sh` installer could never run: its
+    guard grepped only the top-level dispatcher for `ensure_health_pipeline()`
+    while the function lives in the sourced mt-admin-lib module, so the
+    deployed health pipeline silently drifted to stale copies whose unit
+    resolution fell through to the system bus. The check now greps the
+    modules too (WI#228, same commit).
+  - Worker-token backfill preserved the tenant env's `0600` mode but not its
+    owner: a root-run temp-file replacement left the tenant's systemd user
+    manager unable to read `EnvironmentFile=`, stopping LunarWing and its
+    WeeChat adapter before launch. The backfill now restores tenant
+    ownership (`9d7bc8108`; recorded in the WI#205 remediation doc).
+  - `upgrade-tenant` now refreshes an already-installed host-global
+    health/self-heal pipeline from the current mt-admin tree, so deployed
+    script copies stop drifting after upgrades (WI#232 G1, `f1e74960e`;
+    removal semantics unchanged — a leftover script copy never re-arms the
+    schedule, and `LUNARWING_MT_HEALTH_ENABLED=false` still blocks new
+    installs but not refreshes). Operator docs:
+    `docs/ops/MULTITENANCY-PRODUCTION.md`.
 
 ### Documentation Parity (goals 41, 45, 46, 48, 49, 50, 52)
 
@@ -799,10 +883,12 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
    0.1.8, multica 0.1.11, weechat 0.2.9, xmpp 0.1.14). Rebuild/reinstall
    the gitlab tool for registry 0.1.5; other tool registry versions are
    unchanged from v2.1.0.0.
-4. **Sandbox default change.** New tenants render `SANDBOX_NETWORK=none`;
-   existing tenant environments are preserved on re-render and gain the
-   setting only on upgrade. Review any tenant workloads that legitimately
-   need egress and set `SANDBOX_NETWORK=proxy` (allowlist) or
+4. **Sandbox default change.** New tenants render `SANDBOX_NETWORK=none` and
+   the WI#223 sandbox-image defaults (`SANDBOX_RUNTIME=podman`,
+   `SANDBOX_IMAGE=lunarwing-sandbox:latest`, `SANDBOX_AUTO_PULL=false`);
+   existing tenant environments are preserved on re-render and gain
+   `SANDBOX_NETWORK` only on upgrade. Review any tenant workloads that
+   legitimately need egress and set `SANDBOX_NETWORK=proxy` (allowlist) or
    `proxy-enforced` per tenant. The in-code default is now `none`.
 5. If tenants used rootless Podman from agent shells before this release,
    run the `fix-podman-userns` repair verb on pairings already broken; new
@@ -836,11 +922,14 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 12. **Kimi worker lane hardening (WI#206).** Rebuild the kimi worker image
     (2.0.2) and let the `KIMI_ROOTLESS_LAUNCH_CONTRACT` bump force-recreate
     existing containers: the tenant SSH-agent socket is no longer mounted,
-    `no-new-privileges` is applied, and the baked fail-closed command guard
-    ships. Tenants that legitimately need SSH from kimi worker tasks must
-    move that work to the pebble/opencode/opencode2 lanes or a scoped
-    credential broker — the shared tenant agent is no longer exposed to the
-    headless executor.
+    `no-new-privileges` is applied (via the corrected
+    `PodmanArgs=--security-opt=no-new-privileges` Quadlet key — tenants that
+    rendered the earlier invalid `SecurityOpt=` quadlet must re-render, or
+    their kimi unit silently does not exist), and the baked fail-closed
+    command guard ships. Tenants that legitimately need SSH from kimi worker
+    tasks must move that work to the pebble/opencode/opencode2 lanes or a
+    scoped credential broker — the shared tenant agent is no longer exposed
+    to the headless executor.
 13. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
     installer is at `.gitlab/scripts/install-shellcheck.sh`.
 14. Conversation-insights changes add durable cursors, batch identity, and
@@ -859,6 +948,29 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
     `Restart=on-failure`, leaving a worker running after a stop/upgrade.
     No operator action is needed beyond the normal mt-admin update; the
     behavior converges on the next lifecycle pass.
+17. **New-tenant sandbox image (WI#223).** Newly provisioned tenants get
+    `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_AUTO_PULL=false`;
+    upgrade-tenant deliberately does not add these keys to existing tenants
+    or switch their image. To opt an older tenant in, set the three
+    variables in its `lunarwing.env`, build the image
+    (`build-sandbox-image <name>`), and `restart-tenant <name>`.
+    Single-node hosts keep the in-code defaults and need nothing.
+18. **Worker SSH-agent directory mount is read-only (WI#226).** The bumped
+    `ssh-agent-dir-ro` imperative launch contracts and the changed Quadlet
+    `Volume=` line force-recreate existing non-kimi worker containers on
+    their next lifecycle pass; no operator action beyond letting mt-admin
+    converge. Verify `ssh-add -l` from a worker task after recreation.
+19. **upgrade-tenant refreshes the deployed health pipeline (WI#232).** When
+    the managed host-global health/self-heal launcher is installed, each
+    upgrade re-renders its scripts from the current mt-admin tree. A removed
+    pipeline is never re-armed by a leftover script copy;
+    `LUNARWING_MT_HEALTH_ENABLED=false` blocks new installs, not refreshes.
+20. Tenants upgraded during the 09-23 window may have lost tenant ownership
+    of `lunarwing.env` via the worker-token backfill; mt-admin preserves the
+    owner from that fix forward, but an affected env file must be restored
+    to the tenant user (with mode `0600`) before restarting through
+    mt-admin — symptoms were `Result: resources` on the daemon unit and a
+    stopped WeeChat adapter.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -908,12 +1020,14 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   (`docs/ops/2.1.2_FINDINGS.md`).
 - The stale SSH-agent socket inode after daemon-only restarts was addressed
   in goal 40 by mounting the socket's dedicated parent directory rather
-  than the socket file; existing worker containers switch mount shape on
-  their next lifecycle pass. The separately reported `Permission denied`
-  on fresh binds has not yet been confirmed fixed on a live tenant. The
-  directory is now explicitly `0o755` for worker traversal; verify the
-  fresh-bind and restart scenarios on a live tenant before closing that
-  residual (`docs/ops/2.1.2_FINDINGS.md`).
+  than the socket file, and goal 39 (WI#226) hardened that mount to
+  read-only (`:ro,z`) with `ssh-agent-dir-ro` launch contracts; existing
+  worker containers switch mount shape on their next lifecycle pass. The
+  separately reported `Permission denied` on fresh binds has not yet been
+  confirmed fixed on a live tenant. The directory is now explicitly `0o755`
+  for worker traversal; verify the fresh-bind, restart, and worker
+  `ssh-add -l` scenarios on a live tenant before closing that residual
+  (`docs/ops/2.1.2_FINDINGS.md`).
 - WI#159 (open): the engine event listener's terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
   for Research child threads — only Mission threads are filtered — so
@@ -944,11 +1058,15 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   workers no longer receive the full gateway bearer (WI#205, incl. the
   WI#209/#210/#211 review findings and WI#215 sibling derivation).
 - Worker SSH-agent stale-inode fix: the agent socket lives in a
-  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts (not the
-  socket file), so a fresh daemon-bound inode resolves at connect time and
-  the `ssh-agent-dir` launch contracts recreate legacy file-mounted worker
-  containers on their next lifecycle pass (item 40 / WI#206 stale-socket
-  follow-up; live-tenant validation remains outstanding).
+  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts read-only
+  (`:ro,z`, WI#226 — a compromised worker can no longer unlink the host
+  socket and bind a fake agent for sibling workers; `connect(2)` still uses
+  the inode's `0o666` permission), not the socket file, so a fresh
+  daemon-bound inode resolves at connect time and the `ssh-agent-dir-ro`
+  launch contracts recreate legacy writable-mounted worker containers on
+  their next lifecycle pass (items 39/40; Quadlet `Volume=` line change
+  forces recreation on systemd user managers; live-tenant `ssh-add -l`
+  validation remains outstanding).
 - Interrupted mission fires retry with backoff and survive daemon restarts;
   event/webhook delivery is at-least-once (WI#188; the goal-9 audit's
   follow-ups F1/F2/F3/F10 were remediated in-cycle at goal 38). Daily
@@ -970,6 +1088,15 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   runbooks for the known signal-9 class (promotion locks are the only
   serializing resource groups); opencode2
   publication jobs; ShellCheck 0.11.0 floor.
+- New mt-admin tenants provision a lean per-tenant sandbox image by default
+  (`SANDBOX_IMAGE=lunarwing-sandbox:latest`, WI#223); upgrade-tenant
+  refreshes the deployed health pipeline (WI#232); LunarVoice no longer
+  strands after upgrade-tenant (WI#229); the standalone health-fleet
+  installer works again (WI#228); the kimi Quadlet renders a valid
+  `no-new-privileges` key so the unit actually exists; worker-token backfill
+  preserves tenant env ownership.
+- CodeAct `date.today()`/`datetime.now()` are served from the host clock
+  instead of erroring (WI#227).
 - Worker pins updated: kimi-code 2.0.2 (with the WI#195 headless permission
   contract, the WI#206 fail-closed PreToolUse command guard, and the
   deterministic CLI contract gate), opencode2 v2.0.15, gitlab
