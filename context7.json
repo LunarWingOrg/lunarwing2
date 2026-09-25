@@ -1,4 +1,39 @@
 {
-        "url": "https://context7.com/git_git_lunarwing_org/lunarwing_lunarwing2",
-        "public_key": "pk_JqWFioj1emfEAEcoO2M87"
+  "$schema": "https://context7.com/schema/context7.json",
+  "url": "https://context7.com/git_git_lunarwing_org/lunarwing_lunarwing2",
+  "public_key": "pk_JqWFioj1emfEAEcoO2M87",
+  "projectTitle": "LunarWing",
+  "description": "LunarWing multi-tenant agent infrastructure monorepo: Rust daemon (ic/), channels, Podman-first sandboxed execution, orchestration, web gateway, missions, and the WASM/MCP extension ecosystem.",
+  "folders": [],
+  "excludeFolders": [
+    "vendor",
+    "**/vendor",
+    "target",
+    "**/target",
+    "node_modules",
+    "**/node_modules",
+    "dist",
+    "build",
+    "out",
+    "pkg",
+    "__pycache__",
+    "**/__pycache__"
+  ],
+  "excludeFiles": [
+    "CHANGELOG.md",
+    "changelog.md",
+    "CHANGELOG.mdx",
+    "changelog.mdx",
+    "LICENSE.md",
+    "license.md",
+    "CODE_OF_CONDUCT.md",
+    "code_of_conduct.md"
+  ],
+  "rules": [
+    "Core daemon source lives in ic/; subsystem specs (CLAUDE.md, README.md) are authoritative over general docs.",
+    "Build, test, and lint from the ic/ directory (cargo build/test/clippy, edition 2024, MSRV 1.92).",
+    "New persistence behavior must support both PostgreSQL and libSQL via the shared DB trait.",
+    "Security-sensitive surfaces (auth, secrets, sandboxing, approvals, listeners) must not be weakened; sandbox execution is fail-closed with SANDBOX_NETWORK=none by default.",
+    "WASM extensions and MCP integrations are preferred for plugin-style capabilities; keep entrypoints orchestration-focused."
+  ]
 }
