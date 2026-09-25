@@ -730,6 +730,7 @@ def append_message(messages, role, content, action_name=None, action_call_id=Non
     if transient_content_id is not None:
         msg["__transient_content_id"] = transient_content_id
     messages.append(msg)
+    return msg
 
 
 def append_system_append(messages, content):
@@ -756,6 +757,22 @@ def complete_result(state, outcome, response=None, error=None, extra=None):
         for key in extra:
             result[key] = extra[key]
     return result
+
+
+# Marker the Rust host consumes at transcript-sync time (WI#227). Interpreter
+# and internally-produced step output is recorded with role "User" plus this
+# field; the host then classifies the record as a sealed machine step record
+# instead of a human turn. Only step output the engine itself produced is
+# marked — user-authored text, engine nudges/warnings, and retrieved context
+# are never flagged.
+STEP_RECORD_FIELD = "_step_record"
+
+
+def seal_step_record(message):
+    """Flag a transcript message as machine-produced step output."""
+    if isinstance(message, dict):
+        message[STEP_RECORD_FIELD] = True
+    return message
 
 
 def ensure_failure_recovery(state):
@@ -1368,7 +1385,11 @@ def run_loop(context, goal, actions, state, config):
 
             # Format output for next LLM context
             output = format_output(result)
-            append_message(working_messages, "User", output)
+            # Interpreter result for the working transcript (WI#227). The
+            # blob is inference data, not a human statement: sealing keeps it
+            # out of the user-visible transcript while the model still reads
+            # it, and drops it from insight eligible-user evidence.
+            seal_step_record(append_message(working_messages, "User", output))
 
             if (result.get("had_error")
                     and "SyntaxError" in output

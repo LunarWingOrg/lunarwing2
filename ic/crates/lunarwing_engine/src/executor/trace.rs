@@ -93,7 +93,7 @@ pub fn build_trace(thread: &Thread) -> ExecutionTrace {
         .map(|m| {
             let preview: String = m.content.chars().take(300).collect();
             MessageRecord {
-                role: format!("{:?}", m.role),
+                role: m.role.wire_name().to_string(),
                 content_length: m.content.chars().count(),
                 content_preview: if m.content.chars().count() > 300 {
                     format!("{preview}...")

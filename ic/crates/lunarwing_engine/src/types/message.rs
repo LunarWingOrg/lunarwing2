@@ -20,6 +20,27 @@ pub enum MessageRole {
     Assistant,
     /// Result from a capability action (replaces "Tool" role).
     ActionResult,
+    /// Sealed machine step record (WI#227). The host sets it — via
+    /// `ThreadMessage::sealed_step_record` or
+    /// `wire::reclassify_step_output_as_sealed` — on interpreter/diagnostic
+    /// transcripts that are inference data only, so the orchestrator injects
+    /// them back into the model context as a Role::User step record with a
+    /// sealed boundary instead of forging a human turn. Bridge JSON keeps the
+    /// wire spelling; direct constructors keep the variant name.
+    SealedStepRecord,
+}
+
+impl MessageRole {
+    /// Wire spelling for orchestrator JSON and bridge DTOs.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::User => "User",
+            Self::Assistant => "Assistant",
+            Self::ActionResult => "ActionResult",
+            Self::SealedStepRecord => "StepRecord",
+        }
+    }
 }
 
 /// Provider-bound content that must not enter durable engine state.
@@ -170,6 +191,26 @@ impl ThreadMessage {
             },
             action_call_id: Some(call_id.into()),
             action_name: Some(name),
+            action_calls: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Create a sealed machine step record (WI#227).
+    ///
+    /// Interpreter output and internals-facing diagnostics stay in the
+    /// inference transcript without being presented as a human turn. The host
+    /// mint (exhaustive `MessageRole` matching, not an inspectable role
+    /// string) is the only way to produce this role.
+    pub fn sealed_step_record(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::SealedStepRecord,
+            content: content.into(),
+            transient_content_parts: Vec::new(),
+            transient_content_id: None,
+            provenance: Provenance::System,
+            action_call_id: None,
+            action_name: None,
             action_calls: None,
             timestamp: Utc::now(),
         }
