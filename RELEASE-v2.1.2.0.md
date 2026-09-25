@@ -292,6 +292,22 @@ is now the supported runtime:
   tenant `wi162verify` (OpenRC). Rootless builds keep `docker/sandbox.Dockerfile`
   lean. Evidence: `docs/ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md` and
   `docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md`.
+- **Per-tenant sandbox image provisioning (WI#223, late cycle).** mt-admin
+  now defaults every new tenant to the lean sandbox image instead of the full
+  worker image: add-tenant renders `SANDBOX_RUNTIME=podman`,
+  `SANDBOX_IMAGE=lunarwing-sandbox:latest`, and `SANDBOX_AUTO_PULL=false`
+  (explicit operator values preserved), builds the image into the admin store
+  when absent, and distributes it into the tenant's rootless Podman store;
+  `start-tenant` reconciles the image so a failed add-tenant build can be
+  retried, and `build-sandbox-image <tenant>` is the manual recovery step.
+  Image failures warn without stranding base tenant provisioning; the generic
+  shell sandbox fails closed with `ImageUnavailable`. Docker coexistence: on
+  hosts with both CLIs, mt-admin selects the same runtime the sandbox will
+  use. Upgrade-tenant deliberately adds none of this to existing tenants; the
+  build context moved to `ic/docker/` so the vendored crate tree stays
+  out of the lean image's context. Record:
+  `docs/ops/WORKER-CONTAINERS.md` (WI#223 section); harness
+  `test-mt-admin-sandbox-image.sh`.
 
 ### Sandbox Credential Containment (work items #205, #209, #210, #211, #215)
 
