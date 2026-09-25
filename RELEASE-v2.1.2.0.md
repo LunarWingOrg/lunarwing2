@@ -1,8 +1,8 @@
-# Release Notes for LunarWing v2.1.2.0 (DRAFT)
+# Release Notes for LunarWing v2.1.2.0
 
 ## Codename: Yoroi (鎧, armor)
 
-**Release date** 2026-09-23
+**Release date** 2026-09-25
 
 > After the lacing, the plates
 >
