@@ -396,6 +396,23 @@ real exit codes and `success` semantics are preserved. Live acceptance on
 fresh tenant `wi162verify` (OpenRC) passed the real-container regression
 through podman 5.8.2.
 
+### CodeAct Host-Clock OS Calls (work item #227)
+
+The CodeAct preamble documents `import datetime` as the supported way to get
+the current date, but the scripting executor denied every Monty OS call —
+including `DateToday`/`DateTimeNow`, which are pure host-clock reads. Agent
+code asking for the date got `OSError: OS operations are not permitted in
+CodeAct scripts` in step output, which the orchestrator appends to the
+working transcript as a User message; the model then fell back to stale
+cached dates — a self-inflicted staleness loop adjacent to the WI#109
+sanitizer work. The executor now serves `date.today()` and
+`datetime.now(tz)` from `chrono::Utc` (naive `datetime.now()` returns UTC; a
+fixed-offset timezone shifts to that offset); every other OS call
+(filesystem, `os.getenv`, network) remains denied, so the sandbox contract
+is unchanged. Verified: `cargo test -p lunarwing_engine` scripting suite,
+clippy `-D warnings`; contract documented in `docs/architecture/ENGINE-V2.md`
+(host-clock OS calls subsection).
+
 ### Pre-Execution Stale Tool-Output Sanitizer (work items #109, #126)
 
 WI#109's stated purpose — purge stale cached tool output before threads
