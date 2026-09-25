@@ -793,6 +793,33 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   `test_worker_quadlet_stop_parity` in
   `ic/scripts/tests/test-mt-admin-worker-lifecycle.sh` asserts unit-first
   stop + container fallback for kimi/opencode/opencode2.
+- **Late-cycle live-tenant fixes (2026-09-23/24).** Four defects found while
+  diagnosing real tenants, all mt-admin-side:
+  - LunarVoice stranded after upgrade-tenant: `start_tenant_voice` gated on
+    the admin (root) container store as the sole image source and aborted
+    when upgrade-tenant had emptied it, even when the tenant's own rootless
+    store already held the image — leaving the unit failed with no supported
+    recovery path. The admin store now gates distribution only; an
+    already-provisioned tenant can start what it already has (WI#229,
+    `74da5a59e`; regression suite `test-mt-admin-tenant-image.sh`).
+  - The standalone `enable-health-fleet.sh` installer could never run: its
+    guard grepped only the top-level dispatcher for `ensure_health_pipeline()`
+    while the function lives in the sourced mt-admin-lib module, so the
+    deployed health pipeline silently drifted to stale copies whose unit
+    resolution fell through to the system bus. The check now greps the
+    modules too (WI#228, same commit).
+  - Worker-token backfill preserved the tenant env's `0600` mode but not its
+    owner: a root-run temp-file replacement left the tenant's systemd user
+    manager unable to read `EnvironmentFile=`, stopping LunarWing and its
+    WeeChat adapter before launch. The backfill now restores tenant
+    ownership (`9d7bc8108`; recorded in the WI#205 remediation doc).
+  - `upgrade-tenant` now refreshes an already-installed host-global
+    health/self-heal pipeline from the current mt-admin tree, so deployed
+    script copies stop drifting after upgrades (WI#232 G1, `f1e74960e`;
+    removal semantics unchanged — a leftover script copy never re-arms the
+    schedule, and `LUNARWING_MT_HEALTH_ENABLED=false` still blocks new
+    installs but not refreshes). Operator docs:
+    `docs/ops/MULTITENANCY-PRODUCTION.md`.
 
 ### Documentation Parity (goals 41, 45, 46, 48, 49, 50, 52)
 
