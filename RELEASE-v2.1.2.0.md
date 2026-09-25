@@ -35,7 +35,21 @@ authenticate their inbound dispatch handshake with a new scoped
 `WORKER_AUTH_TOKEN` instead of the full gateway bearer. Workload
 processes on systemd multi-tenant hosts now spawn as manager-forked transient
 services, structurally fixing rootless Podman user-namespace joins from
-tenant scopes (work item #181/#178). External workers gained a new opencode2
+tenant scopes (work item #181/#178). Multi-tenant provisioning now defaults
+every new tenant to a lean per-tenant Podman sandbox image — mt-admin builds
+`lunarwing-sandbox:latest` and renders `SANDBOX_RUNTIME=podman`,
+`SANDBOX_IMAGE=lunarwing-sandbox:latest`, and `SANDBOX_AUTO_PULL=false` at
+add-tenant time (work item #223; upgrade-tenant deliberately leaves older
+tenants untouched). A late-cycle mt-admin hardening pass fixed four
+operator-facing defects found on live tenants: an invalid Quadlet key that
+silently prevented the kimi worker unit from ever existing (WI#206
+follow-up), LunarVoice stranded after upgrade-tenant by an admin-store image
+gate (WI#229), a dead standalone health-pipeline installer (WI#228), and a
+tenant-environment ownership loss during worker token backfill (WI#205
+follow-up); upgrade-tenant now also refreshes the deployed host-global
+health pipeline (WI#232). CodeAct scripting serves
+`date.today()`/`datetime.now()` from the host clock instead of denying
+every OS call (work item #227). External workers gained a new opencode2
 lane (v2 line, pinned at v2.0.15 on a reviewed upstream commit) with a
 reproducible-build bridge over the `@opencode/client/promise` SDK, full
 mt-admin mirroring, CI/CD publication jobs, and its own ports-registry v17
