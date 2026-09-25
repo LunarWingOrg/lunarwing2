@@ -883,10 +883,12 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
    0.1.8, multica 0.1.11, weechat 0.2.9, xmpp 0.1.14). Rebuild/reinstall
    the gitlab tool for registry 0.1.5; other tool registry versions are
    unchanged from v2.1.0.0.
-4. **Sandbox default change.** New tenants render `SANDBOX_NETWORK=none`;
-   existing tenant environments are preserved on re-render and gain the
-   setting only on upgrade. Review any tenant workloads that legitimately
-   need egress and set `SANDBOX_NETWORK=proxy` (allowlist) or
+4. **Sandbox default change.** New tenants render `SANDBOX_NETWORK=none` and
+   the WI#223 sandbox-image defaults (`SANDBOX_RUNTIME=podman`,
+   `SANDBOX_IMAGE=lunarwing-sandbox:latest`, `SANDBOX_AUTO_PULL=false`);
+   existing tenant environments are preserved on re-render and gain
+   `SANDBOX_NETWORK` only on upgrade. Review any tenant workloads that
+   legitimately need egress and set `SANDBOX_NETWORK=proxy` (allowlist) or
    `proxy-enforced` per tenant. The in-code default is now `none`.
 5. If tenants used rootless Podman from agent shells before this release,
    run the `fix-podman-userns` repair verb on pairings already broken; new
@@ -920,11 +922,14 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 12. **Kimi worker lane hardening (WI#206).** Rebuild the kimi worker image
     (2.0.2) and let the `KIMI_ROOTLESS_LAUNCH_CONTRACT` bump force-recreate
     existing containers: the tenant SSH-agent socket is no longer mounted,
-    `no-new-privileges` is applied, and the baked fail-closed command guard
-    ships. Tenants that legitimately need SSH from kimi worker tasks must
-    move that work to the pebble/opencode/opencode2 lanes or a scoped
-    credential broker — the shared tenant agent is no longer exposed to the
-    headless executor.
+    `no-new-privileges` is applied (via the corrected
+    `PodmanArgs=--security-opt=no-new-privileges` Quadlet key — tenants that
+    rendered the earlier invalid `SecurityOpt=` quadlet must re-render, or
+    their kimi unit silently does not exist), and the baked fail-closed
+    command guard ships. Tenants that legitimately need SSH from kimi worker
+    tasks must move that work to the pebble/opencode/opencode2 lanes or a
+    scoped credential broker — the shared tenant agent is no longer exposed
+    to the headless executor.
 13. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
     installer is at `.gitlab/scripts/install-shellcheck.sh`.
 14. Conversation-insights changes add durable cursors, batch identity, and
