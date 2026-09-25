@@ -992,12 +992,14 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   (`docs/ops/2.1.2_FINDINGS.md`).
 - The stale SSH-agent socket inode after daemon-only restarts was addressed
   in goal 40 by mounting the socket's dedicated parent directory rather
-  than the socket file; existing worker containers switch mount shape on
-  their next lifecycle pass. The separately reported `Permission denied`
-  on fresh binds has not yet been confirmed fixed on a live tenant. The
-  directory is now explicitly `0o755` for worker traversal; verify the
-  fresh-bind and restart scenarios on a live tenant before closing that
-  residual (`docs/ops/2.1.2_FINDINGS.md`).
+  than the socket file, and goal 39 (WI#226) hardened that mount to
+  read-only (`:ro,z`) with `ssh-agent-dir-ro` launch contracts; existing
+  worker containers switch mount shape on their next lifecycle pass. The
+  separately reported `Permission denied` on fresh binds has not yet been
+  confirmed fixed on a live tenant. The directory is now explicitly `0o755`
+  for worker traversal; verify the fresh-bind, restart, and worker
+  `ssh-add -l` scenarios on a live tenant before closing that residual
+  (`docs/ops/2.1.2_FINDINGS.md`).
 - WI#159 (open): the engine event listener's terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) fire
   for Research child threads — only Mission threads are filtered — so
