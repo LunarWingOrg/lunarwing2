@@ -1028,11 +1028,15 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   workers no longer receive the full gateway bearer (WI#205, incl. the
   WI#209/#210/#211 review findings and WI#215 sibling derivation).
 - Worker SSH-agent stale-inode fix: the agent socket lives in a
-  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts (not the
-  socket file), so a fresh daemon-bound inode resolves at connect time and
-  the `ssh-agent-dir` launch contracts recreate legacy file-mounted worker
-  containers on their next lifecycle pass (item 40 / WI#206 stale-socket
-  follow-up; live-tenant validation remains outstanding).
+  dedicated `run/ssh-agent/` directory that mt-admin bind-mounts read-only
+  (`:ro,z`, WI#226 — a compromised worker can no longer unlink the host
+  socket and bind a fake agent for sibling workers; `connect(2)` still uses
+  the inode's `0o666` permission), not the socket file, so a fresh
+  daemon-bound inode resolves at connect time and the `ssh-agent-dir-ro`
+  launch contracts recreate legacy writable-mounted worker containers on
+  their next lifecycle pass (items 39/40; Quadlet `Volume=` line change
+  forces recreation on systemd user managers; live-tenant `ssh-add -l`
+  validation remains outstanding).
 - Interrupted mission fires retry with backoff and survive daemon restarts;
   event/webhook delivery is at-least-once (WI#188; the goal-9 audit's
   follow-ups F1/F2/F3/F10 were remediated in-cycle at goal 38). Daily
