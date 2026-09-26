@@ -931,6 +931,12 @@ WS_ADAPTER_URL=http://127.0.0.1:${weechat_adapter_port}
 # durable opt-out.
 ENGINE_V2=$engine_v2
 ENGINE_V2_CHANNELS=$engine_v2_channels
+# Engine V2 model recovery + async tool budget (WI#239). Attempts are the
+# per-turn model-retry ceiling; the async timeout wraps a single in-flight
+# tool call so a stuck tool cannot pin a turn forever. Preserved on re-render.
+ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2
+ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=2
+ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=7999
 
 # Generic sandbox egress (WI#154): none by default on multi-tenant hosts —
 # the advisory proxy mode would let a sandboxed process reach host-loopback
@@ -947,6 +953,13 @@ SANDBOX_NETWORK=$sandbox_network
 SANDBOX_RUNTIME=$sandbox_runtime
 SANDBOX_IMAGE=$sandbox_image
 SANDBOX_AUTO_PULL=$sandbox_auto_pull
+# Sandbox policy (WI#239): workspace_write is the default posture — sandboxed
+# commands may write inside the mounted workspace but not outside it.
+# FullAccess stays gated behind SANDBOX_ALLOW_FULL_ACCESS=true (double opt-in
+# with SANDBOX_POLICY=full_access; see src/config/sandbox.rs). Both default
+# off for new tenants.
+SANDBOX_POLICY=workspace_write
+SANDBOX_ALLOW_FULL_ACCESS=false
 
 # Directories the generic sandbox must never expose (WI#205). The sandbox
 # mounts an agent-chosen working directory, so anything reachable from a mount
@@ -967,6 +980,24 @@ SANDBOX_AUTO_PULL=$sandbox_auto_pull
 # The daemon refuses a mount at or inside one of these, and shadows them with
 # an empty mount when a legitimate parent (the tenant home) is mounted.
 SANDBOX_PROTECTED_PATHS=$(tenant_lw_root "$name")/env:$(tenant_lw_root "$name")/state:$(tenant_lw_root "$name")/run
+
+# Agent tool loop (WI#239): local-tools dev mode off, auto-approve off, and a
+# hard cap on tool iterations per turn so a runaway loop cannot spin forever.
+# AUTO_APPROVE_TOOLS is the legacy spelling of AGENT_AUTO_APPROVE_TOOLS; the
+# daemon honours both, with AGENT_AUTO_APPROVE_TOOLS winning when both are set.
+ALLOW_LOCAL_TOOLS=false
+AUTO_APPROVE_TOOLS=false
+AGENT_MAX_TOOL_ITERATIONS=99
+
+# Skills (WI#239): opt into the SKILL.md self-improvement pipeline by default
+# and prune quarantined skills after 15 days so a skill that keeps failing
+# does not accumulate on disk indefinitely.
+SKILL_SELF_IMPROVEMENT=true
+SKILL_PRUNE_QUARANTINE_DAYS=15
+
+# Reflex compiler (WI#239): keep disabled by default for new tenants until the
+# feature is promoted out of experimental status.
+REFLEX_COMPILER_ENABLED=false
 
 # Daemon mode
 CLI_ENABLED=false
