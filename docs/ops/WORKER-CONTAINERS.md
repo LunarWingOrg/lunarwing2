@@ -340,12 +340,13 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`2.0.2` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
+`2.1.1` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
 `0.43.0` → `0.43.1` early in the v2.1.2.0 cycle, then `0.43.1` → `2.0.2` on
 2026-09-21 with `53ccb8377`, adopting the npm-latest 2.x line together with a
 deterministic CLI contract gate so clean image builds resolve a model without
 host config; the 2.x behavior changes the worker cares about are the headless
-permission-contract findings below, all verified on 2.0.2); an override
+permission-contract findings below, all verified on 2.0.2; the pin moved again
+`2.0.2` → `2.1.1` in the v2.1.3.0 crate-update cycle); an override
 without a matching reviewed lock fails closed. The pinned version is baked
 into `KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`, and
 `ic/scripts/tests/test-mt-admin-kimi.sh` cross-checks Dockerfile default, CI
