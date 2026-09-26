@@ -83,7 +83,7 @@
 32. [x] (H) (IP) full test time
 33. [x] (H) sweetie and kumo findings go through prior to release
 34. [x] (S) check all s and h
-35. [x] (S) Reserved
+35. [x] (S) art42130
 36. [x] (S) Reserved
 37. [x] (S) Reserved
 38. [x] (S) Reserved
