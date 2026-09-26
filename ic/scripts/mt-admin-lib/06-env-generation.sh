@@ -720,12 +720,13 @@ write_tenant_lunarwing_env() {
   transcription_provider="${transcription_provider:-lunarvoice}"
   transcription_model="$(_env_existing "$path" TRANSCRIPTION_MODEL)"
   transcription_model="${transcription_model:-whisper-tiny}"
-  # LLM circuit breaker: fleet defaults (open after 7 fully-retried failures,
-  # probe again after 45s). These are tunables, so preserve an operator's
-  # per-tenant override across re-provision rather than clobbering it.
+  # LLM circuit breaker: fleet defaults (open after 5 fully-retried failures,
+  # probe again after 15s — WI#239). These are tunables, so preserve an
+  # operator's per-tenant override across re-provision rather than clobbering
+  # it.
   local cb_threshold cb_recovery
-  cb_threshold="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-7}"
-  cb_recovery="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-45}"
+  cb_threshold="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-5}"
+  cb_recovery="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
   pg_password="$(tenant_pg_password "$name")"
