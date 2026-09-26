@@ -150,8 +150,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.15** at reviewed full commit
-`6f3639d82ed0760091792189b78f8eeb44f699b1`; the v2 bridge uses
+**v2.0.17** at reviewed full commit
+`04f4b0610c79e3692f3b91bd7e4489c2c7010e4b`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -273,6 +273,16 @@ calls. The new session metadata event and update field are additive to the
 bridge's session execution, message, and permission calls. Whole-image
 reproducibility must still pass the CI candidate-versus-clean-rebuild gate.
 
+v2.0.17 bump (2026-09-26): tag SHA `04f4b0610c79e3692f3b91bd7e4489c2c7010e4b`
+verified against the anomalyco/opencode remote (this releases checklist item #2
+moves the lane off the beta-frequent 2.0.15 pin). The Dockerfile has no commit
+of the upstream CLI build script available offline, so the checked
+reproducible-build patch contract was re-verified by the in-image
+`prepare_reproducible_build` self-test against a 2.0.17 fixture; host-side
+verification of the untouched-failure contract (`prepare_reproducible_build_test.py`)
+passed on the bump commit. Whole-image reproducibility must still pass the CI
+candidate-versus-clean-rebuild gate before promotion.
+
 Goal-35 verification (2026-09-18): the #177 root cause was reproduced
 host-side with the pinned Bun — two full self-test sequences with a scratch
 HOME produced identical trees except `~/.local/share/opencode/log/opencode.log`
@@ -340,12 +350,14 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`2.0.2` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
-`0.43.0` → `0.43.1` early in the v2.1.2.0 cycle, then `0.43.1` → `2.0.2` on
-2026-09-21 with `53ccb8377`, adopting the npm-latest 2.x line together with a
-deterministic CLI contract gate so clean image builds resolve a model without
-host config; the 2.x behavior changes the worker cares about are the headless
-permission-contract findings below, all verified on 2.0.2); an override
+`2.1.1` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
+`0.43.0` → `0.43.1` → `2.0.2` earlier in the v2.1.2.0/v2.1.3.0 cycle, then
+`2.0.2` → `2.1.1` on 2026-09-26 for checklist item #2, adopting npm `latest`
+again; engine requirement unchanged at `node >=22.19.0`, satisfied by the
+pinned node 22 base; the 2.x behavior changes the worker cares about are the
+headless permission-contract findings below, verified on 2.0.x — the 2.1.1
+contract gate (`kimi_cli_contract_test.ts`) is the CI-verified live re-check);
+an override
 without a matching reviewed lock fails closed. The pinned version is baked
 into `KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`, and
 `ic/scripts/tests/test-mt-admin-kimi.sh` cross-checks Dockerfile default, CI
