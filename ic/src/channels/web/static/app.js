@@ -2921,6 +2921,7 @@ function switchTab(tab) {
   if (tab === 'memory') loadMemoryTree();
   if (tab === 'jobs') loadJobs();
   if (tab === 'routines') loadRoutines();
+  if (tab === 'missions') loadMissions();
   if (tab === 'logs') {
     flushDeferredLogEntries();
     scheduleLogFilters();
@@ -5191,6 +5192,173 @@ function formatRelativeTime(isoString) {
   return future ? I18n.t('time.daysFromNow', { n: days }) : I18n.t('time.daysAgo', { n: days });
 }
 
+// --- Missions (read-only observability, work item #217) ---
+
+let currentMissionId = null;
+
+function loadMissions() {
+  currentMissionId = null;
+
+  const detail = document.getElementById('mission-detail');
+  if (detail) detail.style.display = 'none';
+  const table = document.getElementById('missions-table');
+  if (table) table.style.display = '';
+
+  Promise.all([
+    apiFetch('/api/missions/summary'),
+    apiFetch('/api/missions'),
+  ]).then(([summary, listData]) => {
+    renderMissionsSummary(summary);
+    renderMissionsList(listData.missions);
+  }).catch(() => {});
+}
+
+function renderMissionsSummary(s) {
+  document.getElementById('missions-summary').innerHTML = ''
+    + summaryCard(I18n.t('missions.summary.total'), s.total, '')
+    + summaryCard(I18n.t('missions.summary.active'), s.active, 'active')
+    + summaryCard(I18n.t('missions.summary.paused'), s.paused, '')
+    + summaryCard(I18n.t('missions.summary.budgetExhausted'), s.budget_exhausted, 'failed')
+    + summaryCard(I18n.t('missions.summary.neverFired'), s.never_fired, 'pending');
+}
+
+function missionStatusBadge(m) {
+  const status = (m.status || '').toLowerCase();
+  if (status === 'active' && m.budget_exhausted) {
+    return '<span class="badge failed">' + escapeHtml(I18n.t('missions.statusBudgetExhausted')) + '</span>';
+  }
+  const cls = status === 'active' ? 'completed'
+    : status === 'paused' ? 'pending'
+    : status === 'completed' ? 'completed'
+    : 'stuck';
+  return '<span class="badge ' + cls + '">' + escapeHtml(m.status) + '</span>';
+}
+
+function renderMissionsList(missions) {
+  const tbody = document.getElementById('missions-tbody');
+  const empty = document.getElementById('missions-empty');
+
+  if (!missions || missions.length === 0) {
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+
+  empty.style.display = 'none';
+  tbody.innerHTML = missions.map((m) => {
+    const today = m.max_threads_per_day > 0
+      ? m.threads_today + ' / ' + m.max_threads_per_day
+      : String(m.threads_today);
+    return '<tr class="routine-row" data-action="open-mission" data-id="' + escapeAttr(m.id) + '">'
+      + '<td>' + escapeHtml(m.name) + '</td>'
+      + '<td>' + escapeHtml(m.cadence_type) + '</td>'
+      + '<td>' + m.thread_count + '</td>'
+      + '<td>' + escapeHtml(today) + '</td>'
+      + '<td>' + formatRelativeTime(m.last_fired_at) + '</td>'
+      + '<td>' + missionStatusBadge(m) + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+function openMissionDetail(id) {
+  currentMissionId = id;
+  apiFetch('/api/missions/' + id).then((res) => {
+    renderMissionDetail(res.mission);
+  }).catch((err) => {
+    showToast('Failed to load mission: ' + err.message, 'error');
+  });
+}
+
+function closeMissionDetail() {
+  currentMissionId = null;
+  loadMissions();
+}
+
+function renderMissionDetail(mission) {
+  const table = document.getElementById('missions-table');
+  if (table) table.style.display = 'none';
+  document.getElementById('missions-empty').style.display = 'none';
+
+  const detail = document.getElementById('mission-detail');
+  detail.style.display = 'block';
+
+  const status = (mission.status || '').toLowerCase();
+  const statusClass = status === 'active' && mission.budget_exhausted ? 'failed'
+    : status === 'active' ? 'completed'
+    : status === 'paused' ? 'pending'
+    : 'stuck';
+  const statusLabel = status === 'active' && mission.budget_exhausted
+    ? I18n.t('missions.statusBudgetExhausted')
+    : mission.status;
+
+  let html = '<div class="job-detail-header">'
+    + '<button class="btn-back" data-action="close-mission-detail">&larr; Back</button>'
+    + '<h2>' + escapeHtml(mission.name) + '</h2>'
+    + '<span class="badge ' + statusClass + '">' + escapeHtml(statusLabel) + '</span>'
+    + '</div>';
+
+  html += '<div class="job-meta-grid">'
+    + metaItem('Mission ID', mission.id)
+    + metaItem(I18n.t('missions.cadence'), mission.cadence_type)
+    + metaItem(I18n.t('missions.threads'), mission.thread_count)
+    + metaItem(I18n.t('missions.threadsToday'), mission.threads_today)
+    + metaItem(I18n.t('missions.dailyBudget'), mission.max_threads_per_day > 0 ? mission.max_threads_per_day : I18n.t('missions.unlimited'))
+    + metaItem(I18n.t('missions.lastFired'), formatDate(mission.last_fired_at))
+    + metaItem(I18n.t('missions.nextFire'), formatDate(mission.next_fire_at))
+    + metaItem(I18n.t('missions.created'), formatDate(mission.created_at))
+    + '</div>';
+
+  if (mission.goal) {
+    html += '<div class="job-description"><h3>' + escapeHtml(I18n.t('missions.goal')) + '</h3>'
+      + '<div class="job-description-body">' + escapeHtml(mission.goal) + '</div></div>';
+  }
+
+  if (mission.current_focus) {
+    html += '<div class="job-description"><h3>' + escapeHtml(I18n.t('missions.currentFocus')) + '</h3>'
+      + '<div class="job-description-body">' + escapeHtml(mission.current_focus) + '</div></div>';
+  }
+
+  if (mission.success_criteria) {
+    html += '<div class="job-description"><h3>' + escapeHtml(I18n.t('missions.successCriteria')) + '</h3>'
+      + '<div class="job-description-body">' + escapeHtml(mission.success_criteria) + '</div></div>';
+  }
+
+  if (mission.cadence) {
+    html += '<div class="job-description"><h3>' + escapeHtml(I18n.t('missions.cadence')) + '</h3>'
+      + '<pre class="action-json">' + escapeHtml(JSON.stringify(mission.cadence, null, 2)) + '</pre></div>';
+  }
+
+  if (mission.approach_history && mission.approach_history.length > 0) {
+    html += '<div class="job-description"><h3>' + escapeHtml(I18n.t('missions.approachHistory')) + '</h3>'
+      + '<div class="job-description-body">' + mission.approach_history.map(escapeHtml).join('<hr>') + '</div></div>';
+  }
+
+  if (mission.threads && mission.threads.length > 0) {
+    html += '<div class="job-timeline-section"><h3>' + escapeHtml(I18n.t('missions.spawnedThreads')) + '</h3>'
+      + '<table class="routines-table"><thead><tr>'
+      + '<th>' + escapeHtml(I18n.t('missions.threadGoal')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('missions.threadType')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('missions.threadState')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('missions.threadSteps')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('missions.threadTokens')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('missions.threadCreated')) + '</th>'
+      + '</tr></thead><tbody>';
+    for (const t of mission.threads) {
+      html += '<tr>'
+        + '<td>' + escapeHtml(t.goal || '-') + '</td>'
+        + '<td>' + escapeHtml(t.thread_type) + '</td>'
+        + '<td>' + escapeHtml(t.state) + '</td>'
+        + '<td>' + t.step_count + '</td>'
+        + '<td>' + t.total_tokens + '</td>'
+        + '<td>' + formatDate(t.created_at) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  detail.innerHTML = html;
+}
+
 // --- Gateway status widget ---
 
 let gatewayStatusInterval = null;
@@ -7254,6 +7422,12 @@ document.addEventListener('click', function(e) {
       break;
     case 'close-routine-detail':
       closeRoutineDetail();
+      break;
+    case 'open-mission':
+      openMissionDetail(el.dataset.id);
+      break;
+    case 'close-mission-detail':
+      closeMissionDetail();
       break;
     case 'view-run-job':
       e.preventDefault();

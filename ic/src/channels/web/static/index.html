@@ -111,6 +111,7 @@
       <button data-tab="memory" data-i18n="tab.memory">Memory</button>
       <button data-tab="jobs" data-i18n="tab.jobs">Jobs</button>
       <button data-tab="routines" data-i18n="tab.routines">Routines</button>
+      <button data-tab="missions" data-i18n="tab.missions">Missions</button>
       <button data-tab="settings" data-i18n="tab.settings">Settings</button>
       <div class="spacer"></div>
 
@@ -322,6 +323,32 @@
           <span data-i18n="routines.noConfigured">No routines configured. Ask the assistant to create one.</span>
         </div>
         <div class="routine-detail" id="routine-detail" style="display:none"></div>
+      </div>
+    </div>
+
+    <!-- Missions Tab -->
+    <div class="tab-panel" id="tab-missions">
+      <div class="routines-container">
+        <div class="routines-summary" id="missions-summary"></div>
+        <div class="table-scroll">
+          <table class="routines-table" id="missions-table">
+            <thead>
+              <tr>
+                <th data-i18n="missions.name">Name</th>
+                <th data-i18n="missions.cadence">Cadence</th>
+                <th data-i18n="missions.threads">Threads</th>
+                <th data-i18n="missions.today">Today</th>
+                <th data-i18n="missions.lastFired">Last Fired</th>
+                <th data-i18n="missions.status">Status</th>
+              </tr>
+            </thead>
+            <tbody id="missions-tbody"></tbody>
+          </table>
+        </div>
+        <div class="empty-state" id="missions-empty" style="display:none">
+          <span data-i18n="missions.noConfigured">No missions yet. Ask the assistant to create one.</span>
+        </div>
+        <div class="routine-detail" id="mission-detail" style="display:none"></div>
       </div>
     </div>
 
