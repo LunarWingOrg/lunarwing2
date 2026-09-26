@@ -720,12 +720,13 @@ write_tenant_lunarwing_env() {
   transcription_provider="${transcription_provider:-lunarvoice}"
   transcription_model="$(_env_existing "$path" TRANSCRIPTION_MODEL)"
   transcription_model="${transcription_model:-whisper-tiny}"
-  # LLM circuit breaker: fleet defaults (open after 7 fully-retried failures,
-  # probe again after 45s). These are tunables, so preserve an operator's
-  # per-tenant override across re-provision rather than clobbering it.
+  # LLM circuit breaker: fleet defaults (open after 5 fully-retried failures,
+  # probe again after 15s — WI#239). These are tunables, so preserve an
+  # operator's per-tenant override across re-provision rather than clobbering
+  # it.
   local cb_threshold cb_recovery
-  cb_threshold="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-7}"
-  cb_recovery="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-45}"
+  cb_threshold="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-5}"
+  cb_recovery="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
   pg_password="$(tenant_pg_password "$name")"
@@ -806,12 +807,37 @@ write_tenant_lunarwing_env() {
   sandbox_auto_pull="$(_env_existing "$path" SANDBOX_AUTO_PULL)"
   sandbox_auto_pull="${sandbox_auto_pull:-false}"
 
+  # Sensible new-tenant defaults (WI#239): each of these is written into the
+  # rendered lunarwing.env with the value below UNLESS the operator has
+  # already set it — re-renders preserve per-tenant overrides, matching how
+  # SANDBOX_RUNTIME / SANDBOX_IMAGE / SANDBOX_AUTO_PULL and the circuit
+  # breaker are handled above. The listed defaults are what new tenants get
+  # on first write.
+  local llm_turn_budget llm_request_timeout allow_local_tools auto_approve_tools agent_max_tool_iterations
+  local sandbox_policy sandbox_allow_full_access
+  local engine_v2_model_recovery_attempts engine_v2_model_recovery_total_attempts engine_v2_tool_async_timeout_secs
+  local skill_self_improvement skill_prune_quarantine_days reflex_compiler_enabled
+  llm_turn_budget="$(_env_existing "$path" LLM_TURN_BUDGET_SECS)";                llm_turn_budget="${llm_turn_budget:-599}"
+  llm_request_timeout="$(_env_existing "$path" LLM_REQUEST_TIMEOUT_SECS)";        llm_request_timeout="${llm_request_timeout:-2599}"
+  allow_local_tools="$(_env_existing "$path" ALLOW_LOCAL_TOOLS)";                 allow_local_tools="${allow_local_tools:-false}"
+  auto_approve_tools="$(_env_existing "$path" AUTO_APPROVE_TOOLS)";               auto_approve_tools="${auto_approve_tools:-false}"
+  agent_max_tool_iterations="$(_env_existing "$path" AGENT_MAX_TOOL_ITERATIONS)"; agent_max_tool_iterations="${agent_max_tool_iterations:-99}"
+  sandbox_policy="$(_env_existing "$path" SANDBOX_POLICY)";                       sandbox_policy="${sandbox_policy:-workspace_write}"
+  sandbox_allow_full_access="$(_env_existing "$path" SANDBOX_ALLOW_FULL_ACCESS)"; sandbox_allow_full_access="${sandbox_allow_full_access:-false}"
+  engine_v2_model_recovery_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_ATTEMPTS)"
+  engine_v2_model_recovery_attempts="${engine_v2_model_recovery_attempts:-2}"
+  engine_v2_model_recovery_total_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)"
+  engine_v2_model_recovery_total_attempts="${engine_v2_model_recovery_total_attempts:-2}"
+  engine_v2_tool_async_timeout_secs="$(_env_existing "$path" ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS)"
+  engine_v2_tool_async_timeout_secs="${engine_v2_tool_async_timeout_secs:-7999}"
+  skill_self_improvement="$(_env_existing "$path" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
+  skill_prune_quarantine_days="$(_env_existing "$path" SKILL_PRUNE_QUARANTINE_DAYS)"
+  skill_prune_quarantine_days="${skill_prune_quarantine_days:-15}"
+  reflex_compiler_enabled="$(_env_existing "$path" REFLEX_COMPILER_ENABLED)";     reflex_compiler_enabled="${reflex_compiler_enabled:-false}"
+
   (
     umask 077
     cat >"$path" <<ENVEOF
-# Legacy IRONCLAW_BASE_DIR / IRONCLAW_SOCKET aliases are no longer generated for
-# new tenants (v2.0.8.0). The daemon still accepts both as fallbacks, so existing
-# tenant envs that carry them keep working unchanged.
 LUNARWING_BASE_DIR=$state_dir
 LUNARWING_SOCKET=$run_dir/lunarwing.sock
 
@@ -827,6 +853,13 @@ LLM_BASE_URL=${llm_base_url_effective}
 LLM_API_KEY=${llm_api_key:-token-${name}}
 LLM_MODEL=$llm_model_effective
 ALLOW_PRIVATE_IPS=1
+# Sensible new-tenant defaults (WI#239): per-turn wall-clock budget and the
+# per-request timeout that wraps a single LLM call. The turn budget must stay
+# comfortably below the request timeout so a slow upstream cannot stall a
+# turn indefinitely, and the request timeout must clear the harness's
+# handle_message envelope (see src/app.rs). Tunables; preserved on re-render.
+LLM_TURN_BUDGET_SECS=$llm_turn_budget
+LLM_REQUEST_TIMEOUT_SECS=$llm_request_timeout
 # Circuit breaker: fast-fail once the LLM backend is degraded, then auto-probe
 # to recover. Guards against a sick gateway amplifying transient blips into
 # tenant-wide slowness. Backend-agnostic (wraps whatever provider is built).
@@ -926,6 +959,12 @@ WS_ADAPTER_URL=http://127.0.0.1:${weechat_adapter_port}
 # durable opt-out.
 ENGINE_V2=$engine_v2
 ENGINE_V2_CHANNELS=$engine_v2_channels
+# Engine V2 model recovery + async tool budget (WI#239). Attempts are the
+# per-turn model-retry ceiling; the async timeout wraps a single in-flight
+# tool call so a stuck tool cannot pin a turn forever. Preserved on re-render.
+ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=$engine_v2_model_recovery_attempts
+ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=$engine_v2_model_recovery_total_attempts
+ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=$engine_v2_tool_async_timeout_secs
 
 # Generic sandbox egress (WI#154): none by default on multi-tenant hosts —
 # the advisory proxy mode would let a sandboxed process reach host-loopback
@@ -942,6 +981,13 @@ SANDBOX_NETWORK=$sandbox_network
 SANDBOX_RUNTIME=$sandbox_runtime
 SANDBOX_IMAGE=$sandbox_image
 SANDBOX_AUTO_PULL=$sandbox_auto_pull
+# Sandbox policy (WI#239): workspace_write is the default posture — sandboxed
+# commands may write inside the mounted workspace but not outside it.
+# FullAccess stays gated behind SANDBOX_ALLOW_FULL_ACCESS=true (double opt-in
+# with SANDBOX_POLICY=full_access; see src/config/sandbox.rs). Both default
+# off for new tenants.
+SANDBOX_POLICY=$sandbox_policy
+SANDBOX_ALLOW_FULL_ACCESS=$sandbox_allow_full_access
 
 # Directories the generic sandbox must never expose (WI#205). The sandbox
 # mounts an agent-chosen working directory, so anything reachable from a mount
@@ -962,6 +1008,24 @@ SANDBOX_AUTO_PULL=$sandbox_auto_pull
 # The daemon refuses a mount at or inside one of these, and shadows them with
 # an empty mount when a legitimate parent (the tenant home) is mounted.
 SANDBOX_PROTECTED_PATHS=$(tenant_lw_root "$name")/env:$(tenant_lw_root "$name")/state:$(tenant_lw_root "$name")/run
+
+# Agent tool loop (WI#239): local-tools dev mode off, auto-approve off, and a
+# hard cap on tool iterations per turn so a runaway loop cannot spin forever.
+# AUTO_APPROVE_TOOLS is the legacy spelling of AGENT_AUTO_APPROVE_TOOLS; the
+# daemon honours both, with AGENT_AUTO_APPROVE_TOOLS winning when both are set.
+ALLOW_LOCAL_TOOLS=$allow_local_tools
+AUTO_APPROVE_TOOLS=$auto_approve_tools
+AGENT_MAX_TOOL_ITERATIONS=$agent_max_tool_iterations
+
+# Skills (WI#239): opt into the SKILL.md self-improvement pipeline by default
+# and prune quarantined skills after 15 days so a skill that keeps failing
+# does not accumulate on disk indefinitely.
+SKILL_SELF_IMPROVEMENT=$skill_self_improvement
+SKILL_PRUNE_QUARANTINE_DAYS=$skill_prune_quarantine_days
+
+# Reflex compiler (WI#239): keep disabled by default for new tenants until the
+# feature is promoted out of experimental status.
+REFLEX_COMPILER_ENABLED=$reflex_compiler_enabled
 
 # Daemon mode
 CLI_ENABLED=false
