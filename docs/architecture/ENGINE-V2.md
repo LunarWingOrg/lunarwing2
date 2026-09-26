@@ -232,6 +232,17 @@ Key characteristics:
   denial used to fire for the date functions too, pushing a "stale date system
   error" `OSError` line into the step output that the orchestrator renders as a
   user-visible message).
+- **Sealed step records (WI#227)**: interpreter step output blobs (`[stdout]`,
+  `[name ERROR]`, `[return]`) are inference data, not conversation. The default
+  orchestrator flags freshly produced `format_output` blobs with a transient
+  `_step_record` marker; the host decoder (`classify_wire_role`) mints those —
+  and only those, plus the persisted `StepRecord` wire spelling — as
+  `MessageRole::SealedStepRecord`. `Thread::add_message` reroutes sealed records
+  into `internal_messages`, so the user-visible transcript (`thread.messages`)
+  can never contain them; the LLM adapter still feeds them to the model as
+  `Role::User` step output, and delegated-worker prompt context excludes them.
+  The Python VM cannot mint the role: unknown wire spellings and unflagged
+  writes decode as `User` exactly as before.
 
 ### Python Orchestrator
 
