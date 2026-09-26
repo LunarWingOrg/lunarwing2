@@ -80,6 +80,33 @@ the binary restores prior behavior.
   `engine_v2_tensorzero_streaming` module compile-checked via lib/tests)
   unaffected: no test asserted that step blobs appear in `thread.messages`.
 
+## Item #13 follow-up (2026-09-26, `rarity/kimi-13-20260926-2102`)
+
+Re-reviewing the cherry-pick against 2.1.3.0 master surfaced one regression
+the original MR missed: sealed records bypass `Thread::add_message`'s
+`MessageAdded` event, and the bridge's `interpret_message_event` only
+matched role `"User"` — channel UIs would have silently lost the
+"Code executed" / "Code executed (no output)" / "Code error — retrying..."
+status hints for every CodeAct step. Fixed on the item-13 branch:
+
+- `Thread::add_message` emits `MessageAdded` (role = `"StepRecord"` wire
+  spelling) before rerouting into `internal_messages`; the visible
+  transcript stays sealed.
+- `interpret_message_event` accepts both `"User"` (pre-seal transcripts)
+  and `"StepRecord"` for the code-execution hint shapes, and the
+  error-shaped preview check now wins over the `[stdout]` prefix check
+  (previously `[stdout]\nOSError: ...` reported "Code executed" — a
+  precedence bug the new router regression test exposed on pre-existing
+  code).
+- Regression coverage: engine test asserts the `StepRecord` event fires on
+  sealed `add_message`; router test
+  `interpret_message_event_covers_legacy_user_and_sealed_step_record_roles`
+  pins both roles and the error precedence.
+
+Re-verified on the item-13 branch: engine lib **628/628**, host lib
+`interpret_message_event` test, clippy `-D warnings` (engine + host),
+rustfmt clean.
+
 ## Remaining (operator, unchanged from !1137 scope)
 
 Kageho live-tenant confirmation that no embedded internal-error line appears
