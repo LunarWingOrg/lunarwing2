@@ -810,9 +810,6 @@ write_tenant_lunarwing_env() {
   (
     umask 077
     cat >"$path" <<ENVEOF
-# Legacy IRONCLAW_BASE_DIR / IRONCLAW_SOCKET aliases are no longer generated for
-# new tenants (v2.0.8.0). The daemon still accepts both as fallbacks, so existing
-# tenant envs that carry them keep working unchanged.
 LUNARWING_BASE_DIR=$state_dir
 LUNARWING_SOCKET=$run_dir/lunarwing.sock
 
@@ -828,6 +825,13 @@ LLM_BASE_URL=${llm_base_url_effective}
 LLM_API_KEY=${llm_api_key:-token-${name}}
 LLM_MODEL=$llm_model_effective
 ALLOW_PRIVATE_IPS=1
+# Sensible new-tenant defaults (WI#239): per-turn wall-clock budget and the
+# per-request timeout that wraps a single LLM call. The turn budget must stay
+# comfortably below the request timeout so a slow upstream cannot stall a
+# turn indefinitely, and the request timeout must clear the harness's
+# handle_message envelope (see src/app.rs). Tunables; preserved on re-render.
+LLM_TURN_BUDGET_SECS=599
+LLM_REQUEST_TIMEOUT_SECS=2599
 # Circuit breaker: fast-fail once the LLM backend is degraded, then auto-probe
 # to recover. Guards against a sick gateway amplifying transient blips into
 # tenant-wide slowness. Backend-agnostic (wraps whatever provider is built).
