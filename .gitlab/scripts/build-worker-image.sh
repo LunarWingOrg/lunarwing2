@@ -45,9 +45,9 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='opencode2.4lunarwing/Dockerfile
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts'
-        source_ref=6f3639d82ed0760091792189b78f8eeb44f699b1
-        build_args="OPENCODE_VERSION=v2.0.15
-OPENCODE_REF=6f3639d82ed0760091792189b78f8eeb44f699b1
+        source_ref=04f4b0610c79e3692f3b91bd7e4489c2c7010e4b
+        build_args="OPENCODE_VERSION=v2.0.17
+OPENCODE_REF=04f4b0610c79e3692f3b91bd7e4489c2c7010e4b
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
@@ -58,8 +58,8 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='kimicode4lunarwing/Dockerfile
 kimicode4lunarwing/scripts/package-lock.json
 kimicode4lunarwing/kimi-cli/package-lock.json'
-        source_ref=2.0.2
-        build_args="KIMI_CODE_VERSION=2.0.2
+        source_ref=2.1.1
+        build_args="KIMI_CODE_VERSION=2.1.1
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;

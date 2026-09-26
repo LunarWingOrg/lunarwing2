@@ -17,7 +17,7 @@ import { test } from "node:test"
  *      usage-valid: stream-json mode engages, the seeded model resolves, and
  *      the run reaches the provider layer — never a usage rejection
  *      (exit 64 / exit 2 / "unknown option"), and
- *   2. `--yolo` is rejected alongside `-p` (kimi-code 2.0.2 enforces this
+ *   2. `--yolo` is rejected alongside `-p` (kimi-code 2.0.x+ enforces this
  *      explicitly: "error: Cannot combine --prompt with --yolo."), which is
  *      why kimi_task_executor.ts relies on config-only auto-approval.
  *
@@ -31,7 +31,7 @@ import { test } from "node:test"
  * the seed is a guaranteed-unreachable loopback endpoint so the image build
  * never contacts the real gateway.
  *
- * kimi-code 2.0.2 does NOT exit 0 on provider failure: it retries connection
+ * kimi-code 2.x does NOT exit 0 on provider failure: it retries connection
  * errors up to 10 times with exponential backoff (stream-json
  * `turn.step.retrying` meta events) before giving up. Test 1 therefore
  * terminates the child as soon as the first provider-layer retry event is
@@ -231,7 +231,7 @@ test(
 //      "Ignored invalid config section" warning (the way an unknown or
 //      malformed hooks table would be rejected at runtime).
 // End-to-end denial behavior (hook blocks a dangerous tool call in print
-// mode) was verified against 2.0.2 with a live mock provider during WI#206
+// mode) was verified against kimi-code 2.0.2 with a live mock provider during WI#206
 // investigation; the image build has no provider, so it is pinned here at
 // the config-contract level instead.
 test(

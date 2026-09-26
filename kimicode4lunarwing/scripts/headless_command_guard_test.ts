@@ -8,10 +8,11 @@ import { test } from "node:test"
  * WI#206 regression coverage for hooks/headless_command_guard.mjs.
  *
  * The guard is the fail-closed policy for the headless kimi worker lane
- * (`kimi -p --output-format stream-json`). Verified against the pinned CLI
- * (2.0.2): print mode forces the auto permission policy, the upstream
- * dangerous-command guard is skipped in auto mode, and [[permission.rules]]
- * never load from config — this hook is the only in-CLI enforcement point.
+ * (`kimi -p --output-format stream-json`). Live-verified on 2.0.2; the 2.1.1
+ * CLI contract gate runs in the worker image build. Print mode forces the auto
+ * permission policy, the upstream dangerous-command guard is skipped in auto
+ * mode, and [[permission.rules]] never load from config — this hook is the
+ * only in-CLI enforcement point.
  *
  * Each case feeds a PreToolUse payload through the real script and asserts
  * the exit code: 0 = allow, 2 = block (reason on stderr). Everything else
