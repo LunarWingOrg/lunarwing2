@@ -3817,15 +3817,20 @@ fn format_action_display_name(action_name: &str, params_summary: &Option<String>
 
 /// Interpret a MessageAdded event into a human-readable status message.
 /// Returns `None` for events that don't need UI surfacing.
+///
+/// Interpreter step output arrives under either the legacy `User` role
+/// (pre-WI#227 transcripts) or the sealed `StepRecord` wire spelling — the
+/// status hints are derived from the preview shape in both cases.
 fn interpret_message_event(role: &str, content_preview: &str) -> Option<&'static str> {
-    if role == "User" && content_preview.starts_with("[stdout]") {
-        Some("Code executed")
-    } else if role == "User" && content_preview.starts_with("[code ") {
-        Some("Code executed (no output)")
-    } else if role == "User"
+    let step_output = role == "User" || role == "StepRecord";
+    if step_output
         && (content_preview.contains("Error") || content_preview.starts_with("Traceback"))
     {
         Some("Code error — retrying...")
+    } else if step_output && content_preview.starts_with("[stdout]") {
+        Some("Code executed")
+    } else if step_output && content_preview.starts_with("[code ") {
+        Some("Code executed (no output)")
     } else if role == "Assistant" {
         Some("Executing code...")
     } else {
@@ -5703,6 +5708,36 @@ mod tests {
             context.as_deref(),
             Some("transport limit\n\ncoordination schema")
         );
+    }
+
+    #[test]
+    fn interpret_message_event_covers_legacy_user_and_sealed_step_record_roles() {
+        // WI#227: sealed records emit MessageAdded with the "StepRecord" wire
+        // spelling; pre-seal transcripts use "User". Both must surface the
+        // same code-execution status hints.
+        for role in ["User", "StepRecord"] {
+            assert_eq!(
+                interpret_message_event(role, "[stdout]\nok"),
+                Some("Code executed"),
+                "role {role}"
+            );
+            assert_eq!(
+                interpret_message_event(role, "[code executed, no output]"),
+                Some("Code executed (no output)"),
+                "role {role}"
+            );
+            assert_eq!(
+                interpret_message_event(role, "[stdout]\nOSError: boom"),
+                Some("Code error — retrying..."),
+                "role {role}"
+            );
+        }
+        assert_eq!(
+            interpret_message_event("Assistant", "anything"),
+            Some("Executing code...")
+        );
+        assert_eq!(interpret_message_event("System", "anything"), None);
+        assert_eq!(interpret_message_event("User", "a human question"), None);
     }
 
     #[test]
