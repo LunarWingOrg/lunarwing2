@@ -3,7 +3,7 @@
 // (WI#206).
 //
 // The worker runs `kimi -p --output-format stream-json` headless. Verified
-// against the pinned CLI (2.0.2): print mode forces the auto permission
+// against the pinned CLI (2.x line; 2.0.2 live-verified): print mode forces the auto permission
 // policy, the upstream dangerous-command guard is skipped entirely in auto
 // mode, and [[permission.rules]] never load from config — so a PreToolUse
 // hook (which fires BEFORE permission checks in every mode and blocks with

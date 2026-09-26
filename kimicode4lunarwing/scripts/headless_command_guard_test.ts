@@ -9,7 +9,7 @@ import { test } from "node:test"
  *
  * The guard is the fail-closed policy for the headless kimi worker lane
  * (`kimi -p --output-format stream-json`). Verified against the pinned CLI
- * (2.0.2): print mode forces the auto permission policy, the upstream
+ * (2.0.x): print mode forces the auto permission policy, the upstream
  * dangerous-command guard is skipped in auto mode, and [[permission.rules]]
  * never load from config — this hook is the only in-CLI enforcement point.
  *

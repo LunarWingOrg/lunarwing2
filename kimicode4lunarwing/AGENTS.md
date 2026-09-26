@@ -11,7 +11,7 @@ Persistent container worker for upstream Kimi Code CLI (MoonshotAI/kimi-code). T
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
 - `entrypoint.sh` — Startup orchestration. Two modes: websocket, cli.
 - `config/config.toml` — Kimi Code CLI default config (model, provider, thinking, fail-closed permission policy). Mounted into container. Default provider is the TensorZero gateway (NetBird overlay `http://100.88.232.146:3000/openai/v1`, function `tensorzero::function_name::FrontierCODE`), not the managed api.kimi.com service — see README.
-- `hooks/headless_command_guard.mjs` — WI#206 fail-closed PreToolUse guard. Verified against the pinned CLI (2.0.2): print mode forces the auto policy, the upstream dangerous-command guard is skipped in auto mode, and `[[permission.rules]]` never load from config — this hook is the only in-CLI enforcement point for the headless lane.
+- `hooks/headless_command_guard.mjs` — WI#206 fail-closed PreToolUse guard. Verified against the pinned CLI (2.x line, 2.0.2 live-verified / 2.1.1 contract-gated): print mode forces the auto policy, the upstream dangerous-command guard is skipped in auto mode, and `[[permission.rules]]` never load from config — this hook is the only in-CLI enforcement point for the headless lane.
 
 ## Protocol Compatibility
 
