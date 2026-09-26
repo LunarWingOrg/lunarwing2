@@ -2,8 +2,8 @@
 
 Operational guide for the class of failure where a tenant survives
 `upgrade-tenant` + `restart-tenant` looking healthy but one subsystem is
-silently broken because **a container image the tenant needs is missing from
-the store the lifecycle path consults**.
+silently broken because **a container image is missing from the tenant's
+runtime store** (or an older lifecycle path checks the wrong store).
 
 Written from two live incidents:
 
@@ -14,10 +14,11 @@ Written from two live incidents:
   path after upgrade: `start_tenant_voice` aborted on an image check against
   the wrong (admin/root) store.
 
-Same defect class both times: **upgrades can empty the admin (root) image
-store, and per-tenant "get stuff distributed" steps silently keep assuming it
-is full.** Watch for this shape after *any* upgrade, in any subsystem that
-depends on a locally built image (sandbox, LunarVoice, LunarVision, workers).
+Upgrades can empty the admin (root) image store, leaving no source for future
+distribution. A tenant with an existing image can still run on the current
+mt-admin; a tenant without one cannot. Watch for this shape after *any*
+upgrade, in subsystems that depend on locally built images (sandbox,
+LunarVoice, LunarVision, workers).
 
 ---
 
@@ -58,37 +59,56 @@ as a signal to re-verify the image stores, not just the env value.
 
 ### Diagnosis
 
-Check all three stores. Use mt-admin for tenant state; never bare
-system-bus `systemctl` against tenant units.
+Check the selected sandbox runtime's admin store and, for Podman, the tenant's
+rootless store. `SANDBOX_RUNTIME=docker` prefers Docker; `auto`/`podman` prefers
+Podman if installed (with CLI fallback as in `sandbox_container_runtime`). The
+mt-admin worker runtime may be different. Use mt-admin for tenant state; never
+bare system-bus `systemctl` against tenant units. Do not print the whole env
+file: it may contain secrets.
 
 ```bash
 # 1. What does the tenant expect, and is AUTO_PULL drifted?
+tenant=YOUR_TENANT  # replace with the actual tenant name
 grep -E '^SANDBOX_(IMAGE|RUNTIME|AUTO_PULL)=' \
-  /home/<tenant>/lunarwing/env/lunarwing.env   # mt-admin tenant_env_dir
+  "/home/$tenant/lunarwing/env/lunarwing.env"   # mt-admin tenant_env_dir
 
-# 2. Admin (root) store
+# 2. If the selected sandbox runtime is Podman, inspect BOTH stores:
 sudo podman image inspect lunarwing-sandbox:latest >/dev/null \
-  && echo "admin store: present" || echo "admin store: MISSING"
+  && echo "Podman admin store: present" || echo "Podman admin store: MISSING"
 
-# 3. Tenant rootless store (as the tenant user)
-sudo -u <tenant> podman image inspect lunarwing-sandbox:latest >/dev/null \
-  && echo "tenant store: present" || echo "tenant store: MISSING"
+# Match mt-admin's _ctr: start from a tenant-traversable directory and set
+# HOME and XDG_RUNTIME_DIR for the tenant's rootless Podman store.
+tenant_uid="$(id -u "$tenant")"
+tenant_home="$(getent passwd "$tenant" | cut -d: -f6)"
+( cd / && sudo -u "$tenant" env HOME="$tenant_home" \
+    XDG_RUNTIME_DIR="/run/user/$tenant_uid" \
+    podman image inspect lunarwing-sandbox:latest >/dev/null ) \
+  && echo "Podman tenant store: present" || echo "Podman tenant store: MISSING"
+
+# If the selected sandbox runtime is Docker instead, the rootful Docker store
+# is the daemon's runtime store; there is no separate tenant rootless store:
+sudo docker image inspect lunarwing-sandbox:latest >/dev/null \
+  && echo "Docker runtime store: present" || echo "Docker runtime store: MISSING"
 ```
 
-If all of: env expects the managed image + both stores missing (or admin
-missing so distribution has no source) → this is your bug.
+If the env expects the managed image and the **runtime store** lacks it
+(tenant Podman or shared Docker), this is an image-availability failure. If
+only the Podman admin copy is missing, an already-provisioned tenant image
+still runs; distribution of a *new* image cannot proceed until the admin
+copy is rebuilt. Confirm actual sandbox failure with a real tool call before
+declaring the tenant broken.
 
-### Fix (verified live on two tenants)
+### Recovery when the runtime image is missing
 
 ```bash
-# 1. Build into the ADMIN store:
-sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image
+# 1. Build into the admin store of this tenant's selected sandbox runtime
+#    (not necessarily mt-admin's worker runtime):
+sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image <tenant>
 
-# 2. Distribute into the affected tenant's store and clear the failed state.
-#    start-tenant reconciles the rootless store itself (WI#223 safety net)
-#    and prints the recovery hint if it still fails:
+# 2. Distribute into the affected Podman tenant's store (Docker uses the
+#    shared rootful store). start-tenant reconciles this (WI#223 safety net)
+#    and prints a recovery hint if it still fails:
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
-#    (explicit equivalent: build-sandbox-image <tenant>, then start-tenant)
 
 # 3. Decisive test: dispatch a real shell task through the tenant's daemon —
 #    a `sandbox-OK`-style reply means the wall is gone.
@@ -97,11 +117,12 @@ sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <tenant>
 ### After-action (prevent recurrence next upgrade)
 
 - Align the env with WI#223's design: `SANDBOX_AUTO_PULL=false` for tenants on
-  the managed image. With `true`, the *next* upgrade that empties the admin
-  store re-creates this exact failure.
-- Treat sandbox-image distribution as a post-upgrade lifecycle step:
-  after any `upgrade-tenant` (or host image-store maintenance), re-check
-  section 1's three probes before declaring the tenant upgraded.
+  the managed image. With `true`, a missing runtime image may trigger a futile
+  registry pull (or a non-interactive short-name prompt) instead of recovering.
+- After `upgrade-tenant` (or host image-store maintenance), check the
+  selected runtime store and exercise a sandboxed shell call. Rebuild the
+  admin image when a future distribution/update needs it; an existing tenant
+  image alone is sufficient to run until then.
 
 ---
 
@@ -157,8 +178,11 @@ half-broken state":
    up. (Never bare system-bus `systemctl` for tenant units.)
 2. For every locally built image the tenant uses (`lunarwing-sandbox:latest`,
    `lunarwing/voice-service:latest`, the LunarVision image, worker images):
-   verify it exists in the **admin store** *and* the **tenant rootless
-   store** (probes in section 1).
+   verify it exists in the store used by that subsystem's runtime. For a
+   rootless Podman tenant, check its store with the section 1 probe; for
+   rootful Docker, check the shared Docker store. Check the corresponding
+   admin store separately if you need to distribute an updated image. A
+   missing admin copy alone does not make an existing tenant image unusable.
 3. Grep the tenant env for drift against the current release's generation
    defaults (e.g. `SANDBOX_AUTO_PULL=false`). Drift implies the provisioning
    or upgrade run diverged — re-verify everything that run was supposed to
@@ -167,11 +191,20 @@ half-broken state":
    command, one voice ping, one OCR request). "Unit is active" is not proof
    the subsystem works — the WI#238 tenant had a healthy daemon and a dead
    shell tool.
-5. Check the journal for non-fatal WARNINGs from the provisioning/upgrade
-   run before retention eats them:
+5. Check the saved output of the `mt-admin` provisioning/upgrade invocation
+   for non-fatal `WARNING`s (they may not be in service logs). For daemon
+   warnings during the incident, use the tenant's init-specific logs:
 
    ```bash
-   sudo journalctl -u 'lunarwing-*' --since '-2 days' | grep -i warning
+   # systemd user manager (not the system journal's tenant units):
+   tenant=YOUR_TENANT  # replace with the actual tenant name
+   sudo -u "$tenant" env XDG_RUNTIME_DIR="/run/user/$(id -u "$tenant")" \
+     journalctl --user -u "lunarwing-${tenant}.service" --since '-2 days' \
+     | grep -i warning
+
+   # OpenRC: rendered daemon stdout/stderr logs under the tenant home:
+   grep -i warning "/home/$tenant/lunarwing/logs/lunarwing.log" \
+     "/home/$tenant/lunarwing/logs/lunarwing.err"
    ```
 
 ## Related
