@@ -293,7 +293,9 @@ stop_tenant_writers() {
   fi
 
   for worker in pebble opencode kimi opencode2; do
-    stop_worker "$name" "$worker"
+    if tenant_worker_enabled "$name" "$worker"; then
+      stop_worker "$name" "$worker"
+    fi
   done
   stop_tenant_vision "$name"
 
