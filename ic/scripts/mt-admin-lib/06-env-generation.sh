@@ -807,6 +807,34 @@ write_tenant_lunarwing_env() {
   sandbox_auto_pull="$(_env_existing "$path" SANDBOX_AUTO_PULL)"
   sandbox_auto_pull="${sandbox_auto_pull:-false}"
 
+  # Sensible new-tenant defaults (WI#239): each of these is written into the
+  # rendered lunarwing.env with the value below UNLESS the operator has
+  # already set it — re-renders preserve per-tenant overrides, matching how
+  # SANDBOX_RUNTIME / SANDBOX_IMAGE / SANDBOX_AUTO_PULL and the circuit
+  # breaker are handled above. The listed defaults are what new tenants get
+  # on first write.
+  local llm_turn_budget llm_request_timeout allow_local_tools auto_approve_tools agent_max_tool_iterations
+  local sandbox_policy sandbox_allow_full_access
+  local engine_v2_model_recovery_attempts engine_v2_model_recovery_total_attempts engine_v2_tool_async_timeout_secs
+  local skill_self_improvement skill_prune_quarantine_days reflex_compiler_enabled
+  llm_turn_budget="$(_env_existing "$path" LLM_TURN_BUDGET_SECS)";                llm_turn_budget="${llm_turn_budget:-599}"
+  llm_request_timeout="$(_env_existing "$path" LLM_REQUEST_TIMEOUT_SECS)";        llm_request_timeout="${llm_request_timeout:-2599}"
+  allow_local_tools="$(_env_existing "$path" ALLOW_LOCAL_TOOLS)";                 allow_local_tools="${allow_local_tools:-false}"
+  auto_approve_tools="$(_env_existing "$path" AUTO_APPROVE_TOOLS)";               auto_approve_tools="${auto_approve_tools:-false}"
+  agent_max_tool_iterations="$(_env_existing "$path" AGENT_MAX_TOOL_ITERATIONS)"; agent_max_tool_iterations="${agent_max_tool_iterations:-99}"
+  sandbox_policy="$(_env_existing "$path" SANDBOX_POLICY)";                       sandbox_policy="${sandbox_policy:-workspace_write}"
+  sandbox_allow_full_access="$(_env_existing "$path" SANDBOX_ALLOW_FULL_ACCESS)"; sandbox_allow_full_access="${sandbox_allow_full_access:-false}"
+  engine_v2_model_recovery_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_ATTEMPTS)"
+  engine_v2_model_recovery_attempts="${engine_v2_model_recovery_attempts:-2}"
+  engine_v2_model_recovery_total_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)"
+  engine_v2_model_recovery_total_attempts="${engine_v2_model_recovery_total_attempts:-2}"
+  engine_v2_tool_async_timeout_secs="$(_env_existing "$path" ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS)"
+  engine_v2_tool_async_timeout_secs="${engine_v2_tool_async_timeout_secs:-7999}"
+  skill_self_improvement="$(_env_existing "$path" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
+  skill_prune_quarantine_days="$(_env_existing "$path" SKILL_PRUNE_QUARANTINE_DAYS)"
+  skill_prune_quarantine_days="${skill_prune_quarantine_days:-15}"
+  reflex_compiler_enabled="$(_env_existing "$path" REFLEX_COMPILER_ENABLED)";     reflex_compiler_enabled="${reflex_compiler_enabled:-false}"
+
   (
     umask 077
     cat >"$path" <<ENVEOF
@@ -830,8 +858,8 @@ ALLOW_PRIVATE_IPS=1
 # comfortably below the request timeout so a slow upstream cannot stall a
 # turn indefinitely, and the request timeout must clear the harness's
 # handle_message envelope (see src/app.rs). Tunables; preserved on re-render.
-LLM_TURN_BUDGET_SECS=599
-LLM_REQUEST_TIMEOUT_SECS=2599
+LLM_TURN_BUDGET_SECS=$llm_turn_budget
+LLM_REQUEST_TIMEOUT_SECS=$llm_request_timeout
 # Circuit breaker: fast-fail once the LLM backend is degraded, then auto-probe
 # to recover. Guards against a sick gateway amplifying transient blips into
 # tenant-wide slowness. Backend-agnostic (wraps whatever provider is built).
@@ -934,9 +962,9 @@ ENGINE_V2_CHANNELS=$engine_v2_channels
 # Engine V2 model recovery + async tool budget (WI#239). Attempts are the
 # per-turn model-retry ceiling; the async timeout wraps a single in-flight
 # tool call so a stuck tool cannot pin a turn forever. Preserved on re-render.
-ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2
-ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=2
-ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=7999
+ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=$engine_v2_model_recovery_attempts
+ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=$engine_v2_model_recovery_total_attempts
+ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=$engine_v2_tool_async_timeout_secs
 
 # Generic sandbox egress (WI#154): none by default on multi-tenant hosts —
 # the advisory proxy mode would let a sandboxed process reach host-loopback
@@ -958,8 +986,8 @@ SANDBOX_AUTO_PULL=$sandbox_auto_pull
 # FullAccess stays gated behind SANDBOX_ALLOW_FULL_ACCESS=true (double opt-in
 # with SANDBOX_POLICY=full_access; see src/config/sandbox.rs). Both default
 # off for new tenants.
-SANDBOX_POLICY=workspace_write
-SANDBOX_ALLOW_FULL_ACCESS=false
+SANDBOX_POLICY=$sandbox_policy
+SANDBOX_ALLOW_FULL_ACCESS=$sandbox_allow_full_access
 
 # Directories the generic sandbox must never expose (WI#205). The sandbox
 # mounts an agent-chosen working directory, so anything reachable from a mount
@@ -985,19 +1013,19 @@ SANDBOX_PROTECTED_PATHS=$(tenant_lw_root "$name")/env:$(tenant_lw_root "$name")/
 # hard cap on tool iterations per turn so a runaway loop cannot spin forever.
 # AUTO_APPROVE_TOOLS is the legacy spelling of AGENT_AUTO_APPROVE_TOOLS; the
 # daemon honours both, with AGENT_AUTO_APPROVE_TOOLS winning when both are set.
-ALLOW_LOCAL_TOOLS=false
-AUTO_APPROVE_TOOLS=false
-AGENT_MAX_TOOL_ITERATIONS=99
+ALLOW_LOCAL_TOOLS=$allow_local_tools
+AUTO_APPROVE_TOOLS=$auto_approve_tools
+AGENT_MAX_TOOL_ITERATIONS=$agent_max_tool_iterations
 
 # Skills (WI#239): opt into the SKILL.md self-improvement pipeline by default
 # and prune quarantined skills after 15 days so a skill that keeps failing
 # does not accumulate on disk indefinitely.
-SKILL_SELF_IMPROVEMENT=true
-SKILL_PRUNE_QUARANTINE_DAYS=15
+SKILL_SELF_IMPROVEMENT=$skill_self_improvement
+SKILL_PRUNE_QUARANTINE_DAYS=$skill_prune_quarantine_days
 
 # Reflex compiler (WI#239): keep disabled by default for new tenants until the
 # feature is promoted out of experimental status.
-REFLEX_COMPILER_ENABLED=false
+REFLEX_COMPILER_ENABLED=$reflex_compiler_enabled
 
 # Daemon mode
 CLI_ENABLED=false
