@@ -195,7 +195,7 @@ class OnboardBrowserTests(unittest.TestCase):
             0,
         )
         self.page.locator("#settings-btn").click()
-        // Mascot defaults to hidden; enabling it reveals Lunar's dock.
+        # Mascot defaults to hidden; enabling it reveals Lunar's dock.
         self.assertTrue(
             self.page.locator("#bat-host").evaluate(
                 "element => element.classList.contains('hidden')"
