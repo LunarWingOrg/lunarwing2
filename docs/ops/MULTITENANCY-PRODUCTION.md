@@ -762,3 +762,12 @@ These mechanisms prevent a single failed routine from permanently blocking itsel
 - Gateways bind to `127.0.0.1` by default
 - Use SSH port forwarding: `ssh -L <port>:127.0.0.1:<port> <host>`
 - Or edit the tenant's `lunarwing.env` to set `GATEWAY_HOST=0.0.0.0` and restart
+
+### Sandbox shell or a sidecar broken after an upgrade
+
+If the daemon is healthy but sandboxed shell calls fail at image resolution,
+or a voice/vision sidecar claims its locally built image is "unavailable"
+after `upgrade-tenant`, the admin/tenant image stores have drifted apart —
+see [TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md](TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md)
+for diagnosis, the `build-sandbox-image` recovery, and the post-upgrade
+checklist (WI#240/#238, WI#229).
