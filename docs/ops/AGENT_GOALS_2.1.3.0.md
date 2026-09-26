@@ -31,7 +31,7 @@
 4. [x] add this https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/240 which references some other work item as part of some troubleshooting documentation so i dont go insane after upgrading some test tenant left in a half-broken state later on
     - DONE 2026-09-26 (`aj/kimi-4-20260926-0601`): created `docs/ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md` covering the WI#240 → WI#238 incident (tenant's sandboxed shell dead after upgrade because `lunarwing-sandbox:latest` was in no image store; `SANDBOX_AUTO_PULL=true` is a trap — short-name resolution TTY failure + nothing to pull since the image is local-only) and the same-class WI#229 LunarVoice bug (start path aborted on an image check against the wrong store; fixed in mt-admin `74da5a59e`). Includes three-store diagnosis probes, the verified `build-sandbox-image` + `start-tenant` recovery, the SANDBOX_AUTO_PULL=false realignment after-action, and a general post-upgrade checklist for image-dependent subsystems
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/239 - for reference here... i want ALL of these explicitly set to the following: ALLOW_LOCAL_TOOLS=false SANDBOX_POLICY=workspace_write SANDBOX_ALLOW_FULL_ACCESS=false AUTO_APPROVE_TOOLS=false AGENT_MAX_TOOL_ITERATIONS=99 LLM_TURN_BUDGET_SECS=599 LLM_REQUEST_TIMEOUT_SECS=2599 LLM_BASE_URL=http://127.0.0.1:3000/openai/v1 LLM_CIRCUIT_BREAKER_THRESHOLD=5 LLM_CIRCUIT_BREAKER_RECOVERY_SECS=15 XMPP_JID=agent@xmpp.localhost XMPP_ALLOW_FROM=user@xmpp.localhost ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=7999 ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=2 SANDBOX_RUNTIME=podman SANDBOX_IMAGE=lunarwing-sandbox:latest SANDBOX_AUTO_PULL=false SKILL_SELF_IMPROVEMENT=true SKILL_PRUNE_QUARANTINE_DAYS=15 REFLEX_COMPILER_TRUE=false - ensure that the regular onboaridng python script and web app can still set custom names/vars obviously - additionally remove the following comments generated on the top of new tenant env files: "Legacy IRONCLAW_BASE_DIR / IRONCLAW_SOCKET aliases are no longer generated for new tenants (v2.0.8.0). The daemon still accepts both as fallbacks so existing tenant envs that carry them keep working unchanged."
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/234
+6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/234 - also, ideally an in-browser test in order to peform various operations such as tenant creation, kawarimi export, and other functionality now would be a good thing to do. we haven't been keeping up with testing this feature in a while... upgrade might not function correctly but most of the other things should... report your findings as well...
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/217
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/202
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/185
@@ -47,7 +47,7 @@
 
 ## Phase 5 - Miscellaneous
 
-14. [x] (S) Reserved slot
+14. [ ] take a look over the kawarimi adapter for hermes agents and see if anything might have changed in the codebase that could have broken anything... later on we can do a more in-depth analysis and perform upkeep if necessary but a cursory report would be sufficient for now.
 
 ## Phase 6 - Fix Reviewed findings
 15. [x] (S) (RESERVED FOR NEXT ROUND) take care of first 4 findings from docs/ops/2.1.2_FINDINGS.md - work on all of these 4 and document fixes
