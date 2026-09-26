@@ -94,7 +94,7 @@
 36. [x] (S) Reserved
 37. [ ] one small finding from goal 5 that you should fix - can get rid of the AUTO_APPROVE_TOOLS variable i told you to add - see explanation for details as to why - Details: One finding in [!1174](https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1174): its new `AUTO_APPROVE_TOOLS` handling does not preserve an existing tenant’s canonical `AGENT_AUTO_APPROVE_TOOLS` override. On re-render, `06-env-generation.sh` reads only the legacy key and rewrites the file without the canonical key, so an operator’s `true` setting becomes `false`. That contradicts the MR’s override-preservation claim.
 38. [x] (S) compile proper list of changes wanted for web gateway itself
-39. [x] (S) Reserved
+39. [x] (S) discussion regarding new external dev review loop concept
 40. [x] (S) Reserved
 
 ---
