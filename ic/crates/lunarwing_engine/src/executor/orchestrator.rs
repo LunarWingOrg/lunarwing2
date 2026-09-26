@@ -3431,6 +3431,13 @@ mod tests {
                 thread.internal_messages[0].role,
                 MessageRole::SealedStepRecord
             );
+            // The MessageAdded event still fires with the wire spelling so
+            // channel UIs keep their "Code executed"-class status hints.
+            assert!(thread.events.iter().any(|event| matches!(
+                &event.kind,
+                crate::types::event::EventKind::MessageAdded { role, .. }
+                    if role == "StepRecord"
+            )));
         }
 
         // Unflagged writes keep their effective User shape...
