@@ -41,7 +41,8 @@
     - Suites: `web_tests` 42/42 OK; `browser_tests` 4/4 OK (settings test updated to assert the new mascot default both ways). Note: upgrade was verified against the demo harness, not a live `upgrade-tenant` — a real-host upgrade acceptance remains an operator step
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/217
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/202
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/185
+9. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/185
+    - DONE 2026-09-26 (`rarity/kimi-9-20260926-1800`): verification-only repass — the WI#185 core work already landed in item-30 (`aj/kimi-30-20260921-1801`, commits `a1c0ab458`/`bfcf73b6e`/`e63481c6f`). Confirmed `ic/skills/` holds exactly the seven product skills (cavepony, delegation, lunarwing-workflow-orchestrator, multica-poll, plan-mode, routine-advisor, study-notes); the three contributor-dev skills (`web-ui-test`, `local-test`, `review-checklist`) remain absent. Repo-wide sweep for their names finds no stale references outside the guard test itself and unrelated multica local-test scripts. `cargo test --lib skills::bundled` passes 3/3 including the pinned-catalog regression test `bundled_catalog_is_exactly_the_product_skill_set`, so the guard against reintroduction is green on this branch. No code changes required.
 
 ## Phase 3 — Loose Ends (DONE-trail residuals not covered by open WIs)
 10. [x] (S) Reserved
