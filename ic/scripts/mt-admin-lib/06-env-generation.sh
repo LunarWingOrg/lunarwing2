@@ -556,6 +556,74 @@ configure_weechat_relay() {  # <tenant>
   say "WeeChat relay configured for tenant '$tenant' (port $relay_port, loopback)"
 }
 
+# Rotate a tenant's WeeChat relay password (WI#202). Generates a fresh random
+# hex password, persists it to lunarwing.env (daemon source of truth) and the
+# dedicated weechat.env (service EnvironmentFile), then applies it to a live
+# WeeChat via the tenant's tmux session when one is running. relay.conf keeps
+# the literal ${env:RELAY_PASSWORD} expression, so the on-disk config never
+# carries the secret — a stopped WeeChat simply picks the new value up from
+# weechat.env on its next start. The new password never appears on argv, in
+# relay.conf, or in logs. Aborts without touching any file when validation
+# fails, so rotation is all-or-nothing on the persisted state.
+rotate_tenant_weechat_relay_password() {  # <tenant>
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  tenant_weechat_enabled "$name" || die "WeeChat is disabled for tenant '$name' (registry enable_weechat=false)"
+
+  local lunarwing_env weechat_env relay_conf relay_port
+  lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
+  weechat_env="$(tenant_env_dir "$name")/weechat.env"
+  relay_conf="$(tenant_weechat_home "$name")/relay.conf"
+  [[ -f "$lunarwing_env" ]] || die "tenant env not found: $lunarwing_env"
+  [[ -n "$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)" ]] \
+    || die "RELAY_PASSWORD missing from $lunarwing_env"
+
+  relay_port="$(ports_get "$name" weechat)"
+  if [[ -n "$relay_port" && "$relay_port" != "0" && -f "$relay_conf" ]]; then
+    # Reuse the bootstrap validator's structural checks (without a plaintext
+    # candidate) so a hand-edited relay.conf never gets a silently broken
+    # rotation: the env expression, loopback bind, and api port must be intact.
+    _weechat_validate_relay_config "$(tenant_weechat_home "$name")" "$relay_port" "" \
+      || die "relay.conf failed validation (env expression/loopback/api port) — refusing to rotate; repair with configure-weechat-relay first"
+  fi
+
+  local new_pw
+  new_pw="$(generate_token | cut -c1-32)"
+
+  # Persist: daemon env first (its restart guidance below covers the daemon),
+  # then the service credential env. Both writes are atomic single-file swaps
+  # that preserve owner/mode, so a failure between them leaves at most one
+  # updated file — never a partial or truncated env.
+  _env_set "$lunarwing_env" RELAY_PASSWORD "$new_pw"
+  _write_weechat_env "$name" "$new_pw" \
+    || die "failed to write $weechat_env (lunarwing.env already rotated; retry to converge)"
+
+  # Live-apply only when the tenant's WeeChat tmux session is up. send-keys
+  # keeps the command off argv and out of process listings; hex needs no
+  # WeeChat quoting. Skipped silently for a stopped WeeChat (OpenRC, disabled
+  # session, or mid-restart): the unit's weechat.env EnvironmentFile delivers
+  # the new password on the next start.
+  local applied="next-start"
+  if command -v tmux >/dev/null 2>&1 \
+    && sudo -u "$name" tmux -L "weechat-$name" has-session -t weechat 2>/dev/null; then
+    if sudo -u "$name" tmux -L "weechat-$name" send-keys -t weechat \
+        "/set relay.network.password \"${new_pw}\"" Enter; then
+      applied="live"
+    else
+      say "WARNING: tmux send-keys failed; WeeChat keeps the old password until restarted" >&2
+    fi
+  fi
+
+  say "Rotated WeeChat relay password for tenant '$name' (applied: $applied)."
+  if [[ "$applied" == "live" ]]; then
+    say "WeeChat live-updated. Restart the adapter and daemon so they reconnect with the new credential:"
+  else
+    say "WeeChat picks the new password up from weechat.env on its next start. Restart the WeeChat stack:"
+  fi
+  say "    lunarwing-mt-admin.sh restart-tenant $name"
+}
+
 # Write a dedicated mode-0600 weechat.env containing only RELAY_PASSWORD.
 # Uses a temp file in the same directory then atomically renames.
 _write_weechat_env() {  # <tenant> <relay_password>

@@ -422,6 +422,8 @@ Commands:
     --skip-render                  Keep existing unit files (run render-units later;
                                    must happen before v2.0.0 for pre-1.1.9 tenants)
   rotate-pg-password <name>       Generate a new random PG password (ALTER ROLE + env update)
+  rotate-relay-password <name>    Generate a new random WeeChat relay password
+                                  (env files + live WeeChat update; WI#202)
 
   configure-gotify <name> <url>    Set custom Gotify URL for a tenant
                                    (updates workspace config + capabilities)
@@ -1155,6 +1157,12 @@ main() {
       require_root
       [[ -n "${1:-}" ]] || die "usage: rotate-pg-password <name>"
       rotate_tenant_pg_password "$1"
+      ;;
+
+    rotate-relay-password)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: rotate-relay-password <name>"
+      rotate_tenant_weechat_relay_password "$1"
       ;;
 
     list-tenants|list)
