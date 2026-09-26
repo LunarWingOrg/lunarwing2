@@ -21,7 +21,8 @@ Then open the printed URL, e.g. `http://127.0.0.1:1969/?token=…`.
 
 Demo mode swaps the active `LUNARWING_*` script paths for bundled fake scripts
 that emit realistic phased output with pauses, so you can exercise the entire
-UI (all five flows, progress, logs, mascot, moon) safely. Tip: to make a demo
+UI (all five flows, progress, logs, moon) safely. The bat mascot is hidden by
+default; enable it from the gear menu. Tip: to make a demo
 build fail (and see the angry bat), use a tenant name containing `fail`.
 
 ## Real provisioning (needs root)

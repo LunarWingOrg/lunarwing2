@@ -20,7 +20,7 @@
   LW.initSettings($('settings-btn'), $('settings-panel'), [
     { key: 'splash', label: 'splash', default: true },
     {
-      key: 'mascot', label: 'mascot', default: true,
+      key: 'mascot', label: 'mascot', default: false,
       onChange: (on) => {
         $('bat-host').classList.toggle('hidden', !on);
         $('bat-mood').classList.toggle('hidden', !on);
