@@ -61,7 +61,7 @@
 ## Phase 6 - Documentation
 17. [ ] take a look at any documentation that should be updated and update necessary documentation
 18. [x] create release notes draft at the root of the repo
-19. [x] review all currently open work items - there is open work item audit already so please update that document
+19. [ ] review all currently open work items - create audit document for 2.1.3.0
 20. [x] UPDATE RELEASE-v2.1.2.0.md WITH CHANGES MADE SINCE FIRST DRAFT WAS CREATED
 21. [ ] update all docs in docs/guides
 22. [ ] update all docs in docs/architecture
