@@ -3464,6 +3464,74 @@ mod tests {
     }
 
     #[test]
+    fn sync_runtime_state_seals_flagged_step_output_out_of_the_visible_transcript() {
+        // WI#227 regression through the reported boundary itself: the Python
+        // orchestrator appends interpreter blobs to `working_messages`; the
+        // host sync path (`sync_runtime_state`) is what materializes them into
+        // the thread. Assert the sealed record lands in `internal_messages`
+        // and can never surface through the user-visible `thread.messages`
+        // that `get_engine_thread` serves.
+        let mut thread = Thread::new(
+            "check the date",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.add_message(ThreadMessage::user("what day is it?"));
+        let visible_before = thread.messages.len();
+
+        let state = serde_json::json!({
+            "working_messages": [
+                {"role": "User", "content": "what day is it?"},
+                {"role": "Assistant", "content": "```python\nimport datetime\nprint(datetime.date.today())\n```"},
+                {
+                    "role": "User",
+                    "content": "[stdout]\nOSError: OS operations are not permitted in CodeAct scripts",
+                    STEP_RECORD_FIELD: true,
+                },
+            ],
+        });
+        sync_runtime_state(&mut thread, Some(&state));
+
+        // The flagged blob is sealed inside the inference transcript...
+        let sealed: Vec<_> = thread
+            .internal_messages
+            .iter()
+            .filter(|m| m.role == MessageRole::SealedStepRecord)
+            .collect();
+        assert_eq!(sealed.len(), 1, "flagged step output must seal");
+        assert!(sealed[0].content.contains("OSError"));
+        assert_eq!(sealed[0].provenance, Provenance::System);
+
+        // ...and the user-visible transcript is untouched by it.
+        assert_eq!(thread.messages.len(), visible_before);
+        assert!(
+            thread
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("OS operations are not permitted")),
+            "sealed step output leaked into the visible transcript"
+        );
+
+        // Unflagged machine controls still ride the inference transcript as
+        // User turns — the seal is narrow, not a blanket User reroute.
+        let state = serde_json::json!({
+            "working_messages": [
+                {"role": "User", "content": "Loop warning: finish now."},
+            ],
+        });
+        sync_runtime_state(&mut thread, Some(&state));
+        assert!(
+            thread
+                .internal_messages
+                .iter()
+                .any(|m| m.role == MessageRole::User && m.content.contains("Loop warning")),
+            "unflagged control text must keep its User turn shape"
+        );
+    }
+
+    #[test]
     fn orchestrator_wire_reattaches_transient_parts_without_serializing_bytes() {
         let mut thread = Thread::new(
             "inspect image",

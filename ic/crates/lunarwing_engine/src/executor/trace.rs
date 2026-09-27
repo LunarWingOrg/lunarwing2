@@ -238,9 +238,10 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
     }
 
     // 4. Check for code execution errors in output messages.
-    // Code output appears as User-role messages (Monty stdout/stderr) with
-    // prefixes like "[stdout]" or "[stderr]". Skip the System prompt (index 0)
-    // and Assistant messages to avoid false positives from example text.
+    // Code output appears as User-role messages (Monty stdout/stderr, legacy
+    // transcripts) or sealed machine step records (WI#227) with prefixes like
+    // "[stdout]" or "[stderr]". Skip the System prompt (index 0) and Assistant
+    // messages to avoid false positives from example text.
     let error_patterns = [
         "NameError",
         "SyntaxError",
@@ -248,7 +249,12 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         "NotImplementedError",
     ];
     for (i, msg) in inference_messages.iter().enumerate() {
-        let is_code_output = msg.role == crate::types::message::MessageRole::User
+        let is_step_role = matches!(
+            msg.role,
+            crate::types::message::MessageRole::User
+                | crate::types::message::MessageRole::SealedStepRecord
+        );
+        let is_code_output = is_step_role
             && (msg.content.starts_with("[stdout]")
                 || msg.content.starts_with("[stderr]")
                 || msg.content.starts_with("[code ")
@@ -593,6 +599,36 @@ mod tests {
         assert!(IssueSeverity::Error.is_actionable());
         assert!(IssueSeverity::Warning.is_actionable());
         assert!(!IssueSeverity::Info.is_actionable());
+    }
+
+    // ── code_error detection over sealed step records (WI#227) ─────────────
+
+    #[test]
+    fn code_error_detection_covers_sealed_step_records_and_legacy_user_blobs() {
+        // WI#227 follow-up: interpreter output sealed as SealedStepRecord must
+        // still produce actionable code_error warnings; pre-seal transcripts
+        // carry the same blobs as role User. Both shapes feed the
+        // self-improvement trigger in runtime/mission.rs.
+        for make_blob in [
+            ThreadMessage::user as fn(&str) -> ThreadMessage,
+            ThreadMessage::sealed_step_record,
+        ] {
+            let mut thread = make_thread();
+            thread.add_message(ThreadMessage::assistant("running the snippet"));
+            thread.internal_messages.push(make_blob(
+                "[stdout]\nTraceback (most recent call last):\nNameError: name 'x' is not defined",
+            ));
+
+            let issues = analyze_trace(&thread);
+            let code_errors: Vec<_> = issues
+                .iter()
+                .filter(|issue| issue.category == "code_error")
+                .collect();
+            assert_eq!(code_errors.len(), 1, "sealed/legacy blob must flag");
+            assert_eq!(code_errors[0].severity, IssueSeverity::Warning);
+            assert!(code_errors[0].severity.is_actionable());
+            assert!(code_errors[0].description.contains("NameError"));
+        }
     }
 
     #[test]

@@ -184,7 +184,7 @@ fn build_context_inputs(
             let mut pairs = vec![
                 (
                     MontyObject::String("role".into()),
-                    MontyObject::String(format!("{:?}", msg.role)),
+                    MontyObject::String(msg.role.wire_name().into()),
                 ),
                 (
                     MontyObject::String("content".into()),
