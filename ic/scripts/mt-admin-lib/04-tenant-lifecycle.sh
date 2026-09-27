@@ -245,6 +245,13 @@ tenant_writer_services() {
     if tenant_worker_enabled "$name" "$worker"; then
       printf '%s\n' "lunarwing-${worker}-${name}"
       [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-${worker}-${name}-sup"
+    elif [[ "$INIT_SYSTEM" == openrc ]]; then
+      # A deselected worker may still have an old init script/supervisor.
+      # Export must inspect it even though the registry no longer selects it.
+      [[ ! -x "$OPENRC_INITD_DIR/lunarwing-${worker}-${name}" ]] \
+        || printf '%s\n' "lunarwing-${worker}-${name}"
+      [[ ! -x "$OPENRC_INITD_DIR/lunarwing-${worker}-${name}-sup" ]] \
+        || printf '%s\n' "lunarwing-${worker}-${name}-sup"
     fi
   done
 }
@@ -285,6 +292,15 @@ stop_tenant_writers() {
     done < <(tenant_writer_services "$name")
   else
     while IFS= read -r service; do
+      # stop_worker handles worker units AND removes their supervisor's boot
+      # links. Do not stop them here first: a second rc-service stop can fail
+      # when the unit is already stopped.
+      case "$service" in
+        "lunarwing-pebble-${name}"|"lunarwing-pebble-${name}-sup"|\
+        "lunarwing-opencode-${name}"|"lunarwing-opencode-${name}-sup"|\
+        "lunarwing-kimi-${name}"|"lunarwing-kimi-${name}-sup"|\
+        "lunarwing-opencode2-${name}"|"lunarwing-opencode2-${name}-sup") continue ;;
+      esac
       [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
       rc-service "$service" stop >/dev/null 2>&1 \
         || rc-service "$service" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
@@ -293,7 +309,12 @@ stop_tenant_writers() {
   fi
 
   for worker in pebble opencode kimi opencode2; do
-    stop_worker "$name" "$worker"
+    if tenant_worker_enabled "$name" "$worker" \
+        || { [[ "$INIT_SYSTEM" == openrc ]] \
+          && { [[ -x "$OPENRC_INITD_DIR/lunarwing-${worker}-${name}" ]] \
+            || [[ -x "$OPENRC_INITD_DIR/lunarwing-${worker}-${name}-sup" ]]; }; }; then
+      stop_worker "$name" "$worker"
+    fi
   done
   stop_tenant_vision "$name"
 

@@ -14,6 +14,7 @@ source "$MT_ADMIN"
 # tenant_writers_active dependency is stubbed per-case.
 _TWA_REAL_DEF="$(declare -f tenant_writers_active)"
 _AWAIT_QUIESCE_REAL_DEF="$(declare -f await_writer_quiescence)"
+_OPENRC_WORKER_STOP_REAL_DEF="$(declare -f openrc_worker_stop_disable)"
 
 failures=0
 CALLS=()
@@ -736,6 +737,76 @@ test_quiesce_wait_active_then_settled
 test_quiesce_wait_never_settles_fails_after_deadline
 test_quiesce_wait_unclassifiable_fails_closed
 test_writers_active_openrc_weechat_wording
+
+# A deselected worker can leave an OpenRC -sup unit behind. It must be visible
+# to the pre-export quiescence probe and stopped before container inspection;
+# unrelated deselected workers with no units must not cause stop-worker errors.
+test_stale_openrc_worker_supervisor() (
+  set +e
+  eval "$_TWA_REAL_DEF"
+  eval "$_AWAIT_QUIESCE_REAL_DEF"
+  eval "$_OPENRC_WORKER_STOP_REAL_DEF"
+  # shellcheck disable=SC2034 # read by eval'd lifecycle helpers
+  INIT_SYSTEM=openrc
+  OPENRC_INITD_DIR="$fixture/stale-init.d"
+  mkdir -p "$OPENRC_INITD_DIR"
+  printf '#!/bin/sh\n' >"$OPENRC_INITD_DIR/lunarwing-kimi-alice-sup"
+  chmod +x "$OPENRC_INITD_DIR/lunarwing-kimi-alice-sup"
+  local state_file="$fixture/stale-supervisor-state" log="$fixture/stale-supervisor-log" rc
+  printf 'started\n' >"$state_file"
+  : >"$log"
+  tenant_proxy_enabled() { return 1; }
+  tenant_weechat_enabled() { return 1; }
+  tenant_darkirc_enabled() { return 1; }
+  tenant_vision_external() { return 0; }
+  tenant_worker_enabled() { return 1; }
+  detect_container_runtime() { return 1; }
+  rc-service() {
+    printf '%s %s\n' "$1" "$2" >>"$log"
+    if [[ "$1" == lunarwing-kimi-alice-sup ]]; then
+      if [[ "$2" == stop ]]; then
+        [[ "$(cat "$state_file")" == started ]] || return 1
+        printf 'stopped\n' >"$state_file"
+        return 0
+      fi
+      cat "$state_file"
+    else
+      printf 'stopped\n'
+    fi
+  }
+  tenant_writers_active alice
+  rc=$?
+  [[ "$rc" == 0 ]] || { printf 'stale supervisor not detected: %s\n' "$rc" >&2; return 1; }
+  # The real stop-worker OpenRC path must disable the supervisor, not merely
+  # stop a container that its supervise-daemon can immediately restart.
+  openrc_service_remove_runlevels() { printf 'disable %s\n' "$1" >>"$log"; }
+  ports_set_worker_desired_running() { :; }
+  ensure_container_runtime() { :; }
+  _ctr() {
+    case "$2" in
+      ps) return 0 ;;
+      inspect) return 1 ;;
+    esac
+    return 1
+  }
+  stop_tenant_vision() { :; }
+  stop_tenant_writers alice || return 1
+  grep -q '^disable lunarwing-kimi-alice-sup$' "$log" || return 1
+  [[ "$(grep -c '^lunarwing-kimi-alice-sup stop$' "$log")" == 1 ]] || return 1
+  if grep -q 'lunarwing-\(pebble\|opencode\|opencode2\)-alice.* stop' "$log"; then
+    printf 'absent disabled worker was stopped\n' >&2
+    return 1
+  fi
+  tenant_writers_active alice
+  rc=$?
+  [[ "$rc" == 1 ]] || { printf 'stale supervisor not quiesced: %s\n' "$rc" >&2; return 1; }
+)
+
+if test_stale_openrc_worker_supervisor; then
+  printf 'PASS: stale OpenRC worker supervisor quiesced\n'
+else
+  fail "stale OpenRC worker supervisor quiescence"
+fi
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
