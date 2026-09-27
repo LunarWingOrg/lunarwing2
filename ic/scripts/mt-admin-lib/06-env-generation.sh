@@ -556,6 +556,87 @@ configure_weechat_relay() {  # <tenant>
   say "WeeChat relay configured for tenant '$tenant' (port $relay_port, loopback)"
 }
 
+# Rotate a tenant's WeeChat relay password (WI#202). Generates a fresh random
+# hex password and persists it to the two credential stores:
+#   1. weechat.env   — the service EnvironmentFile (mode 0600), read by the
+#                      WeeChat unit only at process start;
+#   2. lunarwing.env — the daemon's source of truth for RELAY_PASSWORD.
+# relay.conf always keeps the literal ${env:RELAY_PASSWORD} expression, so the
+# on-disk config never carries the secret and the rotation never touches it.
+#
+# The new password never appears on argv, in relay.conf, or in logs, and the
+# running WeeChat is never live-`/set` (a live /set would replace the validated
+# env expression with a plaintext value that WeeChat could persist into
+# relay.conf on the next /save or /upgrade -quit). The new credential is
+# applied purely through the managed service lifecycle: the operator (or a
+# follow-up restart-tenant) restarts the WeeChat stack and the unit's
+# EnvironmentFile delivers the new value.
+#
+# Convergence: weechat.env is written FIRST. WeeChat reads it only at process
+# start, so updating it while the relay runs changes nothing live; a failure
+# there leaves lunarwing.env untouched (fully old state, nothing to repair).
+# lunarwing.env is written SECOND via the same atomic swap; a failure between
+# the two writes leaves weechat.env=new / lunarwing.env=old, which this verb
+# detects on re-run (post-write mismatch check) and the operator repairs by
+# simply running rotate-relay-password again (it is idempotent — every run
+# generates a fresh password and rewrites both files). The split state is safe
+# in the meantime: the running relay still uses the old password, and the
+# daemon still reads the old value from lunarwing.env, so they keep agreeing
+# until the next managed restart.
+rotate_tenant_weechat_relay_password() {  # <tenant>
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  tenant_weechat_enabled "$name" || die "WeeChat is disabled for tenant '$name' (registry enable_weechat=false)"
+
+  local lunarwing_env weechat_env relay_conf relay_port
+  lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
+  weechat_env="$(tenant_env_dir "$name")/weechat.env"
+  relay_conf="$(tenant_weechat_home "$name")/relay.conf"
+  [[ -f "$lunarwing_env" ]] || die "tenant env not found: $lunarwing_env"
+  [[ -n "$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)" ]] \
+    || die "RELAY_PASSWORD missing from $lunarwing_env"
+
+  relay_port="$(ports_get "$name" weechat)"
+  if [[ -n "$relay_port" && "$relay_port" != "0" && -f "$relay_conf" ]]; then
+    # Reuse the bootstrap validator's structural checks (without a plaintext
+    # candidate) so a hand-edited relay.conf never gets a silently broken
+    # rotation: the env expression, loopback bind, and api port must be intact.
+    _weechat_validate_relay_config "$(tenant_weechat_home "$name")" "$relay_port" "" \
+      || die "relay.conf failed validation (env expression/loopback/api port) — refusing to rotate; repair with configure-weechat-relay first"
+  fi
+
+  local new_pw
+  new_pw="$(generate_token | cut -c1-32)"
+
+  # Persist: service credential env first (inert until the unit restarts), then
+  # the daemon env. Each write is an atomic single-file swap that preserves
+  # owner/mode. If the second write fails, re-run this verb to converge.
+  _write_weechat_env "$name" "$new_pw" \
+    || die "failed to write $weechat_env (lunarwing.env untouched; safe to retry)"
+  if ! _env_set "$lunarwing_env" RELAY_PASSWORD "$new_pw"; then
+    say "WARNING: wrote $weechat_env but failed to update $lunarwing_env;" >&2
+    say "WARNING: re-run 'rotate-relay-password $name' to converge both files" >&2
+    die "failed to update $lunarwing_env after writing weechat.env (split state: weechat.env=new, lunarwing.env=old)"
+  fi
+
+  # Post-write convergence check: both files must now carry the new value.
+  local check_lw check_wc
+  check_lw="$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)"
+  check_wc="$(_read_env_value "$weechat_env" RELAY_PASSWORD)"
+  if [[ "$check_lw" != "$new_pw" || "$check_wc" != "$new_pw" ]]; then
+    say "WARNING: post-rotation verification failed (lunarwing.env/weechat.env mismatch);" >&2
+    say "WARNING: re-run 'rotate-relay-password $name' to converge both files" >&2
+    die "relay password rotation did not converge for tenant '$name'"
+  fi
+
+  say "Rotated WeeChat relay password for tenant '$name'."
+  say "The running WeeChat still uses the old credential; the new one is only in weechat.env/lunarwing.env."
+  say "Apply through the managed service lifecycle (no live /set, secret stays off argv and out of relay.conf):"
+  say "    lunarwing-mt-admin.sh restart-tenant $name"
+  say "relay.conf keeps \${env:RELAY_PASSWORD}; verify after restart that it still does (no plaintext)."
+}
+
 # Write a dedicated mode-0600 weechat.env containing only RELAY_PASSWORD.
 # Uses a temp file in the same directory then atomically renames.
 _write_weechat_env() {  # <tenant> <relay_password>
