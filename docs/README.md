@@ -12,6 +12,7 @@ every **active** file is listed below. Archived material lives under
 * Updated on August 5th, 2026 after the v2.0.4.0 guide audit and archival pass.*
 * Updated on September 12th, 2026 for the v2.1.1.0 pre-release pass: indexed all releases through v2.1.0.0, added the missing guides (voice API, coordination knowledge, mascot, contribution policies) and the self-heal coverage audit to the index, removed a duplicated bugs paragraph and a stray duplicate archive line.*
 * Updated on September 14th, 2026 for the v2.1.2.0 pre-release pass: release index now points at v2.1.1.0 as latest.*
+* Updated on September 27th, 2026 for the v2.1.3.0 pre-release pass: release index now points at v2.1.2.0 as latest; new v2.1.3.0 ops docs (cargo-deny audit, half-broken tenant troubleshooting) indexed.*
 
 ## Companion applications
 
@@ -356,7 +357,7 @@ Dated implementation plans and design specs produced by the superpowers agentic 
 
 ### 📦 [`releases/`](releases/)
 
-Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v2.1.1.0, latest: RELEASE-v2.1.1.0.md).
+Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v2.1.2.0, latest: RELEASE-v2.1.2.0.md).
 
 ---
 
