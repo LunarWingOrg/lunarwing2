@@ -3532,6 +3532,93 @@ mod tests {
     }
 
     #[test]
+    fn model_response_quoting_step_output_is_assistant_authored_in_visible_transcript() {
+        // WI#227 response-boundary regression: the model still reads sealed
+        // step records as User-role inference turns (llm_adapter.rs maps
+        // SealedStepRecord → Role::User), so it can legitimately quote or
+        // reinterpret that internal text in its final visible response. This
+        // test demonstrates that when the model does so, the response is
+        // always Assistant-authored in the operator-visible transcript — the
+        // sealed step blob itself never appears as a user-authored message.
+        //
+        // This is the actual incident path from the WI#227 report: Kageho
+        // saw "stale date system error" text inside what appeared to be a
+        // user message. The seal ensures the raw step record never enters
+        // thread.messages; the model's response — even when quoting it — is
+        // correctly attributed to the assistant.
+        let mut thread = Thread::new(
+            "check the date",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.add_message(ThreadMessage::user("what day is it?"));
+
+        // Step 1: sealed step output enters the inference transcript only.
+        let state = serde_json::json!({
+            "working_messages": [
+                {"role": "User", "content": "what day is it?"},
+                {"role": "Assistant", "content": "```python\nimport datetime\nprint(datetime.date.today())\n```"},
+                {
+                    "role": "User",
+                    "content": "[stdout]\nOSError: OS operations are not permitted in CodeAct scripts",
+                    STEP_RECORD_FIELD: true,
+                },
+            ],
+        });
+        sync_runtime_state(&mut thread, Some(&state));
+
+        // Step 2: the model reads the sealed record (as User-role inference
+        // data) and produces a visible response that quotes it. In the
+        // incident, the model treated the OSError text as if a human had
+        // said it. The response goes through sync_visible_outcome, which
+        // appends it as an Assistant message.
+        let model_response = "I see you got an error: OS operations are not permitted in CodeAct scripts. Let me try a different approach.";
+        sync_visible_outcome(
+            &mut thread,
+            &ThreadOutcome::Completed {
+                response: Some(model_response.to_string()),
+            },
+        );
+
+        // The visible transcript contains the model's response as an
+        // Assistant message, never as a User message.
+        let visible_roles: Vec<_> = thread.messages.iter().map(|m| m.role).collect();
+        assert!(
+            visible_roles.contains(&MessageRole::Assistant),
+            "model response must be Assistant-authored"
+        );
+        let assistant_msgs: Vec<_> = thread
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .collect();
+        assert!(
+            assistant_msgs
+                .iter()
+                .any(|m| m.content.contains("OS operations are not permitted")),
+            "model may quote internal step output in its response"
+        );
+        // Critically: no User-role message in the visible transcript carries
+        // the step blob. The only User message is the original human input.
+        let user_msgs: Vec<_> = thread
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .collect();
+        assert_eq!(user_msgs.len(), 1, "only the human input is User-role");
+        assert!(!user_msgs[0].content.contains("OSError"));
+        // And the sealed step record remains in the inference transcript.
+        assert!(
+            thread
+                .internal_messages
+                .iter()
+                .any(|m| m.role == MessageRole::SealedStepRecord)
+        );
+    }
+
+    #[test]
     fn orchestrator_wire_reattaches_transient_parts_without_serializing_bytes() {
         let mut thread = Thread::new(
             "inspect image",
