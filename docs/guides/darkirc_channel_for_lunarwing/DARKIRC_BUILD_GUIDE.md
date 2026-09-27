@@ -12,7 +12,8 @@ Multi-tenant deployments use one daemon and adapter per tenant. Sharing a daemon
 capability file (3000 ms poll floor, loopback allowlist, `pairing` DM default),
 and the `darkirc-contact prepare/respond/complete` exchange commands were
 re-checked against the current tree; no changes were needed (the 2.1.2.0
-release only bumped the channel crate/registry versions to 0.1.8).
+release only bumped the channel crate/registry versions to 0.1.8; the
+2.1.3.0 release again only bumped them to 0.1.9).
 
 ## Source Layout
 
