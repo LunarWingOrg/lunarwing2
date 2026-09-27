@@ -1,18 +1,32 @@
-# Goal 34 / WI#227 — sealed interpreter step output (third attempt)
+# Goal 34 / WI#227 — sealed interpreter step output (fourth attempt)
 
-Branch: `rarity/kimi-13-20260927-0600` (re-attempt of MR !1183, which was a
-re-attempt of !1152 and !1137 — all closed unmerged on review). Tracker:
-[#227](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/227).
+Branch: `rarity/kimi-13-20260927-0900` (re-attempt of MR !1191, which was a
+re-attempt of !1183, !1152, and !1137 — all closed unmerged on review).
+Tracker: [#227](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/227).
 
-This revision answers the two findings raised on !1183 (note, 2026-09-27) and
-re-raised from !1152 note #4130 / !1137 note #4053:
+## Reviewer feedback addressed (MR !1191, note 4282, 2026-09-27)
 
-- **HIGH** — "capture the incident line/channel, trace the actual
-  operator-response boundary, and add a runtime/bridge regression there before
-  marking #227 fixed."
-- **MEDIUM** — "sealed errors disappear from trace diagnostics
-  (`trace.rs:250–256` detects `code_error` only for `MessageRole::User`);
-  include sealed records in the analyzer and add a regression."
+> **[High] The new tests still do not establish that the reported
+> operator-visible leak is fixed.** [...] Since the model still receives the
+> step blob as a User-role inference turn (llm_adapter.rs / default.py), it
+> can still quote or reinterpret that internal text in its final visible
+> response. Please demonstrate the actual incident path (or clarify that this
+> change is defense-in-depth, not the fix for the reported leak) and add a
+> regression at that response boundary before marking WI#227 resolved.
+
+This revision does both:
+
+1. **Clarifies that the seal is defense-in-depth, not the fix for the
+   reported leak.** The actual incident (Kageho seeing "stale date system
+   error" in operator messages) was caused by the CodeAct OS-denial
+   `OSError` blob being produced when in-sandbox code called `date.today()`.
+   That production path was already fixed by `605971dfd` (host-clock OS
+   calls, merged via !1139). The seal in this MR prevents a *class* of
+   similar leaks from ever reaching the visible transcript, but it does not
+   claim to be the direct fix for the specific incident.
+2. **Adds a response-boundary regression test** demonstrating that when the
+   model quotes or reinterprets sealed step output in its visible response,
+   that response is always Assistant-authored — never user-authored.
 
 ## The incident line and channel (captured)
 
@@ -84,6 +98,16 @@ Path of one interpreter step blob through the system:
    attempt…", gateway `terminal_message`); the Rust fallback is
    `Orchestrator error: {e}` (engine error prose). The traceback itself stays
    sealed in the inference transcript (step 3).
+7. **Model response boundary** — the model reads the sealed step record as
+   a User-role inference turn (step 4). It may quote or reinterpret that
+   internal text in its final visible response. `sync_visible_outcome`
+   appends that response as an `Assistant` message via `Thread::add_message`.
+   The new regression test
+   `model_response_quoting_step_output_is_assistant_authored_in_visible_transcript`
+   demonstrates: (a) the sealed record stays in `internal_messages`, (b) the
+   model's response — even when quoting the OSError text — is always
+   Assistant-authored in `thread.messages`, and (c) the only User-role
+   message in the visible transcript is the original human input.
 
 Prior-review accuracy note (the !1152/!1183 HIGH finding): at target-branch
 code, step 3 already wrote `internal_messages`, so the claim in the earlier
@@ -92,8 +116,29 @@ revisions of this document that "working_messages sync into
 path (`sync_runtime_state` → flagged `working_messages` → internal placement
 + visible exclusion) instead of calling `add_message` in isolation.
 
-## What this MR changes (delta on top of !1183)
+## What this MR changes (delta on top of !1191)
 
+- `executor/orchestrator.rs` (test) —
+  `model_response_quoting_step_output_is_assistant_authored_in_visible_transcript`:
+  drives the response boundary end-to-end (flagged `working_messages` state →
+  host sync → sealed record in `internal_messages` → model response quoting
+  the step blob → `sync_visible_outcome` → visible transcript). Asserts the
+  response is Assistant-authored, the only User message is the human input,
+  and the sealed record never enters `thread.messages`.
+- This document rewritten to clarify the defense-in-depth nature of the
+  seal and to explicitly state that the actual incident was fixed by
+  `605971dfd` (host-clock OS calls), not by this MR.
+
+Carried forward unchanged from !1191 (reviewed there, still correct):
+
+- `MessageRole::SealedStepRecord` + `wire_name()` ("StepRecord"),
+  `ThreadMessage::sealed_step_record` host mint, `Thread::add_message`
+  reroute with the `MessageAdded` `"StepRecord"` event,
+  `classify_wire_role` (only the two VM-unforgeable shapes seal),
+  `default.py` `_step_record` flag consumed/stripped host-side,
+  `prompt_context_from_thread_messages` exclusion, llm_adapter
+  `SealedStepRecord → Role::User`, `interpret_message_event` covering both
+  `User` and `StepRecord` spellings.
 - `executor/trace.rs` — the `code_error` analyzer now matches both legacy
   `User` blobs and `SealedStepRecord` records (`NameError`, `SyntaxError`,
   `TypeError`, `NotImplementedError` in `[stdout]`/`[stderr]`/`[code `/
@@ -117,20 +162,10 @@ path (`sync_runtime_state` → flagged `working_messages` → internal placement
 - `ENGINE-V2.md` — sealed step records documented (also corrects the
   !1184-era statement that ENGINE-V2 needed no 2.1.3.0 changes).
 
-Carried forward unchanged from !1183 (reviewed there, still correct):
-
-- `MessageRole::SealedStepRecord` + `wire_name()` ("StepRecord"),
-  `ThreadMessage::sealed_step_record`, `Thread::add_message` reroute,
-  `classify_wire_role`, `seal_step_record`/`STEP_RECORD_FIELD` in
-  `default.py`, `prompt_context_from_thread_messages` exclusion,
-  `llm_adapter` mapping, `interpret_message_event` covering both `User` and
-  `StepRecord` spellings, and the classification tests from `176609dbc`.
-
 ## Verification
 
-- Engine lib tests (incl. the three new regressions + the carried-forward
-  classification suite): see branch CI / local `cargo test -p lunarwing_engine
-  --lib` output recorded at commit time.
+- Engine lib tests (incl. the four new regressions + the carried-forward
+  classification suite): `cargo test -p lunarwing_engine --lib`.
 - Bridge compile + targeted router tests:
   `cargo test --lib bridge::router` (host crate).
 - `cargo clippy` on touched crates with `-D warnings`; `cargo fmt --all --
