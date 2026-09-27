@@ -25,6 +25,10 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 
 - [`MT-MACHINE-MIGRATION.md`](MT-MACHINE-MIGRATION.md) — move a multi-tenant
   installation to another host.
+- [`TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md`](TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md)
+  — diagnose and recover a tenant whose sandboxed shell dies after an upgrade
+  because `lunarwing-sandbox:latest` is missing from every image store
+  (WI#240/WI#238, WI#229 class).
 - [`MT-LEGACY-UPGRADE-NOTES.md`](MT-LEGACY-UPGRADE-NOTES.md) and
   [`TENANT-RENAME-MIGRATION-1.1.9.md`](TENANT-RENAME-MIGRATION-1.1.9.md) —
   legacy upgrade paths and rename compatibility.
