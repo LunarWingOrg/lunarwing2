@@ -6,7 +6,9 @@ table below, the MIME allowlist, the WIT interface (`ic/wit/channel.wit`,
 send route only), and the LunarVision enrichment bounds were re-checked
 against the current tree and still hold. The 2.1.2.0 release only bumped the
 xmpp-bridge and xmpp channel crate/registry versions (0.1.14); no transfer
-limits or protocol behavior changed.
+limits or protocol behavior changed. The 2.1.3.0 release again only bumped
+the xmpp channel crate/registry version (0.1.15); no transfer limits or
+protocol behavior changed.
 
 ## Overview
 
