@@ -609,10 +609,11 @@ mod tests {
         // still produce actionable code_error warnings; pre-seal transcripts
         // carry the same blobs as role User. Both shapes feed the
         // self-improvement trigger in runtime/mission.rs.
-        for make_blob in [
-            ThreadMessage::user as fn(&str) -> ThreadMessage,
-            ThreadMessage::sealed_step_record,
-        ] {
+        let constructors: [fn(&str) -> ThreadMessage; 2] = [
+            |content| ThreadMessage::user(content),
+            |content| ThreadMessage::sealed_step_record(content),
+        ];
+        for make_blob in constructors {
             let mut thread = make_thread();
             thread.add_message(ThreadMessage::assistant("running the snippet"));
             thread.internal_messages.push(make_blob(
