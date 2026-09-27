@@ -1,0 +1,14 @@
+-   Spitfire
+-   Soarin
+-   Fleetfoot
+-   Rainbow Dash
+-   Blaze
+-   Fire Streak (formerly)
+-   High Winds
+-   Misty Fly
+-   Rapidfire
+-   Silver Zoom
+-   Surprise
+-   Thunderlane
+-   Wave Chill
+-   Wind Rider
