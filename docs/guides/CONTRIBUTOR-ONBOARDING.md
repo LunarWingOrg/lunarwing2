@@ -28,16 +28,18 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-09-17, target release 2.1.2.0):**
+**Current state (updated 2026-09-27, target release 2.1.3.0):**
 
-- v2.1.1.0 (Zanshin) shipped: the repo-wide engine hardening MR (WI#132) and the
-  mission-thread memory pollution fix have landed. Normal review tiers apply to
-  engine internals again — but `ic/src/agent/`, `ic/src/db/`, `ic/src/secrets/`,
+- v2.1.2.0 (Yoroi) shipped 2026-09-25: the generic podman-first agent-shell
+  sandbox, worker-contract hardening, health system parity, and
+  confabulation hardening have landed. Normal review tiers apply to engine
+  internals again — but `ic/src/agent/`, `ic/src/db/`, `ic/src/secrets/`,
   gateway, sandboxing, and approvals are still Tier 3 by default (§3).
-- The v2.1.2.0 pre-release checklist is being worked through
-  (`docs/ops/AGENT_GOALS_2.1.2.0.md`). Areas under active change include the
-  generic podman-first sandbox, the external-worker cancel protocol, and the
-  knowledge sweep cadence. Check the checklist before opening MRs there.
+- The v2.1.3.0 pre-release checklist is being worked through
+  (`docs/ops/AGENT_GOALS_2.1.3.0.md`). Areas under active change include the
+  crate/pin bumps (all LunarWing crates now 2.1.3; kimi worker 2.1.1;
+  opencode2 v2.0.17), the WI#239 new-tenant env defaults, and the open
+  work-item audit. Check the checklist before opening MRs there.
 - **Kawarimi export testing under OpenRC** is being re-worked due to an open-write detection
   difference vs systemd. OpenRC contributors *with kawarimi export expertise* are welcome →
   ask in `#lunarwing`.

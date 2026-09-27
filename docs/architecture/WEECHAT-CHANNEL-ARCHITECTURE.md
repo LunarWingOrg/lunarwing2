@@ -8,7 +8,9 @@ create), and the known issues with their fix status.
 and fix statuses below were re-checked against the current tree; the only change
 is the `dm_policy` default note in §4 (see below). The 2.1.2.0 release bumped the
 channel crate and its registry entry (`ic/registry/channels/weechat.json`) to
-0.2.9; no component paths, limits, or fix statuses changed.
+0.2.9; no component paths, limits, or fix statuses changed. The 2.1.3.0
+release again only bumped the channel crate/registry version to 0.2.10; no
+component paths, limits, or fix statuses changed.
 
 > **Why this doc exists.** A multi-hour debugging session upgrading the `sunburst` tenant
 > showed that message delivery through this channel has several independent, *invisible*

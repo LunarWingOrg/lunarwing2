@@ -8,7 +8,9 @@ migration/retention policy below were re-checked against
 `ic/channels-src/{darkirc,weechat}` and `ic/src/extensions/manager.rs` and
 still hold. The 2.1.2.0 release only bumped the channel crate/registry
 versions (darkirc 0.1.8, weechat 0.2.9); no principal-format or pairing
-logic changed.
+logic changed. The 2.1.3.0 release again only bumped the channel
+crate/registry versions (darkirc 0.1.9, weechat 0.2.10); no
+principal-format or pairing logic changed.
 
 LunarWing treats IRC sender identity as a routing and continuity hint, not as
 cryptographic proof of a person. DarkIRC and WeeChat use versioned,
