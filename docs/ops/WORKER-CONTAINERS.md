@@ -150,8 +150,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.17** at reviewed full commit
-`04f4b0610c79e3692f3b91bd7e4489c2c7010e4b`; the v2 bridge uses
+**v2.0.18** at reviewed full commit
+`cd9a14a6b688d4021bee381dfd39d2cef9c0f862`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -279,6 +279,15 @@ moves the lane off the beta-frequent 2.0.15 pin). The Dockerfile patches the
 upstream CLI build script at that SHA; its `prepare_reproducible_build`
 self-test guards the patch contract against a 2.0.17 fixture during the image
 build. Host-side `prepare_reproducible_build_test.py` passed, including the
+untouched-failure contract. Whole-image reproducibility must still pass the CI
+candidate-versus-clean-rebuild gate before promotion.
+
+v2.0.18 bump (2026-09-27): tag SHA `cd9a14a6b688d4021bee381dfd39d2cef9c0f862`
+verified against the anomalyco/opencode remote (v2.1.3.0 checklist item #2).
+The Dockerfile patches the upstream CLI build script at that SHA; the
+`prepare_reproducible_build` self-test fixture moved to 2.0.18 to keep guarding
+the patch contract during the image build. Host-side
+`prepare_reproducible_build_test.py` passed (3/3), including the
 untouched-failure contract. Whole-image reproducibility must still pass the CI
 candidate-versus-clean-rebuild gate before promotion.
 
