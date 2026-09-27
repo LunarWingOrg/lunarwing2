@@ -576,6 +576,130 @@ _write_weechat_env() {  # <tenant> <relay_password>
   )
 }
 
+# Unlike _env_set, this writer never passes the replacement to awk (or any
+# other child process) via argv. The secret stays in shell memory and a 0600
+# temporary file until the atomic rename.
+_relay_env_set_password() {  # <lunarwing.env> <password>
+  local path="$1" password="$2" tmp line
+  [[ -f "$path" && ! -L "$path" && "$(stat -c %h -- "$path")" == 1 ]] || return 1
+  [[ "$password" != *$'\n'* && "$password" != *$'\r'* ]] || return 1
+  tmp="$(mktemp "$(dirname "$path")/.relay-env.XXXXXX")" || return 1
+  if ! (
+    trap 'rm -f -- "$tmp"' EXIT
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" == RELAY_PASSWORD=* ]] || printf '%s\n' "$line"
+    done <"$path" >"$tmp" || exit 1
+    printf 'RELAY_PASSWORD=%s\n' "$password" >>"$tmp" || exit 1
+    chmod --reference="$path" "$tmp" && chown --reference="$path" "$tmp" \
+      && mv -T -- "$tmp" "$path"
+  ); then
+    return 1
+  fi
+}
+
+_relay_service_active() {  # <tenant> <service basename>
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$1" is-active --quiet "$2.service"
+  else
+    rc-service "$2" status >/dev/null 2>&1
+  fi
+}
+
+_relay_service_action() {  # <tenant> <stop|start> <service basename>
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$1" "$2" "$3.service"
+  else
+    rc-service "$3" "$2"
+  fi
+}
+
+# The caller holds the lifecycle lock. Restore only services that were running
+# on entry; never bring an intentionally stopped daemon or relay online.
+_relay_restore_services() {  # <tenant> <weechat-active> <adapter-active> <daemon-active>
+  local name="$1" rc=0
+  [[ "$2" != true ]] || _relay_service_action "$name" start "lunarwing-weechat-$name" || rc=1
+  [[ "$3" != true ]] || _relay_service_action "$name" start "lunarwing-weechat-adapter-$name" || rc=1
+  [[ "$4" != true ]] || _relay_service_action "$name" start "lunarwing-$name" || rc=1
+  return "$rc"
+}
+
+rotate_tenant_weechat_relay_password() {  # <tenant>, under lifecycle lock
+  local name="$1" lw_env wc_env conf port old_pw new_pw
+  local wc_active=false adapter_active=false daemon_active=false
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  tenant_weechat_enabled "$name" || die "WeeChat is disabled for tenant '$name'"
+  lw_env="$(tenant_env_dir "$name")/lunarwing.env"
+  wc_env="$(tenant_env_dir "$name")/weechat.env"
+  conf="$(tenant_weechat_home "$name")/relay.conf"
+  [[ -f "$lw_env" && ! -L "$lw_env" && -f "$wc_env" && ! -L "$wc_env" ]] \
+    || die "missing or unsafe relay credential file for '$name'"
+  [[ "$(stat -c %h -- "$wc_env")" == 1 ]] || die "unsafe weechat.env hard link"
+  old_pw="$(_read_env_value "$lw_env" RELAY_PASSWORD)"
+  [[ -n "$old_pw" && "$old_pw" == "$(_read_env_value "$wc_env" RELAY_PASSWORD)" ]] \
+    || die "relay credentials already differ; repair before rotating"
+  port="$(ports_get "$name" weechat)"
+  [[ -n "$port" && "$port" != 0 && -f "$conf" && ! -L "$conf" ]] \
+    && [[ "$(<"$conf")" != *"$old_pw"* ]] \
+    && _weechat_validate_relay_config "$(tenant_weechat_home "$name")" "$port" "" \
+    || die "relay.conf is missing or does not use the validated environment expression"
+
+  ensure_init_system || return 1
+  # A broken user manager must not be mistaken for three stopped services.
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$name" show-environment >/dev/null \
+      || die "tenant user service manager unavailable for '$name'"
+  fi
+  _relay_service_active "$name" "lunarwing-weechat-$name" && wc_active=true
+  _relay_service_active "$name" "lunarwing-weechat-adapter-$name" && adapter_active=true
+  _relay_service_active "$name" "lunarwing-$name" && daemon_active=true
+  # Stop consumers before changing either file. The init manager's explicit
+  # stop prevents its automatic Restart=on-failure from firing in this window.
+  local stop_failed=false
+  if [[ "$daemon_active" == true ]]; then
+    _relay_service_action "$name" stop "lunarwing-$name" || stop_failed=true
+  fi
+  if [[ "$adapter_active" == true ]]; then
+    _relay_service_action "$name" stop "lunarwing-weechat-adapter-$name" || stop_failed=true
+  fi
+  if [[ "$wc_active" == true ]]; then
+    _relay_service_action "$name" stop "lunarwing-weechat-$name" || stop_failed=true
+  fi
+  if [[ "$stop_failed" == true ]] \
+    || _relay_service_active "$name" "lunarwing-$name" \
+    || _relay_service_active "$name" "lunarwing-weechat-adapter-$name" \
+    || _relay_service_active "$name" "lunarwing-weechat-$name"; then
+    _relay_restore_services "$name" "$wc_active" "$adapter_active" "$daemon_active" || true
+    die "could not quiesce relay consumers; credentials unchanged"
+  fi
+
+  new_pw="$(generate_token | cut -c1-32)"
+  if ! _relay_env_set_password "$lw_env" "$new_pw" \
+    || ! _write_weechat_env "$name" "$new_pw" \
+    || [[ "$(_read_env_value "$lw_env" RELAY_PASSWORD)" != "$new_pw" ]] \
+    || [[ "$(_read_env_value "$wc_env" RELAY_PASSWORD)" != "$new_pw" ]]; then
+    # Do not restart with mismatched credentials. Even the first writer may
+    # have succeeded before reporting failure, so restore BOTH files.
+    local rollback_failed=false
+    _relay_env_set_password "$lw_env" "$old_pw" || rollback_failed=true
+    _write_weechat_env "$name" "$old_pw" || rollback_failed=true
+    if [[ "$rollback_failed" == true ]] \
+      || [[ "$(_read_env_value "$lw_env" RELAY_PASSWORD)" != "$old_pw" ]] \
+      || [[ "$(_read_env_value "$wc_env" RELAY_PASSWORD)" != "$old_pw" ]]; then
+      say "CRITICAL: relay rollback failed for '$name'; services remain stopped. Repair both env files before starting." >&2
+      return 1
+    fi
+    _relay_restore_services "$name" "$wc_active" "$adapter_active" "$daemon_active" || true
+    say "relay rotation failed; old credentials restored for '$name'" >&2
+    return 1
+  fi
+  if ! _relay_restore_services "$name" "$wc_active" "$adapter_active" "$daemon_active"; then
+    say "relay credentials updated but a service failed to start for '$name'; inspect status and restart via mt-admin" >&2
+    return 1
+  fi
+  say "Rotated WeeChat relay password for tenant '$name' (running services restarted)."
+}
+
 # TensorZero's OpenAI-compatible surface lives under /openai/v1. The daemon's
 # openai_compatible client appends /chat/completions to LLM_BASE_URL, so a bare
 # gateway root (http://host:3000) 404s every LLM turn while every health check

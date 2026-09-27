@@ -377,6 +377,25 @@ and daemon continue to receive credentials from `lunarwing.env`; OpenRC loads
 those files through the same post-drop launcher rather than shell-sourcing them
 as root.
 
+### Rotate a relay password
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password <tenant>
+```
+
+This requires an enabled WeeChat relay with a validated `relay.conf` using
+the literal `${env:RELAY_PASSWORD}` expression and matching existing passwords
+in `lunarwing.env` and `weechat.env`. The command holds the tenant lifecycle
+lock, stops the running daemon, adapter, and WeeChat, writes both credentials,
+then restarts only services that were running beforehand. Expect a brief
+interruption. It does not perform a live WeeChat `/set` or pass the password in
+an external program's arguments. On a failed write it restores both old
+credentials before restarting services; if rollback itself fails, services
+remain stopped and an operator must repair both env files before starting them.
+Check `mt-admin status <tenant>` and run WeeChat preflight after rotation.
+Do not start the affected services concurrently from outside mt-admin: external
+service managers do not participate in its lifecycle lock.
+
 ### Preflight checks
 
 `ic/scripts/lunarwing-weechat-preflight.sh` is a read-only diagnostic that checks the generated relay configuration and minimal env without sourcing either file. It validates:
@@ -624,13 +643,18 @@ rm -f /tmp/tmux-$(id -u <name>)/weechat-<name>
 
 **Symptom**: Adapter connects but authentication fails.
 
-The `RELAY_PASSWORD` in `lunarwing.env` must exactly match the value set inside WeeChat via `/set relay.network.password`. Attach to WeeChat and verify:
+The `RELAY_PASSWORD` in `lunarwing.env` must match `weechat.env`, and
+`relay.conf` must retain `${env:RELAY_PASSWORD}` rather than plaintext.
+Check this without printing either credential via the WeeChat preflight. For
+an existing mismatch, stop both services and repair both env files before
+starting them; use `rotate-relay-password` for subsequent managed rotations.
+Attach to WeeChat to verify the expression:
 
 ```
 /set relay.network.password
 ```
 
-If they differ, update one to match the other and restart the adapter.
+Never paste the secret into the session or a command-line argument.
 
 ### CLI pairing approve fails with "no pairing file"
 
