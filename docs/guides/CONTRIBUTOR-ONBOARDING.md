@@ -38,7 +38,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 - The v2.1.3.0 pre-release checklist is being worked through
   (`docs/ops/AGENT_GOALS_2.1.3.0.md`). Areas under active change include the
   crate/pin bumps (all LunarWing crates now 2.1.3; kimi worker 2.1.1;
-  opencode2 v2.0.17), the WI#239 new-tenant env defaults, and the open
+  opencode2 v2.0.18), the WI#239 new-tenant env defaults, and the open
   work-item audit. Check the checklist before opening MRs there.
 - **Kawarimi export testing under OpenRC** is being re-worked due to an open-write detection
   difference vs systemd. OpenRC contributors *with kawarimi export expertise* are welcome →
