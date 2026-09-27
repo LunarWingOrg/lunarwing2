@@ -729,6 +729,85 @@ mod routines_isolation {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Missions Handler Tests (work item #217)
+// ═══════════════════════════════════════════════════════════════════════
+
+mod missions_handlers {
+    use super::*;
+    use crate::channels::web::handlers::missions::{
+        missions_detail_handler, missions_list_handler, missions_summary_handler,
+    };
+
+    fn missions_router(state: Arc<GatewayState>, auth: MultiAuthState) -> Router {
+        Router::new()
+            .route("/api/missions", get(missions_list_handler))
+            .route("/api/missions/summary", get(missions_summary_handler))
+            .route("/api/missions/{id}", get(missions_detail_handler))
+            .layer(middleware::from_fn_with_state(auth.into(), auth_middleware))
+            .with_state(state)
+    }
+
+    /// With the engine not initialized (ENGINE_STATE unset), the read-only
+    /// surface degrades gracefully: empty list, zeroed summary, 404 detail,
+    /// and a 400 on a malformed mission id.
+    #[tokio::test]
+    async fn test_missions_handlers_degrade_without_engine() {
+        let state = build_state(None, None);
+        let auth = two_user_auth();
+        let app = missions_router(state, auth);
+
+        let req = Request::builder()
+            .uri("/api/missions")
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["missions"].as_array().map(Vec::len),
+            Some(0),
+            "no engine should yield an empty mission list"
+        );
+
+        let req = Request::builder()
+            .uri("/api/missions/summary")
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["active"], 0);
+
+        let req = Request::builder()
+            .uri(format!("/api/missions/{}", Uuid::new_v4()))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let req = Request::builder()
+            .uri("/api/missions/not-a-uuid")
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "malformed mission id should be rejected before touching the engine"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Handler Auth Enforcement Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -752,6 +831,10 @@ mod auth_enforcement {
             .route("/api/routines/{id}", get(authed_handler))
             .route("/api/routines/{id}/toggle", post(authed_handler))
             .route("/api/routines/{id}", delete(authed_handler))
+            // Missions (read-only observability surface, work item #217)
+            .route("/api/missions", get(authed_handler))
+            .route("/api/missions/summary", get(authed_handler))
+            .route("/api/missions/{id}", get(authed_handler))
             // Skills
             .route("/api/skills", get(authed_handler))
             .route("/api/skills/search", post(authed_handler))
@@ -827,6 +910,34 @@ mod auth_enforcement {
         assert_requires_auth(&app, Method::GET, &format!("/api/routines/{id}")).await;
         assert_requires_auth(&app, Method::POST, &format!("/api/routines/{id}/toggle")).await;
         assert_requires_auth(&app, Method::DELETE, &format!("/api/routines/{id}")).await;
+    }
+
+    #[tokio::test]
+    async fn test_missions_handlers_require_auth() {
+        let auth = MultiAuthState::single("secret-tok".to_string(), "user".to_string());
+        let app = auth_test_router(auth);
+        let id = Uuid::new_v4();
+
+        assert_requires_auth(&app, Method::GET, "/api/missions").await;
+        assert_requires_auth(&app, Method::GET, "/api/missions/summary").await;
+        assert_requires_auth(&app, Method::GET, &format!("/api/missions/{id}")).await;
+    }
+
+    #[tokio::test]
+    async fn test_missions_handlers_pass_with_valid_token() {
+        let auth = MultiAuthState::single("secret-tok".to_string(), "user".to_string());
+        let app = auth_test_router(auth);
+        let id = Uuid::new_v4();
+
+        assert_passes_with_token(&app, Method::GET, "/api/missions", "secret-tok").await;
+        assert_passes_with_token(&app, Method::GET, "/api/missions/summary", "secret-tok").await;
+        assert_passes_with_token(
+            &app,
+            Method::GET,
+            &format!("/api/missions/{id}"),
+            "secret-tok",
+        )
+        .await;
     }
 
     #[tokio::test]
