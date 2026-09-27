@@ -11,7 +11,8 @@ The adapter-to-WeeChat hop is WebSocket; the sandboxed channel-to-adapter hop is
 **Revalidated against source 2026-09-17 (v2.1.2.0).** Source/registry paths,
 capability schema, mt-admin bootstrap/recovery commands, and the preflight
 script were re-checked against the current tree; no changes were needed (the
-2.1.2.0 release only bumped the channel crate/registry versions to 0.2.9).
+2.1.2.0 release only bumped the channel crate/registry versions to 0.2.9;
+the 2.1.3.0 release again only bumped them to 0.2.10).
 
 ## Source and Registry
 

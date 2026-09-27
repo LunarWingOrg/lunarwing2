@@ -747,7 +747,7 @@ write_tenant_lunarwing_env() {
   # Idempotent overrides for the configurable flags (--llm-model,
   # --gateway-host, --xmpp-allow-from). An explicit flag value wins; else an
   # existing file value is preserved on re-run; else the hardcoded default
-  # (LLM_MODEL, GATEWAY_HOST) or the owner JID alone (XMPP_ALLOW_FROM).
+  # (LLM_MODEL, GATEWAY_HOST, or the local user JID for XMPP_ALLOW_FROM).
   local llm_model_effective gateway_host_effective mascot_enabled xmpp_allow_from_effective
   if [[ -n "$llm_model" ]]; then
     llm_model_effective="$llm_model"
@@ -766,9 +766,9 @@ write_tenant_lunarwing_env() {
   if [[ -n "$xmpp_allow_from" ]]; then
     xmpp_allow_from_effective="$(build_xmpp_allow_from "$xmpp_jid" "$xmpp_allow_from")"
   else
-    # Preserve an existing list; fall back to owner JID only on first write.
+    # Preserve an existing list; allow the local user to DM on first write.
     xmpp_allow_from_effective="$(_env_existing "$path" XMPP_ALLOW_FROM)"
-    xmpp_allow_from_effective="${xmpp_allow_from_effective:-$xmpp_jid}"
+    xmpp_allow_from_effective="${xmpp_allow_from_effective:-user@xmpp.localhost}"
   fi
 
   # Engine V2 rollout (v2.0.6.0): V2 engine channels ON by default for all
@@ -820,7 +820,13 @@ write_tenant_lunarwing_env() {
   llm_turn_budget="$(_env_existing "$path" LLM_TURN_BUDGET_SECS)";                llm_turn_budget="${llm_turn_budget:-599}"
   llm_request_timeout="$(_env_existing "$path" LLM_REQUEST_TIMEOUT_SECS)";        llm_request_timeout="${llm_request_timeout:-2599}"
   allow_local_tools="$(_env_existing "$path" ALLOW_LOCAL_TOOLS)";                 allow_local_tools="${allow_local_tools:-false}"
-  auto_approve_tools="$(_env_existing "$path" AUTO_APPROVE_TOOLS)";               auto_approve_tools="${auto_approve_tools:-false}"
+  # Migrate the legacy key on re-render, but prefer the canonical setting when
+  # both exist. Only write the canonical key so an operator override survives.
+  auto_approve_tools="$(_env_existing "$path" AGENT_AUTO_APPROVE_TOOLS)"
+  if [[ -z "$auto_approve_tools" ]]; then
+    auto_approve_tools="$(_env_existing "$path" AUTO_APPROVE_TOOLS)"
+  fi
+  auto_approve_tools="${auto_approve_tools:-false}"
   agent_max_tool_iterations="$(_env_existing "$path" AGENT_MAX_TOOL_ITERATIONS)"; agent_max_tool_iterations="${agent_max_tool_iterations:-99}"
   sandbox_policy="$(_env_existing "$path" SANDBOX_POLICY)";                       sandbox_policy="${sandbox_policy:-workspace_write}"
   sandbox_allow_full_access="$(_env_existing "$path" SANDBOX_ALLOW_FULL_ACCESS)"; sandbox_allow_full_access="${sandbox_allow_full_access:-false}"
@@ -1011,10 +1017,8 @@ SANDBOX_PROTECTED_PATHS=$(tenant_lw_root "$name")/env:$(tenant_lw_root "$name")/
 
 # Agent tool loop (WI#239): local-tools dev mode off, auto-approve off, and a
 # hard cap on tool iterations per turn so a runaway loop cannot spin forever.
-# AUTO_APPROVE_TOOLS is the legacy spelling of AGENT_AUTO_APPROVE_TOOLS; the
-# daemon honours both, with AGENT_AUTO_APPROVE_TOOLS winning when both are set.
 ALLOW_LOCAL_TOOLS=$allow_local_tools
-AUTO_APPROVE_TOOLS=$auto_approve_tools
+AGENT_AUTO_APPROVE_TOOLS=$auto_approve_tools
 AGENT_MAX_TOOL_ITERATIONS=$agent_max_tool_iterations
 
 # Skills (WI#239): opt into the SKILL.md self-improvement pipeline by default
@@ -1124,22 +1128,16 @@ write_tenant_bridge_env() {
 
   # Idempotent XMPP allow-from JSON: an explicit flag wins; else re-derive from
   # the daemon's XMPP_ALLOW_FROM (CSV) if present so re-runs without the flag
-  # keep the operator-set list in sync; else fall back to owner JID only.
+  # keep the operator-set list in sync; else allow the local user by default.
   local xmpp_allow_from_json_effective
   if [[ -n "$xmpp_allow_from" ]]; then
     xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "$xmpp_jid" "$xmpp_allow_from")"
   else
     local daemon_csv
     daemon_csv="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_ALLOW_FROM)"
-    if [[ -n "$daemon_csv" && "$daemon_csv" != "$xmpp_jid" ]]; then
-      # Daemon has extras: rebuild JSON from owner + the extras (everything
-      # after the leading owner entry, which build_xmpp_allow_from re-prepends).
-      local extras="${daemon_csv#$xmpp_jid}"
-      extras="${extras#,}"   # strip a single leading comma if present
-      xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "$xmpp_jid" "$extras")"
-    else
-      xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "$xmpp_jid" "")"
-    fi
+    # Do not prepend the agent JID: the daemon list may deliberately contain
+    # only user@xmpp.localhost (or a custom operator-set allowlist).
+    xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "" "${daemon_csv:-user@xmpp.localhost}")"
   fi
 
   (

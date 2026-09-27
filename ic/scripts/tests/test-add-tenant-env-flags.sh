@@ -127,7 +127,15 @@ assert_eq "default MASCOT_ENABLED" "$(envval MASCOT_ENABLED)" "false"
 # tenant root; env/ and run/ are siblings), so mt-admin names them explicitly.
 assert_eq "sandbox protects env, state and run under the tenant root" \
   "$(envval SANDBOX_PROTECTED_PATHS)" "$MT_FIXTURE/env:$MT_FIXTURE/state:$MT_FIXTURE/run"
-assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost"
+assert_eq "default XMPP_JID" "$(envval XMPP_JID)" "fixture-tenant@xmpp.localhost"
+assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "user@xmpp.localhost"
+write_tenant_bridge_env fixture-tenant
+assert_eq "new tenant bridge matches daemon DM allowlist" \
+  "$(_env_existing "$MT_FIXTURE/env/xmpp-bridge.env" XMPP_ALLOW_FROM_JSON)" \
+  '["user@xmpp.localhost"]'
+assert_eq "default AGENT_AUTO_APPROVE_TOOLS" "$(envval AGENT_AUTO_APPROVE_TOOLS)" "false"
+assert_eq "no legacy AUTO_APPROVE_TOOLS key" \
+  "$(grep -c '^AUTO_APPROVE_TOOLS=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
 assert_eq "default coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "default coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
 assert_eq "default coordination knowledge sharing disabled" \
@@ -239,6 +247,33 @@ assert_eq "rerun preserves SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "proxy"
 assert_eq "rerun preserves SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "docker"
 assert_eq "rerun preserves SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "custom-sandbox:v2"
 assert_eq "rerun preserves SANDBOX_AUTO_PULL" "$(envval SANDBOX_AUTO_PULL)" "true"
+
+echo "=== approval setting migration tests ==="
+# Canonical key must win even when a conflicting legacy value is present.
+sed -i 's/^AGENT_AUTO_APPROVE_TOOLS=.*/AGENT_AUTO_APPROVE_TOOLS=true/' \
+  "$MT_FIXTURE/env/lunarwing.env"
+printf 'AUTO_APPROVE_TOOLS=false\n' >>"$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "rerun preserves canonical approval override" "$(envval AGENT_AUTO_APPROVE_TOOLS)" "true"
+assert_eq "rerun drops legacy approval key" \
+  "$(grep -c '^AUTO_APPROVE_TOOLS=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "second rerun preserves canonical approval override" "$(envval AGENT_AUTO_APPROVE_TOOLS)" "true"
+
+# Older tenants may have only the alias; migrate its value without dropping it.
+sed -i '/^AGENT_AUTO_APPROVE_TOOLS=/d' "$MT_FIXTURE/env/lunarwing.env"
+printf 'AUTO_APPROVE_TOOLS=true\n' >>"$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "legacy approval override migrates" "$(envval AGENT_AUTO_APPROVE_TOOLS)" "true"
+assert_eq "migration removes legacy approval key" \
+  "$(grep -c '^AUTO_APPROVE_TOOLS=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+
+# A canonical false must not be replaced by a conflicting legacy true.
+sed -i 's/^AGENT_AUTO_APPROVE_TOOLS=.*/AGENT_AUTO_APPROVE_TOOLS=false/' \
+  "$MT_FIXTURE/env/lunarwing.env"
+printf 'AUTO_APPROVE_TOOLS=true\n' >>"$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "canonical false beats legacy true" "$(envval AGENT_AUTO_APPROVE_TOOLS)" "false"
 
 # Case 3b: explicit add-tenant re-run — the full env writer fills missing keys
 # from an older file. upgrade-tenant calls patch_tenant_env, not this writer.
@@ -403,6 +438,8 @@ rm -f "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant "fixture-tenant@xmpp.sobe.world"
 assert_eq "first write honours explicit JID" \
   "$(envval XMPP_JID)" "fixture-tenant@xmpp.sobe.world"
+assert_eq "custom JID still defaults to local user allowlist" \
+  "$(envval XMPP_ALLOW_FROM)" "user@xmpp.localhost"
 
 # Re-run with NO jid argument -> must preserve, not default to xmpp.localhost.
 write_tenant_lunarwing_env fixture-tenant
@@ -413,6 +450,8 @@ assert_eq "rerun preserves XMPP_JID" \
 write_tenant_lunarwing_env fixture-tenant ""
 assert_eq "empty-arg rerun preserves XMPP_JID" \
   "$(envval XMPP_JID)" "fixture-tenant@xmpp.sobe.world"
+assert_eq "rerun preserves local user allowlist" \
+  "$(envval XMPP_ALLOW_FROM)" "user@xmpp.localhost"
 
 # The bridge env writer must preserve from lunarwing.env too.
 rm -f "$MT_FIXTURE/env/xmpp-bridge.env"
@@ -420,6 +459,19 @@ write_tenant_bridge_env fixture-tenant
 assert_eq "bridge writer preserves XMPP_JID" \
   "$(grep -m1 '^XMPP_JID=' "$MT_FIXTURE/env/xmpp-bridge.env" | cut -d= -f2-)" \
   "fixture-tenant@xmpp.sobe.world"
+assert_eq "custom JID bridge still allows local user by default" \
+  "$(_env_existing "$MT_FIXTURE/env/xmpp-bridge.env" XMPP_ALLOW_FROM_JSON)" \
+  '["user@xmpp.localhost"]'
+
+sed -i 's/^XMPP_ALLOW_FROM=.*/XMPP_ALLOW_FROM=operator@chat.example.net/' \
+  "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+write_tenant_bridge_env fixture-tenant
+assert_eq "rerun preserves operator-only allowlist" \
+  "$(envval XMPP_ALLOW_FROM)" "operator@chat.example.net"
+assert_eq "bridge mirrors operator-only allowlist after rerun" \
+  "$(_env_existing "$MT_FIXTURE/env/xmpp-bridge.env" XMPP_ALLOW_FROM_JSON)" \
+  '["operator@chat.example.net"]'
 
 # An explicit JID still wins over the stored one (intentional re-point).
 write_tenant_lunarwing_env fixture-tenant "fixture-tenant@xmpp.example.net"
@@ -462,9 +514,29 @@ bridgeval() {  # <key>
   grep -m1 "^$1=" "$MT_FIXTURE/env/xmpp-bridge.env" | cut -d= -f2-
 }
 
-# Case 1: no extras → owner JID only
+# Case 1: no extras and no daemon allowlist → local user
 out="$(run_bridge_writer "")"
-assert_eq "bridge json owner-only" "$(bridgeval XMPP_ALLOW_FROM_JSON)" '["fixture-tenant@xmpp.localhost"]'
+assert_eq "bridge json defaults to local user" "$(bridgeval XMPP_ALLOW_FROM_JSON)" '["user@xmpp.localhost"]'
+
+# A daemon allowlist with no owner must not gain one in the bridge env.
+printf 'XMPP_ALLOW_FROM=user@xmpp.localhost\n' >>"$MT_FIXTURE/env/lunarwing.env"
+out="$(run_bridge_writer "")"
+assert_eq "bridge json matches daemon allowlist" "$(bridgeval XMPP_ALLOW_FROM_JSON)" '["user@xmpp.localhost"]'
+sed -i 's/^XMPP_ALLOW_FROM=.*/XMPP_ALLOW_FROM=admin@xmpp.org,bob@xmpp.org/' \
+  "$MT_FIXTURE/env/lunarwing.env"
+out="$(run_bridge_writer "")"
+assert_eq "bridge json preserves custom allowlist" "$(bridgeval XMPP_ALLOW_FROM_JSON)" \
+  '["admin@xmpp.org","bob@xmpp.org"]'
+
+# Pre-existing tenants with the old owner-only default keep that value.
+sed -i 's/^XMPP_ALLOW_FROM=.*/XMPP_ALLOW_FROM=fixture-tenant@xmpp.localhost/' \
+  "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+out="$(run_bridge_writer "")"
+assert_eq "rerun preserves old owner-only allowlist" \
+  "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost"
+assert_eq "bridge retains old owner-only allowlist" \
+  "$(bridgeval XMPP_ALLOW_FROM_JSON)" '["fixture-tenant@xmpp.localhost"]'
 
 # Case 2: extras → owner + extras
 out="$(run_bridge_writer "admin@xmpp.org,bob@xmpp.org")"
