@@ -40,7 +40,7 @@ use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput, ProviderStreamObs
 use crate::traits::store::Store;
 use crate::types::error::{EngineError, ModelFailureKind};
 use crate::types::event::{EventKind, ThreadEvent, summarize_params};
-use crate::types::message::ThreadMessage;
+use crate::types::message::{MessageRole, ThreadMessage};
 use crate::types::project::ProjectId;
 use crate::types::provenance::Provenance;
 use crate::types::shared_owner_id;
@@ -60,6 +60,11 @@ pub(crate) const RECOVERY_STATE_KEY: &str = "_failure_recovery";
 
 /// Opaque in-memory lookup key carried through the Python transcript.
 const TRANSIENT_CONTENT_ID_FIELD: &str = "__transient_content_id";
+
+/// Transcript field the Python orchestrator uses to hand an interpreter step
+/// record back to the host for classification (WI#227). A single-underscore
+/// key stays outside the persisted `working_messages` record once consumed.
+pub const STEP_RECORD_FIELD: &str = "_step_record";
 
 /// Well-known title for orchestrator code in the Store.
 pub const ORCHESTRATOR_TITLE: &str = "orchestrator:main";
@@ -2461,7 +2466,7 @@ fn build_orchestrator_inputs(
         .iter()
         .map(|m| {
             let mut value = serde_json::json!({
-                "role": format!("{:?}", m.role),
+                "role": m.role.wire_name(),
                 "content": m.content,
                 "action_name": m.action_name,
                 "action_call_id": m.action_call_id,
@@ -2518,6 +2523,35 @@ fn json_to_thread_messages(value: &serde_json::Value) -> Option<Vec<ThreadMessag
     json_to_thread_messages_with_transient(value, None)
 }
 
+/// Host-owned classification of one orchestrator wire transcript item (WI#227).
+///
+/// The Python VM cannot mint engine roles: it writes wire strings, and the
+/// decoder treats unknown spellings as `User`. The two shapes classified into
+/// the sealed [`MessageRole::SealedStepRecord`] role are therefore shapes the
+/// VM cannot forge on its own:
+///
+/// - `"StepRecord"` — a record the host itself classified and persisted on an
+///   earlier pass (the wire spelling only round-trips).
+/// - any wire role whose item carries [`STEP_RECORD_FIELD`] — a field the
+///   default orchestrator only sets on freshly produced interpreter/diagnostic
+///   step output, consumed and stripped by the host before persistence.
+///
+/// Every other wire role is returned unchanged; the engine warnings, recovery
+/// controls, bounded probes, and skill text that legitimately ride `User`
+/// keep their shape. Exhaustive over `MessageRole` so a future role fails to
+/// compile here instead of silently widening the writable set.
+pub(crate) fn classify_wire_role(item: &serde_json::Value, role: &str) -> MessageRole {
+    if matches!(role, "StepRecord" | "step_record") || item.get(STEP_RECORD_FIELD).is_some() {
+        return MessageRole::SealedStepRecord;
+    }
+    match role {
+        "System" | "system" => MessageRole::System,
+        "Assistant" | "assistant" => MessageRole::Assistant,
+        "ActionResult" | "action_result" => MessageRole::ActionResult,
+        _ => MessageRole::User,
+    }
+}
+
 fn json_to_thread_messages_with_transient(
     value: &serde_json::Value,
     transient_source: Option<&Thread>,
@@ -2532,17 +2566,18 @@ fn json_to_thread_messages_with_transient(
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let action_calls = item.get("action_calls").and_then(json_to_action_calls);
+        let classified_role = classify_wire_role(item, role);
 
-        let mut message = match role {
-            "System" | "system" => ThreadMessage::system(content),
-            "Assistant" | "assistant" => {
+        let mut message = match classified_role {
+            MessageRole::System => ThreadMessage::system(content),
+            MessageRole::Assistant => {
                 if let Some(calls) = action_calls {
                     ThreadMessage::assistant_with_actions(Some(content.to_string()), calls)
                 } else {
                     ThreadMessage::assistant(content)
                 }
             }
-            "ActionResult" | "action_result" => ThreadMessage::action_result(
+            MessageRole::ActionResult => ThreadMessage::action_result(
                 item.get("action_call_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default(),
@@ -2551,7 +2586,8 @@ fn json_to_thread_messages_with_transient(
                     .unwrap_or_default(),
                 content,
             ),
-            _ => ThreadMessage::user(content),
+            MessageRole::SealedStepRecord => ThreadMessage::sealed_step_record(content),
+            MessageRole::User => ThreadMessage::user(content),
         };
         if message.role == crate::types::message::MessageRole::User
             && let Some(id) = item
@@ -3350,6 +3386,236 @@ mod tests {
         assert!(eval_python_bool(
             r#"append_structured_action_results([], [{"name": "skip", "call_id": "c1"}, {"name": "gate", "call_id": "c2"}], [None, {"gate_paused": True}])[0]["action_call_id"] == "c1""#
         ));
+    }
+
+    #[test]
+    fn sealed_step_records_classify_host_side_and_unflagged_writes_stay_user() {
+        // WI#227 regression: the Python VM cannot mint engine roles. Only the
+        // two host-recognized shapes decode as SealedStepRecord — a persisted
+        // `StepRecord` spelling, or any wire item flagged `_step_record`.
+        // Everything else, including unknown spellings, stays `User` so
+        // engine warnings, bounded probes, and nudges keep their turn shape.
+        let sealed_flagged = serde_json::json!({
+            "role": "User",
+            "content": "[stdout]\nOSError: example",
+            STEP_RECORD_FIELD: true,
+        });
+        let sealed_round_trip = serde_json::json!({
+            "role": "StepRecord",
+            "content": "[stdout]\nok",
+        });
+        for item in [&sealed_flagged, &sealed_round_trip] {
+            let messages = json_to_thread_messages(&serde_json::json!([item]))
+                .expect("wire messages should decode");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].role, MessageRole::SealedStepRecord);
+            assert_eq!(messages[0].provenance, Provenance::System);
+            // Sealed records never reach the user-visible transcript.
+            let mut thread = Thread::new(
+                "goal",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                "user",
+                ThreadConfig::default(),
+            );
+            thread.add_message(messages[0].clone());
+            assert!(
+                thread
+                    .messages
+                    .iter()
+                    .all(|m| m.role != MessageRole::SealedStepRecord),
+                "sealed record leaked into the visible transcript"
+            );
+            assert_eq!(thread.internal_messages.len(), 1);
+            assert_eq!(
+                thread.internal_messages[0].role,
+                MessageRole::SealedStepRecord
+            );
+            // The MessageAdded event still fires with the wire spelling so
+            // channel UIs keep their "Code executed"-class status hints.
+            assert!(thread.events.iter().any(|event| matches!(
+                &event.kind,
+                crate::types::event::EventKind::MessageAdded { role, .. }
+                    if role == "StepRecord"
+            )));
+        }
+
+        // Unflagged writes keep their effective User shape...
+        let plain = serde_json::json!([
+            {"role": "User", "content": "Loop warning: finish now."},
+            {"role": "Unknown", "content": "anything unrecognized"},
+        ]);
+        let messages = json_to_thread_messages(&plain).expect("wire messages should decode");
+        assert!(messages.iter().all(|m| m.role == MessageRole::User));
+
+        // ...and the classification flag never survives a decode.
+        let messages = json_to_thread_messages(&serde_json::json!([sealed_flagged]))
+            .expect("flagged item should decode");
+        let wire_back = serde_json::json!(
+            messages
+                .iter()
+                .map(|m| serde_json::json!({"role": m.role.wire_name(), "content": m.content}))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            wire_back.to_string().find(STEP_RECORD_FIELD).is_none(),
+            "classification flag must be stripped by the host decode"
+        );
+    }
+
+    #[test]
+    fn sync_runtime_state_seals_flagged_step_output_out_of_the_visible_transcript() {
+        // WI#227 regression through the reported boundary itself: the Python
+        // orchestrator appends interpreter blobs to `working_messages`; the
+        // host sync path (`sync_runtime_state`) is what materializes them into
+        // the thread. Assert the sealed record lands in `internal_messages`
+        // and can never surface through the user-visible `thread.messages`
+        // that `get_engine_thread` serves.
+        let mut thread = Thread::new(
+            "check the date",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.add_message(ThreadMessage::user("what day is it?"));
+        let visible_before = thread.messages.len();
+
+        let state = serde_json::json!({
+            "working_messages": [
+                {"role": "User", "content": "what day is it?"},
+                {"role": "Assistant", "content": "```python\nimport datetime\nprint(datetime.date.today())\n```"},
+                {
+                    "role": "User",
+                    "content": "[stdout]\nOSError: OS operations are not permitted in CodeAct scripts",
+                    STEP_RECORD_FIELD: true,
+                },
+            ],
+        });
+        sync_runtime_state(&mut thread, Some(&state));
+
+        // The flagged blob is sealed inside the inference transcript...
+        let sealed: Vec<_> = thread
+            .internal_messages
+            .iter()
+            .filter(|m| m.role == MessageRole::SealedStepRecord)
+            .collect();
+        assert_eq!(sealed.len(), 1, "flagged step output must seal");
+        assert!(sealed[0].content.contains("OSError"));
+        assert_eq!(sealed[0].provenance, Provenance::System);
+
+        // ...and the user-visible transcript is untouched by it.
+        assert_eq!(thread.messages.len(), visible_before);
+        assert!(
+            thread
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("OS operations are not permitted")),
+            "sealed step output leaked into the visible transcript"
+        );
+
+        // Unflagged machine controls still ride the inference transcript as
+        // User turns — the seal is narrow, not a blanket User reroute.
+        let state = serde_json::json!({
+            "working_messages": [
+                {"role": "User", "content": "Loop warning: finish now."},
+            ],
+        });
+        sync_runtime_state(&mut thread, Some(&state));
+        assert!(
+            thread
+                .internal_messages
+                .iter()
+                .any(|m| m.role == MessageRole::User && m.content.contains("Loop warning")),
+            "unflagged control text must keep its User turn shape"
+        );
+    }
+
+    #[test]
+    fn model_response_quoting_step_output_is_assistant_authored_in_visible_transcript() {
+        // WI#227 response-boundary regression: the model still reads sealed
+        // step records as User-role inference turns (llm_adapter.rs maps
+        // SealedStepRecord → Role::User), so it can legitimately quote or
+        // reinterpret that internal text in its final visible response. This
+        // test demonstrates that when the model does so, the response is
+        // always Assistant-authored in the operator-visible transcript — the
+        // sealed step blob itself never appears as a user-authored message.
+        //
+        // This is the actual incident path from the WI#227 report: Kageho
+        // saw "stale date system error" text inside what appeared to be a
+        // user message. The seal ensures the raw step record never enters
+        // thread.messages; the model's response — even when quoting it — is
+        // correctly attributed to the assistant.
+        let mut thread = Thread::new(
+            "check the date",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.add_message(ThreadMessage::user("what day is it?"));
+
+        // Step 1: sealed step output enters the inference transcript only.
+        let state = serde_json::json!({
+            "working_messages": [
+                {"role": "User", "content": "what day is it?"},
+                {"role": "Assistant", "content": "```python\nimport datetime\nprint(datetime.date.today())\n```"},
+                {
+                    "role": "User",
+                    "content": "[stdout]\nOSError: OS operations are not permitted in CodeAct scripts",
+                    STEP_RECORD_FIELD: true,
+                },
+            ],
+        });
+        sync_runtime_state(&mut thread, Some(&state));
+
+        // Step 2: the model reads the sealed record (as User-role inference
+        // data) and produces a visible response that quotes it. In the
+        // incident, the model treated the OSError text as if a human had
+        // said it. The response goes through sync_visible_outcome, which
+        // appends it as an Assistant message.
+        let model_response = "I see you got an error: OS operations are not permitted in CodeAct scripts. Let me try a different approach.";
+        sync_visible_outcome(
+            &mut thread,
+            &ThreadOutcome::Completed {
+                response: Some(model_response.to_string()),
+            },
+        );
+
+        // The visible transcript contains the model's response as an
+        // Assistant message, never as a User message.
+        let visible_roles: Vec<_> = thread.messages.iter().map(|m| m.role).collect();
+        assert!(
+            visible_roles.contains(&MessageRole::Assistant),
+            "model response must be Assistant-authored"
+        );
+        let assistant_msgs: Vec<_> = thread
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .collect();
+        assert!(
+            assistant_msgs
+                .iter()
+                .any(|m| m.content.contains("OS operations are not permitted")),
+            "model may quote internal step output in its response"
+        );
+        // Critically: no User-role message in the visible transcript carries
+        // the step blob. The only User message is the original human input.
+        let user_msgs: Vec<_> = thread
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .collect();
+        assert_eq!(user_msgs.len(), 1, "only the human input is User-role");
+        assert!(!user_msgs[0].content.contains("OSError"));
+        // And the sealed step record remains in the inference transcript.
+        assert!(
+            thread
+                .internal_messages
+                .iter()
+                .any(|m| m.role == MessageRole::SealedStepRecord)
+        );
     }
 
     #[test]

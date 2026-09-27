@@ -14,6 +14,11 @@ compaction summaries, and system-role content), the removal of the dead
 (host-validated `save_conversation_insight` writes, eligible-user-evidence
 batching, project-scoped mission dispatch, restart-safe `InsightCursor`
 batching, and explicit insight-mission opt-out with a Paused tombstone).
+Updates for 2.1.3.0 include the WI#227 sealed step records (interpreter step
+output carries the `SealedStepRecord` role through the inference transcript
+only; `Thread::add_message` reroutes it out of the user-visible transcript,
+the trace analyzer keeps `code_error` detection over sealed records, and all
+wire surfaces use `MessageRole::wire_name()`).
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
@@ -232,6 +237,22 @@ Key characteristics:
   denial used to fire for the date functions too, pushing a "stale date system
   error" `OSError` line into the step output that the orchestrator renders as a
   user-visible message).
+- **Sealed step records (WI#227)**: interpreter step output blobs (`[stdout]`,
+  `[name ERROR]`, `[return]`) are inference data, not conversation. The default
+  orchestrator flags freshly produced `format_output` blobs with a transient
+  `_step_record` marker; the host decoder (`classify_wire_role`) mints those —
+  and only those, plus the persisted `StepRecord` wire spelling — as
+  `MessageRole::SealedStepRecord`. `Thread::add_message` reroutes sealed records
+  into `internal_messages`, so the user-visible transcript (`thread.messages`)
+  can never contain them; the LLM adapter still feeds them to the model as
+  `Role::User` step output, and delegated-worker prompt context excludes them.
+  The Python VM cannot mint the role: unknown wire spellings and unflagged
+  writes decode as `User` exactly as before. Trace diagnostics treat sealed
+  records like legacy `User` code blobs, so `code_error` warnings (and the
+  self-improvement missions keyed on them) keep firing for sealed interpreter
+  failures. All wire surfaces — orchestrator JSON, Monty `context`, bridge
+  DTOs, trace records, thread events — spell roles via
+  `MessageRole::wire_name()` rather than Rust `Debug` formatting.
 
 ### Python Orchestrator
 
