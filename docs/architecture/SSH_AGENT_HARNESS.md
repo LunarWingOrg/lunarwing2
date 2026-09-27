@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built (revalidated against source 2026-09-19, v2.1.2.0; worker list extended with OpenCode 2)
+**Status:** As-built (revalidated against source 2026-09-27, v2.1.3.0)
 **Code:** `ic/src/bridge/ssh*.rs`, `ic/src/config/ssh.rs`
 **Operator guide:** [`docs/ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 **Delivery mechanisms** (how the agent actually runs SSH work — worker mode, the `ssh`/`ssh_git` built-in tools, the WASM `ssh` tool): [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)
@@ -430,21 +430,21 @@ Known limitations / follow-ups:
 
 ## 8. Test coverage
 
-37 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
+38 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
 `ic/tests/` (tool-specific `ssh` / `ssh_git` tests are additional):
 
 | File | Tests |
 |------|-------|
 | `ssh.rs` | 5 — hostname and secret-name helpers, bridge create/add, bridge restart + persistent pin revocation |
-| `ssh_agent.rs` | 1 — start/stop with an **empty** key map |
+| `ssh_agent.rs` | 2 — start/stop with an **empty** key map; parent-directory creation when missing |
 | `ssh_secrets.rs` | 6 — store/load, passphrase, missing key, delete, format detection (ed25519/rsa) |
 | `ssh_hostkeys.rs` | 14 — fingerprint/parse, add/verify/remove, strict/mismatch/ports, encrypted restart persistence, tenant isolation, corruption failure, concurrent-first-key race |
 | `ssh_api.rs` | 6 — conversion, secret-safe debug/logging, bearer authentication, disabled-router behavior |
 | `ssh_client.rs` | 3 — `append_capped` under-limit, crossing-limit, and already-full output behavior |
 | `config/ssh.rs` | 2 — parse config, `to_host_map` defaults/overrides |
 
-Notable gaps: the agent server is never tested with a **real** key (the sole test
-uses an empty map), and no test performs the full host-key preflight and command
+Notable gaps: the agent server is never tested with a **real** key (both tests
+use an empty map), and no test performs the full host-key preflight and command
 flow against a live SSH server. Persistent-pin tests exercise the encrypted
 in-memory secrets backend; normal database-backed stores share the same trait
 surface and their own CRUD coverage.
