@@ -196,11 +196,19 @@ XMPP_ENCRYPTED_ROOMS=                    # Rooms requiring OMEMO encryption
 
 ### Allowing direct messages
 
-By default, `XMPP_DM_POLICY=allowlist` restricts who can message the agent. Add JIDs to `XMPP_ALLOW_FROM`:
+By default, `XMPP_DM_POLICY=allowlist` restricts who can message the agent.
+Configure the authorized JIDs in `XMPP_ALLOW_FROM`:
 
 ```bash
 XMPP_ALLOW_FROM=alice@xmpp.example.com,bob@xmpp.example.com
 ```
+
+On a new mt-admin tenant, `XMPP_JID` defaults to `<tenant>@xmpp.localhost`
+and `XMPP_ALLOW_FROM` defaults to `user@xmpp.localhost` (not the agent's
+own JID). The bridge's JSON allowlist mirrors the daemon's list. Set a real
+domain and authorized senders with `--xmpp-jid` and `--xmpp-allow-from` when
+provisioning outside the local test XMPP network; existing values survive a
+re-render. An explicit `--xmpp-allow-from` adds senders alongside the agent JID.
 
 Set `XMPP_DM_POLICY=open` to allow messages from anyone (not recommended for production).
 
@@ -431,6 +439,10 @@ LUNARWING_TOKIO_MAX_BLOCKING_THREADS=4   # Optional; default is min(host CPUs, 4
 Tokio's worker and blocking-pool caps keep idle memory stable on large hosts.
 Increase them only after measuring sustained runtime saturation; they do not
 limit Cargo or other subprocess parallelism.
+
+The mt-admin env writer sets `AGENT_AUTO_APPROVE_TOOLS=false` on new tenants.
+Re-rendering preserves an existing canonical override; an older tenant with
+only `AUTO_APPROVE_TOOLS` has that value migrated to the canonical key.
 
 ### Enabling heartbeat
 
