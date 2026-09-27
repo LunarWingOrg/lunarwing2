@@ -11,7 +11,8 @@ This integration is available on the current LunarWing source tree; it is not ti
 `poll_interval_ms` clamp, token-presence polling gate, and channel startup
 behavior were re-checked against `ic/channels-src/multica/src/lib.rs`;
 referenced skill, manifests, and smoke-test scripts are present (the 2.1.2.0
-release only bumped the channel crate/registry versions to 0.1.11).
+release only bumped the channel crate/registry versions to 0.1.11; the
+2.1.3.0 release again only bumped them to 0.1.12).
 
 ## Prerequisites
 
