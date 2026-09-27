@@ -12,7 +12,7 @@ a separate additive refresh cadence that imports newly published paths without
 changing existing notes. Existing tenants upgraded to a seed-capable binary are
 neither seeded nor opted in automatically.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0).** The seeding and refresh
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0).** The seeding and refresh
 flows are unchanged. Note the stale-marking sweep no longer has the v2.1.1
 1,000-note scan cap: `knowledge_list_notes` pages the whole store with a keyset
 cursor (500-row pages, 100k safety ceiling), and the sweep also runs on an
@@ -148,7 +148,7 @@ This mode is deliberately labeled `additive`: it imports new paths, but does not
 apply upstream edits, status changes, supersedure, tombstones, or deletions. It
 reports a Git revision rather than claiming exact parity with the hosted MCP.
 Those complete semantics require the revisioned hosted delta contract described
-in `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`.
+in `docs/ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`.
 
 Run a bounded pass immediately without restarting the daemon:
 
@@ -282,7 +282,7 @@ After provisioning and the first `start-tenant`:
   mechanism design record + Gentoo/OpenRC live verification
 - [`../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md) —
   systemd live verification (including the upgraded-tenant negative case)
-- [`../ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](../ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md) —
+- [`../ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](../ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md) —
   refresh architecture, safety invariants, and hosted-delta follow-up
 - Implementation: `ic/src/workspace/knowledge_seed.rs`,
   `ic/src/workspace/knowledge_sync.rs`, `ic/src/config/knowledge.rs`, and
