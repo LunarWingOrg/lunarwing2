@@ -188,6 +188,12 @@ sudo ic/scripts/lunarwing-weechat-preflight.sh ruffles
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant ruffles
 ```
 
+Rotate an already-configured relay password with
+`sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password ruffles`.
+This briefly stops and restarts the running WeeChat, adapter, and daemon;
+it preserves the literal environment expression in `relay.conf`. Run the
+preflight afterward. The verb refuses mismatched existing env credentials.
+
 For architecture, service details, and upgrades, read [`../ops/WEECHAT-SERVICES.md`](../ops/WEECHAT-SERVICES.md) and [`lunarwing_weechat_wss/README.md`](lunarwing_weechat_wss/README.md).
 
 ## 8. Day-to-Day Operations

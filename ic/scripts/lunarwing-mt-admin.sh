@@ -472,6 +472,8 @@ Commands:
   configure-weechat-relay <name>   Generate WeeChat relay config for a tenant.
                                    Preserves existing config: fails on any
                                    non-empty ~/.config/weechat without modifying it.
+  rotate-relay-password <name>     Rotate WeeChat relay credentials and restart
+                                   running consumers (brief service interruption).
 
   disable-weechat <name>           Disable WeeChat for a tenant: stops its (optional)
   enable-weechat <name>            weechat units and removes their boot persistence
@@ -1418,6 +1420,16 @@ main() {
       ports_registry_init
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
       configure_weechat_relay "$name"
+      ;;
+
+    rotate-relay-password)
+      [[ -n "${1:-}" && $# -eq 1 ]] || die "usage: rotate-relay-password <name>"
+      require_root
+      local name
+      name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+      with_tenant_lifecycle_lock "$name" rotate_tenant_weechat_relay_password "$name"
       ;;
 
     disable-weechat|enable-weechat)
