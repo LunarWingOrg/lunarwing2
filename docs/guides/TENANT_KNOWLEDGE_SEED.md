@@ -148,7 +148,7 @@ This mode is deliberately labeled `additive`: it imports new paths, but does not
 apply upstream edits, status changes, supersedure, tombstones, or deletions. It
 reports a Git revision rather than claiming exact parity with the hosted MCP.
 Those complete semantics require the revisioned hosted delta contract described
-in `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`.
+in `docs/ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`.
 
 Run a bounded pass immediately without restarting the daemon:
 
@@ -282,7 +282,7 @@ After provisioning and the first `start-tenant`:
   mechanism design record + Gentoo/OpenRC live verification
 - [`../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md) —
   systemd live verification (including the upgraded-tenant negative case)
-- [`../ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](../ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md) —
+- [`../ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](../ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md) —
   refresh architecture, safety invariants, and hosted-delta follow-up
 - Implementation: `ic/src/workspace/knowledge_seed.rs`,
   `ic/src/workspace/knowledge_sync.rs`, `ic/src/config/knowledge.rs`, and
