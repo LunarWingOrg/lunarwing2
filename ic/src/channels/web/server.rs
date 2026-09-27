@@ -40,6 +40,9 @@ use crate::channels::web::handlers::memory::{
     memory_list_handler, memory_read_handler, memory_search_handler, memory_tree_handler,
     memory_write_handler,
 };
+use crate::channels::web::handlers::missions::{
+    missions_detail_handler, missions_list_handler, missions_summary_handler,
+};
 use crate::channels::web::handlers::routines::{
     routines_delete_handler, routines_detail_handler, routines_list_handler,
     routines_summary_handler, routines_toggle_handler, routines_trigger_handler,
@@ -479,6 +482,10 @@ pub(super) async fn start_server_with_mascot(
         .route("/api/jobs/{id}/events", get(jobs_events_handler))
         .route("/api/jobs/{id}/files/list", get(job_files_list_handler))
         .route("/api/jobs/{id}/files/read", get(job_files_read_handler))
+        // Missions (read-only observability surface, work item #217)
+        .route("/api/missions", get(missions_list_handler))
+        .route("/api/missions/summary", get(missions_summary_handler))
+        .route("/api/missions/{id}", get(missions_detail_handler))
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         .route("/api/logs/level", get(logs_level_get_handler))
