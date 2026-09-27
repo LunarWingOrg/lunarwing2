@@ -49,9 +49,9 @@ if build_sandbox_image; then
 else
   bad "build_sandbox_image must succeed when the runtime build succeeds"
 fi
-expected="podman build -t lunarwing-sandbox:latest -f $SANDBOX_DOCKERFILE $REPO_ROOT/docker"
+expected="podman build --network=host -t lunarwing-sandbox:latest -f $SANDBOX_DOCKERFILE $REPO_ROOT/docker"
 if [[ "${CALLS[0]:-}" == "$expected" ]]; then
-  ok "podman build pinned to the sandbox Dockerfile with the ic/docker context"
+  ok "podman build uses host networking and the sandbox Dockerfile with the ic/docker context"
 else
   bad "unexpected podman invocation: [${CALLS[0]:-}] (expected [$expected])"
 fi

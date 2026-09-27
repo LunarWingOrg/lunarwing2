@@ -322,7 +322,12 @@ build_sandbox_image() {
     || { say "WARNING: $SANDBOX_DOCKERFILE missing; cannot build sandbox image"; return 1; }
   local runtime
   runtime="$(sandbox_container_runtime "${1:-}")" || return 1
-  "$runtime" build -t "$SANDBOX_IMAGE_TAG" \
+  # On hosts whose Podman bridge cannot reach the host DNS resolver, apt in
+  # the locally built sandbox image cannot resolve deb.debian.org. Match the
+  # worker image builders: host networking is build-only, not sandbox runtime.
+  local -a network_args=()
+  [[ "$runtime" != podman ]] || network_args=(--network=host)
+  "$runtime" build "${network_args[@]}" -t "$SANDBOX_IMAGE_TAG" \
     -f "$SANDBOX_DOCKERFILE" "$REPO_ROOT/docker" >/dev/null \
     || { say "WARNING: sandbox image build failed (run 'build-sandbox-image' to retry)"; return 1; }
   say "sandbox image built: $SANDBOX_IMAGE_TAG"

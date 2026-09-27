@@ -140,6 +140,8 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image [tenant]
 
 `start-tenant` also reconciles a missing tenant-side sandbox image as a safety net. See [`../ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md`](../ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md) for the three-store diagnosis when sandboxed shell executions fail after an upgrade.
 
+On Podman hosts, the **admin-store image build** uses `--network=host` so its Debian package installation can resolve DNS even where Podman's default build bridge cannot. This applies only to the trusted, repository-owned Dockerfile during image construction; it does not change tenant sandbox execution networking (`SANDBOX_NETWORK`) or the Docker fallback build.
+
 Run only the builds selected for the deployment. Nanocode is retired; its registry slots remain reserved for compatibility but it is not a runnable worker.
 
 ## 6. Start and Verify
