@@ -121,6 +121,11 @@ seeded `selected_model`, `openai_compatible_base_url`, or other TOML values.
 name-only migration warning; the canonical spelling wins within a layer. Engine
 V2 consumes the resolved `AgentConfig::auto_approve_tools`, including DB-backed
 defaults. Unknown `AGENT_*` / `AUTO_APPROVE_*` keys emit a name-only warning.
+For multi-tenant onboarding, mt-admin renders only the canonical key (default
+`false`); a legacy-only tenant env value is migrated on re-render without
+overriding an existing canonical value. New tenant XMPP defaults are
+`<tenant>@xmpp.localhost` for the agent and `user@xmpp.localhost` for its DM
+allowlist; mt-admin flags and stored tenant settings take precedence.
 See [approval behavior](../../../docs/guides/ENABLING_DEV_TOOLS.md#3-keep-or-change-approval-behavior)
 for the restrictions that global auto-approval does not bypass.
 
