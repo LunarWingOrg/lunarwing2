@@ -181,6 +181,15 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant sparkie
 # Rotate a tenant's PostgreSQL password (ALTER ROLE + pg.secret + DATABASE_URL; then restart)
 sudo ic/scripts/lunarwing-mt-admin.sh rotate-pg-password sparkie
 
+# Rotate a tenant's WeeChat relay password (weechat.env + lunarwing.env; then restart)
+# The new password is written only to the two env files — never on argv and never
+# live-/set into WeeChat, so relay.conf keeps the literal ${env:RELAY_PASSWORD}
+# expression and the secret can never be persisted into it by /save. The running
+# relay keeps the old credential until the next managed restart. Idempotent:
+# re-run to converge if a previous attempt failed between the two file writes.
+sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password sparkie
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant sparkie
+
 # Back up a tenant's DB (pg_dump custom format → $LUNARWING_MT_BACKUP_DIR/<name>/)
 sudo ic/scripts/lunarwing-mt-admin.sh backup-tenant sparkie
 sudo ic/scripts/lunarwing-mt-admin.sh backup-all

@@ -69,6 +69,8 @@ The following are written to `lunarwing.env` by the MT admin script:
 
 `RELAY_PASSWORD` is generated per tenant during `add-tenant` and must match the password configured inside WeeChat (see [WeeChat Relay Setup](#weechat-relay-setup)). On fresh tenants the automatic bootstrap writes the password as the literal `${env:RELAY_PASSWORD}` expression into `relay.conf` and provides the resolved value through a dedicated `env/weechat.env` file (mode `0600`).
 
+Rotate it with `lunarwing-mt-admin.sh rotate-relay-password <name>` followed by `restart-tenant <name>`. The rotation writes the fresh password only to `env/weechat.env` and `lunarwing.env` — never on a command line and never as a live `/set` — so `relay.conf` keeps the env expression and the running relay keeps the old credential until the managed restart. The verb is idempotent: re-running it converges both env files if a previous attempt failed between the two writes.
+
 > **Per-tenant ports & the in-process WASM channel.** The LunarWing daemon
 > (which hosts the WeeChat WASM channel in-process) sources `relay_url`,
 > `ws_adapter_url`, and `relay_password` from `RELAY_URL`, `WS_ADAPTER_URL`, and

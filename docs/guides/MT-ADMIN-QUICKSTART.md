@@ -178,6 +178,20 @@ sudo ic/scripts/lunarwing-weechat-preflight.sh ruffles
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant ruffles
 ```
 
+Rotate the relay password with:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant ruffles
+```
+
+The rotation writes the fresh password only to `env/weechat.env` and
+`env/lunarwing.env` — never to a command line and never as a live `/set` — so
+`relay.conf` keeps the literal `${env:RELAY_PASSWORD}` expression and the
+secret can never be persisted into it by a later `/save`. The running relay
+keeps the old credential until the managed restart. The verb is idempotent:
+if a run fails between the two file writes, re-running it converges both.
+
 For architecture, service details, and upgrades, read [`../ops/WEECHAT-SERVICES.md`](../ops/WEECHAT-SERVICES.md) and [`lunarwing_weechat_wss/README.md`](lunarwing_weechat_wss/README.md).
 
 ## 8. Day-to-Day Operations
