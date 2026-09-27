@@ -5741,6 +5741,72 @@ mod tests {
     }
 
     #[test]
+    fn sealed_step_records_stay_out_of_the_operator_thread_dto() {
+        // WI#227 boundary regression at the operator-visible rendering edge:
+        // `get_engine_thread` (router.rs) serves `thread.messages` verbatim to
+        // channel UIs. `Thread::add_message` is the single choke point that
+        // builds that transcript, so feeding a sealed record through it must
+        // leave the served set free of sealed content — the DTO can then never
+        // render an internal `[stdout]`/diagnostic blob as a conversation
+        // message, regardless of which caller produced it.
+        use lunarwing_engine::MessageRole;
+
+        let mut thread = lunarwing_engine::Thread::new(
+            "run the report",
+            lunarwing_engine::ThreadType::Foreground,
+            lunarwing_engine::ProjectId::new(),
+            "alice",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        thread.add_message(lunarwing_engine::ThreadMessage::user("run it"));
+        thread.add_message(lunarwing_engine::ThreadMessage::sealed_step_record(
+            "[stdout]\nOSError: OS operations are not permitted in CodeAct scripts",
+        ));
+        thread.add_message(lunarwing_engine::ThreadMessage::assistant("done"));
+
+        // The visible transcript is exactly what the DTO serializer iterates.
+        assert!(
+            thread
+                .messages
+                .iter()
+                .all(|m| m.role != MessageRole::SealedStepRecord),
+            "sealed record must never enter the served message set"
+        );
+        assert!(
+            thread
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("OSError")),
+            "sealed diagnostic text must not appear in served content"
+        );
+        // It remains available to inference via the internal transcript.
+        assert!(
+            thread
+                .internal_messages
+                .iter()
+                .any(|m| m.role == MessageRole::SealedStepRecord)
+        );
+
+        // Mirror the get_engine_thread DTO mapping: role spelling + content.
+        let served: Vec<serde_json::Value> = thread
+            .messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role.wire_name(), "content": m.content}))
+            .collect();
+        assert!(
+            served.iter().all(|m| m["role"] != "StepRecord"),
+            "operator DTO must not carry the sealed wire spelling"
+        );
+        assert!(
+            served.iter().all(|m| !m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("[stdout]")),
+            "operator DTO must not carry sealed step output"
+        );
+    }
+
+    #[test]
     fn foreground_thread_config_uses_resolved_agent_iteration_limit() {
         let config = foreground_thread_config(979, true);
 
