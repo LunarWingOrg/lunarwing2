@@ -67,7 +67,7 @@ sudo ./lunarwing_mt_onboard_web/run.sh
 
 Open the token-bearing URL it prints (normally `http://127.0.0.1:1969/?token=...`) and keep the process running until the workflow finishes.
 
-You will need Python 3.10+, a Linux host running systemd or OpenRC, root or sudo, Docker or Podman, `jq`, `git`, and network access on first launch. See the [distribution-specific prerequisites](docs/guides/) and the [full GUI reference](lunarwing_mt_onboard_web/README.md).
+You will need Python 3.10+, a GNU/Linux host running systemd or OpenRC, root or sudo, Docker or Podman, `jq`, `git`, and network access on first launch. See the [distribution-specific prerequisites](docs/guides/) and the [full GUI reference](lunarwing_mt_onboard_web/README.md).
 
 Worth knowing before you provision:
 
