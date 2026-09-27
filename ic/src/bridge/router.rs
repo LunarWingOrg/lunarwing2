@@ -3817,15 +3817,20 @@ fn format_action_display_name(action_name: &str, params_summary: &Option<String>
 
 /// Interpret a MessageAdded event into a human-readable status message.
 /// Returns `None` for events that don't need UI surfacing.
+///
+/// Interpreter step output arrives under either the legacy `User` role
+/// (pre-WI#227 transcripts) or the sealed `StepRecord` wire spelling — the
+/// status hints are derived from the preview shape in both cases.
 fn interpret_message_event(role: &str, content_preview: &str) -> Option<&'static str> {
-    if role == "User" && content_preview.starts_with("[stdout]") {
-        Some("Code executed")
-    } else if role == "User" && content_preview.starts_with("[code ") {
-        Some("Code executed (no output)")
-    } else if role == "User"
+    let step_output = role == "User" || role == "StepRecord";
+    if step_output
         && (content_preview.contains("Error") || content_preview.starts_with("Traceback"))
     {
         Some("Code error — retrying...")
+    } else if step_output && content_preview.starts_with("[stdout]") {
+        Some("Code executed")
+    } else if step_output && content_preview.starts_with("[code ") {
+        Some("Code executed (no output)")
     } else if role == "Assistant" {
         Some("Executing code...")
     } else {
@@ -4401,7 +4406,7 @@ pub async fn get_engine_thread(
         .iter()
         .map(|m| {
             serde_json::json!({
-                "role": format!("{:?}", m.role),
+                "role": m.role.wire_name(),
                 "content": m.content,
                 "timestamp": m.timestamp.to_rfc3339(),
             })
@@ -5702,6 +5707,102 @@ mod tests {
         assert_eq!(
             context.as_deref(),
             Some("transport limit\n\ncoordination schema")
+        );
+    }
+
+    #[test]
+    fn interpret_message_event_covers_legacy_user_and_sealed_step_record_roles() {
+        // WI#227: sealed records emit MessageAdded with the "StepRecord" wire
+        // spelling; pre-seal transcripts use "User". Both must surface the
+        // same code-execution status hints.
+        for role in ["User", "StepRecord"] {
+            assert_eq!(
+                interpret_message_event(role, "[stdout]\nok"),
+                Some("Code executed"),
+                "role {role}"
+            );
+            assert_eq!(
+                interpret_message_event(role, "[code executed, no output]"),
+                Some("Code executed (no output)"),
+                "role {role}"
+            );
+            assert_eq!(
+                interpret_message_event(role, "[stdout]\nOSError: boom"),
+                Some("Code error — retrying..."),
+                "role {role}"
+            );
+        }
+        assert_eq!(
+            interpret_message_event("Assistant", "anything"),
+            Some("Executing code...")
+        );
+        assert_eq!(interpret_message_event("System", "anything"), None);
+        assert_eq!(interpret_message_event("User", "a human question"), None);
+    }
+
+    #[test]
+    fn sealed_step_records_stay_out_of_the_operator_thread_dto() {
+        // WI#227 boundary regression at the operator-visible rendering edge:
+        // `get_engine_thread` (router.rs) serves `thread.messages` verbatim to
+        // channel UIs. `Thread::add_message` is the single choke point that
+        // builds that transcript, so feeding a sealed record through it must
+        // leave the served set free of sealed content — the DTO can then never
+        // render an internal `[stdout]`/diagnostic blob as a conversation
+        // message, regardless of which caller produced it.
+        use lunarwing_engine::MessageRole;
+
+        let mut thread = lunarwing_engine::Thread::new(
+            "run the report",
+            lunarwing_engine::ThreadType::Foreground,
+            lunarwing_engine::ProjectId::new(),
+            "alice",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+        thread.add_message(lunarwing_engine::ThreadMessage::user("run it"));
+        thread.add_message(lunarwing_engine::ThreadMessage::sealed_step_record(
+            "[stdout]\nOSError: OS operations are not permitted in CodeAct scripts",
+        ));
+        thread.add_message(lunarwing_engine::ThreadMessage::assistant("done"));
+
+        // The visible transcript is exactly what the DTO serializer iterates.
+        assert!(
+            thread
+                .messages
+                .iter()
+                .all(|m| m.role != MessageRole::SealedStepRecord),
+            "sealed record must never enter the served message set"
+        );
+        assert!(
+            thread
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("OSError")),
+            "sealed diagnostic text must not appear in served content"
+        );
+        // It remains available to inference via the internal transcript.
+        assert!(
+            thread
+                .internal_messages
+                .iter()
+                .any(|m| m.role == MessageRole::SealedStepRecord)
+        );
+
+        // Mirror the get_engine_thread DTO mapping: role spelling + content.
+        let served: Vec<serde_json::Value> = thread
+            .messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role.wire_name(), "content": m.content}))
+            .collect();
+        assert!(
+            served.iter().all(|m| m["role"] != "StepRecord"),
+            "operator DTO must not carry the sealed wire spelling"
+        );
+        assert!(
+            served.iter().all(|m| !m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("[stdout]")),
+            "operator DTO must not carry sealed step output"
         );
     }
 

@@ -433,6 +433,27 @@ impl Thread {
 
     /// Add a message to this thread's conversation.
     pub fn add_message(&mut self, message: ThreadMessage) {
+        if message.role == crate::types::message::MessageRole::SealedStepRecord {
+            // WI#227: a sealed machine step record is inference-only data.
+            // Route it into the internal transcript so it can never appear in
+            // the user-visible conversation, whatever path called this. Still
+            // emit the MessageAdded event: channel UIs interpret the role +
+            // preview into status hints ("Code executed", "Code error —
+            // retrying...") that predate the seal and must keep working.
+            let preview = if message.content.chars().count() > 80 {
+                let p: String = message.content.chars().take(80).collect();
+                format!("{p}...")
+            } else {
+                message.content.clone()
+            };
+            self.add_event(EventKind::MessageAdded {
+                role: message.role.wire_name().to_string(),
+                content_preview: preview,
+            });
+            self.internal_messages.push(message);
+            self.updated_at = Utc::now();
+            return;
+        }
         if self.thread_type == ThreadType::Foreground
             && self.parent_id.is_none()
             && !self.config.mission_child
@@ -458,7 +479,7 @@ impl Thread {
             message.content.clone()
         };
         self.add_event(EventKind::MessageAdded {
-            role: format!("{:?}", message.role),
+            role: message.role.wire_name().to_string(),
             content_preview: preview,
         });
         self.messages.push(message);
