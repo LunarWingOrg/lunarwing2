@@ -6,7 +6,7 @@ LunarWing controls local filesystem and shell tools through three separate layer
 2. **Sandbox policy** limits filesystem and network access.
 3. **Tool permission** decides whether an invocation runs, asks for approval, or is disabled.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19.** `ALLOW_LOCAL_TOOLS`,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0).** `ALLOW_LOCAL_TOOLS`,
 `AGENT_AUTO_APPROVE_TOOLS`, and the `full_access` double opt-in
 (`SANDBOX_ALLOW_FULL_ACCESS`) were re-checked against the config resolver and
 sandbox manager. Updated for the v2.1.2.0 generic podman-first sandbox: new
@@ -14,6 +14,11 @@ sandbox manager. Updated for the v2.1.2.0 generic podman-first sandbox: new
 scrubbed `full_access` child environment (WI#141). The 2026-09-19 pass
 confirmed the approval-behavior section against the goal-31 fixes
 (`AUTO_APPROVE_TOOLS` legacy alias, Engine V2 `UnlessAutoApproved` scope).
+The 2026-09-27 repass added the v2.1.3.0 mt-admin sandbox-image defaults
+(WI#223: `SANDBOX_IMAGE=lunarwing-sandbox:latest`, `SANDBOX_AUTO_PULL=false`,
+`SANDBOX_RUNTIME=podman` for new tenants) and the env-generation note that
+mt-admin now writes only the canonical `AGENT_AUTO_APPROVE_TOOLS` key for new
+tenants, migrating a legacy-only `AUTO_APPROVE_TOOLS` value on re-render.
 
 Use the narrowest access that satisfies the task. `full_access` combined with automatic approval lets model output execute directly on the host with the LunarWing service account's privileges.
 
@@ -63,7 +68,7 @@ Even under `full_access`, the child environment is scrubbed: commands inherit on
 
 Container egress is selected through `SANDBOX_NETWORK`: `none` (default) passes `--network none` for full network isolation — no egress at all, including loopback. For web-capable sandboxes choose `proxy-enforced`: the container keeps `--network none` and reaches only the validating allowlist proxy through a per-execution Unix-socket relay (public-only destinations, DNS-pinned, redirects rechecked). This requires a local Linux runtime and Python 3 in the image; relay setup fails closed (it never degrades to advisory or direct egress). `proxy` remains as the legacy advisory mode, in which commands can ignore proxy env vars and connect directly to the host/network. Denied responses carry the stable prefix `sandbox-proxy denied:`. `SANDBOX_ENFORCE=true` forces the sandboxed shell even when dev-mode `ALLOW_LOCAL_TOOLS` would otherwise run it directly on the host.
 
-Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, `SANDBOX_EXTRA_DOMAINS`, `SANDBOX_REAPER_INTERVAL_SECS`, and `SANDBOX_ORPHAN_THRESHOLD_SECS`. Keep the proxy domain allowlist minimal. Upgrade note (WI#154): the default `SANDBOX_NETWORK` is `none` everywhere in v2.1.2.0 — an explicit `proxy` setting is preserved, but sandboxed web access now requires an explicit choice of `proxy-enforced` (recommended) or the legacy advisory `proxy`. See [WI#179 combined rollout](../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, `SANDBOX_EXTRA_DOMAINS`, `SANDBOX_REAPER_INTERVAL_SECS`, and `SANDBOX_ORPHAN_THRESHOLD_SECS`. Keep the proxy domain allowlist minimal. Since v2.1.3.0 (WI#223), mt-admin-provisioned tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_AUTO_PULL=false`; `add-tenant` builds and distributes the image, and `mt-admin build-sandbox-image [tenant]` recovers a missing one — `SANDBOX_AUTO_PULL=true` is a trap for this local-only image (short-name resolution fails without a TTY and there is nothing to pull). Upgrade note (WI#154): the default `SANDBOX_NETWORK` is `none` everywhere in v2.1.2.0 — an explicit `proxy` setting is preserved, but sandboxed web access now requires an explicit choice of `proxy-enforced` (recommended) or the legacy advisory `proxy`. See [WI#179 combined rollout](../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
 
 ## 3. Keep or Change Approval Behavior
 
