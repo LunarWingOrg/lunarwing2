@@ -1232,6 +1232,14 @@ async fn run_external_task(
                             if let Ok(progress) = serde_json::from_value::<TaskProgressPayload>(env.payload) {
                                 accumulated_output.push_str(&progress.delta);
 
+                                // WI#263: each streamed delta is proof the
+                                // worker is alive. Note it so idle-based stuck
+                                // detection does not flag a long-running but
+                                // healthy investigation as wedged.
+                                if let Some(cm) = context_manager {
+                                    let _ = cm.update_context(job_id, |ctx| ctx.note_activity()).await;
+                                }
+
                                 emit_event(
                                     event_tx,
                                     job_id,
@@ -1330,6 +1338,18 @@ async fn run_external_task(
             // the same window to acknowledge before the connection is torn
             // down, so its cancel processing isn't racing socket cleanup.
             let _ = wait_for_cancel_ack(&mut read, job_id, worker_name, CANCEL_ACK_TIMEOUT).await;
+            // WI#263: the streamed investigation is real work. Persist a
+            // bounded evidence snapshot and a fallback-deliverable marker so
+            // the partial result survives the timeout instead of vanishing
+            // with the connection.
+            preserve_timeout_evidence(
+                job_id,
+                worker_name,
+                &accumulated_output,
+                context_manager,
+                store,
+            )
+            .await;
             return Err(OrchestratorError::ExternalWorkerTimeout {
                 worker_name: worker_name.to_string(),
                 job_id,
@@ -1371,7 +1391,7 @@ async fn run_external_task(
     };
 
     if let Some(cm) = context_manager {
-        let _ = cm
+        let transition = cm
             .update_context(job_id, |ctx| {
                 if ctx.state == final_state {
                     return Ok(());
@@ -1379,6 +1399,28 @@ async fn run_external_task(
                 ctx.transition_to(final_state, task_result.error.clone())
             })
             .await;
+        match transition {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => {
+                // A rejected transition (e.g. terminal state already reached)
+                // must not be silently discarded (WI#263): log it so the lost
+                // state update is observable, including the recovered output
+                // size so operators can see evidence was received.
+                tracing::warn!(
+                    job_id = %job_id,
+                    worker = worker_name,
+                    from_state_result = %status_str,
+                    output_bytes = final_msg.len(),
+                    "Could not apply external worker final state: {reason}"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "Failed to load job context for final state: {error}"
+                );
+            }
+        }
     }
 
     // Persist final event
@@ -1575,6 +1617,80 @@ async fn persist_event(
     }
 }
 
+/// Cap on the streamed-output snapshot persisted when an external worker task
+/// times out (WI#263). Evidence beyond this is already persisted event-by-event
+/// via `persist_event`; the snapshot is the tail an operator reads first.
+const TIMEOUT_EVIDENCE_SNAPSHOT_BYTES: usize = 16_384;
+
+/// Preserve a partial-evidence snapshot when an external worker task times out
+/// (WI#263).
+///
+/// Real investigations routinely exceed the task deadline at the final
+/// report-composition step; until now the streamed evidence was dropped with
+/// the connection and the report was unrecoverable. Store the output tail in
+/// `JobContext.metadata["partial_output"]` (bounded) and persist an explicit
+/// event so the work is visible from `job_events` / `job_status` even though
+/// the job resolves as TimedOut.
+async fn preserve_timeout_evidence(
+    job_id: Uuid,
+    worker_name: &str,
+    accumulated_output: &str,
+    context_manager: Option<&Arc<ContextManager>>,
+    store: Option<&Arc<dyn Database>>,
+) {
+    const SNAPSHOT_MIN_BYTES: usize = 512;
+    let trimmed = accumulated_output.trim();
+    if trimmed.len() < SNAPSHOT_MIN_BYTES {
+        // Nothing meaningful streamed — nothing to preserve.
+        return;
+    }
+
+    let snapshot: String = if trimmed.len() <= TIMEOUT_EVIDENCE_SNAPSHOT_BYTES {
+        trimmed.to_string()
+    } else {
+        let start = floor_char_boundary(trimmed, trimmed.len() - TIMEOUT_EVIDENCE_SNAPSHOT_BYTES);
+        trimmed[start..].to_string()
+    };
+
+    if let Some(cm) = context_manager {
+        let stored = cm
+            .update_context(job_id, |ctx| {
+                if !ctx.metadata.is_object() {
+                    ctx.metadata = serde_json::json!({});
+                }
+                ctx.metadata["partial_output"] = serde_json::Value::String(snapshot.clone());
+            })
+            .await;
+        if stored.is_err() {
+            tracing::warn!(%job_id, "Failed to store partial output in job context");
+        }
+    }
+
+    persist_event(
+        store,
+        job_id,
+        "partial_output",
+        &format!(
+            "[worker {worker_name} timed out after streaming {total} bytes; tail preserved]\n{snapshot}",
+            total = accumulated_output.len(),
+        ),
+    )
+    .await;
+}
+
+/// UTF-8-safe floor of a char boundary, mirroring `str::floor_char_boundary`
+/// (still unstable on our MSRV).
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 async fn record_external_task_error(
     job_id: Uuid,
     error: &OrchestratorError,
@@ -1678,6 +1794,66 @@ mod tests {
     use super::*;
     use crate::config::LoadBalanceStrategy;
     use lunarwing_common::PromptContextRole;
+
+    #[test]
+    fn floor_char_boundary_is_utf8_safe() {
+        // ASCII passes through unchanged.
+        assert_eq!(floor_char_boundary("hello", 3), 3);
+        // Index beyond the end clamps to the length.
+        assert_eq!(floor_char_boundary("hello", 99), 5);
+        // "é" occupies bytes 3..5 in "café": an index landing mid-codepoint
+        // backs up to the preceding boundary instead of splitting it.
+        let s = "café";
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 4), 3);
+        // The tail slice must itself be valid UTF-8 (no panic on slicing).
+        let long = format!("{}{}", "é".repeat(100), "x".repeat(50));
+        let start = floor_char_boundary(&long, long.len() - 10);
+        assert!(long.is_char_boundary(start));
+        let _tail = &long[start..];
+    }
+
+    #[tokio::test]
+    async fn preserve_timeout_evidence_stores_bounded_tail() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        let streamed = "evidence line\n".repeat(4_000); // ~56 KB, over the cap
+        preserve_timeout_evidence(job_id, "kimi", &streamed, Some(&cm), None).await;
+
+        let ctx = cm.get_context(job_id).await.unwrap();
+        let partial = ctx
+            .metadata
+            .get("partial_output")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(!partial.is_empty());
+        assert!(
+            partial.len() <= TIMEOUT_EVIDENCE_SNAPSHOT_BYTES + 16,
+            "snapshot must be bounded, got {}",
+            partial.len()
+        );
+        // Bounded tail keeps the END of the stream (the report-composition
+        // step), not the beginning.
+        assert!(partial.ends_with("evidence line"));
+    }
+
+    #[tokio::test]
+    async fn preserve_timeout_evidence_skips_trivial_output() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        preserve_timeout_evidence(job_id, "kimi", "   ", Some(&cm), None).await;
+
+        let ctx = cm.get_context(job_id).await.unwrap();
+        assert!(ctx.metadata.get("partial_output").is_none());
+    }
 
     #[test]
     fn describe_connect_failure_enriches_subprotocol_rejection() {
