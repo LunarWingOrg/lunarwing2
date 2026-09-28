@@ -43,6 +43,7 @@ class TestTenantNameValidation(unittest.TestCase):
             "pebble-",
             "opencode-",
             "kimi-",
+            "opencode2-",
             "weechat-",
         ):
             with self.subTest(prefix=prefix):
@@ -79,6 +80,8 @@ class TestConfigSerialization(unittest.TestCase):
             llm_base_url="http://127.0.0.1:4000/openai/v1",
             opencode_model="open-model",
             opencode_base_url="http://open.test/v1",
+            opencode2_model="open2-model",
+            opencode2_base_url="http://open2.test/v1",
             kimi_model="kimi-model",
             kimi_base_url="http://kimi.test/v1",
         )
@@ -95,12 +98,12 @@ class TestConfigSerialization(unittest.TestCase):
     def test_from_dict_accepts_supported_string_workers(self):
         data = {
             "name": "gamma",
-            "workers": ["pebble", "opencode", "kimi"],
+            "workers": ["pebble", "opencode", "kimi", "opencode2"],
         }
         config = TenantConfig.from_dict(data)
         self.assertEqual(
             config.workers,
-            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
+            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI, WorkerType.OPENCODE2],
         )
 
     def test_from_dict_rejects_retired_nanocode_worker(self):
@@ -255,6 +258,8 @@ class TestProvisionerArgs(unittest.TestCase):
                         llm_base_url="http://llm.test/v1",
                         opencode_model="open-model",
                         opencode_base_url="http://open.test/v1",
+                        opencode2_model="open2-model",
+                        opencode2_base_url="http://open2.test/v1",
                         kimi_model="kimi-model",
                         kimi_base_url="http://kimi.test/v1",
                     )
@@ -266,6 +271,8 @@ class TestProvisionerArgs(unittest.TestCase):
             ("--llm-base-url", "http://llm.test/v1"),
             ("--opencode-model", "open-model"),
             ("--opencode-base-url", "http://open.test/v1"),
+            ("--opencode2-model", "open2-model"),
+            ("--opencode2-base-url", "http://open2.test/v1"),
             ("--kimi-model", "kimi-model"),
             ("--kimi-base-url", "http://kimi.test/v1"),
         ):
@@ -323,12 +330,39 @@ class TestProvisionerArgs(unittest.TestCase):
         # Selected workers appear on add-tenant (the persisted selection).
         self.assertIn("--with-opencode", add_args)
         self.assertIn("--with-kimi", add_args)
-        # Unselected worker is omitted from add-tenant.
+        # Unselected workers are omitted from add-tenant.
         self.assertNotIn("--with-pebble", add_args)
+        self.assertNotIn("--with-opencode2", add_args)
         # build-tenant still gets the same selection (to build the images).
         self.assertIn("--with-opencode", build_args)
         self.assertIn("--with-kimi", build_args)
         self.assertNotIn("--with-pebble", build_args)
+        self.assertNotIn("--with-opencode2", build_args)
+
+    def test_opencode2_selection_is_forwarded_to_add_and_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "lunarwing-mt-admin.sh")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(script, 0o700)
+
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = script
+            try:
+                config = TenantConfig(
+                    name="alpha",
+                    workers=[WorkerType.OPENCODE2],
+                )
+                add_args = provisioner.build_add_tenant_args(config)
+                build_args = provisioner.build_build_tenant_args(config)
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+
+        self.assertIn("--with-opencode2", add_args)
+        self.assertIn("--with-opencode2", build_args)
+        self.assertNotIn("--with-opencode", add_args)
+        self.assertNotIn("--with-opencode2-model", add_args)
+        self.assertNotIn("--with-opencode2-base-url", add_args)
 
     def test_no_workers_selected_emits_no_worker_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +384,7 @@ class TestProvisionerArgs(unittest.TestCase):
             "--with-pebble",
             "--with-opencode",
             "--with-kimi",
+            "--with-opencode2",
         ):
             self.assertNotIn(flag, add_args)
 

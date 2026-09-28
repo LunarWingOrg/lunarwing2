@@ -46,6 +46,8 @@ class ProvisionRequest(RequestModel):
     llm_model: str = "tensorzero::function_name::lunarwing"
     opencode_model: str = ""
     opencode_base_url: str = ""
+    opencode2_model: str = ""
+    opencode2_base_url: str = ""
     kimi_model: str = ""
     kimi_base_url: str = ""
     kimi_api_key: str = ""
@@ -97,6 +99,16 @@ class ProvisionRequest(RequestModel):
             opencode_base_url=(
                 self.opencode_base_url.strip()
                 if WorkerType.OPENCODE in workers
+                else ""
+            ),
+            opencode2_model=(
+                self.opencode2_model.strip()
+                if WorkerType.OPENCODE2 in workers
+                else ""
+            ),
+            opencode2_base_url=(
+                self.opencode2_base_url.strip()
+                if WorkerType.OPENCODE2 in workers
                 else ""
             ),
             kimi_model=(

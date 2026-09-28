@@ -166,6 +166,10 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--opencode-model", config.opencode_model])
     if config.opencode_base_url:
         args.extend(["--opencode-base-url", config.opencode_base_url])
+    if config.opencode2_model:
+        args.extend(["--opencode2-model", config.opencode2_model])
+    if config.opencode2_base_url:
+        args.extend(["--opencode2-base-url", config.opencode2_base_url])
     if config.kimi_model:
         args.extend(["--kimi-model", config.kimi_model])
     if config.kimi_base_url:
@@ -181,6 +185,8 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.append("--with-pebble")
     if WorkerType.OPENCODE in config.workers:
         args.append("--with-opencode")
+    if WorkerType.OPENCODE2 in config.workers:
+        args.append("--with-opencode2")
     if WorkerType.KIMI in config.workers:
         args.append("--with-kimi")
     if config.no_ssh:
@@ -200,6 +206,8 @@ def build_build_tenant_args(config: "TenantConfig") -> list[str]:
         args.append("--with-pebble")
     if WorkerType.OPENCODE in config.workers:
         args.append("--with-opencode")
+    if WorkerType.OPENCODE2 in config.workers:
+        args.append("--with-opencode2")
     if WorkerType.KIMI in config.workers:
         args.append("--with-kimi")
     if config.toolchains:

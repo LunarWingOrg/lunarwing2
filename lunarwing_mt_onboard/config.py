@@ -24,6 +24,7 @@ RESERVED_PREFIXES = (
     "pebble-",
     "opencode-",
     "kimi-",
+    "opencode2-",
     "weechat-",
 )
 
@@ -34,6 +35,7 @@ class WorkerType(str, Enum):
     PEBBLE = "pebble"
     OPENCODE = "opencode"
     KIMI = "kimi"
+    OPENCODE2 = "opencode2"
 
 
 @dataclass
@@ -58,6 +60,8 @@ class TenantConfig:
     llm_model: str = "tensorzero::function_name::lunarwing"
     opencode_model: str = ""
     opencode_base_url: str = ""
+    opencode2_model: str = ""
+    opencode2_base_url: str = ""
     kimi_model: str = ""
     kimi_base_url: str = ""
     kimi_api_key: str = ""
@@ -130,6 +134,8 @@ class TenantConfig:
             ),
             opencode_model=data.get("opencode_model", ""),
             opencode_base_url=data.get("opencode_base_url", ""),
+            opencode2_model=data.get("opencode2_model", ""),
+            opencode2_base_url=data.get("opencode2_base_url", ""),
             kimi_model=data.get("kimi_model", ""),
             kimi_base_url=data.get("kimi_base_url", ""),
             kimi_api_key=data.get("kimi_api_key", ""),
