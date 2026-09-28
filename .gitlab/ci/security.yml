@@ -9,6 +9,19 @@ cargo-deny:
     - bash .gitlab/scripts/install-cargo-deny.sh
     - PATH="$CI_PROJECT_DIR/.ci-bin:$PATH" bash .gitlab/scripts/cargo-ci.sh deny check
 
+# cargo-deny filters crates that are pinned in Cargo.lock but never resolved
+# into the built graph, so advisories against such pins stay invisible. This
+# guard fails loudly if one of those pins ever starts compiling.
+lockfile-only-advisory-guard:
+  extends:
+    - .rust-job
+    - .full-validation-context
+  stage: security
+  needs:
+    - cargo-metadata
+  script:
+    - bash .gitlab/scripts/check-lockfile-only-advisories.sh
+
 secret-detection:
   extends: .gitleaks-job
   stage: security
