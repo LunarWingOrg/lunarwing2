@@ -89,6 +89,15 @@ fi
 
 tenant_home() { printf '%s/home/%s' "$ROOT" "$1"; }
 tenant_env_dir() { printf '%s/home/%s/lunarwing/env' "$ROOT" "$1"; }
+tenant_cat() { cat -- "$2"; }
+original_writer="$(declare -f write_tenant_file_atomic)"
+eval "${original_writer/write_tenant_file_atomic ()/original_write_tenant_file_atomic ()}"
+write_tenant_file_atomic() {
+  local name="$1"
+  shift
+  [[ "$name" != alpha ]] || name="$(id -un)"
+  original_write_tenant_file_atomic "$name" "$@"
+}
 tenant_quadlet_dir() { printf '%s/home/%s/.config/containers/systemd' "$ROOT" "$1"; }
 ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=true; }
 ensure_babysitter_helper() { :; }
@@ -103,6 +112,7 @@ command() {
 }
 
 mkdir -p "$(tenant_env_dir alpha)" "$ROOT/init.d"
+chmod 700 "$(tenant_env_dir alpha)"
 printf '%s\n' 'LUNARWING_AUTH_TOKEN=test-only-token' 'OCR_PORT=8088' 'OCR_HEALTH_PORT=8089' \
   >"$(tenant_env_dir alpha)/vision.env"
 OPENRC_INITD_DIR="$ROOT/init.d"

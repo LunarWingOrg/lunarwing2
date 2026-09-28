@@ -131,6 +131,7 @@ fi
 
 # provision_tenant_study_mcp syncs, then wires the tenant read-only.
 mkdir -p "$(tenant_env_dir test)"
+chmod 700 "$(tenant_env_dir test)"
 cat >"$(tenant_env_dir test)/lunarwing.env" <<EOF
 GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
@@ -152,6 +153,7 @@ grep -Fqx 'KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=10485760' "$(tenant_env_dir test)/lu
 
 # Arming never clobbers an explicit operator opt-out.
 mkdir -p "$(tenant_env_dir test3)"
+chmod 700 "$(tenant_env_dir test3)"
 cat >"$(tenant_env_dir test3)/lunarwing.env" <<EOF
 GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
@@ -164,6 +166,7 @@ grep -Fqx 'KNOWLEDGE_SEED_FROM_STUDY_MCP=0' "$(tenant_env_dir test3)/lunarwing.e
 # The operator-facing configure-study-mcp path (existing tenants) never arms
 # the seed: only add-tenant does.
 mkdir -p "$(tenant_env_dir test4)"
+chmod 700 "$(tenant_env_dir test4)"
 cat >"$(tenant_env_dir test4)/lunarwing.env" <<EOF
 GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
@@ -212,6 +215,7 @@ grep -Fqx -- '--no-onboard refresh-knowledge --json' "$REFRESH_LOG"
 
 # A scheduler installation failure cannot commit a new tenant opt-in.
 mkdir -p "$(tenant_env_dir test5)"
+chmod 700 "$(tenant_env_dir test5)"
 printf 'LW2STUDYMCP_HOME=%s\n' "$STUDY_NOTES_DEFAULT_HOME" \
   >"$(tenant_env_dir test5)/lunarwing.env"
 if ( ensure_knowledge_source_scheduler() { die "scheduler unavailable"; }
@@ -226,6 +230,7 @@ fi
 
 # A failing sync is contained: the caller survives and the tenant stays unwired.
 mkdir -p "$(tenant_env_dir test2)"
+chmod 700 "$(tenant_env_dir test2)"
 cat >"$(tenant_env_dir test2)/lunarwing.env" <<EOF
 GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
@@ -259,6 +264,7 @@ grep -Fqx 'scheduled finding' \
 # fixture checkout so the enabled tenant's fast-forward and the skipped
 # tenant's untouched checkout are both observable.
 mkdir -p "$(tenant_env_dir yeson)" "$(tenant_env_dir mixedcase)"
+chmod 700 "$(tenant_env_dir yeson)" "$(tenant_env_dir mixedcase)"
 yeson_home="$fixture/shared/yeson"
 mixedcase_home="$fixture/shared/mixedcase"
 sync_study_notes_checkout "$yeson_home"

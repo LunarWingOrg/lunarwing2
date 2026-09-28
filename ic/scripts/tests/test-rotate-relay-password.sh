@@ -21,6 +21,17 @@ OPENRC_INITD_DIR="$fixture/init.d"
 tenant_home() { printf '%s/%s\n' "$fixture" "$1"; }
 tenant_env_dir() { printf '%s/%s/env\n' "$fixture" "$1"; }
 tenant_weechat_home() { printf '%s/%s/weechat\n' "$fixture" "$1"; }
+# The fixture tenant is "test"; map its privilege drop to a real unprivileged
+# user without requiring a system account named test.
+sudo() {
+  [[ "$1" == -u && "$2" == test && "$3" == env ]] || return 1
+  shift 2
+  if [[ "$EUID" == 0 ]]; then
+    runuser -u nobody -- "$@"
+  else
+    "$@"
+  fi
+}
 tenant_exists_in_registry() { [[ "$1" == test ]]; }
 tenant_weechat_enabled() { return 0; }
 ports_get() { printf '18005\n'; }
@@ -105,6 +116,28 @@ check() {
   # shellcheck disable=SC2016  # require WeeChat's literal expression
   grep -qF '${env:RELAY_PASSWORD}' "$(tenant_weechat_home test)/relay.conf" || fail 'config expression lost'
 }
+# An attacker-controlled final path must not redirect either tenant-side writer
+# to a root-owned file. This also checks the former root chmod/chown path.
+sentinel="$fixture/root-sentinel"
+printf 'untouched\n' >"$sentinel"
+rm "$wc"
+ln -s "$sentinel" "$wc"
+if _write_weechat_env test blocked 2>/dev/null; then fail 'accepted weechat.env symlink'; fi
+[[ "$(<"$sentinel")" == untouched ]] || fail 'weechat writer changed symlink target'
+rm "$wc"
+printf 'RELAY_PASSWORD=old-password\n' >"$wc"
+chmod 600 "$wc"
+# Recreated by the harness user; under root the tenant-side ownership
+# precondition must see the fixture tenant (nobody) as the file owner.
+if [[ "$EUID" == 0 ]]; then chown nobody "$wc"; fi
+rm "$lw"
+ln -s "$sentinel" "$lw"
+if _relay_env_set_password test "$lw" blocked 2>/dev/null; then fail 'accepted lunarwing.env symlink'; fi
+[[ "$(<"$sentinel")" == untouched ]] || fail 'relay writer changed symlink target'
+rm "$lw"
+printf 'OTHER_KEY=preserve\nRELAY_PASSWORD=old-password\n' >"$lw"
+chmod 600 "$lw"
+if [[ "$EUID" == 0 ]]; then chown nobody "$lw"; fi
 rotate_tenant_weechat_relay_password test
 check
 first="$(_read_env_value "$lw" RELAY_PASSWORD)"
@@ -207,7 +240,7 @@ _write_weechat_env() { assert_starts_blocked; kill -KILL "$BASHPID"; }
 assert_starts_blocked
 if rotate_tenant_weechat_relay_password test; then fail 'accepted interrupted split credentials'; fi
 # Operator reconciles the pair, then retries rotation; no manual marker deletion.
-_relay_env_set_password "$lw" "$(_read_env_value "$wc" RELAY_PASSWORD)"
+_relay_env_set_password test "$lw" "$(_read_env_value "$wc" RELAY_PASSWORD)"
 eval "$original_writer"
 rotate_tenant_weechat_relay_password test
 check
@@ -224,7 +257,7 @@ _write_weechat_env() {
 if rotate_tenant_weechat_relay_password test; then fail 'accepted failed rollback'; fi
 assert_starts_blocked
 [[ -d "$(tenant_env_dir test)/.relay-rotation-blocked" ]] || fail 'rollback failure lost barrier'
-_relay_env_set_password "$lw" "$(_read_env_value "$wc" RELAY_PASSWORD)"
+_relay_env_set_password test "$lw" "$(_read_env_value "$wc" RELAY_PASSWORD)"
 eval "$original_writer"
 rotate_tenant_weechat_relay_password test
 check

@@ -64,8 +64,16 @@ ports_get() {  # <name> <service>
   esac
 }
 
-chown() { :; }
-chmod() { :; }
+# Fixture tenants are not system accounts. Stub the privilege drop so the
+# tenant-side atomic writer runs as the invoking user (CI runners have no
+# "render-test" login). chown/chmod stay real: the writer's inner shell never
+# sees these stubs anyway (fresh bash), and the fixture needs mode 0700 env
+# dirs to satisfy the private-parent policy.
+sudo() {
+  [[ "$1" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
 
 FIXTURE_PASSWORD="render-secret-abc"
 
@@ -73,6 +81,7 @@ write_fixture_env() {  # <tenant>
   local env_dir
   env_dir="$(tenant_env_dir "$1")"
   mkdir -p "$env_dir"
+  chmod 700 "$env_dir"
   cat >"$env_dir/lunarwing.env" <<ENV
 GATEWAY_AUTH_TOKEN=gatewaytok
 XMPP_PASSWORD=xmppsecret
@@ -132,6 +141,7 @@ assert_eq "weechat.env writer uses a unique temp file" \
 
 env_conflict_tenant="render-env-directory-conflict"
 mkdir -p "$(tenant_env_dir "$env_conflict_tenant")/weechat.env"
+chmod 700 "$(tenant_env_dir "$env_conflict_tenant")"
 if _write_weechat_env "$env_conflict_tenant" "$FIXTURE_PASSWORD" >/dev/null 2>&1; then
   echo "  FAIL: weechat.env directory conflict should fail"
   failures=$((failures + 1))

@@ -182,21 +182,15 @@ resolve_worker_auth_token() {
   # Mint and persist the scoped token. Preserve the tenant's ownership when
   # replacing the file: mt-admin runs as root, and a root-owned 0600 replacement
   # cannot be read by the tenant's systemd user services.
-  if [[ -w "$env_path" ]] && command -v mktemp >/dev/null 2>&1; then
-    local fresh tmp
+  if [[ -w "$env_path" ]]; then
+    local fresh
     fresh="$(generate_token)"
     if [[ -n "$fresh" ]]; then
-      tmp="$(mktemp "${env_path}.tmp.XXXXXX")"
-      if cat "$env_path" >"$tmp" 2>/dev/null \
-        && printf 'WORKER_AUTH_TOKEN=%s\n' "$fresh" >>"$tmp" \
-        && chmod 600 "$tmp" \
-        && chown --reference="$env_path" "$tmp" \
-        && mv -f "$tmp" "$env_path"; then
+      if _env_set "$env_path" WORKER_AUTH_TOKEN "$fresh"; then
         echo "WARNING: WORKER_AUTH_TOKEN was missing in $env_path; generated and persisted a scoped worker credential (WI#210)." >&2
         printf '%s' "$fresh"
         return 0
       fi
-      rm -f "$tmp"
     fi
   fi
 
@@ -1548,27 +1542,31 @@ prepare_worker_workspace() {
 }
 
 write_kimi_runtime_env() {
-  local name="$1" source_path target_path temporary key value
+  local name="$1" source_path target_path key value staged
   source_path="$(tenant_env_dir "$name")/lunarwing.env"
   target_path="$(tenant_env_dir "$name")/kimi-runtime.env"
-  temporary="$(mktemp "${target_path}.tmp.XXXXXX")"
-  chmod 600 "$temporary"
+  # Generate the complete runtime env in root-private staging first: a failed
+  # source read or token resolution must leave any existing target untouched
+  # instead of publishing the partial stream (die() only exits this subshell).
+  staged="$(mktemp)" || return 1
+  if ! (
+    for key in KIMI_MODEL KIMI_BASE_URL KIMI_API_KEY; do
+      value="$(read_tenant_env_value "$name" "$source_path" "$key")" || exit 1
+      [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+        || die "$key cannot contain a newline"
+      [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value"
+    done
 
-  for key in KIMI_MODEL KIMI_BASE_URL KIMI_API_KEY; do
-    value="$(_read_env_value "$source_path" "$key")"
-    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
-      || { rm -f "$temporary"; die "$key cannot contain a newline"; }
-    [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value" >>"$temporary"
-  done
-
-  value="$(resolve_worker_auth_token "$source_path")"
-  [[ -n "$value" ]] \
-    || { rm -f "$temporary"; die "Kimi worker requires WORKER_AUTH_TOKEN (or GATEWAY_AUTH_TOKEN)"; }
-  # Worker bridge expects AGENT_AUTH_TOKEN, not the daemon's env variable name.
-  printf 'AGENT_AUTH_TOKEN=%s\n' "$value" >>"$temporary"
-  chown "$name:$name" "$temporary"
-  chmod 600 "$temporary"
-  mv -f "$temporary" "$target_path"
+    value="$(resolve_worker_auth_token "$source_path")" || exit 1
+    [[ -n "$value" ]] \
+      || die "Kimi worker requires WORKER_AUTH_TOKEN (or GATEWAY_AUTH_TOKEN)"
+    # Worker bridge expects AGENT_AUTH_TOKEN, not the daemon's env variable name.
+    printf 'AGENT_AUTH_TOKEN=%s\n' "$value"
+  ) >"$staged" || ! write_tenant_file_atomic "$name" "$target_path" 600 <"$staged"; then
+    rm -f -- "$staged"
+    return 1
+  fi
+  rm -f -- "$staged"
   printf '%s\n' "$target_path"
 }
 

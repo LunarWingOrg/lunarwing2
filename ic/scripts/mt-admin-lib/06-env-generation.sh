@@ -31,19 +31,35 @@ _env_existing() {  # <env_file> <KEY>
 }
 
 _env_set() {  # <env_file> <KEY> <VALUE>
-  local path="$1" key="$2" value="$3" tmp
+  local path="$1" key="$2" value="$3" tmp parent owner
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid environment key: $key"
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
     || die "environment value for $key contains a newline"
   [[ -f "$path" && ! -L "$path" ]] || die "environment file missing or unsafe: $path"
-  tmp="$(mktemp "$(dirname "$path")/.env-set.XXXXXX")"
-  awk -v prefix="$key=" -v replacement="$key=$value" '
-    index($0, prefix) != 1 { print }
-    END { print replacement }
-  ' "$path" >"$tmp"
-  chmod --reference="$path" "$tmp"
-  chown --reference="$path" "$tmp"
-  mv -T -- "$tmp" "$path"
+  parent="$(dirname "$path")"
+  darkirc_path_components_safe "$path" || die "unsafe environment path: $path"
+  owner="$(stat -c %U -- "$parent")" || return 1
+  if [[ "$owner" != root ]]; then
+    _tenant_env_replace "$owner" "$path" "$key" "$value"
+    return
+  fi
+  # Root-owned staging files are allowed only in a root-private directory.
+  # No tenant can replace a name between mktemp and the following operations.
+  local parent_mode
+  parent_mode="$(stat -c %a -- "$parent")" || return 1
+  [[ "$parent_mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$parent_mode & 022) == 0 )) || return 1
+  [[ "$(stat -c %U -- "$path")" == root && "$(stat -c %h -- "$path")" == 1 ]] || return 1
+  (
+    tmp="$(mktemp "$parent/.env-set.XXXXXX")" || exit 1
+    trap 'rm -f -- "$tmp"' EXIT
+    awk -v prefix="$key=" -v replacement="$key=$value" '
+      index($0, prefix) != 1 { print }
+      END { print replacement }
+    ' "$path" >"$tmp" || exit 1
+    chmod --reference="$path" "$tmp" && chown --reference="$path" "$tmp" \
+      && mv -T -- "$tmp" "$path"
+  )
 }
 
 validate_study_notes_path() {  # <absolute path> <label>
@@ -296,9 +312,11 @@ _read_env_value() {  # <file> <KEY>
 # process rejects unsafe ownership, permissions, symlinks, and shared hard links.
 read_tenant_env_value() {  # <tenant> <file> <KEY>
   local name="$1" target="$2" key="$3" value
+  local -a drop=(sudo -u "$name")
+  [[ "$(id -un)" != "$name" ]] || drop=()
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
   darkirc_path_components_safe "$target" || die "unsafe tenant env path: $target"
-  value="$(sudo -u "$name" env -i PATH="/usr/bin:/bin" \
+  value="$("${drop[@]}" env -i PATH="/usr/bin:/bin" \
     TARGET_PATH="$target" TARGET_KEY="$key" bash -c '
       set -euo pipefail
       target="$TARGET_PATH"
@@ -337,12 +355,20 @@ read_tenant_env_value() {  # <tenant> <file> <KEY>
 
 # Write stdin to a tenant-owned file through a same-directory candidate. Root
 # never opens the destination for writing and secret contents never enter argv.
-write_tenant_file_atomic() {  # <tenant> <file> [mode]
-  local name="$1" target="$2" mode="${3:-600}"
+# CONTRACT: stdin must already be a complete, validated result (a regular file
+# or an infallible producer). Never pipe a fallible producer straight in: this
+# writer commits whatever bytes it reads and cannot observe an upstream
+# failure. Stage the producer's output (root-private mktemp), check its exit
+# status, and only then redirect the staged file here.
+write_tenant_file_atomic() {  # <tenant> <file> [mode] [private|owned-parent]
+  local name="$1" target="$2" mode="${3:-600}" parent_policy="${4:-private}"
+  local -a drop=(sudo -u "$name")
+  [[ "$(id -un)" != "$name" ]] || drop=()
   [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "invalid tenant file mode"
+  [[ "$parent_policy" == private || "$parent_policy" == owned-parent ]] || return 1
   darkirc_path_components_safe "$target" || die "unsafe tenant file path: $target"
-  sudo -u "$name" env -i PATH="/usr/bin:/bin" \
-    TARGET_PATH="$target" TARGET_MODE="$mode" bash -c '
+  "${drop[@]}" env -i PATH="/usr/bin:/bin" \
+    TARGET_PATH="$target" TARGET_MODE="$mode" PARENT_POLICY="$parent_policy" bash -c '
       set -euo pipefail
       target="$TARGET_PATH"
       parent="${target%/*}"
@@ -352,7 +378,11 @@ write_tenant_file_atomic() {  # <tenant> <file> [mode]
       parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
       parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
       [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
-      (( (8#$parent_mode & 077) == 0 )) || exit 73
+      if [[ "$PARENT_POLICY" == private ]]; then
+        (( (8#$parent_mode & 077) == 0 )) || exit 73
+      else
+        (( (8#$parent_mode & 022) == 0 )) || exit 73
+      fi
       [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || exit 73
       if [[ -e "$target" ]]; then
         owner="$(stat -c %u "$target" 2>/dev/null || printf -- -1)"
@@ -557,44 +587,60 @@ configure_weechat_relay() {  # <tenant>
 }
 
 # Write a dedicated mode-0600 weechat.env containing only RELAY_PASSWORD.
-# Uses a temp file in the same directory then atomically renames.
+# The tenant-side atomic writer never lets root reopen a name in this directory.
 _write_weechat_env() {  # <tenant> <relay_password>
   local tenant="$1" relay_password="$2"
-  local env_dir env_file tmp_file
+  local env_dir env_file
   env_dir="$(tenant_env_dir "$tenant")"
   env_file="$env_dir/weechat.env"
   mkdir -p "$env_dir" || return 1
-  tmp_file="$(mktemp "$env_dir/.weechat.env.XXXXXX")" || return 1
-  (
-    trap '[[ -n "${tmp_file:-}" && -f "$tmp_file" ]] && rm -f -- "$tmp_file"' EXIT
-    umask 077
-    printf 'RELAY_PASSWORD=%s\n' "$relay_password" >"$tmp_file" || return 1
-    chmod 0600 "$tmp_file" || return 1
-    chown "$tenant:$tenant" "$tmp_file" || return 1
-    mv -T -- "$tmp_file" "$env_file" || return 1
-    tmp_file=""
-  )
+  printf 'RELAY_PASSWORD=%s\n' "$relay_password" \
+    | write_tenant_file_atomic "$tenant" "$env_file" 600
 }
 
-# Unlike _env_set, this writer never passes the replacement to awk (or any
-# other child process) via argv. The secret stays in shell memory and a 0600
-# temporary file until the atomic rename.
-_relay_env_set_password() {  # <lunarwing.env> <password>
-  local path="$1" password="$2" tmp line
+# No secret is passed via argv or the child environment. Read the old file as
+# the tenant too: a swapped source path cannot make root read another file.
+# The transformed result is staged in a root-private file first; the tenant-
+# side atomic commit runs only after the producer fully succeeded, so a failed
+# read/transform can never publish a partial or empty replacement.
+_tenant_env_replace() {  # <tenant> <env_file> <KEY> <VALUE>
+  local tenant="$1" path="$2" key="$3" value="$4" staged rc=1
+  local -a drop=(sudo -u "$tenant")
+  [[ "$(id -un)" != "$tenant" ]] || drop=()
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 1
   [[ -f "$path" && ! -L "$path" && "$(stat -c %h -- "$path")" == 1 ]] || return 1
-  [[ "$password" != *$'\n'* && "$password" != *$'\r'* ]] || return 1
-  tmp="$(mktemp "$(dirname "$path")/.relay-env.XXXXXX")" || return 1
-  if ! (
-    trap 'rm -f -- "$tmp"' EXIT
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      [[ "$line" == RELAY_PASSWORD=* ]] || printf '%s\n' "$line"
-    done <"$path" >"$tmp" || exit 1
-    printf 'RELAY_PASSWORD=%s\n' "$password" >>"$tmp" || exit 1
-    chmod --reference="$path" "$tmp" && chown --reference="$path" "$tmp" \
-      && mv -T -- "$tmp" "$path"
-  ); then
-    return 1
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+  darkirc_path_components_safe "$path" || return 1
+  staged="$(mktemp)" || return 1
+  if printf '%s\n' "$value" | "${drop[@]}" env -i PATH="/usr/bin:/bin" \
+    TARGET_PATH="$path" TARGET_KEY="$key" bash -c '
+      set -euo pipefail
+      target="$TARGET_PATH"
+      parent="${target%/*}"
+      uid="$(id -u)"
+      [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+      parent_owner="$(stat -c %u -- "$parent")"
+      parent_mode="$(stat -c %a -- "$parent")"
+      [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$parent_mode & 077) == 0 )) || exit 73
+      [[ -f "$target" && ! -L "$target" ]] || exit 73
+      [[ "$(stat -c %u -- "$target")" == "$uid" && "$(stat -c %h -- "$target")" == 1 ]] || exit 73
+      IFS= read -r value
+      prefix="$TARGET_KEY="
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == "$prefix"* ]] || printf "%s\n" "$line"
+      done <"$target"
+      printf "%s%s\n" "$prefix" "$value"
+    ' >"$staged" \
+    && write_tenant_file_atomic "$tenant" "$path" 600 <"$staged"; then
+    rc=0
   fi
+  rm -f -- "$staged"
+  return "$rc"
+}
+
+_relay_env_set_password() {  # <tenant> <lunarwing.env> <password>
+  _tenant_env_replace "$1" "$2" RELAY_PASSWORD "$3"
 }
 
 _relay_service_active() {  # <tenant> <service basename>
@@ -746,14 +792,14 @@ rotate_tenant_weechat_relay_password() (  # <tenant>, under lifecycle lock; clos
     die "could not quiesce relay consumers; credentials unchanged"
   fi
 
-  if ! _relay_env_set_password "$lw_env" "$new_pw" \
+  if ! _relay_env_set_password "$name" "$lw_env" "$new_pw" \
     || ! _write_weechat_env "$name" "$new_pw" \
     || [[ "$(_read_env_value "$lw_env" RELAY_PASSWORD)" != "$new_pw" ]] \
     || [[ "$(_read_env_value "$wc_env" RELAY_PASSWORD)" != "$new_pw" ]]; then
     # Do not restart with mismatched credentials. Even the first writer may
     # have succeeded before reporting failure, so restore BOTH files.
     local rollback_failed=false
-    _relay_env_set_password "$lw_env" "$old_pw" || rollback_failed=true
+    _relay_env_set_password "$name" "$lw_env" "$old_pw" || rollback_failed=true
     _write_weechat_env "$name" "$old_pw" || rollback_failed=true
     if [[ "$rollback_failed" == true ]] \
       || [[ "$(_read_env_value "$lw_env" RELAY_PASSWORD)" != "$old_pw" ]] \
@@ -1947,8 +1993,29 @@ _ssh_hosts_from_config() {
 # configured [[ssh.hosts]] hosts (the sidecar ships with a "myhost" placeholder).
 # Idempotent: always derived from config.toml. Warn-and-continue on any failure:
 # every internal step is guarded so a failure can never errexit the script.
+# The source file is tenant-controlled too. jq must read it under that UID;
+# only the filtered stdout crosses into the tenant-side atomic writer.
+tenant_jq() {  # <tenant> <jq arguments...>
+  local name="$1"
+  shift
+  if [[ "$(id -un)" == "$name" ]]; then
+    jq "$@"
+  else
+    sudo -u "$name" jq "$@"
+  fi
+}
+
+tenant_cat() {  # <tenant> <file>
+  local name="$1" path="$2"
+  if [[ "$(id -un)" == "$name" ]]; then
+    cat -- "$path"
+  else
+    sudo -u "$name" cat -- "$path"
+  fi
+}
+
 patch_ssh_tool_allowlist() {
-  local name="$1" caps_path hosts_json tmp
+  local name="$1" caps_path hosts_json
   caps_path="$(tenant_state_dir "$name")/tools/ssh-tool.capabilities.json"
 
   if [[ ! -f "$caps_path" ]]; then
@@ -1966,19 +2033,18 @@ patch_ssh_tool_allowlist() {
     return 0
   fi
 
-  # Same-directory temp file so mv is atomic (same pattern as
-  # configure_gotify_capabilities).
-  tmp="$(mktemp "${caps_path}.tmp.XXXXXX")" \
+  # Stage the filtered result before the tenant-side commit: a jq failure
+  # (unreadable or corrupt source) must leave the installed caps untouched.
+  staged="$(mktemp)" \
     || { say "WARNING: mktemp failed; ssh-tool allowlist left unchanged" >&2; return 0; }
-  if jq --argjson hosts "$hosts_json" '.capabilities.ssh.allowed_hosts = $hosts' \
-       "$caps_path" >"$tmp" 2>/dev/null \
-    && mv "$tmp" "$caps_path" \
-    && chown "$name:$name" "$caps_path"; then
+  if tenant_jq "$name" --argjson hosts "$hosts_json" \
+       '.capabilities.ssh.allowed_hosts = $hosts' "$caps_path" >"$staged" 2>/dev/null \
+    && write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent <"$staged"; then
     say "  ssh-tool allowlist set to: $(jq -c . <<<"$hosts_json" 2>/dev/null || printf '%s' "$hosts_json")"
   else
-    rm -f "$tmp"
     say "WARNING: failed to patch ssh-tool allowlist at $caps_path (edit .capabilities.ssh.allowed_hosts manually)" >&2
   fi
+  rm -f -- "$staged"
 }
 
 # True if a TCP connect to host:port succeeds within 2s (pure bash /dev/tcp).
@@ -1993,7 +2059,7 @@ _probe_tcp() {
 # This is called after install-wasm and on tenant start so the ports are always
 # correct. Idempotent: always derived from the registry.
 patch_weechat_caps() {
-  local name="$1" caps_path weechat_port adapter_port tmp
+  local name="$1" caps_path weechat_port adapter_port staged
   caps_path="$(tenant_state_dir "$name")/channels/weechat.capabilities.json"
 
   if [[ ! -f "$caps_path" ]]; then
@@ -2012,19 +2078,19 @@ patch_weechat_caps() {
   local relay_url="http://127.0.0.1:${weechat_port}"
   local adapter_url="http://127.0.0.1:${adapter_port}"
 
-  # Same-directory temp file so mv is atomic.
-  tmp="$(mktemp "${caps_path}.tmp.XXXXXX")" \
+  # Stage the rewritten JSON before the tenant-side commit: a jq failure
+  # (unreadable or corrupt source) must leave the installed caps untouched.
+  staged="$(mktemp)" \
     || { say "WARNING: mktemp failed; weechat caps left unchanged" >&2; return 0; }
-  if jq --arg relay "$relay_url" --arg adapter "$adapter_url" \
+  if tenant_jq "$name" --arg relay "$relay_url" --arg adapter "$adapter_url" \
        '.config.relay_url = $relay | .config.ws_adapter_url = $adapter' \
-       "$caps_path" >"$tmp" 2>/dev/null \
-    && mv "$tmp" "$caps_path" \
-    && chown "$name:$name" "$caps_path"; then
+       "$caps_path" >"$staged" 2>/dev/null \
+    && write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent <"$staged"; then
     say "  weechat caps patched: relay=$relay_url adapter=$adapter_url"
   else
-    rm -f "$tmp"
     say "WARNING: failed to patch weechat caps at $caps_path" >&2
   fi
+  rm -f -- "$staged"
 }
 
 # Warn (never fail) if the tenant's configured loopback SSH host has no sshd
@@ -2538,7 +2604,7 @@ configure_gotify_capabilities() {
   [[ -n "$gotify_url" ]] || return 0
   require_cmd jq
 
-  local tools_dir caps_path host
+  local tools_dir caps_path host staged
   tools_dir="$(tenant_state_dir "$name")/tools"
   caps_path="$tools_dir/gotify-tool.capabilities.json"
 
@@ -2547,13 +2613,17 @@ configure_gotify_capabilities() {
   host="$(extract_host_from_url "$gotify_url")"
   [[ -n "$host" ]] || return 0
 
-  local tmp
-  tmp="$(mktemp "$caps_path.tmp.XXXXXX")"
-  jq --arg host "$host" '
+  # Stage the rewritten JSON first: a jq failure must leave the installed
+  # caps untouched instead of publishing a partial stream.
+  staged="$(mktemp)" || return 1
+  if ! tenant_jq "$name" --arg host "$host" '
     .capabilities.http.allowlist[0].host = $host |
     .capabilities.http.credentials.gotify.host_patterns = [$host]
-  ' "$caps_path" >"$tmp"
-  mv "$tmp" "$caps_path"
-  chown "$name:$name" "$caps_path"
+  ' "$caps_path" >"$staged" \
+    || ! write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent <"$staged"; then
+    rm -f -- "$staged"
+    return 1
+  fi
+  rm -f -- "$staged"
   say "  configured gotify capabilities for host: $host"
 }

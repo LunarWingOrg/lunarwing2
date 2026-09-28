@@ -32,6 +32,9 @@ _ctr() { return 1; }
 chown() { CHOWN_CALL="$*"; }
 
 mkdir -p "$fixture/env" "$fixture/state" "$fixture/home/lunarwing"
+# The tenant-side readers/writers require a private env parent (and a private
+# env file) owned by the fixture tenant, which is the invoking root account.
+chmod 700 "$fixture/env"
 env_file="$fixture/env/lunarwing.env"
 cat >"$env_file" <<'EOF'
 GATEWAY_AUTH_TOKEN=gate%token
@@ -39,6 +42,7 @@ KIMI_MODEL=old-model
 KIMI_BASE_URL=https://old.example/v1
 KIMI_API_KEY=old%key
 EOF
+chmod 600 "$env_file"
 
 configure_kimi root new-model '' ''
 assert_contains "$env_file" 'KIMI_MODEL=new-model' 'configure-kimi updates selected model'
