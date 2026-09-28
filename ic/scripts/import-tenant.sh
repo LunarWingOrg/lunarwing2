@@ -163,7 +163,7 @@ clear_resume_marker() {
 stream_bundle_manifest() {
   if [[ "$BUNDLE_FORMAT" == 7z ]]; then
     { printf '%s\n' "$KAWARIMI_ARCHIVE_PASS"; } \
-      | 7z x -so "$BUNDLE" "$BUNDLE_DARKIRC_MANIFEST_MEMBER" 2>/dev/null
+      | setsid 7z x -so "$BUNDLE" "$BUNDLE_DARKIRC_MANIFEST_MEMBER" 2>/dev/null
   else
     tar -xOf "$BUNDLE" "$BUNDLE_DARKIRC_MANIFEST_MEMBER"
   fi
@@ -203,7 +203,7 @@ validate_bundle_member_name() {
 validate_7z_archive() {
   local listing in_entries=false line path="" normalized="" size attrs mode count=0 total=0
   declare -A seen=()
-  listing="$({ printf '%s\n' "$KAWARIMI_ARCHIVE_PASS"; } | 7z l -slt "$BUNDLE" 2>/dev/null)" \
+  listing="$({ printf '%s\n' "$KAWARIMI_ARCHIVE_PASS"; } | setsid 7z l -slt "$BUNDLE" 2>/dev/null)" \
     || die "failed to inspect encrypted bundle (wrong passphrase or corrupted archive?)"
   while IFS= read -r line; do
     if [[ "$line" == "----------" ]]; then in_entries=true; continue; fi
@@ -751,7 +751,9 @@ command -v jq  >/dev/null 2>&1 || die "jq required"
 command -v tar >/dev/null 2>&1 || die "tar required"
 
 case "$BUNDLE" in
-  *.7z) BUNDLE_FORMAT=7z; command -v 7z >/dev/null 2>&1 || die "7z required" ;;
+  *.7z) BUNDLE_FORMAT=7z
+        command -v 7z >/dev/null 2>&1 || die "7z required"
+        command -v setsid >/dev/null 2>&1 || die "setsid (util-linux) required to feed 7z its passphrase safely" ;;
   *.tar) BUNDLE_FORMAT=tar ;;
   *) die "bundle must end in .7z or .tar" ;;
 esac
@@ -800,7 +802,7 @@ if [[ "$BUNDLE_FORMAT" == 7z ]]; then
   acquire_import_passphrase
   validate_7z_archive
   { printf '%s\n' "$KAWARIMI_ARCHIVE_PASS"; } \
-    | 7z x -o"$WORK" -y \
+    | setsid 7z x -o"$WORK" -y \
       "-x!$DARKIRC_MANIFEST_NAME" "-x!./$DARKIRC_MANIFEST_NAME" \
       "$BUNDLE" >/dev/null 2>&1 \
     || die "failed to unpack encrypted bundle (wrong passphrase or corrupted archive?)"

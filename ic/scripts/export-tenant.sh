@@ -310,6 +310,7 @@ command -v jq  >/dev/null 2>&1 || die "jq required"
 command -v tar >/dev/null 2>&1 || die "tar required"
 if ! $NO_ENCRYPT; then
   command -v 7z >/dev/null 2>&1 || die "7z (p7zip) required for encrypted bundles"
+  command -v setsid >/dev/null 2>&1 || die "setsid (util-linux) required to feed 7z its passphrase safely"
 fi
 
 [[ -x "$MT" ]] || die "mt-admin not found/executable at $MT"
@@ -789,7 +790,10 @@ else
   [[ ! -e "$BUNDLE" && ! -L "$BUNDLE" ]] || die "refusing to overwrite existing migration bundle: $BUNDLE"
   PARTIAL_BUNDLE="$BUNDLE"
   # Bare -p reads the password from stdin and keeps it out of process argv.
-  { printf '%s\n%s\n' "$KAWARIMI_ARCHIVE_PASS" "$KAWARIMI_ARCHIVE_PASS"; } | 7z a -t7z \
+  # setsid detaches 7z from the controlling tty: p7zip prefers /dev/tty for
+  # the password prompt when one exists (tmux/screen/ssh operator sessions),
+  # which would hang the export even though stdin already carries the pass.
+  { printf '%s\n%s\n' "$KAWARIMI_ARCHIVE_PASS" "$KAWARIMI_ARCHIVE_PASS"; } | setsid 7z a -t7z \
     -mhe=on -p -mx=5 "$BUNDLE" "$WORK"/* \
     >/dev/null 2>&1 || die "7z encryption failed"
   chmod 0600 "$BUNDLE"

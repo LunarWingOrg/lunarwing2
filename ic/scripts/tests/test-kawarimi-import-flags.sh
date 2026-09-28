@@ -334,8 +334,10 @@ passphrase_fd_file="$tmp/passphrase-no-newline"
 printf '%s' "$passphrase" >"$passphrase_fd_file"
 (
   cd "$tmp/bundle-src"
+  # setsid keeps p7zip off /dev/tty so the piped passphrase is honored even
+  # when the suite runs inside tmux/screen (it would otherwise block forever).
   { printf '%s\n%s\n' "$passphrase" "$passphrase"; } \
-    | 7z a -t7z -mhe=on -p "$encrypted_bundle" ./* >/dev/null
+    | setsid 7z a -t7z -mhe=on -p "$encrypted_bundle" ./* >/dev/null
 )
 chmod 0600 "$encrypted_bundle"
 encrypted_output="$(
@@ -741,7 +743,7 @@ fi
 mkdir -p "$tmp/roundtrip-extract"
 {
   printf '%s\n' "$full_passphrase"
-} | 7z x -o"$tmp/roundtrip-extract" "$exported_bundle" -y >/dev/null 2>&1
+} | setsid 7z x -o"$tmp/roundtrip-extract" "$exported_bundle" -y >/dev/null 2>&1
 manifest_path="$(find "$tmp/roundtrip-extract" -name manifest-lunarwing.env -print -quit)"
 assert_file_contains "encrypted manifest preserves Kimi API key" "$manifest_path" "KIMI_API_KEY=encrypted-roundtrip-kimi-secret"
 assert_file_contains "encrypted manifest preserves web-written master key quoting" "$manifest_path" 'SECRETS_MASTER_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'

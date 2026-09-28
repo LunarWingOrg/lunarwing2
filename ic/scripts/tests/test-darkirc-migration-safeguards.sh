@@ -709,8 +709,10 @@ fi
 structured_passphrase="structured-darkirc-test-passphrase"
 (
   cd "$structured_tmp/bundle-src"
+  # setsid keeps p7zip off /dev/tty so the piped passphrase is honored even
+  # when the suite runs inside tmux/screen (it would otherwise block forever).
   { printf '%s\n%s\n' "$structured_passphrase" "$structured_passphrase"; } \
-    | 7z a -t7z -mhe=on -p "$structured_tmp/structured.7z" ./* >/dev/null
+    | setsid 7z a -t7z -mhe=on -p "$structured_tmp/structured.7z" ./* >/dev/null
 )
 chmod 0600 "$structured_tmp/structured.7z"
 encrypted_structured_output="$(
