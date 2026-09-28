@@ -16,12 +16,11 @@ docker compose up -d lunarwing-worker
 `AGENT_AUTH_TOKEN` is required in server mode, including loopback deployments;
 Compose rejects a missing value before launching the container. The baked
 default model is the TensorZero gateway function
-`tensorzero::function_name::FrontierCODE` (OpenAI-compatible endpoint, reached
-over the NetBird overlay at `http://100.88.232.146:3000/openai/v1` —
-`cotterhomelab3.netbird.selfhosted` — rather than the LAN static IP), mirroring
-the OpenCode worker; since kimi-code 0.37.2 the managed `api.kimi.com`
-provider no longer works for worker prompts. Set `KIMI_API_KEY` (or the shared
-`TENSORZERO_API_KEY`) when the gateway requires a bearer token; the previous
+`tensorzero::function_name::FrontierCODEK` (OpenAI-compatible endpoint, reached
+over the LAN at `http://192.168.1.157:3000/openai/v1`); since kimi-code 0.37.2
+the managed `api.kimi.com` provider no longer works for worker prompts. Set
+`KIMI_API_KEY` (or the shared `TENSORZERO_API_KEY`) when the gateway requires
+a bearer token; the previous
 managed-service OAuth flow can still be used by mounting a custom config via
 `KIMI_CONFIG_SOURCE`. Build with `WITH_TOOLCHAINS=true` for same Rust, Go,
 C/C++, Python, and native development packages as OpenCode worker.
@@ -45,24 +44,28 @@ Add to `config.toml` under `LUNARWING_BASE_DIR`:
 name = "kimi"
 url = "ws://localhost:9090/ws/agent"
 auth_token = "same value as AGENT_AUTH_TOKEN"
-timeout_ms = 3600000
+timeout_ms = 14400000
 prompt_context = { max_messages = 12, max_chars_per_message = 2000, max_total_chars = 12000 }
 ```
 
 The agent logs `External workers configured: kimi` on startup.
-`timeout_ms` defaults to one hour. On timeout or cancellation, the worker
+New Kimi tenant entries default `timeout_ms` to four hours (existing tenant
+entries retain their configured timeout). On timeout or cancellation, the worker
 sends `SIGTERM` to the Kimi CLI subprocess, then `SIGKILL` after a bounded
-five-second grace (`KIMI_KILL_GRACE_MS`) instead of leaving work orphaned.
+seven-second grace (`KIMI_KILL_GRACE_MS`) instead of leaving work orphaned.
 LunarWing also sends a protocol cancel envelope when its own deadline expires.
 Job metadata and progress events are persisted by LunarWing. After a daemon restart,
 running jobs are reported as `interrupted`, while `list_jobs`, `job_status`, and
 `job_events` can still read their saved status and event history from the database.
 While inference is otherwise silent, the worker emits a persisted progress
-heartbeat every 60 seconds; configure or disable it with
+heartbeat every 120 seconds; configure or disable it with
 `KIMI_PROGRESS_HEARTBEAT_MS` (0-300000).
 Only one active task may modify overlapping resolved workspace paths. A second
 task targeting same directory, parent, or child fails immediately with active
 task UUID; cancel or finish that task before dispatching another.
+The worker accepts up to eight concurrent tasks on distinct workspaces by default.
+An explicit `LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS` overrides the generated
+tenant timeout for newly provisioned workers of every type.
 
 ## Usage
 

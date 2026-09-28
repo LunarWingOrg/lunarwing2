@@ -10,6 +10,16 @@ const entrypointPath = fileURLToPath(new URL("../entrypoint.sh", import.meta.url
 const entrypoint = readFileSync(entrypointPath, "utf8")
 const configSectionEnd = entrypoint.indexOf("# ── always start the health server")
 
+test("baked Kimi defaults use the LAN FrontierCODEK provider", () => {
+  const config = readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8")
+  assert.match(config, /^default_model = "tensorzero\/FrontierCODEK"$/m)
+  assert.match(config, /^base_url = "http:\/\/192\.168\.1\.157:3000\/openai\/v1"$/m)
+  assert.match(config, /^\[models\."tensorzero\/FrontierCODEK"\]$/m)
+  assert.match(config, /^model = "tensorzero::function_name::FrontierCODEK"$/m)
+  assert.match(config, /^dangerous_command_guard = true$/m)
+  assert.match(config, /^command = "node \/app\/hooks\/headless_command_guard\.mjs"$/m)
+})
+
 test("entrypoint writes escaped, validated config atomically with mode 0600", () => {
   assert.ok(configSectionEnd > 0)
   const root = mkdtempSync(join(tmpdir(), "kimi-config-"))

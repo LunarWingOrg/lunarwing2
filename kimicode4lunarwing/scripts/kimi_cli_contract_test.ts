@@ -142,7 +142,7 @@ mkdirSync(join(seededHome, ".kimi-code"), { recursive: true })
 writeFileSync(
   join(seededHome, ".kimi-code", "config.toml"),
   [
-    "default_model = \"tensorzero/FrontierCODE\"",
+    "default_model = \"tensorzero/FrontierCODEK\"",
     "telemetry = false",
     "",
     "[providers.tensorzero]",
@@ -150,9 +150,9 @@ writeFileSync(
     "base_url = \"http://127.0.0.1:1/openai/v1\"",
     "api_key = \"test\"",
     "",
-    "[models.\"tensorzero/FrontierCODE\"]",
+    "[models.\"tensorzero/FrontierCODEK\"]",
     "provider = \"tensorzero\"",
-    "model = \"tensorzero::function_name::FrontierCODE\"",
+    "model = \"tensorzero::function_name::FrontierCODEK\"",
     "max_context_size = 859000",
     "capabilities = [\"tool_use\"]",
     "",
@@ -245,7 +245,7 @@ test(
     writeFileSync(
       guardConfigPath,
       [
-        'default_model = "tensorzero/FrontierCODE"',
+        'default_model = "tensorzero/FrontierCODEK"',
         'default_permission_mode = "auto"',
         "telemetry = false",
         "",
@@ -254,9 +254,9 @@ test(
         'base_url = "http://127.0.0.1:1/openai/v1"',
         'api_key = "test"',
         "",
-        '[models."tensorzero/FrontierCODE"]',
+        '[models."tensorzero/FrontierCODEK"]',
         'provider = "tensorzero"',
-        'model = "tensorzero::function_name::FrontierCODE"',
+        'model = "tensorzero::function_name::FrontierCODEK"',
         "max_context_size = 859000",
         'capabilities = ["tool_use"]',
         "",

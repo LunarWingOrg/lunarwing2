@@ -368,7 +368,7 @@ ensure_external_worker_config() {
   local worker="$2"    # logical worker name, matches create_job mode
   local port_key="$3"  # ports-registry key for its WSS port
 
-  local state_dir env_path config_path wss_port auth_token
+  local state_dir env_path config_path wss_port auth_token default_timeout_ms
 
   if [[ "$worker" == "kimi" ]] && ! tenant_worker_enabled "$name" kimi; then
     say "kimi worker not selected for $name (skipping external-worker config)"
@@ -390,6 +390,12 @@ ensure_external_worker_config() {
 
   if [[ ! "$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]]; then
     die "LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS must be a positive integer"
+  fi
+  default_timeout_ms="$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS"
+  # Keep the other worker lanes at their existing default. An explicitly set
+  # fleet-wide timeout still takes precedence for newly generated entries.
+  if [[ "$worker" == "kimi" && -z "${LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS:-}" ]]; then
+    default_timeout_ms=14400000
   fi
 
   # Already configured? Upgrade only the exact legacy timeout, then skip so
@@ -451,7 +457,7 @@ HDR
     if [[ -n "$auth_token" ]]; then
       printf 'auth_token = "%s"\n' "$auth_token"
     fi
-    printf 'timeout_ms = %s\n' "$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS"
+    printf 'timeout_ms = %s\n' "$default_timeout_ms"
   } >>"$config_path"
 
   if [[ -z "$auth_token" ]]; then
