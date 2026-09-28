@@ -91,8 +91,13 @@ impl JobState {
             (Completed, Submitted) | (Completed, Failed) |
             // From Submitted
             (Submitted, Accepted) | (Submitted, Failed) |
-            // From Stuck (can recover or fail)
-            (Stuck, InProgress) | (Stuck, Failed) | (Stuck, Cancelled)
+            // From Stuck (can recover, complete late, or fail)
+            // Stuck -> Completed (WI#263): a job flagged Stuck by the idle
+            // threshold can still receive its genuine final result — an
+            // external worker that finished composing its report after the
+            // daemon had already flagged the job. Rejecting the transition
+            // silently discarded the deliverable.
+            (Stuck, InProgress) | (Stuck, Completed) | (Stuck, Failed) | (Stuck, Cancelled)
         )
     }
 
@@ -193,6 +198,14 @@ pub struct JobContext {
     pub started_at: Option<DateTime<Utc>>,
     /// When the job was completed.
     pub completed_at: Option<DateTime<Utc>>,
+    /// When the job last emitted observable progress (WI#263).
+    ///
+    /// Stuck detection must distinguish "running long" from "silent": a
+    /// multi-hour external-worker investigation streams evidence throughout
+    /// and is healthy, while a wedged worker goes quiet. Activity is noted on
+    /// every progress event; idle-based detection measures from this stamp,
+    /// falling back to `started_at` when no activity was ever recorded.
+    pub last_activity_at: Option<DateTime<Utc>>,
     /// Number of repair attempts.
     pub repair_attempts: u32,
     /// State transition history.
@@ -265,6 +278,7 @@ impl JobContext {
             created_at: Utc::now(),
             started_at: None,
             completed_at: None,
+            last_activity_at: None,
             repair_attempts: 0,
             transitions: Vec::new(),
             extra_env: Arc::new(HashMap::new()),
@@ -404,6 +418,18 @@ impl JobContext {
         self.transition_to(JobState::Stuck, Some(reason.into()))
     }
 
+    /// Record observable progress on this job (WI#263).
+    ///
+    /// Called for every streamed progress event so idle-based stuck detection
+    /// measures time since the last evidence, not time since the job started.
+    /// Never moves the job backwards out of a terminal state.
+    pub fn note_activity(&mut self) {
+        if self.state.is_terminal() {
+            return;
+        }
+        self.last_activity_at = Some(Utc::now());
+    }
+
     /// Attempt to recover from stuck state.
     pub fn attempt_recovery(&mut self) -> Result<(), String> {
         if self.state != JobState::Stuck {
@@ -491,6 +517,40 @@ mod tests {
         ctx.transition_to(JobState::Completed, Some("Done".to_string()))
             .unwrap();
         assert_eq!(ctx.state, JobState::Completed);
+    }
+
+    #[test]
+    fn test_stuck_can_complete_late() {
+        // WI#263: a job flagged Stuck by the idle threshold can still receive
+        // its genuine final result from an external worker that finished
+        // composing the report late. The deliverable must land, not be
+        // discarded by a rejected transition.
+        let mut ctx = JobContext::new("Test", "Late completion");
+        ctx.transition_to(JobState::InProgress, None).unwrap();
+        ctx.mark_stuck("exceeded stuck_threshold").unwrap();
+        assert_eq!(ctx.state, JobState::Stuck);
+
+        ctx.transition_to(JobState::Completed, Some("late result".into()))
+            .unwrap();
+        assert_eq!(ctx.state, JobState::Completed);
+        assert!(ctx.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_note_activity_tracking() {
+        // WI#263: activity is recorded for active jobs and ignored for
+        // terminal ones so a late progress event cannot resurrect a job.
+        let mut ctx = JobContext::new("Test", "Activity");
+        assert!(ctx.last_activity_at.is_none());
+
+        ctx.transition_to(JobState::InProgress, None).unwrap();
+        ctx.note_activity();
+        assert!(ctx.last_activity_at.is_some());
+
+        ctx.transition_to(JobState::Failed, None).unwrap();
+        let before = ctx.last_activity_at;
+        ctx.note_activity();
+        assert_eq!(ctx.last_activity_at, before);
     }
 
     #[test]
