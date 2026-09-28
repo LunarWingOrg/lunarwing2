@@ -227,7 +227,7 @@ rotate_tenant_pg_password() {
   _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
     || die "PostgreSQL container $container_name is not running; start the tenant first"
 
-  local envf pg_port new_pw secret_file tmp
+  local envf pg_port new_pw secret_file
   envf="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$envf" ]] || die "tenant env not found: $envf"
   pg_port="$(ports_get "$name" postgres)"
@@ -243,16 +243,11 @@ rotate_tenant_pg_password() {
 
   # Persist the new secret (source of truth) ...
   secret_file="$(tenant_env_dir "$name")/pg.secret"
-  ( umask 077; printf '%s\n' "$new_pw" > "$secret_file" )
-  chown "$name:$name" "$secret_file" 2>/dev/null || true
+  printf '%s\n' "$new_pw" | write_tenant_file_atomic "$name" "$secret_file" 600
 
-  # ... and rewrite DATABASE_URL in place (preserving the env file's owner/perms).
-  # Temp lives beside the env file (0600), not in shared /tmp, so the cleartext
-  # password isn't briefly exposed there — matching the convention used elsewhere.
-  tmp="$(mktemp "$envf.tmp.XXXXXX")"
-  sed "s#^DATABASE_URL=.*#DATABASE_URL=postgres://lunarwing:${new_pw}@127.0.0.1:${pg_port}/lunarwing#" "$envf" >"$tmp"
-  cat "$tmp" >"$envf"
-  rm -f "$tmp"
+  # ... and replace DATABASE_URL without reopening a tenant-writable temp as root.
+  _tenant_env_replace "$name" "$envf" DATABASE_URL \
+    "postgres://lunarwing:${new_pw}@127.0.0.1:${pg_port}/lunarwing"
 
   say "Rotated PostgreSQL password for tenant '$name'."
   say "IMPORTANT: the running daemon still holds the old credential — restart to apply:"

@@ -111,6 +111,7 @@ write_fixture_env() {  # <tenant>
   local env_dir
   env_dir="$(tenant_env_dir "$1")"
   mkdir -p "$env_dir"
+  chmod 700 "$env_dir"
   cat >"$env_dir/lunarwing.env" <<ENV
 RELAY_PASSWORD=$FIXTURE_PASSWORD
 ENV
