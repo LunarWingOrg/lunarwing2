@@ -8,6 +8,12 @@ use lunarwing::agent::host::{self, LogLevel};
 use exports::lunarwing::agent::tool::{Guest, Request, Response};
 use serde::{Deserialize, Serialize};
 
+#[derive(Deserialize)]
+struct JobPromptPrecursor {
+    task_precursor: String,
+    skill_precursor: Option<String>,
+    domain: Option<String>,
+
 // Input structure for job prompt requests
 #[derive(Deserialize)]
 struct JobPromptInput {
