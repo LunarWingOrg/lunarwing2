@@ -142,7 +142,8 @@
 43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/263
 44. [ ] look into this - seems very long responses get 502 error in desktop application - has only happened once so not much info on this issue https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/259
 45. [ ] look into https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/255 (possible hallucination from baud since i dont think we have this package used anywhere)
-46. [ ] work on this item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/245
+46. [x] work on this item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/245
+    - DONE 2026-09-28 (`aj/kimi-46-20260928-1200`, WI#245): `tool_list` silent truncation fixed. Root cause: the tool returned the whole inventory (including every exposed tool name per MCP server); the shared pipeline pretty-prints it and the safety layer byte-truncates at `max_output_length`, so a 31-server install surfaced as a valid-looking ~19-entry prefix with no indicator. `ExtensionManager::list()` ordering was also HashMap-random. Fix: deterministic `(kind, name)` sort in `list()`, `tool_list` pagination (`offset`/`limit` 1–100 default 50, `total`/`next_offset`/`truncated` metadata, `memory_read` pattern), per-entry `tools` capped at 25 with `tools_truncated`/`tools_total`, compact entries (optional fields only when set). Docs: `ic/src/tools/README.md` § tool_list pagination (WI#245). Verified: 31-server libSQL end-to-end pagination test (every server enumerated once, pages <50 KiB), unit tests for caps/ordering/param parsing, schema-validator canary, `cargo check`, zero clippy on lib+tests. Same-family follow-ups noted in README: `mission_list` and `list_issues` share this truncation class.
 47. [ ] add opencode2 as selection for external worker for mt onboard ui - see https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/234 for reference
 48. [x] (S) Reserved
 
