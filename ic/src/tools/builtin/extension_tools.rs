@@ -1894,6 +1894,114 @@ mod tests {
         assert!(ToolListTool::parse_limit(&serde_json::json!({"limit": "many"})).is_err());
     }
 
+    /// End-to-end WI#245 regression: a 31-server inventory (the reported
+    /// failure size) must enumerate completely across pages, with every page
+    /// small enough to survive the safety layer's byte truncation intact.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn tool_list_paginates_full_inventory_without_silent_prefix() {
+        use crate::context::JobContext;
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::ToolRegistry;
+        use crate::tools::mcp::McpServerConfig;
+        use crate::tools::mcp::process::McpProcessManager;
+        use crate::tools::mcp::session::McpSessionManager;
+
+        let (store, _db_dir) = crate::testing::test_db().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).ok();
+        std::fs::create_dir_all(&channels_dir).ok();
+
+        let key = secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
+        let crypto = Arc::new(SecretsCrypto::new(key).expect("crypto"));
+        let secrets: Arc<dyn crate::secrets::SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(crypto));
+        let manager = Arc::new(ExtensionManager::new(
+            Arc::new(McpSessionManager::new()),
+            Arc::new(McpProcessManager::new()),
+            secrets,
+            Arc::new(ToolRegistry::new()),
+            None,
+            None,
+            tools_dir,
+            channels_dir,
+            None,
+            "test".to_string(),
+            Some(store),
+            Vec::new(),
+        ));
+
+        for i in 0..31 {
+            let config = McpServerConfig::new_stdio(
+                format!("server_{i:02}"),
+                "echo",
+                vec![],
+                HashMap::new(),
+            );
+            manager
+                .install_mcp_config(config, "test")
+                .await
+                .expect("install test MCP config");
+        }
+
+        let tool = ToolListTool::new(manager);
+        let ctx = crate::context::JobContext {
+            user_id: "test".to_string(),
+            ..JobContext::default()
+        };
+
+        // Page through with limit=20, the reported broken size class: page 1
+        // previously looked complete while 12 servers were silently dropped.
+        let mut seen: Vec<String> = Vec::new();
+        let mut offset = 0usize;
+        let mut pages = 0;
+        loop {
+            let output = tool
+                .execute(serde_json::json!({"limit": 20, "offset": offset}), &ctx)
+                .await
+                .expect("tool_list page");
+            pages += 1;
+            let result = &output.result;
+            let entries = result["extensions"].as_array().expect("extensions array");
+            let serialized = serde_json::to_string(&result).expect("serialize page");
+            assert!(
+                serialized.len() < 50_000,
+                "page must stay far below the 100 KiB safety truncation limit"
+            );
+            for entry in entries {
+                seen.push(entry["name"].as_str().expect("name").to_string());
+            }
+            match result["next_offset"].as_u64() {
+                Some(next) => offset = next as usize,
+                None => {
+                    assert_eq!(result["truncated"], serde_json::json!(false));
+                    assert_eq!(result["total"], serde_json::json!(31));
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(pages, 2, "31 entries at limit 20 spans two pages");
+        assert_eq!(seen.len(), 31, "every installed server must be enumerated");
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 31, "no server may appear twice");
+        assert_eq!(
+            seen[0], "server_00",
+            "deterministic ordering starts at the first name"
+        );
+
+        // offset past the end is a caller error, not an empty page.
+        let err = tool
+            .execute(serde_json::json!({"offset": 99}), &ctx)
+            .await
+            .expect_err("offset beyond total must fail");
+        assert!(err.to_string().contains("exceeds total"));
+    }
+
     #[test]
     fn test_tool_remove_schema() {
         use crate::tools::tool::ApprovalRequirement;

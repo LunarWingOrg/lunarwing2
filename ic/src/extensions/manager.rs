@@ -10374,7 +10374,7 @@ done
 
     #[test]
     fn extension_list_ordering_is_kind_then_case_insensitive_name() {
-        let mut entries = vec![
+        let mut entries = [
             sort_test_extension("zeta_tool", ExtensionKind::WasmTool),
             sort_test_extension("Beta_Server", ExtensionKind::McpServer),
             sort_test_extension("alpha_channel", ExtensionKind::WasmChannel),
@@ -10383,7 +10383,7 @@ done
         ];
         // The production code sorts inside list(); the key function is the
         // contract, so exercise it directly with shuffled input.
-        entries.sort_by(|a, b| extension_sort_key(a).cmp(&extension_sort_key(b)));
+        entries.sort_by_key(extension_sort_key);
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
