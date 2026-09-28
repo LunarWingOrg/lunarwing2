@@ -246,6 +246,13 @@ impl ContextManager {
     }
 
     /// Find stuck jobs with an optional elapsed threshold for `InProgress` detection.
+    ///
+    /// The threshold is measured against **idleness**, not total runtime
+    /// (WI#263): time since the job's last recorded activity
+    /// (`last_activity_at`, noted on every streamed progress event), falling
+    /// back to `started_at` when no activity was ever recorded. A multi-hour
+    /// external-worker investigation that keeps streaming evidence is healthy;
+    /// only a worker that goes silent past the threshold is stuck.
     pub async fn find_stuck_jobs_with_threshold(
         &self,
         elapsed_threshold: Option<Duration>,
@@ -260,15 +267,15 @@ impl ContextManager {
                 if c.state == crate::context::JobState::Stuck {
                     return true;
                 }
-                // Detect InProgress jobs that have been running beyond the elapsed threshold.
-                // NOTE: `started_at` is set on the first transition to InProgress and is
-                // NOT reset when a job recovers from Stuck back to InProgress. This means
-                // a recovered job may be re-detected on the next scan. A future improvement
-                // could track `in_progress_since` or use the most recent StateTransition
-                // with `to == InProgress` to avoid false positives on recovered jobs.
+                // Detect InProgress jobs that have been idle beyond the
+                // threshold. NOTE: `started_at` is set on the first transition
+                // to InProgress and is NOT reset when a job recovers from
+                // Stuck back to InProgress; `last_activity_at` (noted on every
+                // progress event) is the more accurate idle baseline, so it is
+                // preferred when present.
                 if c.state == crate::context::JobState::InProgress
                     && let Some(threshold) = elapsed_threshold
-                    && let Some(started) = c.started_at
+                    && let Some(started) = c.last_activity_at.or(c.started_at)
                 {
                     let elapsed = now.signed_duration_since(started);
                     let elapsed_secs = elapsed.num_seconds().max(0) as u64;
@@ -734,6 +741,58 @@ mod tests {
         // Without threshold, neither InProgress job is detected (no explicit Stuck state)
         let stuck_no_threshold = manager.find_stuck_jobs().await;
         assert!(stuck_no_threshold.is_empty());
+    }
+
+    /// Regression test for WI#263: a long-running InProgress job that keeps
+    /// streaming progress must NOT be flagged stuck by total elapsed time.
+    /// Only a job that has gone silent past the threshold is stuck.
+    #[tokio::test]
+    async fn find_stuck_jobs_threshold_ignores_active_long_jobs() {
+        let manager = ContextManager::new(10);
+
+        let id1 = manager.create_job("Streaming job", "desc").await.unwrap();
+        let id2 = manager.create_job("Silent job", "desc").await.unwrap();
+
+        for id in [id1, id2] {
+            manager
+                .update_context(id, |ctx| {
+                    ctx.transition_to(crate::context::JobState::InProgress, None)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        // Both jobs started long ago (past any sane threshold)...
+        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        for id in [id1, id2] {
+            manager
+                .update_context(id, |ctx| -> Result<(), crate::error::JobError> {
+                    ctx.started_at = Some(long_ago);
+                    Ok(())
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        // ...but id1 emitted progress a minute ago.
+        manager
+            .update_context(id1, |ctx| -> Result<(), crate::error::JobError> {
+                ctx.last_activity_at =
+                    Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+                Ok(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // With a 5-minute idle threshold, only the silent id2 is detected.
+        let stuck = manager
+            .find_stuck_jobs_with_threshold(Some(Duration::from_secs(300)))
+            .await;
+        assert_eq!(stuck.len(), 1, "only the silent job should be flagged");
+        assert_eq!(stuck[0], id2);
     }
 
     #[tokio::test]
