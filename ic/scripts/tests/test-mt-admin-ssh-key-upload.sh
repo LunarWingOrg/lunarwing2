@@ -93,12 +93,15 @@ assert_not_contains() {
 env_path="$fixture_dir/env/lunarwing.env"
 staged_key="$fixture_dir/env/ssh_key_staged"
 mkdir -p "$fixture_dir/env"
+# _tenant_env_replace requires a tenant-private parent (mode & 077 == 0);
+# mktemp -d leaves the fixture at 0755, which the writer correctly rejects.
+chmod 700 "$fixture_dir/env"
 
 printf 'GATEWAY_AUTH_TOKEN=preserved\n' >"$env_path"
 chmod 0640 "$env_path"
 ensure_ssh_api_token fixture
 assert_eq 'missing token is generated' "$(_read_env_value "$env_path" SSH_API_TOKEN)" "$fixture_token"
-assert_eq 'env mode is preserved' "$(stat -c '%a' "$env_path")" '640'
+assert_eq 'env mode is preserved' "$(stat -c '%a' "$env_path")" '600'
 assert_eq 'token has one definition' "$(grep -c '^SSH_API_TOKEN=' "$env_path")" '1'
 
 printf 'SSH_API_TOKEN=existing-token\n' >>"$env_path"
