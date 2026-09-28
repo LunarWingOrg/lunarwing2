@@ -30,6 +30,13 @@ tenant_run_dir() { printf '%s/run\n' "$fixture"; }
 tenant_exists_in_registry() { return 0; }
 _ctr() { return 1; }
 chown() { CHOWN_CALL="$*"; }
+# This fixture's tenant is the invoking account in CI (root). The CI image
+# does not include sudo; execute only root-targeted fixture commands directly.
+sudo() {
+  [[ "${1:-}" == -u && "${2:-}" == root ]] || return 1
+  shift 2
+  "$@"
+}
 
 mkdir -p "$fixture/env" "$fixture/state" "$fixture/home/lunarwing"
 # The tenant-side readers/writers require a private env parent (and a private
