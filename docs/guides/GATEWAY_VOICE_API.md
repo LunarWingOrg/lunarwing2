@@ -36,6 +36,8 @@ TRANSCRIPTION_PROVIDER=lunarvoice
 VOICE_SERVICE_URL=http://127.0.0.1:8090
 VOICE_AUTH_TOKEN=<sidecar-bearer-token>
 TRANSCRIPTION_MODEL=whisper-tiny   # model the gateway selects for clients
+# Synthesis clip cap (seconds); mirrors the sidecar's VOICE_MAX_TTS_AUDIO_SECS
+VOICE_MAX_TTS_AUDIO_SECS=300
 ```
 
 `VOICE_SERVICE_URL` must be plain HTTP, point at `localhost` or a loopback IP,
@@ -149,14 +151,16 @@ failure reads as a server problem, not a gateway-token problem.
   32 chars, `format` allowlisted. Per-route body limits (32 MiB transcribe,
   1 MiB synthesize) override the gateway's global 10 MiB limit.
 - **Synthesis duration bound**: text whose estimated audio duration exceeds
-  `max_synth_audio_secs` (300 s, mirroring the sidecar's
-  `VOICE_MAX_TTS_AUDIO_SECS` default) is rejected up front with 422
-  `text_too_long` instead of letting the sidecar synthesize audio it must then
-  discard. The estimate is deliberately conservative (Latin ≈14 chars/s, CJK ≈
-  3.5 chars/s, slow playback speeds accounted), so a maximal 10 000-char dense
-  Latin reply still passes while genuinely over-long replies fail fast with a
-  distinguishable error. Desktop clients synthesizing agent replies should
-  chunk or trim text against `max_synth_audio_secs` from `/api/voice/status`.
+  `max_synth_audio_secs` (from `VOICE_MAX_TTS_AUDIO_SECS`, default 300 — the
+  same key the sidecar reads, so both sides of the proxy enforce one clip cap;
+  mt-admin mirrors the tenant's `voice.env` value into `lunarwing.env`) is
+  rejected up front with 422 `text_too_long` instead of letting the sidecar
+  synthesize audio it must then discard. The estimate is deliberately
+  conservative (Latin ≈14 chars/s, CJK ≈3.5 chars/s, slow playback speeds
+  accounted), so a maximal 10 000-char dense Latin reply still passes while
+  genuinely over-long replies fail fast with a distinguishable error. Desktop
+  clients synthesizing agent replies should chunk or trim text against
+  `max_synth_audio_secs` from `/api/voice/status`.
 - **Response caps**: sidecar responses are streamed with hard byte caps
   (1 MiB transcription JSON, 64 MiB synthesis audio) before re-serialization.
   Synthesis responses must declare `format: "wav"` — anything else is rejected
