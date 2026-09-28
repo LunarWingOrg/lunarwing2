@@ -605,26 +605,94 @@ _relay_service_active() {  # <tenant> <service basename>
   fi
 }
 
-_relay_service_action() {  # <tenant> <stop|start> <service basename>
+_relay_service_action() {  # <tenant> <stop|start|restart> <service basename>
   if [[ "$INIT_SYSTEM" == systemd ]]; then
+    # Concurrent denied starts may have reached systemd's start-rate limit.
+    if [[ "$2" == restart ]]; then
+      _systemctl_user "$1" reset-failed "$3.service" || return 1
+    fi
     _systemctl_user "$1" "$2" "$3.service"
   else
     rc-service "$3" "$2"
   fi
 }
 
+# Install once per render, on either init. Never replace the lock inode: a
+# detached/in-flight start may already have it open. Preserve recovery markers.
+prepare_relay_start_barrier() {  # <tenant>
+  local name="$1" dir lock helper_dir
+  require_cmd python3
+  require_cmd flock
+  [[ -f "$RELAY_ENV_EXEC_SRC" && ! -L "$RELAY_ENV_EXEC_SRC" ]] \
+    || die "relay launcher source is missing or unsafe"
+  helper_dir="$(dirname "$RELAY_ENV_EXEC")"
+  [[ ! -L "$helper_dir" && ! -L "$RELAY_ENV_EXEC" ]] \
+    || die "unsafe relay launcher path"
+  install -d -o root -g root -m 0755 "$helper_dir" || return 1
+  [[ "$(stat -c '%u:%g:%a' "$helper_dir")" == 0:0:755 ]] || return 1
+  install -o root -g root -m 0755 "$RELAY_ENV_EXEC_SRC" "$RELAY_ENV_EXEC" || return 1
+  dir="$(tenant_env_dir "$name")"
+  [[ -d "$dir" && ! -L "$dir" && "$(stat -c %a "$dir")" == 700 ]] \
+    || die "missing or unsafe tenant env directory"
+  lock="$dir/.relay-start.lock"
+  if [[ ! -e "$lock" && ! -L "$lock" ]]; then
+    (umask 077; set -o noclobber; : >"$lock") || return 1
+    chown "$name:$name" "$lock" || return 1
+  fi
+  [[ -f "$lock" && ! -L "$lock" && "$(stat -c '%h:%a' "$lock")" == 1:600 ]] \
+    || die "unsafe relay start lock"
+  [[ "$(stat -c %u "$lock")" == "$(stat -c %u "$dir")" ]] \
+    || die "relay start lock must be owned by the tenant"
+}
+
+# Refuse rotations on old deployed units. For systemd inspect the manager's
+# effective command, not just the file on disk (daemon-reload may be missing).
+_relay_require_start_barrier() {  # <tenant>
+  local name="$1" svc command
+  [[ -x "$RELAY_ENV_EXEC" ]] || return 1
+  for svc in "lunarwing-$name" "lunarwing-weechat-adapter-$name" "lunarwing-weechat-$name"; do
+    if [[ "$INIT_SYSTEM" == systemd ]]; then
+      command="$(_systemctl_user "$name" show -p ExecStart --value "$svc.service")" || return 1
+    else
+      [[ -f "$OPENRC_INITD_DIR/$svc" ]] || return 1
+      command="$(<"$OPENRC_INITD_DIR/$svc")"
+    fi
+    [[ "$command" == *"$RELAY_ENV_EXEC --env-file "* ]] || return 1
+  done
+}
+
+_relay_release_start_barrier() {  # <marker> <lock fd>
+  local fd="$2"
+  rmdir "$1" || return 1
+  flock -u "$fd" || return 1
+  exec {fd}<&-
+}
+
+_relay_quiesce_services() {  # <tenant>
+  local name="$1" svc failed=false
+  for svc in "lunarwing-$name" "lunarwing-weechat-adapter-$name" "lunarwing-weechat-$name"; do
+    _relay_service_action "$name" stop "$svc" || failed=true
+  done
+  for svc in "lunarwing-$name" "lunarwing-weechat-adapter-$name" "lunarwing-weechat-$name"; do
+    _relay_service_active "$name" "$svc" && failed=true
+  done
+  [[ "$failed" == false ]]
+}
+
 # The caller holds the lifecycle lock. Restore only services that were running
 # on entry; never bring an intentionally stopped daemon or relay online.
 _relay_restore_services() {  # <tenant> <weechat-active> <adapter-active> <daemon-active>
   local name="$1" rc=0
-  [[ "$2" != true ]] || _relay_service_action "$name" start "lunarwing-weechat-$name" || rc=1
-  [[ "$3" != true ]] || _relay_service_action "$name" start "lunarwing-weechat-adapter-$name" || rc=1
-  [[ "$4" != true ]] || _relay_service_action "$name" start "lunarwing-$name" || rc=1
+  # Restart also resets an OpenRC supervisor exhausted by denied respawns.
+  [[ "$2" != true ]] || _relay_service_action "$name" restart "lunarwing-weechat-$name" || rc=1
+  [[ "$3" != true ]] || _relay_service_action "$name" restart "lunarwing-weechat-adapter-$name" || rc=1
+  [[ "$4" != true ]] || _relay_service_action "$name" restart "lunarwing-$name" || rc=1
   return "$rc"
 }
 
-rotate_tenant_weechat_relay_password() {  # <tenant>, under lifecycle lock
+rotate_tenant_weechat_relay_password() (  # <tenant>, under lifecycle lock; close FDs on every exit
   local name="$1" lw_env wc_env conf port old_pw new_pw
+  local lock marker relay_lock_fd
   local wc_active=false adapter_active=false daemon_active=false
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
@@ -635,6 +703,17 @@ rotate_tenant_weechat_relay_password() {  # <tenant>, under lifecycle lock
   [[ -f "$lw_env" && ! -L "$lw_env" && -f "$wc_env" && ! -L "$wc_env" ]] \
     || die "missing or unsafe relay credential file for '$name'"
   [[ "$(stat -c %h -- "$wc_env")" == 1 ]] || die "unsafe weechat.env hard link"
+  ensure_init_system || return 1
+  _relay_require_start_barrier "$name" \
+    || die "relay start barrier missing; run render-units $name before rotating"
+  lock="$(tenant_env_dir "$name")/.relay-start.lock"
+  marker="$(tenant_env_dir "$name")/.relay-rotation-blocked"
+  [[ -f "$lock" && ! -L "$lock" && "$(stat -c '%h:%a' "$lock")" == 1:600 ]] \
+    || die "missing or unsafe relay start lock; run render-units $name"
+  exec {relay_lock_fd}<"$lock" || return 1
+  # Launchers hold a short shared lock until exec, never for service lifetime.
+  # Taking this BEFORE stop also covers starts already admitted by the guard.
+  flock -x -w 30 "$relay_lock_fd" || die "timed out waiting for relay starts"
   old_pw="$(_read_env_value "$lw_env" RELAY_PASSWORD)"
   [[ -n "$old_pw" && "$old_pw" == "$(_read_env_value "$wc_env" RELAY_PASSWORD)" ]] \
     || die "relay credentials already differ; repair before rotating"
@@ -643,8 +722,10 @@ rotate_tenant_weechat_relay_password() {  # <tenant>, under lifecycle lock
     && [[ "$(<"$conf")" != *"$old_pw"* ]] \
     && _weechat_validate_relay_config "$(tenant_weechat_home "$name")" "$port" "" \
     || die "relay.conf is missing or does not use the validated environment expression"
+  new_pw="$(generate_token | cut -c1-32)"
+  [[ "$new_pw" =~ ^[0-9a-f]{32}$ && "$new_pw" != "$old_pw" ]] \
+    || die "failed to generate a fresh relay password"
 
-  ensure_init_system || return 1
   # A broken user manager must not be mistaken for three stopped services.
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     _systemctl_user "$name" show-environment >/dev/null \
@@ -653,27 +734,18 @@ rotate_tenant_weechat_relay_password() {  # <tenant>, under lifecycle lock
   _relay_service_active "$name" "lunarwing-weechat-$name" && wc_active=true
   _relay_service_active "$name" "lunarwing-weechat-adapter-$name" && adapter_active=true
   _relay_service_active "$name" "lunarwing-$name" && daemon_active=true
-  # Stop consumers before changing either file. The init manager's explicit
-  # stop prevents its automatic Restart=on-failure from firing in this window.
-  local stop_failed=false
-  if [[ "$daemon_active" == true ]]; then
-    _relay_service_action "$name" stop "lunarwing-$name" || stop_failed=true
-  fi
-  if [[ "$adapter_active" == true ]]; then
-    _relay_service_action "$name" stop "lunarwing-weechat-adapter-$name" || stop_failed=true
-  fi
-  if [[ "$wc_active" == true ]]; then
-    _relay_service_action "$name" stop "lunarwing-weechat-$name" || stop_failed=true
-  fi
-  if [[ "$stop_failed" == true ]] \
-    || _relay_service_active "$name" "lunarwing-$name" \
-    || _relay_service_active "$name" "lunarwing-weechat-adapter-$name" \
-    || _relay_service_active "$name" "lunarwing-weechat-$name"; then
+  # Durable fail-closed marker: SIGKILL/reboot/failed rollback must not release
+  # consumers onto a split pair when the kernel drops the exclusive lock.
+  [[ ! -L "$marker" ]] || die "unsafe relay rotation marker"
+  (umask 077; mkdir -p "$marker") || return 1
+  # Stop even inactive/activating services to cancel queued init start jobs.
+  # All operator/self-heal/supervisor starts now fail at the exec boundary.
+  if ! _relay_quiesce_services "$name"; then
+    _relay_release_start_barrier "$marker" "$relay_lock_fd" || return 1
     _relay_restore_services "$name" "$wc_active" "$adapter_active" "$daemon_active" || true
     die "could not quiesce relay consumers; credentials unchanged"
   fi
 
-  new_pw="$(generate_token | cut -c1-32)"
   if ! _relay_env_set_password "$lw_env" "$new_pw" \
     || ! _write_weechat_env "$name" "$new_pw" \
     || [[ "$(_read_env_value "$lw_env" RELAY_PASSWORD)" != "$new_pw" ]] \
@@ -686,19 +758,21 @@ rotate_tenant_weechat_relay_password() {  # <tenant>, under lifecycle lock
     if [[ "$rollback_failed" == true ]] \
       || [[ "$(_read_env_value "$lw_env" RELAY_PASSWORD)" != "$old_pw" ]] \
       || [[ "$(_read_env_value "$wc_env" RELAY_PASSWORD)" != "$old_pw" ]]; then
-      say "CRITICAL: relay rollback failed for '$name'; services remain stopped. Repair both env files before starting." >&2
+      say "CRITICAL: relay rollback failed for '$name'; starts remain blocked. Repair both env files, then rerun rotate-relay-password." >&2
       return 1
     fi
+    _relay_release_start_barrier "$marker" "$relay_lock_fd" || return 1
     _relay_restore_services "$name" "$wc_active" "$adapter_active" "$daemon_active" || true
     say "relay rotation failed; old credentials restored for '$name'" >&2
     return 1
   fi
+  _relay_release_start_barrier "$marker" "$relay_lock_fd" || return 1
   if ! _relay_restore_services "$name" "$wc_active" "$adapter_active" "$daemon_active"; then
     say "relay credentials updated but a service failed to start for '$name'; inspect status and restart via mt-admin" >&2
     return 1
   fi
   say "Rotated WeeChat relay password for tenant '$name' (running services restarted)."
-}
+)
 
 # TensorZero's OpenAI-compatible surface lives under /openai/v1. The daemon's
 # openai_compatible client appends /chat/completions to LLM_BASE_URL, so a bare

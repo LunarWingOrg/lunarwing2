@@ -375,7 +375,9 @@ WeeChat through the root-owned env launcher after `start-stop-daemon --user`
 drops privileges, so no root hook opens the tenant-controlled file. The adapter
 and daemon continue to receive credentials from `lunarwing.env`; OpenRC loads
 those files through the same post-drop launcher rather than shell-sourcing them
-as root.
+as root. On both inits, a final relay launcher reloads `RELAY_PASSWORD` under
+the start barrier described below. For WeeChat it runs **inside the tmux pane**,
+after the server forks, so an older tmux environment cannot supply a stale password.
 
 ### Rotate a relay password
 
@@ -385,16 +387,47 @@ sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password <tenant>
 
 This requires an enabled WeeChat relay with a validated `relay.conf` using
 the literal `${env:RELAY_PASSWORD}` expression and matching existing passwords
-in `lunarwing.env` and `weechat.env`. The command holds the tenant lifecycle
-lock, stops the running daemon, adapter, and WeeChat, writes both credentials,
-then restarts only services that were running beforehand. Expect a brief
-interruption. It does not perform a live WeeChat `/set` or pass the password in
-an external program's arguments. On a failed write it restores both old
-credentials before restarting services; if rollback itself fails, services
-remain stopped and an operator must repair both env files before starting them.
+in `lunarwing.env` and `weechat.env`. **Existing tenants must first run
+`mt-admin render-units <tenant>` from the updated checkout.** Rendering installs
+the root-owned `/usr/local/libexec/lunarwing-relay-env-exec` helper and wires all
+three consumers on systemd and OpenRC. Rotation refuses old deployed units;
+on systemd it checks the user manager's effective `ExecStart` (so a missing
+daemon-reload is also detected).
+
+The command holds the tenant lifecycle lock and an exclusive lock on the stable
+`<env_dir>/.relay-start.lock` inode **before stopping consumers**. Each service
+launcher takes a short shared lock, checks `<env_dir>/.relay-rotation-blocked`,
+reloads its password, and releases the lock on exec. Thus starts already
+admitted are covered by the subsequent stop; operator starts, self-heal restarts,
+and supervisor respawns during rotation fail before running a consumer. The
+lock is not inherited by long-lived workloads. This also avoids using an
+environment that systemd read before rotation began.
+
+Rotation stops all three services (including pending starts), writes both
+credentials, releases the start barrier, then restores services that were
+running beforehand. Restore resets systemd start-limit failures and exhausted
+OpenRC supervisors. Expect a brief interruption. It does not perform a live
+WeeChat `/set` or pass the password in an external program's arguments.
+
+On a failed write it restores both old credentials before releasing the barrier.
+If rollback fails, or rotation is killed, the persistent
+`.relay-rotation-blocked` directory keeps starts blocked even after the lock
+holder exits or the host reboots. To recover, reconcile both env passwords
+(retaining mode `0600` and tenant ownership), then rerun
+`rotate-relay-password <tenant>`. A successful retry removes the marker; use
+`start-tenant <tenant>` if the interrupted operation left the tenant stopped.
+Rendering preserves both the lock inode and any recovery marker. Keep the
+guarded units/helper installed through recovery: downgrading to older units
+would bypass the block.
+
 Check `mt-admin status <tenant>` and run WeeChat preflight after rotation.
-Do not start the affected services concurrently from outside mt-admin: external
-service managers do not participate in its lifecycle lock.
+
+Regression checks: `ic/scripts/tests/test-rotate-relay-password.sh` exercises
+both init transports, the real self-heal restart dispatch, failed writes,
+SIGKILL, and recovery. It also runs the real-process Python start-barrier tests.
+For isolated real WeeChat authentication and save/restart coverage, run
+`RUN_LIVE_RELAY_ROTATION=1 bash ic/scripts/tests/test-relay-password-live.sh`
+as an unprivileged user with WeeChat and tmux installed.
 
 ### Preflight checks
 

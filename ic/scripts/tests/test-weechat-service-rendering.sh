@@ -33,10 +33,12 @@ assert_fail() {  # <label> <cmd...>
 }
 
 assert_ok() {  # <label> <cmd...>
+  local label="$1"
+  shift
   if "$@" >/dev/null 2>&1; then
-    echo "  PASS: $1"
+    echo "  PASS: $label"
   else
-    echo "  FAIL: $1 (expected zero exit)"
+    echo "  FAIL: $label (expected zero exit)"
     failures=$((failures + 1))
   fi
 }
@@ -147,6 +149,8 @@ mkdir -p "$systemd_out"
 ( _render_weechat_systemd_unit "render-test" "$systemd_out" ) || true
 
 unit_file="$systemd_out/lunarwing-weechat-render-test.service"
+assert_ok "systemd gates the pane command, after tmux forks" \
+  grep -q "ExecStart=.*tmux.*new-session.*$RELAY_ENV_EXEC --env-file .*weechat.env -- .*lunarwing-weechat-start.sh" "$unit_file"
 if [[ -f "$unit_file" ]]; then
   echo "  PASS: systemd unit file exists"
 else
@@ -225,6 +229,8 @@ mkdir -p "$openrc_out"
 ( _render_weechat_openrc_unit "render-test" "$openrc_out/lunarwing-weechat-render-test" ) || true
 
 rc_file="$openrc_out/lunarwing-weechat-render-test"
+assert_ok "OpenRC gates the pane command, after tmux forks" \
+  grep -qF "$RELAY_ENV_EXEC --env-file \${weechat_env_file} -- \${weechat_start_helper}" "$rc_file"
 if [[ -f "$rc_file" ]]; then
   echo "  PASS: OpenRC script exists"
 else

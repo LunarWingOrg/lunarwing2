@@ -631,7 +631,7 @@ After=network.target
 
 [Service]
 Type=forking
-ExecStart=$(command -v tmux) -L weechat-${name} new-session -d -s weechat '$start_helper --weechat-bin $weechat_binary --weechat-home ${weechat_home}'
+ExecStart=$(command -v tmux) -L weechat-${name} new-session -d -s weechat '$(command -v python3) $RELAY_ENV_EXEC --env-file $env_dir/weechat.env -- $start_helper --weechat-bin $weechat_binary --weechat-home ${weechat_home}'
 ExecStop=$stop_helper --weechat-home ${weechat_home} --tmux-socket weechat-${name} --session weechat
 TimeoutStopSec=30
 EnvironmentFile=$env_dir/weechat.env
@@ -668,6 +668,11 @@ render_tenant_systemd_units() {
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
   local weechat_enabled=false
   tenant_weechat_enabled "$name" && weechat_enabled=true
+  local relay_exec_prefix=""
+  if [[ "$weechat_enabled" == true ]]; then
+    prepare_relay_start_barrier "$name" || return 1
+    relay_exec_prefix="$(command -v python3) $RELAY_ENV_EXEC --env-file $env_dir/lunarwing.env -- "
+  fi
 
   # Proxy unit (only when enabled)
   if tenant_proxy_enabled "$name"; then
@@ -710,7 +715,7 @@ PartOf=lunarwing-${name}.service
 Type=simple
 WorkingDirectory=$(dirname "$ws_adapter_path")
 EnvironmentFile=$env_dir/lunarwing.env
-ExecStart=$(command -v python3) $ws_adapter_path
+ExecStart=${relay_exec_prefix}$(command -v python3) $ws_adapter_path
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -830,7 +835,7 @@ Type=simple
 WorkingDirectory=$repo
 EnvironmentFile=$env_dir/lunarwing.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/${name}/.cargo/bin
-ExecStart=$repo/target/${PROFILE}/lunarwing --no-onboard run
+ExecStart=${relay_exec_prefix}$repo/target/${PROFILE}/lunarwing --no-onboard run
 Restart=always
 RestartSec=5
 TimeoutStartSec=60
