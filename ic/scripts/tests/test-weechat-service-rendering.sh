@@ -33,10 +33,12 @@ assert_fail() {  # <label> <cmd...>
 }
 
 assert_ok() {  # <label> <cmd...>
+  local label="$1"
+  shift
   if "$@" >/dev/null 2>&1; then
-    echo "  PASS: $1"
+    echo "  PASS: $label"
   else
-    echo "  FAIL: $1 (expected zero exit)"
+    echo "  FAIL: $label (expected zero exit)"
     failures=$((failures + 1))
   fi
 }
@@ -62,8 +64,16 @@ ports_get() {  # <name> <service>
   esac
 }
 
-chown() { :; }
-chmod() { :; }
+# Fixture tenants are not system accounts. Stub the privilege drop so the
+# tenant-side atomic writer runs as the invoking user (CI runners have no
+# "render-test" login). chown/chmod stay real: the writer's inner shell never
+# sees these stubs anyway (fresh bash), and the fixture needs mode 0700 env
+# dirs to satisfy the private-parent policy.
+sudo() {
+  [[ "$1" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
 
 FIXTURE_PASSWORD="render-secret-abc"
 
@@ -71,6 +81,7 @@ write_fixture_env() {  # <tenant>
   local env_dir
   env_dir="$(tenant_env_dir "$1")"
   mkdir -p "$env_dir"
+  chmod 700 "$env_dir"
   cat >"$env_dir/lunarwing.env" <<ENV
 GATEWAY_AUTH_TOKEN=gatewaytok
 XMPP_PASSWORD=xmppsecret
@@ -130,6 +141,7 @@ assert_eq "weechat.env writer uses a unique temp file" \
 
 env_conflict_tenant="render-env-directory-conflict"
 mkdir -p "$(tenant_env_dir "$env_conflict_tenant")/weechat.env"
+chmod 700 "$(tenant_env_dir "$env_conflict_tenant")"
 if _write_weechat_env "$env_conflict_tenant" "$FIXTURE_PASSWORD" >/dev/null 2>&1; then
   echo "  FAIL: weechat.env directory conflict should fail"
   failures=$((failures + 1))
@@ -147,6 +159,8 @@ mkdir -p "$systemd_out"
 ( _render_weechat_systemd_unit "render-test" "$systemd_out" ) || true
 
 unit_file="$systemd_out/lunarwing-weechat-render-test.service"
+assert_ok "systemd gates the pane command, after tmux forks" \
+  grep -q "ExecStart=.*tmux.*new-session.*$RELAY_ENV_EXEC --env-file .*weechat.env -- .*lunarwing-weechat-start.sh" "$unit_file"
 if [[ -f "$unit_file" ]]; then
   echo "  PASS: systemd unit file exists"
 else
@@ -225,6 +239,8 @@ mkdir -p "$openrc_out"
 ( _render_weechat_openrc_unit "render-test" "$openrc_out/lunarwing-weechat-render-test" ) || true
 
 rc_file="$openrc_out/lunarwing-weechat-render-test"
+assert_ok "OpenRC gates the pane command, after tmux forks" \
+  grep -qF "$RELAY_ENV_EXEC --env-file \${weechat_env_file} -- \${weechat_start_helper}" "$rc_file"
 if [[ -f "$rc_file" ]]; then
   echo "  PASS: OpenRC script exists"
 else

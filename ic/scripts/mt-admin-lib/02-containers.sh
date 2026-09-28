@@ -322,7 +322,12 @@ build_sandbox_image() {
     || { say "WARNING: $SANDBOX_DOCKERFILE missing; cannot build sandbox image"; return 1; }
   local runtime
   runtime="$(sandbox_container_runtime "${1:-}")" || return 1
-  "$runtime" build -t "$SANDBOX_IMAGE_TAG" \
+  # On hosts whose Podman bridge cannot reach the host DNS resolver, apt in
+  # the locally built sandbox image cannot resolve deb.debian.org. Match the
+  # worker image builders: host networking is build-only, not sandbox runtime.
+  local -a network_args=()
+  [[ "$runtime" != podman ]] || network_args=(--network=host)
+  "$runtime" build "${network_args[@]}" -t "$SANDBOX_IMAGE_TAG" \
     -f "$SANDBOX_DOCKERFILE" "$REPO_ROOT/docker" >/dev/null \
     || { say "WARNING: sandbox image build failed (run 'build-sandbox-image' to retry)"; return 1; }
   say "sandbox image built: $SANDBOX_IMAGE_TAG"
@@ -809,7 +814,9 @@ _restore_vision_configuration() {
   local name="$1" backup="$2" previous_mode="$3" previous_url="$4"
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
-  mv -T -- "$backup" "$env_path" || return 1
+  write_tenant_file_atomic "$name" "$env_path" 600 <"$backup" \
+    || { rm -f -- "$backup"; return 1; }
+  rm -f -- "$backup"
   ports_set_vision_mode "$name" "$previous_mode" "$previous_url"
   if [[ "$previous_mode" == local ]]; then
     start_tenant_vision "$name" || return 1
@@ -831,8 +838,10 @@ configure_tenant_vision_external() {
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" && ! -L "$env_path" ]] \
     || die "tenant LunarWing environment missing or unsafe"
-  backup="$(mktemp "$(dirname "$env_path")/.vision-rollback.XXXXXX")"
-  cp --preserve=mode,ownership -- "$env_path" "$backup" \
+  # Keep rollback material outside the tenant-writable directory; root owns
+  # this mode-0600 temp and cannot be raced through a tenant-side rename.
+  backup="$(mktemp)"
+  tenant_cat "$name" "$env_path" >"$backup" \
     || { rm -f -- "$backup"; return 1; }
   previous_mode="$(tenant_vision_mode "$name")"
   previous_url="$(tenant_vision_external_url "$name")"
@@ -874,8 +883,8 @@ configure_tenant_vision_local() {
   vision_port="$(ports_get "$name" vision_service)" || true
   _vision_port_valid "$vision_port" || die "local LunarVision service port is invalid"
 
-  backup="$(mktemp "$(dirname "$env_path")/.vision-rollback.XXXXXX")"
-  cp --preserve=mode,ownership -- "$env_path" "$backup" \
+  backup="$(mktemp)"
+  tenant_cat "$name" "$env_path" >"$backup" \
     || { rm -f -- "$backup"; return 1; }
   previous_mode="$(tenant_vision_mode "$name")"
   previous_url="$(tenant_vision_external_url "$name")"
@@ -1234,8 +1243,8 @@ _voice_validate_setting() {
   esac
 }
 
-configure_voice_settings() {
-  local name="$1" voice_env lunarwing_env tmp assignment key value
+configure_voice_settings() (
+  local name="$1" voice_env lunarwing_env tmp stage_dir assignment key value
   shift
   tenant_exists_in_registry "$name" \
     || { say "ERROR: tenant '$name' not found" >&2; return 1; }
@@ -1248,34 +1257,36 @@ configure_voice_settings() {
   [[ -f "$lunarwing_env" && ! -L "$lunarwing_env" ]] \
     || { say "ERROR: tenant LunarWing environment missing or unsafe" >&2; return 1; }
 
-  tmp="$(mktemp "$(dirname "$voice_env")/.voice-config.XXXXXX")" || return 1
-  cp --preserve=mode,ownership -- "$voice_env" "$tmp" \
-    || { rm -f "$tmp"; say "ERROR: failed to stage LunarVoice configuration" >&2; return 1; }
+  stage_dir="$(mktemp -d)" || return 1
+  trap 'rm -rf -- "$stage_dir"' EXIT
+  tmp="$stage_dir/voice.env"
+  if ! tenant_cat "$name" "$voice_env" >"$tmp"; then
+    say "ERROR: failed to stage LunarVoice configuration" >&2
+    return 1
+  fi
+  chmod 600 "$tmp"
   for assignment in "$@"; do
     if [[ "$assignment" != *=* ]]; then
-      rm -f "$tmp"; say "ERROR: invalid voice setting" >&2; return 1
+      say "ERROR: invalid voice setting" >&2; return 1
     fi
     key="${assignment%%=*}"
     value="${assignment#*=}"
     if ! _voice_validate_setting "$key" "$value"; then
-      rm -f "$tmp"; say "ERROR: invalid value for $key" >&2; return 1
+      say "ERROR: invalid value for $key" >&2; return 1
     fi
     _env_set "$tmp" "$key" "$value"
   done
   if tenant_voice_enabled "$name" && ! _voice_models_ready_env "$tmp"; then
-    rm -f "$tmp"
     say "ERROR: configured STT model is not verified under $VOICE_MODELS_DIR" >&2
     return 1
   fi
-  mv -T -- "$tmp" "$voice_env"
-  chmod 0600 "$voice_env"
-  chown "$name:$name" "$voice_env"
+  write_tenant_file_atomic "$name" "$voice_env" 600 <"$tmp" || return 1
   if [[ "$(_env_existing "$lunarwing_env" TRANSCRIPTION_PROVIDER)" == lunarvoice ]]; then
     _env_set "$lunarwing_env" TRANSCRIPTION_MODEL \
       "$(_env_existing "$voice_env" VOICE_STT_MODEL)"
   fi
   say "LunarVoice configuration updated for $name"
-}
+)
 
 install_voice_models() {
   local manifest="$1" installer="$SOURCE_REPO/projects/voice-sidecar/scripts/download-models.sh"
@@ -1343,10 +1354,10 @@ configure_tenant_voice() {
     || die "LunarVoice is not installed for $name; run install-voice first"
   [[ -f "$lunarwing_env" && ! -L "$lunarwing_env" ]] \
     || die "tenant LunarWing environment missing or unsafe"
-  voice_backup="$(mktemp "$(dirname "$voice_env")/.voice-rollback.XXXXXX")"
-  lunarwing_backup="$(mktemp "$(dirname "$lunarwing_env")/.lunarwing-rollback.XXXXXX")"
-  cp --preserve=mode,ownership -- "$voice_env" "$voice_backup" \
-    && cp --preserve=mode,ownership -- "$lunarwing_env" "$lunarwing_backup" \
+  voice_backup="$(mktemp)"
+  lunarwing_backup="$(mktemp)"
+  tenant_cat "$name" "$voice_env" >"$voice_backup" \
+    && tenant_cat "$name" "$lunarwing_env" >"$lunarwing_backup" \
     || { rm -f -- "$voice_backup" "$lunarwing_backup"; return 1; }
 
   configure_voice_settings "$name" "$@" || {
@@ -1361,8 +1372,11 @@ configure_tenant_voice() {
   fi
 
   say "ERROR: LunarVoice configuration failed; restoring previous settings" >&2
-  mv -T -- "$voice_backup" "$voice_env"
-  mv -T -- "$lunarwing_backup" "$lunarwing_env"
+  write_tenant_file_atomic "$name" "$voice_env" 600 <"$voice_backup" \
+    || { rm -f -- "$voice_backup" "$lunarwing_backup"; return 1; }
+  write_tenant_file_atomic "$name" "$lunarwing_env" 600 <"$lunarwing_backup" \
+    || { rm -f -- "$voice_backup" "$lunarwing_backup"; return 1; }
+  rm -f -- "$voice_backup" "$lunarwing_backup"
   if tenant_voice_enabled "$name"; then
     start_tenant_voice "$name" \
       || say "WARNING: failed to restore the previous LunarVoice runtime" >&2
@@ -1430,13 +1444,19 @@ deactivate_tenant_voice() {
 }
 
 _voice_remove_daemon_credentials() {
-  local path="$1" tmp
+  local path="$1" name staged rc=1
   [[ -f "$path" && ! -L "$path" ]] || die "tenant LunarWing environment missing or unsafe"
-  tmp="$(mktemp "$(dirname "$path")/.voice-remove.XXXXXX")"
-  awk '!/^(VOICE_SERVICE_URL|VOICE_AUTH_TOKEN)=/' "$path" >"$tmp"
-  chmod --reference="$path" "$tmp"
-  chown --reference="$path" "$tmp"
-  mv -T -- "$tmp" "$path"
+  name="$(stat -c %U -- "$(dirname "$path")")" || return 1
+  # Stage the filtered result first: a failed tenant-side read must leave the
+  # environment untouched instead of publishing an empty replacement.
+  staged="$(mktemp)" || return 1
+  if tenant_cat "$name" "$path" \
+      | awk '!/^(VOICE_SERVICE_URL|VOICE_AUTH_TOKEN)=/' >"$staged" \
+    && write_tenant_file_atomic "$name" "$path" 600 <"$staged"; then
+    rc=0
+  fi
+  rm -f -- "$staged"
+  return "$rc"
 }
 
 remove_tenant_voice() {

@@ -31,6 +31,7 @@ source "$SCRIPTS_DIR/lunarwing-mt-admin.sh"
 PORTS_REGISTRY="$registry"
 env_dir="$ROOT/env"
 mkdir -p "$env_dir"
+chmod 700 "$env_dir"
 cat >"$env_dir/voice.env" <<'ENV'
 VOICE_ENABLED=false
 VOICE_AUTH_TOKEN=stable-token
@@ -52,6 +53,15 @@ VOICE_MODELS_DIR="$ROOT/models"
 mkdir -p "$VOICE_MODELS_DIR"
 hash64=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 chown() { :; }  # No root in the test harness; tenant users do not exist.
+tenant_cat() { cat -- "$2"; }
+original_writer="$(declare -f write_tenant_file_atomic)"
+eval "${original_writer/write_tenant_file_atomic ()/original_write_tenant_file_atomic ()}"
+write_tenant_file_atomic() {
+  local name="$1"
+  shift
+  [[ "$name" != alpha ]] || name="$(id -un)"
+  original_write_tenant_file_atomic "$name" "$@"
+}
 
 write_tenant_voice_env alpha >/dev/null
 assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_STT_ENGINE)" whisper "voice env defaults to whisper engine"

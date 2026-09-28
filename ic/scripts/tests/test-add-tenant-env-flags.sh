@@ -73,6 +73,7 @@ tenant_env_dir()    { echo "$MT_FIXTURE/env"; }
 tenant_state_dir()  { echo "$MT_FIXTURE/state"; }
 tenant_run_dir()    { echo "$MT_FIXTURE/run"; }
 mkdir -p "$MT_FIXTURE/env" "$MT_FIXTURE/state" "$MT_FIXTURE/run"
+chmod 700 "$MT_FIXTURE/env"
 
 # Stub ports_get to return deterministic ports. Restore the real implementation
 # for registry migration/lookup tests below.

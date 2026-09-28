@@ -2,9 +2,10 @@
 
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
-**Revalidated against source 2026-09-19 (v2.1.2.0).** Module map, gate types,
+**Revalidated against source 2026-09-28 (v2.1.3.0).** Module map, gate types,
 mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
-re-checked against the current tree; updates for 2.1.1.0 include the
+re-checked against the current tree, including the landed WI#227 sealed step
+records; updates for 2.1.1.0 include the
 best-effort `thread_start` event dispatch (item 9/WI#109 scope A) and the
 `ENGINE_V2_CHANNELS` routing-policy clarification (there is no `none`
 opt-out; unknown entries are ignored). Updates for 2.1.2.0 include the

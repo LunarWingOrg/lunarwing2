@@ -30,6 +30,12 @@ _DAEMON_LINE_RE = re.compile(
 
 # States that mean the daemon is up under either init.
 _UP_STATES = frozenset({"active", "started", "running"})
+_WORKER_LABELS = {
+    "pebble": "Pebble worker",
+    "opencode": "OpenCode worker",
+    "kimi": "Kimi worker",
+    "opencode2": "OpenCode 2 worker",
+}
 
 
 @dataclass
@@ -72,13 +78,18 @@ def parse_daemon_state(status_output: str, tenant: str) -> tuple[bool | None, st
     return None, "daemon service line not found in mt-admin status"
 
 
-def check_service_status(
+def check_tenant_status(
     tenant: str,
     *,
+    workers: Sequence[str] = (),
+    require_postgres: bool = True,
     script: str | None = None,
     runner: Callable[[Sequence[str]], Any] | None = None,
-) -> CheckResult:
-    """Return a CheckResult for the tenant daemon via ``mt-admin status``.
+) -> list[CheckResult]:
+    """Check the daemon and required containers from one mt-admin status call.
+
+    An active init unit is not proof that Podman can see its container. Require
+    the runtime-backed PostgreSQL and selected-worker lines as well.
 
     *script* overrides the resolved mt-admin path (tests). *runner* is an
     optional ``(argv) -> CompletedProcess-like`` hook for unit tests.
@@ -92,7 +103,7 @@ def check_service_status(
         else:
             admin = script
     except FileNotFoundError as exc:
-        return CheckResult(label, False, str(exc))
+        return [CheckResult(label, False, str(exc))]
 
     argv = [admin, "status", tenant]
     try:
@@ -106,7 +117,7 @@ def check_service_status(
                 timeout=30,
             )
     except (OSError, subprocess.SubprocessError) as exc:
-        return CheckResult(label, False, str(exc))
+        return [CheckResult(label, False, str(exc))]
 
     text = result.stdout or ""
     if result.stderr:
@@ -114,12 +125,34 @@ def check_service_status(
 
     if result.returncode != 0:
         detail = text.strip()[:300] or f"mt-admin status exit {result.returncode}"
-        return CheckResult(label, False, detail)
+        return [CheckResult(label, False, detail)]
 
     ok, detail = parse_daemon_state(text, tenant)
-    if ok is None:
-        return CheckResult(label, False, detail)
-    return CheckResult(label, ok, detail)
+    results = [CheckResult(label, bool(ok), detail)]
+    labels = ["PostgreSQL"] if require_postgres else []
+    for worker in workers:
+        if worker not in _WORKER_LABELS:
+            results.append(CheckResult(f"worker {worker}", False, "unknown worker"))
+        else:
+            labels.append(_WORKER_LABELS[worker])
+    for container_label in labels:
+        match = re.search(rf"^[ \t]*{re.escape(container_label)}:[ \t]*(.+)$", text, re.MULTILINE)
+        state = match.group(1).strip() if match else "container line not found in mt-admin status"
+        running = bool(match and state.split() and state.split()[0] == "running")
+        results.append(CheckResult(container_label, running, state))
+    return results
+
+
+def check_service_status(
+    tenant: str,
+    *,
+    script: str | None = None,
+    runner: Callable[[Sequence[str]], Any] | None = None,
+) -> CheckResult:
+    """Daemon-only check retained for callers that explicitly request it."""
+    return check_tenant_status(
+        tenant, require_postgres=False, script=script, runner=runner
+    )[0]
 
 
 def verify_tenant(
@@ -127,10 +160,11 @@ def verify_tenant(
     host: str = "127.0.0.1",
     port: int = 0,
     *,
+    workers: Sequence[str] = (),
     timeout: int = DEFAULT_TIMEOUT,
     script: str | None = None,
 ) -> list[CheckResult]:
-    """Poll optional TCP port + mt-admin status until healthy or *timeout*.
+    """Poll gateway, daemon, PostgreSQL and selected workers until *timeout*.
 
     Returns a list of CheckResult items for display.
     """
@@ -141,7 +175,7 @@ def verify_tenant(
         results.clear()
         if port:
             results.append(check_port(host, port))
-        results.append(check_service_status(tenant, script=script))
+        results.extend(check_tenant_status(tenant, workers=workers, script=script))
         if all(r.ok for r in results):
             return results
         time.sleep(POLL_INTERVAL)

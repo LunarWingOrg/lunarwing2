@@ -375,7 +375,78 @@ WeeChat through the root-owned env launcher after `start-stop-daemon --user`
 drops privileges, so no root hook opens the tenant-controlled file. The adapter
 and daemon continue to receive credentials from `lunarwing.env`; OpenRC loads
 those files through the same post-drop launcher rather than shell-sourcing them
-as root.
+as root. On both inits, a final relay launcher reloads `RELAY_PASSWORD` under
+the start barrier described below. For WeeChat it runs **inside the tmux pane**,
+after the server forks, so an older tmux environment cannot supply a stale password.
+
+### Rotate a relay password
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password <tenant>
+```
+
+This requires an enabled WeeChat relay with a validated `relay.conf` using
+the literal `${env:RELAY_PASSWORD}` expression and matching existing passwords
+in `lunarwing.env` and `weechat.env`. **Existing tenants must first run
+`mt-admin render-units <tenant>` from the updated checkout.** Rendering installs
+the root-owned `/usr/local/libexec/lunarwing-relay-env-exec` helper and wires all
+three consumers on systemd and OpenRC. Rotation refuses old deployed units;
+on systemd it checks the user manager's effective `ExecStart` (so a missing
+daemon-reload is also detected).
+
+The command holds the tenant lifecycle lock and an exclusive lock on the stable
+`<env_dir>/.relay-start.lock` inode **before stopping consumers**. Each service
+launcher takes a short shared lock, checks `<env_dir>/.relay-rotation-blocked`,
+reloads its password, and releases the lock on exec. Thus starts already
+admitted are covered by the subsequent stop; operator starts, self-heal restarts,
+and supervisor respawns during rotation fail before running a consumer. The
+lock is not inherited by long-lived workloads. This also avoids using an
+environment that systemd read before rotation began.
+
+Rotation stops all three services (including pending starts), writes both
+credentials, releases the start barrier, then restores services that were
+running beforehand. Restore resets systemd start-limit failures and exhausted
+OpenRC supervisors. Expect a brief interruption. It does not perform a live
+WeeChat `/set` or pass the password in an external program's arguments.
+The `env/` directory is mode `0700` and owned by the host tenant account.
+Podman sandboxed tool processes cannot access it, but a host process running
+as that account can. The two credential updates and tenant-owned env patches
+therefore read/write under the tenant UID, then atomically rename; root must
+not reopen a temporary filename inside the tenant-writable directory. This
+protects the host root/tenant boundary, not just the container sandbox.
+Tenant-owned capability files under `state/` use the same privilege-drop
+pattern; their parent directories may be readable but must not be writable by
+other users.
+The tenant-side atomic writer commits whatever bytes reach its stdin, so
+fallible producers (jq rewrites, tenant-side reads) must stage their complete
+result in root-private storage and check the producer's exit status first;
+only then is the staged file handed to the tenant-side commit. A failed
+producer therefore leaves the previous file byte-for-byte intact.
+
+On a failed write it restores both old credentials before releasing the barrier.
+If rollback fails, or rotation is killed, the persistent
+`.relay-rotation-blocked` directory keeps starts blocked even after the lock
+holder exits or the host reboots. To recover, reconcile both env passwords
+(retaining mode `0600` and tenant ownership), then rerun
+`rotate-relay-password <tenant>`. A successful retry removes the marker; use
+`start-tenant <tenant>` if the interrupted operation left the tenant stopped.
+Rendering preserves both the lock inode and any recovery marker. Keep the
+guarded units/helper installed through recovery: downgrading to older units
+would bypass the block.
+
+Check `mt-admin status <tenant>` and run WeeChat preflight after rotation.
+
+Regression checks: `ic/scripts/tests/test-rotate-relay-password.sh` exercises
+both init transports, the real self-heal restart dispatch, failed writes,
+SIGKILL, recovery, and rejected symlink destinations. It also runs the
+real-process Python start-barrier tests.
+`ic/scripts/tests/test-mt-admin-tenant-capability-writers.sh` covers the
+related tenant-owned capability-file rewrites, including producer-failure
+containment (a failing jq or tenant-side read must not publish a partial
+replacement).
+For isolated real WeeChat authentication and save/restart coverage, run
+`RUN_LIVE_RELAY_ROTATION=1 bash ic/scripts/tests/test-relay-password-live.sh`
+as an unprivileged user with WeeChat and tmux installed.
 
 ### Preflight checks
 
@@ -624,13 +695,18 @@ rm -f /tmp/tmux-$(id -u <name>)/weechat-<name>
 
 **Symptom**: Adapter connects but authentication fails.
 
-The `RELAY_PASSWORD` in `lunarwing.env` must exactly match the value set inside WeeChat via `/set relay.network.password`. Attach to WeeChat and verify:
+The `RELAY_PASSWORD` in `lunarwing.env` must match `weechat.env`, and
+`relay.conf` must retain `${env:RELAY_PASSWORD}` rather than plaintext.
+Check this without printing either credential via the WeeChat preflight. For
+an existing mismatch, stop both services and repair both env files before
+starting them; use `rotate-relay-password` for subsequent managed rotations.
+Attach to WeeChat to verify the expression:
 
 ```
 /set relay.network.password
 ```
 
-If they differ, update one to match the other and restart the adapter.
+Never paste the secret into the session or a command-line argument.
 
 ### CLI pairing approve fails with "no pairing file"
 

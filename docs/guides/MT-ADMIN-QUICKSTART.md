@@ -4,20 +4,22 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19.**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0).**
 Every referenced mt-admin
 subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 `patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,
 `tokens`, WeeChat bootstrap recovery) was re-checked against
 `ic/scripts/lunarwing-mt-admin.sh`; no changes were needed beyond adding the
 v2.1.2.0 `fix-podman-userns` repair command below. The 2026-09-19 repass added
-the `opencode2` worker to the single-worker restart example. **Migration note
+the `opencode2` worker to the single-worker restart example. The 2026-09-27
+repass added the v2.1.3.0 (WI#223) `build-sandbox-image` command and the
+new-tenant `SANDBOX_IMAGE`/`SANDBOX_AUTO_PULL=false` defaults. **Migration note
 (WI#154/155):** `SANDBOX_NETWORK` defaults to `none` everywhere. Existing
 explicit `proxy` settings are preserved (mt-admin renders `none` only when
 unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
 (enforced; local Linux runtime + Python-3 image required) or the legacy
 advisory `proxy`. See
-[`../ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](../ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+[`../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
 
 ## 1. Install Host Prerequisites
 
@@ -117,7 +119,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm
 sudo ic/scripts/lunarwing-mt-admin.sh install-wasm ruffles
 ```
 
-MT admin serializes tenant builds to avoid concurrent memory pressure. `--with-wasm` builds current registry channel/tool sources; `install-wasm` publishes the resulting artifacts and capability sidecars into the tenant state directories.
+MT admin serializes tenant builds to avoid concurrent memory pressure. `--with-wasm` builds current registry channel/tool sources; `install-wasm` publishes the resulting artifacts and capability sidecars into the tenant state directories. On a fresh install, it assigns ownership to the tenant before patching WeeChat's generic capability ports to the allocated tenant ports; a separate `start-tenant` is not required for that patch.
 
 Build optional shared components before starting tenants that require them:
 
@@ -129,6 +131,16 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-opencode2-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-vision-sidecar
 ```
+
+Since v2.1.3.0 (WI#223) new tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_RUNTIME=podman` and `SANDBOX_AUTO_PULL=false`. `add-tenant` builds the lean generic sandbox image (from `ic/docker/sandbox.Dockerfile`) into the shared rootful store and distributes it into the tenant's rootless store automatically; if that step failed or the image was later removed, rebuild and redistribute it explicitly (optional tenant name selects that tenant's configured runtime):
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image [tenant]
+```
+
+`start-tenant` also reconciles a missing tenant-side sandbox image as a safety net. See [`../ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md`](../ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md) for the three-store diagnosis when sandboxed shell executions fail after an upgrade.
+
+On Podman hosts, the **admin-store image build** uses `--network=host` so its Debian package installation can resolve DNS even where Podman's default build bridge cannot. This applies only to the trusted, repository-owned Dockerfile during image construction; it does not change tenant sandbox execution networking (`SANDBOX_NETWORK`) or the Docker fallback build.
 
 Run only the builds selected for the deployment. Nanocode is retired; its registry slots remain reserved for compatibility but it is not a runnable worker.
 
@@ -177,6 +189,12 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-weechat-relay ruffles
 sudo ic/scripts/lunarwing-weechat-preflight.sh ruffles
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant ruffles
 ```
+
+Rotate an already-configured relay password with
+`sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password ruffles`.
+This briefly stops and restarts the running WeeChat, adapter, and daemon;
+it preserves the literal environment expression in `relay.conf`. Run the
+preflight afterward. The verb refuses mismatched existing env credentials.
 
 For architecture, service details, and upgrades, read [`../ops/WEECHAT-SERVICES.md`](../ops/WEECHAT-SERVICES.md) and [`lunarwing_weechat_wss/README.md`](lunarwing_weechat_wss/README.md).
 

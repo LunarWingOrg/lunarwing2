@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-19)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-28)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -131,3 +131,15 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > checks addressed in the MR !1041 review; `cron-wrapper` validates the
 > scheduled launcher PATH hygiene (WI#180 F3). The audit's detection/remedy
 > table still describes the self-heal pipeline itself.
+>
+> **Update (2026-09-28, v2.1.3.0):** the `ORDER` list is unchanged in the
+> 2.1.3.0 cycle; `bash tests/run-all.sh --list` currently registers **19**
+> suites. The 2026-09-19 entry above overcounted by one (it said 20): the
+> canonical list it quotes is the same 19 suites
+> (`regression matrix chaos openrc systemd lunarvision init-templates
+> lunarvoice voice-init-templates netbird llm-streams metrics-exporter
+> metrics-unit watchdog watchdog-openrc cron-wrapper runtime knowledge
+> gateway`). No self-heal pipeline script changed in the 2.1.3.0 cycle; the
+> release's tenant-env work (WI#239) lives in mt-admin env generation, not the
+> host health pipeline.
+

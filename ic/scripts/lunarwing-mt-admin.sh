@@ -65,6 +65,8 @@ DARKIRC_WRITER_SCOPE=""
 DARKIRC_WRITER_LOCK_INHERITED="false"
 OPENRC_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-openrc-env-exec.sh"
 OPENRC_ENV_EXEC="/usr/local/libexec/lunarwing-openrc-env-exec"
+RELAY_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-relay-env-exec.py"
+RELAY_ENV_EXEC="/usr/local/libexec/lunarwing-relay-env-exec"
 OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
 OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
@@ -472,6 +474,8 @@ Commands:
   configure-weechat-relay <name>   Generate WeeChat relay config for a tenant.
                                    Preserves existing config: fails on any
                                    non-empty ~/.config/weechat without modifying it.
+  rotate-relay-password <name>     Rotate WeeChat relay credentials and restart
+                                   running consumers (brief service interruption).
 
   disable-weechat <name>           Disable WeeChat for a tenant: stops its (optional)
   enable-weechat <name>            weechat units and removes their boot persistence
@@ -1418,6 +1422,16 @@ main() {
       ports_registry_init
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
       configure_weechat_relay "$name"
+      ;;
+
+    rotate-relay-password)
+      [[ -n "${1:-}" && $# -eq 1 ]] || die "usage: rotate-relay-password <name>"
+      require_root
+      local name
+      name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+      with_tenant_lifecycle_lock "$name" rotate_tenant_weechat_relay_password "$name"
       ;;
 
     disable-weechat|enable-weechat)

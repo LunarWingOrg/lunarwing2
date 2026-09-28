@@ -1,6 +1,6 @@
 # IRC Sender Identity
 
-**Revalidated against source 2026-09-12 (v2.1.2.0).** Principal formats
+**Revalidated against source 2026-09-28 (v2.1.3.0).** Principal formats
 (`darkirc:nick:<case-folded-nick>`, `account:<network>:…` /
 `nick:<network>:…`, `weechat:dm:v2:<principal>`,
 `weechat:group:<network>:<target>`), the owner-actor settings, and the

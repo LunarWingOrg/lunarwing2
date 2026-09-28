@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-09-19, v2.1.2.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics)
+**Date:** 2026-06-13 (revalidated 2026-09-28, v2.1.3.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
@@ -185,6 +185,23 @@ daemon and PostgreSQL are down. Since 2.1.2.0:
   misclassified as quiesced; `crashed` counts as not writing (the container
   branch stays authoritative). Runtime-absent tenants classify as quiesced
   (WI#135 followup).
+
+### Relay rotation start exclusion (2.1.3.0, WI#202)
+
+The daemon, WeeChat adapter, and WeeChat pane now enter through the same
+credential start barrier on systemd user units and OpenRC. `render-units`
+installs the launcher; `rotate-relay-password` refuses unguarded deployed units.
+The barrier covers self-heal's existing `restart_service` dispatch, direct init
+starts, and supervisor respawns. Rotation takes its exclusive lock before
+stopping consumers; launchers hold a shared lock through password loading until
+exec. Starts during the swap fail before a credential consumer runs. A durable
+recovery marker inhibits starts after an interrupted rotation or failed
+rollback, including across reboot. Self-heal cannot clear that marker.
+
+See [WeeChat relay rotation](../ops/WEECHAT-SERVICES.md#rotate-a-relay-password)
+for deployment and recovery. Rotation releases the barrier before restoring
+services and clears start-limit/exhausted-supervisor state caused by concurrent
+denied restarts.
 
 ### WI#180 health-system parity (2.1.2.0)
 

@@ -287,7 +287,7 @@ description="WeeChat IRC client ($name)"
 : "\${weechat_stop_helper:=$stop_helper}"
 
 command="\${weechat_openrc_env_exec}"
-command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '\${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}'"
+command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '$(command -v python3) $RELAY_ENV_EXEC --env-file \${weechat_env_file} -- \${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}'"
 command_user="\${weechat_user}:\${weechat_group}"
 pidfile="\${weechat_pidfile}"
 required_files="\${weechat_openrc_env_exec} \${weechat_command} \${weechat_binary} \${weechat_start_helper} \${weechat_env_file}"
@@ -307,7 +307,7 @@ start() {
         --exec "\${weechat_openrc_env_exec}" -- \\
         --env-file "\${weechat_env_file}" -- "\${weechat_command}" \\
         -L weechat-${name} new-session -d -s weechat \
-        "\${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}"
+        "$(command -v python3) $RELAY_ENV_EXEC --env-file \${weechat_env_file} -- \${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}"
     start_rc=\$?
     if [ "\${start_rc}" -eq 0 ]; then
         # tmux new-session -d returns immediately and the real work runs in the
@@ -566,6 +566,11 @@ render_tenant_openrc_units() {
   ws_adapter_dir="$(dirname "$ws_adapter_path")"
   local weechat_enabled=false
   tenant_weechat_enabled "$name" && weechat_enabled=true
+  local relay_exec_prefix=""
+  if [[ "$weechat_enabled" == true ]]; then
+    prepare_relay_start_barrier "$name" || return 1
+    relay_exec_prefix="$(command -v python3) $RELAY_ENV_EXEC --env-file $env_dir/lunarwing.env -- "
+  fi
 
   local darkirc_rc_after=""
   if tenant_darkirc_enabled "$name"; then
@@ -870,7 +875,7 @@ stop() {
 }
 
 command="\${lunarwing_openrc_env_exec}"
-command_args="--env-file \${lunarwing_env_file} -- \${lunarwing_command} \${lunarwing_args}"
+command_args="--env-file \${lunarwing_env_file} -- ${relay_exec_prefix}\${lunarwing_command} \${lunarwing_args}"
 command_user="\${lunarwing_user}:\${lunarwing_group}"
 directory="\${lunarwing_workdir}"
 pidfile="\${lunarwing_pidfile}"
@@ -1106,7 +1111,7 @@ description="LunarWing WeeChat WS adapter ($name)"
 : "\${adapter_retry:=SIGTERM/30/KILL/5}"
 
 command="\${adapter_openrc_env_exec}"
-command_args="--env-file \${adapter_env_file} -- \${adapter_command} \${adapter_args}"
+command_args="--env-file \${adapter_env_file} -- ${relay_exec_prefix}\${adapter_command} \${adapter_args}"
 command_user="\${adapter_user}:\${adapter_group}"
 directory="$ws_adapter_dir"
 pidfile="\${adapter_pidfile}"

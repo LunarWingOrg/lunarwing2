@@ -41,11 +41,11 @@ function boundedEnvInteger(name: string, fallback: number, min: number, max: num
 }
 
 function progressHeartbeatMs(): number {
-  return boundedEnvInteger("KIMI_PROGRESS_HEARTBEAT_MS", 60_000, 0, 300_000)
+  return boundedEnvInteger("KIMI_PROGRESS_HEARTBEAT_MS", 120_000, 0, 300_000)
 }
 
 function killGraceMs(): number {
-  return boundedEnvInteger("KIMI_KILL_GRACE_MS", 5_000, 100, 30_000)
+  return boundedEnvInteger("KIMI_KILL_GRACE_MS", 7_000, 100, 30_000)
 }
 
 function maxOutputBytes(): number {
@@ -140,7 +140,7 @@ export async function executeTask(
   let lastProgressAt = Date.now()
 
   // Bounds on in-memory accumulation for long/verbose runs (default task
-  // timeout is 1h). Progress is streamed live, so truncating loses nothing
+  // timeout is 4h). Progress is streamed live, so truncating loses nothing
   // operationally; the canonical result only needs the LAST non-empty
   // assistant message, so old messages can be dropped safely.
   const STDERR_CAP = 65_536

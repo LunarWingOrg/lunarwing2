@@ -33,7 +33,7 @@
           "task_id":     "string — unique task identifier",
           "prompt":      "string — natural-language task description",
           "context":     "object — optional TaskContext. conversation_history contains bounded user/assistant messages used only as untrusted JSON reference context; metadata, environment, and user_id are never added to model prompts",
-          "timeout_ms":  "integer — hard deadline for the task (default 3600000)"
+          "timeout_ms":  "integer — hard deadline for the task (default 14400000)"
         }
       },
       "cancel": {

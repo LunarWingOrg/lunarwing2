@@ -315,6 +315,14 @@ rootless-CLI pattern the mt-admin external-worker tooling uses, and it keeps
 the sandbox usable on OpenRC hosts where no `podman system service` socket
 exists.
 
+Client-version detection uses `podman version --format` rather than
+`podman --version`. The subcommand bypasses Podman's rootless namespace
+constructor; on Podman 6.1.2, the flag form can delete a valid `pause.pid` when
+the hardened daemon cannot inspect the pause process. Runtime operations still
+use the isolated workload context, including the background reaper's list and
+remove commands with bounded execution and guarded process-tree cleanup. See
+`docs/bugs/BUG-workload-scope-podman-userns.md` for the live reproduction.
+
 > **BOUNDARY:** the generic sandbox (`src/sandbox/`, CLI runner,
 > `lunarwing.sandbox` container labels) is separate from the orchestrator's
 > live worker-container path (`src/orchestrator/job_manager.rs`, bollard,

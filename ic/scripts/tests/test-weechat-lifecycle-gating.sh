@@ -88,6 +88,7 @@ tenant_proxy_enabled() { return 1; }
 tenant_darkirc_enabled() { return 1; }
 podman_supports_quadlet() { return 1; }
 install_openrc_env_exec() { :; }
+prepare_relay_start_barrier() { :; }
 render_container_babysitter_unit() { :; }
 ensure_container_runtime() {
   # Globals consumed by sourced renderers.
@@ -124,6 +125,8 @@ assert_file "enabled systemd backend rendered" "$SYSTEMD_BACKEND"
 assert_file "enabled systemd adapter rendered" "$SYSTEMD_ADAPTER"
 assert_contains "enabled systemd main wants backend" "$SYSTEMD_MAIN" "lunarwing-weechat-${TENANT}.service"
 assert_contains "enabled systemd main wants adapter" "$SYSTEMD_MAIN" "lunarwing-weechat-adapter-${TENANT}.service"
+assert_contains "systemd main uses relay start barrier" "$SYSTEMD_MAIN" "$RELAY_ENV_EXEC --env-file $(tenant_env_dir "$TENANT")/lunarwing.env -- "
+assert_contains "systemd adapter uses relay start barrier" "$SYSTEMD_ADAPTER" "$RELAY_ENV_EXEC --env-file $(tenant_env_dir "$TENANT")/lunarwing.env -- "
 
 mkdir -p "$SYSTEMD_DIR/default.target.wants"
 ln -s "$SYSTEMD_BACKEND" "$SYSTEMD_DIR/default.target.wants/lunarwing-weechat-${TENANT}.service"
@@ -140,6 +143,7 @@ assert_no_file "disabled systemd backend enable link removed" "$SYSTEMD_DIR/defa
 assert_no_file "disabled systemd adapter enable link removed" "$SYSTEMD_DIR/default.target.wants/lunarwing-weechat-adapter-${TENANT}.service"
 assert_not_contains "disabled systemd main drops backend dependency" "$SYSTEMD_MAIN" "lunarwing-weechat-${TENANT}.service"
 assert_not_contains "disabled systemd main drops adapter dependency" "$SYSTEMD_MAIN" "lunarwing-weechat-adapter-${TENANT}.service"
+assert_not_contains "disabled systemd main drops relay barrier" "$SYSTEMD_MAIN" "$RELAY_ENV_EXEC"
 
 echo "=== OpenRC rendering and dependency gating ==="
 write_weechat_flag true
@@ -155,6 +159,8 @@ assert_file "enabled OpenRC adapter rendered" "$OPENRC_ADAPTER"
 assert_contains "enabled OpenRC main orders after backend" "$OPENRC_MAIN" "lunarwing-weechat-${TENANT}"
 assert_contains "enabled OpenRC main needs backend" "$OPENRC_MAIN_CONF" "lunarwing-weechat-${TENANT}"
 assert_contains "OpenRC main consumes configured optional dependencies" "$OPENRC_MAIN" 'want ${lunarwing_rc_need}'
+assert_contains "OpenRC main uses relay start barrier" "$OPENRC_MAIN" "$RELAY_ENV_EXEC --env-file $(tenant_env_dir "$TENANT")/lunarwing.env -- "
+assert_contains "OpenRC adapter uses relay start barrier" "$OPENRC_ADAPTER" "$RELAY_ENV_EXEC --env-file $(tenant_env_dir "$TENANT")/lunarwing.env -- "
 
 ln -s "$OPENRC_BACKEND" "$OPENRC_RUNLEVELS_DIR/default/lunarwing-weechat-${TENANT}"
 ln -s "$OPENRC_ADAPTER" "$OPENRC_RUNLEVELS_DIR/default/lunarwing-weechat-adapter-${TENANT}"
@@ -168,6 +174,7 @@ assert_no_file "disabled OpenRC backend runlevel link removed" "$OPENRC_RUNLEVEL
 assert_no_file "disabled OpenRC adapter runlevel link removed" "$OPENRC_RUNLEVELS_DIR/default/lunarwing-weechat-adapter-${TENANT}"
 assert_not_contains "disabled OpenRC main drops backend ordering" "$OPENRC_MAIN" "lunarwing-weechat-${TENANT}"
 assert_not_contains "disabled OpenRC main drops backend need" "$OPENRC_MAIN_CONF" "lunarwing-weechat-${TENANT}"
+assert_not_contains "disabled OpenRC main drops relay barrier" "$OPENRC_MAIN" "$RELAY_ENV_EXEC"
 
 echo "=== strict systemd lifecycle ==="
 write_weechat_flag true

@@ -6,7 +6,7 @@ the gateway with their normal bearer token; the gateway holds the sidecar
 credential server-side (`VOICE_AUTH_TOKEN`) and clients never see it. This is
 the LunarWing-side half of desktop goal #19 (`lunarwing/lunarwing2desktop`).
 
-**Revalidated against source 2026-09-17 (v2.1.2.0).** The enabling knobs,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0).** The enabling knobs,
 loopback-only `VOICE_SERVICE_URL` invariants, default sidecar port (8090), and
 the integration test were re-checked against `ic/src/channels/web/voice.rs` and
 `ic/tests/voice_gateway_integration.rs`; no changes were needed.

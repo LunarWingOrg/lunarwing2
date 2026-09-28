@@ -2,7 +2,7 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19.**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0).**
 Referenced ops runbook,
 `ic/scripts/release-test.sh`, and the channel/worker/multi-tenant tiers were
 re-checked against the current tree. Added the v2.1.2.0 durable cross-channel
@@ -10,7 +10,9 @@ attachment tier below; worker cancellation now exercises the cancel-ack
 handoff (bounded ~3s wait for the worker's terminal `task_result`). The
 2026-09-19 repass updated the sandbox network-mode list for the WI#154/155
 `proxy-enforced` mode (default `none` everywhere) and added the OpenCode 2
-worker lane to the workers checklist (mt-admin `--with-opencode2`).
+worker lane to the workers checklist (mt-admin `--with-opencode2`). The
+2026-09-27 repass added the v2.1.3.0 WI#223 per-tenant sandbox-image tier
+below (rendered env defaults + tenant rootless store + recovery verb).
 
 Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
@@ -47,6 +49,7 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] **XMPP room** — send and receive MUC traffic; verify sender attribution.
 - [ ] **XMPP attachments** — exercise the configured upload path and verify size/auth limits.
 - [ ] **Durable cross-channel attachments** (v2.1.2.0) — send a file on one channel, then verify it is retrievable from another via the `attachment_store` tool (list/read under `attachments/<channel>/…` in workspace memory).
+- [ ] **Per-tenant sandbox image** (v2.1.3.0, WI#223) — for a fresh mt-admin tenant, confirm `SANDBOX_IMAGE=lunarwing-sandbox:latest` and `SANDBOX_AUTO_PULL=false` in the rendered env, the image exists in the tenant's rootless store, and a sandboxed shell execution succeeds; recover a missing image with `build-sandbox-image <tenant>` and re-verify.
 - [ ] **WeeChat WSS** — connect relay and adapter, exchange messages, then reconnect after a service restart.
 - [ ] **DarkIRC** — verify the tenant adapter, contact-key boundary, delivery, and health reporting.
 - [ ] **WASM channels** — install, configure, activate, poll, and remove a disposable extension.

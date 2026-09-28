@@ -171,10 +171,17 @@ fn binary_on_path(bin: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+// The `version` subcommand bypasses Podman's rootless namespace constructor.
+// `--version` does not: under a hardened user unit, Podman 6.1.2 can mistake a
+// live but unreadable pause process for a recycled PID and unlink pause.pid.
+// Keep the familiar output shape for the keep-id version parser.
+pub(super) const PODMAN_VERSION_ARGS: [&str; 3] =
+    ["version", "--format", "podman version {{.Client.Version}}"];
+
 /// Check whether the podman CLI is installed and usable.
 ///
 /// Podman has no daemon, so "running" means the CLI itself responds
-/// (`podman --version` succeeds — the generic sandbox drives the CLI
+/// (the client-only `podman version` probe succeeds — the generic sandbox drives the CLI
 /// directly, mirroring the mt-admin external-worker pattern). Status
 /// meanings reuse [`DockerStatus`]: `Available` = CLI usable,
 /// `NotRunning` = installed but broken/uninvokable.
@@ -189,7 +196,7 @@ pub async fn check_podman() -> DockerDetection {
     }
 
     let output = tokio::process::Command::new("podman")
-        .arg("--version")
+        .args(PODMAN_VERSION_ARGS)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()

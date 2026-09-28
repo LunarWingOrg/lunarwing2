@@ -135,4 +135,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-09-17. Update §2 whenever freeze status changes.*
+*Last updated: 2026-09-27 (v2.1.3.0 freeze status). Update §2 whenever freeze status changes.*

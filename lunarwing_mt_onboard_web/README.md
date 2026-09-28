@@ -35,6 +35,13 @@ Real mode drives `lunarwing-mt-admin.sh`, which creates OS users, containers,
 and services — so it requires `sudo`. `build-tenant` can take 20–40 minutes;
 the UI streams logs and shows progress throughout.
 
+Post-start verification requires a reachable gateway, an active daemon, running
+PostgreSQL, and every selected worker container. It reads runtime-backed status
+through mt-admin on both systemd user managers and OpenRC. An active daemon alone
+cannot make the job succeed when the container runtime or a selected worker is
+broken. These checks establish lifecycle readiness; model-backed task execution
+also needs a working provider configuration.
+
 Kawarimi import is dry-run and stage-only by default. Applying an import does
 not start the restored tenant unless **Start restored tenant** is also checked;
 unattended start requires the operator to confirm that the old host is stopped.

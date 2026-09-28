@@ -30,8 +30,18 @@ tenant_run_dir() { printf '%s/run\n' "$fixture"; }
 tenant_exists_in_registry() { return 0; }
 _ctr() { return 1; }
 chown() { CHOWN_CALL="$*"; }
+# This fixture's tenant is the invoking account in CI (root). The CI image
+# does not include sudo; execute only root-targeted fixture commands directly.
+sudo() {
+  [[ "${1:-}" == -u && "${2:-}" == root ]] || return 1
+  shift 2
+  "$@"
+}
 
 mkdir -p "$fixture/env" "$fixture/state" "$fixture/home/lunarwing"
+# The tenant-side readers/writers require a private env parent (and a private
+# env file) owned by the fixture tenant, which is the invoking root account.
+chmod 700 "$fixture/env"
 env_file="$fixture/env/lunarwing.env"
 cat >"$env_file" <<'EOF'
 GATEWAY_AUTH_TOKEN=gate%token
@@ -39,6 +49,7 @@ KIMI_MODEL=old-model
 KIMI_BASE_URL=https://old.example/v1
 KIMI_API_KEY=old%key
 EOF
+chmod 600 "$env_file"
 
 configure_kimi root new-model '' ''
 assert_contains "$env_file" 'KIMI_MODEL=new-model' 'configure-kimi updates selected model'
@@ -71,6 +82,15 @@ ports_get() {
     pebble_health) printf '14002\n' ;;
   esac
 }
+tenant_worker_enabled() { return 0; }
+ensure_external_worker_config root kimi kimi_wss
+assert_contains "$fixture/state/config.toml" 'timeout_ms = 14400000' \
+  'new Kimi tenant defaults to four-hour timeout'
+ensure_external_worker_config root opencode opencode_wss
+assert_contains "$fixture/state/config.toml" 'timeout_ms = 3600000' \
+  'other worker lanes retain one-hour timeout'
+assert_contains "$fixture/state/config.toml" 'timeout_ms = 14400000' \
+  'repeated provisioning preserves Kimi timeout'
 MT_ROOTLESS=true
 render_worker_quadlet root kimi 8443
 quadlet="$fixture/quadlets/lunarwing-kimi-root.container"

@@ -2,12 +2,12 @@
 # Overridden per-tenant by KIMI_MODEL / KIMI_BASE_URL env vars in entrypoint.sh.
 #
 # The default provider is the LunarWing TensorZero gateway (OpenAI-compatible
-# endpoint), the same function the OpenCode worker uses. It is reached over the
-# NetBird overlay (cotterhomelab3.netbird.selfhosted) instead of the LAN static
-# IP (192.168.1.157). The managed Kimi Code service (api.kimi.com) is no longer
-# the default: since kimi-code 0.37.2, worker prompts against it fail.
+# endpoint). It is reached over the NetBird overlay at
+# cotterhomelab3.netbird.selfhosted. The managed Kimi Code
+# service (api.kimi.com) is no longer the default: since kimi-code 0.37.2,
+# worker prompts against it fail.
 
-default_model = "tensorzero/FrontierCODE"
+default_model = "tensorzero/FrontierCODEK"
 # Print mode (kimi -p) forces the auto permission policy regardless of this
 # value; it stays "auto" so an interactive TUI fallback never stalls on an
 # approval prompt (WI#195). Dangerous-command enforcement lives in the
@@ -44,9 +44,9 @@ base_url = "http://cotterhomelab3.netbird.selfhosted:3000/openai/v1"
 # this with KIMI_API_KEY / TENSORZERO_API_KEY when either is provisioned.
 api_key = "tensorzero"
 
-[models."tensorzero/FrontierCODE"]
+[models."tensorzero/FrontierCODEK"]
 provider = "tensorzero"
-model = "tensorzero::function_name::FrontierCODE"
+model = "tensorzero::function_name::FrontierCODEK"
 max_context_size = 859000
 capabilities = ["tool_use"]
 
