@@ -199,7 +199,7 @@ previous compatibility baseline.
   bump, and `failure` 0.1.8 remains final — and each ignore now carries a
   self-contained reason with the re-verification date and the exact
   upstream pin keeping it blocked. No ids were removed. Evidence:
-  `docs/ops/v2.1.3.0_CARGO_DENY_AUDIT.md`.
+  `docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md`.
 - **Web onboarding demo and mascot default (WI#234).** The onboard-web
   demo's fake mt-admin compiles v2.1.3 (not v1.1.9), and the bat mascot is
   hidden by default with opt-in via settings.
@@ -469,7 +469,7 @@ so the rustls-webpki 0.102 chain survives even a libsql bump, and
 self-contained reason with a re-verification date and the exact upstream
 pin keeping it blocked — no more bare strings or "same as X" boilerplate.
 Verified with cargo-deny 0.20.2 (advisories/bans/licenses/sources all ok).
-Evidence: `docs/ops/v2.1.3.0_CARGO_DENY_AUDIT.md`.
+Evidence: `docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md`.
 
 ### Open Work-Item Audit and Half-Broken-Tenant Runbook (goals 19, 4)
 
