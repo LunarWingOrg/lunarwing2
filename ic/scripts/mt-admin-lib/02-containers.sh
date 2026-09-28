@@ -1174,6 +1174,21 @@ _voice_restore_transcription_config() {
   _env_set "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_CAPTURED false
 }
 
+# Mirror the sidecar-side settings the daemon env also carries (WI#259): the
+# gateway reads VOICE_MAX_TTS_AUDIO_SECS for its text_too_long pre-flight and
+# VOICE_REQUEST_TIMEOUT_SECS for its staggered proxy timeout, so both keys must
+# track voice.env on every mutation path, not only a full daemon-env re-render.
+_sync_voice_runtime_env() {  # <name>
+  local name="$1" voice_env lunarwing_env value
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$lunarwing_env" && ! -L "$lunarwing_env" ]] || return 0
+  value="$(_env_existing "$voice_env" VOICE_MAX_TTS_AUDIO_SECS)"
+  [[ -z "$value" ]] || _env_set "$lunarwing_env" VOICE_MAX_TTS_AUDIO_SECS "$value"
+  value="$(_env_existing "$voice_env" VOICE_REQUEST_TIMEOUT_SECS)"
+  [[ -z "$value" ]] || _env_set "$lunarwing_env" VOICE_REQUEST_TIMEOUT_SECS "$value"
+}
+
 configure_voice() {
   local name="$1" enabled="$2" voice_env lunarwing_env token voice_port stt_model
   tenant_exists_in_registry "$name" || die "tenant '$name' not found"
@@ -1195,6 +1210,7 @@ configure_voice() {
   _env_set "$voice_env" VOICE_ENABLED "$enabled"
   _env_set "$lunarwing_env" VOICE_SERVICE_URL "http://127.0.0.1:${voice_port}"
   _env_set "$lunarwing_env" VOICE_AUTH_TOKEN "$token"
+  _sync_voice_runtime_env "$name"
   if [[ "$enabled" == true ]]; then
     _voice_capture_transcription_config "$voice_env" "$lunarwing_env"
     _env_set "$lunarwing_env" TRANSCRIPTION_PROVIDER lunarvoice
@@ -1285,6 +1301,10 @@ configure_voice_settings() (
     _env_set "$lunarwing_env" TRANSCRIPTION_MODEL \
       "$(_env_existing "$voice_env" VOICE_STT_MODEL)"
   fi
+  # Keep the daemon-side mirrors of the sidecar runtime bounds in step with
+  # the just-updated voice.env (WI#259 review: configure-voice must not leave
+  # the gateway enforcing a stale clip cap or request budget).
+  _sync_voice_runtime_env "$name"
   say "LunarVoice configuration updated for $name"
 )
 
