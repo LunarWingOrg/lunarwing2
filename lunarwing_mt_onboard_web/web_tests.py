@@ -82,6 +82,13 @@ class ModelMappingTests(unittest.TestCase):
         self.assertTrue(cfg.no_weechat_bootstrap)
         self.assertEqual(cfg.xmpp_allow_from, ["a@x", "b@y"])
 
+    def test_provision_accepts_opencode2_worker(self) -> None:
+        cfg = ProvisionRequest(
+            name="sphinx",
+            workers=["opencode2"],
+        ).to_tenant_config()
+        self.assertEqual(cfg.workers, [WorkerType.OPENCODE2])
+
     def test_provision_weechat_bootstrap_defaults_false(self) -> None:
         """When omitted, no_weechat_bootstrap defaults to False."""
         req = ProvisionRequest(name="sphinx")
@@ -143,10 +150,12 @@ class ModelMappingTests(unittest.TestCase):
     def test_current_provision_fields_map_to_tenant_config(self) -> None:
         cfg = ProvisionRequest(
             name="sphinx",
-            workers=["opencode", "kimi"],
+            workers=["opencode", "kimi", "opencode2"],
             llm_base_url=" http://llm.test/v1 ",
             opencode_model=" open ",
             opencode_base_url=" http://open.test/v1 ",
+            opencode2_model=" open2 ",
+            opencode2_base_url=" http://open2.test/v1 ",
             kimi_model=" kimi ",
             kimi_base_url=" http://kimi.test/v1 ",
         ).to_tenant_config()
@@ -154,6 +163,8 @@ class ModelMappingTests(unittest.TestCase):
         self.assertEqual(cfg.llm_base_url, "http://llm.test/v1")
         self.assertEqual(cfg.opencode_model, "open")
         self.assertEqual(cfg.opencode_base_url, "http://open.test/v1")
+        self.assertEqual(cfg.opencode2_model, "open2")
+        self.assertEqual(cfg.opencode2_base_url, "http://open2.test/v1")
         self.assertEqual(cfg.kimi_model, "kimi")
         self.assertEqual(cfg.kimi_base_url, "http://kimi.test/v1")
 
@@ -161,11 +172,15 @@ class ModelMappingTests(unittest.TestCase):
         cfg = ProvisionRequest(
             name="sphinx",
             opencode_model="stale-open",
+            opencode2_model="stale-open2",
+            opencode2_base_url="http://stale-open2.test/v1",
             kimi_model="stale-kimi",
             kimi_base_url="http://stale-kimi.test/v1",
             kimi_api_key="stale-secret",
         ).to_tenant_config()
         self.assertEqual(cfg.opencode_model, "")
+        self.assertEqual(cfg.opencode2_model, "")
+        self.assertEqual(cfg.opencode2_base_url, "")
         self.assertEqual(cfg.kimi_model, "")
         self.assertEqual(cfg.kimi_base_url, "")
         self.assertEqual(cfg.kimi_api_key, "")
