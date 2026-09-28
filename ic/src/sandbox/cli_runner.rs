@@ -63,7 +63,7 @@ impl ContainerRuntime {
     }
 }
 
-/// `--userns` support level, resolved once from `podman --version`.
+/// `--userns` support level, resolved once from Podman's client version.
 ///
 /// The ladder is conservative: an unparsable or ancient version steps DOWN
 /// (no `--userns` flag), never up — a wrong flag fails every execution,
@@ -80,7 +80,7 @@ pub enum KeepIdMode {
     Off,
 }
 
-/// Parse `podman --version` output into `(major, minor)`.
+/// Parse the formatted Podman client version into `(major, minor)`.
 ///
 /// Accepts the shapes seen in the wild:
 /// - `podman version 5.2.3`
@@ -1108,10 +1108,10 @@ async fn output_isolated(bin: &str, args: &[&str]) -> std::io::Result<std::proce
     output
 }
 
-/// Capture and parse `podman --version`.
+/// Capture the client version without joining or modifying rootless namespaces.
 async fn probe_podman_version() -> Option<(u32, u32)> {
     let output = tokio::process::Command::new("podman")
-        .arg("--version")
+        .args(crate::sandbox::detect::PODMAN_VERSION_ARGS)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
@@ -1700,7 +1700,7 @@ mod tests {
             return;
         }
         let probe = tokio::process::Command::new("podman")
-            .arg("--version")
+            .args(crate::sandbox::detect::PODMAN_VERSION_ARGS)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1738,7 +1738,7 @@ mod tests {
             return;
         }
         let probe = tokio::process::Command::new("podman")
-            .arg("--version")
+            .args(crate::sandbox::detect::PODMAN_VERSION_ARGS)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

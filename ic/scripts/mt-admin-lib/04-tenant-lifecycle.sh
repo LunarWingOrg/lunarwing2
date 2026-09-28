@@ -1049,19 +1049,26 @@ start_tenant() {
   _ssh_ready_summary "$name" || true
 }
 
-stop_tenant() {
+# Stop init-managed processes/supervisors without asking a potentially broken
+# container runtime to prove quiescence. Only the userns repair uses this as an
+# intermediate step; ordinary stop/export still require runtime-backed quiescence.
+stop_tenant_init_services() {
   local name="$1"
-  name="$(sanitize_name "$name")"
-  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
-
-  say "=== Stopping tenant: $name ==="
-
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     stop_tenant_systemd "$name"
   else
     stop_tenant_openrc "$name"
   fi
+}
+
+stop_tenant() {
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+
+  say "=== Stopping tenant: $name ==="
+  stop_tenant_init_services "$name" || return 1
 
   stop_tenant_vision "$name"
   stop_tenant_voice "$name"
@@ -1281,10 +1288,10 @@ _podman_userns_join_failure() {  # <probe-output>
 # docs/bugs/BUG-workload-scope-podman-userns.md.
 #
 # Sequence, under the tenant lifecycle lock:
-#   probe (healthy -> no-op) -> stop tenant (kills the conmons holding the
-#   broken pairing; init-agnostic) -> stale pause.pid cleanup ->
-#   `podman system migrate` as the tenant (resets the userns pairing; with
-#   containers stopped this no longer has anything to kill) -> start tenant
+#   probe (healthy -> no-op) -> stop init services/supervisors (init-agnostic)
+#   -> stale pause.pid cleanup -> `podman system migrate` as the tenant
+#   (stops remaining containers and resets the userns pairing) -> full tenant
+#   stop with verified writer quiescence -> start tenant
 #   (recreates pg/vision/voice/daemon/workers in a clean, tenant-owned
 #   userns) -> verify probe.
 #
@@ -1329,9 +1336,13 @@ _repair_tenant_podman_userns_locked() {
     die "podman for '$name' fails with an error that is not the userns-join signature; inspect the output above before repairing manually"
   fi
 
-  say "userns join failure confirmed for $name; repairing (stop -> cleanup -> migrate -> start)"
+  say "userns join failure confirmed for $name; repairing (stop services -> cleanup -> migrate -> verify stopped -> start)"
 
-  stop_tenant "$name"
+  # stop_tenant's final writer probe necessarily fails while podman is broken.
+  # Stop its init-managed launchers first, repair the runtime, THEN run the full
+  # verified stop. Never treat failed runtime introspection as snapshot-safe.
+  stop_tenant_init_services "$name" \
+    || die "could not stop init services for '$name'; refusing podman userns repair"
   clean_stale_pause_pid "$name"
 
   say "running 'podman system migrate' as $name (resets the rootless userns pairing) ..."
@@ -1342,7 +1353,8 @@ _repair_tenant_podman_userns_locked() {
     printf '%s\n' "$probe" >&2
   fi
 
-  start_tenant "$name"
+  stop_tenant "$name" || return 1
+  start_tenant "$name" || return 1
 
   rc=0
   probe="$(_ctr "$name" ps 2>&1)" || rc=$?

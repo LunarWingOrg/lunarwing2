@@ -131,17 +131,28 @@ acquire_export_passphrase() {
 }
 
 read_env_value() {  # <file> <key>
-  local file="$1" key="$2"
+  local file="$1" key="$2" value
   [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid environment key"
   [[ -f "$file" && ! -L "$file" ]] || return 0
-  LC_ALL=C awk -v prefix="${key}=" '
+  value="$(LC_ALL=C awk -v prefix="${key}=" '
     index($0, prefix) == 1 {
       if (++seen > 1) exit 2
       value = substr($0, length(prefix) + 1)
       sub(/$/, "", value)
     }
     END { if (seen == 1) printf "%s", value }
-  ' "$file" || die "duplicate or unreadable environment key '$key' in $file"
+  ' "$file")" || die "duplicate or unreadable environment key '$key' in $file"
+  # The web/CLI provisioner writes double-quoted EnvironmentFile values.
+  # Decode its quoting for validation/comparison without sourcing tenant data;
+  # the original lines are still copied verbatim into the encrypted manifests.
+  if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+  fi
+  printf '%s' "$value"
 }
 
 is_loopback_url() {

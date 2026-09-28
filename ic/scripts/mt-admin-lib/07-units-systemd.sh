@@ -951,15 +951,29 @@ start_tenant_systemd() {
 
 stop_tenant_systemd() {
   local name="$1"
-  local uid
+  local uid state rc stop_failed=false
   uid="$(id -u "$name" 2>/dev/null)" || return 0
 
   for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-opencode2-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-voice-${name}.service" "lunarwing-pg-${name}.service"; do
-    if _systemctl_user "$name" is-active --quiet "$svc" 2>/dev/null; then
-      _systemctl_user "$name" stop "$svc"
+    rc=0
+    state="$(_systemctl_user "$name" is-active "$svc" 2>/dev/null)" || rc=$?
+    case "$state" in
+      active|activating|reloading|deactivating) ;;
+      inactive|dead|failed|maintenance) continue ;;
+      *)
+        [[ "$rc" -ne 4 ]] || continue # Absent optional unit.
+        say "could not classify $svc before stop" >&2
+        stop_failed=true
+        continue ;;
+    esac
+    if _systemctl_user "$name" stop "$svc"; then
       say "stopped $svc"
+    else
+      say "failed to stop $svc" >&2
+      stop_failed=true
     fi
   done
+  [[ "$stop_failed" == false ]]
 }
 
 uninstall_tenant_systemd() {

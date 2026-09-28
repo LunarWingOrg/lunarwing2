@@ -496,9 +496,11 @@ def _display_results(result) -> None:  # result: ProvisionResult
     )
 
 
-def _show_verify(tenant: str, host: str = "127.0.0.1", port: int = 0) -> None:
+def _show_verify(
+    tenant: str, host: str = "127.0.0.1", port: int = 0, *, workers: list[WorkerType] | None = None
+) -> bool:
     console.print("Post-start verification...", style="bold")
-    results = verify_tenant(tenant, host, port)
+    results = verify_tenant(tenant, host, port, workers=[w.value for w in workers or []])
     table = Table(title="Verification")
     table.add_column("Check", style="bold cyan")
     table.add_column("Status", justify="center")
@@ -506,6 +508,7 @@ def _show_verify(tenant: str, host: str = "127.0.0.1", port: int = 0) -> None:
         status = Text("PASS", style="green") if r.ok else Text("FAIL", style="red")
         table.add_row(r.label, status)
     console.print(table)
+    return bool(results) and all(r.ok for r in results)
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +575,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         _display_results(result)
         if result.ok and not args.skip_start:
-            _show_verify(config.name, host=config.gateway_host, port=config.gateway_port)
+            if not _show_verify(
+                config.name, host=config.gateway_host, port=config.gateway_port,
+                workers=config.workers,
+            ):
+                console.print("Post-start verification FAILED.", style="bold red")
+                return 2
             console.print(
                 "\n[bold]Tip:[/] Add more secrets (API keys, tokens) to this "
                 "tenant at any time:\n  [cyan]python3 -m lunarwing_mt_onboard secrets[/]"

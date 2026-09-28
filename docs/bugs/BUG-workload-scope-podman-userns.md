@@ -12,6 +12,11 @@
 > `fix-podman-userns` repair verb remains as the operator-side recovery path
 > for pairings already broken before this fix (e.g. by foreign-euid podman
 > runs).
+>
+> **2026-09-28 follow-up:** Goal 12 found a separate startup-probe trigger on
+> Podman 6.1.2. The direct reaper scan/cleanup now use the isolated workload
+> launcher, and client-version probes use the `version` subcommand; the live
+> reproduction and repair limitation are described below.
 
 ## Symptom
 
@@ -74,7 +79,7 @@ live in a pairing the invoking context cannot rejoin:
   which is why the failure looks context-specific ("works outside the scope")
   even though the uid is the same.
 
-## Why the launcher-side fix is not taken (yet)
+## Historical limitation of the original scope design
 
 The issue's option 2 — launch the workload so it shares the podman stack's
 context — is the structural fix, but it is not implementable within the
@@ -133,17 +138,76 @@ context-crossing that broke podman's `setns` join. Verified on a systemd 261
 host: `podman ps` from a transient service with `NoNewPrivileges=true` works
 (exit 0), while the daemon-forked scope shape is the documented failure.
 
+## Remaining direct startup/runtime calls (Goal 12, 2026-09-28)
+
+Fresh real-web provisioning on Podman **6.1.2** reproduced a separate failure:
+the daemon stayed active, but the runtime could no longer see PostgreSQL and
+both selected workers failed to start. Its error named a missing `conmon.pid`
+and recommended `podman system migrate`.
+
+Both `check_podman()` and `probe_podman_version()` directly invoked
+`podman --version`. In Podman 6.1.2's `pkg/rootless/rootless_linux.c`, that flag
+still enters the rootless constructor. Under the daemon's
+`NoNewPrivileges=true` / `PrivateTmp=true` context, inspecting the live pause
+process fails; `check_stale_pause_pid()` treats the unreadable process as a
+recycled PID and unlinks its valid tracking file. The command still exits 0.
+The `version` **subcommand** is explicitly excluded by `can_use_shortcut()`.
+
+A controlled test under the test tenant's hardened user service reproduced:
+
+| Probe | Exit | Existing live `pause.pid` preserved |
+| --- | --- | --- |
+| `podman --version` | 0 | **No** |
+| `podman version --format '{{.Client.Version}}'` | 0 | **Yes** |
+
+The two client probes now share `PODMAN_VERSION_ARGS`, using the subcommand
+with `podman version {{.Client.Version}}` formatting to retain the existing
+version parser. Deploying that fix alone did not resolve startup: the
+socketless sandbox reaper still directly launched `podman ps` on its immediate
+first tick (and `rm` during cleanup), bypassing the workload launcher. These
+calls now use `WorkloadSpawner` and `ProcessTreeGuard`, just like execution and
+image operations. The five-second command timeout remains; timeout cleanup
+awaits stopping the transient service/process tree. OpenRC retains the shared
+process-group fallback. Label filters, orphan-age checks, in-flight protection,
+and the separate job-container sweep are preserved.
+
+Daemon hardening remains intact. Regressions exercise output capture and exit
+status in both direct and detected-isolation contexts, and ensure a timed-out
+command cannot leave its descendant running.
+
+The already-broken test runtime required a narrow manual intervention:
+`system migrate` itself could not recover with the missing file and stale
+conmon metadata. Under the tenant lifecycle lock, the test identified exactly
+one tenant-owned live `catatonit` process with `_PODMAN_PAUSE=1`, restored its
+missing tracking file, and then used ordinary mt-admin stop/start. No container
+store or database was deleted. The generic repair verb still fails closed if
+migration cannot restore runtime introspection; do not claim it automatically
+recovers this missing-file case.
+
+See [the real-web acceptance record](../ops/GOAL12_REAL_WEB_ACCEPTANCE.md) for
+post-deployment worker/export/restart evidence.
+
 ## The repair path (kept for already-broken pairings)
 
 1. **`fix-podman-userns <tenant>`** (`ic/scripts/lunarwing-mt-admin.sh`,
    `repair_tenant_podman_userns` in `ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh`):
    probe as the tenant (`podman ps` via `_ctr`); if healthy, a no-op. On the
    join-failure signature:
-   `stop-tenant` (kills the conmons holding the broken pairing via the init
-   system — tenant podman cannot stop them, it fails with the same join
-   error) → pause.pid hygiene → `podman system migrate` as the tenant
-   (containers already stopped) → `start-tenant` (recreates pg/vision/voice/
+   stop init-managed services/supervisors → pause.pid hygiene →
+   `podman system migrate` as the tenant (stops remaining containers and resets
+   the pairing) → full `stop-tenant` with verified writer quiescence →
+   `start-tenant` (recreates pg/vision/voice/
    daemon/workers health-gated in a clean, tenant-owned pairing) → verify.
+   Goal 12 acceptance exposed a circular dependency in the earlier sequence:
+   the full `stop-tenant` correctly rejected broken runtime introspection, so
+   repair never reached migration. The repair-only preliminary stop now uses
+   the existing systemd-user/OpenRC init helpers. A service-stop failure blocks
+   migration; systemd transitional services are stopped and an unclassifiable
+   native service probe also blocks repair. Failed or still-unclassifiable
+   writer state after migration blocks restart. Ordinary stop/export retain their
+   full runtime-backed proof and
+   never receive a quiescence bypass. A failed repair can leave the test/target
+   tenant stopped; inspect its state before retrying.
    The classifier (`_podman_userns_join_failure`) matches the bare join
    error, the `failed to reexec: Permission denied` variant, and the
    system-migrate wrapper; any other podman failure gets only the cheap
@@ -174,8 +238,21 @@ host: `podman ps` from a transient service with `NoNewPrivileges=true` works
 
 ## Verification
 
+- Goal 12 live rootless-Podman acceptance: the hardened daemon reaped an old
+  labelled sandbox fixture, preserved an unlabelled control, and retained valid
+  pause metadata. PostgreSQL, Pebble, and OpenCode remained usable through real
+  encrypted export and restart. The version-probe comparison above reproduced
+  the destructive flag form separately.
+- Reaper Rust unit tests: **23 passed**, including output/exit status through
+  direct/detected isolation and timeout cleanup of descendants.
 - `ic/scripts/tests/test-mt-admin-fix-podman-userns.sh`: probe-gated no-op,
-  stop→cleanup→migrate→start ordering, stale/dead/foreign/keep pause.pid
+  init-stop→cleanup→migrate→verified-stop→start ordering, stale/dead/foreign/keep pause.pid
   branches, non-join failures never stop the tenant, failing migrate
   tolerated, classifier signatures.
+- `ic/scripts/tests/test-mt-admin-podman-repair-quiescence.sh` (also invoked by
+  the repair test): real repair/stop/quiescence composition with a runtime that
+  cannot answer until migration, on both init paths. Covers service-stop
+  failure, unknown/transitional systemd states, persistent runtime failure,
+  surviving writers, stale deselected OpenRC supervisors, and ordinary
+  stop/export remaining fail-closed.
 - `ic/scripts/check-mt-admin.sh` (shellcheck over root + all modules) green.

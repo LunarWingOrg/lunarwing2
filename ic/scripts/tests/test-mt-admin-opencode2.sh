@@ -45,6 +45,7 @@ say() { :; }
 sanitize_name() { printf '%s' "$1"; }
 
 mkdir -p "$fixture/env" "$fixture/state" "$fixture/home/lunarwing" "$fixture/quadlets"
+chmod 700 "$fixture/env"
 env_file="$fixture/env/lunarwing.env"
 cat >"$env_file" <<'EOF'
 GATEWAY_AUTH_TOKEN=gate%token
@@ -188,22 +189,9 @@ LLM_API_KEY=llm%key
 OPENCODE2_MODEL=new-model
 OPENCODE2_BASE_URL=https://old.example/v1
 EOF
-# The admin runs as root but the env file belongs to the tenant. Simulate a
-# different file owner (as root) or group (as an unprivileged CI user) so a
-# mktemp-owned replacement cannot pass this check accidentally.
+# The fixture user owns the private env directory, as the deployed tenant does.
+# The tenant-side atomic writer must preserve ownership and 0600 mode.
 command chmod 600 "$env_file"
-different_group=""
-for group in $(id -G); do
-  if [[ "$group" != "$(id -g)" ]]; then
-    different_group="$group"
-    break
-  fi
-done
-if [[ "$(id -u)" -eq 0 ]]; then
-  command chown 65534:65534 "$env_file"
-elif [[ -n "$different_group" ]]; then
-  command chgrp "$different_group" "$env_file"
-fi
 owner_before="$(stat -c '%u:%g' "$env_file")"
 render_worker_quadlet root opencode2 8443
 assert_contains "$env_file" 'WORKER_AUTH_TOKEN=' \
