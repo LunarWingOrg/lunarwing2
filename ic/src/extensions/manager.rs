@@ -6433,7 +6433,8 @@ mod tests {
     use crate::extensions::manager::{
         ActiveMcpServer, FallbackDecision, McpRecoveryCandidate, McpRecoveryClaim,
         McpRuntimeHealth, build_wasm_channel_runtime_config_updates, combine_install_errors,
-        fallback_decision, infer_kind_from_url, join_or_abort_tasks, normalize_hosted_callback_url,
+        extension_sort_key, fallback_decision, infer_kind_from_url, join_or_abort_tasks,
+        normalize_hosted_callback_url,
     };
     use crate::extensions::{ExtensionError, ExtensionKind, ExtensionSource, InstallResult};
     use crate::tools::{Tool, ToolError, ToolOutput};
@@ -10342,6 +10343,50 @@ done
             result,
             Some("dcr-secret".to_string()),
             "non-builtin provider secret must be kept"
+        );
+    }
+
+    fn sort_test_extension(name: &str, kind: ExtensionKind) -> crate::extensions::InstalledExtension {
+        crate::extensions::InstalledExtension {
+            name: name.to_string(),
+            kind,
+            display_name: None,
+            description: None,
+            url: None,
+            transport: None,
+            command: None,
+            placement: None,
+            authenticated: false,
+            active: false,
+            recovering: false,
+            enabled: None,
+            tools: Vec::new(),
+            needs_setup: false,
+            has_auth: false,
+            installed: true,
+            activation_error: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn extension_list_ordering_is_kind_then_case_insensitive_name() {
+        let mut entries = vec![
+            sort_test_extension("zeta_tool", ExtensionKind::WasmTool),
+            sort_test_extension("Beta_Server", ExtensionKind::McpServer),
+            sort_test_extension("alpha_channel", ExtensionKind::WasmChannel),
+            sort_test_extension("alpha_server", ExtensionKind::McpServer),
+            sort_test_extension("zeta_channel", ExtensionKind::WasmChannel),
+        ];
+        // The production code sorts inside list(); the key function is the
+        // contract, so exercise it directly with shuffled input.
+        entries.sort_by(|a, b| extension_sort_key(a).cmp(&extension_sort_key(b)));
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha_server", "Beta_Server", "zeta_tool", "alpha_channel", "zeta_channel"],
+            "MCP servers first, then WASM tools, then channels; names case-insensitive"
         );
     }
 }

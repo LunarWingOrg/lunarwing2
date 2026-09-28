@@ -1790,6 +1790,97 @@ mod tests {
         );
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("kind").is_some());
+        assert!(schema["properties"].get("offset").is_some());
+        assert!(schema["properties"].get("limit").is_some());
+    }
+
+    fn installed_extension(name: &str, kind: ExtensionKind, tools: Vec<String>) -> crate::extensions::InstalledExtension {
+        crate::extensions::InstalledExtension {
+            name: name.to_string(),
+            kind,
+            display_name: None,
+            description: None,
+            url: None,
+            transport: None,
+            command: None,
+            placement: None,
+            authenticated: true,
+            active: true,
+            recovering: false,
+            enabled: None,
+            tools,
+            needs_setup: false,
+            has_auth: false,
+            installed: true,
+            activation_error: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn tool_list_entry_caps_per_extension_tools() {
+        let tools: Vec<String> = (0..40).map(|i| format!("tool_{i}")).collect();
+        let entry = extension_to_json(&installed_extension("big", ExtensionKind::McpServer, tools));
+
+        let listed = entry["tools"].as_array().expect("tools array");
+        assert_eq!(listed.len(), TOOL_LIST_MAX_TOOLS_PER_ENTRY);
+        assert_eq!(entry["tools_truncated"], serde_json::json!(true));
+        assert_eq!(entry["tools_total"], serde_json::json!(40));
+
+        let small = extension_to_json(&installed_extension(
+            "small",
+            ExtensionKind::WasmTool,
+            vec!["only".to_string()],
+        ));
+        assert_eq!(small["tools"].as_array().expect("tools array").len(), 1);
+        assert!(small.get("tools_truncated").is_none());
+        assert!(small.get("tools_total").is_none());
+    }
+
+    #[test]
+    fn tool_list_entry_omits_absent_optional_fields() {
+        let entry = extension_to_json(&installed_extension(
+            "plain",
+            ExtensionKind::WasmChannel,
+            Vec::new(),
+        ));
+        for field in ["display_name", "description", "version", "activation_error", "recovering"] {
+            assert!(entry.get(field).is_none(), "field {field} should be absent");
+        }
+        assert_eq!(entry["name"], serde_json::json!("plain"));
+        assert_eq!(entry["installed"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn tool_list_offset_and_limit_parse() {
+        assert_eq!(
+            ToolListTool::parse_offset(&serde_json::json!({})).expect("default"),
+            0
+        );
+        assert_eq!(
+            ToolListTool::parse_offset(&serde_json::json!({"offset": null})).expect("null"),
+            0
+        );
+        assert_eq!(
+            ToolListTool::parse_offset(&serde_json::json!({"offset": 12})).expect("int"),
+            12
+        );
+        assert!(ToolListTool::parse_offset(&serde_json::json!({"offset": -1})).is_err());
+        assert!(ToolListTool::parse_offset(&serde_json::json!({"offset": "5"})).is_err());
+
+        assert_eq!(
+            ToolListTool::parse_limit(&serde_json::json!({})).expect("default"),
+            TOOL_LIST_MAX_PAGE
+        );
+        assert_eq!(
+            ToolListTool::parse_limit(&serde_json::json!({"limit": 7})).expect("int"),
+            7
+        );
+        assert_eq!(
+            ToolListTool::parse_limit(&serde_json::json!({"limit": 500})).expect("clamped"),
+            100
+        );
+        assert!(ToolListTool::parse_limit(&serde_json::json!({"limit": "many"})).is_err());
     }
 
     #[test]
