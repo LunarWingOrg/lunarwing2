@@ -98,6 +98,17 @@ if [[ "$EUID" == 0 ]]; then
   [[ "$(stat -c %U "$wc_caps")" == root ]]
   patch_weechat_caps "$name" >/dev/null 2>&1
   [[ "$(jq -r '.config.relay_url' "$wc_caps")" == http://127.0.0.1:9001 ]]
+  # Real tenants have a matching group, but some CI images provide nobody
+  # only with a different primary group (e.g. nogroup). Translate just the
+  # install fixture's tenant:tenant chown; still perform a real chown so the
+  # tenant-UID writer and ownership assertions exercise the actual boundary.
+  if ! getent group "$name" >/dev/null; then
+    chown() {
+      [[ "$1" == -R && "$2" == "$name:$name" ]] || return 1
+      shift 2
+      command chown -R "$name:$(id -g "$name")" "$@"
+    }
+  fi
   install_wasm_tenant "$name"
   [[ "$(stat -c %U "$fixture/state/channels")" == "$name" ]]
   [[ "$(stat -c %U "$wc_caps")" == "$name" ]]
