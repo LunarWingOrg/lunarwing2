@@ -83,6 +83,17 @@ fn normalize_hosted_callback_url(callback_url: &str) -> String {
     }
 }
 
+/// Total ordering for extension listings: kind first (MCP servers, then WASM
+/// tools, then WASM channels), then case-insensitive name.
+fn extension_sort_key(extension: &InstalledExtension) -> (u8, String) {
+    let kind_rank = match extension.kind {
+        ExtensionKind::McpServer => 0,
+        ExtensionKind::WasmTool => 1,
+        ExtensionKind::WasmChannel => 2,
+    };
+    (kind_rank, extension.name.to_lowercase())
+}
+
 /// Runtime infrastructure needed for hot-activating WASM channels.
 ///
 /// Set after construction via [`ExtensionManager::set_channel_runtime`] once the
@@ -1688,6 +1699,11 @@ impl ExtensionManager {
                 });
             }
         }
+
+        // Deterministic order (kind, then name). Installed entries come from
+        // HashMap-backed discovery, so without this the iteration order — and
+        // therefore any prefix a consumer takes — changes between calls.
+        extensions.sort_by(|a, b| extension_sort_key(a).cmp(&extension_sort_key(b)));
 
         Ok(extensions)
     }
