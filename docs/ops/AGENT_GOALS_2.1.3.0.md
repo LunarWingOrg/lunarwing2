@@ -132,7 +132,7 @@
 38. [x] (S) compile proper list of changes wanted for web gateway itself
 39. [x] (S) discussion regarding new external dev review loop concept
 40. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
-41. [x] (S) Reserved4MO
+41. [ ] Please address the following issue: On a fresh install-wasm, ic/scripts/mt-admin-lib/05-tenant-build.sh:1317,1327,1364 copies weechat.capabilities.json as root and calls patch_weechat_caps before the chown of channels_dir and its contents. The new tenant-UID writer at ic/scripts/mt-admin-lib/06-env-generation.sh:2085–2091 requires the parent and existing destination to be tenant-owned; it rejects the fresh root-owned file, so the standalone install leaves the generic 9001/6681 ports instead of the tenant's allocated ports. A subsequent start-tenant may repatch it, but does not repair the standalone install contract. Please transfer ownership before patching (including the channel directory) and add a first-install fixture that starts with root-created capabilities
 42. [x] (S) (H) Consider web gateway additional functionality (seperate from goal 38)
 
 ---
