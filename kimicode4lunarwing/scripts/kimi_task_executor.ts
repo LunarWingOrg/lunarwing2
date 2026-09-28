@@ -60,7 +60,22 @@ function maxProgressBytes(): number {
   return boundedEnvInteger("KIMI_MAX_PROGRESS_BYTES", 65_536, 256, 1_048_576)
 }
 
-type StopReason = "timeout" | "cancelled"
+/**
+ * How long the CLI may stay completely silent (no stream-json output) before
+ * the task is treated as wedged (WI#263). The observed failure was a hang at
+ * the final report-composition step: investigation events flowed normally,
+ * then the CLI emitted nothing at all while the task sat at the 4h deadline.
+ * 0 disables the watchdog.
+ */
+function silenceTimeoutMs(taskTimeoutMs: number): number {
+  // Cap the silence budget at the remaining task deadline so the watchdog can
+  // never outlive the task's own timeout.
+  const budget = boundedEnvInteger("KIMI_SILENCE_TIMEOUT_MS", 900_000, 0, 86_400_000)
+  if (budget === 0) return 0
+  return Math.min(budget, Math.max(1, taskTimeoutMs))
+}
+
+type StopReason = "timeout" | "cancelled" | "silence"
 
 class TaskStoppedError extends Error {
   constructor(readonly reason: StopReason) {
@@ -138,6 +153,12 @@ export async function executeTask(
   let killEscalation: NodeJS.Timeout | undefined
   let stderrBuffer = ""
   let lastProgressAt = Date.now()
+  // WI#263: tracks the last time the CLI emitted any stream-json line. The
+  // progress heartbeat keeps the socket warm, but only real CLI output proves
+  // the CLI is alive — a wedged CLI streams nothing while the heartbeat
+  // claims "still waiting".
+  let lastStreamAt = Date.now()
+  const silenceBudget = silenceTimeoutMs(timeoutMs)
 
   // Bounds on in-memory accumulation for long/verbose runs (default task
   // timeout is 4h). Progress is streamed live, so truncating loses nothing
@@ -163,9 +184,14 @@ export async function executeTask(
 
   const stoppedResult = (reason: StopReason): TaskResult => ({
     task_id: request.task_id,
-    status: reason === "timeout" ? "timed_out" : "cancelled",
+    status: reason === "cancelled" ? "cancelled" : "timed_out",
     output: truncateUtf8(output.trim(), outputCap),
-    error: reason === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
+    error:
+      reason === "timeout"
+        ? `Task timed out after ${timeoutMs}ms`
+        : reason === "silence"
+          ? `kimi produced no stream output for ${silenceBudget}ms (wedged after ${Date.now() - startTime}ms of runtime); partial output preserved`
+          : null,
     duration_ms: Date.now() - startTime,
   })
 
@@ -187,6 +213,24 @@ export async function executeTask(
     stopReason = "timeout"
     killProc()
   }, timeoutMs)
+
+  // WI#263: silence watchdog. A CLI that emits nothing for the silence budget
+  // is wedged (the observed signature: full investigation, then silence at
+  // report composition). Kill it and resolve as timed_out carrying whatever
+  // partial output was streamed, so the investigation is not lost and the
+  // slot is freed instead of lingering to the 4h deadline.
+  const silenceWatchdog =
+    silenceBudget > 0
+      ? setInterval(() => {
+          if (stopReason) return
+          if (Date.now() - lastStreamAt < silenceBudget) return
+          stopReason = "silence"
+          console.error(
+            `[kimi executor] no stream output for ${silenceBudget}ms (task ${request.task_id}); treating as wedged`,
+          )
+          killProc()
+        }, Math.min(silenceBudget, 60_000))
+      : undefined
 
   const handleAbort = () => {
     if (stopReason) return
@@ -272,6 +316,9 @@ export async function executeTask(
 
       proc!.stdout.on("data", (chunk: Buffer) => {
         if (streamError) return
+        // Any raw stdout byte is proof of life for the silence watchdog,
+        // even when the line is not yet parseable.
+        lastStreamAt = Date.now()
         stdoutBuffer = Buffer.concat([stdoutBuffer, chunk])
         let newlineIndex = stdoutBuffer.indexOf(0x0a)
         while (newlineIndex >= 0) {
@@ -443,6 +490,7 @@ export async function executeTask(
   } finally {
     clearTimeout(timeout)
     if (progressHeartbeat) clearInterval(progressHeartbeat)
+    if (silenceWatchdog) clearInterval(silenceWatchdog)
     abortSignal?.removeEventListener("abort", handleAbort)
     if (proc && !procClosed) signalProcessGroup("SIGKILL")
   }

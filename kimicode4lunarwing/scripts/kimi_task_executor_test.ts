@@ -7,7 +7,7 @@ import { join } from "node:path"
 import { executeTask } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -61,6 +61,21 @@ process.exit(0)
       break
     case "hang":
       script = `#!/usr/bin/env node
+process.on("SIGTERM", () => {})
+setInterval(() => {}, 1000)
+`
+      break
+    case "silent-hang":
+      // WI#263 signature: full investigation streams first, then the CLI
+      // goes completely silent (wedged at report composition) while the
+      // task deadline is still far away.
+      script = `#!/usr/bin/env node
+const messages = [
+  { role: "assistant", content: "Investigation step: evidence gathered." },
+]
+for (const m of messages) {
+  process.stdout.write(JSON.stringify(m) + "\\n")
+}
 process.on("SIGTERM", () => {})
 setInterval(() => {}, 1000)
 `
@@ -250,6 +265,37 @@ test("executeTask: timeout escalates past ignored SIGTERM", async () => {
   delete process.env.KIMI_KILL_GRACE_MS
   assert.equal(result?.status, "timed_out")
   assert.ok(Date.now() - started < 2_000)
+})
+
+test("executeTask: silent wedge resolves as timed_out with partial output (WI#263)", async () => {
+  const bin = makeMockKimi("silent-hang")
+  process.env.KIMI_SILENCE_TIMEOUT_MS = "300"
+  process.env.KIMI_KILL_GRACE_MS = "100"
+  const started = Date.now()
+  const { result, progress } = await runExecutor(
+    { task_id: "silent-wedge-test", prompt: "wedge after investigation", timeout_ms: 60_000 },
+    bin,
+  )
+  delete process.env.KIMI_SILENCE_TIMEOUT_MS
+  delete process.env.KIMI_KILL_GRACE_MS
+  assert.equal(result?.status, "timed_out")
+  assert.match(result?.error || "", /no stream output for 300ms/)
+  // The streamed investigation evidence must survive the wedge.
+  assert.ok((result?.output || "").includes("Investigation step"))
+  assert.ok(progress.some((delta) => delta.includes("Investigation step")))
+  // The watchdog must fire well before the task's own deadline.
+  assert.ok(Date.now() - started < 5_000, "watchdog must not wait for the task deadline")
+})
+
+test("executeTask: silence watchdog disabled with KIMI_SILENCE_TIMEOUT_MS=0", async () => {
+  const bin = makeMockKimi("success")
+  process.env.KIMI_SILENCE_TIMEOUT_MS = "0"
+  const { result } = await runExecutor(
+    { task_id: "watchdog-off", prompt: "normal run", timeout_ms: 10_000 },
+    bin,
+  )
+  delete process.env.KIMI_SILENCE_TIMEOUT_MS
+  assert.equal(result?.status, "success")
 })
 
 test("executeTask: output and progress caps count UTF-8 bytes", async () => {
