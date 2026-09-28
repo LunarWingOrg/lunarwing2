@@ -773,7 +773,9 @@ mod tests {
             speed: None,
         };
         assert_eq!(
-            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err().0,
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS)
+                .unwrap_err()
+                .0,
             StatusCode::BAD_REQUEST
         );
 
@@ -783,7 +785,9 @@ mod tests {
             speed: None,
         };
         assert_eq!(
-            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err().0,
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS)
+                .unwrap_err()
+                .0,
             StatusCode::BAD_REQUEST
         );
 
@@ -793,7 +797,9 @@ mod tests {
             speed: None,
         };
         assert_eq!(
-            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err().0,
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS)
+                .unwrap_err()
+                .0,
             StatusCode::BAD_REQUEST
         );
 
@@ -803,7 +809,9 @@ mod tests {
             speed: Some(2.5),
         };
         assert_eq!(
-            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err().0,
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS)
+                .unwrap_err()
+                .0,
             StatusCode::BAD_REQUEST
         );
 
@@ -812,7 +820,10 @@ mod tests {
             voice: None,
             speed: Some(1.0),
         };
-        assert_eq!(validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap(), "hello");
+        assert_eq!(
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap(),
+            "hello"
+        );
     }
 
     #[test]
