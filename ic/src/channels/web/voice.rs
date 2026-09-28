@@ -213,6 +213,10 @@ impl VoiceProxyClient {
 /// credential is configured (server-held; clients never see it).
 pub struct VoiceApi {
     client: Arc<VoiceProxyClient>,
+    /// Maximum synthesized audio seconds the sidecar accepts (mirrors
+    /// `VOICE_MAX_TTS_AUDIO_SECS`); gates the `text_too_long` pre-flight and
+    /// is advertised through `/api/voice/status`.
+    max_synth_audio_secs: u64,
 }
 
 impl VoiceApi {
@@ -230,14 +234,20 @@ impl VoiceApi {
             .voice_service_url
             .as_deref()
             .unwrap_or("http://127.0.0.1:8090");
+        // Keep the pre-flight honest with the sidecar's own clip cap: a
+        // floor of 1s matches the sidecar's accepted range, and 0 would
+        // disable the guard entirely (every estimate exceeds 0).
+        let max_synth_audio_secs = config.voice_max_synth_audio_secs.max(1);
         match VoiceProxyClient::new(service_url, token, &config.model) {
             Ok(client) => {
                 tracing::info!(
                     model = %config.model,
+                    max_synth_audio_secs,
                     "Gateway voice API enabled via loopback LunarVoice"
                 );
                 Some(Self {
                     client: Arc::new(client),
+                    max_synth_audio_secs,
                 })
             }
             Err(error) => {
@@ -249,6 +259,10 @@ impl VoiceApi {
 
     fn client(&self) -> &Arc<VoiceProxyClient> {
         &self.client
+    }
+
+    fn max_synth_audio_secs(&self) -> u64 {
+        self.max_synth_audio_secs
     }
 }
 
@@ -400,16 +414,20 @@ pub async fn voice_status_handler(
     State(state): State<Arc<GatewayState>>,
     _user: AuthenticatedUser,
 ) -> Json<VoiceStatusResponse> {
-    let (configured, model) = match state.voice.as_ref() {
-        Some(api) => (true, Some(api.client().model().to_string())),
-        None => (false, None),
+    let (configured, model, max_synth_audio_secs) = match state.voice.as_ref() {
+        Some(api) => (
+            true,
+            Some(api.client().model().to_string()),
+            api.max_synth_audio_secs(),
+        ),
+        None => (false, None, MAX_SYNTH_AUDIO_SECS),
     };
     Json(VoiceStatusResponse {
         configured,
         model,
         max_audio_b64_len: MAX_AUDIO_B64_LEN,
         max_text_chars: MAX_SYNTH_TEXT_CHARS,
-        max_synth_audio_secs: MAX_SYNTH_AUDIO_SECS,
+        max_synth_audio_secs,
     })
 }
 
@@ -487,7 +505,7 @@ pub async fn voice_synthesize_handler(
         )
     })?;
 
-    let text = validate_synthesize_request(&request)?;
+    let text = validate_synthesize_request(&request, api.max_synth_audio_secs())?;
     let voice = request.voice.as_deref().unwrap_or("");
     let speed = request.speed.unwrap_or(1.0);
     let sidecar = SidecarSynthesizeRequest {
@@ -615,7 +633,10 @@ fn validate_transcribe_request(request: &VoiceTranscribeRequest) -> Result<(), H
     Ok(())
 }
 
-fn validate_synthesize_request(request: &VoiceSynthesizeRequest) -> Result<String, HandlerError> {
+fn validate_synthesize_request(
+    request: &VoiceSynthesizeRequest,
+    max_synth_audio_secs: u64,
+) -> Result<String, HandlerError> {
     let text = request.text.trim();
     if text.is_empty() {
         return Err(error_response(
@@ -643,11 +664,11 @@ fn validate_synthesize_request(request: &VoiceSynthesizeRequest) -> Result<Strin
     // shortens it, so the estimate clamps at 1.0 to stay conservative.
     let effective_speed = if speed < 1.0 { speed } else { 1.0 };
     let estimated_secs = estimate_synthesis_secs(text, effective_speed);
-    if estimated_secs > MAX_SYNTH_AUDIO_SECS as f64 {
+    if estimated_secs > max_synth_audio_secs as f64 {
         tracing::info!(
             chars = text.chars().count(),
             estimated_secs,
-            max_secs = MAX_SYNTH_AUDIO_SECS,
+            max_secs = max_synth_audio_secs,
             "Rejecting synthesis text estimated to exceed the sidecar audio cap"
         );
         return Err(error_response(
@@ -655,7 +676,7 @@ fn validate_synthesize_request(request: &VoiceSynthesizeRequest) -> Result<Strin
             "text_too_long",
             format!(
                 "text is too long to synthesize (estimated {estimated_secs:.0}s of audio, \
-                 limit {MAX_SYNTH_AUDIO_SECS}s)"
+                 limit {max_synth_audio_secs}s)"
             ),
         ));
     }
@@ -752,7 +773,7 @@ mod tests {
             speed: None,
         };
         assert_eq!(
-            validate_synthesize_request(&request).unwrap_err().0,
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
 
@@ -762,7 +783,7 @@ mod tests {
             speed: None,
         };
         assert_eq!(
-            validate_synthesize_request(&request).unwrap_err().0,
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
 
@@ -772,7 +793,7 @@ mod tests {
             speed: None,
         };
         assert_eq!(
-            validate_synthesize_request(&request).unwrap_err().0,
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
 
@@ -782,7 +803,7 @@ mod tests {
             speed: Some(2.5),
         };
         assert_eq!(
-            validate_synthesize_request(&request).unwrap_err().0,
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
 
@@ -791,7 +812,7 @@ mod tests {
             voice: None,
             speed: Some(1.0),
         };
-        assert_eq!(validate_synthesize_request(&request).unwrap(), "hello");
+        assert_eq!(validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap(), "hello");
     }
 
     #[test]
@@ -805,7 +826,7 @@ mod tests {
             voice: None,
             speed: Some(1.0),
         };
-        let error = validate_synthesize_request(&request).unwrap_err();
+        let error = validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err();
         assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error.1.error, "text_too_long");
 
@@ -816,7 +837,7 @@ mod tests {
             speed: Some(1.0),
         };
         assert_eq!(
-            validate_synthesize_request(&request).unwrap(),
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap(),
             "short reply"
         );
     }
@@ -857,7 +878,37 @@ mod tests {
             voice: None,
             speed: Some(1.0),
         };
-        assert!(validate_synthesize_request(&request).is_ok());
+        assert!(validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).is_ok());
+    }
+
+    #[test]
+    fn voice_api_honors_configured_synth_audio_cap() {
+        // Operators can raise/lower the sidecar's VOICE_MAX_TTS_AUDIO_SECS;
+        // the gateway pre-flight must follow the same configured value so it
+        // neither rejects audio the sidecar would accept nor passes audio the
+        // sidecar must discard.
+        let config = crate::config::TranscriptionConfig {
+            provider: "lunarvoice".to_string(),
+            voice_auth_token: Some(SecretString::from("secret")),
+            voice_max_synth_audio_secs: 60,
+            ..Default::default()
+        };
+        let api = VoiceApi::from_config(&config).expect("voice api");
+        assert_eq!(api.max_synth_audio_secs(), 60);
+
+        // Text estimated at ~143s passes the 300s default cap but must be
+        // rejected against the tighter 60s cap.
+        let text = "w".repeat(2_000);
+        let request = VoiceSynthesizeRequest {
+            text,
+            voice: None,
+            speed: Some(1.0),
+        };
+        assert!(validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).is_ok());
+        let error = validate_synthesize_request(&request, api.max_synth_audio_secs()).unwrap_err();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.1.error, "text_too_long");
+        assert!(error.1.message.contains("limit 60s"));
     }
 
     #[test]
