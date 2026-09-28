@@ -9,7 +9,10 @@ the LunarWing-side half of desktop goal #19 (`lunarwing/lunarwing2desktop`).
 **Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0).** The enabling knobs,
 loopback-only `VOICE_SERVICE_URL` invariants, default sidecar port (8090), and
 the integration test were re-checked against `ic/src/channels/web/voice.rs` and
-`ic/tests/voice_gateway_integration.rs`; no changes were needed.
+`ic/tests/voice_gateway_integration.rs`; no changes were needed. Updated
+2026-09-28 for WI#259: the error table, status payload, and synthesis-duration
+bound reflect the new 422/503/504 upstream mapping and the `text_too_long`
+pre-flight.
 
 ## Canonical Documentation
 
@@ -59,7 +62,8 @@ gateway's CORS and security-header layers.
   "configured": true,
   "model": "whisper-tiny",
   "max_audio_b64_len": 25165824,
-  "max_text_chars": 10000
+  "max_text_chars": 10000,
+  "max_synth_audio_secs": 300
 }
 ```
 
@@ -126,10 +130,12 @@ failure reads as a server problem, not a gateway-token problem.
 | `unauthorized` | 401 | Missing/invalid gateway bearer token (auth middleware) |
 | `payload_too_large` | 413 | Base64 audio exceeds `max_audio_b64_len` |
 | `rate_limited` | 429 | Per-user voice rate limit or sidecar rate limit |
-| `unavailable` | 503 | Voice API not configured (no `VOICE_AUTH_TOKEN`/provider) |
+| `text_too_long` | 422 | Synthesis text estimated to exceed `max_synth_audio_secs` of audio; rejected before the sidecar call (WI#259) |
+| `processing_failed` | 422 | Sidecar could not process the request (e.g. synthesized audio exceeded its duration cap) |
+| `unavailable` | 503 | Voice API not configured, or sidecar reported itself unavailable |
 | `upstream_error` | 500 | Sidecar rejected the gateway credential (sidecar 401) |
-| `upstream_error` | 502 | Other sidecar failure (non-2xx status, unreachable, malformed/oversize response) |
-| `upstream_error` | 504 | Sidecar request timed out |
+| `upstream_error` | 502 | Other sidecar failure (unexpected status, unreachable, malformed/oversize response) |
+| `upstream_timeout` | 504 | Sidecar request timed out |
 
 ## Bounds and Security
 
@@ -142,6 +148,15 @@ failure reads as a server problem, not a gateway-token problem.
   text at 10 000 chars, voice id at 64 chars, speed in 0.5..=2.0, language at
   32 chars, `format` allowlisted. Per-route body limits (32 MiB transcribe,
   1 MiB synthesize) override the gateway's global 10 MiB limit.
+- **Synthesis duration bound**: text whose estimated audio duration exceeds
+  `max_synth_audio_secs` (300 s, mirroring the sidecar's
+  `VOICE_MAX_TTS_AUDIO_SECS` default) is rejected up front with 422
+  `text_too_long` instead of letting the sidecar synthesize audio it must then
+  discard. The estimate is deliberately conservative (Latin ≈14 chars/s, CJK ≈
+  3.5 chars/s, slow playback speeds accounted), so a maximal 10 000-char dense
+  Latin reply still passes while genuinely over-long replies fail fast with a
+  distinguishable error. Desktop clients synthesizing agent replies should
+  chunk or trim text against `max_synth_audio_secs` from `/api/voice/status`.
 - **Response caps**: sidecar responses are streamed with hard byte caps
   (1 MiB transcription JSON, 64 MiB synthesis audio) before re-serialization.
   Synthesis responses must declare `format: "wav"` — anything else is rejected
@@ -156,6 +171,9 @@ failure reads as a server problem, not a gateway-token problem.
 1. `GET /api/voice/status` — check `configured` before showing voice UI.
 2. Record audio → base64 → `POST /api/voice/transcribe`.
 3. Agent text → `POST /api/voice/synthesize` → play returned base64 WAV.
+   For long replies, chunk or trim the text so the estimated audio stays
+   under `max_synth_audio_secs`; a 422 `text_too_long` means the reply was
+   too long to synthesize, not that the service is broken (WI#259).
 
 ## Testing
 
