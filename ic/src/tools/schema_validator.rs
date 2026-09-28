@@ -652,6 +652,19 @@ mod tests {
                             "type": "boolean",
                             "description": "Include not-yet-installed entries",
                             "default": false
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Index of the first entry to return. Use next_offset from a previous truncated response to continue.",
+                            "default": 0,
+                            "minimum": 0
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum entries per page (1-100, default 50).",
+                            "default": 50,
+                            "minimum": 1,
+                            "maximum": 100
                         }
                     }
                 }),
