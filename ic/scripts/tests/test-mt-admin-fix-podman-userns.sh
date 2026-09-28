@@ -5,8 +5,8 @@ set -euo pipefail
 # Verifies:
 #  - a healthy podman probe is a no-op (no stop/migrate/start calls)
 #  - the userns-join failure signature triggers the full repair sequence:
-#    stop tenant -> pause.pid cleanup -> `podman system migrate` as the
-#    tenant -> start tenant -> verify probe
+#    stop init services -> pause.pid cleanup -> `podman system migrate` as the
+#    tenant -> verified tenant stop -> start tenant -> verify probe
 #  - pause.pid hygiene keeps a live pause process owned by the tenant and
 #    removes stale (dead pid) and foreign-owned (reused pid) files
 #  - failures that are NOT the userns-join signature never stop the tenant
@@ -71,6 +71,7 @@ pop_ps_fail() {
 _ctr() { shift; _ctr_behave "$@"; }
 _ctr_behave() { return 0; }
 
+stop_tenant_init_services() { note_step STOP_INIT; }
 stop_tenant() { note_step STOP; }
 start_tenant() { note_step START; }
 # Capture the real hygiene implementation under a distinct name before the
@@ -163,8 +164,8 @@ if repair_tenant_podman_userns acorn >/dev/null 2>&1; then
 else
   fail "join failure: repair failed"
 fi
-assert_eq "join failure: stop -> cleanup -> migrate -> start order" \
-  "$(printf 'STOP\nCLEAN_PAUSE\nMIGRATE\nSTART')" "$(cat "$ORDER")"
+assert_eq "join failure: init stop -> cleanup -> migrate -> verified stop -> start order" \
+  "$(printf 'STOP_INIT\nCLEAN_PAUSE\nMIGRATE\nSTOP\nSTART')" "$(cat "$ORDER")"
 
 # ── 3. Non-matching failure: never stop the tenant, fail loudly ──────────────
 
@@ -284,6 +285,7 @@ else
 fi
 
 echo
+bash "$SCRIPT_DIR/tests/test-mt-admin-podman-repair-quiescence.sh" || fail "repair/quiescence integration"
 if [[ "$failures" -eq 0 ]]; then
   echo "ALL TESTS PASSED"
 else

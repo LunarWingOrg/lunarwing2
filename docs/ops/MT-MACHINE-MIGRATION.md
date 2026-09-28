@@ -26,11 +26,12 @@ system need not match the old host's.
 > selected worker containers. PostgreSQL stays up only for `pg_dump`. Export then
 > verifies all writers are quiesced. Plan a per-tenant maintenance window.
 
-> **Validation status.** A historical plaintext path was live-validated in 2026.
-> The current encrypted path has automated production-script coverage for export,
-> wrong-password rejection, decrypt/import dry-run, manifest restrictions, owner-scope
-> planning, and passphrase safety. A real tenant cutover must still be rehearsed and
-> verified for database rows, encrypted secrets, workspace state, and OMEMO continuity.
+> **Validation status.** The [Goal 12 real-web rehearsal](GOAL12_REAL_WEB_ACCEPTANCE.md)
+> exercised encrypted export, wrong-password rejection, local `pg_restore` with
+> encrypted-secret/workspace verification, encrypted import dry-run, and source
+> restart. Production-script fixtures additionally cover manifest restrictions,
+> owner-scope planning, and passphrase safety. Cross-host cutover and OMEMO
+> continuity still require destination-side acceptance.
 
 ---
 
@@ -158,6 +159,11 @@ you may stop it too). Use `--no-quiesce` only if `mt-admin writers-active
 <tenant>` already reports stopped. DarkIRC export refuses pending, candidate,
 journal, rollback, interrupted-manifest, or unresolved ledger state before any
 lifecycle mutation.
+
+Export preflight accepts the unquoted env values written by mt-admin and the
+quoted values written by web/CLI onboarding. It decodes quotes for master-key
+validation and daemon/bridge password comparison without executing env content;
+the original carried lines remain verbatim inside the encrypted manifests.
 
 If migration-relevant DarkIRC contacts/state exist while `enable_darkirc=false`,
 export fails before entering mt-admin's lifecycle boundary. Explicitly enable and

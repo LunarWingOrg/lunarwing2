@@ -507,6 +507,17 @@ class DemoProvisionIntegrationTests(unittest.TestCase):
             done[-1]["phases"],
         )
 
+    def test_real_verification_forwards_selected_workers(self) -> None:
+        from lunarwing_mt_onboard.verify import CheckResult
+
+        job = Job(id="worker-verify", mode="provision", demo=False)
+        cfg = ProvisionRequest(name="sphinx", workers=["pebble", "opencode"]).to_tenant_config()
+        with patch.object(self.runner, "_read_gateway_port", return_value=10010), \
+             patch.object(self.runner, "verify_tenant", return_value=[CheckResult("Pebble worker", False, "not created")]) as verify:
+            checks = self.runner._verify(job, cfg)
+        verify.assert_called_once_with("sphinx", "127.0.0.1", 10010, workers=["pebble", "opencode"])
+        self.assertEqual(checks, [{"label": "Pebble worker", "ok": False, "detail": "not created"}])
+
     def test_v2_upgrade_uses_mt_admin_lifecycle(self) -> None:
         job = Job(id="test8", mode="upgrade", demo=True)
         req = UpgradeRequest(

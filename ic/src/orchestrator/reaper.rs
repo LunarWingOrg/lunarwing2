@@ -32,6 +32,7 @@ use crate::context::ContextManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::sandbox::connect_docker;
 use crate::sandbox::{SANDBOX_CONTAINER_LABEL, cli_runner::selected_runtime_binary};
+use crate::tools::process::{ProcessTreeGuard, WorkloadSpawner, workload_spawner};
 
 /// Configuration for the sandbox reaper.
 #[derive(Debug, Clone)]
@@ -363,6 +364,39 @@ pub async fn sweep_cli_sandboxes_once(config: &ReaperConfig) {
     sweep_cli_sandboxes(config).await;
 }
 
+/// The reaper needs the same manager-forked context as sandbox execution:
+/// even `podman ps` from the hardened daemon can invalidate live pause state.
+/// On OpenRC the shared spawner retains its process-group fallback. Preserve
+/// the sweep deadline, stopping the whole service/tree on timeout or cancellation.
+async fn runtime_cli_output(
+    spawner: &WorkloadSpawner,
+    bin: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = spawner.command(bin, args);
+    let spec = spawner.prepare_service(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn()?;
+    let mut guard = ProcessTreeGuard::for_service(&child, spec.as_ref(), spawner.xdg_runtime_dir());
+    let result = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "container runtime command timed out",
+            ))
+        });
+    if result.is_ok() {
+        guard.disarm();
+    } else {
+        guard.kill_tree().await;
+    }
+    result
+}
+
 /// Sweep for orphaned generic-sandbox containers via the runtime CLI.
 ///
 /// Shared by [`SandboxReaper::sweep_cli_sandboxes`] and the standalone
@@ -379,19 +413,16 @@ async fn sweep_cli_sandboxes(config: &ReaperConfig) {
     // Bounded (!1046 review finding 5): a wedged runtime CLI must not stall
     // the sweep cadence. The sweep now also runs socketless, so stuck probes
     // would otherwise silently disable orphan recovery on that host.
-    let output = match tokio::time::timeout(
+    let spawner = workload_spawner().await;
+    let output = match runtime_cli_output(
+        spawner,
+        bin,
+        &["ps", "-a", "--filter", &filter, "--format", "json"],
         Duration::from_secs(5),
-        tokio::process::Command::new(bin)
-            .args(["ps", "-a", "--filter", &filter, "--format", "json"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
     )
     .await
     {
-        Ok(Ok(output)) if output.status.success() => output,
+        Ok(output) if output.status.success() => output,
         _ => {
             tracing::debug!("Reaper: runtime CLI sandbox sweep listing failed");
             return;
@@ -432,19 +463,10 @@ async fn sweep_cli_sandboxes(config: &ReaperConfig) {
             age_secs = age.num_seconds(),
             "Reaper: orphaned sandbox container detected, cleaning up"
         );
-        let status = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::process::Command::new(bin)
-                .args(["rm", "-f", &name])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .status(),
-        )
-        .await;
+        let status =
+            runtime_cli_output(spawner, bin, &["rm", "-f", &name], Duration::from_secs(5)).await;
         match status {
-            Ok(Ok(s)) if s.success() => tracing::info!(
+            Ok(output) if output.status.success() => tracing::info!(
                 container = %name,
                 "Reaper: removed orphaned sandbox container"
             ),
@@ -515,6 +537,67 @@ fn container_name(value: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runtime_cli_output_uses_selected_isolation_and_captures_stdout() {
+        let detected = workload_spawner().await;
+        for spawner in [&WorkloadSpawner::direct(), detected] {
+            let output = runtime_cli_output(
+                spawner,
+                "/bin/sh",
+                &["-c", "cat /proc/self/cgroup; exit 7"],
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(output.status.code(), Some(7));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.trim().is_empty());
+            if spawner.uses_systemd_services() {
+                assert!(stdout.contains("/lunarwing-workload-"), "{stdout}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runtime_cli_timeout_reaps_descendants() {
+        let detected = workload_spawner().await;
+        for spawner in [&WorkloadSpawner::direct(), detected] {
+            let temp = tempfile::tempdir().unwrap();
+            let pid_path = temp.path().join("child.pid");
+            let error = runtime_cli_output(
+                spawner,
+                "/bin/sh",
+                &[
+                    "-c",
+                    "sleep 60 & echo $! > \"$1\"; wait",
+                    "test-runtime",
+                    pid_path.to_str().unwrap(),
+                ],
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let pid = std::fs::read_to_string(pid_path).unwrap();
+            let stat = format!("/proc/{}/stat", pid.trim());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let running = std::fs::read_to_string(&stat)
+                    .is_ok_and(|text| !matches!(text.split_whitespace().nth(2), Some("Z" | "X")));
+                if !running {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "descendant survived timeout"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
 
     // ── generic sandbox CLI sweep parsing ──────────────────────────────
 

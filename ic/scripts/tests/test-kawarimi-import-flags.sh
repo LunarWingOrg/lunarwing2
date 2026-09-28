@@ -498,6 +498,11 @@ DATABASE_URL=postgres://lunarwing:test@127.0.0.1/lunarwing
 SECRETS_MASTER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ENV
 chmod 0600 "$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
+PYTHONPATH="$IC_DIR/..${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tmp/export-home/alpha/lunarwing/env/lunarwing.env" <<'PY'
+import sys
+from lunarwing_mt_onboard.provisioner import _write_env_values
+_write_env_values(sys.argv[1], {"SECRETS_MASTER_KEY": "a" * 64})
+PY
 printf '{"tenants":{"alpha":{"enable_darkirc":false}}}\n' >"$tmp/export-ports.json"
 cp "$EXPORT_SRC" "$tmp/export-tenant.sh"
 chmod +x "$tmp/export-tenant.sh"
@@ -609,6 +614,26 @@ else
 fi
 
 echo "=== export validates source secrets before quiescence ==="
+source_env="$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
+cp "$source_env" "$tmp/valid-export.env"
+for key_case in invalid-quoted duplicate; do
+  if [[ "$key_case" == invalid-quoted ]]; then
+    sed -i 's/^SECRETS_MASTER_KEY=.*/SECRETS_MASTER_KEY="invalid"/' "$source_env"
+  else
+    grep '^SECRETS_MASTER_KEY=' "$tmp/valid-export.env" >>"$source_env"
+  fi
+  if PATH="$tmp/export-bin:$PATH" KAWARIMI_TEST_WORK="$tmp" \
+    LUNARWING_MT_ADMIN="$tmp/export-mt-admin.sh" \
+    LUNARWING_PORTS_REGISTRY="$tmp/export-ports.json" \
+    bash "$EXPORT_SRC" alpha --out-dir "$tmp/export-out" --dry-run >"$tmp/key-rejection.log" 2>&1; then
+    fail "export rejects $key_case master key"
+  elif [[ ! -e "$tmp/systemctl-called" ]] && grep -q 'environment key\|missing or invalid' "$tmp/key-rejection.log"; then
+    pass "export rejects $key_case master key before lifecycle mutation"
+  else
+    fail "export rejects $key_case master key before lifecycle mutation"
+  fi
+  cp "$tmp/valid-export.env" "$source_env"
+done
 printf 'XMPP_PASSWORD=daemon-password\n' >>"$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
 cat >"$tmp/export-home/alpha/lunarwing/env/xmpp-bridge.env" <<'ENV'
 XMPP_PASSWORD=bridge-password
@@ -637,6 +662,21 @@ else
 fi
 sed -i '/^XMPP_PASSWORD=/d' "$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
 rm -f "$tmp/export-home/alpha/lunarwing/env/xmpp-bridge.env"
+
+# Equivalent credentials with different env quoting must compare by value.
+# Command-looking password bytes stay data, including through encrypted import.
+PYTHONPATH="$IC_DIR/..${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tmp/export-home/alpha/lunarwing/env" <<'PY'
+import os
+import sys
+from pathlib import Path
+from lunarwing_mt_onboard.provisioner import _write_env_values
+env = Path(sys.argv[1])
+password = r'shared "quote" \slash $(false) $literal'
+_write_env_values(str(env / "lunarwing.env"), {"XMPP_PASSWORD": password})
+bridge = env / "xmpp-bridge.env"
+bridge.write_text("XMPP_PASSWORD='" + password + "'\n")
+os.chmod(bridge, 0o600)
+PY
 
 echo "=== production export -> encrypted import dry-run ==="
 rm -f "$tmp/systemctl-called"
@@ -704,6 +744,7 @@ mkdir -p "$tmp/roundtrip-extract"
 } | 7z x -o"$tmp/roundtrip-extract" "$exported_bundle" -y >/dev/null 2>&1
 manifest_path="$(find "$tmp/roundtrip-extract" -name manifest-lunarwing.env -print -quit)"
 assert_file_contains "encrypted manifest preserves Kimi API key" "$manifest_path" "KIMI_API_KEY=encrypted-roundtrip-kimi-secret"
+assert_file_contains "encrypted manifest preserves web-written master key quoting" "$manifest_path" 'SECRETS_MASTER_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 assert_file_not_contains "encrypted manifest omits retired Nanocode model" "$manifest_path" "NANOCODE_MODEL="
 assert_file_not_contains "encrypted manifest omits retired Nanocode base URL" "$manifest_path" "NANOCODE_BASE_URL="
 for source_local_url in \

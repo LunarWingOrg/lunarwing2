@@ -282,7 +282,10 @@ def _verify(job: Job, cfg: TenantConfig) -> list[dict]:
         demo=False,
         fallback=cfg.gateway_port,
     )
-    results = verify_tenant(cfg.name, cfg.gateway_host, gateway_port)
+    results = verify_tenant(
+        cfg.name, cfg.gateway_host, gateway_port,
+        workers=[worker.value for worker in cfg.workers],
+    )
     checks = [{"label": r.label, "ok": r.ok, "detail": r.detail} for r in results]
     if not gateway_port:
         checks.insert(

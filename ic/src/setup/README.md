@@ -45,6 +45,12 @@ that image before daemon startup so a failed distribution can be retried after
 `build-sandbox-image`. Existing tenants are not changed by `upgrade-tenant`;
 see `docs/ops/WORKER-CONTAINERS.md` for manual opt-in and recovery.
 
+The repository's `lunarwing_mt_onboard` CLI and web frontend verify the gateway,
+daemon, PostgreSQL, and selected workers after provisioning. Container checks
+use mt-admin's runtime-backed status lines on both systemd user managers and
+OpenRC, so active daemon units cannot hide a broken Podman store or missing
+worker. Verification failure fails the onboarding job/CLI exit.
+
 ---
 
 ## Startup Sequence (main.rs)
