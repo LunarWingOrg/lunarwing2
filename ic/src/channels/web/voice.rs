@@ -24,6 +24,19 @@ use crate::llm::transcription::voice_endpoint;
 pub const MAX_AUDIO_B64_LEN: usize = 24 * 1024 * 1024;
 /// Maximum synthesis text length in chars (mirrors the sidecar default).
 pub const MAX_SYNTH_TEXT_CHARS: usize = 10_000;
+/// Maximum synthesized audio duration in seconds the sidecar returns before
+/// rejecting the clip (mirrors the sidecar default `VOICE_MAX_TTS_AUDIO_SECS`).
+/// Text whose estimated speech duration exceeds this is rejected up front with
+/// `text_too_long` instead of burning sidecar CPU on a guaranteed failure
+/// (WI#259: long desktop replies surfaced as opaque 502s).
+pub const MAX_SYNTH_AUDIO_SECS: u64 = 300;
+/// Conservative synthesis rate for Latin-ish text at speed 1.0 (chars/sec),
+/// used only for the duration pre-flight; chosen below typical TTS output so
+/// the estimate over-predicts duration rather than under-predicting it.
+const SYNTH_LATIN_CHARS_PER_SEC: f64 = 14.0;
+/// CJK ideographs/kana carry roughly one syllable per character, so the same
+/// character budget produces ~4x longer audio than Latin text.
+const SYNTH_CJK_CHARS_PER_SEC: f64 = 3.5;
 /// Maximum transcription response body (text-only JSON).
 const MAX_TRANSCRIBE_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Maximum synthesis response body (base64 WAV of a bounded clip).
@@ -54,10 +67,16 @@ impl VoiceProxyError {
             Self::Request(_) => StatusCode::BAD_GATEWAY,
             Self::InvalidResponse => StatusCode::BAD_GATEWAY,
             // Upstream statuses are never forwarded verbatim: a sidecar 401
-            // would read as a gateway-token failure, so it maps to 500 and
-            // everything else to 502 (429 handled separately in
+            // would read as a gateway-token failure, so it maps to 500. The
+            // sidecar's documented overload/processing statuses (422/503/504)
+            // keep their semantics so clients can distinguish "the reply is
+            // too long to synthesize" from a real infrastructure failure;
+            // everything else stays a generic 502 (429 handled separately in
             // `map_proxy_error`).
             Self::Upstream { status: 401, .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Upstream { status: 422, .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Upstream { status: 503, .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Upstream { status: 504, .. } => StatusCode::GATEWAY_TIMEOUT,
             Self::Upstream { .. } => StatusCode::BAD_GATEWAY,
         }
     }
@@ -299,6 +318,9 @@ pub struct VoiceStatusResponse {
     pub model: Option<String>,
     pub max_audio_b64_len: usize,
     pub max_text_chars: usize,
+    /// Maximum synthesized audio duration the sidecar returns; text estimated
+    /// to exceed it is rejected with `text_too_long` (422).
+    pub max_synth_audio_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -387,6 +409,7 @@ pub async fn voice_status_handler(
         model,
         max_audio_b64_len: MAX_AUDIO_B64_LEN,
         max_text_chars: MAX_SYNTH_TEXT_CHARS,
+        max_synth_audio_secs: MAX_SYNTH_AUDIO_SECS,
     })
 }
 
@@ -506,6 +529,27 @@ fn map_proxy_error(error: VoiceProxyError) -> HandlerError {
                     "voice sidecar rejected the request".to_string(),
                 );
             }
+            Ok(StatusCode::UNPROCESSABLE_ENTITY) => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "processing_failed",
+                    "voice sidecar could not process the request".to_string(),
+                );
+            }
+            Ok(StatusCode::SERVICE_UNAVAILABLE) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "voice sidecar is unavailable".to_string(),
+                );
+            }
+            Ok(StatusCode::GATEWAY_TIMEOUT) => {
+                return error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream_timeout",
+                    "voice sidecar request timed out".to_string(),
+                );
+            }
             _ => {}
         }
     }
@@ -587,6 +631,34 @@ fn validate_synthesize_request(request: &VoiceSynthesizeRequest) -> Result<Strin
             format!("text exceeds {} characters", MAX_SYNTH_TEXT_CHARS),
         ));
     }
+    let speed = request.speed.unwrap_or(1.0);
+    if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "speed must be between 0.5 and 2.0".to_string(),
+        ));
+    }
+    // Slow playback (speed < 1.0) lengthens audio; faster playback only
+    // shortens it, so the estimate clamps at 1.0 to stay conservative.
+    let effective_speed = if speed < 1.0 { speed } else { 1.0 };
+    let estimated_secs = estimate_synthesis_secs(text, effective_speed);
+    if estimated_secs > MAX_SYNTH_AUDIO_SECS as f64 {
+        tracing::info!(
+            chars = text.chars().count(),
+            estimated_secs,
+            max_secs = MAX_SYNTH_AUDIO_SECS,
+            "Rejecting synthesis text estimated to exceed the sidecar audio cap"
+        );
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "text_too_long",
+            format!(
+                "text is too long to synthesize (estimated {estimated_secs:.0}s of audio, \
+                 limit {MAX_SYNTH_AUDIO_SECS}s)"
+            ),
+        ));
+    }
     if request
         .voice
         .as_deref()
@@ -598,17 +670,37 @@ fn validate_synthesize_request(request: &VoiceSynthesizeRequest) -> Result<Strin
             "voice must be at most 64 characters".to_string(),
         ));
     }
-    if request
-        .speed
-        .is_some_and(|speed| !speed.is_finite() || !(0.5..=2.0).contains(&speed))
-    {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "speed must be between 0.5 and 2.0".to_string(),
-        ));
-    }
     Ok(text.to_string())
+}
+
+/// Conservative upper-bound estimate of synthesized audio duration, split by
+/// script: CJK code points render roughly one syllable each while Latin-ish
+/// scripts average several characters per spoken syllable.
+fn estimate_synthesis_secs(text: &str, speed: f32) -> f64 {
+    let mut latin = 0u64;
+    let mut cjk = 0u64;
+    for character in text.chars() {
+        let is_cjk = matches!(character as u32,
+            0x1100..=0x11FF        // Hangul Jamo
+            | 0x2E80..=0x303E      // CJK Radicals, Kangxi, CJK symbols
+            | 0x3041..=0x33FF      // Kana, Bopomofo, CJK compatibility
+            | 0x3400..=0x4DBF      // CJK Ext A
+            | 0x4E00..=0x9FFF      // CJK Unified
+            | 0xA960..=0xA97F      // Hangul Ext A
+            | 0xAC00..=0xD7FF      // Hangul syllables
+            | 0xF900..=0xFAFF      // CJK compatibility ideographs
+            | 0xFF00..=0xFF60      // fullwidth forms
+            | 0x20000..=0x2FFFD    // CJK Ext B..
+            | 0x30000..=0x3FFFD
+        );
+        if is_cjk {
+            cjk += 1;
+        } else if !character.is_whitespace() {
+            latin += 1;
+        }
+    }
+    let secs = latin as f64 / SYNTH_LATIN_CHARS_PER_SEC + cjk as f64 / SYNTH_CJK_CHARS_PER_SEC;
+    secs / f64::from(speed.max(0.5))
 }
 
 #[cfg(test)]
@@ -703,6 +795,72 @@ mod tests {
     }
 
     #[test]
+    fn validate_synthesize_rejects_duration_overflow_before_the_sidecar() {
+        // 10_000 chars is within the character cap but would synthesize to
+        // far more than MAX_SYNTH_AUDIO_SECS of audio; the gateway must
+        // reject it up front with a distinct 422 rather than letting the
+        // sidecar burn CPU and fail (WI#259's opaque 502).
+        let request = VoiceSynthesizeRequest {
+            text: "x".repeat(MAX_SYNTH_TEXT_CHARS),
+            voice: None,
+            speed: Some(1.0),
+        };
+        let error = validate_synthesize_request(&request).unwrap_err();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.1.error, "text_too_long");
+
+        // A short reply under the same cap still passes.
+        let request = VoiceSynthesizeRequest {
+            text: "short reply".to_string(),
+            voice: None,
+            speed: Some(1.0),
+        };
+        assert_eq!(
+            validate_synthesize_request(&request).unwrap(),
+            "short reply"
+        );
+    }
+
+    #[test]
+    fn estimate_synthesis_secs_separates_cjk_and_latin_scripts() {
+        // Conservative upper bounds per script: Latin well above typical TTS
+        // pace, CJK assuming one syllable per ideograph.
+        let latin = "word ".repeat(100); // 400 non-whitespace chars
+        assert!(
+            estimate_synthesis_secs(&latin, 1.0) > 400.0 / SYNTH_LATIN_CHARS_PER_SEC - 0.5,
+            "latin estimate should count non-whitespace characters"
+        );
+        assert!(estimate_synthesis_secs(&latin, 1.0) < 60.0);
+
+        // ~150 CJK ideographs must already be treated as slower than the same
+        // number of Latin characters.
+        let cjk: String = "你好世界".repeat(40);
+        assert_eq!(cjk.chars().count(), 160);
+        assert!(
+            estimate_synthesis_secs(&cjk, 1.0) > estimate_synthesis_secs(&latin, 1.0),
+            "CJK text of similar length must estimate longer audio"
+        );
+
+        // Slow playback divides the estimate; clamp floor is 0.5.
+        assert!(estimate_synthesis_secs("hello", 0.5) > estimate_synthesis_secs("hello", 1.0));
+    }
+
+    #[test]
+    fn longest_accepted_reply_fits_the_audio_cap() {
+        // A dense Latin reply at the character cap must estimate under the
+        // audio cap at normal speed (the pre-flight should not reject every
+        // maximal reply, only genuinely over-long ones).
+        let text = "w".repeat(3_500);
+        assert!(estimate_synthesis_secs(&text, 1.0) <= MAX_SYNTH_AUDIO_SECS as f64);
+        let request = VoiceSynthesizeRequest {
+            text,
+            voice: None,
+            speed: Some(1.0),
+        };
+        assert!(validate_synthesize_request(&request).is_ok());
+    }
+
+    #[test]
     fn voice_api_requires_lunarvoice_provider_and_token() {
         let mut config = crate::config::TranscriptionConfig::default();
         assert!(VoiceApi::from_config(&config).is_none());
@@ -785,6 +943,76 @@ mod tests {
             .unwrap();
         assert_eq!(response.audio, "UklGRg==");
         assert_eq!(response.sample_rate, 24000);
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_sidecar_processing_and_overload_statuses() {
+        use axum::routing::post;
+
+        // The sidecar's documented failure modes for over-long synthesis:
+        // 422 processing_failed (audio exceeds the duration cap) and 504
+        // timeout (inference over budget). Both must keep their semantics at
+        // the gateway instead of collapsing into an opaque 502 (WI#259).
+        for (upstream, expected_status, expected_error) in [
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing_failed",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+            ),
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+            ),
+        ] {
+            let detail = format!("sidecar failure {upstream}");
+            let sidecar = axum::Router::new().route(
+                "/v1/voice/synthesize",
+                post(move || async move {
+                    (
+                        upstream,
+                        Json(serde_json::json!({"error": "x", "detail": detail})),
+                    )
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, sidecar).await;
+            });
+
+            let client = VoiceProxyClient::new(
+                &format!("http://{}", addr),
+                SecretString::from("secret"),
+                "whisper-tiny",
+            )
+            .unwrap();
+            let err = client
+                .synthesize(SidecarSynthesizeRequest {
+                    text: "hello",
+                    voice: "",
+                    speed: 1.0,
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, VoiceProxyError::Upstream { status, .. } if *status == upstream.as_u16()),
+                "expected upstream {upstream}"
+            );
+            assert_eq!(err.gateway_status(), expected_status);
+            let (status, body) = map_proxy_error(err);
+            assert_eq!(status, expected_status);
+            assert_eq!(body.0.error, expected_error);
+            assert!(
+                !body.0.message.contains("sidecar failure"),
+                "sidecar detail must not leak"
+            );
+        }
     }
 
     #[tokio::test]
