@@ -59,6 +59,35 @@ container's `/tmp` does not survive the command.
 
 Fresh-tenant acceptance steps: [WI#162 verification](../../../docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md).
 
+### tool_list pagination and completeness (WI#245)
+
+`tool_list` is paginated and self-limiting; it never relies on the safety
+layer's byte truncation to bound its size (a clipped JSON prefix is
+indistinguishable from a complete list — the "19 of 31 MCP servers" failure).
+
+The result always includes:
+
+- `extensions` — entries ordered by kind (`mcp_server`, `wasm_tool`,
+  `wasm_channel`), then case-insensitive name. Ordering is deterministic, so
+  the same offset always addresses the same entries.
+- `count` / `total` — entries on this page vs. entries matching the filter.
+- `offset` / `next_offset` — `next_offset` is `null` on the last page.
+- `truncated` — `true` whenever more pages exist. Consumers must not infer
+  absence from a single page.
+
+Pagination parameters: `offset` (default 0), `limit` (1–100, default 50).
+Keep `kind`/`include_available` identical across pages of one enumeration.
+
+Per entry, `tools` lists at most 25 exposed tool names; when capped, the entry
+carries `tools_truncated: true` and `tools_total`. Optional entry fields
+(`display_name`, `description`, `version`, `activation_error`, `recovering`,
+`needs_setup`, `has_auth`) serialize only when set to keep pages compact.
+
+`ExtensionManager::list()` (used by the web gateway and other internal
+consumers) still returns full structs; only the agent-facing `tool_list`
+output is bounded. The same pagination contract is the model for fixing
+`mission_list` and `list_issues`, which share the truncation family.
+
 ### What Goes in Tools (capabilities.json)
 
 - API endpoints the tool needs (HTTP allowlist)
