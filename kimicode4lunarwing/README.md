@@ -17,7 +17,8 @@ docker compose up -d lunarwing-worker
 Compose rejects a missing value before launching the container. The baked
 default model is the TensorZero gateway function
 `tensorzero::function_name::FrontierCODEK` (OpenAI-compatible endpoint, reached
-over the LAN at `http://192.168.1.157:3000/openai/v1`); since kimi-code 0.37.2
+over NetBird at `http://cotterhomelab3.netbird.selfhosted:3000/openai/v1`);
+since kimi-code 0.37.2
 the managed `api.kimi.com` provider no longer works for worker prompts. Set
 `KIMI_API_KEY` (or the shared `TENSORZERO_API_KEY`) when the gateway requires
 a bearer token; the previous
