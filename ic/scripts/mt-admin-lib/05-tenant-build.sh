@@ -1320,12 +1320,6 @@ install_wasm_tenant() {
     installed=$((installed + 1))
   done
 
-  # Patch WeeChat channel caps with per-tenant ports from the registry.
-  # The source caps file has generic default ports (9001/6681) that are wrong
-  # for every multi-tenant host. This runs after every install-wasm so the
-  # tenant's allocated ports are always correct, even after a fresh copy.
-  patch_weechat_caps "$name"
-
   say "installing WASM tools to $tools_dir..."
   for dir in "$repo/tools-src"/*/; do
     [[ -d "$dir" ]] || continue
@@ -1362,6 +1356,10 @@ install_wasm_tenant() {
   done
 
   chown -R "$name:$name" "$channels_dir" "$tools_dir"
+  # The tenant-UID writer requires both the channel directory and the copied
+  # capabilities file to be tenant-owned before it can replace the file.
+  # Source caps contain generic 9001/6681 ports, not this tenant's ports.
+  patch_weechat_caps "$name"
   patch_ssh_tool_allowlist "$name"
 
   local gotify_config="$state_dir/workspace/config/gotify.json"
