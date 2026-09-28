@@ -1117,6 +1117,13 @@ The hardened function variants with tiered fallback suggest high-availability de
 - `find_stuck_jobs_with_threshold()` polls context manager
 - Jobs in `InProgress` are transitioned to `Stuck` before repair
 - Stuck duration measured from most recent Stuck transition (not from `started_at`) — correct behavior
+- Idle detection (WI#263): the elapsed threshold is measured from
+  `last_activity_at` (noted on every streamed progress event), falling back to
+  `started_at` — a long-running external-worker job that keeps streaming
+  evidence is healthy; only a job that has gone silent is flagged
+- `Stuck → Completed` is a legal transition (WI#263): a job flagged Stuck by
+  the idle threshold can still receive its genuine final result late; the
+  deliverable must land, not be discarded
 
 ### Repair Flow
 
