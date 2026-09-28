@@ -317,7 +317,7 @@ read_tenant_env_value() {  # <tenant> <file> <KEY>
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
   darkirc_path_components_safe "$target" || die "unsafe tenant env path: $target"
   value="$("${drop[@]}" env -i PATH="/usr/bin:/bin" \
-    TARGET_PATH="$target" TARGET_KEY="$key" bash -c '
+    TARGET_PATH="$target" TARGET_KEY="$key" bash --noprofile --norc -c '
       set -euo pipefail
       target="$TARGET_PATH"
       parent="${target%/*}"
@@ -368,7 +368,7 @@ write_tenant_file_atomic() {  # <tenant> <file> [mode] [private|owned-parent]
   [[ "$parent_policy" == private || "$parent_policy" == owned-parent ]] || return 1
   darkirc_path_components_safe "$target" || die "unsafe tenant file path: $target"
   "${drop[@]}" env -i PATH="/usr/bin:/bin" \
-    TARGET_PATH="$target" TARGET_MODE="$mode" PARENT_POLICY="$parent_policy" bash -c '
+    TARGET_PATH="$target" TARGET_MODE="$mode" PARENT_POLICY="$parent_policy" bash --noprofile --norc -c '
       set -euo pipefail
       target="$TARGET_PATH"
       parent="${target%/*}"
@@ -613,7 +613,7 @@ _tenant_env_replace() {  # <tenant> <env_file> <KEY> <VALUE>
   darkirc_path_components_safe "$path" || return 1
   staged="$(mktemp)" || return 1
   if printf '%s\n' "$value" | "${drop[@]}" env -i PATH="/usr/bin:/bin" \
-    TARGET_PATH="$path" TARGET_KEY="$key" bash -c '
+    TARGET_PATH="$path" TARGET_KEY="$key" bash --noprofile --norc -c '
       set -euo pipefail
       target="$TARGET_PATH"
       parent="${target%/*}"
