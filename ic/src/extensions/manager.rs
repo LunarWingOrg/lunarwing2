@@ -1703,7 +1703,7 @@ impl ExtensionManager {
         // Deterministic order (kind, then name). Installed entries come from
         // HashMap-backed discovery, so without this the iteration order — and
         // therefore any prefix a consumer takes — changes between calls.
-        extensions.sort_by(|a, b| extension_sort_key(a).cmp(&extension_sort_key(b)));
+        extensions.sort_by_key(extension_sort_key);
 
         Ok(extensions)
     }
@@ -10346,7 +10346,10 @@ done
         );
     }
 
-    fn sort_test_extension(name: &str, kind: ExtensionKind) -> crate::extensions::InstalledExtension {
+    fn sort_test_extension(
+        name: &str,
+        kind: ExtensionKind,
+    ) -> crate::extensions::InstalledExtension {
         crate::extensions::InstalledExtension {
             name: name.to_string(),
             kind,
@@ -10385,7 +10388,13 @@ done
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["alpha_server", "Beta_Server", "zeta_tool", "alpha_channel", "zeta_channel"],
+            vec![
+                "alpha_server",
+                "Beta_Server",
+                "zeta_tool",
+                "alpha_channel",
+                "zeta_channel"
+            ],
             "MCP servers first, then WASM tools, then channels; names case-insensitive"
         );
     }

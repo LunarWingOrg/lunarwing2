@@ -1040,7 +1040,10 @@ fn extension_to_json(extension: &crate::extensions::InstalledExtension) -> serde
             "needs_setup".to_string(),
             serde_json::json!(extension.needs_setup),
         );
-        obj.insert("has_auth".to_string(), serde_json::json!(extension.has_auth));
+        obj.insert(
+            "has_auth".to_string(),
+            serde_json::json!(extension.has_auth),
+        );
     }
     if extension.recovering {
         obj.insert("recovering".to_string(), serde_json::json!(true));
@@ -1065,9 +1068,7 @@ impl ToolListTool {
         raw.and_then(serde_json::Value::as_u64)
             .map(|v| v as usize)
             .ok_or_else(|| {
-                ToolError::InvalidParameters(
-                    "offset must be a non-negative integer".to_string(),
-                )
+                ToolError::InvalidParameters("offset must be a non-negative integer".to_string())
             })
     }
 
@@ -1794,7 +1795,11 @@ mod tests {
         assert!(schema["properties"].get("limit").is_some());
     }
 
-    fn installed_extension(name: &str, kind: ExtensionKind, tools: Vec<String>) -> crate::extensions::InstalledExtension {
+    fn installed_extension(
+        name: &str,
+        kind: ExtensionKind,
+        tools: Vec<String>,
+    ) -> crate::extensions::InstalledExtension {
         crate::extensions::InstalledExtension {
             name: name.to_string(),
             kind,
@@ -1844,7 +1849,13 @@ mod tests {
             ExtensionKind::WasmChannel,
             Vec::new(),
         ));
-        for field in ["display_name", "description", "version", "activation_error", "recovering"] {
+        for field in [
+            "display_name",
+            "description",
+            "version",
+            "activation_error",
+            "recovering",
+        ] {
             assert!(entry.get(field).is_none(), "field {field} should be absent");
         }
         assert_eq!(entry["name"], serde_json::json!("plain"));
