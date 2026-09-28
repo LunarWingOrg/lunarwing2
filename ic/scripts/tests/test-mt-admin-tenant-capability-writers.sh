@@ -80,9 +80,46 @@ fi
 
 env_file="$fixture/env/lunarwing.env"
 if [[ "$EUID" == 0 ]]; then
+  # Fresh install-wasm copies the shipped caps as root. The tenant-UID writer
+  # must see tenant ownership on both the destination and its parent before
+  # replacing the generic ports; start-tenant must not be needed to fix them.
+  fixture_repo="$fixture/repo"
+  tenant_repo() { printf '%s\n' "$fixture_repo"; }
+  tenant_exists_in_registry() { :; }
+  tenant_darkirc_enabled() { return 1; }
+  mkdir -p "$fixture_repo/channels-src/weechat/target/wasm32-wasip2/release"
+  printf 'fixture wasm\n' >"$fixture_repo/channels-src/weechat/target/wasm32-wasip2/release/weechat_relay_channel.wasm"
+  printf '{"config":{"relay_url":"http://127.0.0.1:9001","ws_adapter_url":"http://127.0.0.1:6681"}}\n' \
+    >"$fixture_repo/channels-src/weechat/weechat.capabilities.json"
+  rm -rf -- "$fixture/state/channels" "$fixture/state/tools"
+  mkdir -p "$fixture/state/channels"
+  cp "$fixture_repo/channels-src/weechat/weechat.capabilities.json" "$wc_caps"
+  [[ "$(stat -c %U "$fixture/state/channels")" == root ]]
+  [[ "$(stat -c %U "$wc_caps")" == root ]]
+  patch_weechat_caps "$name" >/dev/null 2>&1
+  [[ "$(jq -r '.config.relay_url' "$wc_caps")" == http://127.0.0.1:9001 ]]
+  # Real tenants have a matching group, but some CI images provide nobody
+  # only with a different primary group (e.g. nogroup). Translate just the
+  # install fixture's tenant:tenant chown; still perform a real chown so the
+  # tenant-UID writer and ownership assertions exercise the actual boundary.
+  if ! getent group "$name" >/dev/null; then
+    chown() {
+      [[ "$1" == -R && "$2" == "$name:$name" ]] || return 1
+      shift 2
+      command chown -R "$name:$(id -g "$name")" "$@"
+    }
+  fi
+  install_wasm_tenant "$name"
+  [[ "$(stat -c %U "$fixture/state/channels")" == "$name" ]]
+  [[ "$(stat -c %U "$wc_caps")" == "$name" ]]
+  [[ "$(stat -c %a "$wc_caps")" == 600 ]]
+  [[ "$(jq -r '.config.relay_url' "$wc_caps")" == http://127.0.0.1:18005 ]]
+  [[ "$(jq -r '.config.ws_adapter_url' "$wc_caps")" == http://127.0.0.1:18006 ]]
+  install_wasm_tenant "$name"
+  [[ "$(jq -r '.config.relay_url' "$wc_caps")" == http://127.0.0.1:18005 ]]
   # The rotation/worker tests cover root -> unprivileged tenant. Keep this
   # fixture focused on owner-side secret generation under a real login UID.
-  printf 'PASS: tenant capability rewrites, symlink rejection, and producer-failure containment\n'
+  printf 'PASS: fresh root-created WASM caps patched, tenant capability rewrites, symlink rejection, and producer-failure containment\n'
   exit 0
 fi
 printf 'KIMI_MODEL=coder\nKIMI_API_KEY=fixture-key\nWORKER_AUTH_TOKEN=fixture-token\n' >"$env_file"

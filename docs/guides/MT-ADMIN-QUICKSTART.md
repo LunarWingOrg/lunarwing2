@@ -119,7 +119,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-tenant ruffles --with-wasm
 sudo ic/scripts/lunarwing-mt-admin.sh install-wasm ruffles
 ```
 
-MT admin serializes tenant builds to avoid concurrent memory pressure. `--with-wasm` builds current registry channel/tool sources; `install-wasm` publishes the resulting artifacts and capability sidecars into the tenant state directories.
+MT admin serializes tenant builds to avoid concurrent memory pressure. `--with-wasm` builds current registry channel/tool sources; `install-wasm` publishes the resulting artifacts and capability sidecars into the tenant state directories. On a fresh install, it assigns ownership to the tenant before patching WeeChat's generic capability ports to the allocated tenant ports; a separate `start-tenant` is not required for that patch.
 
 Build optional shared components before starting tenants that require them:
 
