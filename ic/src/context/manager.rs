@@ -779,8 +779,7 @@ mod tests {
         // ...but id1 emitted progress a minute ago.
         manager
             .update_context(id1, |ctx| -> Result<(), crate::error::JobError> {
-                ctx.last_activity_at =
-                    Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+                ctx.last_activity_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
                 Ok(())
             })
             .await
