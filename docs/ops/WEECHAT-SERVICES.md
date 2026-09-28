@@ -417,6 +417,11 @@ protects the host root/tenant boundary, not just the container sandbox.
 Tenant-owned capability files under `state/` use the same privilege-drop
 pattern; their parent directories may be readable but must not be writable by
 other users.
+The tenant-side atomic writer commits whatever bytes reach its stdin, so
+fallible producers (jq rewrites, tenant-side reads) must stage their complete
+result in root-private storage and check the producer's exit status first;
+only then is the staged file handed to the tenant-side commit. A failed
+producer therefore leaves the previous file byte-for-byte intact.
 
 On a failed write it restores both old credentials before releasing the barrier.
 If rollback fails, or rotation is killed, the persistent
@@ -436,7 +441,9 @@ both init transports, the real self-heal restart dispatch, failed writes,
 SIGKILL, recovery, and rejected symlink destinations. It also runs the
 real-process Python start-barrier tests.
 `ic/scripts/tests/test-mt-admin-tenant-capability-writers.sh` covers the
-related tenant-owned capability-file rewrites.
+related tenant-owned capability-file rewrites, including producer-failure
+containment (a failing jq or tenant-side read must not publish a partial
+replacement).
 For isolated real WeeChat authentication and save/restart coverage, run
 `RUN_LIVE_RELAY_ROTATION=1 bash ic/scripts/tests/test-relay-password-live.sh`
 as an unprivileged user with WeeChat and tmux installed.

@@ -11,6 +11,13 @@ name="$(id -un)"
 if [[ "$EUID" == 0 ]]; then
   name=nobody
   chmod 755 "$fixture"
+  # CI container images ship no sudo binary; route the nobody privilege drop
+  # through runuser (util-linux), matching test-rotate-relay-password.sh.
+  sudo() {
+    [[ "$1" == -u && "$2" == nobody ]] || return 1
+    shift 2
+    runuser -u nobody -- "$@"
+  }
 fi
 tenant_state_dir() { printf '%s/state' "$fixture"; }
 tenant_env_dir() { printf '%s/env' "$fixture"; }
@@ -44,11 +51,38 @@ rm "$wc_caps"
 ln -s "$sentinel" "$wc_caps"
 patch_weechat_caps "$name"
 [[ "$(<"$sentinel")" == untouched && -L "$wc_caps" ]]
+
+# Failure paths: a failing producer must never publish a partial result.
+# Corrupt JSON makes the tenant-side jq exit nonzero mid-parse; the staged
+# rewrite is discarded and the installed caps stay byte-for-byte intact.
+rm -f "$wc_caps"
+printf '{"config":{"relay_url":' >"$wc_caps"
+if [[ "$EUID" == 0 ]]; then chown nobody "$wc_caps"; fi
+wc_sha="$(sha256sum "$wc_caps" | cut -d' ' -f1)"
+patch_weechat_caps "$name" >/dev/null 2>&1
+[[ "$(sha256sum "$wc_caps" | cut -d' ' -f1)" == "$wc_sha" ]] \
+  || { echo 'FAIL: weechat caps clobbered by failing jq' >&2; exit 1; }
+printf '{"capabilities":{"ssh":' >"$ssh_caps"
+if [[ "$EUID" == 0 ]]; then chown nobody "$ssh_caps"; fi
+ssh_sha="$(sha256sum "$ssh_caps" | cut -d' ' -f1)"
+patch_ssh_tool_allowlist "$name" >/dev/null 2>&1
+[[ "$(sha256sum "$ssh_caps" | cut -d' ' -f1)" == "$ssh_sha" ]] \
+  || { echo 'FAIL: ssh-tool caps clobbered by failing jq' >&2; exit 1; }
+printf '{"capabilities":{"http":' >"$gotify_caps"
+if [[ "$EUID" == 0 ]]; then chown nobody "$gotify_caps"; fi
+gotify_sha="$(sha256sum "$gotify_caps" | cut -d' ' -f1)"
+if configure_gotify_capabilities "$name" 'https://gotify.example.org' >/dev/null 2>&1; then
+  echo 'FAIL: gotify caps accepted corrupt JSON' >&2
+  exit 1
+fi
+[[ "$(sha256sum "$gotify_caps" | cut -d' ' -f1)" == "$gotify_sha" ]] \
+  || { echo 'FAIL: gotify caps clobbered by failing jq' >&2; exit 1; }
+
 env_file="$fixture/env/lunarwing.env"
 if [[ "$EUID" == 0 ]]; then
   # The rotation/worker tests cover root -> unprivileged tenant. Keep this
   # fixture focused on owner-side secret generation under a real login UID.
-  printf 'PASS: tenant capability rewrites and symlink rejection\n'
+  printf 'PASS: tenant capability rewrites, symlink rejection, and producer-failure containment\n'
   exit 0
 fi
 printf 'KIMI_MODEL=coder\nKIMI_API_KEY=fixture-key\nWORKER_AUTH_TOKEN=fixture-token\n' >"$env_file"
@@ -58,6 +92,27 @@ runtime="$(write_kimi_runtime_env "$name")"
 [[ "$(stat -c %a "$runtime")" == 600 ]]
 grep -q '^AGENT_AUTH_TOKEN=fixture-token$' "$runtime"
 grep -q '^KIMI_API_KEY=fixture-key$' "$runtime"
+
+# A failed tenant-side read/transform must leave committed files intact: the
+# relaxed env parent (mode 711) violates the private-parent policy, so the
+# staged rewrite is discarded before any rename can happen.
+env_sha="$(sha256sum "$env_file" | cut -d' ' -f1)"
+kimi_sha="$(sha256sum "$runtime" | cut -d' ' -f1)"
+chmod 711 "$fixture/env"
+if _tenant_env_replace "$name" "$env_file" DATABASE_URL 'postgres://replacement-value'; then
+  echo 'FAIL: _tenant_env_replace accepted a non-private env parent' >&2
+  exit 1
+fi
+[[ "$(sha256sum "$env_file" | cut -d' ' -f1)" == "$env_sha" ]] \
+  || { echo 'FAIL: lunarwing.env clobbered by failed replace' >&2; exit 1; }
+if write_kimi_runtime_env "$name" >/dev/null 2>&1; then
+  echo 'FAIL: write_kimi_runtime_env accepted a non-private env parent' >&2
+  exit 1
+fi
+[[ "$(sha256sum "$runtime" | cut -d' ' -f1)" == "$kimi_sha" ]] \
+  || { echo 'FAIL: kimi-runtime.env clobbered by failed generation' >&2; exit 1; }
+chmod 700 "$fixture/env"
+
 printf 'DATABASE_URL=postgres://old\nPRESERVE=yes\n' >"$env_file"
 chmod 600 "$env_file"
 ensure_container_runtime() { :; }

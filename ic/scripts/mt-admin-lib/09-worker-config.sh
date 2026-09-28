@@ -1542,23 +1542,31 @@ prepare_worker_workspace() {
 }
 
 write_kimi_runtime_env() {
-  local name="$1" source_path target_path key value
+  local name="$1" source_path target_path key value staged
   source_path="$(tenant_env_dir "$name")/lunarwing.env"
   target_path="$(tenant_env_dir "$name")/kimi-runtime.env"
-  {
+  # Generate the complete runtime env in root-private staging first: a failed
+  # source read or token resolution must leave any existing target untouched
+  # instead of publishing the partial stream (die() only exits this subshell).
+  staged="$(mktemp)" || return 1
+  if ! (
     for key in KIMI_MODEL KIMI_BASE_URL KIMI_API_KEY; do
-      value="$(read_tenant_env_value "$name" "$source_path" "$key")" || return 1
+      value="$(read_tenant_env_value "$name" "$source_path" "$key")" || exit 1
       [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
         || die "$key cannot contain a newline"
       [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value"
     done
 
-    value="$(resolve_worker_auth_token "$source_path")" || return 1
+    value="$(resolve_worker_auth_token "$source_path")" || exit 1
     [[ -n "$value" ]] \
       || die "Kimi worker requires WORKER_AUTH_TOKEN (or GATEWAY_AUTH_TOKEN)"
     # Worker bridge expects AGENT_AUTH_TOKEN, not the daemon's env variable name.
     printf 'AGENT_AUTH_TOKEN=%s\n' "$value"
-  } | write_tenant_file_atomic "$name" "$target_path" 600
+  ) >"$staged" || ! write_tenant_file_atomic "$name" "$target_path" 600 <"$staged"; then
+    rm -f -- "$staged"
+    return 1
+  fi
+  rm -f -- "$staged"
   printf '%s\n' "$target_path"
 }
 

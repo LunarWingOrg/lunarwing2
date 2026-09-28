@@ -127,6 +127,9 @@ if _write_weechat_env test blocked 2>/dev/null; then fail 'accepted weechat.env 
 rm "$wc"
 printf 'RELAY_PASSWORD=old-password\n' >"$wc"
 chmod 600 "$wc"
+# Recreated by the harness user; under root the tenant-side ownership
+# precondition must see the fixture tenant (nobody) as the file owner.
+if [[ "$EUID" == 0 ]]; then chown nobody "$wc"; fi
 rm "$lw"
 ln -s "$sentinel" "$lw"
 if _relay_env_set_password test "$lw" blocked 2>/dev/null; then fail 'accepted lunarwing.env symlink'; fi
@@ -134,6 +137,7 @@ if _relay_env_set_password test "$lw" blocked 2>/dev/null; then fail 'accepted l
 rm "$lw"
 printf 'OTHER_KEY=preserve\nRELAY_PASSWORD=old-password\n' >"$lw"
 chmod 600 "$lw"
+if [[ "$EUID" == 0 ]]; then chown nobody "$lw"; fi
 rotate_tenant_weechat_relay_password test
 check
 first="$(_read_env_value "$lw" RELAY_PASSWORD)"

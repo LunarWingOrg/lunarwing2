@@ -1444,12 +1444,19 @@ deactivate_tenant_voice() {
 }
 
 _voice_remove_daemon_credentials() {
-  local path="$1" name
+  local path="$1" name staged rc=1
   [[ -f "$path" && ! -L "$path" ]] || die "tenant LunarWing environment missing or unsafe"
   name="$(stat -c %U -- "$(dirname "$path")")" || return 1
-  tenant_cat "$name" "$path" \
-    | awk '!/^(VOICE_SERVICE_URL|VOICE_AUTH_TOKEN)=/' \
-    | write_tenant_file_atomic "$name" "$path" 600
+  # Stage the filtered result first: a failed tenant-side read must leave the
+  # environment untouched instead of publishing an empty replacement.
+  staged="$(mktemp)" || return 1
+  if tenant_cat "$name" "$path" \
+      | awk '!/^(VOICE_SERVICE_URL|VOICE_AUTH_TOKEN)=/' >"$staged" \
+    && write_tenant_file_atomic "$name" "$path" 600 <"$staged"; then
+    rc=0
+  fi
+  rm -f -- "$staged"
+  return "$rc"
 }
 
 remove_tenant_voice() {

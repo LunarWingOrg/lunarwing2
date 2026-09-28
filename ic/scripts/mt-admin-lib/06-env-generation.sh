@@ -355,6 +355,11 @@ read_tenant_env_value() {  # <tenant> <file> <KEY>
 
 # Write stdin to a tenant-owned file through a same-directory candidate. Root
 # never opens the destination for writing and secret contents never enter argv.
+# CONTRACT: stdin must already be a complete, validated result (a regular file
+# or an infallible producer). Never pipe a fallible producer straight in: this
+# writer commits whatever bytes it reads and cannot observe an upstream
+# failure. Stage the producer's output (root-private mktemp), check its exit
+# status, and only then redirect the staged file here.
 write_tenant_file_atomic() {  # <tenant> <file> [mode] [private|owned-parent]
   local name="$1" target="$2" mode="${3:-600}" parent_policy="${4:-private}"
   local -a drop=(sudo -u "$name")
@@ -595,15 +600,19 @@ _write_weechat_env() {  # <tenant> <relay_password>
 
 # No secret is passed via argv or the child environment. Read the old file as
 # the tenant too: a swapped source path cannot make root read another file.
+# The transformed result is staged in a root-private file first; the tenant-
+# side atomic commit runs only after the producer fully succeeded, so a failed
+# read/transform can never publish a partial or empty replacement.
 _tenant_env_replace() {  # <tenant> <env_file> <KEY> <VALUE>
-  local tenant="$1" path="$2" key="$3" value="$4"
+  local tenant="$1" path="$2" key="$3" value="$4" staged rc=1
   local -a drop=(sudo -u "$tenant")
   [[ "$(id -un)" != "$tenant" ]] || drop=()
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 1
   [[ -f "$path" && ! -L "$path" && "$(stat -c %h -- "$path")" == 1 ]] || return 1
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
   darkirc_path_components_safe "$path" || return 1
-  printf '%s\n' "$value" | "${drop[@]}" env -i PATH="/usr/bin:/bin" \
+  staged="$(mktemp)" || return 1
+  if printf '%s\n' "$value" | "${drop[@]}" env -i PATH="/usr/bin:/bin" \
     TARGET_PATH="$path" TARGET_KEY="$key" bash -c '
       set -euo pipefail
       target="$TARGET_PATH"
@@ -622,7 +631,12 @@ _tenant_env_replace() {  # <tenant> <env_file> <KEY> <VALUE>
         [[ "$line" == "$prefix"* ]] || printf "%s\n" "$line"
       done <"$target"
       printf "%s%s\n" "$prefix" "$value"
-    ' | write_tenant_file_atomic "$tenant" "$path" 600
+    ' >"$staged" \
+    && write_tenant_file_atomic "$tenant" "$path" 600 <"$staged"; then
+    rc=0
+  fi
+  rm -f -- "$staged"
+  return "$rc"
 }
 
 _relay_env_set_password() {  # <tenant> <lunarwing.env> <password>
@@ -2019,13 +2033,18 @@ patch_ssh_tool_allowlist() {
     return 0
   fi
 
+  # Stage the filtered result before the tenant-side commit: a jq failure
+  # (unreadable or corrupt source) must leave the installed caps untouched.
+  staged="$(mktemp)" \
+    || { say "WARNING: mktemp failed; ssh-tool allowlist left unchanged" >&2; return 0; }
   if tenant_jq "$name" --argjson hosts "$hosts_json" \
-       '.capabilities.ssh.allowed_hosts = $hosts' "$caps_path" 2>/dev/null \
-    | write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent; then
+       '.capabilities.ssh.allowed_hosts = $hosts' "$caps_path" >"$staged" 2>/dev/null \
+    && write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent <"$staged"; then
     say "  ssh-tool allowlist set to: $(jq -c . <<<"$hosts_json" 2>/dev/null || printf '%s' "$hosts_json")"
   else
     say "WARNING: failed to patch ssh-tool allowlist at $caps_path (edit .capabilities.ssh.allowed_hosts manually)" >&2
   fi
+  rm -f -- "$staged"
 }
 
 # True if a TCP connect to host:port succeeds within 2s (pure bash /dev/tcp).
@@ -2040,7 +2059,7 @@ _probe_tcp() {
 # This is called after install-wasm and on tenant start so the ports are always
 # correct. Idempotent: always derived from the registry.
 patch_weechat_caps() {
-  local name="$1" caps_path weechat_port adapter_port
+  local name="$1" caps_path weechat_port adapter_port staged
   caps_path="$(tenant_state_dir "$name")/channels/weechat.capabilities.json"
 
   if [[ ! -f "$caps_path" ]]; then
@@ -2059,14 +2078,19 @@ patch_weechat_caps() {
   local relay_url="http://127.0.0.1:${weechat_port}"
   local adapter_url="http://127.0.0.1:${adapter_port}"
 
+  # Stage the rewritten JSON before the tenant-side commit: a jq failure
+  # (unreadable or corrupt source) must leave the installed caps untouched.
+  staged="$(mktemp)" \
+    || { say "WARNING: mktemp failed; weechat caps left unchanged" >&2; return 0; }
   if tenant_jq "$name" --arg relay "$relay_url" --arg adapter "$adapter_url" \
        '.config.relay_url = $relay | .config.ws_adapter_url = $adapter' \
-       "$caps_path" 2>/dev/null \
-    | write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent; then
+       "$caps_path" >"$staged" 2>/dev/null \
+    && write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent <"$staged"; then
     say "  weechat caps patched: relay=$relay_url adapter=$adapter_url"
   else
     say "WARNING: failed to patch weechat caps at $caps_path" >&2
   fi
+  rm -f -- "$staged"
 }
 
 # Warn (never fail) if the tenant's configured loopback SSH host has no sshd
@@ -2580,7 +2604,7 @@ configure_gotify_capabilities() {
   [[ -n "$gotify_url" ]] || return 0
   require_cmd jq
 
-  local tools_dir caps_path host
+  local tools_dir caps_path host staged
   tools_dir="$(tenant_state_dir "$name")/tools"
   caps_path="$tools_dir/gotify-tool.capabilities.json"
 
@@ -2589,9 +2613,17 @@ configure_gotify_capabilities() {
   host="$(extract_host_from_url "$gotify_url")"
   [[ -n "$host" ]] || return 0
 
-  tenant_jq "$name" --arg host "$host" '
+  # Stage the rewritten JSON first: a jq failure must leave the installed
+  # caps untouched instead of publishing a partial stream.
+  staged="$(mktemp)" || return 1
+  if ! tenant_jq "$name" --arg host "$host" '
     .capabilities.http.allowlist[0].host = $host |
     .capabilities.http.credentials.gotify.host_patterns = [$host]
-  ' "$caps_path" | write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent
+  ' "$caps_path" >"$staged" \
+    || ! write_tenant_file_atomic "$name" "$caps_path" 600 owned-parent <"$staged"; then
+    rm -f -- "$staged"
+    return 1
+  fi
+  rm -f -- "$staged"
   say "  configured gotify capabilities for host: $host"
 }
