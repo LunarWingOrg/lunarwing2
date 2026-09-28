@@ -75,6 +75,15 @@ ports_get() {
     pebble_health) printf '14002\n' ;;
   esac
 }
+tenant_worker_enabled() { return 0; }
+ensure_external_worker_config root kimi kimi_wss
+assert_contains "$fixture/state/config.toml" 'timeout_ms = 14400000' \
+  'new Kimi tenant defaults to four-hour timeout'
+ensure_external_worker_config root opencode opencode_wss
+assert_contains "$fixture/state/config.toml" 'timeout_ms = 3600000' \
+  'other worker lanes retain one-hour timeout'
+assert_contains "$fixture/state/config.toml" 'timeout_ms = 14400000' \
+  'repeated provisioning preserves Kimi timeout'
 MT_ROOTLESS=true
 render_worker_quadlet root kimi 8443
 quadlet="$fixture/quadlets/lunarwing-kimi-root.container"

@@ -289,6 +289,6 @@ export function readWsState(): WsState | null {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 export const SUBPROTOCOL = "lunarwing-agent-v1"
-export const DEFAULT_TIMEOUT_MS = 3_600_000
+export const DEFAULT_TIMEOUT_MS = 14_400_000
 export const WORKER_ID = process.env.LUNARWING_WORKER_ID || "worker-kimi-01"
 export const WORKER_VERSION = "kimi-worker-1.0.0"
