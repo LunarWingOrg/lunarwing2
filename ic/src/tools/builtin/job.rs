@@ -2955,6 +2955,39 @@ mod tests {
         assert_eq!(stats.get("failed").unwrap(), 2); // safety: test
     }
 
+    /// WI#263: the timeout-evidence snapshot stored by the external worker
+    /// orchestrator must be surfaced by job_status so a wedged-then-recovered
+    /// investigation is readable without scraping job events.
+    #[tokio::test]
+    async fn test_job_status_includes_partial_output() {
+        let manager = Arc::new(ContextManager::new(5));
+        let job_id = manager
+            .create_job_for_user("default", "Timed Out Job", "Wedge at report")
+            .await
+            .unwrap(); // safety: test
+
+        let snapshot = "…tail of the streamed investigation…".to_string();
+        manager
+            .update_context(job_id, |ctx| {
+                ctx.metadata = serde_json::json!({ "partial_output": snapshot.clone() });
+                Ok::<(), String>(())
+            })
+            .await
+            .unwrap() // safety: test
+            .unwrap(); // safety: test
+
+        let tool = JobStatusTool::new(manager);
+        let params = serde_json::json!({ "job_id": job_id.to_string() });
+        let ctx = JobContext::default();
+        let result = tool.execute(params, &ctx).await.unwrap(); // safety: test
+
+        let partial = result.result.get("partial_output").unwrap(); // safety: test
+        assert_eq!(
+            partial.as_str().unwrap(), // safety: test
+            "…tail of the streamed investigation…"
+        );
+    }
+
     #[test]
     fn test_resolve_project_dir_auto() {
         let project_id = Uuid::new_v4();
