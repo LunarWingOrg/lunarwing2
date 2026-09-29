@@ -76,7 +76,10 @@ pub enum GitlabAction {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
         project: String,
         title: String,
-        #[serde(default)]
+        /// GitLab's REST field is `description`; `body` is accepted as an
+        /// alias because callers habitually reuse the note-action parameter
+        /// name (WI#266). Supplying both is rejected in `parse_action`.
+        #[serde(alias = "body", default)]
         description: Option<String>,
         #[serde(default)]
         labels: Vec<String>,
@@ -89,7 +92,7 @@ pub enum GitlabAction {
         iid: u64,
         #[serde(default)]
         title: Option<String>,
-        #[serde(default)]
+        #[serde(alias = "body", default)]
         description: Option<String>,
         #[serde(default)]
         state_event: Option<String>,

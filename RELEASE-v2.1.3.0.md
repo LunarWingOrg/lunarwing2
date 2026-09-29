@@ -214,8 +214,8 @@ previous compatibility baseline.
 | New SQL migration | None; `V27__memory_index_outbox.sql` remains latest |
 | Multi-tenant port registry | v17 (no change); v15 LunarVoice, v16 health_metrics, v17 opencode2 blocks remain current |
 | Channel registry patches | darkirc 0.1.9, multica 0.1.12, weechat 0.2.10, xmpp 0.1.15 (behavior unchanged; rebuild required) |
-| Tool registry patches | No change (gitlab 0.1.5 et al. as in v2.1.2.0) |
-| WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (no change) |
+| Tool registry patches | gitlab 0.1.6 (issue writes accept `body` as a `description` alias, WI#266); other tools unchanged from v2.1.2.0 |
+| WASM runtime | Wasmtime / wasmtime-wasi 36.0.16 (36.0.14→36.0.16 for RUSTSEC-2026-0314/0316; vendored set regenerated) |
 | External crate updates | aws-lc-rs 1.18.0→1.18.1, aws-lc-sys 0.44.0→0.45.0, rustls-webpki 0.103.14→0.103.15, zerovec-derive 0.11.4→0.11.5; `ic/vendor/` regenerated with no source drift |
 | Worker image tool pins | kimi-code `2.1.1` (2.x line; default endpoint back on the NetBird overlay with the `FrontierCODEK` function); opencode2 `v2.0.18` at `cd9a14a6b688d4021bee381dfd39d2cef9c0f862`; opencode `v1.18.25` at `cb7d8b2f…` (no change); pebble `2d0f3786…` (no change) |
 | Engine transcript roles | New `SealedStepRecord`/`StepRecord` wire role for interpreter step records; legacy pre-seal transcripts keep the `User` spelling and remain readable |
