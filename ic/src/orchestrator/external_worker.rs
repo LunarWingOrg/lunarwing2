@@ -1238,13 +1238,20 @@ async fn run_external_task(
                                 // claims the task is active, so heartbeats
                                 // must not refresh the idle baseline used by
                                 // stuck detection.
-                                if is_genuine_progress(&progress.delta)
-                                    && let Some(cm) = context_manager
-                                {
-                                    let _ = cm.update_context(job_id, |ctx| ctx.note_activity()).await;
-                                }
+                                //
+                                // WI#267: heartbeats are equally not evidence.
+                                // They must stay out of the recovery buffer or
+                                // a heartbeat-only timeout (a wedged CLI with
+                                // a healthy executor) is later presented as a
+                                // preserved "partial investigation" that never
+                                // existed.
+                                if is_genuine_progress(&progress.delta) {
+                                    if let Some(cm) = context_manager {
+                                        let _ = cm.update_context(job_id, |ctx| ctx.note_activity()).await;
+                                    }
 
-                                accumulated_output.push_str(&progress.delta);
+                                    accumulated_output.push_str(&progress.delta);
+                                }
 
                                 emit_event(
                                     event_tx,
@@ -1270,10 +1277,17 @@ async fn run_external_task(
                                     }
                                 })?;
 
+                            // WI#267: a worker-reported result can carry
+                            // synthetic heartbeats (a kimi executor older than
+                            // the daemon, or any worker that folds its
+                            // keep-alives into the final output). Strip them
+                            // before the buffer is used as evidence so a
+                            // heartbeat-only run is never presented as a
+                            // partial investigation.
                             let final_output = if result.output.is_empty() {
                                 accumulated_output.clone()
                             } else {
-                                result.output.clone()
+                                strip_worker_heartbeats(&result.output)
                             };
 
                             let status = match result.status.as_str() {
@@ -1406,6 +1420,11 @@ async fn run_external_task(
     // snapshot lives in job metadata + a job event, not the caller's return
     // value.
     if task_result.status == ExternalTaskStatus::TimedOut {
+        // WI#267: `accumulated_output` already excludes heartbeats (the read
+        // loop gates on `is_genuine_progress`), and `task_result.output` is
+        // heartbeat-stripped at parse time. A heartbeat-only timeout therefore
+        // resolves with empty evidence and preserves nothing — which is the
+        // correct outcome: nothing genuine streamed.
         let evidence = if task_result.output.is_empty() {
             accumulated_output.clone()
         } else {
@@ -1653,6 +1672,26 @@ const WORKER_HEARTBEAT_PREFIX: &str = "[worker] ";
 /// synthetic heartbeat (WI#263).
 fn is_genuine_progress(delta: &str) -> bool {
     !delta.trim_start().starts_with(WORKER_HEARTBEAT_PREFIX)
+}
+
+/// Remove synthetic worker-heartbeat lines from a worker-supplied output
+/// buffer (WI#267).
+///
+/// The daemon's own read loop already keeps heartbeats out of the streamed
+/// evidence buffer, but a `task_result.output` comes from the worker and may
+/// fold its keep-alives in (e.g. a kimi executor that concatenates every
+/// emitted progress frame). Timeout evidence must only ever contain genuine
+/// output, so heartbeat lines are dropped here before the buffer is treated
+/// as recovered work.
+fn strip_worker_heartbeats(output: &str) -> String {
+    let mut stripped = String::with_capacity(output.len());
+    for line in output.split_inclusive('\n') {
+        if !is_genuine_progress(line) {
+            continue;
+        }
+        stripped.push_str(line);
+    }
+    stripped.trim().to_string()
 }
 
 /// Build the persisted result message for a worker-reported timeout (WI#263).
