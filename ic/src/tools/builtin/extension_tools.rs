@@ -1061,22 +1061,28 @@ struct ToolNameWindow {
     next_offset: Option<usize>,
 }
 
-/// Fixed serialized cost of an entry's identifier/kind/status fields plus the
-/// per-window metadata keys, with generous slack. Reserved before tool names
-/// so the window sizing cannot be starved by descriptive fields.
+/// Fixed serialized cost of an entry's kind/status fields plus the per-window
+/// metadata keys, with generous slack. Reserved before tool names so the
+/// window sizing cannot be starved by descriptive fields; the extension's own
+/// name is added on top since it is embedded verbatim.
 const TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES: usize = TOOL_LIST_ENTRY_BUDGET_BYTES - 24_000;
 
 /// Apply a `tools_offset`/`tools_limit` window over one extension's tool
 /// names so entries with more tools than the window cap remain fully
 /// enumerable (review finding 1 on WI#245), keeping every name lossless and
 /// bounded by the per-entry serialized budget (MR !1221 findings 1-2).
-fn tool_name_window(tools: &[String], offset: usize, limit: usize) -> ToolNameWindow {
+fn tool_name_window(
+    tools: &[String],
+    extension_name: &str,
+    offset: usize,
+    limit: usize,
+) -> ToolNameWindow {
     let total = tools.len();
     let start = offset.min(total);
     let end = (start + limit).min(total);
 
     let mut names_end = end;
-    let mut used = TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES;
+    let mut used = TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES + json_string_upper_bound(extension_name);
     for (idx, name) in tools[start..end].iter().enumerate() {
         let cost = tool_name_upper_bound(name);
         if idx > 0 && used + cost > TOOL_LIST_ENTRY_BUDGET_BYTES {
@@ -1147,7 +1153,7 @@ fn extension_to_json(
     tools_offset: usize,
     tools_limit: usize,
 ) -> serde_json::Value {
-    let window = tool_name_window(&extension.tools, tools_offset, tools_limit);
+    let window = tool_name_window(&extension.tools, &extension.name, tools_offset, tools_limit);
 
     let mut obj = serde_json::Map::new();
     // Identifiers stay verbatim: eliding `name` would make long names
