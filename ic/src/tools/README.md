@@ -59,6 +59,45 @@ container's `/tmp` does not survive the command.
 
 Fresh-tenant acceptance steps: [WI#162 verification](../../../docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md).
 
+### tool_list pagination and completeness (WI#245)
+
+`tool_list` is paginated and self-limiting; it never relies on the safety
+layer's byte truncation to bound its size (a clipped JSON prefix is
+indistinguishable from a complete list — the "19 of 31 MCP servers" failure).
+
+The result always includes:
+
+- `extensions` — entries ordered by kind (`mcp_server`, `wasm_tool`,
+  `wasm_channel`), then case-insensitive name. Ordering is deterministic, so
+  the same offset always addresses the same entries.
+- `count` / `total` — entries on this page vs. entries matching the filter.
+- `offset` / `next_offset` — `next_offset` is `null` on the last page.
+- `truncated` — `true` whenever more pages exist. Consumers must not infer
+  absence from a single page.
+
+Pagination parameters: `offset` (default 0), `limit` (1–100, default 50).
+Keep `kind`/`include_available` identical across pages of one enumeration.
+An `offset` past the end is a caller error, not an empty page.
+
+Per entry, `tools` lists a window of exposed tool names — at most
+`tools_limit` (1–100, default 25) starting at `tools_offset`. When a server
+exposes more tools than the window, the entry carries
+`tools_truncated: true`, `tools_total`, and `tools_next_offset`; a follow-up
+call with that `tools_offset` (and the entry's name in `kind` filtering as
+needed) retrieves the remaining names. No tool name is unreachable.
+
+Every string field in an entry (`name`, `description`, `display_name`,
+`version`, `activation_error`, tool names) is bounded to 200 characters with
+an explicit `…` elision marker, and the pretty-printed page — the exact
+string the safety layer clips — is kept under a 60 KiB budget by dropping
+trailing entries and re-deriving `count`/`next_offset`/`truncated`. A page
+can therefore never claim completeness while silently clipped.
+
+`ExtensionManager::list()` (used by the web gateway and other internal
+consumers) still returns full structs; only the agent-facing `tool_list`
+output is bounded. The same pagination contract is the model for fixing
+`mission_list` and `list_issues`, which share the truncation family.
+
 ### What Goes in Tools (capabilities.json)
 
 - API endpoints the tool needs (HTTP allowlist)
