@@ -1014,7 +1014,7 @@ async fn successful_result_output_is_returned_verbatim() {
     })
     .await;
     let context_manager = Arc::new(ContextManager::new(5));
-    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
     let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
         .with_event_deps(event_tx, Arc::clone(&context_manager));
     let job_id = Uuid::new_v4();
