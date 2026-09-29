@@ -1061,11 +1061,13 @@ struct ToolNameWindow {
     next_offset: Option<usize>,
 }
 
-/// Fixed serialized cost of an entry's kind/status fields plus the per-window
-/// metadata keys, with generous slack. Reserved before tool names so the
-/// window sizing cannot be starved by descriptive fields; the extension's own
-/// name is added on top since it is embedded verbatim.
-const TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES: usize = TOOL_LIST_ENTRY_BUDGET_BYTES - 24_000;
+/// Fixed serialized cost of an entry's kind/status/config fields (including
+/// the restored `enabled`/`placement`/`transport`/`url`/`command` from MR
+/// !1225 finding 2) plus the per-window metadata keys, with generous slack.
+/// Reserved before tool names so the window sizing cannot be starved by
+/// descriptive fields; the extension's own name is added on top since it is
+/// embedded verbatim.
+const TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES: usize = TOOL_LIST_ENTRY_BUDGET_BYTES - 20_000;
 
 /// Apply a `tools_offset`/`tools_limit` window over one extension's tool
 /// names so entries with more tools than the window cap remain fully
@@ -1186,6 +1188,35 @@ fn extension_to_json(
         obj.insert(
             "tools_next_offset".to_string(),
             serde_json::json!(window.next_offset),
+        );
+    }
+
+    // Status/config fields restored from the pre-pagination serialization
+    // (MR !1225 finding 2): without `enabled`, a deliberately disabled MCP
+    // server is indistinguishable from an inactive/failing one; without
+    // `placement`, host vs job-worker placement cannot be diagnosed from
+    // this surface. `transport`, `url`, and `command` carry the same
+    // configuration the old full-struct output exposed. Free-text values
+    // are bounded; enums and booleans are short by construction.
+    if let Some(enabled) = extension.enabled {
+        obj.insert("enabled".to_string(), serde_json::json!(enabled));
+    }
+    if let Some(placement) = extension.placement {
+        obj.insert("placement".to_string(), serde_json::json!(placement));
+    }
+    if let Some(transport) = &extension.transport {
+        obj.insert(
+            "transport".to_string(),
+            serde_json::json!(bound_field(transport)),
+        );
+    }
+    if let Some(url) = &extension.url {
+        obj.insert("url".to_string(), serde_json::json!(bound_field(url)));
+    }
+    if let Some(command) = &extension.command {
+        obj.insert(
+            "command".to_string(),
+            serde_json::json!(bound_field(command)),
         );
     }
 
@@ -2155,11 +2186,77 @@ mod tests {
             "recovering",
             "tools_total",
             "tools_truncated",
+            "enabled",
+            "placement",
+            "transport",
+            "url",
+            "command",
         ] {
             assert!(entry.get(field).is_none(), "field {field} should be absent");
         }
         assert_eq!(entry["name"], serde_json::json!("plain"));
         assert_eq!(entry["installed"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn tool_list_entry_preserves_mcp_status_and_config_fields() {
+        // MR !1225 finding 2: the pre-pagination output serialized the full
+        // InstalledExtension. Pagination must not drop status/config fields:
+        // a deliberately disabled MCP server must stay distinguishable from
+        // an inactive/failing one, and host vs job-worker placement must be
+        // diagnosable from this surface.
+        let mut extension =
+            installed_extension("configured", ExtensionKind::McpServer, Vec::new());
+        extension.enabled = Some(false);
+        extension.placement = Some(crate::tools::mcp::McpPlacement::JobWorker);
+        extension.transport = Some("stdio".to_string());
+        extension.url = Some("https://example.com/mcp".to_string());
+        extension.command = Some("server-binary".to_string());
+
+        let entry = extension_to_json(&extension, 0, TOOL_LIST_TOOLS_PAGE_DEFAULT);
+        assert_eq!(entry["enabled"], serde_json::json!(false));
+        assert_eq!(entry["placement"], serde_json::json!("job_worker"));
+        assert_eq!(entry["transport"], serde_json::json!("stdio"));
+        assert_eq!(entry["url"], serde_json::json!("https://example.com/mcp"));
+        assert_eq!(entry["command"], serde_json::json!("server-binary"));
+
+        // WASM entries keep placement/enabled absent (None in the source).
+        let wasm = extension_to_json(
+            &installed_extension("wasm-tool", ExtensionKind::WasmTool, Vec::new()),
+            0,
+            TOOL_LIST_TOOLS_PAGE_DEFAULT,
+        );
+        assert!(wasm.get("enabled").is_none());
+        assert!(wasm.get("placement").is_none());
+    }
+
+    #[test]
+    fn tool_list_entry_bounds_restored_config_fields() {
+        // The restored fields ride along bounded: worst-case escaped urls and
+        // commands must not blow the per-entry budget reserved for tool names.
+        let mut extension =
+            installed_extension("long_url", ExtensionKind::McpServer, Vec::new());
+        extension.transport = Some("t".repeat(1_000));
+        extension.url = Some("u".repeat(1_000));
+        extension.command = Some("c".repeat(1_000));
+        extension.description = Some("d".repeat(1_000));
+        extension.display_name = Some("n".repeat(1_000));
+
+        let entry = extension_to_json(&extension, 0, TOOL_LIST_TOOLS_PAGE_DEFAULT);
+        for field in ["transport", "url", "command", "description", "display_name"] {
+            let value = entry[field].as_str().expect(field);
+            assert!(
+                value.chars().count() <= TOOL_LIST_FIELD_MAX_CHARS,
+                "{field} must be bounded, got {}",
+                value.chars().count()
+            );
+        }
+        let serialized = serde_json::to_string(&entry).expect("serialize entry");
+        assert!(
+            serialized.len() <= TOOL_LIST_ENTRY_BUDGET_BYTES,
+            "entry with bounded fields must stay within the per-entry budget (got {})",
+            serialized.len()
+        );
     }
 
     #[test]
