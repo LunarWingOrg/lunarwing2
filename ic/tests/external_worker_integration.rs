@@ -1327,26 +1327,24 @@ async fn timed_out_result_with_empty_output_keeps_genuine_progress() {
     assert_eq!(res.status, ExternalTaskStatus::TimedOut);
     // The immediate wait=true caller sees the real streamed work — not an
     // empty buffer that only the later metadata fallback would recover.
+    // `final_msg` (the persisted `timed_out_result_message`) is derived from
+    // this same `task_result.output`, so it carries the progress too.
     assert_eq!(res.output, genuine);
 
-    // And the persisted result message carries it as Partial output too.
-    let result_msg = timeout(TEST_BOUND, async {
+    // The result event fires (job resolves as timed_out end-to-end).
+    timeout(TEST_BOUND, async {
         loop {
             let (event_job_id, _, event) = event_rx.recv().await.expect("job event");
             if event_job_id == job_id
                 && let SseEvent::JobResult { .. } = event
             {
-                // The JobResult SSE frame itself carries no text; the
-                // persisted message is asserted via the metadata snapshot
-                // below, which preserves the same sanitized value.
-                break ();
+                break;
             }
         }
     })
     .await
     .expect("result event timed out");
 
-    let _ = result_msg;
     let ctx = context_manager
         .get_context(job_id)
         .await
