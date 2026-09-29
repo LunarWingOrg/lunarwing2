@@ -2542,7 +2542,7 @@ mod tests {
             0,
             TOOL_LIST_TOOLS_PAGE_DEFAULT,
         );
-        let len = page_json_len(&[oversized.clone()], 0, 1).expect("serialize");
+        let len = page_json_len(std::slice::from_ref(&oversized), 0, 1).expect("serialize");
         assert!(
             len > TOOL_LIST_PAGE_BUDGET_BYTES,
             "fixture must exceed the page budget (got {len})"
