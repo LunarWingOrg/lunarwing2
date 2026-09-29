@@ -6441,7 +6441,9 @@ mod tests {
         McpRuntimeHealth, build_wasm_channel_runtime_config_updates, combine_install_errors,
         fallback_decision, infer_kind_from_url, join_or_abort_tasks, normalize_hosted_callback_url,
     };
-    use crate::extensions::{ExtensionError, ExtensionKind, ExtensionSource, InstallResult};
+    use crate::extensions::{
+        ExtensionError, ExtensionKind, ExtensionSource, InstallResult, InstalledExtension,
+    };
     use crate::tools::{Tool, ToolError, ToolOutput};
 
     struct UnhealthyMcpTransport;
