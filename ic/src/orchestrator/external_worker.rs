@@ -1931,6 +1931,29 @@ mod tests {
     }
 
     #[test]
+    fn strip_worker_heartbeats_removes_only_keepalive_lines() {
+        // WI#267: a worker-supplied buffer that folded its synthetic
+        // keep-alives in must lose them (and only them) before it can be
+        // treated as timeout evidence.
+        let heartbeat = "[worker] Still waiting for Kimi Code response; task remains active.";
+        let mixed = format!(
+            "{heartbeat}\nInvestigation step: evidence gathered.\n{heartbeat}\n[tool result] ok\n  {heartbeat}\n"
+        );
+        assert_eq!(
+            strip_worker_heartbeats(&mixed),
+            "Investigation step: evidence gathered.\n[tool result] ok"
+        );
+
+        // A heartbeat-only buffer strips to empty — nothing genuine streamed.
+        assert_eq!(strip_worker_heartbeats(&format!("{heartbeat}\n{heartbeat}")), "");
+
+        // Genuine-only buffers survive verbatim (modulo the tail trim).
+        let genuine = "line one\nline two";
+        assert_eq!(strip_worker_heartbeats(genuine), genuine);
+        assert_eq!(strip_worker_heartbeats(""), "");
+    }
+
+    #[test]
     fn timed_out_result_message_keeps_partial_output() {
         // WI#263: a worker-reported timeout carrying streamed output must
         // persist that output alongside the error — the investigation is the
@@ -2017,6 +2040,50 @@ mod tests {
             ctx.metadata.get("partial_output").and_then(|v| v.as_str()),
             Some(short),
             "short genuine output must be preserved verbatim"
+        );
+    }
+
+    /// WI#267: the companion case to the short-genuine-output finding. The
+    /// read loop now keeps synthetic heartbeats out of the evidence buffer,
+    /// so a heartbeat-only timeout (a wedged CLI behind a healthy executor)
+    /// must preserve NOTHING — the streamed buffer is empty of genuine work
+    /// and must not be presented as a recovered investigation.
+    #[tokio::test]
+    async fn heartbeat_only_timeout_preserves_no_evidence() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        // Simulate the read loop's progress handling on heartbeat frames
+        // only — exactly what a wedged CLI with a healthy executor streams
+        // until the 15-minute silence watchdog fires.
+        let mut accumulated_output = String::new();
+        for _ in 0..5 {
+            let delta = "[worker] Still waiting for Kimi Code response; task remains active.";
+            if is_genuine_progress(delta) {
+                cm.update_context(job_id, |ctx| ctx.note_activity())
+                    .await
+                    .unwrap();
+                accumulated_output.push_str(delta);
+            }
+        }
+
+        // The worker's timeout result carries no genuine output either (the
+        // kimi executor only accumulates real CLI stdout), so the daemon's
+        // fallback for an empty result output is the heartbeat-free buffer.
+        let evidence = if accumulated_output.is_empty() {
+            String::new()
+        } else {
+            accumulated_output
+        };
+        preserve_timeout_evidence(job_id, "kimi", &evidence, Some(&cm), None).await;
+
+        let ctx = cm.get_context(job_id).await.unwrap();
+        assert!(
+            ctx.metadata.get("partial_output").is_none(),
+            "a heartbeat-only timeout must not be preserved as evidence"
         );
     }
 
