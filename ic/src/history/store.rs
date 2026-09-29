@@ -246,6 +246,9 @@ impl Store {
                     created_at: row.get("created_at"),
                     started_at: row.get("started_at"),
                     completed_at: row.get("completed_at"),
+                    // Not persisted yet (WI#263): idle detection falls back to
+                    // started_at for contexts reconstructed from the DB.
+                    last_activity_at: None,
                     transitions: Vec::new(), // Not loaded from DB for now
                     metadata: serde_json::Value::Null,
                     prompt_context: std::sync::Arc::from([]),
