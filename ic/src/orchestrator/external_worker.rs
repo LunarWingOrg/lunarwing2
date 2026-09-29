@@ -1277,24 +1277,32 @@ async fn run_external_task(
                                     }
                                 })?;
 
-                            // WI#267: a worker-reported result can carry
-                            // synthetic heartbeats (a kimi executor older than
-                            // the daemon, or any worker that folds its
-                            // keep-alives into the final output). Strip them
-                            // before the buffer is used as evidence so a
-                            // heartbeat-only run is never presented as a
-                            // partial investigation.
-                            let final_output = if result.output.is_empty() {
-                                accumulated_output.clone()
-                            } else {
-                                strip_worker_heartbeats(&result.output)
-                            };
-
                             let status = match result.status.as_str() {
                                 "success" => ExternalTaskStatus::Success,
                                 "cancelled" => ExternalTaskStatus::Cancelled,
                                 "timed_out" => ExternalTaskStatus::TimedOut,
                                 _ => ExternalTaskStatus::Failed,
+                            };
+
+                            // WI#267: a worker-reported *timeout* can carry
+                            // synthetic heartbeats (a kimi executor older than
+                            // the daemon, or any worker that folds its
+                            // keep-alives into the final output). Strip them
+                            // before the buffer is used as timeout evidence so
+                            // a heartbeat-only run is never presented as a
+                            // partial investigation. Any other status keeps
+                            // the worker-supplied output verbatim — a
+                            // successful result is not "evidence" and must not
+                            // have its whitespace or genuine `[worker] …`
+                            // content rewritten (!1235 finding 2).
+                            let final_output = match status {
+                                ExternalTaskStatus::TimedOut => {
+                                    strip_worker_heartbeats(&result.output)
+                                }
+                                _ if result.output.is_empty() => {
+                                    accumulated_output.clone()
+                                }
+                                _ => result.output.clone(),
                             };
 
                             return Ok(ExternalTaskResult {
@@ -1421,10 +1429,13 @@ async fn run_external_task(
     // value.
     if task_result.status == ExternalTaskStatus::TimedOut {
         // WI#267: `accumulated_output` already excludes heartbeats (the read
-        // loop gates on `is_genuine_progress`), and `task_result.output` is
-        // heartbeat-stripped at parse time. A heartbeat-only timeout therefore
-        // resolves with empty evidence and preserves nothing — which is the
-        // correct outcome: nothing genuine streamed.
+        // loop gates on `is_genuine_progress`), and `task_result.output` was
+        // heartbeat-stripped when the result frame was parsed. A
+        // heartbeat-only timeout therefore resolves with empty evidence and
+        // preserves nothing — which is the correct outcome: nothing genuine
+        // streamed. `preserve_timeout_evidence` itself is idempotent w.r.t.
+        // heartbeats (it drops whitespace-only buffers), so this is defense in
+        // depth rather than a second stripping site.
         let evidence = if task_result.output.is_empty() {
             accumulated_output.clone()
         } else {
@@ -1668,10 +1679,30 @@ async fn persist_event(
 /// idle baseline used by stuck detection.
 const WORKER_HEARTBEAT_PREFIX: &str = "[worker] ";
 
+/// Structural shape of the synthetic keep-alive sentence every in-tree
+/// executor emits on its progress timer — kimi says "… for Kimi Code response
+/// …", opencode/opencode2 say "… for OpenCode/model response …", all sharing
+/// the same `"[worker] Still waiting for …; task remains active."` frame.
+/// Matching the shape (rather than the bare `[worker] ` prefix) keeps genuine
+/// worker log lines such as `[worker] initialized` intact (WI#267 / !1235).
+const WORKER_HEARTBEAT_LINE_PREFIX: &str = "[worker] Still waiting for ";
+const WORKER_HEARTBEAT_LINE_SUFFIX: &str = "; task remains active.";
+
 /// Whether a streamed progress delta is genuine worker output rather than a
 /// synthetic heartbeat (WI#263).
 fn is_genuine_progress(delta: &str) -> bool {
     !delta.trim_start().starts_with(WORKER_HEARTBEAT_PREFIX)
+}
+
+/// Whether a single output line is a synthetic executor keep-alive (WI#267).
+///
+/// The bare `[worker] ` prefix is too broad for evidence cleanup — workers may
+/// legitimately emit `[worker] initialized`-style logs — so the full known
+/// heartbeat shape is matched instead.
+fn is_heartbeat_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with(WORKER_HEARTBEAT_LINE_PREFIX)
+        && trimmed.ends_with(WORKER_HEARTBEAT_LINE_SUFFIX)
 }
 
 /// Remove synthetic worker-heartbeat lines from a worker-supplied output
@@ -1686,7 +1717,7 @@ fn is_genuine_progress(delta: &str) -> bool {
 fn strip_worker_heartbeats(output: &str) -> String {
     let mut stripped = String::with_capacity(output.len());
     for line in output.split_inclusive('\n') {
-        if !is_genuine_progress(line) {
+        if is_heartbeat_line(line) {
             continue;
         }
         stripped.push_str(line);
@@ -1948,6 +1979,27 @@ mod tests {
         assert_eq!(
             strip_worker_heartbeats(&format!("{heartbeat}\n{heartbeat}")),
             ""
+        );
+
+        // The opencode executors emit the same shape with a different subject
+        // — it is the same synthetic keep-alive and must go too.
+        assert_eq!(
+            strip_worker_heartbeats(
+                "[worker] Still waiting for OpenCode/model response; task remains active."
+            ),
+            ""
+        );
+
+        // A genuine worker log line sharing the `[worker] ` prefix is NOT a
+        // heartbeat and must survive (!1235 finding 2).
+        assert_eq!(
+            strip_worker_heartbeats("[worker] initialized session"),
+            "[worker] initialized session"
+        );
+        // Nor is a near-miss of the heartbeat sentence.
+        assert_eq!(
+            strip_worker_heartbeats("[worker] Still waiting for Kimi Code response (retrying)"),
+            "[worker] Still waiting for Kimi Code response (retrying)"
         );
 
         // Genuine-only buffers survive verbatim (modulo the tail trim).
