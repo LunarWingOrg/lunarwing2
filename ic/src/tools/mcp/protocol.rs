@@ -977,7 +977,10 @@ mod tests {
 
         let result: ListToolsResult =
             serde_json::from_value(server_response).expect("name at the bound must be accepted");
-        assert_eq!(result.tools[0].name.chars().count(), MAX_MCP_TOOL_NAME_CHARS);
+        assert_eq!(
+            result.tools[0].name.chars().count(),
+            MAX_MCP_TOOL_NAME_CHARS
+        );
     }
 
     #[test]

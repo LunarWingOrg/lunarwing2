@@ -6464,8 +6464,8 @@ mod tests {
     use crate::context::JobContext;
     use crate::extensions::ExtensionManager;
     use crate::extensions::manager::{
-        ActiveMcpServer, FallbackDecision, McpRecoveryCandidate, McpRecoveryClaim,
-        McpRuntimeHealth, MAX_EXTENSION_NAME_BYTES, build_wasm_channel_runtime_config_updates,
+        ActiveMcpServer, FallbackDecision, MAX_EXTENSION_NAME_BYTES, McpRecoveryCandidate,
+        McpRecoveryClaim, McpRuntimeHealth, build_wasm_channel_runtime_config_updates,
         combine_install_errors, fallback_decision, infer_kind_from_url, join_or_abort_tasks,
         normalize_hosted_callback_url,
     };

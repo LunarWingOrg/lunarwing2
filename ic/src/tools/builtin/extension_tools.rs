@@ -1310,18 +1310,13 @@ impl std::fmt::Debug for FittedPage {
     }
 }
 
-fn fit_page_to_budget(
-    mut page: Vec<serde_json::Value>,
-    offset: usize,
-    total: usize,
-) -> FittedPage {
+fn fit_page_to_budget(mut page: Vec<serde_json::Value>, offset: usize, total: usize) -> FittedPage {
     if page.is_empty() {
         // No entries were requested or matched: a complete empty page, not a
         // budget failure.
         return FittedPage::NoEntries;
     }
-    while page_json_len(&page, offset, total).is_none_or(|len| len > TOOL_LIST_PAGE_BUDGET_BYTES)
-    {
+    while page_json_len(&page, offset, total).is_none_or(|len| len > TOOL_LIST_PAGE_BUDGET_BYTES) {
         page.pop();
         if page.is_empty() {
             // At least one entry existed and even a single one could not fit:
@@ -2205,8 +2200,7 @@ mod tests {
         // a deliberately disabled MCP server must stay distinguishable from
         // an inactive/failing one, and host vs job-worker placement must be
         // diagnosable from this surface.
-        let mut extension =
-            installed_extension("configured", ExtensionKind::McpServer, Vec::new());
+        let mut extension = installed_extension("configured", ExtensionKind::McpServer, Vec::new());
         extension.enabled = Some(false);
         extension.placement = Some(crate::tools::mcp::McpPlacement::JobWorker);
         extension.transport = Some("stdio".to_string());
@@ -2234,8 +2228,7 @@ mod tests {
     fn tool_list_entry_bounds_restored_config_fields() {
         // The restored fields ride along bounded: worst-case escaped urls and
         // commands must not blow the per-entry budget reserved for tool names.
-        let mut extension =
-            installed_extension("long_url", ExtensionKind::McpServer, Vec::new());
+        let mut extension = installed_extension("long_url", ExtensionKind::McpServer, Vec::new());
         extension.transport = Some("t".repeat(1_000));
         extension.url = Some("u".repeat(1_000));
         extension.command = Some("c".repeat(1_000));
@@ -2711,8 +2704,9 @@ mod tests {
             Arc::new(McpSessionManager::new()),
             Arc::new(McpProcessManager::new()),
             {
-                let key =
-                    secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
+                let key = secrecy::SecretString::from(
+                    crate::secrets::keychain::generate_master_key_hex(),
+                );
                 let crypto = Arc::new(SecretsCrypto::new(key).expect("crypto"));
                 Arc::new(InMemorySecretsStore::new(crypto))
                     as Arc<dyn crate::secrets::SecretsStore + Send + Sync>
