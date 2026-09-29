@@ -91,16 +91,32 @@ follow-up call with that `tools_offset` retrieves the remaining names. No
 tool name is unreachable.
 
 Identifiers are never elided: `name` and every `tools[]` entry pass through
-verbatim, however long, so two long names sharing a prefix stay
-distinguishable and each remains retrievable through its window. Descriptive
-fields (`description`, `display_name`, `version`, `activation_error`) are
-bounded to 200 characters with an explicit `…` elision marker. Each entry is
-kept under a 32 KiB serialized bound (the tool-name window shrinks to
-enforce it), and the pretty-printed page — the exact string the safety layer
-clips — is kept under a 60 KiB budget by dropping trailing entries and
-re-deriving `count`/`next_offset`/`truncated`. A page can therefore never
-claim completeness while silently clipped; if an upstream value ever defeats
-the per-entry bound, the tool errors instead of returning a clipped page.
+verbatim, so two long names sharing a prefix stay distinguishable and each
+remains retrievable through its window. Descriptive and free-text fields
+(`description`, `display_name`, `version`, `activation_error`, `transport`,
+`url`, `command`) are bounded to 200 characters with an explicit `…` elision
+marker. Each entry is kept under a 32 KiB serialized bound (the tool-name
+window shrinks to enforce it), and the pretty-printed page — the exact string
+the safety layer clips — is kept under a 60 KiB budget by dropping trailing
+entries and re-deriving `count`/`next_offset`/`truncated`. A page can
+therefore never claim completeness while silently clipped; if an upstream
+value ever defeats the per-entry bound, the tool errors instead of returning
+a clipped page.
+
+Entries carry the MCP status/config fields the pre-pagination output
+exposed: `enabled` (a deliberately disabled server is distinguishable from
+an inactive or failing one), `placement` (`host` / `job_worker` /
+`external_worker`), and when applicable `transport`, `url`, and `command`.
+WASM entries omit placement/enabled (they are `None` for those kinds).
+
+Identifier length is bounded at ingress, not by elision: an MCP `tools/list`
+tool name longer than 256 characters is rejected when the response is
+deserialized (failing that tools/list, like the existing byte/count/page
+caps), and extension names are capped at 200 bytes at validation (they are
+filename components as well as listing identifiers). A genuinely empty
+result — fresh tenant, `kind` filter with no matches, or `offset == total`
+— returns `{"extensions":[],"count":0}`, never an error; only a nonempty
+page that cannot fit the byte budget errors.
 
 `ExtensionManager::list()` (used by the web gateway and other internal
 consumers) still returns full structs; only the agent-facing `tool_list`
