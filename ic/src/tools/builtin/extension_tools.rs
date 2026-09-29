@@ -1254,21 +1254,52 @@ fn page_json_len(page: &[serde_json::Value], offset: usize, total: usize) -> Opt
 /// Metadata is derived after shrinking, so `count`/`next_offset`/`truncated`
 /// always describe the entries actually returned. The check also applies to
 /// the final single entry: a lone oversized entry is dropped rather than
-/// returned clipped-while-claiming-completeness (MR !1221 finding 1). Callers
-/// treat an empty result as a hard error, never as a complete empty page —
-/// the per-entry tool-name window already bounds every entry, so an empty
-/// page can only mean an upstream value exceeded what one entry may carry.
+/// returned clipped-while-claiming-completeness (MR !1221 finding 1).
+///
+/// Returns `FittedPage::Empty` when no entry survives the budget **and the
+/// request asked for entries** — only that case is a hard error for the
+/// caller. A request that legitimately matched zero entries (empty
+/// inventory, or a `kind` filter with no matches) is reported via
+/// `FittedPage::NoEntries` so it can return the same
+/// `{"extensions":[],"count":0}` shape callers got before pagination
+/// (MR !1225 finding 1).
+enum FittedPage {
+    Entries(Vec<serde_json::Value>),
+    NoEntries,
+    Empty,
+}
+
+impl std::fmt::Debug for FittedPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Entries(page) => f.debug_tuple("Entries").field(&page.len()).finish(),
+            Self::NoEntries => f.write_str("NoEntries"),
+            Self::Empty => f.write_str("Empty"),
+        }
+    }
+}
+
 fn fit_page_to_budget(
     mut page: Vec<serde_json::Value>,
     offset: usize,
     total: usize,
-) -> Vec<serde_json::Value> {
-    while !page.is_empty()
-        && page_json_len(&page, offset, total).is_none_or(|len| len > TOOL_LIST_PAGE_BUDGET_BYTES)
+) -> FittedPage {
+    if page.is_empty() {
+        // No entries were requested or matched: a complete empty page, not a
+        // budget failure.
+        return FittedPage::NoEntries;
+    }
+    while page_json_len(&page, offset, total).is_none_or(|len| len > TOOL_LIST_PAGE_BUDGET_BYTES)
     {
         page.pop();
+        if page.is_empty() {
+            // At least one entry existed and even a single one could not fit:
+            // an upstream value defeated the per-entry bound. Signal the
+            // caller to fail loudly rather than claim completeness.
+            return FittedPage::Empty;
+        }
     }
-    page
+    FittedPage::Entries(page)
 }
 
 pub struct ToolListTool {
@@ -1399,17 +1430,33 @@ impl Tool for ToolListTool {
         // (long upstream description + 100 tool names) must never produce a
         // page the safety layer would clip mid-JSON while its own
         // truncated/next_offset fields claim completeness.
-        let page = fit_page_to_budget(page, offset, total);
-        if page.is_empty() {
-            // The per-entry tool-name window bounds every entry below the
-            // page budget, so this is unreachable for well-formed data; if an
-            // upstream value ever defeats it, fail loudly rather than return
-            // an empty page whose metadata would claim completeness.
-            return Err(ToolError::ExecutionFailed(format!(
-                "entry at offset {offset} exceeds the serialized page budget; \
-                 retry with a smaller tools_limit or a higher tools_offset"
-            )));
-        }
+        let page = match fit_page_to_budget(page, offset, total) {
+            FittedPage::Entries(page) => page,
+            FittedPage::NoEntries => {
+                // Empty inventory or a kind filter with no matches: a
+                // complete empty page, matching the pre-pagination shape
+                // (MR !1225 finding 1).
+                let output = serde_json::json!({
+                    "extensions": [],
+                    "count": 0,
+                    "total": total,
+                    "offset": offset,
+                    "next_offset": null,
+                    "truncated": false,
+                });
+                return Ok(ToolOutput::success(output, start.elapsed()));
+            }
+            FittedPage::Empty => {
+                // The per-entry tool-name window bounds every entry below the
+                // page budget, so this is unreachable for well-formed data; if
+                // an upstream value ever defeats it, fail loudly rather than
+                // return an empty page whose metadata would claim completeness.
+                return Err(ToolError::ExecutionFailed(format!(
+                    "entry at offset {offset} exceeds the serialized page budget; \
+                     retry with a smaller tools_limit or a higher tools_offset"
+                )));
+            }
+        };
 
         let returned = page.len();
         let next_offset = (offset + returned < total).then_some(offset + returned);
@@ -2229,7 +2276,10 @@ mod tests {
             "fixture must be oversized to exercise the budget (got {full_len})"
         );
 
-        let fitted = fit_page_to_budget(page, 0, total);
+        let fitted = match fit_page_to_budget(page, 0, total) {
+            FittedPage::Entries(fitted) => fitted,
+            other => panic!("oversized page must keep entries, got {other:?}"),
+        };
         assert!(
             !fitted.is_empty(),
             "budget fit must keep at least one entry"
@@ -2281,7 +2331,10 @@ mod tests {
             serialized.len(),
             TOOL_LIST_ENTRY_BUDGET_BYTES
         );
-        let single = fit_page_to_budget(vec![entry.clone()], 0, 1);
+        let single = match fit_page_to_budget(vec![entry.clone()], 0, 1) {
+            FittedPage::Entries(single) => single,
+            other => panic!("window-bounded entry must survive, got {other:?}"),
+        };
         assert_eq!(
             single.len(),
             1,
@@ -2351,7 +2404,10 @@ mod tests {
             )
         };
         let page: Vec<serde_json::Value> = (0..100).map(make_entry).collect();
-        let fitted = fit_page_to_budget(page, 0, 100);
+        let fitted = match fit_page_to_budget(page, 0, 100) {
+            FittedPage::Entries(fitted) => fitted,
+            other => panic!("oversized page must keep entries, got {other:?}"),
+        };
 
         let next_offset = (fitted.len() < 100).then_some(fitted.len());
         let combined = serde_json::json!({
@@ -2369,6 +2425,42 @@ mod tests {
             serde_json::json!(next_offset.is_some())
         );
         assert!(fitted.len() < 100, "oversized fixture must be shrunken");
+    }
+
+    #[test]
+    fn tool_list_empty_inventory_returns_complete_empty_page() {
+        // MR !1225 finding 1: a genuinely empty result (fresh tenant, or a
+        // kind filter with no matches) must return the pre-pagination
+        // {"extensions":[],"count":0} shape — not the budget-drop error.
+        // Only a nonempty page dropped for exceeding the byte budget errors.
+        assert!(matches!(
+            fit_page_to_budget(Vec::new(), 0, 0),
+            FittedPage::NoEntries
+        ));
+    }
+
+    #[test]
+    fn tool_list_nonempty_page_dropped_for_budget_is_distinguishable() {
+        // The other half of MR !1225 finding 1: entries existed but none
+        // fit — that stays a hard failure, never a silent empty page. The
+        // extension name is an identifier and passes through verbatim, so a
+        // name longer than the page budget is the one construct that can
+        // still defeat the fitter today.
+        let long_name = "n".repeat(TOOL_LIST_PAGE_BUDGET_BYTES * 2);
+        let oversized = extension_to_json(
+            &installed_extension(&long_name, ExtensionKind::McpServer, Vec::new()),
+            0,
+            TOOL_LIST_TOOLS_PAGE_DEFAULT,
+        );
+        let len = page_json_len(&[oversized.clone()], 0, 1).expect("serialize");
+        assert!(
+            len > TOOL_LIST_PAGE_BUDGET_BYTES,
+            "fixture must exceed the page budget (got {len})"
+        );
+        assert!(matches!(
+            fit_page_to_budget(vec![oversized], 0, 1),
+            FittedPage::Empty
+        ));
     }
 
     /// End-to-end WI#245 regression: a 31-server inventory (the reported
