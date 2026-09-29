@@ -68,8 +68,10 @@ indistinguishable from a complete list — the "19 of 31 MCP servers" failure).
 The result always includes:
 
 - `extensions` — entries ordered by kind (`mcp_server`, `wasm_tool`,
-  `wasm_channel`), then case-insensitive name. Ordering is deterministic, so
-  the same offset always addresses the same entries.
+  `wasm_channel`), then case-insensitive name, then original name as a
+  tie-breaker (distinct names that differ only by case still get a stable
+  total order). Ordering is deterministic, so the same offset always
+  addresses the same entries.
 - `count` / `total` — entries on this page vs. entries matching the filter.
 - `offset` / `next_offset` — `next_offset` is `null` on the last page.
 - `truncated` — `true` whenever more pages exist. Consumers must not infer
@@ -80,18 +82,25 @@ Keep `kind`/`include_available` identical across pages of one enumeration.
 An `offset` past the end is a caller error, not an empty page.
 
 Per entry, `tools` lists a window of exposed tool names — at most
-`tools_limit` (1–100, default 25) starting at `tools_offset`. When a server
-exposes more tools than the window, the entry carries
-`tools_truncated: true`, `tools_total`, and `tools_next_offset`; a follow-up
-call with that `tools_offset` (and the entry's name in `kind` filtering as
-needed) retrieves the remaining names. No tool name is unreachable.
+`tools_limit` (1–100, default 25) starting at `tools_offset` (echoed as
+`tools_offset` on the entry when nonzero). When a server exposes more tools
+than the window carries — including when worst-case JSON escaping (control
+characters serialize to six bytes each) makes fewer names fit — the entry
+carries `tools_truncated: true`, `tools_total`, and `tools_next_offset`; a
+follow-up call with that `tools_offset` retrieves the remaining names. No
+tool name is unreachable.
 
-Every string field in an entry (`name`, `description`, `display_name`,
-`version`, `activation_error`, tool names) is bounded to 200 characters with
-an explicit `…` elision marker, and the pretty-printed page — the exact
-string the safety layer clips — is kept under a 60 KiB budget by dropping
-trailing entries and re-deriving `count`/`next_offset`/`truncated`. A page
-can therefore never claim completeness while silently clipped.
+Identifiers are never elided: `name` and every `tools[]` entry pass through
+verbatim, however long, so two long names sharing a prefix stay
+distinguishable and each remains retrievable through its window. Descriptive
+fields (`description`, `display_name`, `version`, `activation_error`) are
+bounded to 200 characters with an explicit `…` elision marker. Each entry is
+kept under a 32 KiB serialized bound (the tool-name window shrinks to
+enforce it), and the pretty-printed page — the exact string the safety layer
+clips — is kept under a 60 KiB budget by dropping trailing entries and
+re-deriving `count`/`next_offset`/`truncated`. A page can therefore never
+claim completeness while silently clipped; if an upstream value ever defeats
+the per-entry bound, the tool errors instead of returning a clipped page.
 
 `ExtensionManager::list()` (used by the web gateway and other internal
 consumers) still returns full structs; only the agent-facing `tool_list`
