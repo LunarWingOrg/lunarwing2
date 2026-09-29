@@ -125,6 +125,9 @@ impl JobStore for LibSqlBackend {
                     created_at: get_ts(&row, 16),
                     started_at: get_opt_ts(&row, 17),
                     completed_at: get_opt_ts(&row, 18),
+                    // Not persisted yet (WI#263): idle detection falls back to
+                    // started_at for contexts reconstructed from the DB.
+                    last_activity_at: None,
                     transitions: Vec::new(),
                     metadata: serde_json::Value::Null,
                     prompt_context: std::sync::Arc::from([]),

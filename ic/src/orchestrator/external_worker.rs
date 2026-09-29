@@ -1230,6 +1230,20 @@ async fn run_external_task(
                     match env.msg_type.as_str() {
                         "task_progress" => {
                             if let Ok(progress) = serde_json::from_value::<TaskProgressPayload>(env.payload) {
+                                // WI#263: a streamed delta is proof the worker
+                                // is alive — unless it is a synthetic worker
+                                // heartbeat (the kimi executor's "[worker]
+                                // Still waiting…" keep-alive). A wedged CLI
+                                // emits nothing at all while its heartbeat
+                                // claims the task is active, so heartbeats
+                                // must not refresh the idle baseline used by
+                                // stuck detection.
+                                if is_genuine_progress(&progress.delta)
+                                    && let Some(cm) = context_manager
+                                {
+                                    let _ = cm.update_context(job_id, |ctx| ctx.note_activity()).await;
+                                }
+
                                 accumulated_output.push_str(&progress.delta);
 
                                 emit_event(
@@ -1330,6 +1344,18 @@ async fn run_external_task(
             // the same window to acknowledge before the connection is torn
             // down, so its cancel processing isn't racing socket cleanup.
             let _ = wait_for_cancel_ack(&mut read, job_id, worker_name, CANCEL_ACK_TIMEOUT).await;
+            // WI#263: the streamed investigation is real work. Persist a
+            // bounded evidence snapshot and a fallback-deliverable marker so
+            // the partial result survives the timeout instead of vanishing
+            // with the connection.
+            preserve_timeout_evidence(
+                job_id,
+                worker_name,
+                &accumulated_output,
+                context_manager,
+                store,
+            )
+            .await;
             return Err(OrchestratorError::ExternalWorkerTimeout {
                 worker_name: worker_name.to_string(),
                 job_id,
@@ -1350,15 +1376,18 @@ async fn run_external_task(
             "cancelled",
             "Cancelled by user".to_string(),
         ),
-        ExternalTaskStatus::TimedOut => (
-            false,
-            JobState::Failed,
-            "timed_out",
-            task_result
-                .error
-                .clone()
-                .unwrap_or_else(|| "External worker timed out".to_string()),
-        ),
+        ExternalTaskStatus::TimedOut => {
+            // WI#263: a worker-reported timeout (e.g. the kimi silence
+            // watchdog resolving a wedged CLI) carries the streamed
+            // investigation in `output`. The deliverable evidence must reach
+            // the persisted result — an error string alone loses the work.
+            (
+                false,
+                JobState::Failed,
+                "timed_out",
+                timed_out_result_message(task_result.error.as_deref(), &task_result.output),
+            )
+        }
         ExternalTaskStatus::Failed | ExternalTaskStatus::Partial(_) => (
             false,
             JobState::Failed,
@@ -1370,8 +1399,23 @@ async fn run_external_task(
         ),
     };
 
+    // WI#263: preserve a bounded evidence snapshot whenever the task resolves
+    // as timed out — whether the daemon's own deadline fired (handled at the
+    // timeout return above) or the *worker* reported TimedOut (e.g. the kimi
+    // silence watchdog). Covers both wait=true and wait=false callers: the
+    // snapshot lives in job metadata + a job event, not the caller's return
+    // value.
+    if task_result.status == ExternalTaskStatus::TimedOut {
+        let evidence = if task_result.output.is_empty() {
+            accumulated_output.clone()
+        } else {
+            task_result.output.clone()
+        };
+        preserve_timeout_evidence(job_id, worker_name, &evidence, context_manager, store).await;
+    }
+
     if let Some(cm) = context_manager {
-        let _ = cm
+        let transition = cm
             .update_context(job_id, |ctx| {
                 if ctx.state == final_state {
                     return Ok(());
@@ -1379,6 +1423,28 @@ async fn run_external_task(
                 ctx.transition_to(final_state, task_result.error.clone())
             })
             .await;
+        match transition {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => {
+                // A rejected transition (e.g. terminal state already reached)
+                // must not be silently discarded (WI#263): log it so the lost
+                // state update is observable, including the recovered output
+                // size so operators can see evidence was received.
+                tracing::warn!(
+                    job_id = %job_id,
+                    worker = worker_name,
+                    from_state_result = %status_str,
+                    output_bytes = final_msg.len(),
+                    "Could not apply external worker final state: {reason}"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "Failed to load job context for final state: {error}"
+                );
+            }
+        }
     }
 
     // Persist final event
@@ -1575,6 +1641,116 @@ async fn persist_event(
     }
 }
 
+/// Marker prefix workers use for synthetic keep-alive progress (WI#263).
+///
+/// The kimi executor emits `"[worker] Still waiting …"` heartbeats on a timer
+/// while the underlying CLI runs. Those frames prove the *executor* is alive,
+/// not that the CLI is producing output, so they must not refresh the
+/// idle baseline used by stuck detection.
+const WORKER_HEARTBEAT_PREFIX: &str = "[worker] ";
+
+/// Whether a streamed progress delta is genuine worker output rather than a
+/// synthetic heartbeat (WI#263).
+fn is_genuine_progress(delta: &str) -> bool {
+    !delta.trim_start().starts_with(WORKER_HEARTBEAT_PREFIX)
+}
+
+/// Build the persisted result message for a worker-reported timeout (WI#263).
+///
+/// The worker's `task_result.output` carries whatever the CLI streamed before
+/// wedging (e.g. the kimi silence watchdog). Appending it to the persisted
+/// result keeps the investigation readable from `job_events` / the job record
+/// even though the job resolves as `timed_out`; an error string alone would
+/// discard the work.
+fn timed_out_result_message(error: Option<&str>, output: &str) -> String {
+    let reason = error.unwrap_or("External worker timed out");
+    if output.trim().is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}\n\nPartial output:\n{output}")
+    }
+}
+
+/// Cap on the streamed-output snapshot persisted when an external worker task
+/// times out (WI#263). Evidence beyond this is already persisted event-by-event
+/// via `persist_event`; the snapshot is the tail an operator reads first.
+const TIMEOUT_EVIDENCE_SNAPSHOT_BYTES: usize = 16_384;
+
+/// Preserve a partial-evidence snapshot when an external worker task times out
+/// (WI#263).
+///
+/// Real investigations routinely exceed the task deadline at the final
+/// report-composition step; until now the streamed evidence was dropped with
+/// the connection and the report was unrecoverable. Store the output tail in
+/// `JobContext.metadata["partial_output"]` (bounded) and persist an explicit
+/// event so the work is visible from `job_events` / `job_status` even though
+/// the job resolves as TimedOut. Applies to both the daemon-deadline path and
+/// worker-reported timeouts (the kimi silence watchdog), for wait=true and
+/// wait=false callers alike.
+///
+/// Any **nonempty** genuine output is preserved (WI#263 review finding): a
+/// short streamed investigation is still real evidence, and dropping it under
+/// an arbitrary size floor left `job_status.partial_output` null exactly when
+/// the recovery path was needed most.
+async fn preserve_timeout_evidence(
+    job_id: Uuid,
+    worker_name: &str,
+    accumulated_output: &str,
+    context_manager: Option<&Arc<ContextManager>>,
+    store: Option<&Arc<dyn Database>>,
+) {
+    let trimmed = accumulated_output.trim();
+    if trimmed.is_empty() {
+        // Nothing genuine streamed — nothing to preserve.
+        return;
+    }
+
+    let snapshot: String = if trimmed.len() <= TIMEOUT_EVIDENCE_SNAPSHOT_BYTES {
+        trimmed.to_string()
+    } else {
+        let start = floor_char_boundary(trimmed, trimmed.len() - TIMEOUT_EVIDENCE_SNAPSHOT_BYTES);
+        trimmed[start..].to_string()
+    };
+
+    if let Some(cm) = context_manager {
+        let stored = cm
+            .update_context(job_id, |ctx| {
+                if !ctx.metadata.is_object() {
+                    ctx.metadata = serde_json::json!({});
+                }
+                ctx.metadata["partial_output"] = serde_json::Value::String(snapshot.clone());
+            })
+            .await;
+        if stored.is_err() {
+            tracing::warn!(%job_id, "Failed to store partial output in job context");
+        }
+    }
+
+    persist_event(
+        store,
+        job_id,
+        "partial_output",
+        &format!(
+            "[worker {worker_name} timed out after streaming {total} bytes; tail preserved]\n{snapshot}",
+            total = accumulated_output.len(),
+        ),
+    )
+    .await;
+}
+
+/// UTF-8-safe floor of a char boundary, mirroring `str::floor_char_boundary`
+/// (still unstable on our MSRV).
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 async fn record_external_task_error(
     job_id: Uuid,
     error: &OrchestratorError,
@@ -1678,6 +1854,175 @@ mod tests {
     use super::*;
     use crate::config::LoadBalanceStrategy;
     use lunarwing_common::PromptContextRole;
+
+    #[test]
+    fn floor_char_boundary_is_utf8_safe() {
+        // ASCII passes through unchanged.
+        assert_eq!(floor_char_boundary("hello", 3), 3);
+        // Index beyond the end clamps to the length.
+        assert_eq!(floor_char_boundary("hello", 99), 5);
+        // "é" occupies bytes 3..5 in "café": an index landing mid-codepoint
+        // backs up to the preceding boundary instead of splitting it.
+        let s = "café";
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 4), 3);
+        // The tail slice must itself be valid UTF-8 (no panic on slicing).
+        let long = format!("{}{}", "é".repeat(100), "x".repeat(50));
+        let start = floor_char_boundary(&long, long.len() - 10);
+        assert!(long.is_char_boundary(start));
+        let _tail = &long[start..];
+    }
+
+    #[test]
+    fn heartbeats_are_not_genuine_progress() {
+        // WI#263: the kimi executor's synthetic keep-alive must not refresh
+        // the idle baseline — a wedged CLI emits nothing while the heartbeat
+        // claims the task is active.
+        assert!(!is_genuine_progress(
+            "[worker] Still waiting for Kimi Code response; task remains active."
+        ));
+        assert!(!is_genuine_progress("  [worker] Still waiting…"));
+        // Real CLI output (including output that merely mentions the worker)
+        // still counts.
+        assert!(is_genuine_progress(
+            "Investigation step: evidence gathered."
+        ));
+        assert!(is_genuine_progress("[assistant] partial report"));
+        assert!(is_genuine_progress(""));
+    }
+
+    #[test]
+    fn timed_out_result_message_keeps_partial_output() {
+        // WI#263: a worker-reported timeout carrying streamed output must
+        // persist that output alongside the error — the investigation is the
+        // deliverable, and it is unrecoverable from the error string alone.
+        let msg = timed_out_result_message(
+            Some("kimi produced no stream output for 900000ms"),
+            "Investigation step: evidence gathered.",
+        );
+        assert!(msg.contains("no stream output for 900000ms"));
+        assert!(msg.contains("Partial output:"));
+        assert!(msg.contains("Investigation step: evidence gathered."));
+
+        // Without output (or whitespace-only), the reason stands alone.
+        assert_eq!(
+            timed_out_result_message(Some("External worker timed out"), "   "),
+            "External worker timed out"
+        );
+        assert_eq!(
+            timed_out_result_message(None, ""),
+            "External worker timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn preserve_timeout_evidence_stores_bounded_tail() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        let streamed = "evidence line\n".repeat(4_000); // ~56 KB, over the cap
+        preserve_timeout_evidence(job_id, "kimi", &streamed, Some(&cm), None).await;
+
+        let ctx = cm.get_context(job_id).await.unwrap();
+        let partial = ctx
+            .metadata
+            .get("partial_output")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(!partial.is_empty());
+        assert!(
+            partial.len() <= TIMEOUT_EVIDENCE_SNAPSHOT_BYTES + 16,
+            "snapshot must be bounded, got {}",
+            partial.len()
+        );
+        // Bounded tail keeps the END of the stream (the report-composition
+        // step), not the beginning.
+        assert!(partial.ends_with("evidence line"));
+    }
+
+    #[tokio::test]
+    async fn preserve_timeout_evidence_skips_trivial_output() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        preserve_timeout_evidence(job_id, "kimi", "   ", Some(&cm), None).await;
+
+        let ctx = cm.get_context(job_id).await.unwrap();
+        assert!(ctx.metadata.get("partial_output").is_none());
+    }
+
+    /// WI#263 review finding: short genuine evidence must be preserved too.
+    /// A streamed investigation of only a few bytes (e.g. the silence
+    /// watchdog firing shortly after the CLI's first — and only — progress
+    /// event) is still real evidence; the old 512-byte floor dropped it and
+    /// left `job_status.partial_output` null.
+    #[tokio::test]
+    async fn preserve_timeout_evidence_keeps_short_genuine_output() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        let short = "Investigation step: evidence gathered.";
+        preserve_timeout_evidence(job_id, "kimi", short, Some(&cm), None).await;
+
+        let ctx = cm.get_context(job_id).await.unwrap();
+        assert_eq!(
+            ctx.metadata.get("partial_output").and_then(|v| v.as_str()),
+            Some(short),
+            "short genuine output must be preserved verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_only_streams_do_not_refresh_idle_baseline() {
+        // WI#263 end-to-end at the context level: only genuine deltas may
+        // note activity, so a wedged worker whose executor keeps sending
+        // heartbeats still crosses the idle threshold.
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        // Backdate the start and record one genuine activity long ago…
+        cm.update_context(job_id, |ctx| -> Result<(), crate::error::JobError> {
+            ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3600));
+            ctx.last_activity_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        // …then simulate the orchestrator's progress handler on heartbeat
+        // frames only (mirrors the is_genuine_progress gate).
+        for _ in 0..3 {
+            let delta = "[worker] Still waiting for Kimi Code response; task remains active.";
+            if is_genuine_progress(delta) {
+                cm.update_context(job_id, |ctx| ctx.note_activity())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let stuck = cm
+            .find_stuck_jobs_with_threshold(Some(std::time::Duration::from_secs(300)))
+            .await;
+        assert_eq!(
+            stuck.len(),
+            1,
+            "heartbeats must not keep a wedged job alive"
+        );
+        assert_eq!(stuck[0], job_id);
+    }
 
     #[test]
     fn describe_connect_failure_enriches_subprotocol_rejection() {

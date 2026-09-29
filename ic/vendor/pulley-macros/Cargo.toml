@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "pulley-macros"
-version = "36.0.14"
+version = "36.0.16"
 build = false
 autolib = false
 autobins = false

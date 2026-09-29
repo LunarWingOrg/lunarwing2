@@ -37,6 +37,7 @@ WORKER_LABELS = {
     WorkerType.PEBBLE: "pebble (Rust harness)",
     WorkerType.OPENCODE: "opencode (anomalyco/opencode)",
     WorkerType.KIMI: "kimi (MoonshotAI/kimi-code)",
+    WorkerType.OPENCODE2: "opencode2 (OpenCode 2 lane)",
 }
 
 
@@ -364,6 +365,7 @@ def _configure_workers(config: TenantConfig) -> None:
         WORKER_LABELS[WorkerType.PEBBLE],
         WORKER_LABELS[WorkerType.OPENCODE],
         WORKER_LABELS[WorkerType.KIMI],
+        WORKER_LABELS[WorkerType.OPENCODE2],
     ]
     selected = _q_checkbox("External workers (space to toggle, enter to confirm)", labels)
     config.workers = []
@@ -384,6 +386,14 @@ def _configure_workers(config: TenantConfig) -> None:
         config.opencode_base_url = _q_text(
             "OpenCode base URL override (optional)",
             default=config.opencode_base_url,
+        )
+    if WorkerType.OPENCODE2 in config.workers:
+        config.opencode2_model = _q_text(
+            "OpenCode 2 model override (optional)", default=config.opencode2_model
+        )
+        config.opencode2_base_url = _q_text(
+            "OpenCode 2 base URL override (optional)",
+            default=config.opencode2_base_url,
         )
     if WorkerType.KIMI in config.workers:
         config.kimi_model = _q_text(

@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "wasmtime-internal-component-util"
-version = "36.0.14"
+version = "36.0.16"

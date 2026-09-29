@@ -4,7 +4,7 @@
   const LW = (window.LW = window.LW || {});
 
   const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
-  const RESERVED = ['pg-', 'proxy-', 'nanocode-', 'pebble-', 'opencode-', 'kimi-', 'weechat-'];
+  const RESERVED = ['pg-', 'proxy-', 'nanocode-', 'pebble-', 'opencode-', 'opencode2-', 'kimi-', 'weechat-'];
 
   function validateName(name) {
     if (!name) return 'tenant name is required';
@@ -82,6 +82,7 @@
       llm_base_url: '',
       model_choice: 'lunarwing', model_custom: '',
       opencode_model: '', opencode_base_url: '',
+      w_opencode2: false, opencode2_model: '', opencode2_base_url: '',
       llm_api_key: '', secrets_master_key: '',
       ssh_harness: true, health_pipeline: true, weechat_bootstrap: true,
       skip_build: false, skip_start: false,
@@ -182,6 +183,16 @@
         opencode.appendChild(textField(data, 'opencode_base_url', 'OpenCode base URL override (optional)', {}));
         b.appendChild(opencode);
       }
+      b.appendChild(checkField(data, 'w_opencode2', 'opencode2 (OpenCode 2 lane)', (checked) => {
+        if (!checked) { data.opencode2_model = ''; data.opencode2_base_url = ''; }
+        render();
+      }));
+      if (data.w_opencode2) {
+        const opencode2 = h('div', { class: 'subgroup' });
+        opencode2.appendChild(textField(data, 'opencode2_model', 'OpenCode 2 model override (optional)', {}));
+        opencode2.appendChild(textField(data, 'opencode2_base_url', 'OpenCode 2 base URL override (optional)', {}));
+        b.appendChild(opencode2);
+      }
       b.appendChild(checkField(data, 'w_kimi', 'kimi (MoonshotAI/kimi-code)', (checked) => {
         if (!checked) { data.kimi_model = ''; data.kimi_base_url = ''; data.kimi_api_key = ''; }
         render();
@@ -221,7 +232,7 @@
     }
 
     function stepReview(b) {
-      const workers = [data.w_pebble && 'pebble', data.w_opencode && 'opencode', data.w_kimi && 'kimi'].filter(Boolean);
+      const workers = [data.w_pebble && 'pebble', data.w_opencode && 'opencode', data.w_opencode2 && 'opencode2', data.w_kimi && 'kimi'].filter(Boolean);
       const rows = [
         ['Tenant', data.name || '(unset)'],
         ['Gateway host', data.gateway_host],
@@ -251,6 +262,7 @@
       const workers = [];
       if (data.w_pebble) workers.push('pebble');
       if (data.w_opencode) workers.push('opencode');
+      if (data.w_opencode2) workers.push('opencode2');
       if (data.w_kimi) workers.push('kimi');
       let model = 'tensorzero::function_name::lunarwing';
       if (data.model_choice === 'FrontierCODE') model = 'tensorzero::function_name::FrontierCODE';
@@ -273,6 +285,8 @@
         llm_model: model,
         opencode_model: data.opencode_model.trim(),
         opencode_base_url: data.opencode_base_url.trim(),
+        opencode2_model: data.opencode2_model.trim(),
+        opencode2_base_url: data.opencode2_base_url.trim(),
         kimi_model: data.kimi_model.trim(),
         kimi_base_url: data.kimi_base_url.trim(),
         kimi_api_key: data.kimi_api_key,
