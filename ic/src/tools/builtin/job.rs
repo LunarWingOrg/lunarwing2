@@ -1841,6 +1841,7 @@ impl Tool for JobStatusTool {
                     "completed_at": job_ctx.completed_at.map(|t| t.to_rfc3339()),
                     "actual_cost": job_ctx.actual_cost.to_string(),
                     "fallback_deliverable": job_ctx.metadata.get("fallback_deliverable"),
+                    "partial_output": job_ctx.metadata.get("partial_output"),
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
