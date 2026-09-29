@@ -1381,16 +1381,12 @@ async fn run_external_task(
             // watchdog resolving a wedged CLI) carries the streamed
             // investigation in `output`. The deliverable evidence must reach
             // the persisted result — an error string alone loses the work.
-            let reason = task_result
-                .error
-                .clone()
-                .unwrap_or_else(|| "External worker timed out".to_string());
-            let msg = if task_result.output.trim().is_empty() {
-                reason
-            } else {
-                format!("{reason}\n\nPartial output:\n{}", task_result.output)
-            };
-            (false, JobState::Failed, "timed_out", msg)
+            (
+                false,
+                JobState::Failed,
+                "timed_out",
+                timed_out_result_message(task_result.error.as_deref(), &task_result.output),
+            )
         }
         ExternalTaskStatus::Failed | ExternalTaskStatus::Partial(_) => (
             false,
@@ -1659,6 +1655,22 @@ fn is_genuine_progress(delta: &str) -> bool {
     !delta.trim_start().starts_with(WORKER_HEARTBEAT_PREFIX)
 }
 
+/// Build the persisted result message for a worker-reported timeout (WI#263).
+///
+/// The worker's `task_result.output` carries whatever the CLI streamed before
+/// wedging (e.g. the kimi silence watchdog). Appending it to the persisted
+/// result keeps the investigation readable from `job_events` / the job record
+/// even though the job resolves as `timed_out`; an error string alone would
+/// discard the work.
+fn timed_out_result_message(error: Option<&str>, output: &str) -> String {
+    let reason = error.unwrap_or("External worker timed out");
+    if output.trim().is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}\n\nPartial output:\n{output}")
+    }
+}
+
 /// Cap on the streamed-output snapshot persisted when an external worker task
 /// times out (WI#263). Evidence beyond this is already persisted event-by-event
 /// via `persist_event`; the snapshot is the tail an operator reads first.
@@ -1873,6 +1885,30 @@ mod tests {
         ));
         assert!(is_genuine_progress("[assistant] partial report"));
         assert!(is_genuine_progress(""));
+    }
+
+    #[test]
+    fn timed_out_result_message_keeps_partial_output() {
+        // WI#263: a worker-reported timeout carrying streamed output must
+        // persist that output alongside the error — the investigation is the
+        // deliverable, and it is unrecoverable from the error string alone.
+        let msg = timed_out_result_message(
+            Some("kimi produced no stream output for 900000ms"),
+            "Investigation step: evidence gathered.",
+        );
+        assert!(msg.contains("no stream output for 900000ms"));
+        assert!(msg.contains("Partial output:"));
+        assert!(msg.contains("Investigation step: evidence gathered."));
+
+        // Without output (or whitespace-only), the reason stands alone.
+        assert_eq!(
+            timed_out_result_message(Some("External worker timed out"), "   "),
+            "External worker timed out"
+        );
+        assert_eq!(
+            timed_out_result_message(None, ""),
+            "External worker timed out"
+        );
     }
 
     #[tokio::test]
