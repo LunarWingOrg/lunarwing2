@@ -652,6 +652,32 @@ mod tests {
                             "type": "boolean",
                             "description": "Include not-yet-installed entries",
                             "default": false
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Index of the first entry to return. Use next_offset from a previous truncated response to continue.",
+                            "default": 0,
+                            "minimum": 0
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum entries per page (1-100, default 50).",
+                            "default": 50,
+                            "minimum": 1,
+                            "maximum": 100
+                        },
+                        "tools_offset": {
+                            "type": "integer",
+                            "description": "Index of the first per-entry tool name to return within each entry's tools array. Use tools_next_offset from a truncated entry to continue.",
+                            "default": 0,
+                            "minimum": 0
+                        },
+                        "tools_limit": {
+                            "type": "integer",
+                            "description": "Maximum per-entry tool names per page (1-100, default 25).",
+                            "default": 25,
+                            "minimum": 1,
+                            "maximum": 100
                         }
                     }
                 }),
