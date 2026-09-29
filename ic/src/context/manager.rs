@@ -803,7 +803,10 @@ mod tests {
     async fn find_stuck_jobs_uses_last_activity_over_started_at() {
         let manager = ContextManager::new(10);
 
-        let id = manager.create_job("Backdated activity", "desc").await.unwrap();
+        let id = manager
+            .create_job("Backdated activity", "desc")
+            .await
+            .unwrap();
         manager
             .update_context(id, |ctx| {
                 ctx.transition_to(crate::context::JobState::InProgress, None)
