@@ -164,9 +164,10 @@ into one opaque 502.
 - **Request bounds**: base64 audio capped at 24 MiB (≈18 MiB decoded), synthesis
   text at 10 000 chars, voice id at 64 chars, speed in 0.5..=2.0, language at
   32 chars, `format` allowlisted. Synthesis text additionally passes a
-  conservative duration pre-flight (Latin ≈14 chars/s, CJK ≈3.5 chars/s, slow
-  speed clamped) against `VOICE_MAX_TTS_AUDIO_SECS`, rejecting guaranteed
-  over-cap clips before any sidecar CPU is spent. Per-route body limits
+  conservative duration pre-flight (Latin ≈14 chars/s, CJK ≈3.5 chars/s,
+  scaled by the requested speed the same way the sidecar's engine scales the
+  clip) against `VOICE_MAX_TTS_AUDIO_SECS`, rejecting guaranteed over-cap
+  clips before any sidecar CPU is spent. Per-route body limits
   (32 MiB transcribe, 1 MiB synthesize) override the gateway's global 10 MiB
   limit.
 - **Response caps**: sidecar responses are streamed with hard byte caps
@@ -185,8 +186,9 @@ into one opaque 502.
 2. Record audio → base64 → `POST /api/voice/transcribe`.
 3. Agent text → chunk/trim against `max_synth_audio_secs` →
    `POST /api/voice/synthesize` → play returned base64 WAV. Over-long text is
-   rejected with 422 `text_too_long`; chunk at sentence boundaries and
-   synthesize sequentially.
+   rejected with 422 `text_too_long` (the estimate scales with the requested
+   `speed`, so a faster playback setting admits longer text); chunk at
+   sentence boundaries and synthesize sequentially.
 
 ## Testing
 

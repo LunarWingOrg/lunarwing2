@@ -700,11 +700,12 @@ fn validate_synthesize_request(
         ));
     }
     // WI#259: reject text whose estimated audio duration exceeds the sidecar's
-    // clip cap before any sidecar CPU is burned. Slow playback (speed < 1.0)
-    // lengthens audio; faster playback only shortens it, so the estimate
-    // clamps at 1.0 to stay conservative.
-    let effective_speed = if speed < 1.0 { speed } else { 1.0 };
-    let estimated_secs = estimate_synthesis_secs(text, effective_speed);
+    // clip cap before any sidecar CPU is burned. The sidecar passes the
+    // requested speed (already validated to 0.5..=2.0 here, clamped to the
+    // same range there) straight to the engine, so the clip duration scales
+    // with it: a reply too long at 1x can fit the cap at 2x, and the estimate
+    // must account for that instead of rejecting it outright.
+    let estimated_secs = estimate_synthesis_secs(text, speed);
     if estimated_secs > max_synth_audio_secs as f64 {
         tracing::info!(
             chars = text.chars().count(),
@@ -881,6 +882,42 @@ mod tests {
             validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap(),
             "short reply"
         );
+    }
+
+    #[test]
+    fn duration_pre_flight_accounts_for_requested_speed() {
+        // MR !1219 review: the sidecar passes the requested speed straight to
+        // the engine, so a reply too long for the cap at 1x can fit it at 2x.
+        // The pre-flight must consult the sidecar rather than reject the
+        // faster-playback request outright.
+        let text = "w".repeat(4_480); // ~320s at 1x, ~160s at 2x
+        let request = VoiceSynthesizeRequest {
+            text: text.clone(),
+            voice: None,
+            speed: Some(1.0),
+        };
+        let error = validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.1.error, "text_too_long");
+
+        let request = VoiceSynthesizeRequest {
+            text,
+            voice: None,
+            speed: Some(2.0),
+        };
+        assert_eq!(
+            validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap(),
+            "w".repeat(4_480)
+        );
+
+        // Slow playback still lengthens audio and must keep rejecting.
+        let request = VoiceSynthesizeRequest {
+            text: "w".repeat(4_480),
+            voice: None,
+            speed: Some(0.5),
+        };
+        let error = validate_synthesize_request(&request, MAX_SYNTH_AUDIO_SECS).unwrap_err();
+        assert_eq!(error.1.error, "text_too_long");
     }
 
     #[test]
