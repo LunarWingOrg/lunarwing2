@@ -76,7 +76,7 @@
     - **New regression** — `model_response_quoting_step_output_is_assistant_authored_in_visible_transcript`: drives the response boundary end-to-end (flagged `working_messages` state → host sync → sealed record in `internal_messages` → model response quoting the step blob → `sync_visible_outcome` → visible transcript). Asserts the response is Assistant-authored, the only User message is the human input, and the sealed record never enters `thread.messages`
     - **Carried-forward regressions** — `sync_runtime_state_seals_flagged_step_output_out_of_the_visible_transcript` (engine: flagged `working_messages` → host sync → sealed record in `internal_messages`, zero leakage into `thread.messages`, unflagged control text unaffected) and `sealed_step_records_stay_out_of_the_operator_thread_dto` (bridge: the exact set the DTO serializes carries no sealed role/content).
     - Also: Monty `context` role spellings moved to `wire_name()` (scripting.rs), so every wire surface (orchestrator JSON, Monty context, bridge DTOs, trace records, thread events) uses one vocabulary; ENGINE-V2.md gained the 2.1.3.0 sealed-step-records note.
-    - Verified: engine lib **631/631** (`cargo test -p lunarwing_engine --lib`) incl. all four new/carried regressions; host `cargo test --lib bridge::router` **85/85** incl. the DTO boundary test; clippy `-D warnings` clean on `lunarwing_engine` all-targets; `cargo fmt --all -- --check` clean. Kageho live-tenant confirmation remains the operator acceptance step.
+    - Verified: engine lib **631/631** (`cargo test -p lunarwing_engine --lib`) incl. all four new/carried regressions; host `cargo test --lib bridge::router` **85/85** incl. the DTO boundary test; clippy `-D warnings` clean on `lunarwing_engine` all-targets; `cargo fmt --all -- --check` clean. Kageho live-tenant confirmation remains the operator acceptance step
 
 ## Phase 5 - Miscellaneous
 
@@ -153,5 +153,7 @@
 48. [x] (S) come back to ones that were marked for come back to later
 49. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/266
 50. [x] (S) Reserved
+51. [ ] second pass of goal 19
+52. [x] (S) come back to ones that were marked for come back to later
 
 ---
