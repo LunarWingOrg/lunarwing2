@@ -1244,7 +1244,22 @@ async fn run_external_task(
                                     let _ = cm.update_context(job_id, |ctx| ctx.note_activity()).await;
                                 }
 
-                                accumulated_output.push_str(&progress.delta);
+                                // WI#267: heartbeats are not evidence. They
+                                // must stay out of the recovery buffer or a
+                                // heartbeat-only timeout (a wedged CLI with a
+                                // healthy executor) is later presented as a
+                                // preserved "partial investigation" that never
+                                // existed. Only the keep-alive *sentence
+                                // shape* is excluded (!1237 finding 1): the
+                                // idle gate above intentionally stays on the
+                                // broad prefix, but genuine `[worker] `
+                                // diagnostics such as the opencode executors'
+                                // "Transient provider failure; retrying…"
+                                // retry notices are real evidence of what the
+                                // worker was doing and must survive here.
+                                if !is_heartbeat_only_frame(&progress.delta) {
+                                    accumulated_output.push_str(&progress.delta);
+                                }
 
                                 emit_event(
                                     event_tx,
@@ -1270,17 +1285,44 @@ async fn run_external_task(
                                     }
                                 })?;
 
-                            let final_output = if result.output.is_empty() {
-                                accumulated_output.clone()
-                            } else {
-                                result.output.clone()
-                            };
-
                             let status = match result.status.as_str() {
                                 "success" => ExternalTaskStatus::Success,
                                 "cancelled" => ExternalTaskStatus::Cancelled,
                                 "timed_out" => ExternalTaskStatus::TimedOut,
                                 _ => ExternalTaskStatus::Failed,
+                            };
+
+                            // WI#267: a worker-reported *timeout* can carry
+                            // synthetic heartbeats (an executor older than the
+                            // daemon, or one that folds its keep-alives into
+                            // the final output). Strip them before the buffer
+                            // is used as timeout evidence so a heartbeat-only
+                            // run is never presented as a partial
+                            // investigation. Any other status keeps the
+                            // worker-supplied output verbatim — a successful
+                            // result is not "evidence" and must not have its
+                            // whitespace or genuine `[worker] …` content
+                            // rewritten (!1235 finding 2).
+                            //
+                            // !1237 finding 2: when a timed-out worker result
+                            // strips down to nothing (or was empty all along),
+                            // the fallback to the daemon's own genuine-progress
+                            // buffer must happen HERE — before the result is
+                            // constructed — so `res.output` and the persisted
+                            // `timed_out_result_message` keep the real streamed
+                            // work instead of collapsing to an error-only
+                            // string.
+                            let final_output = match status {
+                                ExternalTaskStatus::TimedOut => {
+                                    let sanitized = strip_worker_heartbeats(&result.output);
+                                    if sanitized.is_empty() {
+                                        accumulated_output.clone()
+                                    } else {
+                                        sanitized
+                                    }
+                                }
+                                _ if result.output.is_empty() => accumulated_output.clone(),
+                                _ => result.output.clone(),
                             };
 
                             return Ok(ExternalTaskResult {
@@ -1406,6 +1448,15 @@ async fn run_external_task(
     // snapshot lives in job metadata + a job event, not the caller's return
     // value.
     if task_result.status == ExternalTaskStatus::TimedOut {
+        // WI#267: by this point `task_result.output` is already the sanitized
+        // worker output with the genuine-progress fallback applied (see the
+        // task_result frame handler), and `accumulated_output` excludes
+        // keep-alive frames (the read loop gates on the heartbeat shape). A
+        // heartbeat-only timeout therefore resolves with empty evidence and
+        // preserves nothing — which is the correct outcome: nothing genuine
+        // streamed. `preserve_timeout_evidence` itself is idempotent w.r.t.
+        // heartbeats (it drops whitespace-only buffers), so this is defense
+        // in depth rather than a second stripping site.
         let evidence = if task_result.output.is_empty() {
             accumulated_output.clone()
         } else {
@@ -1653,6 +1704,67 @@ const WORKER_HEARTBEAT_PREFIX: &str = "[worker] ";
 /// synthetic heartbeat (WI#263).
 fn is_genuine_progress(delta: &str) -> bool {
     !delta.trim_start().starts_with(WORKER_HEARTBEAT_PREFIX)
+}
+
+/// Structural shape of the synthetic keep-alive sentence every in-tree
+/// executor emits on its progress timer — kimi says "… for Kimi Code response
+/// …", opencode/opencode2 say "… for OpenCode/model response …", all sharing
+/// the same `"[worker] Still waiting for …; task remains active."` frame.
+/// Matching the shape (rather than the bare `[worker] ` prefix) keeps genuine
+/// worker log lines such as `[worker] initialized` and the opencode
+/// executors' `[worker] Transient provider failure; retrying …` diagnostics
+/// intact (WI#267 / !1235 / !1237 finding 1).
+const WORKER_HEARTBEAT_LINE_PREFIX: &str = "[worker] Still waiting for ";
+const WORKER_HEARTBEAT_LINE_SUFFIX: &str = "; task remains active.";
+
+/// Whether a single output line is a synthetic executor keep-alive (WI#267).
+///
+/// The bare `[worker] ` prefix is too broad for evidence cleanup — workers
+/// legitimately emit `[worker] initialized`-style logs and transient-failure
+/// retry notices — so the full known heartbeat shape is matched instead.
+fn is_heartbeat_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with(WORKER_HEARTBEAT_LINE_PREFIX)
+        && trimmed.ends_with(WORKER_HEARTBEAT_LINE_SUFFIX)
+}
+
+/// Whether a streamed progress *frame* carries only synthetic keep-alive
+/// content (WI#267 / !1237 finding 1).
+///
+/// The read loop's evidence gate needs a frame-level predicate: a delta that
+/// is entirely heartbeat lines contributes nothing genuine to
+/// `accumulated_output`, while a delta mixing genuine content with keep-alive
+/// lines keeps its genuine part. This is deliberately narrower than
+/// [`is_genuine_progress`]: that broad-prefix predicate drives the idle
+/// baseline (any `[worker] ` frame may not prove CLI liveness), but it must
+/// not gate the evidence buffer or it would also discard the opencode
+/// executors' `[worker] Transient provider failure; retrying …` diagnostics,
+/// which are real evidence of what the worker was doing when it timed out.
+fn is_heartbeat_only_frame(delta: &str) -> bool {
+    delta.lines().all(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty() || is_heartbeat_line(trimmed)
+    })
+}
+
+/// Remove synthetic worker-heartbeat lines from a worker-supplied output
+/// buffer (WI#267).
+///
+/// The daemon's own read loop already keeps heartbeats out of the streamed
+/// evidence buffer, but a `task_result.output` comes from the worker and may
+/// fold its keep-alives in (e.g. an executor that concatenates every emitted
+/// progress frame). Timeout evidence must only ever contain genuine output,
+/// so heartbeat lines are dropped here before the buffer is treated as
+/// recovered work.
+fn strip_worker_heartbeats(output: &str) -> String {
+    let mut stripped = String::with_capacity(output.len());
+    for line in output.split_inclusive('\n') {
+        if is_heartbeat_line(line) {
+            continue;
+        }
+        stripped.push_str(line);
+    }
+    stripped.trim().to_string()
 }
 
 /// Build the persisted result message for a worker-reported timeout (WI#263).
