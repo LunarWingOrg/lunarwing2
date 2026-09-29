@@ -1208,7 +1208,10 @@ async fn heartbeat_only_timeout_preserves_no_evidence() {
         "heartbeat-only timeout must not substitute heartbeats as output"
     );
 
-    let ctx = context_manager.get_context(job_id).await.expect("job context");
+    let ctx = context_manager
+        .get_context(job_id)
+        .await
+        .expect("job context");
     assert!(
         ctx.metadata.get("partial_output").is_none(),
         "heartbeat-only timeout must not preserve keep-alives as evidence"
@@ -1264,7 +1267,10 @@ async fn timeout_with_genuine_evidence_still_preserves_it() {
     // The worker's result output is heartbeat-stripped, not taken verbatim.
     assert_eq!(res.output, genuine);
 
-    let ctx = context_manager.get_context(job_id).await.expect("job context");
+    let ctx = context_manager
+        .get_context(job_id)
+        .await
+        .expect("job context");
     let partial = ctx
         .metadata
         .get("partial_output")
@@ -1341,7 +1347,10 @@ async fn timed_out_result_with_empty_output_keeps_genuine_progress() {
     .expect("result event timed out");
 
     let _ = result_msg;
-    let ctx = context_manager.get_context(job_id).await.expect("job context");
+    let ctx = context_manager
+        .get_context(job_id)
+        .await
+        .expect("job context");
     let partial = ctx
         .metadata
         .get("partial_output")
@@ -1358,8 +1367,7 @@ async fn timed_out_result_with_empty_output_keeps_genuine_progress() {
 #[tokio::test]
 async fn timed_out_evidence_keeps_transient_failure_diagnostics() {
     let heartbeat = "[worker] Still waiting for OpenCode/model response; task remains active.";
-    let transient =
-        "[worker] Transient provider failure; retrying same OpenCode session (1/3).";
+    let transient = "[worker] Transient provider failure; retrying same OpenCode session (1/3).";
     let (url, _count) = spawn_mock_worker_async(MockBehavior::HeartbeatTimeout {
         progress: vec![transient.to_string(), heartbeat.to_string()],
         result_output: String::new(),
@@ -1397,7 +1405,10 @@ async fn timed_out_evidence_keeps_transient_failure_diagnostics() {
         "the transient-failure diagnostic must remain recoverable evidence"
     );
 
-    let ctx = context_manager.get_context(job_id).await.expect("job context");
+    let ctx = context_manager
+        .get_context(job_id)
+        .await
+        .expect("job context");
     let partial = ctx
         .metadata
         .get("partial_output")
