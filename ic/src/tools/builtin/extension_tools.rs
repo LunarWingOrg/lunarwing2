@@ -1064,8 +1064,7 @@ struct ToolNameWindow {
 /// Fixed serialized cost of an entry's identifier/kind/status fields plus the
 /// per-window metadata keys, with generous slack. Reserved before tool names
 /// so the window sizing cannot be starved by descriptive fields.
-const TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES: usize =
-    TOOL_LIST_ENTRY_BUDGET_BYTES - 24_000;
+const TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES: usize = TOOL_LIST_ENTRY_BUDGET_BYTES - 24_000;
 
 /// Apply a `tools_offset`/`tools_limit` window over one extension's tool
 /// names so entries with more tools than the window cap remain fully
@@ -1155,10 +1154,7 @@ fn extension_to_json(
     // unrecoverable through this surface (MR !1221 finding 2). The per-entry
     // byte budget is enforced by the tool-name window, which shrinks instead
     // of clipping.
-    obj.insert(
-        "name".to_string(),
-        serde_json::json!(extension.name),
-    );
+    obj.insert("name".to_string(), serde_json::json!(extension.name));
     obj.insert("kind".to_string(), serde_json::json!(extension.kind));
     obj.insert(
         "authenticated".to_string(),
@@ -1173,10 +1169,7 @@ fn extension_to_json(
     if window.total > 0 {
         obj.insert("tools_total".to_string(), serde_json::json!(window.total));
         if window.start > 0 {
-            obj.insert(
-                "tools_offset".to_string(),
-                serde_json::json!(window.start),
-            );
+            obj.insert("tools_offset".to_string(), serde_json::json!(window.start));
         }
     }
     if window.truncated {
@@ -2266,10 +2259,7 @@ mod tests {
         );
         assert_eq!(entry["tools_total"], serde_json::json!(100));
         assert_eq!(entry["tools_truncated"], serde_json::json!(true));
-        assert_eq!(
-            entry["tools_next_offset"],
-            serde_json::json!(listed.len())
-        );
+        assert_eq!(entry["tools_next_offset"], serde_json::json!(listed.len()));
         assert_eq!(
             listed[0].as_str().expect("verbatim name"),
             name,
