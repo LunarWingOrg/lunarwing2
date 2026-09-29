@@ -1687,6 +1687,11 @@ const TIMEOUT_EVIDENCE_SNAPSHOT_BYTES: usize = 16_384;
 /// the job resolves as TimedOut. Applies to both the daemon-deadline path and
 /// worker-reported timeouts (the kimi silence watchdog), for wait=true and
 /// wait=false callers alike.
+///
+/// Any **nonempty** genuine output is preserved (WI#263 review finding): a
+/// short streamed investigation is still real evidence, and dropping it under
+/// an arbitrary size floor left `job_status.partial_output` null exactly when
+/// the recovery path was needed most.
 async fn preserve_timeout_evidence(
     job_id: Uuid,
     worker_name: &str,
@@ -1694,10 +1699,9 @@ async fn preserve_timeout_evidence(
     context_manager: Option<&Arc<ContextManager>>,
     store: Option<&Arc<dyn Database>>,
 ) {
-    const SNAPSHOT_MIN_BYTES: usize = 512;
     let trimmed = accumulated_output.trim();
-    if trimmed.len() < SNAPSHOT_MIN_BYTES {
-        // Nothing meaningful streamed — nothing to preserve.
+    if trimmed.is_empty() {
+        // Nothing genuine streamed — nothing to preserve.
         return;
     }
 
@@ -1951,6 +1955,30 @@ mod tests {
 
         let ctx = cm.get_context(job_id).await.unwrap();
         assert!(ctx.metadata.get("partial_output").is_none());
+    }
+
+    /// WI#263 review finding: short genuine evidence must be preserved too.
+    /// A streamed investigation of only a few bytes (e.g. the silence
+    /// watchdog firing shortly after the CLI's first — and only — progress
+    /// event) is still real evidence; the old 512-byte floor dropped it and
+    /// left `job_status.partial_output` null.
+    #[tokio::test]
+    async fn preserve_timeout_evidence_keeps_short_genuine_output() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        let short = "Investigation step: evidence gathered.";
+        preserve_timeout_evidence(job_id, "kimi", short, Some(&cm), None).await;
+
+        let ctx = cm.get_context(job_id).await.unwrap();
+        assert_eq!(
+            ctx.metadata.get("partial_output").and_then(|v| v.as_str()),
+            Some(short),
+            "short genuine output must be preserved verbatim"
+        );
     }
 
     #[tokio::test]
