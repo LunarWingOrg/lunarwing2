@@ -83,6 +83,21 @@ fn normalize_hosted_callback_url(callback_url: &str) -> String {
     }
 }
 
+/// Total ordering for extension listings: kind first (MCP servers, then WASM
+/// tools, then WASM channels), then case-insensitive name.
+///
+/// `ExtensionManager::list()` uses this so paginated consumers (e.g.
+/// `tool_list`) get stable offsets across calls; discovery sources are
+/// HashMap-backed, so raw iteration order is not stable.
+pub(crate) fn extension_sort_key(extension: &InstalledExtension) -> (u8, String) {
+    let kind_rank = match extension.kind {
+        ExtensionKind::McpServer => 0,
+        ExtensionKind::WasmTool => 1,
+        ExtensionKind::WasmChannel => 2,
+    };
+    (kind_rank, extension.name.to_lowercase())
+}
+
 /// Runtime infrastructure needed for hot-activating WASM channels.
 ///
 /// Set after construction via [`ExtensionManager::set_channel_runtime`] once the
@@ -1688,6 +1703,13 @@ impl ExtensionManager {
                 });
             }
         }
+
+        // Deterministic order: kind first (MCP servers, then WASM tools, then
+        // WASM channels), then case-insensitive name. Installed entries come
+        // from HashMap-backed discovery, so without this the iteration order —
+        // and therefore any prefix a paginated consumer takes — changes
+        // between calls.
+        extensions.sort_by_key(extension_sort_key);
 
         Ok(extensions)
     }
@@ -10326,6 +10348,56 @@ done
             result,
             Some("dcr-secret".to_string()),
             "non-builtin provider secret must be kept"
+        );
+    }
+
+    fn sort_test_extension(name: &str, kind: ExtensionKind) -> InstalledExtension {
+        InstalledExtension {
+            name: name.to_string(),
+            kind,
+            display_name: None,
+            description: None,
+            url: None,
+            transport: None,
+            command: None,
+            placement: None,
+            authenticated: false,
+            active: false,
+            recovering: false,
+            enabled: None,
+            tools: Vec::new(),
+            needs_setup: false,
+            has_auth: false,
+            installed: true,
+            activation_error: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn extension_list_ordering_is_kind_then_case_insensitive_name() {
+        use crate::extensions::manager::extension_sort_key;
+
+        let mut entries = [
+            sort_test_extension("zeta_tool", ExtensionKind::WasmTool),
+            sort_test_extension("Beta_Server", ExtensionKind::McpServer),
+            sort_test_extension("alpha_channel", ExtensionKind::WasmChannel),
+            sort_test_extension("alpha_server", ExtensionKind::McpServer),
+            sort_test_extension("zeta_channel", ExtensionKind::WasmChannel),
+        ];
+        entries.sort_by_key(extension_sort_key);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "alpha_server",
+                "Beta_Server",
+                "zeta_tool",
+                "alpha_channel",
+                "zeta_channel",
+            ],
+            "MCP servers first, then WASM tools, then channels; names case-insensitive"
         );
     }
 }
