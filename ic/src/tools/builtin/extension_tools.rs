@@ -1989,7 +1989,11 @@ mod tests {
     #[test]
     fn tool_list_entry_windows_tool_names_with_continuation() {
         let tools: Vec<String> = (0..40).map(|i| format!("tool_{i}")).collect();
-        let entry = extension_to_json(&installed_extension("big", ExtensionKind::McpServer, tools), 0, 25);
+        let entry = extension_to_json(
+            &installed_extension("big", ExtensionKind::McpServer, tools),
+            0,
+            25,
+        );
 
         let listed = entry["tools"].as_array().expect("tools array");
         assert_eq!(listed.len(), 25);
@@ -1999,7 +2003,11 @@ mod tests {
 
         // Finding 1: the dropped names must be retrievable — window past 25.
         let tools: Vec<String> = (0..40).map(|i| format!("tool_{i}")).collect();
-        let tail = extension_to_json(&installed_extension("big", ExtensionKind::McpServer, tools), 25, 25);
+        let tail = extension_to_json(
+            &installed_extension("big", ExtensionKind::McpServer, tools),
+            25,
+            25,
+        );
         let tail_names = tail["tools"].as_array().expect("tools array");
         assert_eq!(tail_names.len(), 15);
         assert_eq!(tail_names[0], serde_json::json!("tool_25"));
@@ -2090,8 +2098,13 @@ mod tests {
 
         // null means "not provided"
         assert_eq!(
-            parse_bounded_param(&serde_json::json!({"offset": null}), "offset", 0, usize::MAX)
-                .expect("null offset"),
+            parse_bounded_param(
+                &serde_json::json!({"offset": null}),
+                "offset",
+                0,
+                usize::MAX
+            )
+            .expect("null offset"),
             0
         );
 
@@ -2141,7 +2154,10 @@ mod tests {
         );
 
         let fitted = fit_page_to_budget(page, 0, total);
-        assert!(!fitted.is_empty(), "budget fit must keep at least one entry");
+        assert!(
+            !fitted.is_empty(),
+            "budget fit must keep at least one entry"
+        );
         let fitted_len = page_json_len(&fitted, 0, total).expect("serialize fitted");
         assert!(
             fitted_len <= TOOL_LIST_PAGE_BUDGET_BYTES,
@@ -2197,9 +2213,9 @@ mod tests {
     async fn tool_list_paginates_full_inventory_without_silent_prefix() {
         use crate::context::JobContext;
         use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::ToolRegistry;
         use crate::tools::mcp::process::McpProcessManager;
         use crate::tools::mcp::session::McpSessionManager;
-        use crate::tools::ToolRegistry;
 
         let (store, _db_dir) = crate::testing::test_db().await;
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2262,8 +2278,7 @@ mod tests {
 
             let result = &output.result;
             let entries = result["extensions"].as_array().expect("extensions array");
-            let serialized =
-                serde_json::to_string_pretty(&result).expect("serialize page pretty");
+            let serialized = serde_json::to_string_pretty(&result).expect("serialize page pretty");
             assert!(
                 serialized.len() < 100_000,
                 "page must stay below the 100 KiB safety truncation limit (got {})",
