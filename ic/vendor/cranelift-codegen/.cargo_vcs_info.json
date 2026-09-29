@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "3d0ec7e7c5ae4cd3f9b99d915276926d799b9a2b"
+    "sha1": "5cd4bf51aad8ae193823d35a05bfa97dd8dc3f11"
   },
   "path_in_vcs": "cranelift/codegen"
 }

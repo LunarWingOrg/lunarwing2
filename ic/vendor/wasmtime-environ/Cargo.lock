@@ -147,9 +147,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.123.14"
+version = "0.123.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "986bea0b0858b55192782120032ce9c15943fa073f186f6e479653c59e62c329"
+checksum = "5447cd11203bcb5b71bb91e1e8b8470f350870ca837847bf82ec2e25f55fcd7b"
 dependencies = [
  "serde",
  "serde_derive",
@@ -157,9 +157,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-entity"
-version = "0.123.14"
+version = "0.123.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ff53acc85f5c5f7d9315ff133a6671d329a0f04aa2d1a8a2e81d59709ccddcb"
+checksum = "554aaa52367f0396570d031aa0bdedfff4f63794022dc418d0cdcf8f6d321b60"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-environ"
-version = "36.0.14"
+version = "36.0.16"
 dependencies = [
  "anyhow",
  "clap",
@@ -510,9 +510,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-component-util"
-version = "36.0.14"
+version = "36.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c3e218b51d2ef9eb181499e42c691512c1bc11dd6dc7746807a9b2b9290369c"
+checksum = "36b8553647a6ae550ec3bca45759565204af763c37b1b51d5e45d6c5a26a1e32"
 
 [[package]]
 name = "wast"
