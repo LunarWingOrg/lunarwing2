@@ -1000,17 +1000,31 @@ const TOOL_LIST_TOOLS_PAGE_MAX: usize = 100;
 /// wrapper text and truncation notices.
 const TOOL_LIST_PAGE_BUDGET_BYTES: usize = 60_000;
 
-/// Maximum characters embedded for any single string field (description,
-/// display name, activation error) in an entry. Longer values are elided
-/// with an explicit marker; the full text stays available through the
-/// owning subsystem.
+/// Serialized-byte budget for a single entry. Tool-name windows are sized so
+/// one entry can never exceed this even with worst-case JSON escaping
+/// (control characters serialize to six bytes each), so a one-entry page
+/// always fits the page budget without clipping identifiers.
+const TOOL_LIST_ENTRY_BUDGET_BYTES: usize = 32_000;
+
+/// Worst-case JSON serialization expansion of a string: every char may become
+/// a six-byte `\u00XX` escape (control characters), plus the surrounding
+/// quotes.
+const TOOL_LIST_JSON_ESCAPE_FACTOR: usize = 6;
+
+/// Maximum characters embedded for any single descriptive string field
+/// (description, display name, activation error) in an entry. Longer values
+/// are elided with an explicit marker; the full text stays available through
+/// the owning subsystem. Identifiers (`name`, `tools[]`) are never elided —
+/// see `TOOL_LIST_ENTRY_BUDGET_BYTES`.
 const TOOL_LIST_FIELD_MAX_CHARS: usize = 200;
 
 /// Elision marker appended when a string field is clipped.
 const TOOL_LIST_ELLIPSIS: &str = "…";
 
-/// Bound a string field, eliding past `TOOL_LIST_FIELD_MAX_CHARS` with an
-/// explicit marker so consumers can tell a clipped value from a full one.
+/// Bound a descriptive string field, eliding past `TOOL_LIST_FIELD_MAX_CHARS`
+/// with an explicit marker so consumers can tell a clipped value from a full
+/// one. Identifiers must not pass through here — eliding them would make two
+/// long names indistinguishable with no way back (MR !1221 finding 2).
 fn bound_field(value: &str) -> String {
     if value.chars().count() <= TOOL_LIST_FIELD_MAX_CHARS {
         return value.to_string();
@@ -1020,26 +1034,65 @@ fn bound_field(value: &str) -> String {
     format!("{clipped}{TOOL_LIST_ELLIPSIS}")
 }
 
+/// Serialized byte length of a string as it appears in pretty JSON, assuming
+/// worst-case per-char escaping. Cheap upper bound used to size tool-name
+/// windows without serializing per candidate.
+fn json_string_upper_bound(value: &str) -> usize {
+    2 + value.chars().count() * TOOL_LIST_JSON_ESCAPE_FACTOR
+}
+
+/// Upper bound on the serialized byte length of a tool-name window entry
+/// (pretty-printed array element = quoted string + comma/indent).
+fn tool_name_upper_bound(name: &str) -> usize {
+    json_string_upper_bound(name) + 8
+}
+
 /// One page of per-extension tool names plus completeness metadata.
+///
+/// Names are embedded verbatim (never elided) so long identifiers stay
+/// distinguishable; if they do not all fit the entry byte budget, the window
+/// shrinks and `truncated`/`next_offset` point at the remainder (MR !1221
+/// finding 2).
 struct ToolNameWindow {
     names: Vec<String>,
     total: usize,
+    start: usize,
     truncated: bool,
     next_offset: Option<usize>,
 }
 
+/// Fixed serialized cost of an entry's identifier/kind/status fields plus the
+/// per-window metadata keys, with generous slack. Reserved before tool names
+/// so the window sizing cannot be starved by descriptive fields.
+const TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES: usize =
+    TOOL_LIST_ENTRY_BUDGET_BYTES - 24_000;
+
 /// Apply a `tools_offset`/`tools_limit` window over one extension's tool
-/// names so entries with more tools than the page cap remain fully
-/// enumerable (review finding 1 on WI#245).
+/// names so entries with more tools than the window cap remain fully
+/// enumerable (review finding 1 on WI#245), keeping every name lossless and
+/// bounded by the per-entry serialized budget (MR !1221 findings 1-2).
 fn tool_name_window(tools: &[String], offset: usize, limit: usize) -> ToolNameWindow {
     let total = tools.len();
     let start = offset.min(total);
     let end = (start + limit).min(total);
+
+    let mut names_end = end;
+    let mut used = TOOL_LIST_ENTRY_FIXED_BUDGET_BYTES;
+    for (idx, name) in tools[start..end].iter().enumerate() {
+        let cost = tool_name_upper_bound(name);
+        if idx > 0 && used + cost > TOOL_LIST_ENTRY_BUDGET_BYTES {
+            names_end = start + idx;
+            break;
+        }
+        used += cost;
+    }
+
     ToolNameWindow {
-        names: tools[start..end].iter().map(|n| bound_field(n)).collect(),
+        names: tools[start..names_end].to_vec(),
         total,
-        truncated: end < total,
-        next_offset: (end < total).then_some(end),
+        start,
+        truncated: names_end < total,
+        next_offset: (names_end < total).then_some(names_end),
     }
 }
 
@@ -1088,7 +1141,8 @@ fn parse_positive_param(
     Ok((value as usize).min(max))
 }
 
-/// Serialize an entry with bounded fields and a windowed tool-name list.
+/// Serialize an entry with verbatim identifiers, elided descriptive fields,
+/// and a windowed tool-name list that keeps every name lossless.
 fn extension_to_json(
     extension: &crate::extensions::InstalledExtension,
     tools_offset: usize,
@@ -1097,9 +1151,13 @@ fn extension_to_json(
     let window = tool_name_window(&extension.tools, tools_offset, tools_limit);
 
     let mut obj = serde_json::Map::new();
+    // Identifiers stay verbatim: eliding `name` would make long names
+    // unrecoverable through this surface (MR !1221 finding 2). The per-entry
+    // byte budget is enforced by the tool-name window, which shrinks instead
+    // of clipping.
     obj.insert(
         "name".to_string(),
-        serde_json::json!(bound_field(&extension.name)),
+        serde_json::json!(extension.name),
     );
     obj.insert("kind".to_string(), serde_json::json!(extension.kind));
     obj.insert(
@@ -1114,6 +1172,12 @@ fn extension_to_json(
     obj.insert("tools".to_string(), serde_json::json!(window.names));
     if window.total > 0 {
         obj.insert("tools_total".to_string(), serde_json::json!(window.total));
+        if window.start > 0 {
+            obj.insert(
+                "tools_offset".to_string(),
+                serde_json::json!(window.start),
+            );
+        }
     }
     if window.truncated {
         obj.insert(
@@ -1189,15 +1253,18 @@ fn page_json_len(page: &[serde_json::Value], offset: usize, total: usize) -> Opt
 
 /// Drop trailing entries until the serialized page fits the byte budget.
 /// Metadata is derived after shrinking, so `count`/`next_offset`/`truncated`
-/// always describe the entries actually returned. Per-field bounds
-/// (`bound_field`) and the per-entry tool-name cap bound a single entry far
-/// below the budget, so the loop terminates before the page empties.
+/// always describe the entries actually returned. The check also applies to
+/// the final single entry: a lone oversized entry is dropped rather than
+/// returned clipped-while-claiming-completeness (MR !1221 finding 1). Callers
+/// treat an empty result as a hard error, never as a complete empty page —
+/// the per-entry tool-name window already bounds every entry, so an empty
+/// page can only mean an upstream value exceeded what one entry may carry.
 fn fit_page_to_budget(
     mut page: Vec<serde_json::Value>,
     offset: usize,
     total: usize,
 ) -> Vec<serde_json::Value> {
-    while page.len() > 1
+    while !page.is_empty()
         && page_json_len(&page, offset, total).is_none_or(|len| len > TOOL_LIST_PAGE_BUDGET_BYTES)
     {
         page.pop();
@@ -1334,6 +1401,16 @@ impl Tool for ToolListTool {
         // page the safety layer would clip mid-JSON while its own
         // truncated/next_offset fields claim completeness.
         let page = fit_page_to_budget(page, offset, total);
+        if page.is_empty() {
+            // The per-entry tool-name window bounds every entry below the
+            // page budget, so this is unreachable for well-formed data; if an
+            // upstream value ever defeats it, fail loudly rather than return
+            // an empty page whose metadata would claim completeness.
+            return Err(ToolError::ExecutionFailed(format!(
+                "entry at offset {offset} exceeds the serialized page budget; \
+                 retry with a smaller tools_limit or a higher tools_offset"
+            )));
+        }
 
         let returned = page.len();
         let next_offset = (offset + returned < total).then_some(offset + returned);
@@ -2164,10 +2241,105 @@ mod tests {
             "fitted page ({fitted_len}) must stay within the {} byte budget",
             TOOL_LIST_PAGE_BUDGET_BYTES
         );
+    }
 
-        // A single entry always fits on its own page.
-        let single = fit_page_to_budget(vec![make_entry(0)], 0, 1);
-        assert_eq!(single.len(), 1);
+    #[test]
+    fn tool_list_single_entry_fits_escaped_worst_case_names() {
+        // MR !1221 finding 1: 100 tool names of 200 JSON-escaped control
+        // characters serialize to >120 KiB pretty-printed. The tool-name
+        // window must bound the entry below the page budget (and per-entry
+        // budget) even in that worst case, and every name it does return
+        // stays verbatim.
+        let name: String = "\u{1}".repeat(200);
+        let tools: Vec<String> = (0..100).map(|_| name.clone()).collect();
+        let entry = extension_to_json(
+            &installed_extension("escape_server", ExtensionKind::McpServer, tools.clone()),
+            0,
+            TOOL_LIST_TOOLS_PAGE_MAX,
+        );
+
+        let listed = entry["tools"].as_array().expect("tools array");
+        assert!(
+            listed.len() < 100,
+            "worst-case escaped names must be windowed, got {}",
+            listed.len()
+        );
+        assert_eq!(entry["tools_total"], serde_json::json!(100));
+        assert_eq!(entry["tools_truncated"], serde_json::json!(true));
+        assert_eq!(
+            entry["tools_next_offset"],
+            serde_json::json!(listed.len())
+        );
+        assert_eq!(
+            listed[0].as_str().expect("verbatim name"),
+            name,
+            "tool names must stay lossless"
+        );
+
+        // The single-entry page fits the page budget without dropping the
+        // entry (previously the fitter stopped at one entry unconditionally).
+        let serialized = serde_json::to_string(&entry).expect("serialize entry");
+        assert!(
+            serialized.len() <= TOOL_LIST_ENTRY_BUDGET_BYTES,
+            "entry ({}) must stay within the {} byte per-entry budget",
+            serialized.len(),
+            TOOL_LIST_ENTRY_BUDGET_BYTES
+        );
+        let single = fit_page_to_budget(vec![entry.clone()], 0, 1);
+        assert_eq!(
+            single.len(),
+            1,
+            "a window-bounded entry must survive the page fitter"
+        );
+
+        // Continuation: the next window starts where this one ended and
+        // keeps names lossless.
+        let tail = extension_to_json(
+            &installed_extension("escape_server", ExtensionKind::McpServer, tools),
+            listed.len(),
+            TOOL_LIST_TOOLS_PAGE_MAX,
+        );
+        let tail_names = tail["tools"].as_array().expect("tail tools");
+        assert!(!tail_names.is_empty());
+        assert_eq!(tail_names[0].as_str().expect("verbatim name"), name);
+    }
+
+    #[test]
+    fn tool_list_long_identifiers_stay_lossless() {
+        // MR !1221 finding 2: two tool names sharing a 198-character prefix
+        // must remain distinguishable — identifiers are never elided, the
+        // window shrinks instead.
+        let shared = "t".repeat(198);
+        let tools = vec![format!("{shared}A"), format!("{shared}B")];
+        let entry = extension_to_json(
+            &installed_extension("long_ids", ExtensionKind::McpServer, tools),
+            0,
+            TOOL_LIST_TOOLS_PAGE_MAX,
+        );
+        let listed = entry["tools"].as_array().expect("tools array");
+        assert_eq!(listed.len(), 2, "both long names fit the entry budget");
+        assert_eq!(listed[0].as_str(), Some(format!("{shared}A").as_str()));
+        assert_eq!(listed[1].as_str(), Some(format!("{shared}B").as_str()));
+    }
+
+    #[test]
+    fn tool_list_long_extension_name_stay_lossless() {
+        // The entry name itself may exceed the descriptive field cap; it is
+        // an identifier and must pass through verbatim (MR !1221 finding 2).
+        let long_name = "n".repeat(600);
+        let entry = extension_to_json(
+            &installed_extension(&long_name, ExtensionKind::WasmTool, Vec::new()),
+            0,
+            TOOL_LIST_TOOLS_PAGE_DEFAULT,
+        );
+        assert_eq!(entry["name"].as_str(), Some(long_name.as_str()));
+        assert!(
+            !entry["name"]
+                .as_str()
+                .expect("name")
+                .contains(TOOL_LIST_ELLIPSIS),
+            "identifiers are never elided"
+        );
     }
 
     #[test]
