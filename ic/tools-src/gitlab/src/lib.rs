@@ -330,8 +330,9 @@ fn execute_inner(params: &str) -> Result<String, String> {
 }
 
 fn parse_action(params: &str) -> Result<GitlabAction, String> {
+    let normalized = resolve_description_alias(params)?;
     let mut unknown = Vec::new();
-    let mut deserializer = serde_json::Deserializer::from_str(params);
+    let mut deserializer = serde_json::Deserializer::from_str(&normalized);
     let action = serde_ignored::deserialize(&mut deserializer, |path| {
         unknown.push(path.to_string());
     })
@@ -341,6 +342,42 @@ fn parse_action(params: &str) -> Result<GitlabAction, String> {
     } else {
         Err(format!("unknown field(s): {}", unknown.join(", ")))
     }
+}
+
+/// `body` is an accepted alias for the `description` field of issue write
+/// actions (WI#266: callers habitually reuse the note-action parameter name).
+/// Serde counts the alias and the canonical spelling as the same field, so
+/// both appearing — even as a null placeholder — would fail deep inside
+/// deserialization with an opaque "duplicate field" error. Normalize the raw
+/// params instead: both spelled with a value is a caller error, a null twin
+/// is dropped, and everything else passes through untouched.
+fn resolve_description_alias(params: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(params).map_err(|e| e.to_string())?;
+    let is_issue_write = matches!(
+        value.get("action").and_then(serde_json::Value::as_str),
+        Some("create_issue") | Some("update_issue")
+    );
+    if !is_issue_write {
+        return Ok(params.to_string());
+    }
+    let body_present = value.get("body").is_some_and(|v| !v.is_null());
+    let description_present = value.get("description").is_some_and(|v| !v.is_null());
+    if body_present && description_present {
+        return Err(
+            "body and description are the same field; provide only one of them".to_string(),
+        );
+    }
+    let redundant_null = if body_present {
+        "description"
+    } else if description_present {
+        "body"
+    } else {
+        return Ok(params.to_string());
+    };
+    if let Some(map) = value.as_object_mut() {
+        map.remove(redundant_null);
+    }
+    serde_json::to_string(&value).map_err(|e| e.to_string())
 }
 
 fn action_name(action: &GitlabAction) -> &'static str {
@@ -487,5 +524,80 @@ mod tests {
         ] {
             assert!(parse_action(input).is_err(), "accepted {input}");
         }
+    }
+
+    /// WI#266: `body` and `description` name the same GitLab issue field.
+    /// Either spelling populates the description; both at once is rejected.
+    #[test]
+    fn issue_description_accepts_body_alias() {
+        let via_description = parse_action(
+            r#"{"action":"create_issue","project":"group/repo","title":"t","description":"from description"}"#,
+        )
+        .unwrap();
+        let via_body = parse_action(
+            r#"{"action":"create_issue","project":"group/repo","title":"t","body":"from body"}"#,
+        )
+        .unwrap();
+        for action in [via_description, via_body] {
+            let GitlabAction::CreateIssue { description, .. } = action else {
+                panic!("wrong variant");
+            };
+            assert!(description.is_some());
+        }
+
+        let updated = parse_action(
+            r#"{"action":"update_issue","project":"group/repo","iid":7,"body":"replaced"}"#,
+        )
+        .unwrap();
+        let GitlabAction::UpdateIssue { description, .. } = updated else {
+            panic!("wrong variant for update_issue");
+        };
+        assert_eq!(description.as_deref(), Some("replaced"));
+
+        for conflicting in [
+            r#"{"action":"create_issue","project":"group/repo","title":"t","body":"a","description":"b"}"#,
+            r#"{"action":"update_issue","project":"group/repo","iid":7,"body":"a","description":"b"}"#,
+        ] {
+            let error = parse_action(conflicting)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {conflicting}"));
+            assert!(
+                error.contains("body and description"),
+                "unexpected error: {error}"
+            );
+        }
+
+        // Explicit nulls do not conflict with a real value.
+        let null_body = parse_action(
+            r#"{"action":"create_issue","project":"group/repo","title":"t","body":null,"description":"kept"}"#,
+        )
+        .unwrap();
+        let GitlabAction::CreateIssue { description, .. } = null_body else {
+            panic!("wrong variant for null body");
+        };
+        assert_eq!(description.as_deref(), Some("kept"));
+    }
+
+    /// `body` stays a note-only field everywhere else: unrelated actions
+    /// must not quietly start accepting it through the alias.
+    #[test]
+    fn body_alias_is_scoped_to_issue_write_actions() {
+        assert!(parse_action(
+            r#"{"action":"create_merge_request","project":"group/repo","source_branch":"a","target_branch":"b","title":"t","body":"not an issue"}"#
+        )
+        .is_err());
+        assert!(
+            parse_action(r#"{"action":"get_issue","project":"group/repo","iid":7,"body":"x"}"#)
+                .is_err()
+        );
+        // Note actions keep `body` as their real, required field name.
+        let note = parse_action(
+            r#"{"action":"create_issue_note","project":"group/repo","iid":7,"body":"note text"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            note,
+            GitlabAction::CreateIssueNote { body, .. } if body == "note text"
+        ));
     }
 }
