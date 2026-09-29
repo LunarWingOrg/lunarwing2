@@ -68,6 +68,13 @@ fn normalize_oauth_callback_path(path: &str) -> String {
     }
 }
 
+/// Maximum byte length of an extension name. Names become filename
+/// components (`{name}.wasm`, `{name}.capabilities.json`) and are embedded
+/// verbatim in bounded listings (`tool_list`), so an unbounded name could
+/// both break file storage and defeat a page's serialized byte budget
+/// (WI #245, MR !1225 finding 3's sibling for extension names).
+const MAX_EXTENSION_NAME_BYTES: usize = 200;
+
 fn normalize_hosted_callback_url(callback_url: &str) -> String {
     if let Ok(mut parsed) = url::Url::parse(callback_url) {
         let normalized_path = normalize_oauth_callback_path(parsed.path());
@@ -5411,11 +5418,23 @@ impl ExtensionManager {
     }
 
     /// Reject names containing path separators or traversal sequences.
-    fn validate_extension_name(name: &str) -> Result<(), ExtensionError> {
+    pub(crate) fn validate_extension_name(name: &str) -> Result<(), ExtensionError> {
         if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
             return Err(ExtensionError::InstallFailed(format!(
                 "Invalid extension name '{}': contains path separator or traversal characters",
                 name
+            )));
+        }
+        // Names become filename components (`{name}.wasm`,
+        // `{name}.capabilities.json`) and are embedded verbatim in bounded
+        // listings (`tool_list`), so an unbounded name could both break file
+        // storage and defeat any page's serialized budget. 200 bytes leaves
+        // room for the longest suffix under the 255-byte component limit.
+        if name.len() > MAX_EXTENSION_NAME_BYTES {
+            return Err(ExtensionError::InstallFailed(format!(
+                "Invalid extension name: {} bytes exceeds the {}-byte limit",
+                name.len(),
+                MAX_EXTENSION_NAME_BYTES
             )));
         }
         Ok(())
@@ -6446,8 +6465,9 @@ mod tests {
     use crate::extensions::ExtensionManager;
     use crate::extensions::manager::{
         ActiveMcpServer, FallbackDecision, McpRecoveryCandidate, McpRecoveryClaim,
-        McpRuntimeHealth, build_wasm_channel_runtime_config_updates, combine_install_errors,
-        fallback_decision, infer_kind_from_url, join_or_abort_tasks, normalize_hosted_callback_url,
+        McpRuntimeHealth, MAX_EXTENSION_NAME_BYTES, build_wasm_channel_runtime_config_updates,
+        combine_install_errors, fallback_decision, infer_kind_from_url, join_or_abort_tasks,
+        normalize_hosted_callback_url,
     };
     use crate::extensions::{
         ExtensionError, ExtensionKind, ExtensionSource, InstallResult, InstalledExtension,
@@ -10382,6 +10402,27 @@ done
             activation_error: None,
             version: None,
         }
+    }
+
+    #[test]
+    fn extension_names_are_bounded_at_validation() {
+        // WI #245: a name longer than MAX_EXTENSION_NAME_BYTES could defeat
+        // every tool_list page budget (identifiers serialize verbatim) and
+        // overflows filename components. The bound is on bytes, not chars,
+        // because filenames are byte-oriented.
+        let at_bound = "n".repeat(MAX_EXTENSION_NAME_BYTES);
+        assert!(ExtensionManager::validate_extension_name(&at_bound).is_ok());
+
+        let over = "n".repeat(MAX_EXTENSION_NAME_BYTES + 1);
+        let error = ExtensionManager::validate_extension_name(&over)
+            .expect_err("oversized extension name must be rejected");
+        assert!(error.to_string().contains("byte limit"));
+
+        assert!(ExtensionManager::validate_extension_name("normal-name").is_ok());
+        assert!(ExtensionManager::validate_extension_name("a/b").is_err());
+        assert!(ExtensionManager::validate_extension_name("a\\b").is_err());
+        assert!(ExtensionManager::validate_extension_name("..").is_err());
+        assert!(ExtensionManager::validate_extension_name("a\0b").is_err());
     }
 
     #[test]
