@@ -1781,6 +1781,23 @@ impl JobStatusTool {
         self.store = Some(store);
         self
     }
+
+    /// Durable `partial_output` snapshot for the DB fallback branch (WI#263
+    /// review finding): after a daemon restart the in-memory context is gone,
+    /// so the snapshot written by `preserve_timeout_evidence` is recovered
+    /// from the persisted `partial_output` job event instead. Returns the
+    /// latest such event's content.
+    async fn persisted_partial_output(&self, job_id: Uuid) -> Option<String> {
+        let store = self.store.as_ref()?;
+        let events = store.list_job_events(job_id, Some(16)).await.ok()?;
+        events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "partial_output")
+            .and_then(|event| event.data.get("content"))
+            .and_then(|content| content.as_str())
+            .map(str::to_string)
+    }
 }
 
 #[async_trait]
@@ -1871,6 +1888,11 @@ impl Tool for JobStatusTool {
                     "project_dir": record.project_dir,
                     "source": "database",
                     "events_available": true,
+                    // WI#263 review finding: the snapshot survives restarts by
+                    // being recovered from the persisted `partial_output` job
+                    // event, so the DB branch reports the same field as the
+                    // in-memory branch.
+                    "partial_output": self.persisted_partial_output(job_id).await,
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
@@ -2723,6 +2745,71 @@ mod tests {
                 )
                 .await;
         assert!(hidden_events.is_err());
+    }
+
+    /// WI#263 review finding: the `partial_output` snapshot must survive a
+    /// daemon restart. The DB fallback branch of job_status recovers it from
+    /// the persisted `partial_output` job event written by
+    /// `preserve_timeout_evidence`, so the field is present in both branches.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn db_job_status_recovers_partial_output_from_events() {
+        use crate::testing::TestHarnessBuilder;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let store = Arc::clone(&harness.db);
+        let manager = Arc::new(ContextManager::new(5));
+        let job_id = Uuid::new_v4();
+        store
+            .save_sandbox_job(&SandboxJobRecord {
+                id: job_id,
+                task: "Timed-out kimi audit".to_string(),
+                status: "timed_out".to_string(),
+                user_id: "default".to_string(),
+                project_dir: "/workspace/lunarwing2".to_string(),
+                success: None,
+                failure_reason: Some("External worker timed out".to_string()),
+                created_at: Utc::now(),
+                started_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+                credential_grants_json: "[]".to_string(),
+            })
+            .await
+            .expect("save persisted job");
+        store
+            .save_job_event(
+                job_id,
+                "message",
+                &serde_json::json!({ "content": "streamed investigation line" }),
+            )
+            .await
+            .expect("save streamed event");
+        store
+            .save_job_event(
+                job_id,
+                "partial_output",
+                &serde_json::json!({ "content": "[worker kimi timed out after streaming 40 bytes; tail preserved]\nInvestigation step: evidence gathered." }),
+            )
+            .await
+            .expect("save partial_output event");
+
+        let ctx = JobContext::default();
+        let status = JobStatusTool::new(Arc::clone(&manager))
+            .with_store(Arc::clone(&store))
+            .execute(serde_json::json!({ "job_id": job_id.to_string() }), &ctx)
+            .await
+            .expect("query persisted status");
+
+        assert_eq!(status.result["source"], "database");
+        let partial = status
+            .result
+            .get("partial_output")
+            .and_then(|value| value.as_str())
+            .expect("partial_output must be recovered in the DB branch");
+        assert!(
+            partial.ends_with("Investigation step: evidence gathered."),
+            "recovered snapshot must carry the streamed evidence tail"
+        );
     }
 
     #[tokio::test]
