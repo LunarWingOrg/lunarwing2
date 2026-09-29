@@ -2151,7 +2151,10 @@ mod tests {
         );
 
         // A heartbeat-only buffer strips to empty — nothing genuine streamed.
-        assert_eq!(strip_worker_heartbeats(&format!("{heartbeat}\n{heartbeat}")), "");
+        assert_eq!(
+            strip_worker_heartbeats(&format!("{heartbeat}\n{heartbeat}")),
+            ""
+        );
 
         // Genuine-only buffers survive verbatim (modulo the tail trim).
         let genuine = "line one\nline two";
