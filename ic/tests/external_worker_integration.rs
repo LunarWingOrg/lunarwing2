@@ -1157,7 +1157,10 @@ async fn heartbeat_only_timeout_preserves_no_evidence() {
         "heartbeat-only timeout must not substitute heartbeats as output"
     );
 
-    let ctx = context_manager.get_context(job_id).await.expect("job context");
+    let ctx = context_manager
+        .get_context(job_id)
+        .await
+        .expect("job context");
     assert!(
         ctx.metadata.get("partial_output").is_none(),
         "heartbeat-only timeout must not preserve keep-alives as evidence"
@@ -1213,7 +1216,10 @@ async fn timeout_with_genuine_evidence_still_preserves_it() {
     // The worker's result output is heartbeat-stripped, not taken verbatim.
     assert_eq!(res.output, genuine);
 
-    let ctx = context_manager.get_context(job_id).await.expect("job context");
+    let ctx = context_manager
+        .get_context(job_id)
+        .await
+        .expect("job context");
     let partial = ctx
         .metadata
         .get("partial_output")
