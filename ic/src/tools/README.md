@@ -113,7 +113,13 @@ Identifier length is bounded at ingress, not by elision: an MCP `tools/list`
 tool name longer than 256 characters is rejected when the response is
 deserialized (failing that tools/list, like the existing byte/count/page
 caps), and extension names are capped at 200 bytes at validation (they are
-filename components as well as listing identifiers). A genuinely empty
+filename components as well as listing identifiers). The 200-byte cap is an
+*install-time* bound only: names of any length were installable before it
+existed, so operations that address an already-installed extension (activate,
+deactivate, toggle, remove, upgrade, info, configure, update) accept
+grandfathered longer names — traversal-shaped names (`/`, `\`, `..`, NUL)
+stay rejected everywhere, and only new installs and renames are bounded. A
+genuinely empty
 result — fresh tenant, `kind` filter with no matches, or `offset == total`
 — returns `{"extensions":[],"count":0}`, never an error; only a nonempty
 page that cannot fit the byte budget errors.
