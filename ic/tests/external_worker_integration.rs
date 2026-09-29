@@ -13,6 +13,10 @@
 //! - failed result
 //! - task timeout (worker hangs) -> `ExternalWorkerTimeout`
 //! - cancel an in-flight task -> `ExternalTaskStatus::Cancelled`
+//! - heartbeat-only timeout -> no `partial_output` evidence (WI#267: synthetic
+//!   keep-alives must not be presented as a recovered investigation)
+//! - timeout with genuine streamed evidence -> still preserved, with
+//!   heartbeats stripped from a worker-supplied result output (WI#267)
 //! - connection failure (unreachable endpoint) -> `ExternalWorkerConnectionFailed`
 //! - protocol error (connection closed before `ready`) -> `ExternalWorkerProtocolError`
 //! - connection-pool reuse across two sequential successful tasks
@@ -90,6 +94,14 @@ enum MockBehavior {
     /// never closes the socket (read loop parked inside the task). Drives the
     /// daemon's bounded-deadline fallback (WI#149).
     CancelNoAck,
+    /// WI#267: a kimi-executor-shaped worker whose CLI wedged. Streams the
+    /// given progress frames (typically synthetic `[worker] ` heartbeats,
+    /// optionally interleaved with genuine deltas), then reports `timed_out`
+    /// with the given result output. Never pooled (terminal failure).
+    HeartbeatTimeout {
+        progress: Vec<String>,
+        result_output: String,
+    },
     /// Complete the WebSocket upgrade but close without sending `ready`
     /// (drives a protocol error).
     CloseBeforeReady,
@@ -444,6 +456,38 @@ async fn handle_connection(
                 // Pre-WI#101 shape: the cancel envelope queues unread (read
                 // loop parked inside the task); never ack, never close.
                 tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            MockBehavior::HeartbeatTimeout {
+                ref progress,
+                ref result_output,
+            } => {
+                // WI#267 shape: the executor keeps its socket alive with
+                // synthetic heartbeats while the wedged CLI streams nothing,
+                // then its silence watchdog resolves `timed_out`. The result
+                // output mirrors the executor's accumulator (genuine CLI
+                // stdout only) — the test decides whether to fold heartbeats
+                // in to exercise the daemon-side stripping.
+                for delta in progress {
+                    let p = envelope(
+                        "task_progress",
+                        serde_json::json!({ "task_id": "t", "delta": delta, "done": false }),
+                    );
+                    if ws.send(Message::Text(p.into())).await.is_err() {
+                        return;
+                    }
+                }
+                let r = envelope(
+                    "task_result",
+                    serde_json::json!({
+                        "task_id": "t",
+                        "status": "timed_out",
+                        "output": result_output,
+                        "error": "kimi produced no stream output for 900000ms",
+                        "duration_ms": 900_000,
+                    }),
+                );
+                let _ = ws.send(Message::Text(r.into())).await;
+                return; // timed-out tasks are not pooled
             }
             MockBehavior::CloseBeforeReady => unreachable!("handled above"),
         }
@@ -1066,6 +1110,117 @@ async fn async_timeout_finalizes_job_and_emits_result() {
             .state,
         JobState::Failed
     );
+}
+
+/// WI#267: a wedged CLI behind a healthy executor streams only synthetic
+/// `[worker] Still waiting…` heartbeats until the silence watchdog fires.
+/// Nothing genuine was produced, so the timeout must NOT be preserved as
+/// `partial_output` evidence — the exact inverse of the WI#263 short-evidence
+/// case, which must keep working.
+#[tokio::test]
+async fn heartbeat_only_timeout_preserves_no_evidence() {
+    let heartbeat = "[worker] Still waiting for Kimi Code response; task remains active.";
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::HeartbeatTimeout {
+        progress: vec![heartbeat.to_string(); 4],
+        result_output: String::new(),
+    })
+    .await;
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
+        .with_event_deps(event_tx, Arc::clone(&context_manager));
+    let job_id = Uuid::new_v4();
+    context_manager
+        .register_sandbox_job(job_id, "test-user", "task", "task")
+        .await
+        .expect("register job");
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(5_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected a result for wait=true");
+
+    assert_eq!(res.status, ExternalTaskStatus::TimedOut);
+    assert!(
+        res.output.is_empty(),
+        "heartbeat-only timeout must not substitute heartbeats as output"
+    );
+
+    let ctx = context_manager.get_context(job_id).await.expect("job context");
+    assert!(
+        ctx.metadata.get("partial_output").is_none(),
+        "heartbeat-only timeout must not preserve keep-alives as evidence"
+    );
+    assert_eq!(ctx.state, JobState::Failed);
+}
+
+/// WI#267 companion: genuine streamed evidence around a timeout is still
+/// preserved verbatim — the heartbeat exclusion must not swallow real work.
+/// Also covers the daemon-side stripping of a worker `task_result.output`
+/// that (unlike the current kimi executor) folded its keep-alives in.
+#[tokio::test]
+async fn timeout_with_genuine_evidence_still_preserves_it() {
+    let heartbeat = "[worker] Still waiting for Kimi Code response; task remains active.";
+    let genuine = "Investigation step: evidence gathered.";
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::HeartbeatTimeout {
+        progress: vec![
+            heartbeat.to_string(),
+            genuine.to_string(),
+            heartbeat.to_string(),
+        ],
+        // Old-executor shape: heartbeats concatenated into the result buffer.
+        result_output: format!("{heartbeat}\n{genuine}\n{heartbeat}"),
+    })
+    .await;
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
+        .with_event_deps(event_tx, Arc::clone(&context_manager));
+    let job_id = Uuid::new_v4();
+    context_manager
+        .register_sandbox_job(job_id, "test-user", "task", "task")
+        .await
+        .expect("register job");
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(5_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected a result for wait=true");
+
+    assert_eq!(res.status, ExternalTaskStatus::TimedOut);
+    // The worker's result output is heartbeat-stripped, not taken verbatim.
+    assert_eq!(res.output, genuine);
+
+    let ctx = context_manager.get_context(job_id).await.expect("job context");
+    let partial = ctx
+        .metadata
+        .get("partial_output")
+        .and_then(|v| v.as_str())
+        .expect("genuine evidence must still be preserved");
+    assert_eq!(partial, genuine);
+    assert!(!partial.contains("[worker]"));
 }
 
 #[tokio::test]
