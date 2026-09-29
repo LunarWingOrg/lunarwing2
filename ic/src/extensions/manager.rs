@@ -84,18 +84,26 @@ fn normalize_hosted_callback_url(callback_url: &str) -> String {
 }
 
 /// Total ordering for extension listings: kind first (MCP servers, then WASM
-/// tools, then WASM channels), then case-insensitive name.
+/// tools, then WASM channels), then case-insensitive name, then the original
+/// name as a tie-breaker.
 ///
 /// `ExtensionManager::list()` uses this so paginated consumers (e.g.
 /// `tool_list`) get stable offsets across calls; discovery sources are
-/// HashMap-backed, so raw iteration order is not stable.
-pub(crate) fn extension_sort_key(extension: &InstalledExtension) -> (u8, String) {
+/// HashMap-backed, so raw iteration order is not stable. The original-name
+/// tie-breaker matters for distinct allowed names that fold to the same
+/// lowercase key (`Alpha` vs `alpha`): without it, equal-key entries could
+/// repeat or swap across calls and a paginated consumer would skip one.
+pub(crate) fn extension_sort_key(extension: &InstalledExtension) -> (u8, String, String) {
     let kind_rank = match extension.kind {
         ExtensionKind::McpServer => 0,
         ExtensionKind::WasmTool => 1,
         ExtensionKind::WasmChannel => 2,
     };
-    (kind_rank, extension.name.to_lowercase())
+    (
+        kind_rank,
+        extension.name.to_lowercase(),
+        extension.name.clone(),
+    )
 }
 
 /// Runtime infrastructure needed for hot-activating WASM channels.
@@ -10401,5 +10409,24 @@ done
             ],
             "MCP servers first, then WASM tools, then channels; names case-insensitive"
         );
+    }
+
+    #[test]
+    fn extension_list_ordering_breaks_case_fold_ties_deterministically() {
+        // Finding 3 on MR !1221: distinct allowed names that fold to the same
+        // lowercase key must still get a total order, or HashMap-backed
+        // discovery can repeat/skip one across paginated calls.
+        use crate::extensions::manager::extension_sort_key;
+
+        let mut entries = [
+            sort_test_extension("alpha", ExtensionKind::McpServer),
+            sort_test_extension("ALPHA", ExtensionKind::McpServer),
+            sort_test_extension("Alpha", ExtensionKind::McpServer),
+            sort_test_extension("beta", ExtensionKind::McpServer),
+        ];
+        entries.sort_by_key(extension_sort_key);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["ALPHA", "Alpha", "alpha", "beta"]);
     }
 }
