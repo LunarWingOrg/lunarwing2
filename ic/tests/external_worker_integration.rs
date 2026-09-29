@@ -995,6 +995,54 @@ async fn happy_path_uses_accumulated_progress_when_output_empty() {
     assert_eq!(res.output, "alpha beta");
 }
 
+/// WI#267 / !1235 finding 2 regression: heartbeat stripping is scoped to
+/// timeout evidence. A *successful* worker result must come back verbatim —
+/// no whitespace trimming and no deletion of lines that merely start with the
+/// `[worker] ` prefix — and that exact value is what the job record persists
+/// as `Completed: …`.
+#[tokio::test]
+async fn successful_result_output_is_returned_verbatim() {
+    // Leading/trailing whitespace plus a genuine `[worker] `-prefixed log
+    // line: both must survive a success where the old fix reworded the
+    // buffer to "result\n[worker] initialized".
+    let output = "  result\n[worker] initialized session\n";
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Success {
+        progress: vec![
+            "[worker] Still waiting for Kimi Code response; task remains active.".to_string(),
+        ],
+        output: output.to_string(),
+    })
+    .await;
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
+        .with_event_deps(event_tx, Arc::clone(&context_manager));
+    let job_id = Uuid::new_v4();
+    context_manager
+        .register_sandbox_job(job_id, "test-user", "task", "task")
+        .await
+        .expect("register job");
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(5_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+    assert_eq!(res.output, output);
+}
+
 #[tokio::test]
 async fn failed_result_status() {
     let (url, _count) = spawn_mock_worker_async(MockBehavior::Failed {
