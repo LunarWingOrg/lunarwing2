@@ -163,7 +163,7 @@
 50. [x] (S) test goal reconciler
 51. [ ] second pass of goal 19 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1234 - see comments on the MR for findings that must be addressed and re-attempt this, using the last MR attempts as a reference
 52. [x] (S) come back to ones that were marked for come back to later
-53. [x] (S) Reserved
+53. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
 54. [x] (S) Reserved
 
 ---
