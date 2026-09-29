@@ -10514,7 +10514,10 @@ done
             .remove(&long_name, "test")
             .await
             .expect("remove grandfathered server");
-        assert!(removed.contains("Removed"), "removal reports success: {removed}");
+        assert!(
+            removed.contains("Removed"),
+            "removal reports success: {removed}"
+        );
 
         let after = manager
             .list(None, false, "test")
