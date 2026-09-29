@@ -25,6 +25,12 @@ number, and may also be spelled `project_id`. Issue, Work Item, and merge
 request `iid` values are project-local IDs shown by GitLab, not global IDs.
 `get_file_content` returns base64 to preserve arbitrary file bytes.
 
+`create_issue` and `update_issue` accept the issue text as `description`
+(GitLab's REST field name) or `body` (the note-action spelling callers
+habitually reuse); supplying both in one call is rejected. Note actions
+(`create_issue_note`, `create_mr_note`) keep `body` as their only field name
+for the note text itself.
+
 ## Authentication
 
 Create a personal access token with `api` scope, then configure extension through
