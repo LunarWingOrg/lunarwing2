@@ -983,6 +983,228 @@ impl Tool for ToolUpdateTool {
 
 // ── tool_list ────────────────────────────────────────────────────────────
 
+/// Default and maximum number of extension entries per `tool_list` page.
+const TOOL_LIST_DEFAULT_PAGE: usize = 50;
+const TOOL_LIST_MAX_PAGE: usize = 100;
+
+/// Default and maximum number of per-extension tool names per `tool_list`
+/// entry. A server exposing hundreds of tools would otherwise consume the
+/// whole page budget on one entry; `tools_offset`/`tools_limit` page through
+/// the rest.
+const TOOL_LIST_TOOLS_PAGE_DEFAULT: usize = 25;
+const TOOL_LIST_TOOLS_PAGE_MAX: usize = 100;
+
+/// Serialized-byte budget for a single `tool_list` page, covering the
+/// pretty-printed JSON the safety layer would otherwise clip mid-structure.
+/// The default safety cap is 100_000 bytes; this leaves ample headroom for
+/// wrapper text and truncation notices.
+const TOOL_LIST_PAGE_BUDGET_BYTES: usize = 60_000;
+
+/// Maximum characters embedded for any single string field (description,
+/// display name, activation error) in an entry. Longer values are elided
+/// with an explicit marker; the full text stays available through the
+/// owning subsystem.
+const TOOL_LIST_FIELD_MAX_CHARS: usize = 200;
+
+/// Elision marker appended when a string field is clipped.
+const TOOL_LIST_ELLIPSIS: &str = "…";
+
+/// Bound a string field, eliding past `TOOL_LIST_FIELD_MAX_CHARS` with an
+/// explicit marker so consumers can tell a clipped value from a full one.
+fn bound_field(value: &str) -> String {
+    if value.chars().count() <= TOOL_LIST_FIELD_MAX_CHARS {
+        return value.to_string();
+    }
+    let keep = TOOL_LIST_FIELD_MAX_CHARS.saturating_sub(TOOL_LIST_ELLIPSIS.len());
+    let clipped: String = value.chars().take(keep).collect();
+    format!("{clipped}{TOOL_LIST_ELLIPSIS}")
+}
+
+/// One page of per-extension tool names plus completeness metadata.
+struct ToolNameWindow {
+    names: Vec<String>,
+    total: usize,
+    truncated: bool,
+    next_offset: Option<usize>,
+}
+
+/// Apply a `tools_offset`/`tools_limit` window over one extension's tool
+/// names so entries with more tools than the page cap remain fully
+/// enumerable (review finding 1 on WI#245).
+fn tool_name_window(tools: &[String], offset: usize, limit: usize) -> ToolNameWindow {
+    let total = tools.len();
+    let start = offset.min(total);
+    let end = (start + limit).min(total);
+    ToolNameWindow {
+        names: tools[start..end].iter().map(|n| bound_field(n)).collect(),
+        total,
+        truncated: end < total,
+        next_offset: (end < total).then_some(end),
+    }
+}
+
+/// Parse an optional non-negative integer parameter with an inclusive upper
+/// clamp. `None`/`null` yields `default`.
+fn parse_bounded_param(
+    params: &serde_json::Value,
+    key: &str,
+    default: usize,
+    max: usize,
+) -> Result<usize, ToolError> {
+    let Some(raw) = params.get(key) else {
+        return Ok(default);
+    };
+    if raw.is_null() {
+        return Ok(default);
+    }
+    raw.as_u64()
+        .map(|v| (v as usize).clamp(0, max))
+        .ok_or_else(|| {
+            ToolError::InvalidParameters(format!("{key} must be a non-negative integer"))
+        })
+}
+
+/// Parse a required positive integer parameter with an inclusive upper clamp.
+fn parse_positive_param(
+    params: &serde_json::Value,
+    key: &str,
+    default: usize,
+    max: usize,
+) -> Result<usize, ToolError> {
+    let Some(raw) = params.get(key) else {
+        return Ok(default);
+    };
+    if raw.is_null() {
+        return Ok(default);
+    }
+    let value = raw
+        .as_u64()
+        .ok_or_else(|| ToolError::InvalidParameters(format!("{key} must be a positive integer")))?;
+    if value == 0 {
+        return Err(ToolError::InvalidParameters(format!(
+            "{key} must be a positive integer"
+        )));
+    }
+    Ok((value as usize).min(max))
+}
+
+/// Serialize an entry with bounded fields and a windowed tool-name list.
+fn extension_to_json(
+    extension: &crate::extensions::InstalledExtension,
+    tools_offset: usize,
+    tools_limit: usize,
+) -> serde_json::Value {
+    let window = tool_name_window(&extension.tools, tools_offset, tools_limit);
+
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "name".to_string(),
+        serde_json::json!(bound_field(&extension.name)),
+    );
+    obj.insert("kind".to_string(), serde_json::json!(extension.kind));
+    obj.insert(
+        "authenticated".to_string(),
+        serde_json::json!(extension.authenticated),
+    );
+    obj.insert("active".to_string(), serde_json::json!(extension.active));
+    obj.insert(
+        "installed".to_string(),
+        serde_json::json!(extension.installed),
+    );
+    obj.insert("tools".to_string(), serde_json::json!(window.names));
+    if window.total > 0 {
+        obj.insert("tools_total".to_string(), serde_json::json!(window.total));
+    }
+    if window.truncated {
+        obj.insert(
+            "tools_truncated".to_string(),
+            serde_json::json!(window.truncated),
+        );
+        obj.insert(
+            "tools_next_offset".to_string(),
+            serde_json::json!(window.next_offset),
+        );
+    }
+
+    // Optional fields ride along only when present, bounded in length.
+    if let Some(display_name) = &extension.display_name {
+        obj.insert(
+            "display_name".to_string(),
+            serde_json::json!(bound_field(display_name)),
+        );
+    }
+    if let Some(description) = &extension.description {
+        obj.insert(
+            "description".to_string(),
+            serde_json::json!(bound_field(description)),
+        );
+    }
+    if let Some(version) = &extension.version {
+        obj.insert(
+            "version".to_string(),
+            serde_json::json!(bound_field(version)),
+        );
+    }
+    if let Some(activation_error) = &extension.activation_error {
+        obj.insert(
+            "activation_error".to_string(),
+            serde_json::json!(bound_field(activation_error)),
+        );
+    }
+    if extension.needs_setup || extension.has_auth {
+        obj.insert(
+            "needs_setup".to_string(),
+            serde_json::json!(extension.needs_setup),
+        );
+        obj.insert(
+            "has_auth".to_string(),
+            serde_json::json!(extension.has_auth),
+        );
+    }
+    if extension.recovering {
+        obj.insert("recovering".to_string(), serde_json::json!(true));
+    }
+
+    serde_json::Value::Object(obj)
+}
+
+/// Byte length a page would occupy once pretty-printed — the exact string
+/// the safety layer clips at `max_output_length` — including pagination
+/// metadata for `offset`/`total`. Used to enforce the serialized budget
+/// before returning (review finding 2 on WI#245).
+fn page_json_len(page: &[serde_json::Value], offset: usize, total: usize) -> Option<usize> {
+    let next_offset = (offset + page.len() < total).then_some(offset + page.len());
+    let combined = serde_json::json!({
+        "extensions": page,
+        "count": page.len(),
+        "total": total,
+        "offset": offset,
+        "next_offset": next_offset,
+        "truncated": next_offset.is_some(),
+    });
+    serde_json::to_string_pretty(&combined)
+        .ok()
+        .map(|s| s.len())
+}
+
+/// Drop trailing entries until the serialized page fits the byte budget.
+/// Metadata is derived after shrinking, so `count`/`next_offset`/`truncated`
+/// always describe the entries actually returned. Per-field bounds
+/// (`bound_field`) and the per-entry tool-name cap bound a single entry far
+/// below the budget, so the loop terminates before the page empties.
+fn fit_page_to_budget(
+    mut page: Vec<serde_json::Value>,
+    offset: usize,
+    total: usize,
+) -> Vec<serde_json::Value> {
+    while page.len() > 1
+        && page_json_len(&page, offset, total).is_none_or(|len| len > TOOL_LIST_PAGE_BUDGET_BYTES)
+    {
+        page.pop();
+    }
+    page
+}
+
 pub struct ToolListTool {
     manager: Arc<ExtensionManager>,
 }
@@ -1001,7 +1223,12 @@ impl Tool for ToolListTool {
 
     fn description(&self) -> &str {
         "List extensions with their authentication and activation status. \
-         Set include_available:true to also show registry entries not yet installed."
+         Set include_available:true to also show registry entries not yet installed. \
+         Output is paginated: when truncated is true, call again with the returned \
+         next_offset as offset (same kind/include_available) to continue. \
+         Per-extension tool names are windowed by tools_offset/tools_limit; \
+         tools_truncated/tools_next_offset on an entry mark servers whose remaining \
+         tool names need a follow-up call with that entry's name."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1017,6 +1244,32 @@ impl Tool for ToolListTool {
                     "type": "boolean",
                     "description": "If true, also include registry entries that are not yet installed",
                     "default": false
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Index of the first entry to return. Use next_offset from a previous truncated response to continue.",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum entries per page (1-100, default 50).",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 100
+                },
+                "tools_offset": {
+                    "type": "integer",
+                    "description": "Index of the first per-entry tool name to return within each entry's tools array. Use tools_next_offset from a truncated entry to continue.",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "tools_limit": {
+                    "type": "integer",
+                    "description": "Maximum per-entry tool names per page (1-100, default 25).",
+                    "default": 25,
+                    "minimum": 1,
+                    "maximum": 100
                 }
             }
         })
@@ -1044,15 +1297,54 @@ impl Tool for ToolListTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let offset = parse_bounded_param(&params, "offset", 0, usize::MAX)?;
+        let limit =
+            parse_positive_param(&params, "limit", TOOL_LIST_DEFAULT_PAGE, TOOL_LIST_MAX_PAGE)?;
+        let tools_offset = parse_bounded_param(&params, "tools_offset", 0, usize::MAX)?;
+        let tools_limit = parse_positive_param(
+            &params,
+            "tools_limit",
+            TOOL_LIST_TOOLS_PAGE_DEFAULT,
+            TOOL_LIST_TOOLS_PAGE_MAX,
+        )?;
+
         let extensions = self
             .manager
             .list(kind_filter, include_available, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
+        let total = extensions.len();
+        if offset > total {
+            return Err(ToolError::InvalidParameters(format!(
+                "offset {offset} exceeds total entry count {total}"
+            )));
+        }
+
+        let page: Vec<serde_json::Value> = extensions
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|e| extension_to_json(e, tools_offset, tools_limit))
+            .collect();
+
+        // Enforce the serialized-byte budget: if the page would exceed it,
+        // drop entries from the tail until it fits. A single oversized entry
+        // (long upstream description + 100 tool names) must never produce a
+        // page the safety layer would clip mid-JSON while its own
+        // truncated/next_offset fields claim completeness.
+        let page = fit_page_to_budget(page, offset, total);
+
+        let returned = page.len();
+        let next_offset = (offset + returned < total).then_some(offset + returned);
+
         let output = serde_json::json!({
-            "extensions": extensions,
-            "count": extensions.len(),
+            "extensions": page,
+            "count": returned,
+            "total": total,
+            "offset": offset,
+            "next_offset": next_offset,
+            "truncated": next_offset.is_some(),
         });
 
         Ok(ToolOutput::success(output, start.elapsed()))
