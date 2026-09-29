@@ -1951,7 +1951,362 @@ mod tests {
             ApprovalRequirement::Never
         );
         let schema = tool.parameters_schema();
-        assert!(schema["properties"].get("kind").is_some());
+        for param in ["kind", "offset", "limit", "tools_offset", "tools_limit"] {
+            assert!(
+                schema["properties"].get(param).is_some(),
+                "tool_list schema must expose {param}"
+            );
+        }
+    }
+
+    fn installed_extension(
+        name: &str,
+        kind: ExtensionKind,
+        tools: Vec<String>,
+    ) -> crate::extensions::InstalledExtension {
+        crate::extensions::InstalledExtension {
+            name: name.to_string(),
+            kind,
+            display_name: None,
+            description: None,
+            url: None,
+            transport: None,
+            command: None,
+            placement: None,
+            authenticated: true,
+            active: true,
+            recovering: false,
+            enabled: None,
+            tools,
+            needs_setup: false,
+            has_auth: false,
+            installed: true,
+            activation_error: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn tool_list_entry_windows_tool_names_with_continuation() {
+        let tools: Vec<String> = (0..40).map(|i| format!("tool_{i}")).collect();
+        let entry = extension_to_json(&installed_extension("big", ExtensionKind::McpServer, tools), 0, 25);
+
+        let listed = entry["tools"].as_array().expect("tools array");
+        assert_eq!(listed.len(), 25);
+        assert_eq!(entry["tools_total"], serde_json::json!(40));
+        assert_eq!(entry["tools_truncated"], serde_json::json!(true));
+        assert_eq!(entry["tools_next_offset"], serde_json::json!(25));
+
+        // Finding 1: the dropped names must be retrievable — window past 25.
+        let tools: Vec<String> = (0..40).map(|i| format!("tool_{i}")).collect();
+        let tail = extension_to_json(&installed_extension("big", ExtensionKind::McpServer, tools), 25, 25);
+        let tail_names = tail["tools"].as_array().expect("tools array");
+        assert_eq!(tail_names.len(), 15);
+        assert_eq!(tail_names[0], serde_json::json!("tool_25"));
+        assert_eq!(tail_names[14], serde_json::json!("tool_39"));
+        // final window: no truncation marker, next_offset absent (Null)
+        assert_eq!(tail.get("tools_truncated"), None);
+        assert_eq!(tail["tools_next_offset"], serde_json::json!(null));
+    }
+
+    #[test]
+    fn tool_list_entry_omits_absent_optional_fields() {
+        let entry = extension_to_json(
+            &installed_extension("plain", ExtensionKind::WasmChannel, Vec::new()),
+            0,
+            TOOL_LIST_TOOLS_PAGE_DEFAULT,
+        );
+        for field in [
+            "display_name",
+            "description",
+            "version",
+            "activation_error",
+            "recovering",
+            "tools_total",
+            "tools_truncated",
+        ] {
+            assert!(entry.get(field).is_none(), "field {field} should be absent");
+        }
+        assert_eq!(entry["name"], serde_json::json!("plain"));
+        assert_eq!(entry["installed"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn tool_list_bounds_unbounded_upstream_fields() {
+        let long_desc = "x".repeat(5_000);
+        let mut extension =
+            installed_extension("desc_server", ExtensionKind::McpServer, Vec::new());
+        extension.description = Some(long_desc);
+        extension.display_name = Some("y".repeat(1_000));
+
+        let entry = extension_to_json(&extension, 0, 25);
+        let description = entry["description"].as_str().expect("description");
+        assert!(
+            description.chars().count() <= TOOL_LIST_FIELD_MAX_CHARS,
+            "description must be bounded, got {}",
+            description.chars().count()
+        );
+        assert!(description.ends_with(TOOL_LIST_ELLIPSIS));
+        let display_name = entry["display_name"].as_str().expect("display name");
+        assert!(display_name.chars().count() <= TOOL_LIST_FIELD_MAX_CHARS);
+    }
+
+    #[test]
+    fn tool_list_param_parsing_defaults_and_errors() {
+        let none = serde_json::json!({});
+        assert_eq!(
+            parse_bounded_param(&none, "offset", 0, usize::MAX).expect("default offset"),
+            0
+        );
+        assert_eq!(
+            parse_positive_param(&none, "limit", TOOL_LIST_DEFAULT_PAGE, TOOL_LIST_MAX_PAGE)
+                .expect("default limit"),
+            50
+        );
+        assert_eq!(
+            parse_positive_param(
+                &none,
+                "tools_limit",
+                TOOL_LIST_TOOLS_PAGE_DEFAULT,
+                TOOL_LIST_TOOLS_PAGE_MAX
+            )
+            .expect("default tools_limit"),
+            25
+        );
+
+        let explicit = serde_json::json!({"offset": 12, "limit": 7, "tools_limit": 40});
+        assert_eq!(
+            parse_bounded_param(&explicit, "offset", 0, usize::MAX).expect("offset"),
+            12
+        );
+        assert_eq!(
+            parse_positive_param(&explicit, "limit", 50, 100).expect("limit"),
+            7
+        );
+        assert_eq!(
+            parse_positive_param(&explicit, "tools_limit", 25, 100).expect("tools_limit"),
+            40
+        );
+
+        // null means "not provided"
+        assert_eq!(
+            parse_bounded_param(&serde_json::json!({"offset": null}), "offset", 0, usize::MAX)
+                .expect("null offset"),
+            0
+        );
+
+        // clamping, not errors, for over-max values
+        assert_eq!(
+            parse_positive_param(&serde_json::json!({"limit": 500}), "limit", 50, 100)
+                .expect("clamped limit"),
+            100
+        );
+
+        for bad in [
+            serde_json::json!({"offset": -1}),
+            serde_json::json!({"offset": "5"}),
+            serde_json::json!({"limit": 0}),
+            serde_json::json!({"limit": "many"}),
+            serde_json::json!({"tools_limit": 0}),
+        ] {
+            let res1 = parse_bounded_param(&bad, "offset", 0, usize::MAX);
+            let res2 = parse_positive_param(&bad, "limit", 50, 100);
+            let res3 = parse_positive_param(&bad, "tools_limit", 25, 100);
+            assert!(
+                res1.is_err() || res2.is_err() || res3.is_err(),
+                "one parser must reject {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_list_page_respects_serialized_byte_budget() {
+        // Finding 2: 100 max-size entries (bounded 200-char descriptions,
+        // 100 tool names each) must shrink to fit the byte budget, with
+        // metadata describing the shrunken page.
+        let make_entry = |i: usize| {
+            let tools: Vec<String> = (0..100).map(|t| format!("server{i}_tool_{t}")).collect();
+            let mut extension =
+                installed_extension(&format!("server_{i:03}"), ExtensionKind::McpServer, tools);
+            extension.description = Some("d".repeat(TOOL_LIST_FIELD_MAX_CHARS));
+            extension_to_json(&extension, 0, TOOL_LIST_TOOLS_PAGE_MAX)
+        };
+        let page: Vec<serde_json::Value> = (0..100).map(make_entry).collect();
+
+        let total = 100;
+        let full_len = page_json_len(&page, 0, total).expect("serialize page");
+        assert!(
+            full_len > TOOL_LIST_PAGE_BUDGET_BYTES,
+            "fixture must be oversized to exercise the budget (got {full_len})"
+        );
+
+        let fitted = fit_page_to_budget(page, 0, total);
+        assert!(!fitted.is_empty(), "budget fit must keep at least one entry");
+        let fitted_len = page_json_len(&fitted, 0, total).expect("serialize fitted");
+        assert!(
+            fitted_len <= TOOL_LIST_PAGE_BUDGET_BYTES,
+            "fitted page ({fitted_len}) must stay within the {} byte budget",
+            TOOL_LIST_PAGE_BUDGET_BYTES
+        );
+
+        // A single entry always fits on its own page.
+        let single = fit_page_to_budget(vec![make_entry(0)], 0, 1);
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn tool_list_page_budget_metadata_stays_consistent() {
+        // count/next_offset/truncated must describe the returned entries,
+        // never claim completeness for a clipped page.
+        let make_entry = |i: usize| {
+            let tools: Vec<String> = (0..100).map(|t| format!("s{i}_t{t}")).collect();
+            extension_to_json(
+                &installed_extension(&format!("s{i:03}"), ExtensionKind::McpServer, tools),
+                0,
+                TOOL_LIST_TOOLS_PAGE_MAX,
+            )
+        };
+        let page: Vec<serde_json::Value> = (0..100).map(make_entry).collect();
+        let fitted = fit_page_to_budget(page, 0, 100);
+
+        let next_offset = (fitted.len() < 100).then_some(fitted.len());
+        let combined = serde_json::json!({
+            "extensions": fitted,
+            "count": fitted.len(),
+            "total": 100,
+            "offset": 0,
+            "next_offset": next_offset,
+            "truncated": next_offset.is_some(),
+        });
+        assert_eq!(combined["count"], serde_json::json!(fitted.len()));
+        assert_eq!(combined["next_offset"], serde_json::json!(next_offset));
+        assert_eq!(
+            combined["truncated"],
+            serde_json::json!(next_offset.is_some())
+        );
+        assert!(fitted.len() < 100, "oversized fixture must be shrunken");
+    }
+
+    /// End-to-end WI#245 regression: a 31-server inventory (the reported
+    /// failure size) must enumerate completely across pages, with every page
+    /// small enough to survive the safety layer's byte truncation intact.
+    /// Servers carry oversized descriptions to prove the byte budget, not
+    /// just the entry cap, bounds each page.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn tool_list_paginates_full_inventory_without_silent_prefix() {
+        use crate::context::JobContext;
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::mcp::process::McpProcessManager;
+        use crate::tools::mcp::session::McpSessionManager;
+        use crate::tools::ToolRegistry;
+
+        let (store, _db_dir) = crate::testing::test_db().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).ok();
+        std::fs::create_dir_all(&channels_dir).ok();
+
+        let key = secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
+        let crypto = Arc::new(SecretsCrypto::new(key).expect("crypto"));
+        let secrets: Arc<dyn crate::secrets::SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(crypto));
+
+        let manager = Arc::new(ExtensionManager::new(
+            Arc::new(McpSessionManager::new()),
+            Arc::new(McpProcessManager::new()),
+            secrets,
+            Arc::new(ToolRegistry::new()),
+            None,
+            None,
+            tools_dir,
+            channels_dir,
+            None,
+            "test".to_string(),
+            Some(store),
+            Vec::new(),
+        ));
+
+        for i in 0..31 {
+            let config = McpServerConfig::new_stdio(
+                format!("server_{i:02}"),
+                "echo",
+                vec![],
+                HashMap::new(),
+            )
+            .with_description("x".repeat(5_000));
+            manager
+                .install_mcp_config(config, "test")
+                .await
+                .expect("install test MCP config");
+        }
+
+        let tool = ToolListTool::new(manager);
+        let ctx = crate::context::JobContext {
+            user_id: "test".to_string(),
+            ..JobContext::default()
+        };
+
+        // Page through with limit=20, the reported broken size class: page 1
+        // previously looked complete while 12 servers were silently dropped.
+        let mut seen: Vec<String> = Vec::new();
+        let mut offset = 0usize;
+        let mut pages = 0;
+        loop {
+            let output = tool
+                .execute(serde_json::json!({"limit": 20, "offset": offset}), &ctx)
+                .await
+                .expect("tool_list page");
+            pages += 1;
+
+            let result = &output.result;
+            let entries = result["extensions"].as_array().expect("extensions array");
+            let serialized =
+                serde_json::to_string_pretty(&result).expect("serialize page pretty");
+            assert!(
+                serialized.len() < 100_000,
+                "page must stay below the 100 KiB safety truncation limit (got {})",
+                serialized.len()
+            );
+
+            for entry in entries {
+                seen.push(entry["name"].as_str().expect("name").to_string());
+                let description = entry["description"].as_str().expect("description");
+                assert!(
+                    description.chars().count() <= TOOL_LIST_FIELD_MAX_CHARS,
+                    "oversized upstream description must be bounded in output"
+                );
+            }
+
+            match result["next_offset"].as_u64() {
+                Some(next) => offset = next as usize,
+                None => {
+                    assert_eq!(result["truncated"], serde_json::json!(false));
+                    assert_eq!(result["total"], serde_json::json!(31));
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(pages, 2, "31 entries at limit 20 spans two pages");
+        assert_eq!(seen.len(), 31, "every installed server must be enumerated");
+
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 31, "no server may appear twice");
+        assert_eq!(
+            seen[0], "server_00",
+            "deterministic ordering starts at the first name"
+        );
+
+        // offset past the end is a caller error, not an empty page.
+        let err = tool
+            .execute(serde_json::json!({"offset": 99}), &ctx)
+            .await
+            .expect_err("offset beyond total must fail");
+        assert!(err.to_string().contains("exceeds total"));
     }
 
     #[test]
