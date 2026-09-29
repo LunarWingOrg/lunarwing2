@@ -2137,6 +2137,129 @@ mod tests {
     }
 
     #[test]
+    fn strip_worker_heartbeats_removes_only_keepalive_lines() {
+        // WI#267: a worker-supplied buffer that folded its synthetic
+        // keep-alives in must lose them (and only them) before it can be
+        // treated as timeout evidence.
+        let heartbeat = "[worker] Still waiting for Kimi Code response; task remains active.";
+        let mixed = format!(
+            "{heartbeat}\nInvestigation step: evidence gathered.\n{heartbeat}\n[tool result] ok\n  {heartbeat}\n"
+        );
+        assert_eq!(
+            strip_worker_heartbeats(&mixed),
+            "Investigation step: evidence gathered.\n[tool result] ok"
+        );
+
+        // A heartbeat-only buffer strips to empty — nothing genuine streamed.
+        assert_eq!(strip_worker_heartbeats(&format!("{heartbeat}\n{heartbeat}")), "");
+
+        // Genuine-only buffers survive verbatim (modulo the tail trim).
+        let genuine = "line one\nline two";
+        assert_eq!(strip_worker_heartbeats(genuine), genuine);
+        assert_eq!(strip_worker_heartbeats(""), "");
+
+        // The opencode executors emit the same shape with a different subject
+        // — it is the same synthetic keep-alive and must go too.
+        assert_eq!(
+            strip_worker_heartbeats(
+                "[worker] Still waiting for OpenCode/model response; task remains active."
+            ),
+            ""
+        );
+
+        // A genuine worker log line sharing the `[worker] ` prefix is NOT a
+        // heartbeat and must survive (!1235 finding 2) — including the
+        // opencode executors' transient-failure retry diagnostics, which are
+        // real evidence of what the worker was doing (!1237 finding 1).
+        assert_eq!(
+            strip_worker_heartbeats("[worker] initialized session"),
+            "[worker] initialized session"
+        );
+        assert_eq!(
+            strip_worker_heartbeats(
+                "[worker] Transient provider failure; retrying same OpenCode session (1/3)."
+            ),
+            "[worker] Transient provider failure; retrying same OpenCode session (1/3)."
+        );
+        // Nor is a near-miss of the heartbeat sentence.
+        assert_eq!(
+            strip_worker_heartbeats("[worker] Still waiting for Kimi Code response (retrying)"),
+            "[worker] Still waiting for Kimi Code response (retrying)"
+        );
+    }
+
+    #[test]
+    fn heartbeat_only_frames_are_genuine_progress_diagnostics_survive() {
+        // !1237 finding 1: the evidence-buffer gate is the narrow
+        // keep-alive-shape predicate, NOT the broad idle-baseline prefix.
+        // Synthetic keep-alives must be excluded from the buffer…
+        assert!(is_heartbeat_only_frame(
+            "[worker] Still waiting for Kimi Code response; task remains active."
+        ));
+        assert!(is_heartbeat_only_frame(
+            "[worker] Still waiting for OpenCode/model response; task remains active.\n"
+        ));
+        assert!(is_heartbeat_only_frame(""));
+
+        // …while genuine `[worker] `-prefixed diagnostics stay in the buffer.
+        let transient =
+            "[worker] Transient provider failure; retrying same OpenCode session (2/5).";
+        assert!(!is_heartbeat_only_frame(transient));
+        assert!(!is_heartbeat_only_frame("[worker] initialized session"));
+        // The two predicates intentionally disagree on the transient notice:
+        // it may not refresh the idle baseline (any `[worker] ` frame is
+        // executor-authored, not CLI-authored)…
+        assert!(!is_genuine_progress(transient));
+        // …but it IS recoverable evidence.
+        let mut buffer = String::new();
+        if !is_heartbeat_only_frame(transient) {
+            buffer.push_str(transient);
+        }
+        assert_eq!(buffer, transient);
+    }
+
+    /// WI#267: the companion case to the short-genuine-output finding. The
+    /// read loop now keeps synthetic heartbeats out of the evidence buffer,
+    /// so a heartbeat-only timeout (a wedged CLI behind a healthy executor)
+    /// must preserve NOTHING — the streamed buffer is empty of genuine work
+    /// and must not be presented as a recovered investigation.
+    #[tokio::test]
+    async fn heartbeat_only_timeout_preserves_no_evidence() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        // Simulate the read loop's progress handling on heartbeat frames
+        // only — exactly what a wedged CLI with a healthy executor streams
+        // until the 15-minute silence watchdog fires.
+        let mut accumulated_output = String::new();
+        for _ in 0..5 {
+            let delta = "[worker] Still waiting for Kimi Code response; task remains active.";
+            if !is_heartbeat_only_frame(delta) {
+                accumulated_output.push_str(delta);
+            }
+        }
+
+        // The worker's timeout result carries no genuine output either (the
+        // kimi executor only accumulates real CLI stdout), so the daemon's
+        // fallback for an empty result output is the heartbeat-free buffer.
+        let evidence = if accumulated_output.is_empty() {
+            String::new()
+        } else {
+            accumulated_output
+        };
+        preserve_timeout_evidence(job_id, "kimi", &evidence, Some(&cm), None).await;
+
+        let ctx = cm.get_context(job_id).await.unwrap();
+        assert!(
+            ctx.metadata.get("partial_output").is_none(),
+            "a heartbeat-only timeout must not be preserved as evidence"
+        );
+    }
+
+    #[test]
     fn describe_connect_failure_enriches_subprotocol_rejection() {
         use tokio_tungstenite::tungstenite::http::Response;
 
