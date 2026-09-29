@@ -170,6 +170,28 @@ else
 fi
 assert_eq "$(sha256sum "$env_dir/voice.env" | cut -d' ' -f1)" "$before_invalid" "invalid configure leaves env unchanged"
 
+# ── WI#259: configure-voice must propagate the sidecar runtime bounds into the
+# daemon env, otherwise the gateway pre-flight/status advertise a stale clip
+# cap and request budget until the next full lunarwing.env re-render.
+printf 'VOICE_MAX_TTS_AUDIO_SECS=300\nVOICE_REQUEST_TIMEOUT_SECS=120\n' >>"$env_dir/voice.env"
+printf 'VOICE_MAX_TTS_AUDIO_SECS=300\nVOICE_REQUEST_TIMEOUT_SECS=120\n' >>"$env_dir/lunarwing.env"
+configure_voice_settings alpha VOICE_MAX_TTS_AUDIO_SECS=60 VOICE_REQUEST_TIMEOUT_SECS=90 >/dev/null
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_MAX_TTS_AUDIO_SECS)" 60 "configure updates sidecar clip cap"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" VOICE_MAX_TTS_AUDIO_SECS)" 60 "configure propagates clip cap to daemon env"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" VOICE_REQUEST_TIMEOUT_SECS)" 90 "configure propagates request budget to daemon env"
+
+configure_voice alpha true >/dev/null
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" VOICE_MAX_TTS_AUDIO_SECS)" 60 "enable keeps propagated clip cap"
+configure_voice_settings alpha VOICE_MAX_TTS_AUDIO_SECS=300 >/dev/null
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" VOICE_MAX_TTS_AUDIO_SECS)" 300 "raising the cap propagates on reconfigure"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" VOICE_REQUEST_TIMEOUT_SECS)" 90 "reconfigure preserves untouched request budget"
+
+# Rollback path restores both env files verbatim, so the mirrored keys return
+# to their pre-configure values together.
+configure_voice alpha false >/dev/null
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" VOICE_MAX_TTS_AUDIO_SECS)" 300 "disable keeps the propagated clip cap"
+configure_voice alpha true >/dev/null
+
 tenant_quadlet_dir() { printf '%s' "$ROOT/quadlets"; }
 tenant_home() { printf '%s' "$ROOT/home"; }
 OPENRC_INITD_DIR="$ROOT/init.d"

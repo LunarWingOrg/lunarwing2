@@ -1307,14 +1307,22 @@ ENVEOF
       "$vision_service_url" "$(_quote_env_value "$vision_token")" >> "$path"
   fi
   # LunarVoice is provisioned but disabled until explicitly enabled. Preserve
-  # any operator-selected cloud transcription provider on re-render.
-  local voice_port voice_token
+  # any operator-selected cloud transcription provider on re-render. The
+  # sidecar's synthesis clip cap and request budget are mirrored into the
+  # daemon env so the gateway's text_too_long pre-flight and staggered proxy
+  # timeout stay in sync with the values the sidecar actually enforces
+  # (WI#259).
+  local voice_port voice_token voice_max_tts_secs voice_req_timeout
   voice_port="$(ports_get "$name" voice_service)" || true
   if [[ -n "$voice_port" ]]; then
     voice_token="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_AUTH_TOKEN)"
     voice_token="${voice_token:-$(generate_token)}"
-    printf '\nVOICE_SERVICE_URL=http://127.0.0.1:%s\nVOICE_AUTH_TOKEN=%s\n' \
-      "$voice_port" "$voice_token" >> "$path"
+    voice_max_tts_secs="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_MAX_TTS_AUDIO_SECS)"
+    voice_max_tts_secs="${voice_max_tts_secs:-300}"
+    voice_req_timeout="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_REQUEST_TIMEOUT_SECS)"
+    voice_req_timeout="${voice_req_timeout:-120}"
+    printf '\nVOICE_SERVICE_URL=http://127.0.0.1:%s\nVOICE_AUTH_TOKEN=%s\nVOICE_MAX_TTS_AUDIO_SECS=%s\nVOICE_REQUEST_TIMEOUT_SECS=%s\n' \
+      "$voice_port" "$voice_token" "$voice_max_tts_secs" "$voice_req_timeout" >> "$path"
     printf 'TRANSCRIPTION_ENABLED=%s\nTRANSCRIPTION_PROVIDER=%s\nTRANSCRIPTION_MODEL=%s\n' \
       "$transcription_enabled" "$transcription_provider" "$transcription_model" >> "$path"
   fi

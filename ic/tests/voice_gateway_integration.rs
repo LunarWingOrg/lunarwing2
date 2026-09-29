@@ -9,7 +9,8 @@
 //! - Bounds are enforced (oversize audio, bad format, empty/long text,
 //!   invalid speed, body limit)
 //! - Upstream failures map to stable gateway errors without leaking sidecar
-//!   detail (401 -> 500, other statuses -> 502, timeout -> 504)
+//!   detail (401 -> 500, 429 -> 429, 400 -> 400, 422/503/504 keep their
+//!   semantics, other statuses -> 502, proxy timeout -> 504)
 
 use std::sync::Arc;
 
@@ -223,6 +224,7 @@ async fn transcribe_proxies_to_sidecar_with_server_held_credential() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["configured"], json!(true));
     assert_eq!(body["model"], json!("whisper-tiny"));
+    assert_eq!(body["max_synth_audio_secs"], json!(300));
 
     let audio = base64::engine::general_purpose::STANDARD.encode(b"RIFFfake");
     let (status, body) = post_json(
@@ -321,23 +323,37 @@ async fn synthesize_validates_bounds_and_maps_upstream_unavailable() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // A valid request flows to the sidecar; the mock reports TTS disabled,
-    // which must surface as a generic upstream error (not a gateway 200, not
-    // a verbatim 503, and without leaking the sidecar's detail text).
+    // which must surface as a distinct unavailable error (not a gateway 200,
+    // not a verbatim detail leak). Sidecar overload statuses keep their
+    // semantics at the gateway (503 unavailable — WI#259).
     let (status, body) = post_json(
         &format!("http://{addr}/api/voice/synthesize"),
         AUTH_TOKEN,
         json!({"text": "hello", "voice": "af_heart", "speed": 1.0}),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
-    assert_eq!(body["error"], json!("upstream_error"));
-    assert_eq!(body["message"], json!("voice sidecar error (HTTP 503)"));
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert_eq!(body["error"], json!("unavailable"));
+    assert_eq!(body["message"], json!("voice sidecar is unavailable"));
     assert!(
         !body["message"]
             .as_str()
             .is_some_and(|m| m.contains("tts disabled")),
         "sidecar detail must not leak to clients"
     );
+
+    // WI#259: a reply whose estimated audio duration exceeds the sidecar cap
+    // is rejected by the gateway itself with a distinct 422 `text_too_long`
+    // instead of burning sidecar CPU and surfacing an opaque 502.
+    let long = "word ".repeat(1_200); // ~4800 non-whitespace chars ≈ 343s
+    let (status, body) = post_json(
+        &format!("http://{addr}/api/voice/synthesize"),
+        AUTH_TOKEN,
+        json!({"text": long}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert_eq!(body["error"], json!("text_too_long"));
 }
 
 #[tokio::test]
@@ -403,6 +419,55 @@ async fn unreachable_sidecar_maps_to_bad_gateway() {
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
     assert_eq!(body["error"], json!("upstream_error"));
+}
+
+#[tokio::test]
+async fn sidecar_stall_maps_to_upstream_timeout() {
+    // WI#259 review finding 2: a sidecar that never answers must time out at
+    // the gateway proxy with the documented 504 `upstream_timeout` code —
+    // not the generic `upstream_error` bucket that previously read as an
+    // opaque 502/504 mix in the desktop app.
+    use std::time::Duration;
+
+    let sidecar = Router::new().route(
+        "/v1/voice/synthesize",
+        post(|| async {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            (
+                StatusCode::OK,
+                Json(json!({"audio": "UklGRg==", "format": "wav",
+                            "sample_rate": 24000, "duration_ms": 1, "voice": "af_heart"})),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let sidecar_addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, sidecar).await;
+    });
+
+    let mut config = voice_config(&format!("http://{sidecar_addr}"));
+    config.voice_request_timeout_secs = 1;
+    let api = VoiceApi::from_config(&config)
+        .map(Arc::new)
+        .expect("voice api");
+    let addr = start_gateway(Some(api)).await;
+
+    let started = std::time::Instant::now();
+    let (status, body) = post_json(
+        &format!("http://{addr}/api/voice/synthesize"),
+        AUTH_TOKEN,
+        json!({"text": "hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "body: {body}");
+    assert_eq!(body["error"], json!("upstream_timeout"));
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "timeout must follow the configured sidecar budget (1s + headroom), not outlast the sidecar"
+    );
 }
 
 #[tokio::test]

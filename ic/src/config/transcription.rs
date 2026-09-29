@@ -25,6 +25,14 @@ pub struct TranscriptionConfig {
     pub voice_service_url: Option<String>,
     /// LunarVoice bearer token.
     pub voice_auth_token: Option<SecretString>,
+    /// Maximum synthesized audio seconds the sidecar accepts before rejecting
+    /// the clip (mirrors the sidecar's `VOICE_MAX_TTS_AUDIO_SECS`); used by
+    /// the gateway voice proxy's `text_too_long` pre-flight.
+    pub voice_max_synth_audio_secs: u64,
+    /// Sidecar per-request budget in seconds (mirrors the sidecar's
+    /// `VOICE_REQUEST_TIMEOUT_SECS`). The gateway proxy timeout is derived
+    /// from it so the sidecar's structured error always wins the race.
+    pub voice_request_timeout_secs: u64,
 }
 
 impl Default for TranscriptionConfig {
@@ -39,6 +47,8 @@ impl Default for TranscriptionConfig {
             base_url: None,
             voice_service_url: None,
             voice_auth_token: None,
+            voice_max_synth_audio_secs: 300,
+            voice_request_timeout_secs: 120,
         }
     }
 }
@@ -68,6 +78,10 @@ impl TranscriptionConfig {
 
         let base_url = optional_env("TRANSCRIPTION_BASE_URL")?;
         let voice_service_url = optional_env("VOICE_SERVICE_URL")?;
+        let voice_max_synth_audio_secs =
+            crate::config::helpers::parse_optional_env("VOICE_MAX_TTS_AUDIO_SECS", 300u64)?;
+        let voice_request_timeout_secs =
+            crate::config::helpers::parse_optional_env("VOICE_REQUEST_TIMEOUT_SECS", 120u64)?;
 
         // Validate base URL to prevent SSRF (#1103).
         if let Some(ref url) = base_url {
@@ -84,6 +98,8 @@ impl TranscriptionConfig {
             base_url,
             voice_service_url,
             voice_auth_token,
+            voice_max_synth_audio_secs,
+            voice_request_timeout_secs,
         })
     }
 
