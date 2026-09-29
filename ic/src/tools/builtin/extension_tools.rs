@@ -2679,6 +2679,79 @@ mod tests {
             .await
             .expect_err("offset beyond total must fail");
         assert!(err.to_string().contains("exceeds total"));
+
+        // offset == total is the empty tail page a pagination loop lands on
+        // after the last entry: it must be a complete empty page, not the
+        // budget-drop error (MR !1225 finding 1).
+        let tail = tool
+            .execute(serde_json::json!({"offset": 31, "limit": 20}), &ctx)
+            .await
+            .expect("tail page at offset == total");
+        assert_eq!(tail.result["extensions"], serde_json::json!([]));
+        assert_eq!(tail.result["count"], serde_json::json!(0));
+        assert_eq!(tail.result["total"], serde_json::json!(31));
+        assert_eq!(tail.result["truncated"], serde_json::json!(false));
+    }
+
+    /// Fresh-tenant shape (MR !1225 finding 1): an inventory with zero
+    /// matching entries must return the pre-pagination empty result, not an
+    /// error. A `kind` filter with no matches exercises the same path.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn tool_list_empty_inventory_and_unmatched_filter_return_empty_page() {
+        use crate::context::JobContext;
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::ToolRegistry;
+        use crate::tools::mcp::process::McpProcessManager;
+        use crate::tools::mcp::session::McpSessionManager;
+
+        let (store, _db_dir) = crate::testing::test_db().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manager = Arc::new(ExtensionManager::new(
+            Arc::new(McpSessionManager::new()),
+            Arc::new(McpProcessManager::new()),
+            {
+                let key =
+                    secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
+                let crypto = Arc::new(SecretsCrypto::new(key).expect("crypto"));
+                Arc::new(InMemorySecretsStore::new(crypto))
+                    as Arc<dyn crate::secrets::SecretsStore + Send + Sync>
+            },
+            Arc::new(ToolRegistry::new()),
+            None,
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            None,
+            "test".to_string(),
+            Some(store),
+            Vec::new(),
+        ));
+
+        let tool = ToolListTool::new(manager);
+        let ctx = crate::context::JobContext {
+            user_id: "test".to_string(),
+            ..JobContext::default()
+        };
+
+        let empty = tool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("empty inventory must not error");
+        assert_eq!(empty.result["extensions"], serde_json::json!([]));
+        assert_eq!(empty.result["count"], serde_json::json!(0));
+        assert_eq!(empty.result["total"], serde_json::json!(0));
+        assert_eq!(empty.result["truncated"], serde_json::json!(false));
+
+        let unmatched = tool
+            .execute(
+                serde_json::json!({"kind": "mcp_server", "include_available": true}),
+                &ctx,
+            )
+            .await
+            .expect("unmatched filter must not error");
+        assert_eq!(unmatched.result["extensions"], serde_json::json!([]));
+        assert_eq!(unmatched.result["count"], serde_json::json!(0));
     }
 
     #[test]
