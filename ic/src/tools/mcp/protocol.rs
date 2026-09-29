@@ -87,10 +87,36 @@ pub const PROTOCOL_VERSION_2025_03_26: &str = "2025-03-26";
 /// MCP protocol versions this client can negotiate.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION, PROTOCOL_VERSION_2025_03_26];
 
+/// Maximum characters accepted for a tool name in an MCP `tools/list`
+/// response. A longer name is rejected at deserialization — the same
+/// fail-closed posture as the byte/count/page caps on the surrounding
+/// response — because a name of unbounded length cannot fit any bounded
+/// `tool_list` entry without either elision (which makes identifiers
+/// unrecoverable) or a clipped page (MR !1225 finding 3).
+pub const MAX_MCP_TOOL_NAME_CHARS: usize = 256;
+
+/// Deserialize a tool name, rejecting names longer than
+/// `MAX_MCP_TOOL_NAME_CHARS` so oversized identifiers fail the tools/list
+/// instead of becoming unrepresentable in bounded listings.
+fn deserialize_tool_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    if name.chars().count() > MAX_MCP_TOOL_NAME_CHARS {
+        return Err(<D::Error as serde::de::Error>::custom(format!(
+            "MCP tool name exceeds {MAX_MCP_TOOL_NAME_CHARS} characters (got {})",
+            name.chars().count()
+        )));
+    }
+    Ok(name)
+}
+
 /// An MCP tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTool {
     /// Tool name.
+    #[serde(deserialize_with = "deserialize_tool_name")]
     pub name: String,
     /// Tool description.
     #[serde(default)]
@@ -937,5 +963,39 @@ mod tests {
 
         let required = tool.input_schema.get("required").expect("has required");
         assert!(required.as_array().expect("is array").len() == 2);
+    }
+
+    #[test]
+    fn test_tool_name_at_bound_deserializes() {
+        let server_response = serde_json::json!({
+            "tools": [{
+                "name": "x".repeat(MAX_MCP_TOOL_NAME_CHARS),
+                "description": "",
+                "inputSchema": {"type": "object", "properties": {}}
+            }]
+        });
+
+        let result: ListToolsResult =
+            serde_json::from_value(server_response).expect("name at the bound must be accepted");
+        assert_eq!(result.tools[0].name.chars().count(), MAX_MCP_TOOL_NAME_CHARS);
+    }
+
+    #[test]
+    fn test_oversized_tool_name_is_rejected() {
+        // MR !1225 finding 3: a 65,000-character tool name used to deserialize
+        // fine (the response only has an 8 MiB total cap), producing a
+        // >60 KiB single tool_list entry that no bounded page could carry.
+        // The bound must reject it at ingress so the server fails loudly.
+        let server_response = serde_json::json!({
+            "tools": [{
+                "name": "x".repeat(MAX_MCP_TOOL_NAME_CHARS + 1),
+                "description": "",
+                "inputSchema": {"type": "object", "properties": {}}
+            }]
+        });
+
+        let error = serde_json::from_value::<ListToolsResult>(server_response)
+            .expect_err("oversized tool name must fail deserialization");
+        assert!(error.to_string().contains("exceeds"));
     }
 }
