@@ -74,7 +74,7 @@ const messages = [
   { role: "assistant", content: "Investigation step: evidence gathered." },
 ]
 for (const m of messages) {
-  process.stdout.write(JSON.stringify(m) + "\\\\n")
+  process.stdout.write(JSON.stringify(m) + "\\n")
 }
 process.on("SIGTERM", () => {})
 setInterval(() => {}, 1000)
