@@ -68,6 +68,13 @@ fn normalize_oauth_callback_path(path: &str) -> String {
     }
 }
 
+/// Maximum byte length of an extension name. Names become filename
+/// components (`{name}.wasm`, `{name}.capabilities.json`) and are embedded
+/// verbatim in bounded listings (`tool_list`), so an unbounded name could
+/// both break file storage and defeat a page's serialized byte budget
+/// (WI #245, MR !1225 finding 3's sibling for extension names).
+const MAX_EXTENSION_NAME_BYTES: usize = 200;
+
 fn normalize_hosted_callback_url(callback_url: &str) -> String {
     if let Ok(mut parsed) = url::Url::parse(callback_url) {
         let normalized_path = normalize_oauth_callback_path(parsed.path());
@@ -81,6 +88,29 @@ fn normalize_hosted_callback_url(callback_url: &str) -> String {
     } else {
         format!("{normalized_callback_url}/oauth/callback")
     }
+}
+
+/// Total ordering for extension listings: kind first (MCP servers, then WASM
+/// tools, then WASM channels), then case-insensitive name, then the original
+/// name as a tie-breaker.
+///
+/// `ExtensionManager::list()` uses this so paginated consumers (e.g.
+/// `tool_list`) get stable offsets across calls; discovery sources are
+/// HashMap-backed, so raw iteration order is not stable. The original-name
+/// tie-breaker matters for distinct allowed names that fold to the same
+/// lowercase key (`Alpha` vs `alpha`): without it, equal-key entries could
+/// repeat or swap across calls and a paginated consumer would skip one.
+pub(crate) fn extension_sort_key(extension: &InstalledExtension) -> (u8, String, String) {
+    let kind_rank = match extension.kind {
+        ExtensionKind::McpServer => 0,
+        ExtensionKind::WasmTool => 1,
+        ExtensionKind::WasmChannel => 2,
+    };
+    (
+        kind_rank,
+        extension.name.to_lowercase(),
+        extension.name.clone(),
+    )
 }
 
 /// Runtime infrastructure needed for hot-activating WASM channels.
@@ -843,7 +873,7 @@ impl ExtensionManager {
             tracing::warn!("inject_mcp_client called with empty name; ignoring");
             return;
         }
-        if let Err(e) = Self::validate_extension_name(&name) {
+        if let Err(e) = Self::validate_existing_extension_name(&name) {
             tracing::warn!(
                 error = %e,
                 name = %name,
@@ -1265,7 +1295,7 @@ impl ExtensionManager {
         name: &str,
         user_id: &str,
     ) -> Result<ActivateResult, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
 
         match kind {
@@ -1281,7 +1311,7 @@ impl ExtensionManager {
         name: &str,
         user_id: &str,
     ) -> Result<Option<ActivateResult>, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
         match kind {
             ExtensionKind::McpServer => self.activate_mcp_if_enabled(name, user_id).await,
@@ -1293,7 +1323,7 @@ impl ExtensionManager {
 
     /// Deactivate an MCP server without deleting its configuration or credentials.
     pub async fn deactivate(&self, name: &str, user_id: &str) -> Result<String, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
         if kind != ExtensionKind::McpServer {
             return Err(ExtensionError::Other(format!(
@@ -1327,7 +1357,7 @@ impl ExtensionManager {
 
     /// Atomically toggle an MCP server and apply the corresponding runtime transition.
     pub async fn toggle_mcp(&self, name: &str, user_id: &str) -> Result<String, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
         if kind != ExtensionKind::McpServer {
             return Err(ExtensionError::Other(format!(
@@ -1689,12 +1719,19 @@ impl ExtensionManager {
             }
         }
 
+        // Deterministic order: kind first (MCP servers, then WASM tools, then
+        // WASM channels), then case-insensitive name. Installed entries come
+        // from HashMap-backed discovery, so without this the iteration order —
+        // and therefore any prefix a paginated consumer takes — changes
+        // between calls.
+        extensions.sort_by_key(extension_sort_key);
+
         Ok(extensions)
     }
 
     /// Remove an installed extension.
     pub async fn remove(&self, name: &str, user_id: &str) -> Result<String, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
 
         if kind != ExtensionKind::McpServer {
@@ -1834,7 +1871,7 @@ impl ExtensionManager {
         let mut candidates: Vec<(String, ExtensionKind)> = Vec::new();
 
         if let Some(name) = name {
-            Self::validate_extension_name(name)?;
+            Self::validate_existing_extension_name(name)?;
             let kind = self.determine_installed_kind(name, user_id).await?;
             if kind == ExtensionKind::McpServer {
                 return Err(ExtensionError::Other(
@@ -2029,7 +2066,7 @@ impl ExtensionManager {
         name: &str,
         user_id: &str,
     ) -> Result<serde_json::Value, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
 
         match kind {
@@ -3003,7 +3040,7 @@ impl ExtensionManager {
         mut new_config: McpServerConfig,
         user_id: &str,
     ) -> Result<String, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
         if kind != ExtensionKind::McpServer {
             return Err(ExtensionError::Other(format!(
@@ -5381,7 +5418,36 @@ impl ExtensionManager {
     }
 
     /// Reject names containing path separators or traversal sequences.
-    fn validate_extension_name(name: &str) -> Result<(), ExtensionError> {
+    ///
+    /// Ingress gate for *new* names (install/update): additionally enforces the
+    /// [`MAX_EXTENSION_NAME_BYTES`] cap, since names become filename components
+    /// (`{name}.wasm`, `{name}.capabilities.json`) and are embedded verbatim in
+    /// bounded listings (`tool_list`), so an unbounded name could both break
+    /// file storage and defeat any page's serialized budget.
+    pub(crate) fn validate_extension_name(name: &str) -> Result<(), ExtensionError> {
+        Self::validate_existing_extension_name(name)?;
+        if name.len() > MAX_EXTENSION_NAME_BYTES {
+            return Err(ExtensionError::InstallFailed(format!(
+                "Invalid extension name: {} bytes exceeds the {}-byte limit",
+                name.len(),
+                MAX_EXTENSION_NAME_BYTES
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a name addressing an *already installed* extension.
+    ///
+    /// The pre-WI#245 ingress accepted names of any length (only path
+    /// traversal/separators/NUL were rejected, and MCP config names are not
+    /// filename components), so a server saved before the 200-byte cap may
+    /// legitimately carry a longer name. Lifecycle operations on installed
+    /// extensions (activate/deactivate/toggle/remove/info/auth/configure/...)
+    /// must keep accepting those grandfathered names, or an upgraded tenant
+    /// could no longer manage — let alone remove — an extension that it can
+    /// still load and list. Traversal-shaped names remain rejected everywhere;
+    /// only the length cap is grandfathered (MR !1228 review finding).
+    pub(crate) fn validate_existing_extension_name(name: &str) -> Result<(), ExtensionError> {
         if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
             return Err(ExtensionError::InstallFailed(format!(
                 "Invalid extension name '{}': contains path separator or traversal characters",
@@ -5530,7 +5596,7 @@ impl ExtensionManager {
         name: &str,
         user_id: &str,
     ) -> Result<ExtensionSetupSchema, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
         match kind {
             ExtensionKind::WasmChannel => {
@@ -5652,7 +5718,7 @@ impl ExtensionManager {
         fields: &std::collections::HashMap<String, String>,
         user_id: &str,
     ) -> Result<ConfigureResult, ExtensionError> {
-        Self::validate_extension_name(name)?;
+        Self::validate_existing_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
 
         // Load allowed secret names and tool setup field definitions from capabilities.
@@ -6415,11 +6481,14 @@ mod tests {
     use crate::context::JobContext;
     use crate::extensions::ExtensionManager;
     use crate::extensions::manager::{
-        ActiveMcpServer, FallbackDecision, McpRecoveryCandidate, McpRecoveryClaim,
-        McpRuntimeHealth, build_wasm_channel_runtime_config_updates, combine_install_errors,
-        fallback_decision, infer_kind_from_url, join_or_abort_tasks, normalize_hosted_callback_url,
+        ActiveMcpServer, FallbackDecision, MAX_EXTENSION_NAME_BYTES, McpRecoveryCandidate,
+        McpRecoveryClaim, McpRuntimeHealth, build_wasm_channel_runtime_config_updates,
+        combine_install_errors, fallback_decision, infer_kind_from_url, join_or_abort_tasks,
+        normalize_hosted_callback_url,
     };
-    use crate::extensions::{ExtensionError, ExtensionKind, ExtensionSource, InstallResult};
+    use crate::extensions::{
+        ExtensionError, ExtensionKind, ExtensionSource, InstallResult, InstalledExtension,
+    };
     use crate::tools::{Tool, ToolError, ToolOutput};
 
     struct UnhealthyMcpTransport;
@@ -10327,5 +10396,209 @@ done
             Some("dcr-secret".to_string()),
             "non-builtin provider secret must be kept"
         );
+    }
+
+    fn sort_test_extension(name: &str, kind: ExtensionKind) -> InstalledExtension {
+        InstalledExtension {
+            name: name.to_string(),
+            kind,
+            display_name: None,
+            description: None,
+            url: None,
+            transport: None,
+            command: None,
+            placement: None,
+            authenticated: false,
+            active: false,
+            recovering: false,
+            enabled: None,
+            tools: Vec::new(),
+            needs_setup: false,
+            has_auth: false,
+            installed: true,
+            activation_error: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn extension_names_are_bounded_at_validation() {
+        // WI #245: a name longer than MAX_EXTENSION_NAME_BYTES could defeat
+        // every tool_list page budget (identifiers serialize verbatim) and
+        // overflows filename components. The bound is on bytes, not chars,
+        // because filenames are byte-oriented.
+        let at_bound = "n".repeat(MAX_EXTENSION_NAME_BYTES);
+        assert!(ExtensionManager::validate_extension_name(&at_bound).is_ok());
+
+        let over = "n".repeat(MAX_EXTENSION_NAME_BYTES + 1);
+        let error = ExtensionManager::validate_extension_name(&over)
+            .expect_err("oversized extension name must be rejected");
+        assert!(error.to_string().contains("byte limit"));
+
+        assert!(ExtensionManager::validate_extension_name("normal-name").is_ok());
+        assert!(ExtensionManager::validate_extension_name("a/b").is_err());
+        assert!(ExtensionManager::validate_extension_name("a\\b").is_err());
+        assert!(ExtensionManager::validate_extension_name("..").is_err());
+        assert!(ExtensionManager::validate_extension_name("a\0b").is_err());
+    }
+
+    #[test]
+    fn lifecycle_name_validation_grandfathers_long_installed_names() {
+        // MR !1228 review finding: names over MAX_EXTENSION_NAME_BYTES were
+        // installable before WI #245 (only traversal-shaped names were
+        // rejected, and MCP config names are not filename components), so
+        // already-installed extensions may carry them. Operations that
+        // address an installed extension must keep accepting the name;
+        // only new installs are bound.
+        let over = "n".repeat(MAX_EXTENSION_NAME_BYTES + 1);
+
+        assert!(
+            ExtensionManager::validate_existing_extension_name(&over).is_ok(),
+            "grandfathered over-bound name must pass lifecycle validation"
+        );
+        assert!(ExtensionManager::validate_extension_name(&over).is_err());
+
+        // The traversal class stays rejected on both paths — grandfathering
+        // is length-only.
+        for bad in ["a/b", "a\\b", "..", "a\0b"] {
+            assert!(ExtensionManager::validate_existing_extension_name(bad).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn grandfathered_long_named_mcp_server_stays_manageable() {
+        // MR !1228 review finding, end to end: a server persisted before the
+        // WI #245 length cap (seeded directly into the config store, as an
+        // upgraded tenant's would be) must remain listable, togglable,
+        // deactivatable, and — critically — removable after the upgrade.
+        let (store, dir) = make_test_store().await;
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store.clone()),
+        );
+
+        let long_name = "g".repeat(MAX_EXTENSION_NAME_BYTES + 61);
+        let mut config = crate::tools::mcp::McpServerConfig::new_wasm(
+            &long_name,
+            "/opt/lunarwing/does-not-exist.wasm",
+        );
+        config.enabled = true;
+        // Seed the pre-cap persisted config directly: install_mcp_config now
+        // enforces the ingress bound, which is exactly what must not block
+        // managing the already-persisted server.
+        crate::tools::mcp::config::persist_mcp_server_db(store.as_ref(), "test", config, false)
+            .await
+            .expect("seed pre-cap MCP config");
+
+        let listed = manager
+            .list(None, false, "test")
+            .await
+            .expect("list extensions");
+        assert!(
+            listed.iter().any(|e| e.name == long_name),
+            "grandfathered server must still be listed"
+        );
+
+        manager
+            .toggle_mcp(&long_name, "test")
+            .await
+            .expect("toggle grandfathered server");
+        manager
+            .deactivate(&long_name, "test")
+            .await
+            .expect("deactivate grandfathered server");
+
+        let removed = manager
+            .remove(&long_name, "test")
+            .await
+            .expect("remove grandfathered server");
+        assert!(
+            removed.contains("Removed"),
+            "removal reports success: {removed}"
+        );
+
+        let after = manager
+            .list(None, false, "test")
+            .await
+            .expect("list after removal");
+        assert!(
+            !after.iter().any(|e| e.name == long_name),
+            "grandfathered server is gone after removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_still_rejects_over_bound_mcp_installs() {
+        // The grandfathering above must not reopen new installs: the ingress
+        // bound stays enforced on the install path.
+        let (store, dir) = make_test_store().await;
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        );
+
+        let over = "i".repeat(MAX_EXTENSION_NAME_BYTES + 1);
+        let config = crate::tools::mcp::McpServerConfig::new_wasm(
+            &over,
+            "/opt/lunarwing/does-not-exist.wasm",
+        );
+        let error = manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect_err("new over-bound install must be rejected");
+        assert!(
+            error.to_string().contains("byte limit"),
+            "rejection cites the bound: {error}"
+        );
+    }
+
+    #[test]
+    fn extension_list_ordering_is_kind_then_case_insensitive_name() {
+        use crate::extensions::manager::extension_sort_key;
+
+        let mut entries = [
+            sort_test_extension("zeta_tool", ExtensionKind::WasmTool),
+            sort_test_extension("Beta_Server", ExtensionKind::McpServer),
+            sort_test_extension("alpha_channel", ExtensionKind::WasmChannel),
+            sort_test_extension("alpha_server", ExtensionKind::McpServer),
+            sort_test_extension("zeta_channel", ExtensionKind::WasmChannel),
+        ];
+        entries.sort_by_key(extension_sort_key);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "alpha_server",
+                "Beta_Server",
+                "zeta_tool",
+                "alpha_channel",
+                "zeta_channel",
+            ],
+            "MCP servers first, then WASM tools, then channels; names case-insensitive"
+        );
+    }
+
+    #[test]
+    fn extension_list_ordering_breaks_case_fold_ties_deterministically() {
+        // Finding 3 on MR !1221: distinct allowed names that fold to the same
+        // lowercase key must still get a total order, or HashMap-backed
+        // discovery can repeat/skip one across paginated calls.
+        use crate::extensions::manager::extension_sort_key;
+
+        let mut entries = [
+            sort_test_extension("alpha", ExtensionKind::McpServer),
+            sort_test_extension("ALPHA", ExtensionKind::McpServer),
+            sort_test_extension("Alpha", ExtensionKind::McpServer),
+            sort_test_extension("beta", ExtensionKind::McpServer),
+        ];
+        entries.sort_by_key(extension_sort_key);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["ALPHA", "Alpha", "alpha", "beta"]);
     }
 }
