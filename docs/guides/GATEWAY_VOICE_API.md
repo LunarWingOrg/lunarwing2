@@ -6,7 +6,7 @@ the gateway with their normal bearer token; the gateway holds the sidecar
 credential server-side (`VOICE_AUTH_TOKEN`) and clients never see it. This is
 the LunarWing-side half of desktop goal #19 (`lunarwing/lunarwing2desktop`).
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-28 (v2.1.3.0, WI#259).** The enabling knobs,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-28 (v2.1.3.0, WI#259); 2026-09-30 sidecar abandonment fencing (WI#264).** The enabling knobs,
 loopback-only `VOICE_SERVICE_URL` invariants, default sidecar port (8090), the
 422/503/504 status preservation, the synthesis-duration pre-flight, and the
 integration test were re-checked against `ic/src/channels/web/voice.rs` and
@@ -153,6 +153,13 @@ The sidecar's documented processing/overload statuses (422/503/504) keep their
 semantics end-to-end (WI#259): a desktop client can distinguish "this reply is
 too long to synthesize" from "the sidecar is down", which previously collapsed
 into one opaque 502.
+
+A sidecar 504 additionally means the underlying native inference may still be
+running with the caller gone (WI#264); the sidecar itself now fences that
+zombie: while the abandoned call drains, further synthesis attempts fail fast
+with 503 `unavailable` rather than queueing behind it, STT/VAD stay available,
+and the component re-admits itself once the call exits. Clients should retry
+503 synthesis with backoff; no gateway-side intervention is needed.
 
 ## Bounds and Security
 
