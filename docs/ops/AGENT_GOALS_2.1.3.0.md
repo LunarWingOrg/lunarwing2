@@ -165,10 +165,10 @@
     - MR !1229 review finding (note 4605, the sole finding and explicitly "not a code merge blocker") addressed in this re-attempt: `RELEASE-v2.1.3.0.md` compatibility table said "Wasmtime / wasmtime-wasi 36.0.14 (no change)" directly below the tool row this change updates, while the branch already pins 36.0.16 (item #39, RUSTSEC-2026-0314/0316); the row now states 36.0.16 with the advisory bump called out. The reviewer also confirmed the alias scoping itself was correct
     - Verified: 32/32 gitlab tool unit tests pass (incl. `issue_description_accepts_body_alias`, `body_alias_is_scoped_to_issue_write_actions`); clippy `--all-targets -D warnings` clean; rustfmt clean; `check-version-bumps.sh` against pre-change base passes (registry 0.1.5→0.1.6 OK); release `wasm32-wasip2` artifact builds. Live GitLab create_issue acceptance (real API call with `body`) remains an operator step; WI#266 itself is labeled 2.1.4.0
 50. [x] (S) test goal reconciler
-51. [ ] second pass of goal 19 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1234 - see comments on the MR for findings that must be addressed and re-attempt this, using the last MR attempts as a reference
+51. [ ] do another pass on goal 23 in order to update the draft of the release notes
 52. [x] (S) come back to ones that were marked for come back to later
-53. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
-54. [x] (S) Reserved
-55. [ ] do another pass on goal 23 in order to update the draft of the release notes
+53. [ ] (S) Reserved
+54. [ ] Work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
+55. [ ] (S) Reserved
 
 ---
