@@ -198,6 +198,9 @@ candidate job — the scan can only succeed after a candidate publishes
   local lockfile entry, and CI version expectation together. The WASM build
   uses `--locked`; its runtime compatibility job still requires a fresh
   artifact and the existing 10-million-fuel budget.
+  The host capabilities-schema test derives Cavepony's expected version from
+  its Cargo manifest, so valid tool releases do not leave a stale version
+  literal in `rust-test-lib`; WIT and no-host-capability assertions remain.
   Agreement alone does not satisfy `version-policy`: any change under a
   tool's source directory, including metadata or lockfile corrections, also
   needs a registry version newer than `CI_MERGE_REQUEST_DIFF_BASE_SHA`.
