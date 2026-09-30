@@ -1579,11 +1579,14 @@ tenant_daemon_pid() {
     local record="${RC_SVCDIR:-/run/openrc}/options/${svc}/child_pid"
     [[ -r "$record" ]] || return 1
     pid="$(cat -- "$record" 2>/dev/null)" || return 1
-    _daemon_pid_valid "$pid" || return 1
   else
     pid="$(_systemctl_user "$name" show "${svc}.service" -p MainPID --value 2>/dev/null || true)"
-    _daemon_pid_valid "${pid:-}" || return 1
   fi
+  # Validate the record as-written (only surrounding whitespace is ever
+  # removed), then canonicalize the trimmed value for downstream checks.
+  _daemon_pid_valid "$pid" || return 1
+  pid="${pid#"${pid%%[![:space:]]*}"}"
+  pid="${pid%"${pid##*[![:space:]]}"}"
 
   _daemon_pid_belongs_to_tenant "$pid" "$name" || return 1
   printf '%s\n' "$pid"
