@@ -453,6 +453,29 @@ def validate_worker_versions(errors: list[str]) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", value):
             errors.append(f"{label} must pin a full 40-hex-char commit, got {value!r}")
 
+    # The pebble patched-lock override must carry a canonical reviewed digest so
+    # every builder (plain docker/podman build, compose, mt-admin) passes the
+    # Dockerfile digest gate without extra wiring, and the committed file must
+    # actually hash to it — drift between the input and its pin fails validation
+    # here instead of only failing protected pipeline builds.
+    lock_override = ROOT / "pebble4lunarwing" / "upstream" / "Cargo.lock"
+    lock_digest = extract_arg_default(pebble_text, "PEBBLE_LOCK_SHA256")
+    if not lock_digest or not re.fullmatch(r"[0-9a-f]{64}", lock_digest):
+        errors.append(
+            "PEBBLE_LOCK_SHA256 must declare a canonical 64-hex-char digest default"
+        )
+    elif not lock_override.is_file():
+        errors.append("pebble4lunarwing/upstream/Cargo.lock build input missing")
+    else:
+        import hashlib
+
+        actual = hashlib.sha256(lock_override.read_bytes()).hexdigest()
+        if actual != lock_digest:
+            errors.append(
+                "pebble4lunarwing/upstream/Cargo.lock hashes to "
+                f"{actual!r} != Dockerfile PEBBLE_LOCK_SHA256 {lock_digest!r}"
+            )
+
     kimi_version = extract_arg_default(kimi_text, "KIMI_CODE_VERSION") or ""
     if not KIMI_CLI_LOCK.is_file():
         errors.append("kimicode4lunarwing/kimi-cli/package-lock.json missing")

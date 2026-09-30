@@ -38,7 +38,10 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 # the checked-out lock or the pinned digest drift from the reviewed inputs,
 # keeping the locked/reproducible-build guarantee.
 COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
-ARG PEBBLE_LOCK_SHA256
+# Canonical reviewed digest of the copied lock; every builder gets this default,
+# and CI's build-worker-image.sh recomputes and passes the same value so the two
+# can never silently diverge (validate_config.py enforces the agreement).
+ARG PEBBLE_LOCK_SHA256=056cc561f07d9b207ec76dec8ea7413110056ae3214a8e0058f71f917350025b
 RUN test "$(sha256sum /tmp/pebble-upstream-Cargo.lock | cut -d' ' -f1)" = "${PEBBLE_LOCK_SHA256}" && \
     python3 - <<'PY'
 import tomllib, pathlib, sys
