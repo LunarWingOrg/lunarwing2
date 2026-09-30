@@ -34,7 +34,7 @@
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/244 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1258
 8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
     - DONE 2026-09-30 (`aj/kimi-8-20260930-1200`, item 8): the goal-54 rollover fix was correct on the engine side, but the recurrence root cause sat in the host store. `HybridStore` never overrode `list_all_missions_global`/`list_all_active_missions_global`, so both inherited the trait default that derives from `list_all_projects()`. Missions load by directory scan (`engine/projects/*/missions/*/mission.json`) while projects load from `project.json`, so a mission whose project record was missing/unparseable loaded into the missions map but was invisible to every global listing — never bootstrapped into the active index, so no startup/tick rollover, no event/webhook dispatch, and `threads_today_date` pinned at its creation date (matches the dwarfstar `expected-behavior`/`canary-delta-m4t` evidence). Both globals now enumerate the missions map directly (same semantics the engine test store already had)
-    - Verified: new libsql regression `global_mission_listings_see_missions_whose_project_file_is_missing` (missions persisted without their project record remain globally enumerable; only Active ones reach the active-only listing) passes; full engine mission suite and lib clippy with `--all-features -D warnings` pass; `docs/architecture/ENGINE-V2.md` scheduling contract updated. Live dwarfstar acceptance (inspecting persisted `mission.json` after a day rollover) remains an operator step.
+    - Verified: new libsql regression `global_mission_listings_see_missions_whose_project_file_is_missing` (missions persisted without their project record remain globally enumerable; only Active ones reach the active-only listing) passes; full engine mission suite and lib clippy with `--all-features -D warnings` pass; `docs/architecture/ENGINE-V2.md` scheduling contract updated. Live dwarfstar acceptance (inspecting persisted `mission.json` after a day rollover) remains an operator step
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/220
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/184
@@ -52,7 +52,7 @@
 20. [ ] fix issues in CI/CD (if any)
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
 22. [x] (S) (H) Consider web gateway additional functionality (seperate from goal 38)
-23. [x] (S) new reconcile method for MR review process
+23. [x] (S) new reconcile routine method improvement for MR review process
 24. [x] (S) record deferred items somewhere in one place
 25. [ ] come up with ideas for names for 2.1.4.0 - write in a document in docs/ops
 26. [x] (S) (HUMAN) start thinking about scope of 2.1.6.0 next real feature set
