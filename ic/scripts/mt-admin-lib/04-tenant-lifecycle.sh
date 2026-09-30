@@ -1554,13 +1554,14 @@ openrc_service_state() {
 # (default rc_svcdir /run/openrc, overridable via RC_SVCDIR) — never from the
 # supervisor pidfile.
 #
-# PID records are validated BEFORE any cleanup: only surrounding whitespace is
-# stripped, so a record like "1234-not-a-number" is rejected instead of being
-# silently collapsed into the unrelated PID 1234 (WI#268 review). A resolved
-# PID is additionally checked for tenant association — owned by the tenant
-# user and carrying the tenant's home path in its command line — so a
-# stale-but-reused PID cannot pass an audit as this tenant's daemon
-# (WI#268 review). /proc/<pid> existence alone is never sufficient.
+# PID records are checked as byte streams BEFORE command substitution can
+# discard NULs; only surrounding whitespace is stripped. A resolved PID must
+# also be tenant-owned and /proc/<pid>/exe must match the canonical launch path
+# $(tenant_repo)/target/${PROFILE}/lunarwing used by both service renderers.
+# Neither a tenant path in arbitrary arguments nor a forged argv[0] establishes
+# daemon identity (WI#268 / !1276 review). Use the same LUNARWING_MT_PROFILE as
+# the rendered service (release by default); unreadable or changed executables
+# fail closed. /proc/<pid> existence alone is never sufficient.
 #
 # Prints the numeric PID and returns 0, or prints nothing and returns 1 when
 # the PID cannot be resolved (unit not running/unknown state, missing or
@@ -1578,21 +1579,32 @@ tenant_daemon_pid() {
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
     local record="${RC_SVCDIR:-/run/openrc}/options/${svc}/child_pid"
     [[ -r "$record" ]] || return 1
-    pid="$(cat -- "$record" 2>/dev/null)" || return 1
+    pid="$(cat -- "$record" 2>/dev/null | _daemon_pid_read_record)" || return 1
   else
-    pid="$(_systemctl_user "$name" show "${svc}.service" -p MainPID --value 2>/dev/null || true)"
+    pid="$(_systemctl_user "$name" show "${svc}.service" -p MainPID --value 2>/dev/null \
+      | _daemon_pid_read_record)" || return 1
   fi
-  # Validate the record as-written (only surrounding whitespace is ever
-  # removed), then canonicalize the trimmed value for downstream checks.
-  _daemon_pid_valid "$pid" || return 1
-  pid="${pid#"${pid%%[![:space:]]*}"}"
-  pid="${pid%"${pid##*[![:space:]]}"}"
 
   _daemon_pid_belongs_to_tenant "$pid" "$name" || return 1
   printf '%s\n' "$pid"
 }
 
-# Validate a raw PID record: only surrounding whitespace (including the
+# Read until EOF, using NUL as an explicit delimiter. read succeeds only when
+# it finds a NUL, so that success is a malformed-record failure. Unlike command
+# substitution, this sees the NUL before Bash can silently strip it. pipefail
+# in mt-admin also rejects producer errors, even if they emitted numeric data.
+_daemon_pid_read_record() {
+  local raw
+  if IFS= read -r -d '' raw; then
+    return 1
+  fi
+  _daemon_pid_valid "$raw" || return 1
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  printf '%s\n' "$raw"
+}
+
+# Validate a NUL-free PID record: only surrounding whitespace (including the
 # trailing newline OpenRC never writes but callers may add) may be removed.
 # Any embedded non-digit — including digits mixed with non-digits — makes the
 # record malformed and the probe fails (prints nothing, returns 1).
@@ -1603,14 +1615,14 @@ _daemon_pid_valid() {
 }
 
 _daemon_pid_belongs_to_tenant() {
-  local pid="$1" name="$2" uid cmdline
+  local pid="$1" name="$2" uid expected_exe actual_exe
   [[ -d "/proc/$pid" ]] || return 1
   uid="$(id -u "$name" 2>/dev/null)" || return 1
   [[ "$(stat -c %u "/proc/$pid" 2>/dev/null || echo -1)" == "$uid" ]] || return 1
-  cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" || return 1
-  [[ "$cmdline" == *"/lunarwing"* ]] || return 1
-  [[ "$cmdline" == *"$(tenant_home "$name")"* ]] || return 1
-  return 0
+  expected_exe="$(realpath -e -- "$(tenant_repo "$name")/target/${PROFILE}/lunarwing" 2>/dev/null)" \
+    || return 1
+  actual_exe="$(readlink -- "/proc/$pid/exe" 2>/dev/null)" || return 1
+  [[ "$actual_exe" == "$expected_exe" ]]
 }
 
 status_tenant() {
