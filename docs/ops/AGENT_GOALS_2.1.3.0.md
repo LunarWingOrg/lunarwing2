@@ -168,7 +168,9 @@
 51. [ ] do another pass on goal 23 in order to update the draft of the release notes
 52. [x] (S) come back to ones that were marked for come back to later
 53. [x] (S) Reserved
-54. [ ] Work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
+54. [x] Work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
+    - DONE 2026-09-30 (`cmc/g54/v2.1.3.0`): the existing spawn-time reset already precedes the quota gate; the stale persisted date comes from missions that never reach that reset (idle manual/event/webhook, not-yet-due cron, and early-return paths). Startup and every scheduler tick now persist UTC daily-budget rollover for all active cadences without spawning threads or shifting schedules. A shared helper preserves undated legacy counts and leaves same-day counts untouched. Startup and maintenance reload under the existing per-mission fire/update lock so a rollover cannot overwrite a concurrent quota reservation; failed tick saves are isolated and retried next tick. Paused/terminal missions are deliberately not swept. The scheduling contract is updated in `docs/architecture/ENGINE-V2.md`.
+    - Verified: engine library suite 636/636, including five new regressions for all idle cadences, startup/reload, same-day idempotence and legacy counts, failed-save recovery, concurrent tick/fire, and deterministic lock-boundary reload; engine `cargo check --locked` and all-targets clippy with `-D warnings` pass; workspace rustfmt and `git diff --check` pass. Live dwarfstar acceptance (inspecting the persisted `mission.json` after startup/day rollover) remains an operator step; no tenant services or data were modified.
 55. [x] (S) record deferred items somewhere in one place
 
 ---

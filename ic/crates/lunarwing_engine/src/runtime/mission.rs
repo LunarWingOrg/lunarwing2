@@ -301,6 +301,18 @@ fn refresh_next_fire_at(mission: &mut Mission, after: DateTime<Utc>) -> Result<(
     Ok(())
 }
 
+/// Stamp legacy counters conservatively; reset dated counters at a UTC boundary.
+fn rollover_daily_budget(mission: &mut Mission, today: chrono::NaiveDate) -> bool {
+    if mission.threads_today_date == Some(today) {
+        return false;
+    }
+    if mission.threads_today_date.is_some() {
+        mission.threads_today = 0;
+    }
+    mission.threads_today_date = Some(today);
+    true
+}
+
 async fn mission_lock(locks: &MissionLockRegistry, id: MissionId) -> Arc<MissionExecutionLock> {
     let mut locks = locks.lock().await;
     locks.retain(|_, lock| lock.strong_count() > 0);
@@ -454,7 +466,12 @@ impl MissionManager {
         self_improvement_on: bool,
     ) -> Result<usize, EngineError> {
         let mut active_ids = Vec::new();
-        for mut mission in missions {
+        for candidate in missions {
+            let lock = mission_lock(&self.fire_locks, candidate.id).await;
+            let _guard = lock.lock().await;
+            let Some(mut mission) = self.store.load_mission(candidate.id).await? else {
+                continue;
+            };
             if mission.status != MissionStatus::Active {
                 continue;
             }
@@ -465,11 +482,7 @@ impl MissionManager {
                 self.active.write().await.retain(|id| *id != mission.id);
                 continue;
             }
-            let mut changed = false;
-            if mission.threads_today_date.is_none() {
-                mission.threads_today_date = Some(Utc::now().date_naive());
-                changed = true;
-            }
+            let mut changed = rollover_daily_budget(&mut mission, Utc::now().date_naive());
             if matches!(mission.cadence, MissionCadence::Cron { .. })
                 && mission.next_fire_at.is_none()
             {
@@ -998,18 +1011,7 @@ impl MissionManager {
         let rollback_mission = mission.clone();
         let now = Utc::now();
         let today = now.date_naive();
-        let budget_date_changed = match mission.threads_today_date {
-            None => {
-                mission.threads_today_date = Some(today);
-                true
-            }
-            Some(date) if date != today => {
-                mission.threads_today = 0;
-                mission.threads_today_date = Some(today);
-                true
-            }
-            Some(_) => false,
-        };
+        let budget_date_changed = rollover_daily_budget(&mut mission, today);
         if advance_schedule {
             mission.next_fire_at = next_fire_for_cadence(&mission.cadence, now)?;
         }
@@ -2048,7 +2050,8 @@ impl MissionManager {
     /// Tick — check all active missions and fire any that are due.
     ///
     /// For `Cron` cadence missions, checks `next_fire_at` against current time.
-    /// For `Manual` missions, this is a no-op.
+    /// All active cadences receive durable UTC daily-budget maintenance,
+    /// even when no trigger arrives. Manual missions never auto-fire.
     /// Returns the IDs of threads spawned.
     pub async fn tick(&self, _fallback_user_id: &str) -> Result<Vec<ThreadId>, EngineError> {
         let active_ids = self.active.read().await.clone();
@@ -2059,11 +2062,11 @@ impl MissionManager {
             // Each mission is processed independently so that a load or fire
             // failure on one mission does not abort the remaining missions in
             // this tick cycle.
-            let mission = match self.store.load_mission(mid).await {
-                Ok(Some(m)) if m.status == MissionStatus::Active => m,
+            let mission = match self.load_active_mission_for_tick(mid).await {
+                Ok(Some(m)) => m,
                 Ok(_) => continue,
                 Err(e) => {
-                    warn!(mission_id = %mid, error = %e, "mission tick: load failed, skipping");
+                    warn!(mission_id = %mid, error = %e, "mission tick: budget maintenance/load failed, skipping");
                     continue;
                 }
             };
@@ -2102,6 +2105,26 @@ impl MissionManager {
         }
 
         Ok(spawned)
+    }
+
+    async fn load_active_mission_for_tick(
+        &self,
+        id: MissionId,
+    ) -> Result<Option<Mission>, EngineError> {
+        // Reload under the same lock as spawn reservations and mission updates:
+        // maintenance must not save a stale snapshot over a newly spent slot.
+        let lock = mission_lock(&self.fire_locks, id).await;
+        let _guard = lock.lock().await;
+        let Some(mut mission) = self.store.load_mission(id).await? else {
+            return Ok(None);
+        };
+        if mission.status != MissionStatus::Active {
+            return Ok(None);
+        }
+        if rollover_daily_budget(&mut mission, Utc::now().date_naive()) {
+            self.store.save_mission(&mission).await?;
+        }
+        Ok(Some(mission))
     }
 
     async fn spawn_mission_outcome_watcher(&self, mission_id: MissionId, thread_id: ThreadId) {
@@ -6862,6 +6885,235 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let mission = mgr.get_mission(id).await.unwrap().unwrap();
         assert_eq!(mission.threads_today, 1);
         assert_eq!(mission.threads_today_date, Some(Utc::now().date_naive()));
+    }
+
+    #[tokio::test]
+    async fn daily_budget_tick_rolls_over_idle_cadences_without_firing() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let today = Utc::now().date_naive();
+        let cadences = [
+            MissionCadence::Manual,
+            MissionCadence::OnEvent {
+                event_pattern: "hello".into(),
+            },
+            MissionCadence::OnSystemEvent {
+                source: "test".into(),
+                event_type: "ready".into(),
+            },
+            MissionCadence::Webhook {
+                path: "idle".into(),
+                secret: Some("test-secret".into()),
+            },
+            MissionCadence::Cron {
+                expression: "0 * * * *".into(),
+                timezone: None,
+            },
+        ];
+        let mut ids = Vec::new();
+        for (index, cadence) in cadences.into_iter().enumerate() {
+            let id = mgr
+                .create_mission(
+                    ProjectId::new(),
+                    "test-user",
+                    &format!("idle-{index}"),
+                    "no trigger",
+                    cadence,
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            let mut missions = store.missions.write().await;
+            let mission = missions.get_mut(&id).unwrap();
+            mission.threads_today = 30;
+            mission.threads_today_date = Some(today.pred_opt().unwrap());
+            mission.next_fire_at = Some(Utc::now() + chrono::Duration::hours(2));
+            ids.push((id, mission.next_fire_at));
+        }
+
+        assert!(mgr.tick("test-user").await.unwrap().is_empty());
+        for (id, schedule) in &ids {
+            let mission = store.load_mission(*id).await.unwrap().unwrap();
+            assert_eq!(mission.threads_today_date, Some(today));
+            assert_eq!(mission.threads_today, 0);
+            assert!(mission.thread_history.is_empty());
+            assert_eq!(mission.next_fire_at, *schedule);
+        }
+        // A second same-day tick must not even attempt to save unchanged rows.
+        *store.failing_mission_saves.write().await = ids.iter().map(|(id, _)| *id).collect();
+        assert!(mgr.tick("test-user").await.unwrap().is_empty());
+        assert_eq!(store.failing_mission_saves.read().await.len(), ids.len());
+    }
+
+    #[tokio::test]
+    async fn daily_budget_bootstrap_rollover_survives_reload_and_preserves_legacy_count() {
+        let store = Arc::new(TestStore::new());
+        let today = Utc::now().date_naive();
+        let project = ProjectId::new();
+        let mut dated = Mission::new(
+            project,
+            "test-user",
+            "dated",
+            "idle",
+            MissionCadence::Manual,
+        );
+        dated.threads_today = 30;
+        dated.threads_today_date = Some(today.pred_opt().unwrap());
+        let mut legacy = Mission::new(
+            project,
+            "test-user",
+            "legacy",
+            "idle",
+            MissionCadence::Manual,
+        );
+        legacy.threads_today = 30;
+        legacy.threads_today_date = None;
+        store.save_mission(&dated).await.unwrap();
+        store.save_mission(&legacy).await.unwrap();
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        assert_eq!(mgr.bootstrap_project(project).await.unwrap(), 2);
+        let reloaded = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        assert_eq!(reloaded.bootstrap_project(project).await.unwrap(), 2);
+        for (id, count) in [(dated.id, 0), (legacy.id, 30)] {
+            let mission = reloaded.get_mission(id).await.unwrap().unwrap();
+            assert_eq!(mission.threads_today_date, Some(today));
+            assert_eq!(mission.threads_today, count);
+            assert!(mission.thread_history.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn daily_budget_tick_retries_failed_rollover_and_keeps_same_day_counts() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let today = Utc::now().date_naive();
+        let mut ids = Vec::new();
+        for (name, date) in [
+            ("stale", Some(today.pred_opt().unwrap())),
+            ("legacy", None),
+            ("today", Some(today)),
+        ] {
+            let id = mgr
+                .create_mission(
+                    ProjectId::new(),
+                    "test-user",
+                    name,
+                    "idle",
+                    MissionCadence::Manual,
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            let mut missions = store.missions.write().await;
+            let mission = missions.get_mut(&id).unwrap();
+            mission.threads_today = 30;
+            mission.threads_today_date = date;
+            ids.push(id);
+        }
+        store.failing_mission_saves.write().await.push(ids[0]);
+        assert!(mgr.tick("test-user").await.unwrap().is_empty());
+        let stale = store.load_mission(ids[0]).await.unwrap().unwrap();
+        assert_eq!(stale.threads_today_date, Some(today.pred_opt().unwrap()));
+        assert_eq!(stale.threads_today, 30);
+        for id in &ids[1..] {
+            let mission = store.load_mission(*id).await.unwrap().unwrap();
+            assert_eq!(mission.threads_today_date, Some(today));
+            assert_eq!(mission.threads_today, 30);
+        }
+        assert!(mgr.tick("test-user").await.unwrap().is_empty());
+        assert_eq!(
+            store
+                .load_mission(ids[0])
+                .await
+                .unwrap()
+                .unwrap()
+                .threads_today,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_budget_tick_and_fire_preserve_the_reserved_slot() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager_with_response(Arc::clone(&store) as Arc<dyn Store>, "done");
+        let today = Utc::now().date_naive();
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "concurrent rollover",
+                "run",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut missions = store.missions.write().await;
+            let mission = missions.get_mut(&id).unwrap();
+            mission.max_threads_per_day = 1;
+            mission.threads_today = 1;
+            mission.threads_today_date = Some(today.pred_opt().unwrap());
+        }
+        let (tick, first, second) = tokio::join!(
+            mgr.tick("test-user"),
+            mgr.fire_mission(id, "test-user", None),
+            mgr.fire_mission(id, "test-user", None),
+        );
+        assert!(tick.unwrap().is_empty());
+        assert_eq!(
+            [first.unwrap(), second.unwrap()]
+                .into_iter()
+                .flatten()
+                .count(),
+            1
+        );
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.threads_today_date, Some(today));
+        assert_eq!(mission.threads_today, 1);
+        assert_eq!(mission.thread_history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn daily_budget_tick_waits_for_reservation_and_reloads_under_lock() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "locked rollover",
+                "idle",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let today = Utc::now().date_naive();
+        let mut mission = store.load_mission(id).await.unwrap().unwrap();
+        mission.threads_today = 30;
+        mission.threads_today_date = Some(today.pred_opt().unwrap());
+        store.save_mission(&mission).await.unwrap();
+
+        let lock = mission_lock(&mgr.fire_locks, id).await;
+        let guard = lock.lock().await;
+        let tick = mgr.tick("test-user");
+        tokio::pin!(tick);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut tick)
+                .await
+                .is_err()
+        );
+        // Model a fire's durable reservation while maintenance is waiting.
+        mission.threads_today_date = Some(today);
+        mission.threads_today = 1;
+        mission.record_thread(ThreadId::new());
+        store.save_mission(&mission).await.unwrap();
+        drop(guard);
+        assert!(tick.await.unwrap().is_empty());
+        let persisted = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(persisted.threads_today, 1);
+        assert_eq!(persisted.thread_history, mission.thread_history);
     }
 
     #[tokio::test]
