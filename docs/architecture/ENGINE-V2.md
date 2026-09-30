@@ -1022,6 +1022,20 @@ default **1800s (30 minutes)**. Values outside the inclusive range **30s to
 shorter than the 60-second gate sweep can observe; the upper bound prevents
 unsigned-to-signed wraparound and Chrono duration overflow (WI#115).
 
+**Prompt-overlay audit and operator lifecycle (WI#268).** The full contract —
+overlay storage identity and bridge path, the three gated writers, consumption
+semantics, the existing-thread retention caveat, safe enable/disable, and a
+read-only tenant inspection runbook (`mt-admin daemon-pid` / `mt-admin psql`)
+— is published in
+`docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
+`ORCHESTRATOR_SELF_MODIFY` unset or any value other than `true`/`1` makes
+stored overlays inert regardless of database contents; `SKILL_SELF_IMPROVEMENT`
+(the new-tenant provisioning default) is a separate flag and never authorizes
+prompt alteration; disabling the gate does not rewrite System messages already
+persisted in existing threads; and on OpenRC the daemon's live environment is
+probed via OpenRC's `child_pid` record — never the supervise-daemon pidfile,
+which holds the supervisor's PID.
+
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time. `supervised_timeout_secs` (the fixed 300s fail-closed approval auto-deny) has no env override.
 
 **WI#88 timeout policy — intentional, not deferred (closes Kageho's "double-timeout" review question).** The orchestrator's hardcoded policy for the two timeout surfaces that work item #88 exposed is by design: every deferred tool join and every deferred LLM join awaited in a `ResolveFutures` round is bounded by the *same* hardcoded deadline — `tool_async_timeout_secs` (default 300s, env escape hatch `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS`) — so the round's two suspended surfaces, deferred tool joins and deferred LLM joins (the two hang shapes #88 reported), share one fixed "double-applied" deadline. On expiry the wedged task is aborted and the call resolves back to the model as an ordinary tool/LLM error; the orchestrator does not retry the future, re-arm it with a larger deadline, or split the deadline per surface. Christopher's answer to Kageho's "unblock the double-timeout knob (or document it as deferred)" review question is that this single fixed deadline covering both suspended surfaces is **intentional, not deferred** — a split knob (separate tool-vs-LLM deadlines) or a retry/re-arm-with-larger-deadline policy was considered and deliberately rejected — so future readers should treat the hardcoded 2-surface/one-deadline policy as a settled decision and not re-litigate it without fresh evidence that the 300s default causes real user harm.
