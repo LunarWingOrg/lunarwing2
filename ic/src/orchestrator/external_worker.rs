@@ -1729,7 +1729,7 @@ fn is_heartbeat_line(line: &str) -> bool {
 }
 
 /// Whether a streamed progress *frame* carries only synthetic keep-alive
-/// content (WI#267 / !1237 finding 1).
+/// content (WI#267 / !1237 finding 1 / !1239 finding 1).
 ///
 /// The read loop's evidence gate needs a frame-level predicate: a delta that
 /// is entirely heartbeat lines contributes nothing genuine to
@@ -1740,11 +1740,26 @@ fn is_heartbeat_line(line: &str) -> bool {
 /// not gate the evidence buffer or it would also discard the opencode
 /// executors' `[worker] Transient provider failure; retrying …` diagnostics,
 /// which are real evidence of what the worker was doing when it timed out.
+///
+/// At least one actual heartbeat line is required before a frame counts as
+/// heartbeat-only (!1239 finding 1): the opencode2 executor forwards raw,
+/// untrimmed `session.text.delta` strings, so whitespace-only frames (`" "`,
+/// `"\n"`) are genuine stream separators between real content. Treating them
+/// as heartbeat-only collapsed `["alpha", " ", "beta", "\n", "gamma"]` into
+/// `"alphabetagamma"`, corrupting timeout evidence instead of preserving it.
 fn is_heartbeat_only_frame(delta: &str) -> bool {
+    let mut saw_heartbeat = false;
     delta.lines().all(|line| {
         let trimmed = line.trim();
-        trimmed.is_empty() || is_heartbeat_line(trimmed)
-    })
+        if is_heartbeat_line(trimmed) {
+            saw_heartbeat = true;
+            true
+        } else {
+            // Whitespace-only lines are neutral — they carry no keep-alive
+            // signal and must not, on their own, mark the frame heartbeat-only.
+            trimmed.is_empty()
+        }
+    }) && saw_heartbeat
 }
 
 /// Remove synthetic worker-heartbeat lines from a worker-supplied output
@@ -2202,7 +2217,18 @@ mod tests {
         assert!(is_heartbeat_only_frame(
             "[worker] Still waiting for OpenCode/model response; task remains active.\n"
         ));
-        assert!(is_heartbeat_only_frame(""));
+        assert!(is_heartbeat_only_frame(
+            "  [worker] Still waiting for Kimi Code response; task remains active.  \n\n"
+        ));
+        // !1239 finding 1: a frame must carry an actual heartbeat line to be
+        // heartbeat-only. Whitespace-only frames are genuine stream
+        // separators (the opencode2 executor forwards raw, untrimmed
+        // `session.text.delta` strings) and empty deltas carry nothing —
+        // neither may be dropped from the evidence buffer.
+        assert!(!is_heartbeat_only_frame(""));
+        assert!(!is_heartbeat_only_frame(" "));
+        assert!(!is_heartbeat_only_frame("\n"));
+        assert!(!is_heartbeat_only_frame(" \n \n  "));
 
         // …while genuine `[worker] `-prefixed diagnostics stay in the buffer.
         let transient =
@@ -2219,6 +2245,37 @@ mod tests {
             buffer.push_str(transient);
         }
         assert_eq!(buffer, transient);
+    }
+
+    /// !1239 finding 1 regression: the evidence gate must preserve
+    /// whitespace-only progress frames. The opencode2 executor forwards raw,
+    /// untrimmed `session.text.delta` strings, so separators arrive as their
+    /// own `" "` / `"\n"` frames between genuine deltas; dropping them
+    /// concatenated the surrounding words and corrupted the recovered
+    /// evidence (`"alpha beta\ngamma"` became `"alphabetagamma"`).
+    #[test]
+    fn whitespace_only_frames_are_preserved_in_the_evidence_buffer() {
+        // Simulate the read loop's progress handling on a delta stream with
+        // whitespace separators as standalone frames — exact opencode2 shape.
+        let frames = ["alpha", " ", "beta", "\n", "gamma"];
+        let mut accumulated_output = String::new();
+        for delta in frames {
+            if !is_heartbeat_only_frame(delta) {
+                accumulated_output.push_str(delta);
+            }
+        }
+        assert_eq!(accumulated_output, "alpha beta\ngamma");
+
+        // A heartbeat interleaved with genuine separators stays excluded
+        // without eating the separators around it.
+        let heartbeat = "[worker] Still waiting for OpenCode/model response; task remains active.";
+        let mut mixed = String::new();
+        for delta in ["one\n", heartbeat, "\ntwo"] {
+            if !is_heartbeat_only_frame(delta) {
+                mixed.push_str(delta);
+            }
+        }
+        assert_eq!(mixed, "one\n\ntwo");
     }
 
     /// WI#267: the companion case to the short-genuine-output finding. The
