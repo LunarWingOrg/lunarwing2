@@ -2053,6 +2053,31 @@ impl Store for HybridStore {
             .collect())
     }
 
+    /// Global mission listings must enumerate the missions map directly.
+    ///
+    /// The trait default derives both globals from `list_all_projects()`, but
+    /// missions are discovered by directory scan (`engine/projects/*/missions/
+    /// */mission.json`) and a mission whose `project.json` is missing or
+    /// unparseable still loads into the map — its project does not. Such a
+    /// mission was invisible to every global listing, so it never entered the
+    /// active index: no startup/tick daily-budget rollover, no event or webhook
+    /// dispatch, and `threads_today_date` pinned at its creation date forever
+    /// (WI#243 recurrence after the goal-54 rollover fix).
+    async fn list_all_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
+        Ok(self.missions.read().await.values().cloned().collect())
+    }
+
+    async fn list_all_active_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
+        Ok(self
+            .missions
+            .read()
+            .await
+            .values()
+            .filter(|mission| mission.status == MissionStatus::Active)
+            .cloned()
+            .collect())
+    }
+
     async fn update_mission_status(
         &self,
         id: MissionId,
@@ -2638,6 +2663,94 @@ title: \"old doc\"\n\
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn global_mission_listings_see_missions_whose_project_file_is_missing() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::MissionStatus;
+
+        // WI#243 recurrence: a mission whose project.json never loads must
+        // still be enumerable by the global listings the mission manager
+        // bootstraps from — otherwise it never receives daily-budget
+        // rollover or dispatch and threads_today_date pins forever.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("mission-global-list.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "mission-global-list-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+
+        let project = Project::new("test-user", "orphan host", "test");
+        let mut active_mission = Mission::new(
+            project.id,
+            "test-user",
+            "orphan active",
+            "still needs rollover",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        active_mission.threads_today_date =
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 29).expect("static date"));
+        let mut paused_mission = Mission::new(
+            project.id,
+            "test-user",
+            "orphan paused",
+            "not dispatched",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        paused_mission.status = MissionStatus::Paused;
+
+        // Persist both missions, but never the project — its project.json is
+        // absent, exactly like a tenant whose project record failed to load.
+        store
+            .save_mission(&active_mission)
+            .await
+            .expect("save active mission");
+        store
+            .save_mission(&paused_mission)
+            .await
+            .expect("save paused mission");
+        assert!(
+            store.load_project(project.id).await.unwrap().is_none(),
+            "fixture requires the project record to be absent"
+        );
+
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        let global = reloaded
+            .list_all_missions_global()
+            .await
+            .expect("list all missions globally");
+        assert!(
+            global.iter().any(|m| m.id == active_mission.id),
+            "active mission with missing project must appear in the global listing"
+        );
+        assert!(
+            global.iter().any(|m| m.id == paused_mission.id),
+            "paused mission with missing project must appear in the global listing"
+        );
+
+        let active_global = reloaded
+            .list_all_active_missions_global()
+            .await
+            .expect("list all active missions globally");
+        assert!(
+            active_global
+                .iter()
+                .any(|m| m.id == active_mission.id && m.status == MissionStatus::Active),
+            "active mission with missing project must be bootstrappable"
+        );
+        assert!(
+            !active_global.iter().any(|m| m.id == paused_mission.id),
+            "paused mission must not be reported active"
         );
     }
 
