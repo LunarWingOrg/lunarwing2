@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1](https://github.com/rust-lang/cc-rs/compare/cc-v1.5.0...cc-v1.5.1) - 2026-09-25
+
+### Fixed
+
+- link the static C++ stdlib with `-bundle`, once per `Build` ([#1955](https://github.com/rust-lang/cc-rs/pull/1955))
+
+### Other
+
+- Use lp64d ABI for Redox riscv64 ([#1953](https://github.com/rust-lang/cc-rs/pull/1953))
+
+## [1.5.0](https://github.com/rust-lang/cc-rs/compare/cc-v1.4.7...cc-v1.5.0) - 2026-09-25
+
+### Added
+
+- inherit x86 target features from RUSTFLAGS ([#1948](https://github.com/rust-lang/cc-rs/pull/1948))
+
+### Fixed
+
+- don't report the file name cl.exe echoes as a warning in expand() ([#1950](https://github.com/rust-lang/cc-rs/pull/1950))
+- ignore MSVC `/link` flags with a warning ([#1949](https://github.com/rust-lang/cc-rs/pull/1949))
+- Make `windows_sys` more private and re-export types needed by cc-rs ([#1944](https://github.com/rust-lang/cc-rs/pull/1944))
+- pass -Tp on MSVC for .cc so they are not treated as objects ([#1930](https://github.com/rust-lang/cc-rs/pull/1930))
+
+### Other
+
+- document macOS SDKROOT and Xcode CLT for testing ([#1943](https://github.com/rust-lang/cc-rs/pull/1943))
+- remove License section from CONTRIBUTING.md ([#1942](https://github.com/rust-lang/cc-rs/pull/1942))
+- add CONTRIBUTING.md and Conventional Commit PR title check ([#1938](https://github.com/rust-lang/cc-rs/pull/1938))
+
+### Fixed
+
+- Pass `-Tp` immediately before `.cc` sources on MSVC (not clang-cl) when compiling C++ so they are not treated as object files ([#1877](https://github.com/rust-lang/cc-rs/issues/1877))
+
+## [1.4.7](https://github.com/rust-lang/cc-rs/compare/cc-v1.4.6...cc-v1.4.7) - 2026-09-18
+
+### Fixed
+
+- strip OUT_DIR from the object file name hash too ([#1902](https://github.com/rust-lang/cc-rs/pull/1902))
+- search_is_some clippy lint ([#1903](https://github.com/rust-lang/cc-rs/pull/1903))
+
+### Other
+
+- Regenerate target info ([#1924](https://github.com/rust-lang/cc-rs/pull/1924))
+- Regenerate windows sys bindings ([#1919](https://github.com/rust-lang/cc-rs/pull/1919))
+- Fix target info parsing ([#1911](https://github.com/rust-lang/cc-rs/pull/1911))
+- Add Z80 and SM83 target support ([#1900](https://github.com/rust-lang/cc-rs/pull/1900))
+
+## [1.4.6](https://github.com/rust-lang/cc-rs/compare/cc-v1.4.5...cc-v1.4.6) - 2026-09-11
+
+### Fixed
+
+- Prevent check_exe from dropping flags on the floor. ([#1884](https://github.com/rust-lang/cc-rs/pull/1884))
+- update fd handling to use BorrowedFd ([#1882](https://github.com/rust-lang/cc-rs/pull/1882))
+
+### Other
+
+- *(deps)* bump taiki-e/install-action from 2.87.2 to 2.87.4 ([#1888](https://github.com/rust-lang/cc-rs/pull/1888))
+- Regenerate target info ([#1891](https://github.com/rust-lang/cc-rs/pull/1891))
+- *(deps)* bump tombi-toml/setup-tombi from 1.5.0 to 1.5.1 ([#1890](https://github.com/rust-lang/cc-rs/pull/1890))
+- *(deps)* bump release-plz/action from 0.5.131 to 0.5.132 ([#1889](https://github.com/rust-lang/cc-rs/pull/1889))
+- Fix ci(test): make sure right toolchain is passed ([#1892](https://github.com/rust-lang/cc-rs/pull/1892))
+- *(deps)* bump tombi-toml/setup-tombi from 1.2.5 to 1.5.0 ([#1885](https://github.com/rust-lang/cc-rs/pull/1885))
+- *(deps)* bump taiki-e/install-action from 2.85.5 to 2.87.2 ([#1886](https://github.com/rust-lang/cc-rs/pull/1886))
+- add toml formatting check ([#1879](https://github.com/rust-lang/cc-rs/pull/1879))
+
+## [1.4.5](https://github.com/rust-lang/cc-rs/compare/cc-v1.4.4...cc-v1.4.5) - 2026-09-04
+
+### Fixed
+
+- probe flag support without OUT_DIR via tempfile ([#1875](https://github.com/rust-lang/cc-rs/pull/1875))
+
+### Other
+
+- simplify conditional logic using `then` method ([#1860](https://github.com/rust-lang/cc-rs/pull/1860))
+
+### Fixed
+
+- Probe flag support without `OUT_DIR` via tempfile, so `flag_if_supported` no longer silently drops flags outside Cargo build scripts ([#1875](https://github.com/rust-lang/cc-rs/pull/1875))
+
+## [1.4.4](https://github.com/rust-lang/cc-rs/compare/cc-v1.4.3...cc-v1.4.4) - 2026-08-21
+
+### Fixed
+
+- honour `Build::env` overrides in Android llvm-ar probe ([#1868](https://github.com/rust-lang/cc-rs/pull/1868))
+- honour `Build::env` overrides in flag support and compiler family detection probes ([#1866](https://github.com/rust-lang/cc-rs/pull/1866))
+
 ## [1.4.3](https://github.com/rust-lang/cc-rs/compare/cc-v1.4.2...cc-v1.4.3) - 2026-08-14
 
 ### Other

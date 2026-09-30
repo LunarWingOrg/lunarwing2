@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.83"
 name = "async-compression"
-version = "0.4.43"
+version = "0.4.49"
 authors = [
     "Wim Looman <wim@nemo157.com>",
     "Allen Bui <fairingrey@gmail.com>",
@@ -38,6 +38,14 @@ resolver = "2"
 
 [package.metadata.docs.rs]
 all-features = true
+rustc-args = [
+    "--cfg",
+    "async_compression_unstable",
+]
+rustdoc-args = [
+    "--cfg",
+    "async_compression_unstable",
+]
 
 [features]
 all = [
@@ -62,6 +70,7 @@ all-implementations = [
     "tokio",
 ]
 brotli = ["compression-codecs/brotli"]
+brotli-mbrotli = ["compression-codecs/brotli-mbrotli"]
 bzip2 = ["compression-codecs/bzip2"]
 deflate = ["compression-codecs/deflate"]
 deflate64 = ["compression-codecs/deflate64"]
@@ -122,6 +131,11 @@ path = "tests/brotli.rs"
 required-features = ["brotli"]
 
 [[test]]
+name = "brotli-mbrotli"
+path = "tests/brotli-mbrotli.rs"
+required-features = ["brotli-mbrotli"]
+
+[[test]]
 name = "bzip2"
 path = "tests/bzip2.rs"
 required-features = ["bzip2"]
@@ -130,6 +144,14 @@ required-features = ["bzip2"]
 name = "deflate"
 path = "tests/deflate.rs"
 required-features = ["deflate"]
+
+[[test]]
+name = "deflate64"
+path = "tests/deflate64.rs"
+required-features = [
+    "deflate64",
+    "tokio",
+]
 
 [[test]]
 name = "gzip"
@@ -182,10 +204,10 @@ required-features = [
 ]
 
 [dependencies.compression-codecs]
-version = "0.4.38"
+version = "0.4.44"
 
 [dependencies.compression-core]
-version = "0.4.32"
+version = "0.4.33"
 
 [dependencies.futures-io]
 version = "0.3"
@@ -226,7 +248,7 @@ version = "0.3.5"
 version = "0.4.2"
 
 [dev-dependencies.libzstd]
-version = "0.13.1"
+version = "0.14.0"
 default-features = false
 package = "zstd"
 
@@ -261,12 +283,18 @@ features = ["io"]
 default-features = false
 
 [dev-dependencies.zstd-safe]
-version = "7"
+version = "8"
 default-features = false
-
-[lints.rust]
-rust_2018_idioms = "deny"
 
 [lints.rust.missing_debug_implementations]
 level = "deny"
 priority = -1
+
+[lints.rust.rust_2018_idioms]
+level = "deny"
+priority = -1
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(async_compression_unstable)"]

@@ -5,7 +5,7 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use quinn::{RecvStream, SendStream, VarInt};
 use tracing::debug;
 
@@ -200,18 +200,23 @@ impl QuicStream {
         // bytes.  This maximum size is enforced by the use of a 2-octet message length field in DNS
         // over TCP [RFC1035] and DoT [RFC7858], and by the definition of the
         // "application/dns-message" for DoH [RFC8484].  DoQ enforces the same restriction.
-        let mut bytes = BytesMut::with_capacity(len);
-        bytes.resize(len, 0);
-        if let Err(e) = self.receive_stream.read_exact(&mut bytes[..len]).await {
-            debug!("received bad packet len: {} bytes: {:?}", len, bytes);
-
-            if let Err(error) = self.reset(DoqErrorCode::ProtocolError) {
-                debug!(%error, "stream already closed");
+        let mut bytes = BytesMut::with_capacity(512);
+        let mut left = len;
+        while left > 0 {
+            match self.receive_stream.read_chunk(left, true).await {
+                Ok(Some(chunk)) => {
+                    left -= chunk.bytes.len();
+                    bytes.put(chunk.bytes);
+                }
+                Ok(None) => {
+                    return Err(NetError::QuinnReadError(
+                        quinn::ReadExactError::FinishedEarly(bytes.len()),
+                    ));
+                }
+                Err(e) => return Err(NetError::QuinnReadError(e.into())),
             }
-            return Err(NetError::from(e));
         }
 
-        debug!("received packet len: {} bytes: {:x?}", len, bytes);
         Ok(bytes)
     }
 

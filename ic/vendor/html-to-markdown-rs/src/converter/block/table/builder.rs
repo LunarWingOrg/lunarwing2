@@ -6,9 +6,37 @@
 use std::borrow::Cow;
 
 use super::cell::{collect_table_cells, get_colspan};
-use super::cells::{CellTextCache, append_layout_row, collect_row_cell_widths, convert_table_row};
+use super::cells::{CellTextCache, RowEnv, append_layout_row, collect_row_cell_widths, convert_table_row};
 use super::scanner::{TableScan, scan_table};
 use super::utils::{is_tag_name, normalized_tag_name};
+
+/// Return the content cell of a one-cell layout wrapper containing a nested table.
+/// Stop at that cell, so nested data headers do not give the wrapper table semantics.
+fn nested_table_wrapper_cell(
+    tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    scan: &TableScan,
+) -> Option<(tl::NodeHandle, usize)> {
+    if scan.row_counts != [1] || scan.nested_table_count == 0 || scan.has_span || !scan.has_text {
+        return None;
+    }
+    let mut cell = None;
+    let mut pending: Vec<_> = tag.children().top().iter().map(|handle| (*handle, 1)).collect();
+    while let Some((handle, depth)) = pending.pop() {
+        let Some(tl::Node::Tag(child)) = handle.get(parser) else {
+            continue;
+        };
+        match child.name().as_utf8_str().to_ascii_lowercase().as_str() {
+            "td" if cell.is_none() => cell = Some((handle, depth)),
+            "thead" | "tbody" | "tfoot" | "tr" => {
+                pending.extend(child.children().top().iter().map(|handle| (*handle, depth + 1)));
+            }
+            _ => return None,
+        }
+    }
+    cell
+}
+
 /// Maximum allowed table columns to prevent unbounded memory usage.
 const MAX_TABLE_COLS: usize = 1000;
 
@@ -174,21 +202,30 @@ pub fn handle_table(
         }
 
         let table_scan = scan_table(node_handle, parser, dom_ctx);
+        // Keep the normal table renderer at the traversal boundary: it emits the
+        // truncated table structure and records the usual depth-limit warning.
+        let wrapper_cell = nested_table_wrapper_cell(tag, parser, &table_scan).filter(|(_, cell_depth)| {
+            depth + cell_depth + 1 < crate::converter::main_helpers::effective_max_depth(options)
+        });
         let row_count = table_scan.row_counts.len();
-        let mut distinct_counts: Vec<_> = table_scan.row_counts.iter().copied().filter(|c| *c > 0).collect();
-        distinct_counts.sort_unstable();
-        distinct_counts.dedup();
 
         let has_border_zero = tag
             .attributes()
             .get("border")
             .is_some_and(|v| v.as_ref().is_some_and(|b| b.as_utf8_str() == "0"));
-        let looks_like_layout =
-            table_scan.nested_table_count > 1 || distinct_counts.len() > 1 || (table_scan.has_span && has_border_zero);
+        // ~keep issue #500: ragged row lengths (rows with differing cell counts) used to be
+        // ~keep treated as layout on their own. A headerless table with ragged rows is
+        // ~keep ordinary tabular data far more often than it is an email-signature-style
+        // ~keep layout table, and the regular renderer already pads short rows to the table's
+        // ~keep column count (issue #13), so ragged rows alone no longer classify a table as
+        // ~keep layout. Layout still triggers on nested tables, colspan/rowspan combined with
+        // ~keep `border="0"`, a blank table, or a short table dense with links.
+        let looks_like_layout = table_scan.nested_table_count > 1 || (table_scan.has_span && has_border_zero);
         let link_count = table_scan.link_count;
         let is_blank_table = !table_scan.has_text;
 
-        if !table_scan.has_header
+        if wrapper_cell.is_none()
+            && !table_scan.has_header
             && !table_scan.has_caption
             && (looks_like_layout || is_blank_table || (row_count <= 2 && link_count >= 3))
         {
@@ -206,13 +243,33 @@ pub fn handle_table(
                                 if let Some(tl::Node::Tag(row_tag)) = row_handle.get(parser) {
                                     let row_tag_name = normalized_tag_name(row_tag.name().as_utf8_str());
                                     if matches!(row_tag_name.as_ref(), "tr" | "row") {
-                                        append_layout_row(row_handle, parser, output, options, ctx, dom_ctx, depth + 1);
+                                        append_layout_row(
+                                            row_handle,
+                                            output,
+                                            RowEnv {
+                                                parser,
+                                                options,
+                                                ctx,
+                                                dom_ctx,
+                                            },
+                                            depth + 1,
+                                        );
                                     }
                                 }
                             }
                         }
                         "tr" | "row" => {
-                            append_layout_row(child_handle, parser, output, options, ctx, dom_ctx, depth + 1);
+                            append_layout_row(
+                                child_handle,
+                                output,
+                                RowEnv {
+                                    parser,
+                                    options,
+                                    ctx,
+                                    dom_ctx,
+                                },
+                                depth + 1,
+                            );
                         }
                         "colgroup" | "col" => {}
                         _ => {
@@ -237,204 +294,256 @@ pub fn handle_table(
             return;
         }
 
-        let mut row_index = 0;
-        // ~keep The header separator row's column count must cover every row's width, not
-        // ~keep just the first row: a later row with more actual cells than the header
-        // ~keep ("ragged" table) would otherwise render a separator declaring fewer columns
-        // ~keep than that row provides, and GFM-compliant renderers silently drop cells past
-        // ~keep the declared column count (issue #13).
-        let total_cols = table_total_columns(node_handle, parser, dom_ctx);
-        let mut rowspan_tracker = vec![None; total_cols];
-
-        let reuse_cell_text = !options.compact_tables && cell_text_reuse_allowed(ctx, &table_scan);
-        let mut cell_cache = CellTextCache::new(reuse_cell_text);
-
-        // ~keep Pre-pass: compute per-column max content widths for aligned padding.
-        // ~keep Uses a rowspan tracker so spanned columns are skipped just as they
-        // ~keep are in the render pass, keeping column indices correctly aligned.
-        // ~keep Skipped entirely when compact_tables is true — passing an empty slice
-        // ~keep to convert_table_row disables all padding and reduces separator dashes
-        // ~keep to the GFM minimum (---).
-        let col_widths: Vec<usize> = if options.compact_tables {
-            Vec::new()
-        } else {
-            // ~keep Exactly one walk of a cell may reach each collector, and the context's
-            // ~keep collector handles are `Rc`s that `..ctx.clone()` shares rather than copies.
-            // ~keep With reuse on, the render pass emits this pass's cached markdown without
-            // ~keep walking the cell again, so this pass is that one walk and keeps the handles.
-            // ~keep With reuse off the render pass walks and records, so the handles are detached
-            // ~keep here — the width measurement is an internal detail and must not be visible in
-            // ~keep `ConversionResult`. Detaching propagates to the whole subtree because every
-            // ~keep nested context is built from this one by `..clone()`.
-            // ~keep For the structure and inline-image collectors the reuse-on branch is
-            // ~keep unreachable rather than merely unused: `cell_text_reuse_allowed` returns false
-            // ~keep whenever either is set, so neither can ever be the pass that records. The
-            // ~keep guard is kept so the two rules stay coupled if that function changes.
-            let mut prepass_ctx = super::super::super::Context {
-                skip_visitor_hooks: true,
-                measure_width_only: true,
-                ..ctx.clone()
-            };
-            if !reuse_cell_text {
-                #[cfg(feature = "metadata")]
-                {
-                    prepass_ctx.metadata_collector = None;
-                }
-                prepass_ctx.structure_collector = None;
-                #[cfg(feature = "inline-images")]
-                {
-                    prepass_ctx.inline_collector = None;
+        if let Some((cell_handle, cell_depth)) = wrapper_cell {
+            if let Some(tl::Node::Tag(cell)) = cell_handle.get(parser) {
+                for child in cell.children().top().iter() {
+                    super::super::super::walk_node(
+                        child,
+                        parser,
+                        output,
+                        options,
+                        ctx,
+                        depth + cell_depth + 1,
+                        dom_ctx,
+                    );
                 }
             }
-            let mut widths: Vec<usize> = Vec::new();
-            let mut prepass_rowspan: Vec<Option<usize>> = vec![None; total_cols];
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                    let tag_name = normalized_tag_name(child_tag.name().as_utf8_str());
-                    match tag_name.as_ref() {
-                        "thead" | "tbody" | "tfoot" => {
-                            for row_handle in child_tag.children().top().iter() {
-                                if is_tag_name(row_handle, parser, dom_ctx, "tr") {
-                                    collect_row_cell_widths(
-                                        row_handle,
-                                        parser,
-                                        options,
-                                        &prepass_ctx,
-                                        dom_ctx,
-                                        &mut widths,
-                                        &mut prepass_rowspan,
-                                        &mut cell_cache,
-                                        depth + 1,
-                                    );
-                                }
-                            }
-                        }
-                        "tr" | "row" => {
-                            collect_row_cell_widths(
-                                child_handle,
-                                parser,
-                                options,
-                                &prepass_ctx,
-                                dom_ctx,
-                                &mut widths,
-                                &mut prepass_rowspan,
-                                &mut cell_cache,
-                                depth + 1,
-                            );
-                        }
-                        _ => {}
+        } else {
+            let mut row_index = 0;
+            // ~keep The header separator row's column count must cover every row's width, not
+            // ~keep just the first row: a later row with more actual cells than the header
+            // ~keep ("ragged" table) would otherwise render a separator declaring fewer columns
+            // ~keep than that row provides, and GFM-compliant renderers silently drop cells past
+            // ~keep the declared column count (issue #13).
+            let total_cols = table_total_columns(node_handle, parser, dom_ctx);
+            let mut rowspan_tracker = vec![None; total_cols];
+
+            let reuse_cell_text = !options.compact_tables && cell_text_reuse_allowed(ctx, &table_scan);
+            let mut cell_cache = CellTextCache::new(reuse_cell_text);
+            // ~keep Populated by `convert_table_row` when a row's sole cell holds a nested
+            // ~keep table (issue #484): rendered separately, after this table, instead of
+            // ~keep being flattened into a line of escaped pipes.
+            let mut deferred_tables: Vec<String> = Vec::new();
+
+            // ~keep Pre-pass: compute per-column max content widths for aligned padding.
+            // ~keep Uses a rowspan tracker so spanned columns are skipped just as they
+            // ~keep are in the render pass, keeping column indices correctly aligned.
+            // ~keep Skipped entirely when compact_tables is true — passing an empty slice
+            // ~keep to convert_table_row disables all padding and reduces separator dashes
+            // ~keep to the GFM minimum (---).
+            let col_widths: Vec<usize> = if options.compact_tables {
+                Vec::new()
+            } else {
+                // ~keep Exactly one walk of a cell may reach each collector, and the context's
+                // ~keep collector handles are `Rc`s that `..ctx.clone()` shares rather than copies.
+                // ~keep With reuse on, the render pass emits this pass's cached markdown without
+                // ~keep walking the cell again, so this pass is that one walk and keeps the handles.
+                // ~keep With reuse off the render pass walks and records, so the handles are detached
+                // ~keep here — the width measurement is an internal detail and must not be visible in
+                // ~keep `ConversionResult`. Detaching propagates to the whole subtree because every
+                // ~keep nested context is built from this one by `..clone()`.
+                // ~keep For the structure and inline-image collectors the reuse-on branch is
+                // ~keep unreachable rather than merely unused: `cell_text_reuse_allowed` returns false
+                // ~keep whenever either is set, so neither can ever be the pass that records. The
+                // ~keep guard is kept so the two rules stay coupled if that function changes.
+                let mut prepass_ctx = super::super::super::Context {
+                    skip_visitor_hooks: true,
+                    measure_width_only: true,
+                    ..ctx.clone()
+                };
+                if !reuse_cell_text {
+                    #[cfg(feature = "metadata")]
+                    {
+                        prepass_ctx.metadata_collector = None;
+                    }
+                    prepass_ctx.structure_collector = None;
+                    #[cfg(feature = "inline-images")]
+                    {
+                        prepass_ctx.inline_collector = None;
                     }
                 }
-            }
-            widths
-        };
-
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                    let tag_name: Cow<'_, str> = dom_ctx.tag_info(child_handle.get_inner(), parser).map_or_else(
-                        || normalized_tag_name(child_tag.name().as_utf8_str()).into_owned().into(),
-                        |info| Cow::Borrowed(info.name.as_str()),
-                    );
-
-                    match tag_name.as_ref() {
-                        "caption" => {
-                            let mut text = String::new();
-                            let grandchildren = child_tag.children();
-                            {
-                                for grandchild_handle in grandchildren.top().iter() {
-                                    super::super::super::walk_node(
-                                        grandchild_handle,
-                                        parser,
-                                        &mut text,
-                                        options,
-                                        ctx,
-                                        depth + 1,
-                                        dom_ctx,
-                                    );
+                let mut widths: Vec<usize> = Vec::new();
+                let mut prepass_rowspan: Vec<Option<usize>> = vec![None; total_cols];
+                let children = tag.children();
+                for child_handle in children.top().iter() {
+                    if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
+                        let tag_name = normalized_tag_name(child_tag.name().as_utf8_str());
+                        match tag_name.as_ref() {
+                            "thead" | "tbody" | "tfoot" => {
+                                for row_handle in child_tag.children().top().iter() {
+                                    if is_tag_name(row_handle, parser, dom_ctx, "tr") {
+                                        collect_row_cell_widths(
+                                            row_handle,
+                                            RowEnv {
+                                                parser,
+                                                options,
+                                                ctx: &prepass_ctx,
+                                                dom_ctx,
+                                            },
+                                            &mut widths,
+                                            &mut prepass_rowspan,
+                                            &mut cell_cache,
+                                            depth + 1,
+                                        );
+                                    }
                                 }
                             }
-                            let text = text.trim();
-                            if !text.is_empty() {
-                                let escaped_text = text.replace('-', r"\-");
-                                output.push('*');
-                                output.push_str(&escaped_text);
-                                output.push_str("*\n\n");
+                            "tr" | "row" => {
+                                collect_row_cell_widths(
+                                    child_handle,
+                                    RowEnv {
+                                        parser,
+                                        options,
+                                        ctx: &prepass_ctx,
+                                        dom_ctx,
+                                    },
+                                    &mut widths,
+                                    &mut prepass_rowspan,
+                                    &mut cell_cache,
+                                    depth + 1,
+                                );
                             }
+                            _ => {}
                         }
+                    }
+                }
+                widths
+            };
 
-                        "thead" | "tbody" | "tfoot" => {
-                            let is_header_section = tag_name.as_ref() == "thead";
-                            let section_children = child_tag.children();
-                            {
-                                for row_handle in section_children.top().iter() {
-                                    if let Some(tl::Node::Tag(row_tag)) = row_handle.get(parser) {
-                                        let row_tag_name = dom_ctx
-                                            .tag_name_for(*row_handle, parser)
-                                            .unwrap_or_else(|| normalized_tag_name(row_tag.name().as_utf8_str()));
-                                        if matches!(row_tag_name.as_ref(), "tr" | "row") {
-                                            convert_table_row(
-                                                row_handle,
-                                                parser,
-                                                output,
-                                                options,
-                                                ctx,
-                                                row_index,
-                                                table_scan.has_span,
-                                                &mut rowspan_tracker,
-                                                total_cols,
-                                                total_cols,
-                                                dom_ctx,
-                                                depth + 1,
-                                                is_header_section,
-                                                &col_widths,
-                                                &mut cell_cache,
-                                            );
-                                            row_index += 1;
+            let children = tag.children();
+            {
+                for child_handle in children.top().iter() {
+                    if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
+                        let tag_name: Cow<'_, str> = dom_ctx.tag_info(child_handle.get_inner(), parser).map_or_else(
+                            || normalized_tag_name(child_tag.name().as_utf8_str()).into_owned().into(),
+                            |info| Cow::Borrowed(info.name.as_str()),
+                        );
+
+                        match tag_name.as_ref() {
+                            "caption" => {
+                                let mut text = String::new();
+                                let grandchildren = child_tag.children();
+                                {
+                                    for grandchild_handle in grandchildren.top().iter() {
+                                        super::super::super::walk_node(
+                                            grandchild_handle,
+                                            parser,
+                                            &mut text,
+                                            options,
+                                            ctx,
+                                            depth + 1,
+                                            dom_ctx,
+                                        );
+                                    }
+                                }
+                                let text = text.trim();
+                                if !text.is_empty() {
+                                    let escaped_text = text.replace('-', r"\-");
+                                    output.push('*');
+                                    output.push_str(&escaped_text);
+                                    output.push_str("*\n\n");
+                                }
+                            }
+
+                            "thead" | "tbody" | "tfoot" => {
+                                let is_header_section = tag_name.as_ref() == "thead";
+                                let section_children = child_tag.children();
+                                {
+                                    for row_handle in section_children.top().iter() {
+                                        if let Some(tl::Node::Tag(row_tag)) = row_handle.get(parser) {
+                                            let row_tag_name = dom_ctx
+                                                .tag_name_for(*row_handle, parser)
+                                                .unwrap_or_else(|| normalized_tag_name(row_tag.name().as_utf8_str()));
+                                            if matches!(row_tag_name.as_ref(), "tr" | "row") {
+                                                let row_emitted = convert_table_row(
+                                                    row_handle,
+                                                    parser,
+                                                    output,
+                                                    options,
+                                                    ctx,
+                                                    row_index,
+                                                    table_scan.has_span,
+                                                    &mut rowspan_tracker,
+                                                    total_cols,
+                                                    total_cols,
+                                                    dom_ctx,
+                                                    depth + 1,
+                                                    is_header_section,
+                                                    &col_widths,
+                                                    &mut cell_cache,
+                                                    &mut deferred_tables,
+                                                );
+                                                // ~keep Only advance the row counter for a row
+                                                // ~keep that actually emitted output -- a
+                                                // ~keep cell-less row (issue #489) must not
+                                                // ~keep consume the header slot.
+                                                if row_emitted {
+                                                    row_index += 1;
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        "tr" | "row" => {
-                            convert_table_row(
-                                child_handle,
-                                parser,
-                                output,
-                                options,
-                                ctx,
-                                row_index,
-                                table_scan.has_span,
-                                &mut rowspan_tracker,
-                                total_cols,
-                                total_cols,
-                                dom_ctx,
-                                depth + 1,
-                                row_index == 0,
-                                &col_widths,
-                                &mut cell_cache,
-                            );
-                            row_index += 1;
-                        }
+                            "tr" | "row" => {
+                                let row_emitted = convert_table_row(
+                                    child_handle,
+                                    parser,
+                                    output,
+                                    options,
+                                    ctx,
+                                    row_index,
+                                    table_scan.has_span,
+                                    &mut rowspan_tracker,
+                                    total_cols,
+                                    total_cols,
+                                    dom_ctx,
+                                    depth + 1,
+                                    row_index == 0,
+                                    &col_widths,
+                                    &mut cell_cache,
+                                    &mut deferred_tables,
+                                );
+                                // ~keep Only advance the row counter for a row that actually
+                                // ~keep emitted output -- a cell-less row (issue #489) must
+                                // ~keep not consume the header slot.
+                                if row_emitted {
+                                    row_index += 1;
+                                }
+                            }
 
-                        "colgroup" | "col" => {}
+                            "colgroup" | "col" => {}
 
-                        _ => {
-                            super::super::super::walk_node(
-                                child_handle,
-                                parser,
-                                output,
-                                options,
-                                ctx,
-                                depth + 1,
-                                dom_ctx,
-                            );
+                            _ => {
+                                super::super::super::walk_node(
+                                    child_handle,
+                                    parser,
+                                    output,
+                                    options,
+                                    ctx,
+                                    depth + 1,
+                                    dom_ctx,
+                                );
+                            }
                         }
                     }
                 }
+            }
+
+            // ~keep Render each deferred nested table (issue #484) as its own separate GFM
+            // ~keep table, immediately after this one. GFM cannot express real nesting, so
+            // ~keep this is the closest usable substitute to what 3.8.3 rendered before the
+            // ~keep escaped-flatten fallback (issue #469) took over this shape too.
+            for nested in &deferred_tables {
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                if !output.ends_with("\n\n") {
+                    output.push('\n');
+                }
+                output.push_str(nested);
+                output.push('\n');
             }
         }
 

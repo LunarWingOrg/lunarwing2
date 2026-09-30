@@ -160,37 +160,20 @@ pub(super) async fn udp_client_stream_bad_id_test(
     .await;
 }
 
-/// Test udp_client_stream response limit (3 max).
-#[allow(clippy::print_stdout)]
-pub(super) async fn udp_client_stream_response_limit_test(
+pub(super) async fn udp_client_stream_empty_question_section_test(
     server_addr: IpAddr,
     provider: impl RuntimeProvider,
 ) {
     udp_client_stream_test_inner(
         server_addr,
         provider,
-        "udp_client_stream_response_limit",
+        "udp_client_stream_empty_question_section_test",
         1,
-        4,
-        |idx, message| {
-            // Replace the query in all but the final response message.
-            // We should skip through reading the first three responses, and then error
-            // before looking at the fourth correct response.
-            if idx < 3 {
-                message.queries.clear();
-                message.add_query(Query::query(
-                    Name::from_str("wrong.name.").unwrap(),
-                    RecordType::A,
-                ));
-            }
-        },
-        |response| {
-            // The test should pass when we get a UDP receive limit exceeded error.
-            matches!(
-                response,
-                Err(NetError::Message("udp receive attempts exceeded"))
-            )
-        },
+        1,
+        // Send a response with an empty question section.
+        |_, message| message.queries.clear(),
+        // We expect to see a timeout after waiting for a response with a matching question section.
+        |response_res| matches!(response_res, Err(NetError::Timeout)),
     )
     .await;
 }

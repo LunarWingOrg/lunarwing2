@@ -6,21 +6,21 @@ use std::{
     future::Future,
     marker::PhantomData,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use deadpool_runtime::Runtime;
+use deadpool_runtime::{Runtime, timeout};
 use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::{
-    managed::{
-        dropguard::DropGuard, hooks::Hooks, object::ObjectInner, Manager, Metrics, Object,
-        PoolBuilder, PoolConfig, PoolError, QueueMode, TimeoutType, Timeouts,
-    },
     Status,
+    managed::{
+        Manager, Metrics, Object, PoolBuilder, PoolConfig, PoolError, QueueMode, TimeoutType,
+        Timeouts, dropguard::DropGuard, hooks::Hooks, object::ObjectInner,
+    },
 };
 
 /// Generic object and connection pool.
@@ -242,7 +242,7 @@ impl<M: Manager, W: From<Object<M>>> Pool<M, W> {
      * Resize the pool. This change the `max_size` of the pool dropping
      * excess objects and/or making space for new ones.
      *
-     * If the pool is closed this method does nothing. The [`Pool::status`] method
+     * If the pool is closed this method does nothing. The [`Pool::status()`] method
      * always reports a `max_size` of 0 for closed pools.
      */
     pub fn resize(&self, max_size: usize) {
@@ -416,8 +416,8 @@ pub(crate) struct PoolInner<M: Manager> {
     manager: M,
     next_id: AtomicUsize,
     slots: Mutex<Slots<ObjectInner<M>>>,
-    /// Number of ['Pool'] users. A user is both a future which is waiting for an ['Object'] or one
-    /// with an ['Object'] which hasn't been returned, yet.
+    /// Number of [`Pool`] users. A user is both a future which is waiting for an [`Object`] or one
+    /// with an [`Object`] which hasn't been returned, yet.
     users: AtomicUsize,
     semaphore: Semaphore,
     config: PoolConfig,
@@ -509,8 +509,7 @@ async fn apply_timeout<O, E>(
 ) -> Result<O, PoolError<E>> {
     match (runtime, duration) {
         (_, None) => future.await.map_err(Into::into),
-        (Some(runtime), Some(duration)) => runtime
-            .timeout(duration, future)
+        (Some(runtime), Some(duration)) => timeout(runtime, duration, future)
             .await
             .ok_or(PoolError::Timeout(timeout_type))?
             .map_err(Into::into),

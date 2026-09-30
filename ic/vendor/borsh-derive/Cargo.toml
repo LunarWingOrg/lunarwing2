@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.77.0"
 name = "borsh-derive"
-version = "1.8.0"
+version = "1.8.1"
 authors = ["Near Inc <hello@nearprotocol.com>"]
 build = false
 exclude = ["*.snap"]
@@ -61,7 +61,7 @@ version = "1"
 version = "1"
 
 [dependencies.syn]
-version = "2.0.81"
+version = "3.0"
 features = [
     "full",
     "fold",
@@ -71,10 +71,10 @@ features = [
 version = "1.29.0"
 
 [dev-dependencies.prettyplease]
-version = "0.2.9"
+version = "0.3"
 
 [dev-dependencies.syn]
-version = "2.0.81"
+version = "3.0"
 features = [
     "full",
     "fold",

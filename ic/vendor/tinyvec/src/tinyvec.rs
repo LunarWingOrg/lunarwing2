@@ -1,8 +1,7 @@
 use super::*;
 
-use alloc::vec::{self, Vec};
+use alloc::vec::{Drain, Vec};
 use core::convert::TryFrom;
-use tinyvec_macros::impl_mirrored;
 
 #[cfg(feature = "rustc_1_57")]
 use alloc::collections::TryReserveError;
@@ -13,6 +12,27 @@ use core::marker::PhantomData;
 use serde_core::de::{Deserialize, Deserializer, SeqAccess, Visitor};
 #[cfg(feature = "serde")]
 use serde_core::ser::{Serialize, SerializeSeq, Serializer};
+
+macro_rules! impl_mirrored {
+  {
+  type Mirror = $tinyname:ident;
+  $(
+    $(#[$attr:meta])*
+    $v:vis fn $fname:ident ($seif:ident : $seifty:ty $(,$argname:ident : $argtype:ty)*) $(-> $ret:ty)? ;
+  )*
+  } => {
+    $(
+    $(#[$attr])*
+    #[inline(always)]
+    $v fn $fname($seif : $seifty, $($argname: $argtype),*) $(-> $ret)? {
+      match $seif {
+        $tinyname::Inline(i) => i.$fname($($argname),*),
+        $tinyname::Heap(h) => h.$fname($($argname),*),
+      }
+    }
+    )*
+  };
+}
 
 /// Helper to make a `TinyVec`.
 ///
@@ -46,7 +66,7 @@ macro_rules! tiny_vec {
           f($crate::array_vec!($array_type => $($elem),*))
         }
         $crate::TinyVecConstructor::Heap(f) => {
-          f(vec!($($elem),*))
+          f($crate::alloc::vec![$($elem),*])
         }
       }
     }
@@ -684,6 +704,33 @@ impl<A: Array> TinyVec<A> {
     }
   }
 
+  /// Makes a default-initialized TinyVec with the given initial length.
+  ///
+  /// If the requested length is less than or equal to the array capacity you
+  /// get an inline vec. If it's greater than you get a heap vec.
+  /// ```
+  /// # use tinyvec::*;
+  /// let t = TinyVec::<[u8; 10]>::with_initial_len(5);
+  /// assert!(t.is_inline());
+  /// assert_eq!(t.len(), 5);
+  ///
+  /// let t = TinyVec::<[u8; 10]>::with_initial_len(20);
+  /// assert!(t.is_heap());
+  /// assert_eq!(t.len(), 20);
+  /// ```
+  #[inline]
+  #[must_use]
+  pub fn with_initial_len(len: usize) -> Self
+  where
+    A::Item: Clone,
+  {
+    if len <= A::CAPACITY {
+      TinyVec::Inline(ArrayVec::from_array_len(A::default(), len))
+    } else {
+      TinyVec::Heap(alloc::vec![A::Item::default(); len])
+    }
+  }
+
   /// Converts a `TinyVec<[T; N]>` into a `Box<[T]>`.
   ///
   /// - For `TinyVec::Heap(Vec<T>)`, it takes the `Vec<T>` and converts it into
@@ -1281,7 +1328,7 @@ pub enum TinyVecDrain<'p, A: Array> {
   #[allow(missing_docs)]
   Inline(ArrayVecDrain<'p, A::Item>),
   #[allow(missing_docs)]
-  Heap(vec::Drain<'p, A::Item>),
+  Heap(Drain<'p, A::Item>),
 }
 
 impl<'p, A: Array> Iterator for TinyVecDrain<'p, A> {

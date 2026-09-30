@@ -275,8 +275,23 @@ pub fn with_in_background<T: AsRef<OsStr>>(
 /// the program ends up to be blocking or want to out-live your app
 ///
 /// See documentation of [`that()`] for more details.
+///
+/// ## Platform-specific
+///
+/// - **macOS**: `/usr/bin/open` already hands the target off to LaunchServices and
+///   returns. Extra double-fork detachment (`spawn_detached`) is unnecessary and
+///   leaves unreaped zombie children. This function therefore waits for `open`
+///   itself, matching [`with_detached()`].
 pub fn that_detached(path: impl AsRef<OsStr>) -> io::Result<()> {
-    #[cfg(any(not(feature = "shellexecute-on-windows"), not(windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        that(path)
+    }
+
+    #[cfg(all(
+        not(target_os = "macos"),
+        any(not(feature = "shellexecute-on-windows"), not(windows))
+    ))]
     {
         let mut last_err = None;
         for mut cmd in commands(path) {
@@ -342,7 +357,10 @@ impl IntoResult<io::Result<()>> for io::Result<std::process::ExitStatus> {
 
 trait CommandExt {
     fn status_without_output(&mut self) -> io::Result<std::process::ExitStatus>;
-    #[cfg_attr(feature = "shellexecute-on-windows", allow(dead_code))]
+    #[cfg_attr(
+        any(target_os = "macos", feature = "shellexecute-on-windows"),
+        allow(dead_code)
+    )]
     fn spawn_detached(&mut self) -> io::Result<()>;
 }
 
@@ -354,31 +372,43 @@ impl CommandExt for Command {
             .status()
     }
 
+    #[cfg_attr(
+        any(target_os = "macos", feature = "shellexecute-on-windows"),
+        allow(dead_code)
+    )]
     fn spawn_detached(&mut self) -> io::Result<()> {
-        // This is pretty much lifted from the implementation in Alacritty:
-        // https://github.com/alacritty/alacritty/blob/b9c886872d1202fc9302f68a0bedbb17daa35335/alacritty/src/daemon.rs
+        // Based on Alacritty's cross-platform daemon implementation:
+        // https://github.com/alacritty/alacritty/blob/52031ea91980cee1ee0ec087d214e98b2b1de4bc/alacritty/src/daemon.rs
 
         self.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
         #[cfg(unix)]
-        unsafe {
-            use std::os::unix::process::CommandExt as _;
+        {
+            unsafe {
+                use std::os::unix::process::CommandExt as _;
 
-            self.pre_exec(move || {
-                match libc::fork() {
-                    -1 => return Err(io::Error::last_os_error()),
-                    0 => (),
-                    _ => libc::_exit(0),
-                }
+                self.pre_exec(|| {
+                    // POSIX.1-2024 replaces `fork` with the async-signal-safe `_Fork`, but macOS
+                    // does not support it. Since we do not register fork handlers, `fork` remains
+                    // suitable for the POSIX.1-2017 systems supported here.
+                    match libc::fork() {
+                        -1 => return Err(io::Error::last_os_error()),
+                        0 => (),
+                        _ => libc::_exit(0),
+                    }
 
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
+                    if libc::setsid() == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
 
-                Ok(())
-            });
+                    Ok(())
+                });
+            }
+
+            // Reap the intermediate child created by the double-fork.
+            self.spawn()?.wait().map(|_| ())
         }
         #[cfg(windows)]
         {
@@ -386,9 +416,9 @@ impl CommandExt for Command {
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             self.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        }
 
-        self.spawn().map(|_| ())
+            self.spawn().map(|_| ())
+        }
     }
 }
 
@@ -438,3 +468,35 @@ mod wsl;
     target_os = "hurd"
 ))]
 mod unix;
+
+#[cfg(test)]
+mod command_ext_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn spawn_detached_does_not_wait_for_target() {
+        const CHILD: &str = "OPEN_RS_DETACHED_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::sleep(Duration::from_secs(3));
+            return;
+        }
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "command_ext_tests::spawn_detached_does_not_wait_for_target",
+            ])
+            .env(CHILD, "1");
+
+        let start = Instant::now();
+        command.spawn_detached().unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "spawn_detached must return before its detached target exits, but took {:?}",
+            elapsed
+        );
+    }
+}

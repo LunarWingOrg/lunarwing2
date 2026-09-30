@@ -10,10 +10,10 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2018"
-rust-version = "1.70.0"
+edition = "2024"
+rust-version = "1.85"
 name = "string_cache"
-version = "0.9.0"
+version = "0.11.0"
 authors = ["The Servo Project Developers"]
 build = false
 autolib = false
@@ -26,6 +26,10 @@ documentation = "https://docs.rs/string_cache"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/servo/string-cache"
+
+[features]
+default = ["serde_support"]
+serde_support = ["serde"]
 
 [lib]
 name = "string_cache"
@@ -52,7 +56,7 @@ version = "1.0.2"
 version = "0.12"
 
 [dependencies.phf_shared]
-version = "0.13"
+version = "0.14"
 
 [dependencies.precomputed-hash]
 version = "0.1"
@@ -60,7 +64,3 @@ version = "0.1"
 [dependencies.serde]
 version = "1"
 optional = true
-
-[features]
-default = ["serde_support"]
-serde_support = ["serde"]

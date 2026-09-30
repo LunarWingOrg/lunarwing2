@@ -93,6 +93,13 @@ const _: () = {
     #[cfg(target_os = "emscripten")]
     #[link_section = "__wasm_bindgen_emscripten_marker"]
     static __WASM_BINDGEN_EMSCRIPTEN_MARKER: [u8; 1] = [1];
+
+    /// A custom data section telling the CLI that the runtime was built with
+    /// `--cfg wasm_bindgen_unstable_jspi`, so JSPI on Emscripten goes through
+    /// its lifecycle hooks rather than wasm-bindgen's own stack management.
+    #[cfg(all(target_os = "emscripten", wasm_bindgen_unstable_jspi))]
+    #[link_section = "__wasm_bindgen_emscripten_jspi_marker"]
+    static __WASM_BINDGEN_EMSCRIPTEN_JSPI_MARKER: [u8; 1] = [1];
 };
 
 macro_rules! externs {
@@ -145,7 +152,7 @@ mod externref;
 use externref::__wbindgen_externref_heap_live_count;
 
 pub use crate::__rt::marker::ErasableGeneric;
-pub use crate::convert::{IntoJsGeneric, JsGeneric};
+pub use crate::convert::{IntoJsGeneric, JsGeneric, JsStringLike};
 
 #[doc(hidden)]
 pub mod handler;
@@ -1320,7 +1327,15 @@ externs! {
         fn __wbindgen_object_drop_ref(idx: u32) -> ();
 
         fn __wbindgen_describe(v: u32) -> ();
-        fn __wbindgen_describe_cast(func: *const (), prims: *const ()) -> *const ();
+        // Marker terminating a descriptor function, signaling to the CLI that
+        // the parent function is a monomorphisation to be discovered,
+        // interpreted, and rewritten to a manufactured JS binding. The
+        // descriptor stream preceding this call carries a length-prefixed
+        // `shim` key followed by the concrete `FUNCTION` signature for this
+        // monomorphisation. A non-empty key identifies which generic-import AST
+        // entry supplies the JS binding metadata; an empty key marks a `wbg_cast`
+        // identity adapter (see `__rt::wbg_cast`).
+        fn __wbindgen_describe_generic_import(func: *const (), prims: *const ()) -> *const ();
     }
 }
 
@@ -1844,13 +1859,12 @@ impl JsError {
     }
 }
 
-#[cfg(feature = "std")]
 impl<E> From<E> for JsError
 where
-    E: std::error::Error,
+    E: core::error::Error,
 {
     fn from(error: E) -> Self {
-        use std::string::ToString;
+        use alloc::string::ToString;
 
         JsError::new(&error.to_string())
     }

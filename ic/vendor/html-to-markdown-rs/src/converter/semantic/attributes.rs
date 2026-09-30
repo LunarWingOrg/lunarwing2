@@ -97,7 +97,7 @@ pub fn handle_abbr(
         if !trimmed.is_empty() {
             output.push_str(trimmed);
 
-            if let Some(title) = tag.attributes().get("title").flatten().map(|v| v.as_utf8_str()) {
+            if let Some(title) = crate::converter::utility::attributes::decoded_attribute(tag, "title") {
                 let trimmed_title = title.trim();
                 if !trimmed_title.is_empty() {
                     output.push_str(" (");
@@ -217,11 +217,18 @@ pub fn handle_q(
         }
 
         let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            output.push('"');
-            output.push_str(trimmed);
-            output.push('"');
+        if trimmed.is_empty() {
+            // ~keep issue #481: `<q>` wraps in quotes, which a whitespace-only body has
+            // ~keep nothing to wrap -- but the body is still the word separator the source
+            // ~keep wrote, and dropping it outright joined the words either side together.
+            if !content.is_empty() {
+                crate::converter::inline::wrapped::emit_whitespace_only_inline_body(&content, output);
+            }
+            return;
         }
+        output.push('"');
+        output.push_str(trimmed);
+        output.push('"');
     }
 }
 

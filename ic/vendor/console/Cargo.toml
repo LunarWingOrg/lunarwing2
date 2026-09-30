@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.71"
 name = "console"
-version = "0.16.4"
+version = "0.16.6"
 build = false
 include = [
     "CHANGELOG.md",
@@ -21,6 +21,7 @@ include = [
     "LICENSE",
     "README.md",
     "src/**/*.rs",
+    "tests/data/sample_zellij_session.log",
 ]
 autolib = false
 autobins = false

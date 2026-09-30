@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.56"
 name = "termimad"
-version = "0.35.1"
+version = "0.35.5"
 authors = ["dystroy <denys.seguret@gmail.com>"]
 build = false
 autolib = false
@@ -122,6 +122,30 @@ path = "examples/text/main.rs"
 [[example]]
 name = "text-template"
 path = "examples/text-template/main.rs"
+
+[[test]]
+name = "fit"
+path = "tests/fit.rs"
+
+[[test]]
+name = "issue_80_codeblock_wrap"
+path = "tests/issue_80_codeblock_wrap.rs"
+
+[[test]]
+name = "parse"
+path = "tests/parse.rs"
+
+[[test]]
+name = "skin_serde"
+path = "tests/skin_serde.rs"
+
+[[test]]
+name = "tables"
+path = "tests/tables.rs"
+
+[[test]]
+name = "wrap"
+path = "tests/wrap.rs"
 
 [dependencies.coolor]
 version = "1.1.0"

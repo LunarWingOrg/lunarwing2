@@ -9,6 +9,7 @@
 
 use crate::converter::Context;
 use crate::converter::dom_context::DomContext;
+use crate::converter::inline::wrapped::emit_code_span;
 use crate::converter::main::walk_node;
 use crate::converter::text::dedent_code_block;
 use crate::options::ConversionOptions;
@@ -119,7 +120,12 @@ pub fn handle_code(
 
         let trimmed = &content;
 
-        if !content.trim().is_empty() {
+        // ~keep issue #481: an all-whitespace body is NOT an empty one. `<code> </code>` is a
+        // ~keep code span whose content is a space, and CommonMark spells that exactly --
+        // ~keep `format_inline_code`'s `all_spaces` branch pads with delimiter spaces so the
+        // ~keep span survives the spec's own stripping rule (spec example 138). Testing
+        // ~keep `trim()` here dropped the element outright and joined the words either side.
+        if !content.is_empty() {
             #[cfg(feature = "visitor")]
             let code_output = if let Some(ref visitor_handle) = ctx.visitor {
                 use crate::visitor::{NodeContext, NodeType, VisitResult};
@@ -162,14 +168,55 @@ pub fn handle_code(
             if let Some(custom_output) = code_output {
                 output.push_str(&custom_output);
             } else {
-                format_inline_code(trimmed, output);
+                emit_inline_code(trimmed, output, options, node_handle, parser, dom_ctx);
             }
 
             #[cfg(not(feature = "visitor"))]
             {
-                format_inline_code(trimmed, output);
+                emit_inline_code(trimmed, output, options, node_handle, parser, dom_ctx);
             }
         }
+    }
+}
+
+/// Render a `<code>` element's content as one or more backtick spans, then emit through the
+/// adjacent-span merge.
+///
+/// `content` may contain `'\n'` bytes: `line_break.rs`'s code-SPAN branch pushes one as an
+/// internal-only split marker for each `<br>` the element contained (a source text node's own
+/// literal line ending is already folded to a space by the time it reaches this buffer, so
+/// every `'\n'` here unambiguously came from a `<br>` — see `text_node.rs`'s
+/// `in_code && !in_code_block` branch). Split on it and render each segment as its own
+/// backtick span, joined by the configured `newline_style` hard-break marker OUTSIDE the
+/// backticks, where it is syntax rather than span content (issue #487) — matching how
+/// `<b>`/`<i>` already turn an internal `<br>` into a hard break between two delimiter pairs.
+/// An empty segment (an adjacent, leading, or trailing `<br>`) is dropped rather than emitted
+/// as a dangling empty `` `` `` pair with nothing before or after it. ~keep
+fn emit_inline_code(
+    content: &str,
+    output: &mut String,
+    options: &ConversionOptions,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    dom_ctx: &DomContext,
+) {
+    let separator = crate::converter::main_helpers::hard_break_marker(options.newline_style);
+    let mut first = true;
+    for segment in content.split('\n').filter(|segment| !segment.is_empty()) {
+        if first {
+            let mut span = String::with_capacity(segment.len() + 2);
+            format_inline_code(segment, &mut span);
+            emit_code_span(&span, segment, output, node_handle, parser, dom_ctx);
+        } else {
+            // ~keep Only the FIRST segment may merge into an immediately preceding
+            // ~keep sibling code span (issue #483): every later segment is preceded by
+            // ~keep our own separator, not a bare closing backtick, so `emit_code_span`'s
+            // ~keep merge check would never fire for it anyway -- rendered directly
+            // ~keep without going through that check at all.
+            output.push_str(separator);
+            format_inline_code(segment, output);
+        }
+        first = false;
     }
 }
 
@@ -196,6 +243,7 @@ pub fn handle_pre(
 ) {
     let code_ctx = Context {
         in_code: true,
+        in_code_block: true,
         ..ctx.clone()
     };
 
@@ -205,7 +253,7 @@ pub fn handle_pre(
 
         if let Some(class_attr) = tag.attributes().get("class") {
             if let Some(class_bytes) = class_attr {
-                let class_str = class_bytes.as_utf8_str();
+                let class_str = crate::text::decode_html_entities_cow(&class_bytes.as_utf8_str()).into_owned();
                 for cls in class_str.split_whitespace() {
                     if let Some(stripped) = cls.strip_prefix("language-") {
                         lang = Some(String::from(stripped));
@@ -225,7 +273,8 @@ pub fn handle_pre(
                     if child_tag.name() == "code" {
                         if let Some(class_attr) = child_tag.attributes().get("class") {
                             if let Some(class_bytes) = class_attr {
-                                let class_str = class_bytes.as_utf8_str();
+                                let class_str =
+                                    crate::text::decode_html_entities_cow(&class_bytes.as_utf8_str()).into_owned();
                                 for cls in class_str.split_whitespace() {
                                     if let Some(stripped) = cls.strip_prefix("language-") {
                                         lang = Some(String::from(stripped));
@@ -363,12 +412,11 @@ fn format_inline_code(content: &str, output: &mut String) {
         let ends_with_space = last_char == Some(' ');
         let starts_with_backtick = first_char == Some('`');
         let ends_with_backtick = last_char == Some('`');
-        let all_spaces = content.chars().all(|c| c == ' ');
-
-        all_spaces
-            || starts_with_backtick
-            || ends_with_backtick
-            || (starts_with_space && ends_with_space && contains_backtick)
+        // ~keep CommonMark strips one space from each end of a code span ONLY when the
+        // ~keep content is not entirely spaces, so an all-spaces body needs no padding --
+        // ~keep and padding it changes what the span contains (`` ` ` `` is one space,
+        // ~keep `` `   ` `` is three). Spec example 138 is exactly this case.
+        starts_with_backtick || ends_with_backtick || (starts_with_space && ends_with_space && contains_backtick)
     };
 
     let (num_backticks, needs_spaces) = if contains_backtick {
@@ -414,6 +462,11 @@ fn format_code_block(
         // ~keep shedding their markers in a cell. Line breaks fold to a space rather than to
         // ~keep `<br>` so that the two tiers stay byte-equal.
         output.push_str(crate::text::fold_cell_line_breaks_verbatim_cow(content.trim_matches('\n')).as_ref());
+        return;
+    }
+
+    if ctx.in_list_item {
+        format_code_block_in_list_item(content, language, output, options, ctx);
         return;
     }
 
@@ -473,6 +526,73 @@ fn format_code_block(
             output.push('\n');
             output.push_str(&fence);
             output.push_str("\n\n");
+        }
+    }
+}
+
+/// Format a code block that is a child of a list item.
+///
+/// ~keep A fenced (or indented) code block spans several physical lines, but the
+/// ~keep only call site that indented list continuation content
+/// ~keep (`block/paragraph.rs::add_list_continuation_indent`) indented a single
+/// ~keep leading position, not every line a block emits. CommonMark's list
+/// ~keep container match is per physical line: a non-blank line that is not
+/// ~keep indented to `list_indent_columns` is not part of the item, so an
+/// ~keep unindented closing fence (or any interior content line) drops the rest
+/// ~keep of the block, and the item itself, out of the list on re-parse
+/// ~keep (CommonMark spec examples 263, 273, 274, 318, 324). Render into a
+/// ~keep scratch buffer first so every line can be indented uniformly, then only
+/// ~keep skip the indent on the very first line when this block sits directly
+/// ~keep after the marker text (i.e. it is the item's first content, not a
+/// ~keep continuation) — that line already starts at the right column.
+fn format_code_block_in_list_item(
+    content: &str,
+    language: Option<&str>,
+    output: &mut String,
+    options: &ConversionOptions,
+    ctx: &Context,
+) {
+    let mut rendered = String::new();
+    let plain_ctx = Context {
+        in_list_item: false,
+        ..ctx.clone()
+    };
+    format_code_block(content, language, &mut rendered, options, &plain_ctx);
+
+    // ~keep A plain suffix check like `output.ends_with("* ")` also matches the closing
+    // ~keep "**"/"*" of `<strong>`/`<em>` immediately followed by a migrated trailing
+    // ~keep space, indistinguishable from a real bare bullet by suffix alone -- and, being
+    // ~keep hardcoded to `-`/`*`, never matched the third bullet `+` at all. Both false
+    // ~keep positive (fake marker) and false negative (real `+ ` marker) misclassified
+    // ~keep this fenced block relative to the marker, either gluing the opening fence onto
+    // ~keep the previous inline line (breaking the fence syntax) or doubly indenting the
+    // ~keep first line. See `list::utils::line_is_bare_list_marker`'s doc comment.
+    let is_continuation = !ctx.convert_as_inline
+        && !output.is_empty()
+        && !crate::converter::list::utils::line_is_bare_list_marker(output);
+
+    if is_continuation {
+        crate::converter::trim_trailing_whitespace(output);
+        if !output.ends_with("\n\n") {
+            if output.ends_with('\n') {
+                output.push('\n');
+            } else {
+                output.push_str("\n\n");
+            }
+        }
+    }
+
+    let indent =
+        crate::converter::list::utils::continuation_indent_string(ctx.list_depth, ctx.list_indent_columns, options)
+            .unwrap_or_default();
+
+    for (index, segment) in rendered.split_inclusive('\n').enumerate() {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        if line.is_empty() || (index == 0 && !is_continuation) {
+            output.push_str(segment);
+        } else {
+            output.push_str(&indent);
+            output.push_str(segment);
         }
     }
 }

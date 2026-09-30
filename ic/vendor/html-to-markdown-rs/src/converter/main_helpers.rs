@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use crate::options::ConversionOptions;
+use crate::options::NewlineStyle;
 use crate::options::conversion::{MAX_CONFIGURABLE_DEPTH, NATIVE_STACK_SAFE_DEPTH};
 
 /// Resolve the effective traversal-depth ceiling.
@@ -33,19 +34,68 @@ pub fn trim_trailing_whitespace(output: &mut String) {
     }
 }
 
+/// Whether `text` is empty or composed only of plain ASCII whitespace (`' '`,
+/// `'\t'`, `'\n'`, `'\r'`).
+///
+/// ~keep Unlike `str::trim().is_empty()`, this does NOT treat other Unicode
+/// ~keep whitespace (a decoded `&nbsp;`, a thin space, etc.) as "empty": such a
+/// ~keep character trims to nothing under `str::trim`'s Unicode-aware definition,
+/// ~keep but it is still significant, visible content. A caller deciding whether a
+/// ~keep whitespace-looking text node carries zero content -- safe to collapse or
+/// ~keep drop outright -- must use this instead, or it silently swallows real
+/// ~keep content that merely LOOKS like formatting whitespace. `block/paragraph.rs`'s
+/// ~keep empty-inline-neighbour skip used to do exactly that: a lone nbsp between
+/// ~keep two `<br>`s vanished because the skip used the Unicode-aware check.
+pub fn is_ascii_whitespace_only(text: &str) -> bool {
+    text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+}
+
 /// Strip a trailing run of backslash hard-break markers from the end of a block's content.
 ///
 /// CommonMark's hard-break rule has no effect at the end of a block: there is no next line
 /// for the break to reach. For the two-space style the leftover marker is invisible trailing
 /// whitespace, so it is harmless and left in place. For the backslash style the leftover `\`
-/// is a literal, visible character, so a trailing run of one or more `<br>`-emitted `"\\\n"`
-/// markers must be dropped entirely rather than rendered as stray backslashes (issue #464).
-/// `block_start` bounds the strip to the current block so an earlier block's content already
-/// in `output` is never touched.
+/// is a literal, visible character, so it must go — but each `"\\\n"` marker in the run keeps
+/// its `\n` (only the `\` is dropped). The freed newline is what a block boundary is already
+/// made of, so callers that then run their own "how many blank lines are already here"
+/// separator logic (every block handler's `needs_leading_sep`-shaped check) keep working
+/// unmodified, and any surplus blank lines a run of several `<br>` collapses into are mopped
+/// up by `collapse_excess_blank_lines` at the end of the document (issue #464). `block_start`
+/// bounds the strip to the current block so an earlier block's content already in `output` is
+/// never touched.
 pub fn strip_trailing_backslash_breaks(output: &mut String, block_start: usize) {
+    // ~keep `block_content_start` is set only by the paragraph handler, so a handler that
+    // ~keep walks its children into a fresh buffer while inheriting that context leaves the
+    // ~keep index pointing into the wrong buffer. That is not hypothetical: it is the root
+    // ~keep cause of the reported panics in issues #216/#217, and `text_node.rs` clamps the
+    // ~keep same index the same way for the same reason. The `output.len() > block_start`
+    // ~keep loop guard below already rules out an out-of-bounds slice, but not a stale index
+    // ~keep that lands mid-UTF-8-character, which slicing would also panic on.
+    let block_start = crate::converter::utility::content::floor_char_boundary(output, block_start.min(output.len()));
+    let mut stripped_breaks = 0usize;
     while output.len() > block_start && output[block_start..].ends_with("\\\n") {
         let new_len = output.len() - "\\\n".len();
         output.truncate(new_len);
+        stripped_breaks += 1;
+    }
+    for _ in 0..stripped_breaks {
+        output.push('\n');
+    }
+}
+
+/// Strip a trailing backslash hard-break run from a self-contained block-content buffer,
+/// before that buffer is trimmed and spliced back into the shared output.
+///
+/// Several block handlers (blockquote, sectioning elements, details/summary, figure/
+/// figcaption, dl/dt/dd, list items) walk their children into a fresh, empty local
+/// `String` rather than the shared `output`, then splice the trimmed result back.
+/// `str::trim` cannot repair a trailing `"\\\n"` marker by itself — trim only removes
+/// whitespace, and `\` is not whitespace, so it eats the newline and leaves the
+/// backslash stranded (issue #464 follow-up). Since the buffer is fresh, position `0`
+/// is always its own start, so callers only need to name the buffer and the style.
+pub fn strip_trailing_backslash_breaks_from_fresh_buffer(content: &mut String, newline_style: NewlineStyle) {
+    if newline_style == NewlineStyle::Backslash {
+        strip_trailing_backslash_breaks(content, 0);
     }
 }
 
@@ -65,6 +115,21 @@ pub fn emit_table_cell_break(output: &mut String, br_in_tables: bool) {
         output.push_str("<br>");
     } else if !output.is_empty() {
         output.push(' ');
+    }
+}
+
+/// The literal hard-break marker `line_break.rs` emits for a real `<br>` under `style`.
+///
+/// Shared by `line_break.rs`'s own non-code fallback and by the split code-span emitters
+/// (`handlers::code_block::emit_inline_code`, `inline::code::handle_kbd_samp`) that join a
+/// `<code>`/`<kbd>`/`<samp>` element's `<br>`-separated segments with this same marker,
+/// now placed OUTSIDE the backticks where it is syntax rather than span content
+/// (issue #487).
+#[must_use]
+pub const fn hard_break_marker(style: NewlineStyle) -> &'static str {
+    match style {
+        NewlineStyle::Spaces => "  \n",
+        NewlineStyle::Backslash => "\\\n",
     }
 }
 
@@ -128,50 +193,123 @@ pub fn trim_line_end_whitespace(output: &mut String) {
     }
 }
 
-/// Check if HTML contains custom element tags.
+/// Check for custom elements or paragraphs misnested inside namespaced elements.
 pub fn has_custom_element_tags(html: &str) -> bool {
-    // ~keep Custom elements must have a hyphen in their TAG NAME, not in attributes
-    // ~keep Look for patterns like <foo-bar> or </foo-bar>
+    // ~keep Custom elements must have a hyphen in their TAG NAME, not in attributes.
+    // ~keep Namespaced Office tags also need HTML5 repair when paragraphs are misnested.
+    // ~keep A markup declaration/comment (`<!...>`), a processing instruction (`<?...?>`),
+    // ~keep or a CDATA section is NOT a tag — its "name" is arbitrary content that may
+    // ~keep itself contain a hyphen (`<!--c-->` naively yields `!--c--`, which contains
+    // ~keep one), so every comment-bearing document was misreported as having a custom
+    // ~keep element. Those constructs are skipped wholesale instead of scanned for a name.
+    // ~keep HTML5 begins a tag name only when `<`/`</` is IMMEDIATELY followed by an ASCII
+    // ~keep letter (see `tier1::parse::is_tag_name_start`) — no whitespace skip first, so
+    // ~keep `< div>`/`</ div>` are left as plain text rather than treated as tags.
     let bytes = html.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+    let mut namespaced_tags = Vec::new();
 
     while i < len {
-        if bytes[i] == b'<' {
+        if bytes[i] != b'<' {
             i += 1;
-            if i >= len {
+            continue;
+        }
+
+        let after_lt = i + 1;
+        let Some(&next) = bytes.get(after_lt) else {
+            break;
+        };
+
+        if next == b'!' {
+            i = skip_markup_declaration(bytes, i);
+            continue;
+        }
+
+        if next == b'?' {
+            i = skip_to_after_gt(bytes, after_lt);
+            continue;
+        }
+
+        let name_start = if next == b'/' { after_lt + 1 } else { after_lt };
+
+        if name_start >= len || !crate::converter::tier1::parse::is_tag_name_start(bytes[name_start]) {
+            // ~keep Not a real tag start (e.g. `< div>`, `</ div>`, `</>`) — leave it as
+            // ~keep text and resume scanning right after the `<`.
+            i = after_lt;
+            continue;
+        }
+
+        let tag_start = name_start;
+        let mut tag_end = tag_start;
+        while tag_end < len {
+            let ch = bytes[tag_end];
+            if ch == b'>' || ch == b'/' || ch.is_ascii_whitespace() {
                 break;
             }
-
-            if bytes[i] == b'/' {
-                i += 1;
-                if i >= len {
-                    break;
-                }
-            }
-
-            while i < len && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-
-            let tag_start = i;
-            while i < len {
-                let ch = bytes[i];
-                if ch == b'>' || ch == b'/' || ch.is_ascii_whitespace() {
-                    let tag_name = &bytes[tag_start..i];
-                    if tag_name.contains(&b'-') {
-                        return true;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-        } else {
-            i += 1;
+            tag_end += 1;
         }
+
+        let name = &bytes[tag_start..tag_end];
+        if name.contains(&b'-') {
+            return true;
+        }
+        let (self_closing, terminator) = scan_tag_terminator(bytes, tag_end);
+        if namespaced_paragraph_is_misnested(&mut namespaced_tags, name, next == b'/', self_closing) {
+            return true;
+        }
+        i = terminator.saturating_add(if self_closing { 2 } else { 1 });
     }
 
     false
+}
+
+/// Track only namespace subtrees, leaving well-formed Office documents on the normal parser path.
+fn namespaced_paragraph_is_misnested<'a>(
+    open_tags: &mut Vec<&'a [u8]>,
+    name: &'a [u8],
+    closing: bool,
+    self_closing: bool,
+) -> bool {
+    if closing {
+        if name.contains(&b':') {
+            if let Some(position) = open_tags.iter().rposition(|open| open.eq_ignore_ascii_case(name)) {
+                let unclosed_paragraph = open_tags[position + 1..]
+                    .iter()
+                    .any(|open| open.eq_ignore_ascii_case(b"p"));
+                open_tags.truncate(position);
+                return unclosed_paragraph;
+            }
+        } else if open_tags.last().is_some_and(|open| open.eq_ignore_ascii_case(name)) {
+            open_tags.pop();
+        }
+    } else if !self_closing && (!open_tags.is_empty() || name.contains(&b':')) && !is_html5_void_element(name) {
+        open_tags.push(name);
+    }
+    false
+}
+
+/// Skip a `<!...>` construct — an HTML comment, a CDATA section, or another
+/// markup declaration such as `<!doctype html>` — starting at the `<` at
+/// `lt_idx`. Returns the index just past the construct (or `bytes.len()` if
+/// it is never terminated).
+fn skip_markup_declaration(bytes: &[u8], lt_idx: usize) -> usize {
+    // ~keep Reuses the exact comment/CDATA terminator scan `strip_hidden_elements`
+    // ~keep relies on, rather than re-implementing it a third time in this crate.
+    if let Some(end) = crate::converter::utility::preprocessing::skip_opaque_region(bytes, lt_idx) {
+        return end;
+    }
+    skip_to_after_gt(bytes, lt_idx + 2)
+}
+
+/// Index just past the next `>` at or after `from`, or `bytes.len()` if none
+/// exists (an unterminated declaration/processing-instruction runs to EOF).
+fn skip_to_after_gt(bytes: &[u8], from: usize) -> usize {
+    let start = from.min(bytes.len());
+    match bytes[start..].iter().position(|&b| b == b'>') {
+        Some(offset) => start + offset + 1,
+        None => bytes.len(),
+    }
 }
 
 /// HTML5 void elements that are self-closing by spec and must NOT be expanded.
@@ -182,6 +320,84 @@ pub fn has_custom_element_tags(html: &str) -> bool {
 const HTML5_VOID_ELEMENTS: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr",
 ];
+
+/// Advance past a `</tag>` closing tag, starting at the `/` immediately after `<` (`i` points
+/// at that `/`). Returns the index just past the `>`, or `len` if never terminated. Extracted
+/// from `expand_xml_self_closing_tags` — identical scan, unchanged.
+fn skip_closing_tag(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    while i < len && bytes[i] != b'>' {
+        i += 1;
+    }
+    if i < len {
+        i += 1;
+    }
+    i
+}
+
+/// Scan a tag name starting at `start`, stopping at `>`, `/`, or ASCII whitespace. Returns the
+/// end index (exclusive) of the name. Extracted from `expand_xml_self_closing_tags` — identical
+/// scan, unchanged.
+pub fn scan_tag_name_end(bytes: &[u8], start: usize) -> usize {
+    let len = bytes.len();
+    let mut i = start;
+    while i < len {
+        let ch = bytes[i];
+        if ch == b'>' || ch == b'/' || ch.is_ascii_whitespace() {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Whether `tag_name_bytes` (ASCII-case-insensitive) names an HTML5 void element. Extracted
+/// from `expand_xml_self_closing_tags` — identical lowercase-and-compare, unchanged.
+pub fn is_html5_void_element(tag_name_bytes: &[u8]) -> bool {
+    let tag_name_lower = tag_name_bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    HTML5_VOID_ELEMENTS
+        .iter()
+        .any(|v| v.as_bytes() == tag_name_lower.as_slice())
+}
+
+/// Scan forward from `start` (the position right after the tag name) to find where the tag's
+/// attribute list ends, honoring quoted attribute values so a `/` or `>` inside a quoted string
+/// is not mistaken for the tag terminator. Returns `(self_closing, end)` where `end` is the
+/// index of the terminating `/` (when `self_closing` is true) or `>` (when false), or `len` if
+/// the tag is never closed. Extracted from `expand_xml_self_closing_tags` — identical
+/// quote-tracking scan, unchanged.
+fn scan_tag_terminator(bytes: &[u8], start: usize) -> (bool, usize) {
+    let len = bytes.len();
+    let mut i = start;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < len {
+        match bytes[i] {
+            b'"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                i += 1;
+            }
+            b'\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                i += 1;
+            }
+            b'/' if !in_single_quote && !in_double_quote => {
+                if i + 1 < len && bytes[i + 1] == b'>' {
+                    return (true, i);
+                }
+                i += 1;
+            }
+            b'>' if !in_single_quote && !in_double_quote => {
+                return (false, i);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    (false, len)
+}
 
 /// Expand XML-style self-closing tags to explicit open+close pairs.
 ///
@@ -220,12 +436,7 @@ pub fn expand_xml_self_closing_tags(input: &str) -> String {
         i += 1;
 
         if i < len && bytes[i] == b'/' {
-            while i < len && bytes[i] != b'>' {
-                i += 1;
-            }
-            if i < len {
-                i += 1;
-            }
+            i = skip_closing_tag(bytes, i, len);
             continue;
         }
 
@@ -234,54 +445,18 @@ pub fn expand_xml_self_closing_tags(input: &str) -> String {
         }
 
         let name_start = i;
-        while i < len {
-            let ch = bytes[i];
-            if ch == b'>' || ch == b'/' || ch.is_ascii_whitespace() {
-                break;
-            }
-            i += 1;
-        }
+        i = scan_tag_name_end(bytes, name_start);
         let tag_name_bytes = &bytes[name_start..i];
 
         if tag_name_bytes.is_empty() {
             continue;
         }
 
-        let tag_name_lower = tag_name_bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-        let is_void = HTML5_VOID_ELEMENTS
-            .iter()
-            .any(|v| v.as_bytes() == tag_name_lower.as_slice());
+        let is_void = is_html5_void_element(tag_name_bytes);
 
         let attrs_start = i;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut self_closing = false;
-
-        while i < len {
-            match bytes[i] {
-                b'"' if !in_single_quote => {
-                    in_double_quote = !in_double_quote;
-                    i += 1;
-                }
-                b'\'' if !in_double_quote => {
-                    in_single_quote = !in_single_quote;
-                    i += 1;
-                }
-                b'/' if !in_single_quote && !in_double_quote => {
-                    if i + 1 < len && bytes[i + 1] == b'>' {
-                        self_closing = true;
-                        break;
-                    }
-                    i += 1;
-                }
-                b'>' if !in_single_quote && !in_double_quote => {
-                    break;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
+        let (self_closing, terminator) = scan_tag_terminator(bytes, attrs_start);
+        i = terminator;
 
         if self_closing && !is_void {
             output.push_str(&input[copy_start..tag_open]);
@@ -324,16 +499,17 @@ pub fn expand_xml_self_closing_tags(input: &str) -> String {
 /// element would be left open and subsequent siblings would nest inside it, breaking
 /// visitor start/end event pairing (issue #331).
 pub fn repair_with_html5ever(input: &str) -> Option<String> {
-    use crate::rcdom::{RcDom, SerializableHandle};
+    use crate::converter::anchor_origin::{collapse_split_anchors, parse_with_anchor_origins};
+    use crate::rcdom::SerializableHandle;
     use html5ever::serialize::{SerializeOpts, serialize};
-    use html5ever::tendril::TendrilSink;
 
     let expanded = expand_xml_self_closing_tags(input);
 
-    let dom = html5ever::parse_document(RcDom::default(), Default::default())
-        .from_utf8()
-        .read_from(&mut expanded.as_bytes())
-        .ok()?;
+    // ~keep The adoption agency splits an `<a>` around a block into an authored element and
+    // ~keep clones; collapse the empty halves before the tree is flattened to a string and
+    // ~keep the provenance is gone (issue #493).
+    let dom = parse_with_anchor_origins(&expanded);
+    collapse_split_anchors(&dom.document);
 
     let mut buf = Vec::with_capacity(input.len());
     let handle = SerializableHandle::from(dom.document);
@@ -350,6 +526,101 @@ pub fn format_metadata_frontmatter(metadata: &BTreeMap<String, String>) -> Strin
     }
     result.push_str("---\n");
     result
+}
+
+/// Record `<meta name>`/`<meta property>` content into `metadata`, honoring `strip_tags`/
+/// `preserve_tags` for `"meta"`. Extracted from `extract_head_metadata` — same tag-name,
+/// attribute-lookup, and key-formatting logic, unchanged.
+fn collect_meta_head_metadata(
+    child_tag: &tl::HTMLTag,
+    options: &ConversionOptions,
+    metadata: &mut BTreeMap<String, String>,
+) {
+    if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("meta")
+        || options.strip_tags.iter().any(|t| t == "meta")
+        || options.preserve_tags.iter().any(|t| t == "meta")
+    {
+        return;
+    }
+
+    // ~keep `content` is a user-visible metadata value and carries character references like
+    // ~keep any other attribute, so it is decoded before it reaches the frontmatter (#494).
+    // ~keep The key (`name`/`property`) is an identifier, not prose, and stays raw.
+    if let (Some(name), Some(content)) = (
+        child_tag.attributes().get("name").flatten(),
+        crate::converter::utility::attributes::decoded_attribute(child_tag, "content"),
+    ) {
+        let name_str = name.as_utf8_str();
+        metadata.insert(format!("meta-{name_str}"), content.into_owned());
+    }
+    if let (Some(property), Some(content)) = (
+        child_tag.attributes().get("property").flatten(),
+        crate::converter::utility::attributes::decoded_attribute(child_tag, "content"),
+    ) {
+        let property_str = property.as_utf8_str();
+        metadata.insert(format!("meta-{property_str}"), content.into_owned());
+    }
+}
+
+/// Record the `<title>` text into `metadata`, honoring `strip_tags`/`preserve_tags` for
+/// `"title"`. Extracted from `extract_head_metadata` — same traversal and trimming, unchanged.
+fn collect_title_head_metadata(
+    child_tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    options: &ConversionOptions,
+    metadata: &mut BTreeMap<String, String>,
+) {
+    if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("title")
+        || options.strip_tags.iter().any(|t| t == "title")
+        || options.preserve_tags.iter().any(|t| t == "title")
+    {
+        return;
+    }
+
+    let mut title_content = String::new();
+    let title_children = child_tag.children();
+    for title_child in title_children.top().iter() {
+        if let Some(tl::Node::Raw(raw)) = title_child.get(parser) {
+            title_content.push_str(raw.as_utf8_str().as_ref());
+        }
+    }
+    title_content = title_content.trim().to_string();
+    if !title_content.is_empty() {
+        metadata.insert("title".to_string(), title_content);
+    }
+}
+
+/// Record a `<link rel="canonical">` href into `metadata`. Extracted from
+/// `extract_head_metadata` — same attribute lookups and `"canonical"` substring check, unchanged.
+fn collect_link_head_metadata(child_tag: &tl::HTMLTag, metadata: &mut BTreeMap<String, String>) {
+    if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("link") {
+        return;
+    }
+    let Some(rel_attr) = child_tag.attributes().get("rel").flatten() else {
+        return;
+    };
+    let rel_str = rel_attr.as_utf8_str();
+    if !rel_str.contains("canonical") {
+        return;
+    }
+    let Some(href_attr) = child_tag.attributes().get("href").flatten() else {
+        return;
+    };
+    let href_str = href_attr.as_utf8_str();
+    metadata.insert("canonical".to_string(), href_str.to_string());
+}
+
+/// Record a `<base href>` into `metadata`. Extracted from `extract_head_metadata` — same
+/// attribute lookup, unchanged.
+fn collect_base_head_metadata(child_tag: &tl::HTMLTag, metadata: &mut BTreeMap<String, String>) {
+    if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("base") {
+        return;
+    }
+    let Some(href_attr) = child_tag.attributes().get("href").flatten() else {
+        return;
+    };
+    let href_str = href_attr.as_utf8_str();
+    metadata.insert("base".to_string(), href_str.to_string());
 }
 
 /// Extract metadata from the head element.
@@ -377,60 +648,10 @@ pub fn extract_head_metadata(
             let children = tag.children();
             for child_handle in children.top().iter() {
                 if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                    if child_tag.name().as_utf8_str().eq_ignore_ascii_case("meta")
-                        && !options.strip_tags.iter().any(|t| t == "meta")
-                        && !options.preserve_tags.iter().any(|t| t == "meta")
-                    {
-                        if let (Some(name), Some(content)) = (
-                            child_tag.attributes().get("name").flatten(),
-                            child_tag.attributes().get("content").flatten(),
-                        ) {
-                            let name_str = name.as_utf8_str();
-                            let content_str = content.as_utf8_str();
-                            metadata.insert(format!("meta-{name_str}"), content_str.to_string());
-                        }
-                        if let (Some(property), Some(content)) = (
-                            child_tag.attributes().get("property").flatten(),
-                            child_tag.attributes().get("content").flatten(),
-                        ) {
-                            let property_str = property.as_utf8_str();
-                            let content_str = content.as_utf8_str();
-                            metadata.insert(format!("meta-{property_str}"), content_str.to_string());
-                        }
-                    }
-                    if child_tag.name().as_utf8_str().eq_ignore_ascii_case("title")
-                        && !options.strip_tags.iter().any(|t| t == "title")
-                        && !options.preserve_tags.iter().any(|t| t == "title")
-                    {
-                        let mut title_content = String::new();
-                        let title_children = child_tag.children();
-                        for title_child in title_children.top().iter() {
-                            if let Some(tl::Node::Raw(raw)) = title_child.get(parser) {
-                                title_content.push_str(raw.as_utf8_str().as_ref());
-                            }
-                        }
-                        title_content = title_content.trim().to_string();
-                        if !title_content.is_empty() {
-                            metadata.insert("title".to_string(), title_content);
-                        }
-                    }
-                    if child_tag.name().as_utf8_str().eq_ignore_ascii_case("link") {
-                        if let Some(rel_attr) = child_tag.attributes().get("rel").flatten() {
-                            let rel_str = rel_attr.as_utf8_str();
-                            if rel_str.contains("canonical") {
-                                if let Some(href_attr) = child_tag.attributes().get("href").flatten() {
-                                    let href_str = href_attr.as_utf8_str();
-                                    metadata.insert("canonical".to_string(), href_str.to_string());
-                                }
-                            }
-                        }
-                    }
-                    if child_tag.name().as_utf8_str().eq_ignore_ascii_case("base") {
-                        if let Some(href_attr) = child_tag.attributes().get("href").flatten() {
-                            let href_str = href_attr.as_utf8_str();
-                            metadata.insert("base".to_string(), href_str.to_string());
-                        }
-                    }
+                    collect_meta_head_metadata(child_tag, options, &mut metadata);
+                    collect_title_head_metadata(child_tag, parser, options, &mut metadata);
+                    collect_link_head_metadata(child_tag, &mut metadata);
+                    collect_base_head_metadata(child_tag, &mut metadata);
                 }
             }
         }
@@ -482,6 +703,7 @@ pub fn is_inline_element(tag_name: &str) -> bool {
             | "var"
             | "wbr"
             | "del"
+            | "strike"
             | "ins"
             | "img"
             | "map"
@@ -546,5 +768,91 @@ mod tests {
         let mut s = "hello, world\t\t  \n.abc def \t \t".to_owned();
         trim_line_end_whitespace(&mut s);
         assert_eq!("hello, world  \n.abc def\n", s.as_str());
+    }
+
+    #[test]
+    fn test_is_ascii_whitespace_only() {
+        assert!(is_ascii_whitespace_only(""));
+        assert!(is_ascii_whitespace_only(" \t\n\r"));
+        assert!(is_ascii_whitespace_only("\n\n"));
+        // ~keep A decoded `&nbsp;` trims to empty under `str::trim`'s Unicode-aware
+        // ~keep definition but must NOT be treated as safe-to-drop formatting whitespace.
+        assert!(!is_ascii_whitespace_only("\u{a0}"));
+        assert!(!is_ascii_whitespace_only("\n\u{a0}"));
+        assert!(!is_ascii_whitespace_only("a"));
+        assert!(!is_ascii_whitespace_only(" a "));
+    }
+
+    #[test]
+    fn test_has_custom_element_tags_ignores_comments() {
+        // ~keep Regression for the bug this module fixed: a comment's own text
+        // ~keep (`!--c--`) contains a hyphen and must not be mistaken for a tag name.
+        assert!(!has_custom_element_tags("<!--c-->"));
+        assert!(!has_custom_element_tags("<p><!-- a routine comment --></p>"));
+        assert!(!has_custom_element_tags("<!-- multiple -- dashes -- here -->"));
+    }
+
+    #[test]
+    fn should_detect_namespaced_elements_for_html5_repair() {
+        assert!(has_custom_element_tags("<o:p><P></o:p></P>"));
+        assert!(!has_custom_element_tags("<o:p><P></P></o:p>"));
+        assert!(!has_custom_element_tags("<o:p>Office text</o:p>"));
+        assert!(!has_custom_element_tags("<o:p/><P>text</P>"));
+        assert!(!has_custom_element_tags("<!-- <o:p>comment</o:p> -->"));
+        assert!(!has_custom_element_tags("<div title='o:p'>text</div>"));
+    }
+
+    #[test]
+    fn test_has_custom_element_tags_detects_real_custom_element() {
+        assert!(has_custom_element_tags("<my-widget></my-widget>"));
+        assert!(has_custom_element_tags("<p></p><my-widget></my-widget>"));
+        assert!(has_custom_element_tags("<div></my-widget>"));
+    }
+
+    #[test]
+    fn test_has_custom_element_tags_detects_custom_element_alongside_comment() {
+        assert!(has_custom_element_tags(
+            "<!-- a routine comment --><my-widget>hi</my-widget>"
+        ));
+        assert!(has_custom_element_tags(
+            "<my-widget><!-- nested comment -->hi</my-widget>"
+        ));
+    }
+
+    #[test]
+    fn test_has_custom_element_tags_ignores_comment_mentioning_custom_element() {
+        // ~keep A custom-element-shaped tag written INSIDE a comment is text, not markup.
+        assert!(!has_custom_element_tags("<!-- <my-widget>hi</my-widget> -->"));
+    }
+
+    #[test]
+    fn test_has_custom_element_tags_ignores_processing_instruction() {
+        assert!(!has_custom_element_tags("<?php echo 'a-b'; ?>"));
+        assert!(!has_custom_element_tags(
+            "<?xml-stylesheet type=\"text/xsl\" href=\"a-b.xsl\"?>"
+        ));
+    }
+
+    #[test]
+    fn test_has_custom_element_tags_ignores_cdata_section() {
+        assert!(!has_custom_element_tags(
+            "<svg><![CDATA[<my-widget>a-b</my-widget>]]></svg>"
+        ));
+    }
+
+    #[test]
+    fn test_has_custom_element_tags_ignores_doctype() {
+        assert!(!has_custom_element_tags("<!doctype html>"));
+        assert!(!has_custom_element_tags("<!DOCTYPE html><p>no custom elements</p>"));
+        // ~keep A real custom element after the doctype must still be detected.
+        assert!(has_custom_element_tags("<!DOCTYPE html><my-widget></my-widget>"));
+    }
+
+    #[test]
+    fn test_has_custom_element_tags_rejects_whitespace_before_name() {
+        // ~keep HTML5 does not skip whitespace after `<`/`</` before the tag name:
+        // ~keep `< div>` and `</ div>` are plain text, not tags, in a real parser.
+        assert!(!has_custom_element_tags("< my-widget>"));
+        assert!(!has_custom_element_tags("</ my-widget>"));
     }
 }

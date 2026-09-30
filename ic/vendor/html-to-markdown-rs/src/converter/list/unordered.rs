@@ -8,7 +8,7 @@
 
 use super::utils::{
     add_list_leading_separator, add_nested_list_trailing_separator, calculate_list_nesting_depth, is_loose_list,
-    process_list_children,
+    preceding_same_type_list_separator_comment, process_list_children,
 };
 use crate::options::ConversionOptions;
 #[cfg(feature = "visitor")]
@@ -32,7 +32,12 @@ pub fn handle_ul(
     depth: usize,
     dom_ctx: &DomContext,
 ) {
-    add_list_leading_separator(output, ctx);
+    let separator_comment = preceding_same_type_list_separator_comment(*node_handle, parser, dom_ctx, "ul");
+    add_list_leading_separator(output, ctx, options);
+    if let Some(comment) = separator_comment {
+        output.push_str(&comment);
+        output.push_str("\n\n");
+    }
 
     let nested_depth = calculate_list_nesting_depth(ctx);
     let is_loose = is_loose_list(*node_handle, parser, dom_ctx);
@@ -146,6 +151,11 @@ pub fn handle_ul(
             false,
         );
 
+        // ~keep Empty children can trim earlier indentation, and child visitors can
+        // ~keep replace it with multibyte text. Revalidate the saved position for both
+        // ~keep the end callback and every output mutation below (issue #474).
+        let list_output_start =
+            crate::converter::utility::content::floor_char_boundary(output, list_output_start.min(output.len()));
         let list_content = &output[list_output_start..];
 
         let visit_result = {

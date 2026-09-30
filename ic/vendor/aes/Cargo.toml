@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 name = "aes"
-version = "0.9.2"
+version = "0.9.3"
 authors = ["RustCrypto Developers"]
 build = false
 autolib = false
@@ -85,6 +85,6 @@ level = "warn"
 priority = 0
 check-cfg = [
     'cfg(aes_backend_soft, values("compact"))',
-    'cfg(aes_backend, values("soft", "avx256", "avx512"))',
+    'cfg(aes_backend, values("soft"))',
     'cfg(cpubits, values("16", "32", "64"))',
 ]
