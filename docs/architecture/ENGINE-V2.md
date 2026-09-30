@@ -513,6 +513,13 @@ without resetting their count, conservatively preserving upgrade-day usage;
 same-day counters are unchanged. Paused and terminal missions are not swept.
 A failed maintenance save skips that mission for the tick and is retried on
 the next tick without preventing other missions from receiving maintenance.
+The store's global mission listings enumerate the missions map directly
+rather than deriving from the projects index: missions are discovered by
+directory scan (`engine/projects/*/missions/*/mission.json`), so a mission
+whose `project.json` is missing or unparseable still loads while its project
+does not. Project-derived listings dropped such missions from the active
+index entirely — no rollover, no dispatch, and a `threads_today_date` pinned
+at its creation date (WI#243 recurrence, v2.1.4.0).
 
 The daily thread budget (`max_threads_per_day`,
 default 30 via `DEFAULT_MAX_THREADS_PER_DAY` since work item #189, 0 =
