@@ -1411,6 +1411,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn midstream_transient_decode_failure_recovers_with_fresh_request() {
+        // WI#244: a TensorZero-style decode failure after partial text must
+        // get one bounded model-visible recovery request instead of failing
+        // the thread. Nothing from the failed response was committed, so a
+        // fresh draft cannot duplicate work.
+        let llm = Arc::new(StreamingMockLlm::new(vec![
+            vec![
+                Ok(LlmStreamChunk::TextDelta("```repl\nFINAL('part".to_string())),
+                Err(EngineError::Llm {
+                    kind: crate::types::error::ModelFailureKind::Transient,
+                    reason: "error decoding response body".to_string(),
+                }),
+            ],
+            vec![
+                Ok(LlmStreamChunk::TextDelta(
+                    "```repl\nFINAL('recovered')\n```".to_string(),
+                )),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                }),
+            ],
+        ]));
+        let (mut exec, _signal_tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+        ));
+        assert_eq!(llm.streaming_calls.load(Ordering::Relaxed), 2);
+        // The failed attempt's partial text must not persist as an assistant
+        // message — only the recovered response does.
+        assert!(!exec.thread.messages.iter().any(|message| {
+            message.role == crate::types::message::MessageRole::Assistant
+                && message.content.contains("FINAL('part")
+        }));
+        // The recovery request carries the safe failure instruction, never
+        // the provider diagnostic.
+        let requests = llm.requests();
+        assert!(requests.len() >= 2);
+        assert!(requests[1].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("provider temporarily failed")
+        }));
+        assert!(
+            !requests[1]
+                .iter()
+                .any(|message| message.content.contains("error decoding response body"))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_midstream_transient_failures_stay_bounded() {
+        // The recovery exception must not unbounded-loop: the policy caps the
+        // attempts and the thread then fails with the typed safe message.
+        let failed_stream = || {
+            vec![
+                Ok(LlmStreamChunk::TextDelta("partial".to_string())),
+                Err(EngineError::Llm {
+                    kind: crate::types::error::ModelFailureKind::Transient,
+                    reason: "error decoding response body".to_string(),
+                }),
+            ]
+        };
+        let llm = Arc::new(StreamingMockLlm::new(vec![
+            failed_stream(),
+            failed_stream(),
+            failed_stream(),
+            failed_stream(),
+        ]));
+        let (mut exec, _signal_tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(
+                    crate::types::error::ModelFailureKind::Transient
+                ),
+                error,
+            } if error.contains("after retries") && !error.contains("error decoding")
+        ));
+        // Default config caps model_recovery_max_attempts at 1 (the env
+        // default), so: initial attempt + one recovery attempt, then the
+        // per-thread cap forces the typed terminal failure.
+        assert_eq!(llm.streaming_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
     async fn orchestrator_streams_without_event_sender() {
         let llm = Arc::new(StreamingMockLlm::new(vec![vec![
             Ok(LlmStreamChunk::TextDelta("no receiver".to_string())),
