@@ -811,6 +811,7 @@ mod missions_handlers {
 // Prompt management (WI#220)
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(test)]
 mod prompt_handlers {
     use super::*;
 
