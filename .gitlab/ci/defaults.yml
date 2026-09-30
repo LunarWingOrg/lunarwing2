@@ -139,10 +139,14 @@ variables:
 
 .full-validation-context:
   rules:
+    # Scratch branches can request the same required checks as integration.
+    # This does not change the protected push-only worker publication rules.
+    - if: '$LUNARWING_CI_FULL_VALIDATION == "1"'
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
     - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^aragents\/kimil00p\//'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
 

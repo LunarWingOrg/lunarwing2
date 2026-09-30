@@ -33,7 +33,7 @@ cavepony-wasm:
   # The wit_compat step compiles the lunarwing lib test binary; use the same
   # memory-qualified runner pool and host-side limits as the Rust matrix.
   variables:
-    CAVEPONY_EXPECTED_VERSION: "0.4.2"
+    CAVEPONY_EXPECTED_VERSION: "0.4.4"
     CAVEPONY_WASM_REQUIRED: "1"
   needs:
     - job: rust-check-default
@@ -45,7 +45,7 @@ cavepony-wasm:
   timeout: 2h
   script:
     - rustup target add --toolchain 1.96.1 wasm32-wasip2
-    - bash .gitlab/scripts/cargo-ci.sh build -j2 --release --target wasm32-wasip2 --manifest-path tools-src/cavepony/Cargo.toml
+    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path tools-src/cavepony/Cargo.toml
     - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --test wit_compat cavepony_component_actions_fit_ten_million_fuel -- --exact
 
 # Architecture boundaries: blocking changed-line/hard-violation ratchet since

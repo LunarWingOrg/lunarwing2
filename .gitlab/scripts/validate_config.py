@@ -31,10 +31,12 @@ EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_NORMAL_DEBUG = "line-tables-only"
 RELEASE_TAG_PREDICATE = r"^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$"
 FULL_VALIDATION_RULES = (
+    '$LUNARWING_CI_FULL_VALIDATION == "1"',
     '$CI_PIPELINE_SOURCE == "schedule"',
     "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH",
     r"$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//",
     "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH",
+    r"$CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^aragents\/kimil00p\//",
     '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ '
     rf'/{RELEASE_TAG_PREDICATE}/ && $CI_COMMIT_REF_PROTECTED == "true"',
 )
@@ -45,6 +47,8 @@ FULL_VALIDATION_JOBS = (
     "rust-test-libsql",
     "rust-test-postgres-integration",
     "cavepony-wasm",
+    "architecture-boundaries",
+    "rust-clippy-all",
     "cargo-deny",
 )
 WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
@@ -169,11 +173,14 @@ def matches_full_validation_context(context: dict[str, str]) -> bool:
     branch = context.get("branch", "")
     default_branch = context.get("default_branch", "master")
     tag = context.get("tag", "")
+    target = context.get("target", "")
     return (
-        source == "schedule"
+        context.get("full_validation") == "1"
+        or source == "schedule"
         or branch == default_branch
         or bool(re.fullmatch(r"aragents/kimil00p/.+", branch))
-        or context.get("target", "") == default_branch
+        or target == default_branch
+        or bool(re.fullmatch(r"aragents/kimil00p/.+", target))
         or (
             source == "push"
             and context.get("protected") == "true"
@@ -200,6 +207,10 @@ def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> N
 
     context_matrix = (
         ({"source": "merge_request_event", "target": "master"}, True),
+        ({"source": "merge_request_event", "target": "aragents/kimil00p/v2.1.4.0"}, True),
+        ({"source": "merge_request_event", "target": "feature/integration"}, False),
+        ({"source": "push", "branch": "cmc/g1/v2.1.4.0", "full_validation": "1"}, True),
+        ({"source": "push", "branch": "cmc/g1/v2.1.4.0", "full_validation": "0"}, False),
         ({"source": "push", "branch": "master"}, True),
         ({"source": "push", "branch": "aragents/kimil00p/release"}, True),
         ({"source": "schedule", "branch": "maintenance"}, True),
@@ -342,6 +353,15 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
         if any(fragment not in commands for fragment in fragments):
             errors.append(f"{job_name} does not enforce its required backend test shape")
 
+    cavepony_script = merged.get("cavepony-wasm", {}).get("script", [])
+    if not any(
+        isinstance(command, str) and all(fragment in command for fragment in (
+            "cargo-ci.sh build", "--locked", "--release", "--target wasm32-wasip2",
+            "--manifest-path tools-src/cavepony/Cargo.toml",
+        )) for command in cavepony_script
+    ):
+        errors.append("cavepony-wasm must build its committed WASM source with --locked")
+
     junit_jobs = {
         "python-unit": ("junit-python.xml", ".gitlab/scripts/python_tests.py"),
         "shell-harnesses": ("junit-shell.xml", ".gitlab/scripts/shell-harnesses-junit.sh"),
@@ -358,6 +378,37 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
         reports = artifacts.get("reports", {}) if isinstance(artifacts, dict) else {}
         if not isinstance(reports, dict) or reports.get("junit") != report:
             errors.append(f"{job_name} must report junit artifact {report}")
+
+
+def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
+    """Catch release metadata drift before the expensive WASM/host test job."""
+    expected = merged.get("cavepony-wasm", {}).get("variables", {}).get("CAVEPONY_EXPECTED_VERSION")
+    if not isinstance(expected, str) or not re.fullmatch(r"\d+\.\d+\.\d+", expected):
+        errors.append("cavepony-wasm must declare CAVEPONY_EXPECTED_VERSION")
+        return
+
+    source = "ic/tools-src/cavepony"
+    versions = {}
+    for relative in (
+        "ic/registry/tools/cavepony-tool.json", f"{source}/cavepony-tool.capabilities.json",
+        f"{source}/Cargo.toml", f"{source}/Cargo.lock",
+    ):
+        try:
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            if relative.endswith(".json"):
+                versions[relative] = [json.loads(text).get("version")]
+            elif relative.endswith("Cargo.toml"):
+                versions[relative] = [tomllib.loads(text).get("package", {}).get("version")]
+            else:
+                versions[relative] = [
+                    package.get("version") for package in tomllib.loads(text).get("package", [])
+                    if package.get("name") == "cavepony-tool" and "source" not in package
+                ]
+        except (OSError, ValueError) as error:
+            errors.append(f"cannot read Cavepony release metadata {relative}: {error}")
+    for relative, actual in versions.items():
+        if actual != [expected]:
+            errors.append(f"{relative} Cavepony version {actual!r} != CI expectation {expected!r}")
 
 
 def cache_policies(job: object) -> list[str]:
@@ -791,6 +842,7 @@ def main() -> int:
     validate_release_gates(merged_config, defaults, errors)
     validate_worker_publication(merged_config, errors)
     validate_test_shapes(merged_config, errors)
+    validate_cavepony_version(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
     validate_worker_versions(errors)
     validate_deliverables_manifest(merged_config, errors)
