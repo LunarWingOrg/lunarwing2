@@ -813,8 +813,14 @@ mod tests {
     fn cavepony_sidecar_parses_with_no_host_capabilities() {
         let json = include_str!("../../../tools-src/cavepony/cavepony-tool.capabilities.json");
         let caps = CapabilitiesFile::from_json(json).expect("Cavepony sidecar should parse");
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../../tools-src/cavepony/Cargo.toml"))
+                .expect("Cavepony manifest should parse");
+        let expected_version = manifest["package"]["version"]
+            .as_str()
+            .expect("Cavepony manifest should declare a package version");
 
-        assert_eq!(caps.version.as_deref(), Some("0.4.2"));
+        assert_eq!(caps.version.as_deref(), Some(expected_version));
         assert_eq!(caps.wit_version.as_deref(), Some("0.3.0"));
         assert!(caps.http.is_none());
         assert!(caps.secrets.is_none());
