@@ -6490,6 +6490,37 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
     }
 
     #[tokio::test]
+    async fn self_improvement_outcome_skips_prompt_additions_when_gate_off() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "self-improve",
+            "improve prompts",
+            MissionCadence::Manual,
+        );
+        mission.metadata = serde_json::json!({"self_improvement": true});
+        store.save_mission(&mission).await.unwrap();
+
+        let response = r#"{"prompt_additions": ["9. Never call web_fetch — use http() instead."], "fix_patterns": [], "level": 1}"#;
+
+        process_self_improvement_output(&store, &mission, response, false)
+            .await
+            .unwrap();
+
+        // WI#268: with ORCHESTRATOR_SELF_MODIFY off, prompt additions must not
+        // create or mutate the overlay document.
+        let docs = store.list_shared_memory_docs(project_id).await.unwrap();
+        assert!(
+            docs.iter()
+                .all(|d| d.title != crate::executor::prompt::PREAMBLE_OVERLAY_TITLE),
+            "prompt overlay must not be written while self-modification is disabled"
+        );
+    }
+
+    #[tokio::test]
     async fn self_improvement_outcome_saves_fix_patterns() {
         let store: Arc<dyn Store> = Arc::new(TestStore::new());
         let project_id = ProjectId::new();
