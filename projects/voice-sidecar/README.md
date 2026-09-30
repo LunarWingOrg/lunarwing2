@@ -11,7 +11,8 @@ loopback HTTP API, and uses `sherpa-rs`/sherpa-onnx for inference.
   bind to `0.0.0.0` while publishing both host ports on loopback only.
 - Health listener is separate and exposes only `/health`, `/ready`, and `/metrics`.
 - Request bodies, decoded bytes, audio duration, text length, and rate are bounded.
-- Blocking inference concurrency, processing time, and synthesized duration are bounded.
+- Inference admission, caller wait time, and returned synthesized duration are
+  bounded. Native inference itself cannot be interrupted safely; see recovery below.
 - Redirects and arbitrary outbound requests are not used by the service.
 - Non-WAV decoding invokes configured `ffmpeg` directly with fixed arguments,
   never through a shell.
@@ -37,41 +38,71 @@ Health defaults to `127.0.0.1:8091`:
 
 ```text
 GET /health   process liveness and loaded components
-GET /ready    STT readiness; returns 503 until required models load or an abandoned inference is still draining
+GET /ready    STT readiness and inference state; 503 while draining or failed
 GET /metrics  bounded operational counters
 ```
 
-### Abandoned inference (WI#264)
+### Inference Timeout, Admission, and Recovery (WI#264)
 
-A request timeout returns `504 timeout` to the caller, but the native ONNX
-inference already handed to a blocking thread cannot be interrupted and keeps
-running until it exits on its own. The sidecar therefore never lets such a
-zombie call silently monopolize resources:
+`VOICE_REQUEST_TIMEOUT_SECS` bounds the HTTP wait, not the native ONNX call.
+A timeout returns **504** (`timeout`); dropping the request future also
+abandons its wait. Neither can safely interrupt `KokoroTts::create` or other
+already-running native inference. A disconnected transport may keep the
+handler alive until its timeout; this does not bypass admission limits.
 
-- Each component (STT/TTS/VAD) tracks abandoned calls. While an abandoned
-  call is still running, new requests for **that component** fail fast with
-  `503 unavailable` instead of queueing behind it; the other components stay
-  available **for as long as shared inference permits remain** — the draining
-  call still holds one permit, so with
-  `VOICE_MAX_CONCURRENT_INFERENCE=1` the single permit is gone and STT/VAD
-  also answer `503 unavailable` until it exits. TTS mutex acquisition is
-  `try_lock`, so fresh synthesis never blocks waiting behind a stuck one.
-- Once the underlying call returns (success, error, or panic unwinding), the
-  component is re-admitted automatically. Recovery needs no operator action.
-- `/ready` includes a per-component `abandoned_inference` object
-  (`{"stt": {"in_flight": 0, "total": 1}, ...}`) and reports 503 while any
-  component has a call in flight. `/metrics` exposes
-  `abandoned_inference_in_flight` and `abandoned_inference_total`, and the
-  log emits one `warn` per abandoned request naming the draining component.
+All three components share one inference runner. It admits **at most one call
+per component before acquiring a shared permit**, then moves both permits into
+the blocking worker. Requests for an occupied component return **503**
+(`unavailable`) immediately, even before the original request times out. They
+cannot queue behind its model mutex or take additional shared permits. A
+timed-out TTS call can therefore retain only one permit. With the default two
+permits, STT/VAD can use the remaining capacity; with a limit of one, or other
+components also occupying the pool, they return 503 too. This is admission
+isolation, not native cancellation or a guarantee of inference completion.
 
-Remaining limitation: the zombie inference itself still consumes one shared
-inference permit (`VOICE_MAX_CONCURRENT_INFERENCE`) and CPU until it exits.
-If a model wedges indefinitely (never observed with Kokoro, but possible with
-a pathological model), the draining component stays 503; operator recovery is
-restarting the sidecar (`mt-admin restart <tenant>` or the systemd/OpenRC
-unit). The remaining shared permits (and, through them, the other components)
-are unaffected meanwhile, and repeated timeouts cannot leave the sidecar
-degraded after the call exits.
+When abandoned inference returns normally (including a returned inference
+error), its mutex/permits are released and admission recovers automatically.
+Caller/worker settlement is serialized so a concurrent completion cannot
+underflow abandonment counts. An ordinary processing failure remains **422**
+(`processing_failed`).
+
+**Panics require restart.** A Rust panic while holding a model mutex releases
+permits through unwinding but may leave native state invalid. The component is
+marked failed and later calls return **503** (`component_failed`, restart
+required), not transient Busy. A pre-poisoned model lock is handled the same
+way. No poisoned model is reused or silently cleared. Other components remain
+admissible if capacity is available. A native process abort cannot be
+recovered in-process either.
+
+`/ready` and `/metrics` expose an additive `inference` object for `stt`,
+`tts`, and `vad`. Each reports `active`, `abandoned_in_flight` (0 or 1),
+`abandoned_total` (since process start), and `failed`. `/ready` is 503
+whenever STT is absent, any abandoned inference is still draining, or any
+component is failed; normal busy work alone does not make it unready.
+`/health` remains process liveness (200). A returning worker clears current
+abandonment, not its cumulative total or permanent failure state.
+
+If a call **never returns**, admission stays bounded but that component
+remains unavailable and retains one shared permit. Inspect `/ready` and
+`/metrics` on the tenant's registry `voice_health` port (not hardcoded
+standalone ports). Persistent abandonment or `failed: true` requires
+restarting the process. For a managed tenant use the supported
+init-agnostic lifecycle command:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
+```
+
+Use the installed/configured mt-admin path if different. **This restarts the
+whole tenant, including the voice sidecar**, and interrupts its other
+workloads; schedule recovery accordingly. Recheck both `/health` and `/ready`
+afterward. Do not use bare tenant-unit `systemctl`/`rc-service` commands.
+LunarVoice's health monitor alerts but does not automatically restart model
+workloads. Raising the timeout or shared permit count is not a repair for a
+hung or poisoned model. The gateway retains WI#259's 422/503/504 mappings;
+its 503 response is generic, so operators use the sidecar's operational
+endpoint to distinguish failure from temporary contention.
 
 ## Multi-Tenant Lifecycle
 
@@ -211,8 +242,8 @@ ranges fail startup instead of being silently clamped.
 | `VOICE_MAX_AUDIO_SECS` | `300`, `1..3600` | Maximum decoded input duration |
 | `VOICE_MAX_TEXT_CHARS` | `10000`, `1..100000` | Maximum TTS Unicode scalar count |
 | `VOICE_MAX_TTS_AUDIO_SECS` | `300`, `1..3600` | Maximum synthesized duration |
-| `VOICE_REQUEST_TIMEOUT_SECS` | `120`, `1..3600` | Decode/inference timeout |
-| `VOICE_MAX_CONCURRENT_INFERENCE` | `2`, `1..64` | Shared STT/TTS/VAD inference permits |
+| `VOICE_REQUEST_TIMEOUT_SECS` | `120`, `1..3600` | Decode/inference caller timeout; does not terminate native inference |
+| `VOICE_MAX_CONCURRENT_INFERENCE` | `2`, `1..64` | Shared STT/TTS/VAD permits, additionally limited to one admitted call per component |
 | `VOICE_RATE_LIMIT_PER_SEC` | `5`, `1..10000` | Process-wide API token-bucket rate |
 | `VOICE_CACHE_TTL_SECS` | `600`, `0..86400` | Transcription cache TTL; zero disables cache hits |
 | `VOICE_CACHE_MAX_ENTRIES` | `5000`, `1..1000000` | Cache entry bound |
@@ -236,16 +267,17 @@ values and preserves/restores a pre-existing cloud transcription selection.
 ## Health And Operations
 
 `/health` is process liveness; `/ready` returns HTTP 200 only when STT is
-loaded and no component is draining an abandoned inference (see
-[Abandoned inference](#abandoned-inference-wi264)); `/metrics` exposes bounded
-request, cache, rate-limit, error, and abandoned-inference counters.
+loaded and no component is draining abandoned inference or failed (see
+[Inference Timeout, Admission, and Recovery](#inference-timeout-admission-and-recovery-wi264));
+`/metrics` exposes bounded
+request, cache, rate-limit, error, and per-component inference counters.
 The systemd/OpenRC and mt-admin startup gates require both liveness and
 readiness; Docker and Compose mark the container healthy only after both pass.
 `health-lunarvoice.sh` discovers enabled tenants
 from `voice_health` registry slots, probes all of them, and fails closed on
 malformed enablement, missing/duplicate ports, unreachable instances, or
-unready STT. LunarVoice remains monitor-only in self-heal: failures alert but do
-not automatically restart optional model workloads.
+unready inference. LunarVoice remains monitor-only in self-heal: failures alert
+but do not automatically restart optional model workloads.
 
 ## Build And Test
 
@@ -254,9 +286,17 @@ all-feature runs in tmux:
 
 ```bash
 taskset -c 0-11 cargo fmt --all -- --check
-taskset -c 0-11 cargo check -j12
-taskset -c 0-11 cargo test -j12 -- --test-threads=12
-taskset -c 0-11 cargo clippy -j12 --all-targets --all-features -- -D warnings
+# Model-free tests include the production inference runner with controlled
+# blocking work, shared permits, cancellation, and a real poisoned mutex.
+taskset -c 0-11 cargo test --locked -j12 --no-default-features -- --test-threads=12
+
+# Native-feature checks use the committed, hash-verified libraries; no model download.
+(cd native-libs && sha256sum -c SHA256SUMS)
+export SHERPA_LIB_PATH="$PWD/native-libs/linux-x64"
+export LD_LIBRARY_PATH="$SHERPA_LIB_PATH/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+taskset -c 0-11 cargo check --locked -j12 --all-targets
+taskset -c 0-11 cargo test --locked -j12 -- --test-threads=12
+taskset -c 0-11 cargo clippy --locked -j12 --all-targets -- -D warnings
 
 # Repository-root lifecycle and health harnesses:
 bash ic/scripts/tests/test-mt-admin-voice.sh
