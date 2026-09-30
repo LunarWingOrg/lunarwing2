@@ -25,7 +25,8 @@
 
 4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264
+6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264
+    - (2026-09-30, AJ) WI#264 fixed in the voice sidecar. A timed-out request can no longer leave zombie Kokoro inference silently monopolizing the TTS mutex and a shared inference permit: per-component abandonment tracking (CallerGuard/WorkerGuard pair), fail-fast 503 for the draining component only (STT/VAD unaffected), try_lock on the TTS mutex so nothing queues behind a stuck synthesis, and automatic re-admission when the native call returns (Drop-based, panic-safe). /ready and /metrics expose per-component abandoned-inference counters. 100% of the sidecar scope: engine + api + tests + README/gateway-guide docs (commits 908645604, 9d0151383, 37fb440a4). Gateway #259 422/503/504 semantics unchanged (503 already maps through). Remaining known limitation documented in README: the zombie call itself still holds one permit + CPU until it exits; operator recovery for a never-returning model is a sidecar restart.
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/244
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/220
