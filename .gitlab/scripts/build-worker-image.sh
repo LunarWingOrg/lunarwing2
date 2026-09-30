@@ -21,9 +21,11 @@ case "$1" in
         context=.
         dockerfile_dir=pebble4lunarwing
         input_files='pebble4lunarwing/Dockerfile
-pebble4lunarwing/Cargo.lock'
+pebble4lunarwing/Cargo.lock
+pebble4lunarwing/upstream/Cargo.lock'
         source_ref=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
         build_args="PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
+PEBBLE_LOCK_SHA256=$(sha256sum "$CI_PROJECT_DIR/pebble4lunarwing/upstream/Cargo.lock" | cut -d' ' -f1)
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
