@@ -605,10 +605,20 @@ async fn assert_strict_stream_failure(script: Vec<SseFrame>) {
         captured_stream_chunks(&rig),
         vec!["```repl\nFINAL('partial".to_string()]
     );
-    assert_eq!(fixture.request_count(), 1);
+    // The mid-stream failure is transport-class transient, so the engine
+    // issues its one bounded model-visible recovery request (WI#244). The
+    // fixture has no second script, so that attempt also fails and the thread
+    // terminates — proving strict failure still holds after exhausted
+    // recovery.
+    assert_eq!(fixture.request_count(), 2);
     let requests = fixture.captured_requests();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_stream_request(&requests[0]);
+    assert_stream_request(&requests[1]);
+    assert!(
+        requests[1]["messages"].to_string().contains("provider temporarily failed"),
+        "recovery request must carry the safe failure instruction"
+    );
     assert_eq!(
         rig.llm_call_count(),
         0,
@@ -640,4 +650,68 @@ async fn midstream_json_error_does_not_commit_a_partial_response() {
 #[tokio::test]
 async fn premature_eof_before_terminal_event_does_not_synthesize_done() {
     assert_strict_stream_failure(premature_eof_script()).await;
+}
+
+#[tokio::test]
+async fn midstream_decode_failure_recovers_with_one_fresh_request() {
+    // WI#244: a TensorZero-style decode failure after partial text gets one
+    // bounded model-visible recovery request. The recovered response
+    // completes the thread; the aborted partial draft never persists and the
+    // provider diagnostic never reaches model context.
+    let _lock = ENGINE_V2_ENV_LOCK.lock().await;
+    let env = EngineV2EnvGuard::enable(Some("gateway"));
+    lunarwing::bridge::reset_engine_state().await;
+
+    let fixture = TensorZeroFixture::start(vec![
+        midstream_error_script(),
+        terminal_script("decode-recovered", 12, 6),
+    ])
+    .await;
+    let rig = TestRigBuilder::new()
+        .with_channel_name("gateway")
+        .with_llm(fixture.provider())
+        .build()
+        .await;
+    let thread_id = Uuid::new_v4();
+    register_gateway_thread(&rig, thread_id).await;
+    rig.send_incoming(gateway_message(
+        thread_id,
+        "fail mid-stream then recover",
+    ))
+    .await;
+
+    let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].content, "decode-recovered");
+
+    assert_eq!(fixture.request_count(), 2);
+    let requests = fixture.captured_requests();
+    assert_eq!(requests.len(), 2);
+    assert_stream_request(&requests[0]);
+    assert_stream_request(&requests[1]);
+    let recovery_messages = requests[1]["messages"].to_string();
+    assert!(
+        recovery_messages.contains("provider temporarily failed"),
+        "recovery request must carry the safe failure instruction"
+    );
+    assert!(
+        !recovery_messages.contains("TensorZero provider failed mid-stream"),
+        "provider diagnostics must stay out of recovery context"
+    );
+
+    // The aborted partial draft is never committed to conversation history.
+    let assistants = assistant_messages(&rig, thread_id).await;
+    assert!(
+        assistants
+            .iter()
+            .all(|content| !content.contains("FINAL('partial")),
+        "partial provider content must not persist: {assistants:?}"
+    );
+    // Only the terminal usage of the successful attempt is recorded.
+    assert_eq!(rig.llm_call_count(), 1);
+    assert_eq!(rig.total_input_tokens(), 12);
+    assert_eq!(rig.total_output_tokens(), 6);
+
+    rig.shutdown_and_wait().await;
+    env.cleanup().await;
 }
