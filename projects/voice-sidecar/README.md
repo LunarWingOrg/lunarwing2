@@ -37,9 +37,37 @@ Health defaults to `127.0.0.1:8091`:
 
 ```text
 GET /health   process liveness and loaded components
-GET /ready    STT readiness; returns 503 until required models load
+GET /ready    STT readiness; returns 503 until required models load or an abandoned inference is still draining
 GET /metrics  bounded operational counters
 ```
+
+### Abandoned inference (WI#264)
+
+A request timeout returns `504 timeout` to the caller, but the native ONNX
+inference already handed to a blocking thread cannot be interrupted and keeps
+running until it exits on its own. The sidecar therefore never lets such a
+zombie call silently monopolize resources:
+
+- Each component (STT/TTS/VAD) tracks abandoned calls. While an abandoned
+  call is still running, new requests for **that component** fail fast with
+  `503 unavailable` instead of queueing behind it; the other components stay
+  available. TTS mutex acquisition is `try_lock`, so fresh synthesis never
+  blocks waiting behind a stuck one.
+- Once the underlying call returns (success, error, or panic unwinding), the
+  component is re-admitted automatically. Recovery needs no operator action.
+- `/ready` includes a per-component `abandoned_inference` object
+  (`{"stt": {"in_flight": 0, "total": 1}, ...}`) and reports 503 while any
+  component has a call in flight. `/metrics` exposes
+  `abandoned_inference_in_flight` and `abandoned_inference_total`, and the
+  log emits one `warn` per abandoned request naming the draining component.
+
+Remaining limitation: the zombie inference itself still consumes one shared
+inference permit (`VOICE_MAX_CONCURRENT_INFERENCE`) and CPU until it exits.
+If a model wedges indefinitely (never observed with Kokoro, but possible with
+a pathological model), the draining component stays 503; operator recovery is
+restarting the sidecar (`mt-admin restart <tenant>` or the systemd/OpenRC
+unit). The shared permit pool and other components are unaffected meanwhile,
+and repeated timeouts cannot leave the sidecar degraded after the call exits.
 
 ## Multi-Tenant Lifecycle
 
@@ -203,8 +231,10 @@ values and preserves/restores a pre-existing cloud transcription selection.
 
 ## Health And Operations
 
-`/health` is process liveness; `/ready` returns HTTP 200 only when STT is loaded;
-`/metrics` exposes bounded request, cache, rate-limit, and error counters.
+`/health` is process liveness; `/ready` returns HTTP 200 only when STT is
+loaded and no component is draining an abandoned inference (see
+[Abandoned inference](#abandoned-inference-wi264)); `/metrics` exposes bounded
+request, cache, rate-limit, error, and abandoned-inference counters.
 The systemd/OpenRC and mt-admin startup gates require both liveness and
 readiness; Docker and Compose mark the container healthy only after both pass.
 `health-lunarvoice.sh` discovers enabled tenants
