@@ -2,7 +2,7 @@
   "name": "gitlab",
   "display_name": "Self-hosted GitLab",
   "kind": "tool",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "wit_version": "0.3.0",
   "description": "Manage projects, classic issues, unified Work Items (including Tasks), merge requests, branches, files, search, and pipelines on self-hosted GitLab",
   "keywords": [
