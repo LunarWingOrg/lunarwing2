@@ -23,7 +23,12 @@
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.2.0.md (candidates, weigh each)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268
+4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268
+    - Completed 100% for the auditable scope: audit doc + operator runbook at `docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md` (branch `aj/kimi-4-20260930-0601`), pointer added in `docs/architecture/ENGINE-V2.md`.
+    - Source-verified overlay storage, all three gated writers, consumption gates, thread-lifetime caveat; every citation from the work item re-checked against the current tree.
+    - Read-only live audit of both registered tenants (antelope 2.1.3, hermes 2.0.4): `ORCHESTRATOR_SELF_MODIFY` unset in env and live process, zero stored overlay docs, zero injected thread snapshots. Both classified "absent". Tenants outside this host uninspected (documented as such).
+    - One test gap found and closed: `self_improvement_outcome_skips_prompt_additions_when_gate_off` in `ic/crates/lunarwing_engine/src/runtime/mission.rs`. cargo test + clippy -D warnings + fmt clean on the engine crate.
+    - No defect found; opt-in mechanism is not a bug (per item scope). Broader per-tenant prompt management stays in #220.
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/244
