@@ -20,6 +20,8 @@
 //! - timed-out result with empty/heartbeat-only output -> falls back to the
 //!   genuine-progress buffer in `res.output` and the persisted result
 //!   message (!1237 finding 2)
+//! - whitespace separator frames -> preserved verbatim in recovered timeout
+//!   evidence (!1239 finding 1: opencode2 streams raw, untrimmed deltas)
 //! - connection failure (unreachable endpoint) -> `ExternalWorkerConnectionFailed`
 //! - protocol error (connection closed before `ready`) -> `ExternalWorkerProtocolError`
 //! - connection-pool reuse across two sequential successful tasks
@@ -1278,6 +1280,72 @@ async fn timeout_with_genuine_evidence_still_preserves_it() {
         .expect("genuine evidence must still be preserved");
     assert_eq!(partial, genuine);
     assert!(!partial.contains("[worker]"));
+}
+
+/// !1239 finding 1 regression: whitespace separators must survive the
+/// evidence gate. The opencode2 executor forwards raw, untrimmed
+/// `session.text.delta` strings, so separators arrive as their own `" "` /
+/// `"\n"` progress frames between genuine deltas. The heartbeat exclusion
+/// used to drop those frames and concatenate the surrounding words, turning
+/// `"alpha beta\ngamma"` into `"alphabetagamma"` in the recovered evidence.
+#[tokio::test]
+async fn timed_out_evidence_preserves_whitespace_separator_frames() {
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::HeartbeatTimeout {
+        // opencode2 stream shape: separators split into their own frames.
+        progress: vec![
+            "alpha".to_string(),
+            " ".to_string(),
+            "beta".to_string(),
+            "\n".to_string(),
+            "gamma".to_string(),
+        ],
+        // Empty result output: the evidence comes from the daemon's own
+        // streamed buffer, which is exactly what the gate corrupted.
+        result_output: String::new(),
+    })
+    .await;
+    let context_manager = Arc::new(ContextManager::new(5));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)])
+        .with_event_deps(event_tx, Arc::clone(&context_manager));
+    let job_id = Uuid::new_v4();
+    context_manager
+        .register_sandbox_job(job_id, "test-user", "task", "task")
+        .await
+        .expect("register job");
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(5_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected a result for wait=true");
+
+    assert_eq!(res.status, ExternalTaskStatus::TimedOut);
+    assert_eq!(
+        res.output, "alpha beta\ngamma",
+        "whitespace separator frames must not be dropped from recovered evidence"
+    );
+
+    let ctx = context_manager
+        .get_context(job_id)
+        .await
+        .expect("job context");
+    let partial = ctx
+        .metadata
+        .get("partial_output")
+        .and_then(|v| v.as_str())
+        .expect("separator-preserving evidence must be persisted");
+    assert_eq!(partial, "alpha beta\ngamma");
 }
 
 /// !1237 finding 2 regression: a worker that streams genuine progress and
