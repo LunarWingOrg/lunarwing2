@@ -24,10 +24,10 @@ use parking_lot::Mutex as SyncMutex;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
-#[cfg(feature = "metrics")]
-use crate::metrics::ResolverMetrics;
 #[cfg(all(feature = "metrics", any(feature = "__tls", feature = "__quic")))]
 use crate::metrics::opportunistic_encryption::ProbeMetrics;
+#[cfg(feature = "metrics")]
+use crate::metrics::{NameServerAddr, ResolverMetrics};
 use crate::{
     config::{
         ConnectionConfig, NameServerConfig, OpportunisticEncryption, ResolverOpts,
@@ -84,6 +84,12 @@ impl<P: ConnectionProvider> NameServer<P> {
             connections.sort_by_key(|ns| ns.protocol != Protocol::Udp);
         }
 
+        #[cfg(feature = "metrics")]
+        let resolver_metrics = ResolverMetrics::new(match options.enable_per_name_server_metrics {
+            true => NameServerAddr::Individual(config.ip),
+            false => NameServerAddr::Aggregated,
+        });
+
         Self {
             config,
             connections: AsyncMutex::new(connections),
@@ -91,7 +97,7 @@ impl<P: ConnectionProvider> NameServer<P> {
             #[cfg(all(feature = "metrics", any(feature = "__tls", feature = "__quic")))]
             opportunistic_probe_metrics: ProbeMetrics::default(),
             #[cfg(feature = "metrics")]
-            resolver_metrics: ResolverMetrics::default(),
+            resolver_metrics,
             connection_provider,
         }
     }
@@ -103,111 +109,159 @@ impl<P: ConnectionProvider> NameServer<P> {
         policy: ConnectionPolicy,
         cx: &Arc<PoolContext>,
     ) -> Result<DnsResponse, NetError> {
-        let (handle, meta, protocol) = self.connected_mut_client(policy, cx).await?;
+        let (_protocol, result) = self.send_inner(request, policy, cx).await;
         #[cfg(feature = "metrics")]
-        self.resolver_metrics.increment_outgoing_query(&protocol);
-        let now = Instant::now();
-        let response = handle.send(request).first_answer().await;
-        let rtt = now.elapsed();
+        if let Some(protocol) = _protocol {
+            self.resolver_metrics
+                .increment_query_result(&protocol, result.as_ref().map(|_| ()));
+        }
 
-        match response {
-            Ok(response) => {
-                meta.set_status(Status::Established);
-                let result = DnsError::from_response(response);
-                let error = match result {
-                    Ok(response) => {
-                        meta.srtt.record(rtt);
-                        self.server_srtt.record(rtt);
-                        if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
-                            cx.transport_state()
-                                .await
-                                .response_received(self.config.ip, protocol);
+        result
+    }
+
+    async fn send_inner(
+        &self,
+        request: DnsRequest,
+        policy: ConnectionPolicy,
+        cx: &Arc<PoolContext>,
+    ) -> (Option<Protocol>, Result<DnsResponse, NetError>) {
+        // Reconnect and retry once if a reused connection was closed mid-flight.
+        // Caps total retries even when the pool holds several reusable connections.
+        let mut reconnect_budget = 1u8;
+        loop {
+            let ConnectedClient {
+                handle,
+                meta,
+                protocol,
+                reuse,
+            } = match self.connected_mut_client(policy, cx).await {
+                Ok(v) => v,
+                Err((err, protocol)) => {
+                    debug!(config = ?self.config, ?protocol, %err, "failed to establish connection to name server");
+                    return (protocol, Err(err));
+                }
+            };
+            #[cfg(feature = "metrics")]
+            self.resolver_metrics.increment_outgoing_query(&protocol);
+            let now = Instant::now();
+            let response = handle.send(request.clone()).first_answer().await;
+            let rtt = now.elapsed();
+
+            match response {
+                Ok(response) => {
+                    meta.set_status(Status::Established);
+                    let result = DnsError::from_response(response);
+                    let error = match result {
+                        Ok(response) => {
+                            meta.srtt.record(rtt);
+                            self.server_srtt.record(rtt);
+                            if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
+                                cx.transport_state()
+                                    .await
+                                    .response_received(self.config.ip, protocol);
+                            }
+                            return (Some(protocol), Ok(response));
                         }
-                        return Ok(response);
-                    }
-                    Err(error) => error,
-                };
+                        Err(error) => error,
+                    };
 
-                let update = match error {
-                    DnsError::NoRecordsFound(NoRecords {
-                        response_code: ResponseCode::ServFail,
-                        ..
-                    }) => Some(true),
-                    DnsError::NoRecordsFound(NoRecords { .. }) => Some(false),
-                    _ => None,
-                };
+                    let update = match error {
+                        DnsError::NoRecordsFound(NoRecords {
+                            response_code: ResponseCode::ServFail,
+                            ..
+                        }) => Some(true),
+                        DnsError::NoRecordsFound(NoRecords { .. }) => Some(false),
+                        _ => None,
+                    };
 
-                match update {
-                    Some(true) => {
-                        meta.srtt.record(rtt);
-                        self.server_srtt.record(rtt);
+                    match update {
+                        Some(true) => {
+                            meta.srtt.record(rtt);
+                            self.server_srtt.record(rtt);
+                        }
+                        Some(false) => {
+                            // record the failure
+                            meta.srtt.record_failure();
+                            self.server_srtt.record_failure();
+                        }
+                        None => {}
                     }
-                    Some(false) => {
-                        // record the failure
-                        meta.srtt.record_failure();
-                        self.server_srtt.record_failure();
+
+                    let err = NetError::from(error);
+                    if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
+                        cx.transport_state()
+                            .await
+                            .error_received(self.config.ip, protocol, &err)
                     }
-                    None => {}
+                    return (Some(protocol), Err(err));
                 }
+                Err(error) => {
+                    debug!(config = ?self.config, %error, "failed to connect to name server");
 
-                let err = NetError::from(error);
-                if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
-                    cx.transport_state()
-                        .await
-                        .error_received(self.config.ip, protocol, &err)
-                }
-                Err(err)
-            }
-            Err(error) => {
-                debug!(config = ?self.config, %error, "failed to connect to name server");
+                    // this transitions the state to failure, so the next acquire drops it
+                    meta.set_status(Status::Failed);
 
-                // this transitions the state to failure
-                meta.set_status(Status::Failed);
-
-                // record the failure on both the per-connection and server-level SRTTs.
-                // updating server_srtt ensures the server is deprioritized in pool
-                // ordering (decayed_srtt) so other servers get a chance to be tried.
-                match &error {
-                    NetError::Busy | NetError::Io(_) | NetError::Timeout => {
-                        meta.srtt.record_failure();
-                        self.server_srtt.record_failure();
+                    // A reused connection the peer had already closed isn't a server fault.
+                    // Reconnect and retry once without penalizing server selection. The resend
+                    // is at-least-once; the resolver only sends read-only queries through this pool.
+                    if reuse == ConnectionReuse::Reused
+                        && reconnect_budget > 0
+                        && error.is_connection_closed()
+                    {
+                        #[cfg(feature = "metrics")]
+                        // The increment in send() won't occur since we're retrying.
+                        self.resolver_metrics
+                            .increment_query_result(&protocol, Err(&error));
+                        reconnect_budget -= 1;
+                        continue;
                     }
-                    #[cfg(feature = "__quic")]
-                    NetError::QuinnConfigError(_)
-                    | NetError::QuinnConnect(_)
-                    | NetError::QuinnConnection(_)
-                    | NetError::QuinnTlsConfigError(_) => {
-                        meta.srtt.record_failure();
-                        self.server_srtt.record_failure();
-                    }
-                    #[cfg(feature = "__tls")]
-                    NetError::RustlsError(_) => {
-                        meta.srtt.record_failure();
-                        self.server_srtt.record_failure();
-                    }
-                    _ => {}
-                }
 
-                if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
-                    cx.transport_state()
-                        .await
-                        .error_received(self.config.ip, protocol, &error);
-                }
+                    // record the failure on both the per-connection and server-level SRTTs.
+                    // updating server_srtt ensures the server is deprioritized in pool
+                    // ordering (decayed_srtt) so other servers get a chance to be tried.
+                    match &error {
+                        NetError::Busy | NetError::Io(_) | NetError::Timeout => {
+                            meta.srtt.record_failure();
+                            self.server_srtt.record_failure();
+                        }
+                        #[cfg(feature = "__quic")]
+                        NetError::QuinnConfigError(_)
+                        | NetError::QuinnConnect(_)
+                        | NetError::QuinnConnection(_)
+                        | NetError::QuinnTlsConfigError(_) => {
+                            meta.srtt.record_failure();
+                            self.server_srtt.record_failure();
+                        }
+                        #[cfg(feature = "__tls")]
+                        NetError::RustlsError(_) => {
+                            meta.srtt.record_failure();
+                            self.server_srtt.record_failure();
+                        }
+                        _ => {}
+                    }
 
-                // These are connection failures, not lookup failures, that is handled in the resolver layer
-                Err(error)
+                    if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
+                        cx.transport_state()
+                            .await
+                            .error_received(self.config.ip, protocol, &error);
+                    }
+
+                    // These are connection failures, not lookup failures, that is handled in the resolver layer
+                    return (Some(protocol), Err(error));
+                }
             }
         }
     }
 
     /// This will return a mutable client to allows for sending messages.
     ///
-    /// If the connection is in a failed state, then this will establish a new connection
+    /// If the connection is in a failed state, then this will establish a new connection.
+    ///
     async fn connected_mut_client(
         &self,
         policy: ConnectionPolicy,
         cx: &Arc<PoolContext>,
-    ) -> Result<(P::Conn, Arc<ConnectionMeta>, Protocol), NetError> {
+    ) -> Result<ConnectedClient<P>, (NetError, Option<Protocol>)> {
         // Check for an existing usable connection (short lock)
         {
             let mut connections = self.connections.lock().await;
@@ -219,7 +273,12 @@ impl<P: ConnectionProvider> NameServer<P> {
                 &cx.opportunistic_encryption,
                 &connections,
             ) {
-                return Ok((conn.handle.clone(), conn.meta.clone(), conn.protocol));
+                return Ok(ConnectedClient {
+                    handle: conn.handle.clone(),
+                    meta: conn.meta.clone(),
+                    protocol: conn.protocol,
+                    reuse: ConnectionReuse::Reused,
+                });
             }
         }
 
@@ -232,7 +291,7 @@ impl<P: ConnectionProvider> NameServer<P> {
                 &cx.opportunistic_encryption,
                 &self.config.connections,
             )
-            .ok_or(NetError::NoConnections)?;
+            .ok_or((NetError::NoConnections, None))?;
 
         let protocol = config.protocol.to_protocol();
         if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
@@ -244,12 +303,14 @@ impl<P: ConnectionProvider> NameServer<P> {
         }
 
         // Establish connection
-        let handle = Box::pin(self.connection_provider.new_connection(
-            self.config.ip,
-            config,
-            cx,
-        )?)
-        .await?;
+        let handle_fut = self
+            .connection_provider
+            .new_connection(self.config.ip, config, cx)
+            .map_err(|e| (e, Some(protocol)))?;
+
+        let handle = Box::pin(handle_fut)
+            .await
+            .map_err(|e| (e, Some(protocol)))?;
 
         if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
             cx.transport_state()
@@ -261,7 +322,12 @@ impl<P: ConnectionProvider> NameServer<P> {
         let state = ConnectionState::new(handle.clone(), protocol);
         let meta = state.meta.clone();
         self.connections.lock().await.push(state);
-        Ok((handle, meta, protocol))
+        Ok(ConnectedClient {
+            handle,
+            meta,
+            protocol,
+            reuse: ConnectionReuse::Fresh,
+        })
     }
 
     pub(super) fn protocols(&self) -> impl Iterator<Item = Protocol> + '_ {
@@ -504,6 +570,21 @@ impl<P: ConnectionProvider> ProbeRequest<P> {
             metrics.record_probe_duration(proto, start.elapsed());
         }
     }
+}
+
+/// Whether `connected_mut_client` returned an existing pooled connection or established a new one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectionReuse {
+    Reused,
+    Fresh,
+}
+
+/// A connection selected by [`NameServer::connected_mut_client`] for sending a request.
+struct ConnectedClient<P: ConnectionProvider> {
+    handle: P::Conn,
+    meta: Arc<ConnectionMeta>,
+    protocol: Protocol,
+    reuse: ConnectionReuse,
 }
 
 struct ConnectionState<P: ConnectionProvider> {
@@ -1702,7 +1783,7 @@ mod opportunistic_enc_tests {
     }
 
     fn mock_connection(protocol: Protocol) -> ConnectionState<MockProvider> {
-        ConnectionState::new(MockClientHandle, protocol)
+        ConnectionState::new(MockClientHandle::default(), protocol)
     }
 
     #[cfg(feature = "metrics")]
@@ -1942,10 +2023,13 @@ mod opportunistic_enc_tests {
             provider.clone(),
         );
 
-        name_server
+        match name_server
             .connected_mut_client(ConnectionPolicy::default(), &cx)
             .await
-            .map(|_| ())
+        {
+            Ok(_) => Ok(()),
+            Err((e, _)) => Err(e),
+        }
     }
 }
 
@@ -1976,7 +2060,10 @@ mod resolver_metrics_tests {
                 .unwrap();
 
             runtime.block_on(async {
-                let options = ResolverOpts::default();
+                let options = ResolverOpts {
+                    enable_per_name_server_metrics: true,
+                    ..ResolverOpts::default()
+                };
                 let config = NameServerConfig::udp(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
                 let name_server = Arc::new(NameServer::new(
                     [],
@@ -2101,10 +2188,362 @@ mod resolver_metrics_tests {
         let protocol = vec![Label::new("protocol", "tls")];
         assert_counter_eq(&map, OUTGOING_QUERIES_TOTAL, protocol, 1);
     }
+
+    #[test]
+    fn test_name_server_query_success_metrics() {
+        subscribe();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let options = ResolverOpts {
+                    enable_per_name_server_metrics: true,
+                    ..ResolverOpts::default()
+                };
+                let config = NameServerConfig::udp(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+                let mock_provider = MockProvider::default();
+                let name_server = Arc::new(NameServer::new([], config, &options, mock_provider));
+
+                let cx = Arc::new(PoolContext::new(options, TlsConfig::new().unwrap()));
+                let name = Name::parse("www.example.com.", None).unwrap();
+                let _ = name_server
+                    .send(
+                        DnsRequest::from_query(
+                            Query::query(name.clone(), RecordType::A),
+                            DnsRequestOptions::default(),
+                        ),
+                        ConnectionPolicy::default(),
+                        &cx,
+                    )
+                    .await;
+            });
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+
+        use crate::metrics::NAME_SERVER_QUERY_RESPONSES;
+        let labels = vec![
+            Label::new("addr", "8.8.8.8"),
+            Label::new("protocol", "udp"),
+            Label::new("status", "success"),
+        ];
+        assert_counter_eq(&map, NAME_SERVER_QUERY_RESPONSES, labels, 1);
+    }
+
+    #[test]
+    fn test_name_server_query_connection_failure_metrics() {
+        subscribe();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let options = ResolverOpts {
+                    enable_per_name_server_metrics: true,
+                    ..ResolverOpts::default()
+                };
+                let config = NameServerConfig::udp(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+                let mock_provider = MockProvider {
+                    new_connection_error: Some(NetError::Io(Arc::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))),
+                    ..MockProvider::default()
+                };
+                let name_server = Arc::new(NameServer::new([], config, &options, mock_provider));
+
+                let cx = Arc::new(PoolContext::new(options, TlsConfig::new().unwrap()));
+                let name = Name::parse("www.example.com.", None).unwrap();
+                let _ = name_server
+                    .send(
+                        DnsRequest::from_query(
+                            Query::query(name.clone(), RecordType::A),
+                            DnsRequestOptions::default(),
+                        ),
+                        ConnectionPolicy::default(),
+                        &cx,
+                    )
+                    .await;
+            });
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+
+        use crate::metrics::NAME_SERVER_QUERY_RESPONSES;
+        let labels = vec![
+            Label::new("addr", "8.8.8.8"),
+            Label::new("protocol", "udp"),
+            Label::new("status", "io_connection_refused"),
+        ];
+        assert_counter_eq(&map, NAME_SERVER_QUERY_RESPONSES, labels, 1);
+    }
+
+    #[test]
+    fn test_name_server_query_response_code_failure_metrics() {
+        subscribe();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let options = ResolverOpts {
+                    enable_per_name_server_metrics: true,
+                    ..ResolverOpts::default()
+                };
+                let config = NameServerConfig::udp(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+                let mock_provider = MockProvider::default();
+                mock_provider
+                    .send_outcomes
+                    .lock()
+                    .push_back(Some(NetError::Dns(DnsError::ResponseCode(
+                        ResponseCode::ServFail,
+                    ))));
+                let name_server = Arc::new(NameServer::new([], config, &options, mock_provider));
+
+                let cx = Arc::new(PoolContext::new(options, TlsConfig::new().unwrap()));
+                let name = Name::parse("www.example.com.", None).unwrap();
+                let _ = name_server
+                    .send(
+                        DnsRequest::from_query(
+                            Query::query(name.clone(), RecordType::A),
+                            DnsRequestOptions::default(),
+                        ),
+                        ConnectionPolicy::default(),
+                        &cx,
+                    )
+                    .await;
+            });
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+
+        use crate::metrics::NAME_SERVER_QUERY_RESPONSES;
+        let labels = vec![
+            Label::new("addr", "8.8.8.8"),
+            Label::new("protocol", "udp"),
+            Label::new("status", "dns_response_code_servfail"),
+        ];
+        assert_counter_eq(&map, NAME_SERVER_QUERY_RESPONSES, labels, 1);
+    }
+
+    #[test]
+    fn test_name_server_query_no_records_success_metrics() {
+        subscribe();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let options = ResolverOpts {
+                    enable_per_name_server_metrics: true,
+                    ..ResolverOpts::default()
+                };
+                let config = NameServerConfig::udp(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+                let name = Name::parse("www.example.com.", None).unwrap();
+                let query = Query::query(name.clone(), RecordType::A);
+                let mock_provider = MockProvider::default();
+                mock_provider
+                    .send_outcomes
+                    .lock()
+                    .push_back(Some(NetError::Dns(DnsError::NoRecordsFound(
+                        NoRecords::new(query, ResponseCode::NXDomain),
+                    ))));
+                let name_server = Arc::new(NameServer::new([], config, &options, mock_provider));
+
+                let cx = Arc::new(PoolContext::new(options, TlsConfig::new().unwrap()));
+                let _ = name_server
+                    .send(
+                        DnsRequest::from_query(
+                            Query::query(name.clone(), RecordType::A),
+                            DnsRequestOptions::default(),
+                        ),
+                        ConnectionPolicy::default(),
+                        &cx,
+                    )
+                    .await;
+            });
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+
+        use crate::metrics::NAME_SERVER_QUERY_RESPONSES;
+        let labels = vec![
+            Label::new("addr", "8.8.8.8"),
+            Label::new("protocol", "udp"),
+            Label::new("status", "dns_no_records"),
+        ];
+        assert_counter_eq(&map, NAME_SERVER_QUERY_RESPONSES, labels, 1);
+    }
+
+    #[test]
+    fn test_name_server_query_metrics_aggregation() {
+        subscribe();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let name = Name::parse("www.example.com.", None).unwrap();
+                let options = ResolverOpts {
+                    enable_per_name_server_metrics: false,
+                    ..Default::default()
+                };
+                let config = NameServerConfig::udp(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+                let mock_provider = MockProvider::default();
+                let name_server = Arc::new(NameServer::new([], config, &options, mock_provider));
+
+                let cx = Arc::new(PoolContext::new(options, TlsConfig::new().unwrap()));
+                let _ = name_server
+                    .send(
+                        DnsRequest::from_query(
+                            Query::query(name.clone(), RecordType::A),
+                            DnsRequestOptions::default(),
+                        ),
+                        ConnectionPolicy::default(),
+                        &cx,
+                    )
+                    .await;
+            });
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+
+        use crate::metrics::NAME_SERVER_QUERY_RESPONSES;
+        let labels = vec![
+            // No address label.
+            Label::new("protocol", "udp"),
+            Label::new("status", "success"),
+        ];
+        assert_counter_eq(&map, NAME_SERVER_QUERY_RESPONSES, labels, 1);
+    }
+}
+
+#[cfg(all(test, any(feature = "metrics", feature = "__tls")))]
+mod reconnect_tests {
+    use std::collections::VecDeque;
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    use parking_lot::Mutex as SyncMutex;
+    use test_support::subscribe;
+
+    use super::mock_provider::MockProvider;
+    use super::{ConnectionPolicy, NameServer};
+    use crate::config::{NameServerConfig, ResolverOpts};
+    use crate::connection_provider::TlsConfig;
+    use crate::name_server_pool::PoolContext;
+    use crate::net::NetError;
+    use crate::proto::op::{DnsRequest, DnsRequestOptions, Query};
+    use crate::proto::rr::{Name, RecordType};
+
+    fn connection_closed() -> NetError {
+        NetError::from(io::Error::from(io::ErrorKind::ConnectionReset))
+    }
+
+    fn query() -> DnsRequest {
+        DnsRequest::from_query(
+            Query::query(
+                Name::parse("www.example.com.", None).unwrap(),
+                RecordType::A,
+            ),
+            DnsRequestOptions::default(),
+        )
+    }
+
+    /// Build a name server whose connections replay `outcomes` across the sends they receive.
+    fn name_server_with(
+        outcomes: VecDeque<Option<NetError>>,
+    ) -> (
+        Arc<NameServer<MockProvider>>,
+        MockProvider,
+        Arc<PoolContext>,
+    ) {
+        let provider = MockProvider {
+            send_outcomes: Arc::new(SyncMutex::new(outcomes)),
+            ..MockProvider::default()
+        };
+        let options = ResolverOpts::default();
+        let config = NameServerConfig::udp(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        let ns = Arc::new(NameServer::new([], config, &options, provider.clone()));
+        let cx = Arc::new(PoolContext::new(options, TlsConfig::new().unwrap()));
+        (ns, provider, cx)
+    }
+
+    /// A reused pooled connection that the peer closed while idle should be
+    /// transparently reconnected rather than surfacing the error to the caller.
+    #[tokio::test]
+    async fn reconnects_once_when_reused_connection_was_closed() {
+        subscribe();
+
+        // Establish (ok), the reused send fails connection-closed, and the
+        // post-reconnect send succeeds (empty queue falls through to success).
+        let (ns, provider, cx) =
+            name_server_with(VecDeque::from([None, Some(connection_closed())]));
+
+        ns.clone()
+            .send(query(), ConnectionPolicy::default(), &cx)
+            .await
+            .expect("initial query establishes the connection");
+        ns.clone()
+            .send(query(), ConnectionPolicy::default(), &cx)
+            .await
+            .expect("stale reused connection is transparently reconnected");
+
+        // The initial connection plus the post-failure reconnect.
+        assert_eq!(provider.new_connection_calls().len(), 2);
+    }
+
+    /// A connection-closed error on a brand-new (non-reused) connection is a real
+    /// failure, not a stale-pool artifact: it must propagate without a retry.
+    #[tokio::test]
+    async fn does_not_retry_when_a_fresh_connection_fails_closed() {
+        subscribe();
+
+        let (ns, provider, cx) = name_server_with(VecDeque::from([Some(connection_closed())]));
+
+        ns.send(query(), ConnectionPolicy::default(), &cx)
+            .await
+            .expect_err("a fresh connection failure must not be retried");
+
+        assert_eq!(provider.new_connection_calls().len(), 1);
+    }
 }
 
 #[cfg(all(test, any(feature = "metrics", feature = "__tls")))]
 mod mock_provider {
+    use std::collections::VecDeque;
     use std::future::Future;
     use std::io;
     use std::pin::Pin;
@@ -2119,6 +2558,8 @@ mod mock_provider {
     use crate::net::runtime::TokioTime;
     use crate::net::runtime::iocompat::AsyncIoTokioAsStd;
     use crate::proto::op::Message;
+    use crate::proto::rr::rdata::NULL;
+    use crate::proto::rr::{RData, Record};
 
     /// `MockProvider` is a `ConnectionProvider` that uses a synchronous runtime provider.
     ///
@@ -2131,6 +2572,10 @@ mod mock_provider {
         pub(super) runtime: MockSyncRuntimeProvider,
         pub(super) new_connection_calls: Arc<SyncMutex<Vec<(IpAddr, ProtocolConfig)>>>,
         pub(super) new_connection_error: Option<NetError>,
+        /// Per-send outcomes, consumed front-to-back across all connections this
+        /// provider hands out: `Some(err)` fails that send, `None` (or an empty
+        /// queue) succeeds.
+        pub(super) send_outcomes: Arc<SyncMutex<VecDeque<Option<NetError>>>>,
     }
 
     impl MockProvider {
@@ -2156,7 +2601,9 @@ mod mock_provider {
 
             Ok(Box::pin(future::ready(match &self.new_connection_error {
                 Some(err) => Err(err.clone()),
-                None => Ok(MockClientHandle),
+                None => Ok(MockClientHandle {
+                    send_outcomes: self.send_outcomes.clone(),
+                }),
             })))
         }
 
@@ -2171,25 +2618,38 @@ mod mock_provider {
                 runtime: MockSyncRuntimeProvider,
                 new_connection_calls: Arc::new(SyncMutex::new(Vec::new())),
                 new_connection_error: None,
+                send_outcomes: Arc::new(SyncMutex::new(VecDeque::new())),
             }
         }
     }
 
     /// `MockClientHandle` is a `DnsHandle` that uses a synchronous runtime provider.
     ///
-    /// It's `send` method always returns a `NoError` response when polled, simulating a
-    /// successful DNS request exchange.
+    /// Its `send` method replays the provider's scripted `send_outcomes`: a `Some(err)`
+    /// entry fails that send, while `None` or an exhausted queue yields a `NoError` response.
     #[derive(Clone, Default)]
-    pub(super) struct MockClientHandle;
+    pub(super) struct MockClientHandle {
+        send_outcomes: Arc<SyncMutex<VecDeque<Option<NetError>>>>,
+    }
 
     impl DnsHandle for MockClientHandle {
         type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, NetError>> + Send>>;
         type Runtime = MockSyncRuntimeProvider;
 
         fn send(&self, request: DnsRequest) -> Self::Response {
+            if let Some(Some(err)) = self.send_outcomes.lock().pop_front() {
+                return Box::pin(once(future::ready(Err(err))));
+            }
             let mut response = Message::response(request.id, request.op_code);
             response.metadata.response_code = ResponseCode::NoError;
             response.add_queries(request.queries.clone());
+            if let Some(query) = request.queries.first() {
+                response.add_answer(Record::from_rdata(
+                    query.name.clone(),
+                    0,
+                    RData::NULL(NULL::with(vec![0])),
+                ));
+            }
             Box::pin(once(future::ready(Ok(
                 DnsResponse::from_message(response).unwrap()
             ))))

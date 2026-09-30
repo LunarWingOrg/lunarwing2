@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.62"
 name = "open"
-version = "5.4.1"
+version = "5.4.4"
 authors = ["Sebastian Thiel <byronimo@gmail.com>"]
 build = false
 include = [

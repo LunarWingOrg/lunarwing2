@@ -1,7 +1,7 @@
 [package]
 name = "console"
 description = "A terminal and console abstraction for Rust"
-version = "0.16.4"
+version = "0.16.6"
 keywords = ["cli", "terminal", "colors", "console", "ansi"]
 license = "MIT"
 edition = "2021"
@@ -10,7 +10,14 @@ repository = "https://github.com/console-rs/console"
 documentation = "https://docs.rs/console"
 readme = "README.md"
 rust-version = "1.71"
-include = ["CHANGELOG.md", "Cargo.toml", "LICENSE", "README.md", "src/**/*.rs"]
+include = [
+    "CHANGELOG.md",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "src/**/*.rs",
+    "tests/data/sample_zellij_session.log",
+]
 
 [features]
 default = ["unicode-width", "ansi-parsing", "std"]

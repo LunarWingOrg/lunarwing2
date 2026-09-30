@@ -16,7 +16,7 @@ pub type HookFuture<'a, E> = Pin<Box<dyn Future<Output = HookResult<E>> + Send +
 type SyncFn<M> =
     dyn Fn(&mut <M as Manager>::Type, &Metrics) -> HookResult<<M as Manager>::Error> + Sync + Send;
 
-/// Function siganture for async callbacks
+/// Function signature for async callbacks
 type AsyncFn<M> = dyn for<'a> Fn(&'a mut <M as Manager>::Type, &'a Metrics) -> HookFuture<'a, <M as Manager>::Error>
     + Sync
     + Send;
@@ -39,9 +39,9 @@ impl<M: Manager> Hook<M> {
     /// Create Hook from async function
     pub fn async_fn(
         f: impl for<'a> Fn(&'a mut M::Type, &'a Metrics) -> HookFuture<'a, M::Error>
-            + Sync
-            + Send
-            + 'static,
+        + Sync
+        + Send
+        + 'static,
     ) -> Self {
         Self::AsyncFn(Box::new(f))
     }
@@ -62,7 +62,7 @@ impl<M: Manager> fmt::Debug for Hook<M> {
     }
 }
 
-/// Error which is returned by `pre_create`, `pre_recycle` and
+/// Error which is returned by `post_create`, `pre_recycle` and
 /// `post_recycle` hooks.
 #[derive(Debug)]
 pub enum HookError<E> {
@@ -151,7 +151,7 @@ impl<M: Manager> fmt::Debug for Hooks<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Hooks")
             .field("post_create", &self.post_create)
-            .field("pre_recycle", &self.post_recycle)
+            .field("pre_recycle", &self.pre_recycle)
             .field("post_recycle", &self.post_recycle)
             .finish()
     }

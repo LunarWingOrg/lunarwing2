@@ -11,9 +11,9 @@
 
 [package]
 edition = "2018"
-rust-version = "1.34"
+rust-version = "1.36"
 name = "portable-atomic-util"
-version = "0.2.7"
+version = "0.2.8"
 build = "build.rs"
 exclude = [
     "/.*",
@@ -83,6 +83,10 @@ trailing_empty_array = "warn"
 transmute_undefined_repr = "warn"
 undocumented_unsafe_blocks = "warn"
 unused_trait_names = "warn"
+
+[lints.clippy.assert_is_empty]
+level = "allow"
+priority = 1
 
 [lints.clippy.bool_assert_comparison]
 level = "allow"

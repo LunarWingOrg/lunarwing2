@@ -309,27 +309,28 @@ fn test_list_in_cell_handled_natively() {
     assert_eq!(t1, tier2(html), "<ul>-in-cell output must match Tier-2");
 }
 
-/// Test 18: nested `<table>` — Phase HH: flattened inline into the outer cell.
-/// Tier-1 no longer bails; it inlines the nested table as pipe-separated text.
-/// Separator-row dash counts diverge between tiers post-#406 (Tier-2's measurement
-/// pre-pass skips nested-table rendering to avoid the O(N²) explosion; Tier-1 still
-/// measures the rendered cell text and pads to the full width).  Outer row content
-/// remains byte-equal between tiers.
+/// Test 18: nested `<table>` alone in a data table's last row's only cell — issue #484.
+/// Tier-2's `block/table/builder::handle_table` defers such a nested table to a separate
+/// GFM table rendered after the enclosing one, rather than flattening it into a line of
+/// escaped pipes (the outer table is not a one-cell wrapper here — it has a `<th>` row —
+/// so the pre-existing `TableNestedTable` wrapper-unwrap bail does not cover it). This
+/// scanner has no equivalent end-of-table deferred-output buffer, so it bails with
+/// `TableNestedTableInSingleCellRow` and Tier-2 is authoritative.
 #[test]
-fn test_nested_table_flattened_natively() {
+fn test_nested_table_deferred_natively() {
     let html = "<table>\
         <tr><th>H</th></tr>\
         <tr><td><table><tr><td>inner</td></tr></table></td></tr>\
     </table>";
-    let t1 = tier1_run(html).expect("Tier-1 should not bail on nested table (Phase HH)");
-    let t2 = tier2(html);
+    let err = tier1_run(html).unwrap_err();
     assert!(
-        t1.contains("| | inner | | ----- | |"),
-        "Tier-1 must inline nested table contents; got: {t1:?}"
+        matches!(err, BailReason::TableNestedTableInSingleCellRow),
+        "expected TableNestedTableInSingleCellRow, got {err:?}"
     );
-    assert!(
-        t2.contains("| | inner | | ----- | |"),
-        "Tier-2 must inline nested table contents; got: {t2:?}"
+    let t2 = tier2(html);
+    assert_eq!(
+        t2, "| H     |\n| ----- |\n|       |\n\n| inner |\n| ----- |\n",
+        "Tier-2 must render the inner table separately, not flattened: {t2:?}"
     );
 }
 
@@ -527,22 +528,14 @@ fn byte_eq_block_child_bail_fallback() {
 
 #[test]
 fn byte_eq_nested_table_bail_fallback() {
-    // ~keep Post-#406: Tier-1 and Tier-2 separator-row dash counts diverge on the
-    // ~keep nested-table fallback (Tier-2 skips nested-table rendering during the
-    // ~keep measurement pre-pass to avoid the O(N²) explosion; Tier-1 still inlines
-    // ~keep and measures the full rendered text).  Outer row content stays equal.
+    // ~keep Issue #484: the outer table is not a one-cell wrapper (it has a `<th>` row),
+    // ~keep so the pre-existing `TableNestedTable` bail does not fire; this shape instead
+    // ~keep bails with `TableNestedTableInSingleCellRow` (Tier-2 defers the nested table to
+    // ~keep a separate GFM table after the enclosing one). `tier1()` dispatches through the
+    // ~keep normal bail-and-fall-back path, so it is exactly Tier-2's output here.
     let html = "<table><tr><th>H</th></tr>\
         <tr><td><table><tr><td>inner</td></tr></table></td></tr></table>";
-    let t1 = tier1(html);
-    let t2 = tier2(html);
-    assert!(
-        t1.contains("| | inner | | ----- | |"),
-        "Tier-1 must inline nested table contents; got: {t1:?}"
-    );
-    assert!(
-        t2.contains("| | inner | | ----- | |"),
-        "Tier-2 must inline nested table contents; got: {t2:?}"
-    );
+    assert_eq!(tier1(html), tier2(html));
 }
 
 #[test]

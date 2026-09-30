@@ -7,7 +7,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::dynamic_set::{dynamic_set, Entry};
+use crate::dynamic_set::{Entry, dynamic_set};
 use crate::static_sets::StaticAtomSet;
 use debug_unreachable::debug_unreachable;
 
@@ -27,6 +27,10 @@ const DYNAMIC_TAG: u8 = 0b_00;
 const INLINE_TAG: u8 = 0b_01; // len in upper nybble
 const STATIC_TAG: u8 = 0b_10;
 const TAG_MASK: u64 = 0b_11;
+
+/// With alignment, a `*const Entry` pointer always has zeroes in its lowest `TAG_BITS` bits
+const _: () = assert!(mem::align_of::<Entry>() >= TAG_MASK.next_power_of_two() as usize);
+
 const LEN_OFFSET: u64 = 4;
 const LEN_MASK: u64 = 0xF0;
 
@@ -75,6 +79,26 @@ const STATIC_SHIFT_BITS: usize = 32;
 ///     }
 /// } // atom is dropped here, so it is not kept around in memory
 /// ```
+///
+/// ## Internal representation
+///
+/// An `Atom` is always 64 bits / 8 bytes.
+/// The least-significant two bits form a tag to distinguish three different representations:
+///
+/// * `0b01`: A short string up to 7 bytes, stored inline in most-significant 56 bits.
+///   Bits #4 to #7 (the upper nibble of the lower byte) are the length of the string.
+/// * `0b10`: A string part of a statically-known indexed set with [perfect hashing].
+///   The most-significant 32 bits are the index in the set.
+/// * `0b00`: For other cases, the entire 64 bits are a heap-allocated pointer
+///   to an entry in a global hash map.
+///   Alignment of the allocation ensures the tag bits are indeed zero.
+///   The entry is atomically reference-counted.
+///   It is removed from the map and deallocated when its last `Atom` is dropped.
+///   The map exists so that interning the same string again gives another pointer to the same entry.
+///
+/// In all cases, shallow 64-bit equality is equivalent to string equality.
+///
+/// [perfect hashing]: https://docs.rs/phf/latest/phf/
 #[derive(PartialEq, Eq)]
 // NOTE: Deriving PartialEq requires that a given string must always be interned the same way.
 pub struct Atom<Static> {
@@ -82,8 +106,8 @@ pub struct Atom<Static> {
     phantom: PhantomData<Static>,
 }
 
-// This isn't really correct as the Atoms can technically take up space. But I guess it's ok
-// as it is possible to measure the size of the atom set separately/
+/// Static and inline atoms don’t have any allocated space. Dynamic atoms do but
+/// are accounted for by [`malloc_size_of_dynamic_set`][crate::malloc_size_of_dynamic_set].
 #[cfg(feature = "malloc_size_of")]
 impl<Static: StaticAtomSet> malloc_size_of::MallocSizeOf for Atom<Static> {
     fn size_of(&self, _ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
@@ -130,6 +154,11 @@ impl<Static> Atom<Static> {
     fn tag(&self) -> u8 {
         (self.unsafe_data.get() & TAG_MASK) as u8
     }
+
+    /// Assuming DYNAMIC_TAG, return the pointer to `Entry`
+    fn dynamic_ptr(&self) -> *const Entry {
+        std::ptr::with_exposed_provenance(self.unsafe_data.get() as usize)
+    }
 }
 
 impl<Static: StaticAtomSet> Atom<Static> {
@@ -161,19 +190,22 @@ impl<Static: StaticAtomSet> Atom<Static> {
         self.unsafe_data.get() >> STATIC_SHIFT_BITS
     }
 
-    /// Get the hash of the string as it is stored in the set.
-    pub fn get_hash(&self) -> u32 {
+    /// Returns a hash of the string
+    ///
+    /// For static or dynamic atoms, it is a pre-computed high-quality hash.
+    ///
+    /// For inline atoms however (short strings 7 bytes or less),
+    /// the returned value is the literal inline representation
+    /// with string bytes packed directly in the `u64` value,
+    /// which makes it a relatively poor-quality hash if used directly.
+    pub fn get_hash(&self) -> u64 {
         match self.tag() {
             DYNAMIC_TAG => {
-                let entry = self.unsafe_data.get() as *const Entry;
+                let entry = self.dynamic_ptr();
                 unsafe { (*entry).hash }
             }
             STATIC_TAG => Static::get().hashes[self.static_index() as usize],
-            INLINE_TAG => {
-                let data = self.unsafe_data.get();
-                // This may or may not be great...
-                ((data >> 32) ^ data) as u32
-            }
+            INLINE_TAG => self.unsafe_data.get(),
             _ => unsafe { debug_unreachable!() },
         }
     }
@@ -184,7 +216,7 @@ impl<Static: StaticAtomSet> Atom<Static> {
 
     fn try_static_internal(string_to_add: &str) -> Result<Self, phf_shared::Hashes> {
         let static_set = Static::get();
-        let hash = phf_shared::hash(&*string_to_add, &static_set.key);
+        let hash = phf_shared::hash(string_to_add, &static_set.key);
         let index = phf_shared::get_index(&hash, static_set.disps, static_set.atoms.len());
 
         if static_set.atoms[index as usize] == string_to_add {
@@ -193,12 +225,24 @@ impl<Static: StaticAtomSet> Atom<Static> {
             Err(hash)
         }
     }
+
+    /// Get a reference to the underlying str.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self // auto-deref
+    }
+
+    /// Get a reference to the bytes of the underlying str.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_str().as_bytes()
+    }
 }
 
 impl<Static: StaticAtomSet> Default for Atom<Static> {
     #[inline]
     fn default() -> Self {
-        Atom::pack_static(Static::empty_string_index())
+        Atom::pack_inline(0, 0)
     }
 }
 
@@ -208,16 +252,14 @@ impl<Static: StaticAtomSet> Hash for Atom<Static> {
     where
         H: Hasher,
     {
-        state.write_u32(self.get_hash())
+        state.write_u64(self.get_hash())
     }
 }
 
 impl<'a, Static: StaticAtomSet> From<Cow<'a, str>> for Atom<Static> {
     fn from(string_to_add: Cow<'a, str>) -> Self {
         let len = string_to_add.len();
-        if len == 0 {
-            Self::pack_static(Static::empty_string_index())
-        } else if len <= MAX_INLINE_LEN {
+        if len <= MAX_INLINE_LEN {
             let mut data: u64 = (INLINE_TAG as u64) | ((len as u64) << LEN_OFFSET);
             {
                 let dest = inline_atom_slice_mut(&mut data);
@@ -229,9 +271,12 @@ impl<'a, Static: StaticAtomSet> From<Cow<'a, str>> for Atom<Static> {
                 phantom: PhantomData,
             }
         } else {
-            Self::try_static_internal(&*string_to_add).unwrap_or_else(|hash| {
-                let ptr: std::ptr::NonNull<Entry> = dynamic_set().insert(string_to_add, hash.g);
-                let data = ptr.as_ptr() as u64;
+            Self::try_static_internal(&string_to_add).unwrap_or_else(|hash| {
+                // Reconstitute 64-bit `Hash128::h1`
+                // https://docs.rs/phf_shared/0.14.0/src/phf_shared/lib.rs.html#45-54
+                let hash = (hash.g as u64) << 32 | (hash.f1 as u64);
+                let ptr: std::ptr::NonNull<Entry> = dynamic_set().insert(string_to_add, hash);
+                let data = ptr.as_ptr().expose_provenance() as u64;
                 debug_assert!(0 == data & TAG_MASK);
                 Atom {
                     // The address of a ptr::NonNull is non-zero
@@ -247,8 +292,12 @@ impl<Static: StaticAtomSet> Clone for Atom<Static> {
     #[inline(always)]
     fn clone(&self) -> Self {
         if self.tag() == DYNAMIC_TAG {
-            let entry = self.unsafe_data.get() as *const Entry;
-            unsafe { &*entry }.ref_count.fetch_add(1, SeqCst);
+            let entry = self.dynamic_ptr();
+            // SAFETY: `self` is a valid Atom, meaning its `unsafe_data` points to a live `Entry`
+            // kept alive by `self`'s reference count. We can safely dereference it.
+            if unsafe { &*entry }.ref_count.fetch_add(1, SeqCst) == isize::MAX {
+                std::process::abort();
+            }
         }
         Atom { ..*self }
     }
@@ -258,15 +307,16 @@ impl<Static> Drop for Atom<Static> {
     #[inline]
     fn drop(&mut self) {
         if self.tag() == DYNAMIC_TAG {
-            let entry = self.unsafe_data.get() as *const Entry;
+            let entry = self.dynamic_ptr();
             if unsafe { &*entry }.ref_count.fetch_sub(1, SeqCst) == 1 {
                 drop_slow(self)
             }
         }
 
         // Out of line to guide inlining.
+        #[cold]
         fn drop_slow<Static>(this: &mut Atom<Static>) {
-            dynamic_set().remove(this.unsafe_data.get() as *mut Entry);
+            dynamic_set().remove(this.dynamic_ptr().cast_mut());
         }
     }
 }
@@ -279,7 +329,7 @@ impl<Static: StaticAtomSet> ops::Deref for Atom<Static> {
         unsafe {
             match self.tag() {
                 DYNAMIC_TAG => {
-                    let entry = self.unsafe_data.get() as *const Entry;
+                    let entry = self.dynamic_ptr();
                     &(*entry).string
                 }
                 INLINE_TAG => {
@@ -307,17 +357,14 @@ impl<Static: StaticAtomSet> fmt::Debug for Atom<Static> {
             }
         };
 
-        write!(f, "Atom('{}' type={})", &*self, ty_str)
+        write!(f, "Atom('{}' type={})", self, ty_str)
     }
 }
 
 impl<Static: StaticAtomSet> PartialOrd for Atom<Static> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        if self.unsafe_data == other.unsafe_data {
-            return Some(Equal);
-        }
-        self.as_ref().partial_cmp(other.as_ref())
+        Some(self.cmp(other))
     }
 }
 
@@ -327,7 +374,7 @@ impl<Static: StaticAtomSet> Ord for Atom<Static> {
         if self.unsafe_data == other.unsafe_data {
             return Equal;
         }
-        self.as_ref().cmp(other.as_ref())
+        self.as_str().cmp(other.as_ref())
     }
 }
 
@@ -336,12 +383,18 @@ impl<Static: StaticAtomSet> Ord for Atom<Static> {
 // over the one from &str.
 impl<Static: StaticAtomSet> Atom<Static> {
     fn from_mutated_str<F: FnOnce(&mut str)>(s: &str, f: F) -> Self {
-        let mut buffer = mem::MaybeUninit::<[u8; 64]>::uninit();
-        let buffer = unsafe { &mut *buffer.as_mut_ptr() };
+        let mut buffer = [const { mem::MaybeUninit::<u8>::uninit() }; 64];
 
         if let Some(buffer_prefix) = buffer.get_mut(..s.len()) {
-            buffer_prefix.copy_from_slice(s.as_bytes());
-            let as_str = unsafe { ::std::str::from_utf8_unchecked_mut(buffer_prefix) };
+            let buffer_ptr = buffer_prefix.as_mut_ptr().cast::<u8>();
+            // SAFETY: `buffer_ptr` points to the `MaybeUninit` array.
+            // We use `copy_nonoverlapping` to write valid data into it,
+            // and then create a slice covering ONLY the initialized portion.
+            let as_str = unsafe {
+                buffer_ptr.copy_from_nonoverlapping(s.as_ptr(), s.len());
+                let buffer_slice = slice::from_raw_parts_mut(buffer_ptr, s.len());
+                std::str::from_utf8_unchecked_mut(buffer_slice)
+            };
             f(as_str);
             Atom::from(&*as_str)
         } else {
@@ -379,37 +432,37 @@ impl<Static: StaticAtomSet> Atom<Static> {
     ///
     /// [`eq_ignore_ascii_case`]: https://doc.rust-lang.org/std/ascii/trait.AsciiExt.html#tymethod.eq_ignore_ascii_case
     pub fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
-        (self == other) || self.eq_str_ignore_ascii_case(&**other)
+        (self == other) || self.eq_str_ignore_ascii_case(other)
     }
 
     /// Like [`eq_ignore_ascii_case`], but takes an unhashed string as `other`.
     ///
     /// [`eq_ignore_ascii_case`]: https://doc.rust-lang.org/std/ascii/trait.AsciiExt.html#tymethod.eq_ignore_ascii_case
     pub fn eq_str_ignore_ascii_case(&self, other: &str) -> bool {
-        (&**self).eq_ignore_ascii_case(other)
+        self.as_str().eq_ignore_ascii_case(other)
     }
 }
 
 #[inline(always)]
 fn inline_atom_slice(x: &NonZeroU64) -> &[u8] {
-        let x: *const NonZeroU64 = x;
-        let mut data = x as *const u8;
-        // All except the lowest byte, which is first in little-endian, last in big-endian.
-        if cfg!(target_endian = "little") {
-            data = unsafe { data.offset(1) };
-        }
-        let len = 7;
-        unsafe { slice::from_raw_parts(data, len) }   
+    let x: *const NonZeroU64 = x;
+    let mut data = x as *const u8;
+    // All except the lowest byte, which is first in little-endian, last in big-endian.
+    if cfg!(target_endian = "little") {
+        data = unsafe { data.offset(1) };
+    }
+    let len = 7;
+    unsafe { slice::from_raw_parts(data, len) }
 }
 
 #[inline(always)]
-fn inline_atom_slice_mut(x: &mut u64) -> &mut [u8] {   
-        let x: *mut u64 = x;
-        let mut data = x as *mut u8;
-        // All except the lowest byte, which is first in little-endian, last in big-endian.
-        if cfg!(target_endian = "little") {
-            data = unsafe { data.offset(1) };
-        }
-        let len = 7;
-        unsafe { slice::from_raw_parts_mut(data, len) }
+fn inline_atom_slice_mut(x: &mut u64) -> &mut [u8] {
+    let x: *mut u64 = x;
+    let mut data = x as *mut u8;
+    // All except the lowest byte, which is first in little-endian, last in big-endian.
+    if cfg!(target_endian = "little") {
+        data = unsafe { data.offset(1) };
+    }
+    let len = 7;
+    unsafe { slice::from_raw_parts_mut(data, len) }
 }

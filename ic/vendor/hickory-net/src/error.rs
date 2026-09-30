@@ -23,7 +23,7 @@ use crate::proto::ProtoError;
 use crate::proto::dnssec::Proof;
 use crate::proto::op::{DnsResponse, Query, ResponseCode};
 use crate::proto::rr::RData;
-use crate::proto::rr::{Record, RecordRef, RecordType, rdata::SOA};
+use crate::proto::rr::{DNSClass, Name, Record, RecordRef, RecordType, rdata::SOA};
 use crate::proto::serialize::binary::DecodeError;
 
 /// The error type for network protocol errors (UDP, TCP, QUIC, H2, H3)
@@ -81,6 +81,11 @@ pub enum NetError {
     /// An error got returned from IO
     #[error("io error: {0}")]
     Io(Arc<io::Error>),
+
+    /// A request was too large
+    #[cfg(any(feature = "__https", feature = "__h3"))]
+    #[error("request too large")]
+    RequestTooLarge,
 
     /// A request timed out
     #[error("request timed out")]
@@ -140,6 +145,21 @@ pub enum NetError {
     /// case.
     #[error("case of query name in response did not match")]
     QueryCaseMismatch,
+
+    /// An upstream response contained a record whose class did not match the IN query class.
+    #[error("foreign class record in response: {record_name} {record_class} {record_type}")]
+    ForeignClassRecord {
+        /// The name of the offending record.
+        record_name: Name,
+        /// The class of the offending record.
+        record_class: DNSClass,
+        /// The type of the offending record.
+        record_type: RecordType,
+    },
+
+    /// Received a truncated response
+    #[error("response was truncated; TCP already tried or no other transport available")]
+    Truncated,
 }
 
 impl NetError {
@@ -161,12 +181,136 @@ impl NetError {
         matches!(self, Self::Dns(DnsError::NoRecordsFound { .. }))
     }
 
+    /// Returns true for a transport-level connection error: the connection was
+    /// closed, reset, or refused, as opposed to a timeout or a server-side (DNS)
+    /// error.
+    pub fn is_connection_closed(&self) -> bool {
+        match self {
+            #[cfg(feature = "__https")]
+            Self::H2(err) => {
+                err.is_io() || err.is_go_away() || err.reason() == Some(h2::Reason::REFUSED_STREAM)
+            }
+            #[cfg(feature = "__h3")]
+            Self::H3(err) => err.is_h3_no_error(),
+            Self::Io(err) => matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+            ),
+            #[cfg(feature = "__quic")]
+            Self::QuinnConnection(err) => matches!(
+                err,
+                quinn::ConnectionError::ConnectionClosed(_)
+                    | quinn::ConnectionError::ApplicationClosed(_)
+                    | quinn::ConnectionError::Reset
+            ),
+            _ => false,
+        }
+    }
+
     /// Returns the SOA record, if the error contains one
     #[inline]
     pub fn into_soa(self) -> Option<Box<Record<SOA>>> {
         match self {
             Self::Dns(DnsError::NoRecordsFound(NoRecords { soa, .. })) => soa,
             _ => None,
+        }
+    }
+
+    /// Returns a representative string of the error for use as a metrics label.
+    pub fn as_metrics_label(&self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            #[cfg(any(feature = "__https", feature = "__h3"))]
+            Self::Decode(_) => "http_header_decode",
+            Self::Dns(dns_err) => dns_err.as_metrics_label(),
+            #[cfg(feature = "__https")]
+            Self::H2(_) => "http2",
+            #[cfg(feature = "__h3")]
+            Self::H3(_) => "http3",
+            Self::ParseInt(_) => "parse_header_value",
+            Self::NoConnections => "no_connections",
+            Self::Proto(_) => "proto",
+            Self::Io(e) => {
+                use std::io::ErrorKind::*;
+                match e.kind() {
+                    NotFound => "io_not_found",
+                    PermissionDenied => "io_permission_denied",
+                    ConnectionRefused => "io_connection_refused",
+                    ConnectionReset => "io_connection_reset",
+                    HostUnreachable => "io_host_unreachable",
+                    NetworkUnreachable => "io_network_unreachable",
+                    ConnectionAborted => "io_connection_aborted",
+                    NotConnected => "io_not_connected",
+                    AddrInUse => "io_addr_in_use",
+                    AddrNotAvailable => "io_addr_not_available",
+                    NetworkDown => "io_network_down",
+                    BrokenPipe => "io_broken_pipe",
+                    AlreadyExists => "io_already_exists",
+                    WouldBlock => "io_would_block",
+                    InvalidInput => "io_invalid_input",
+                    InvalidData => "io_invalid_data",
+                    TimedOut => "io_timed_out",
+                    WriteZero => "io_write_zero",
+                    QuotaExceeded => "io_quota_exceeded",
+                    ResourceBusy => "io_resource_busy",
+                    Deadlock => "io_deadlock",
+                    Interrupted => "io_interrupted",
+                    Unsupported => "io_unsupported",
+                    OutOfMemory => "io_out_of_memory",
+                    Other => "io_other",
+
+                    // It's highly unlikely that any of these would actually be returned.
+                    NotADirectory => "io_not_a_directory",
+                    IsADirectory => "io_is_a_directory",
+                    DirectoryNotEmpty => "io_directory_not_empty",
+                    ReadOnlyFilesystem => "io_read_only_filesystem",
+                    StaleNetworkFileHandle => "io_stale_network_file_handle",
+                    StorageFull => "io_storage_full",
+                    NotSeekable => "io_not_seekable",
+                    FileTooLarge => "io_file_too_large",
+                    ExecutableFileBusy => "io_executable_file_busy",
+                    CrossesDevices => "io_crosses_devices",
+                    TooManyLinks => "io_too_many_links",
+                    InvalidFilename => "io_invalid_filename",
+                    ArgumentListTooLong => "io_argument_list_too_long",
+                    UnexpectedEof => "io_unexpected_eof",
+
+                    _ => "io_unknown",
+                }
+            }
+            #[cfg(any(feature = "__https", feature = "__h3"))]
+            Self::RequestTooLarge => "request_too_large",
+            Self::Timeout => "timeout",
+            #[cfg(feature = "__quic")]
+            Self::QuinnConnect(_) => "quic_connect",
+            #[cfg(feature = "__quic")]
+            Self::QuinnConnection(_) => "quic_connection",
+            #[cfg(feature = "__quic")]
+            Self::QuinnWriteError(_) => "quic_write",
+            #[cfg(feature = "__quic")]
+            Self::QuinnReadError(_) => "quic_read",
+            #[cfg(feature = "__quic")]
+            Self::QuinnStreamError(_) => "quic_stream",
+            #[cfg(feature = "__quic")]
+            Self::QuinnConfigError(_) => "quic_config",
+            #[cfg(feature = "__quic")]
+            Self::QuinnTlsConfigError(_) => "quic_tls_config_error",
+            #[cfg(feature = "__quic")]
+            Self::QuinnUnknownStreamError => "quic_unknown_stream",
+            #[cfg(feature = "__quic")]
+            Self::QuicMessageIdNot0(_) => "quic_message_id_not_0",
+            #[cfg(feature = "__tls")]
+            Self::RustlsError(_) => "tls",
+            Self::QueryCaseMismatch => "query_case_mismatch",
+            Self::ForeignClassRecord { .. } => "foreign_class_record",
+            Self::Truncated => "truncated",
+
+            // Don't report these because the format is arbitrary, and in the case of Msg, dynamic.
+            Self::Message(_) | Self::Msg(_) => "message",
         }
     }
 }
@@ -247,6 +391,9 @@ pub enum DnsError {
         /// DNSSEC proof of the record
         proof: Proof,
     },
+    /// DNSSEC validation failure
+    #[error("DNSSEC validation failed")]
+    DnssecBogus,
 }
 
 impl DnsError {
@@ -331,6 +478,38 @@ impl DnsError {
                 | Unknown(_) => Ok(response),
             }
     }
+
+    /// Returns the DNS error as a representative string for use as a metrics label.
+    pub fn as_metrics_label(&self) -> &'static str {
+        use hickory_proto::op::ResponseCode::*;
+        match self {
+            Self::ResponseCode(NoError) => "dns_response_code_noerror",
+            Self::ResponseCode(FormErr) => "dns_response_code_formerror",
+            Self::ResponseCode(ServFail) => "dns_response_code_servfail",
+            Self::ResponseCode(NXDomain) => "dns_response_code_nxdomain",
+            Self::ResponseCode(NotImp) => "dns_response_code_notimp",
+            Self::ResponseCode(Refused) => "dns_response_code_refused",
+            Self::ResponseCode(YXDomain) => "dns_response_code_yxdomain",
+            Self::ResponseCode(YXRRSet) => "dns_response_code_yxrrset",
+            Self::ResponseCode(NXRRSet) => "dns_response_code_nxrrset",
+            Self::ResponseCode(NotAuth) => "dns_response_code_notauth",
+            Self::ResponseCode(NotZone) => "dns_response_code_notzone",
+            Self::ResponseCode(BADVERS) => "dns_response_code_badvers",
+            Self::ResponseCode(BADSIG) => "dns_response_code_badsig",
+            Self::ResponseCode(BADKEY) => "dns_response_code_badkey",
+            Self::ResponseCode(BADTIME) => "dns_response_code_badtime",
+            Self::ResponseCode(BADMODE) => "dns_response_code_badmode",
+            Self::ResponseCode(BADNAME) => "dns_response_code_badname",
+            Self::ResponseCode(BADALG) => "dns_response_code_badalg",
+            Self::ResponseCode(BADTRUNC) => "dns_response_code_badtrunc",
+            Self::ResponseCode(BADCOOKIE) => "dns_response_code_badcookie",
+            Self::ResponseCode(Unknown(_)) => "dns_response_code_unknown",
+            Self::NoRecordsFound(_) => "dns_no_records",
+            #[cfg(feature = "__dnssec")]
+            Self::Nsec { .. } => "dns_nsec",
+            Self::DnssecBogus => "dns_dnssec_bogus",
+        }
+    }
 }
 
 /// Response where no records were found
@@ -375,4 +554,52 @@ pub struct ForwardNSData {
     pub ns: Record,
     /// Any glue records associated with the referant NS record.
     pub glue: Arc<[Record]>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_connection_closed_io_kinds() {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                NetError::from(io::Error::from(kind)).is_connection_closed(),
+                "{kind:?}"
+            );
+        }
+
+        assert!(
+            !NetError::from(io::Error::from(io::ErrorKind::PermissionDenied))
+                .is_connection_closed()
+        );
+        assert!(!NetError::Timeout.is_connection_closed());
+        assert!(!NetError::Message("server error").is_connection_closed());
+    }
+
+    #[cfg(feature = "__https")]
+    #[test]
+    fn is_connection_closed_h2() {
+        // REFUSED_STREAM: the server never processed the request, so it's safe to retry.
+        assert!(NetError::from(h2::Error::from(h2::Reason::REFUSED_STREAM)).is_connection_closed());
+        // A protocol error mid-exchange is not a clean connection-closed signal.
+        assert!(
+            !NetError::from(h2::Error::from(h2::Reason::INTERNAL_ERROR)).is_connection_closed()
+        );
+    }
+
+    #[cfg(feature = "__quic")]
+    #[test]
+    fn is_connection_closed_quic_excludes_timeout() {
+        assert!(NetError::QuinnConnection(quinn::ConnectionError::Reset).is_connection_closed());
+        assert!(
+            !NetError::QuinnConnection(quinn::ConnectionError::TimedOut).is_connection_closed()
+        );
+    }
 }

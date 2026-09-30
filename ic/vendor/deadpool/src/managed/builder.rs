@@ -3,15 +3,15 @@ use std::{fmt, marker::PhantomData, time::Duration};
 use crate::Runtime;
 
 use super::{
-    hooks::{Hook, Hooks},
     Manager, Object, Pool, PoolConfig, QueueMode, Timeouts,
+    hooks::{Hook, Hooks},
 };
 
 /// Possible errors returned when [`PoolBuilder::build()`] fails to build a
 /// [`Pool`].
 #[derive(Copy, Clone, Debug)]
 pub enum BuildError {
-    /// [`Runtime`] is required du to configured timeouts.
+    /// [`Runtime`] is required due to configured timeouts.
     NoRuntimeSpecified,
 }
 
@@ -170,8 +170,8 @@ where
     ///
     /// # Important
     ///
-    /// The [`Runtime`] is optional. Most [`Pool`]s don't need a
-    /// [`Runtime`]. If want to utilize timeouts, however a [`Runtime`] must be
+    /// The [`Runtime`] is optional. Most [`Pool`]s don't need a [`Runtime`].
+    /// If you want to utilize timeouts, however, a [`Runtime`] must be
     /// specified as you will otherwise get a [`PoolError::NoRuntimeSpecified`]
     /// when trying to use [`Pool::timeout_get()`].
     ///

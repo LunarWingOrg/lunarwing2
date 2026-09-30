@@ -7,6 +7,7 @@
 //! - Empty element filtering
 //! - Visitor callbacks for custom paragraph processing
 
+use crate::converter::main_helpers::is_ascii_whitespace_only;
 use crate::options::{ConversionOptions, NewlineStyle};
 use tl::{NodeHandle, Parser};
 
@@ -30,14 +31,16 @@ pub fn handle(
 
     let content_start_pos = output.len();
 
-    let is_table_continuation =
-        ctx.in_table_cell && !output.is_empty() && !output.ends_with('|') && !output.ends_with("<br>");
-
-    let is_list_continuation = ctx.in_list_item
+    let is_table_continuation = (ctx.in_table_cell || ctx.in_layout_cell)
         && !output.is_empty()
-        && !output.ends_with("* ")
-        && !output.ends_with("- ")
-        && !output.ends_with(". ");
+        && !output.ends_with('|')
+        && !output.ends_with("<br>")
+        // ~keep A layout cell, unlike a real one, may already hold a newline: its row renders as a
+        // ~keep list item, not a pipe row. Separating there opens the next line with a stray space.
+        // ~keep Inert for `in_table_cell`, whose buffer never holds a newline by construction.
+        && !output.ends_with('\n');
+
+    let is_list_continuation = ctx.in_list_item && !output.is_empty() && !ends_with_bare_list_marker(output, options);
 
     let after_code_block = output.ends_with("```\n");
     // ~keep Inside a blockquote, sibling blocks (heading, list, table, pre) already manage
@@ -71,6 +74,7 @@ pub fn handle(
     let p_ctx = Context {
         in_paragraph: true,
         block_content_start: output.len(),
+        block_output_ptr: std::ptr::from_ref::<String>(output) as usize,
         ..ctx.clone()
     };
 
@@ -86,7 +90,13 @@ pub fn handle(
                 if let Some(node) = child_handle.get(parser) {
                     if let tl::Node::Raw(bytes) = node {
                         let text = bytes.as_utf8_str();
-                        if text.trim().is_empty() && i > 0 && i < child_handles.len() - 1 {
+                        // ~keep `is_ascii_whitespace_only`, not `text.trim().is_empty()`: a
+                        // ~keep raw byte that is significant, Unicode-whitespace content (a
+                        // ~keep literal decoded nbsp, not the `&nbsp;` entity) trims to empty
+                        // ~keep under `str::trim`'s broader definition, but dropping it here
+                        // ~keep outright discarded real content -- it must only be skipped
+                        // ~keep when it is genuinely pure ASCII formatting whitespace.
+                        if is_ascii_whitespace_only(&text) && i > 0 && i < child_handles.len() - 1 {
                             let prev = &child_handles[i - 1];
                             let next = &child_handles[i + 1];
                             if is_empty_inline_element(prev, parser, dom_ctx)
@@ -146,6 +156,28 @@ fn add_list_continuation_indent(
     for _ in 0..list_indent_columns {
         output.push(' ');
     }
+}
+
+/// Whether `output` ends with a bare list marker and nothing else: an ordered marker's
+/// "N. " (matched generically via the trailing ". ", regardless of digit count) or one of the
+/// user-configured bullet characters in `options.bullets` followed by its trailing space.
+///
+/// ~keep Hardcoding only '*' and '-' here missed any other configured bullet -- the default
+/// ~keep `bullets` cycle is "-*+", so a paragraph as the first content of a THIRD-level nested
+/// ~keep list item (marker "+ ") fell through this check, was wrongly treated as a
+/// ~keep mid-paragraph continuation, and got a second, redundant continuation indent stacked
+/// ~keep onto the very first line after its own marker (spec example 307).
+fn ends_with_bare_list_marker(output: &str, options: &ConversionOptions) -> bool {
+    if output.ends_with(". ") {
+        return true;
+    }
+    let mut chars = output.chars().rev();
+    if chars.next() != Some(' ') {
+        return false;
+    }
+    chars
+        .next()
+        .is_some_and(|marker_char| options.bullets.contains(marker_char))
 }
 
 /// Check if an element is empty (has no text content).

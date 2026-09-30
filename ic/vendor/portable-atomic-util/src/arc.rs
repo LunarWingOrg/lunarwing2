@@ -18,9 +18,9 @@ use alloc::{
     alloc::handle_alloc_error,
     borrow::{Cow, ToOwned},
     boxed::Box,
+    string::String,
+    vec::Vec,
 };
-#[cfg(not(portable_atomic_no_maybe_uninit))]
-use alloc::{string::String, vec::Vec};
 #[cfg(not(portable_atomic_no_min_const_generics))]
 use core::convert::TryFrom;
 use core::{
@@ -30,16 +30,16 @@ use core::{
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
-    isize,
+    iter::FromIterator,
     marker::PhantomData,
     mem::{self, ManuallyDrop},
     ops::Deref,
     pin::Pin,
     ptr::{self, NonNull},
-    usize,
+    slice,
 };
-#[cfg(not(portable_atomic_no_maybe_uninit))]
-use core::{iter::FromIterator, slice};
+#[allow(deprecated)]
+use core::{isize, usize};
 #[cfg(portable_atomic_unstable_coerce_unsized)]
 use core::{marker::Unsize, ops::CoerceUnsized};
 
@@ -53,6 +53,11 @@ use crate::utils::ptr as strict;
 #[cfg(portable_atomic_no_strict_provenance)]
 use crate::utils::ptr::PtrExt as _;
 
+#[allow(deprecated)] // associated constant MAX requires Rust 1.43
+const ISIZE_MAX: isize = isize::MAX;
+#[allow(deprecated)] // associated constant MAX requires Rust 1.43
+const USIZE_MAX: usize = usize::MAX;
+
 /// A soft limit on the amount of references that may be made to an `Arc`.
 ///
 /// Going above this limit will abort your program (although not
@@ -62,7 +67,7 @@ use crate::utils::ptr::PtrExt as _;
 /// This is a global invariant, and also applies when using a compare-exchange loop.
 ///
 /// See comment in `Arc::clone`.
-const MAX_REFCOUNT: usize = isize::MAX as usize;
+const MAX_REFCOUNT: usize = ISIZE_MAX as usize;
 
 /// The error in case either counter reaches above `MAX_REFCOUNT`, and we can `panic` safely.
 const INTERNAL_OVERFLOW_ERROR: &str = "Arc counter overflow";
@@ -187,7 +192,7 @@ impl<T: ?Sized> Arc<T> {
 pub struct Weak<T: ?Sized> {
     // This is a `NonNull` to allow optimizing the size of this type in enums,
     // but it is not necessarily a valid pointer.
-    // `Weak::new` sets this to `usize::MAX` so that it doesn’t need
+    // `Weak::new` sets this to `usize::MAX` so that it doesn't need
     // to allocate space on the heap. That's not a value a real pointer
     // will ever have because ArcInner has alignment at least 2.
     ptr: NonNull<ArcInner<T>>,
@@ -367,7 +372,6 @@ impl<T> Arc<T> {
     ///
     /// assert_eq!(*five, 5)
     /// ```
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     #[inline]
     #[must_use]
     pub fn new_uninit() -> Arc<mem::MaybeUninit<T>> {
@@ -398,7 +402,6 @@ impl<T> Arc<T> {
     /// ```
     ///
     /// [zeroed]: mem::MaybeUninit::zeroed
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     #[inline]
     #[must_use]
     pub fn new_zeroed() -> Arc<mem::MaybeUninit<T>> {
@@ -564,7 +567,7 @@ impl<T> Arc<T> {
     /// ```
     #[inline]
     pub fn into_inner(this: Self) -> Option<T> {
-        // Make sure that the ordinary `Drop` implementation isn’t called as well
+        // Make sure that the ordinary `Drop` implementation isn't called as well
         let mut this = mem::ManuallyDrop::new(this);
 
         // Following the implementation of `drop` and `drop_slow`
@@ -587,9 +590,48 @@ impl<T> Arc<T> {
 
         Some(inner)
     }
+
+    /// Maps the value in an `Arc`, reusing the allocation if possible.
+    ///
+    /// `f` is called on a reference to the value in the `Arc`, and the result is returned, also in
+    /// an `Arc`.
+    ///
+    /// Note: this is an associated function, which means that you have
+    /// to call it as `Arc::map(a, f)` instead of `r.map(a)`. This
+    /// is so that there is no conflict with a method on the inner type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use portable_atomic_util::Arc;
+    ///
+    /// let r = Arc::new(7);
+    /// let new = Arc::map(r, |i| i + 7);
+    /// assert_eq!(*new, 14);
+    /// ```
+    #[inline]
+    pub fn map<F, U>(this: Self, f: F) -> Arc<U>
+    where
+        F: FnOnce(&T) -> U,
+    {
+        if mem::size_of::<T>() == mem::size_of::<U>()
+            && mem::align_of::<T>() == mem::align_of::<U>()
+            && Arc::is_unique(&this)
+        {
+            unsafe {
+                let ptr = Arc::into_raw(this);
+                let value = ptr.read();
+                let mut allocation = Arc::from_raw(ptr as *const mem::MaybeUninit<U>);
+
+                *Arc::get_mut_unchecked(&mut allocation) = mem::MaybeUninit::new(f(&value));
+                allocation.assume_init()
+            }
+        } else {
+            Arc::new(f(&*this))
+        }
+    }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl<T> Arc<[T]> {
     /// Constructs a new atomically reference-counted slice with uninitialized contents.
     ///
@@ -664,7 +706,6 @@ impl<T> Arc<[T]> {
     }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl<T> Arc<mem::MaybeUninit<T>> {
     /// Converts to `Arc<T>`.
     ///
@@ -717,7 +758,6 @@ impl<T: ?Sized + CloneToUninit> Arc<T> {
     }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl<T> Arc<[mem::MaybeUninit<T>]> {
     /// Converts to `Arc<[T]>`.
     ///
@@ -978,7 +1018,7 @@ impl<T: ?Sized> Arc<T> {
 
         loop {
             // check if the weak counter is currently "locked"; if so, spin.
-            if cur == usize::MAX {
+            if cur == USIZE_MAX {
                 hint::spin_loop();
                 cur = this.inner().weak.load(Relaxed);
                 continue;
@@ -1031,7 +1071,7 @@ impl<T: ?Sized> Arc<T> {
         let cnt = this.inner().weak.load(Relaxed);
         // If the weak count is currently locked, the value of the
         // count was 0 just before taking the lock.
-        if cnt == usize::MAX { 0 } else { cnt - 1 }
+        if cnt == USIZE_MAX { 0 } else { cnt - 1 }
     }
 
     /// Gets the number of strong (`Arc`) pointers to this allocation.
@@ -1083,7 +1123,7 @@ impl<T: ?Sized> Arc<T> {
         // Destroy the data at this time, even though we must not free the box
         // allocation itself (there might still be weak pointers lying around).
         // We cannot use `get_mut_unchecked` here, because `self.alloc` is borrowed.
-        unsafe { ptr::drop_in_place(&mut (*self.ptr.as_ptr()).data) };
+        unsafe { ptr::drop_in_place(&mut (*self.ptr.as_ptr()).data) }
     }
 
     /// Returns `true` if the two `Arc`s point to the same allocation in a vein similar to
@@ -1188,7 +1228,6 @@ impl<T: ?Sized> Arc<T> {
     }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl<T> Arc<[T]> {
     /// Allocates an `ArcInner<[mem::MaybeUninit<T>]>` with the given length.
     unsafe fn allocate_for_slice(len: usize) -> *mut ArcInner<[mem::MaybeUninit<T>]> {
@@ -1371,12 +1410,12 @@ impl<T: ?Sized + CloneToUninit> Arc<T> {
     /// let mut data = Arc::new(75);
     /// let weak = Arc::downgrade(&data);
     ///
-    /// assert!(75 == *data);
-    /// assert!(75 == *weak.upgrade().unwrap());
+    /// assert_eq!(75, *data);
+    /// assert_eq!(75, *weak.upgrade().unwrap());
     ///
     /// *Arc::make_mut(&mut data) += 1;
     ///
-    /// assert!(76 == *data);
+    /// assert_eq!(76, *data);
     /// assert!(weak.upgrade().is_none());
     /// ```
     #[inline]
@@ -1533,7 +1572,7 @@ impl<T: ?Sized> Arc<T> {
         // writes to `strong` (in particular in `Weak::upgrade`) prior to decrements
         // of the `weak` count (via `Weak::drop`, which uses release). If the upgraded
         // weak ref was never dropped, the CAS here will fail so we do not care to synchronize.
-        if this.inner().weak.compare_exchange(1, usize::MAX, Acquire, Relaxed).is_ok() {
+        if this.inner().weak.compare_exchange(1, USIZE_MAX, Acquire, Relaxed).is_ok() {
             // This needs to be an `Acquire` to synchronize with the decrement of the `strong`
             // counter in `drop` -- the only access that happens when any but the last reference
             // is being dropped.
@@ -1679,7 +1718,7 @@ impl<T> Weak<T> {
     pub const fn new() -> Self {
         Self {
             ptr: unsafe {
-                NonNull::new_unchecked(strict::without_provenance_mut::<ArcInner<T>>(usize::MAX))
+                NonNull::new_unchecked(strict::without_provenance_mut::<ArcInner<T>>(USIZE_MAX))
             },
         }
     }
@@ -2166,7 +2205,7 @@ impl<T: ?Sized + PartialEq> PartialEq for Arc<T> {
     ///
     /// let five = Arc::new(5);
     ///
-    /// assert!(five == Arc::new(5));
+    /// assert_eq!(five, Arc::new(5));
     /// ```
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -2187,7 +2226,7 @@ impl<T: ?Sized + PartialEq> PartialEq for Arc<T> {
     ///
     /// let five = Arc::new(5);
     ///
-    /// assert!(five != Arc::new(6));
+    /// assert_ne!(five, Arc::new(6));
     /// ```
     #[allow(clippy::partialeq_ne_impl)]
     #[inline]
@@ -2444,7 +2483,6 @@ items!({
     }
 });
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl<T: Clone> From<&[T]> for Arc<[T]> {
     /// Allocates a reference-counted slice and fills it by cloning `v`'s items.
     ///
@@ -2462,7 +2500,6 @@ impl<T: Clone> From<&[T]> for Arc<[T]> {
     }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl<T: Clone> From<&mut [T]> for Arc<[T]> {
     /// Allocates a reference-counted slice and fills it by cloning `v`'s items.
     ///
@@ -2481,7 +2518,6 @@ impl<T: Clone> From<&mut [T]> for Arc<[T]> {
     }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl From<&str> for Arc<str> {
     /// Allocates a reference-counted `str` and copies `v` into it.
     ///
@@ -2501,7 +2537,6 @@ impl From<&str> for Arc<str> {
     }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl From<&mut str> for Arc<str> {
     /// Allocates a reference-counted `str` and copies `v` into it.
     ///
@@ -2520,7 +2555,6 @@ impl From<&mut str> for Arc<str> {
     }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl From<String> for Arc<str> {
     /// Allocates a reference-counted `str` and copies `v` into it.
     ///
@@ -2555,7 +2589,6 @@ impl<T: ?Sized> From<Box<T>> for Arc<T> {
     }
 }
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl<T> From<Vec<T>> for Arc<[T]> {
     /// Allocates a reference-counted slice and moves `v`'s items into it.
     ///
@@ -2650,7 +2683,6 @@ items!({
     }
 });
 
-#[cfg(not(portable_atomic_no_maybe_uninit))]
 impl<T> FromIterator<T> for Arc<[T]> {
     /// Takes each element in the `Iterator` and collects it into an `Arc<[T]>`.
     ///
@@ -3012,7 +3044,6 @@ mod std_impls {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             (&**self).read(buf)
         }
-        #[cfg(not(portable_atomic_no_io_vec))]
         fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
             (&**self).read_vectored(bufs)
         }
@@ -3034,7 +3065,6 @@ mod std_impls {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             (&**self).write(buf)
         }
-        #[cfg(not(portable_atomic_no_io_vec))]
         fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
             (&**self).write_vectored(bufs)
         }
@@ -3060,7 +3090,6 @@ mod std_impls {
     //     // fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> io::Result<()> {
     //     //     (&**self).read_buf(buf)
     //     // }
-    //     #[cfg(not(portable_atomic_no_io_vec))]
     //     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
     //         (&**self).read_vectored(bufs)
     //     }
@@ -3073,7 +3102,6 @@ mod std_impls {
     //     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
     //         (&**self).write(buf)
     //     }
-    //     #[cfg(not(portable_atomic_no_io_vec))]
     //     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
     //         (&**self).write_vectored(bufs)
     //     }
@@ -3094,7 +3122,6 @@ mod std_impls {
     //     // fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> io::Result<()> {
     //     //     (&**self).read_buf(buf)
     //     // }
-    //     #[cfg(not(portable_atomic_no_io_vec))]
     //     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
     //         (&**self).read_vectored(bufs)
     //     }
@@ -3108,7 +3135,6 @@ mod std_impls {
     //     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
     //         (&**self).write(buf)
     //     }
-    //     #[cfg(not(portable_atomic_no_io_vec))]
     //     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
     //         (&**self).write_vectored(bufs)
     //     }
@@ -3125,14 +3151,11 @@ mod std_impls {
 
 use self::clone::CloneToUninit;
 mod clone {
-    use core::ptr;
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     use core::{
         mem::{self, MaybeUninit},
-        slice,
+        ptr, slice,
     };
 
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     use super::strict;
 
     // Based on unstable core::clone::CloneToUninit.
@@ -3149,7 +3172,6 @@ mod clone {
             unsafe { clone_one(self, dest as *mut T) }
         }
     }
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     unsafe impl<T: Clone> CloneToUninit for [T] {
         #[inline]
         #[cfg_attr(all(debug_assertions, not(portable_atomic_no_track_caller)), track_caller)]
@@ -3159,7 +3181,6 @@ mod clone {
             unsafe { clone_slice(self, dest) }
         }
     }
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     unsafe impl CloneToUninit for str {
         #[inline]
         #[cfg_attr(all(debug_assertions, not(portable_atomic_no_track_caller)), track_caller)]
@@ -3180,7 +3201,6 @@ mod clone {
             ptr::write(dst, src.clone());
         }
     }
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     #[inline]
     #[cfg_attr(all(debug_assertions, not(portable_atomic_no_track_caller)), track_caller)]
     unsafe fn clone_slice<T: Clone>(src: &[T], dst: *mut [T]) {
@@ -3216,13 +3236,11 @@ mod clone {
     /// initialized, unless disarmed by forgetting.
     ///
     /// This is a helper for `impl<T: Clone> CloneToUninit for [T]`.
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     struct InitializingSlice<'a, T> {
         data: &'a mut [MaybeUninit<T>],
         /// Number of elements of `*self.data` that are initialized.
         initialized_len: usize,
     }
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     impl<'a, T> InitializingSlice<'a, T> {
         #[inline]
         fn from_fully_uninit(data: &'a mut [MaybeUninit<T>]) -> Self {
@@ -3239,7 +3257,6 @@ mod clone {
             self.initialized_len += 1;
         }
     }
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     impl<T> Drop for InitializingSlice<'_, T> {
         #[cold] // will only be invoked on unwind
         fn drop(&mut self) {
@@ -3258,9 +3275,9 @@ mod clone {
 }
 
 mod layout {
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
-    use core::isize;
-    use core::{alloc::Layout, cmp, usize};
+    use core::{alloc::Layout, cmp};
+
+    use super::{ISIZE_MAX, USIZE_MAX};
 
     // Based on unstable Layout::padding_needed_for.
     #[inline]
@@ -3268,7 +3285,7 @@ mod layout {
     pub(super) fn padding_needed_for(layout: Layout, align: usize) -> usize {
         // FIXME: Can we just change the type on this to `Alignment`?
         if !align.is_power_of_two() {
-            return usize::MAX;
+            return USIZE_MAX;
         }
         let len_rounded_up = size_rounded_up_to_custom_align(layout, align);
         // SAFETY: Cannot overflow because the rounded-up value is never less
@@ -3333,7 +3350,6 @@ mod layout {
     }
 
     // Based on Layout::array stabilized in Rust 1.44.
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     #[inline]
     pub(super) fn array<T>(n: usize) -> Option<Layout> {
         #[inline(always)]
@@ -3355,7 +3371,7 @@ mod layout {
 
             // SAFETY: the maximum possible alignment is `isize::MAX + 1`,
             // so the subtraction cannot overflow.
-            (isize::MAX as usize + 1).wrapping_sub(align)
+            (ISIZE_MAX as usize + 1).wrapping_sub(align)
         }
 
         #[inline]
@@ -3407,7 +3423,7 @@ fn abort() -> ! {
 }
 
 fn is_dangling<T: ?Sized>(ptr: *const T) -> bool {
-    (ptr as *const ()).addr() == usize::MAX
+    (ptr as *const ()).addr() == USIZE_MAX
 }
 
 // Based on unstable alloc::alloc::Global.
@@ -3446,7 +3462,6 @@ impl Global {
     fn allocate(self, layout: Layout) -> Option<NonNull<u8>> {
         self.alloc_impl(layout, false)
     }
-    #[cfg(not(portable_atomic_no_maybe_uninit))]
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     fn allocate_zeroed(self, layout: Layout) -> Option<NonNull<u8>> {

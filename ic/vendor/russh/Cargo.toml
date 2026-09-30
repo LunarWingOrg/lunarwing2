@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "russh"
-version = "0.62.6"
+version = "0.62.7"
 authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
 build = false
 autolib = false

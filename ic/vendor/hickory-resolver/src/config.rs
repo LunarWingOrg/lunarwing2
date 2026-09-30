@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(all(
+    feature = "recursor",
     feature = "toml",
     feature = "serde",
     any(feature = "__tls", feature = "__quic")
@@ -25,6 +26,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 #[cfg(all(
+    feature = "recursor",
     feature = "toml",
     feature = "serde",
     any(feature = "__tls", feature = "__quic")
@@ -32,6 +34,7 @@ use tracing::warn;
 use tracing::{debug, info};
 
 #[cfg(all(
+    feature = "recursor",
     feature = "toml",
     feature = "serde",
     any(feature = "__tls", feature = "__quic")
@@ -44,7 +47,11 @@ use crate::proto::access_control::{AccessControlSet, AccessControlSetBuilder};
 use crate::proto::op::DEFAULT_MAX_PAYLOAD_LEN;
 use crate::proto::rr::Name;
 
-/// Configuration for the upstream nameservers to use for resolution
+/// Configuration for the upstream nameservers to use for resolution.
+///
+/// The `Default` implementation of this struct will be removed in a future version. Use
+/// [`Self::from_name_servers()`] instead. Note that a `ResolverConfig` with no name servers will
+/// produce a nonfunctional resolver.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -141,6 +148,13 @@ impl ResolverConfig {
             search,
             name_servers,
         }
+    }
+
+    /// Create a ResolverConfig from a list of name server configurations.
+    ///
+    /// No base domain for relative names will be set, and no additional search domains will be set.
+    pub fn from_name_servers(name_servers: Vec<NameServerConfig>) -> Self {
+        Self::from_parts(None, vec![], name_servers)
     }
 
     /// Take the `domain`, `search`, and `name_servers` from the config.
@@ -606,6 +620,14 @@ pub struct ResolverOpts {
     /// See [DnsRequestOptions::edns_payload_len][crate::proto::op::DnsRequestOptions::edns_payload_len].
     #[cfg_attr(feature = "serde", serde(default = "default_edns_payload_len"))]
     pub edns_payload_len: u16,
+    /// Report the IP of the name server for query result metrics.
+    ///
+    /// When `false`, metrics are aggregated under a static "aggregate" address label to avoid
+    /// cardinality blowup. For this reason, you might want to leave this disabled when querying a
+    /// large or unbounded set of DNS servers.
+    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg(feature = "metrics")]
+    pub enable_per_name_server_metrics: bool,
 }
 
 impl ResolverOpts {
@@ -655,6 +677,8 @@ impl Default for ResolverOpts {
             allow_answers: vec![],
             deny_answers: vec![],
             edns_payload_len: default_edns_payload_len(),
+            #[cfg(feature = "metrics")]
+            enable_per_name_server_metrics: false,
         }
     }
 }
@@ -772,6 +796,7 @@ pub enum OpportunisticEncryption {
 
 impl OpportunisticEncryption {
     #[cfg(all(
+        feature = "recursor",
         feature = "toml",
         feature = "serde",
         any(feature = "__tls", feature = "__quic")
@@ -1142,5 +1167,10 @@ mod tests {
         assert_eq!(code.os_port_selection, json.os_port_selection);
         assert_eq!(code.case_randomization, json.case_randomization);
         assert_eq!(code.trust_anchor, json.trust_anchor);
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            code.enable_per_name_server_metrics,
+            json.enable_per_name_server_metrics
+        );
     }
 }

@@ -10,7 +10,9 @@ use std::{
 use test_support::{MockNetworkHandler, MockProvider, MockRecord, MockResponseSection, subscribe};
 use tokio::time as TokioTime;
 
-use super::{Recursor, RecursorError, RecursorMode, RecursorOptions, is_subzone};
+use super::{
+    Recursor, RecursorError, RecursorMode, RecursorOptions, handle::RequestLimits, is_subzone,
+};
 use crate::{
     cache::TtlConfig,
     config::ResolverOpts,
@@ -19,6 +21,7 @@ use crate::{
         op::{Message, Query, ResponseCode},
         rr::{Name, Record, RecordType},
     },
+    recursor::QNameMinimization,
 };
 
 #[tokio::test]
@@ -450,6 +453,92 @@ async fn ns_pool_zone_name_test() -> Result<(), NetError> {
 }
 
 #[tokio::test]
+async fn ns_pool_zone_name_nxdomain_at_ent() -> Result<(), NetError> {
+    subscribe();
+
+    let query_name = Name::from_ascii("host.ent.hickory-dns.testing.")?;
+    let ent_name = Name::from_ascii("ent.hickory-dns.testing.")?;
+
+    let tld_zone = Name::from_ascii("testing.")?;
+    let tld_ns = Name::from_ascii("testing.testing.")?;
+    let leaf_zone = Name::from_ascii("hickory-dns.testing.")?;
+    let leaf_ns = Name::from_ascii("ns.hickory-dns.testing.")?;
+
+    let responses = vec![
+        MockRecord::ns(ROOT_IP, &tld_zone, &tld_ns),
+        MockRecord::a(ROOT_IP, &tld_ns, TLD_IP)
+            .with_query_name(&tld_zone)
+            .with_query_type(RecordType::NS)
+            .with_section(MockResponseSection::Additional),
+        MockRecord::ns(TLD_IP, &leaf_zone, &leaf_ns),
+        MockRecord::a(TLD_IP, &leaf_ns, LEAF_IP)
+            .with_query_name(&leaf_zone)
+            .with_query_type(RecordType::NS)
+            .with_section(MockResponseSection::Additional),
+        MockRecord::soa(LEAF_IP, &leaf_zone, &leaf_ns, &leaf_ns)
+            .with_query_name(&ent_name)
+            .with_query_type(RecordType::NS)
+            .with_section(MockResponseSection::Authority),
+        MockRecord::soa(LEAF_IP, &leaf_zone, &leaf_ns, &leaf_ns)
+            .with_query_name(&query_name)
+            .with_query_type(RecordType::NS)
+            .with_section(MockResponseSection::Authority),
+        MockRecord::a(LEAF_IP, &query_name, LEAF_IP),
+    ];
+
+    let nxdomain_at_ent = Box::new(move |_, _, message: &mut Message| {
+        if let Some(query) = message.queries.first() {
+            if query.name == ent_name && query.query_type == RecordType::NS {
+                message.metadata.response_code = ResponseCode::NXDomain;
+                message.answers.clear();
+            }
+        }
+    });
+
+    let recursor_no_cache = Recursor::with_options(
+        &[ROOT_IP],
+        RecursorOptions {
+            deny_server: Vec::new(),
+            ns_cache_size: 1,
+            qname_minimization: QNameMinimization::Relaxed,
+            ..RecursorOptions::default()
+        },
+        MockProvider::new(
+            MockNetworkHandler::new(responses.clone()).with_mutation(nxdomain_at_ent.clone()),
+        ),
+    )?;
+
+    let recursor_cache = Recursor::with_options(
+        &[ROOT_IP],
+        RecursorOptions {
+            deny_server: Vec::new(),
+            ns_cache_size: 1024,
+            qname_minimization: QNameMinimization::Relaxed,
+            ..RecursorOptions::default()
+        },
+        MockProvider::new(
+            MockNetworkHandler::new(responses.clone()).with_mutation(nxdomain_at_ent),
+        ),
+    )?;
+
+    for recursor in [recursor_no_cache, recursor_cache] {
+        assert_eq!(
+            get_zone_name(&recursor, &query_name).await?,
+            Some(leaf_zone.clone())
+        );
+
+        // Sanity check - IPs are correct
+        assert!(validate_response(
+            ttl_lookup(&recursor, &query_name).await?,
+            &query_name,
+            LEAF_IP
+        ));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn not_fully_qualified_domain_name_in_query() -> Result<(), NetError> {
     subscribe();
 
@@ -584,7 +673,7 @@ async fn get_zone_name(
     match recursor.mode {
         RecursorMode::NonValidating { ref handle } => {
             let ns_pool = handle
-                .ns_pool_for_name(query.clone(), Instant::now(), 0)
+                .ns_pool_for_name(query.clone(), Instant::now(), 0, &RequestLimits::new())
                 .await?
                 .1;
             Ok(ns_pool.zone().cloned())
@@ -888,10 +977,10 @@ mod metrics {
 
         #[cfg(feature = "__dnssec")]
         {
-            assert_counter_eq(&map, OUTGOING_QUERIES_TOTAL, vec![], 4);
-            assert_counter_eq(&map, CACHE_HIT_TOTAL, vec![], 5);
-            assert_counter_eq(&map, CACHE_MISS_TOTAL, vec![], 2);
-            assert_histogram_sample_count_eq(&map, CACHE_HIT_DURATION, vec![], 3, Unit::Seconds);
+            assert_counter_eq(&map, OUTGOING_QUERIES_TOTAL, vec![], 6);
+            assert_counter_eq(&map, CACHE_HIT_TOTAL, vec![], 7);
+            assert_counter_eq(&map, CACHE_MISS_TOTAL, vec![], 4);
+            assert_histogram_sample_count_eq(&map, CACHE_HIT_DURATION, vec![], 5, Unit::Seconds);
             assert_histogram_sample_count_eq(&map, CACHE_MISS_DURATION, vec![], 1, Unit::Seconds);
 
             // When validating DNSSEC, we should also see DNSSEC-specific metrics.
@@ -993,6 +1082,117 @@ enabled = {}
         );
     }
 }
+
+/// Regression test: when all glueless NS hostname lookups fail (e.g. transient
+/// network issue), the resolver must not cache the resulting empty NameServerPool.
+/// Previously, the empty pool was cached for the full NS TTL (up to 24 hours),
+/// causing SERVFAIL for every subsequent query under that zone.
+/// See: RFC 9520 section 3 — resolution failures must not be cached > 5 minutes.
+#[tokio::test]
+async fn empty_ns_pool_not_cached_on_glueless_failure() -> Result<(), NetError> {
+    subscribe();
+
+    let query_name = Name::from_ascii("host.hickory-dns.testing.")?;
+
+    let tld_zone = Name::from_ascii("testing.")?;
+    let tld_ns = Name::from_ascii("testing.testing.")?;
+    let leaf_zone = Name::from_ascii("hickory-dns.testing.")?;
+    // Glueless: NS hostname is in a different zone (otherdomain.testing.)
+    let off_domain_zone = Name::from_ascii("otherdomain.testing.")?;
+    let off_domain_ns = Name::from_ascii("ns.otherdomain.testing.")?;
+    let off_domain_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 5, 1));
+
+    let responses = vec![
+        // Root -> TLD delegation (with glue)
+        MockRecord::ns(ROOT_IP, &tld_zone, &tld_ns),
+        MockRecord::a(ROOT_IP, &tld_ns, TLD_IP)
+            .with_query_name(&tld_zone)
+            .with_query_type(RecordType::NS)
+            .with_section(MockResponseSection::Additional),
+        // TLD -> leaf zone delegation, glueless NS in otherdomain.testing.
+        MockRecord::ns(TLD_IP, &leaf_zone, &off_domain_ns),
+        // TLD -> otherdomain.testing. delegation (with glue)
+        MockRecord::ns(TLD_IP, &off_domain_zone, &off_domain_ns),
+        MockRecord::a(TLD_IP, &off_domain_ns, off_domain_ip)
+            .with_query_name(&off_domain_zone)
+            .with_query_type(RecordType::NS)
+            .with_section(MockResponseSection::Additional),
+        // otherdomain.testing. SOA for NS query that has no zone cut
+        MockRecord::soa(
+            off_domain_ip,
+            &off_domain_ns,
+            &off_domain_zone,
+            &off_domain_ns,
+        )
+        .with_query_name(&off_domain_ns)
+        .with_query_type(RecordType::NS),
+        // otherdomain.testing. authoritative: ns.otherdomain.testing. A record
+        MockRecord::a(off_domain_ip, &off_domain_ns, LEAF_IP),
+        // Leaf zone authoritative answer
+        MockRecord::a(LEAF_IP, &query_name, LEAF_IP),
+    ];
+
+    // Use a counter to make the first A lookup for ns.otherdomain.testing. fail
+    let counter = Arc::new(AtomicU8::new(0));
+    let off_domain_ns_clone = off_domain_ns.clone();
+
+    let handler = MockNetworkHandler::new(responses).with_mutation(Box::new(
+        move |destination: IpAddr, _protocol: Protocol, msg: &mut Message| {
+            if destination == off_domain_ip
+                && msg.queries[0].name == off_domain_ns_clone
+                && msg.queries[0].query_type == RecordType::A
+            {
+                let count = counter.fetch_add(1, Ordering::Relaxed);
+                if count == 0 {
+                    // First attempt: simulate transient failure
+                    msg.answers.clear();
+                    msg.metadata.response_code = ResponseCode::ServFail;
+                }
+                // Second+ attempts: return the real response
+            }
+        },
+    ));
+
+    let provider = MockProvider::new(handler);
+    let recursor = Recursor::with_options(
+        &[ROOT_IP],
+        RecursorOptions {
+            deny_server: Vec::new(),
+            ..RecursorOptions::default()
+        },
+        provider,
+    )?;
+
+    let now = Instant::now();
+
+    // First query: glueless NS hostname lookup fails -> should error
+    let result = recursor
+        .resolve(Query::query(query_name.clone(), RecordType::A), now, false)
+        .await;
+    assert!(
+        result.is_err(),
+        "first query should fail due to NS hostname lookup failure"
+    );
+
+    // Second query: NS hostname lookup now succeeds -> should succeed.
+    // This verifies that the empty pool was NOT cached from the first failure.
+    // Advance past the RFC 9520 failure cache TTL so the cached SERVFAIL expires.
+    let result = recursor
+        .resolve(
+            Query::query(query_name.clone(), RecordType::A),
+            now + Duration::from_secs(2),
+            false,
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "second query should succeed because empty pool was not cached: {result:?}"
+    );
+
+    Ok(())
+}
+
+mod ghost_domain;
 
 const ROOT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
 const TLD_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));

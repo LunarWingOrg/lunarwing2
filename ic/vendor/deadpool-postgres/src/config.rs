@@ -13,8 +13,8 @@ use super::Pool;
 use crate::{CreatePoolError, PoolBuilder, Runtime};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_postgres::{
-    tls::{MakeTlsConnect, TlsConnect},
     Socket,
+    tls::{MakeTlsConnect, TlsConnect},
 };
 
 use super::PoolConfig;
@@ -131,7 +131,7 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidUrl(e) => write!(f, "configuration property \"url\" is invalid: {}", e),
+            Self::InvalidUrl(e) => write!(f, "configuration property \"url\" is invalid: {e}"),
             Self::DbnameMissing => write!(f, "configuration property \"dbname\" not found"),
             Self::DbnameEmpty => write!(
                 f,
@@ -203,7 +203,7 @@ impl Config {
         if let Some(user) = self.user.as_ref().filter(|s| !s.is_empty()) {
             cfg.user(user.as_str());
         }
-        if !cfg.get_user().map_or(false, |u| !u.is_empty()) {
+        if cfg.get_user().is_none_or(|u| u.is_empty()) {
             if let Ok(user) = env::var("USER") {
                 cfg.user(&user);
             }
@@ -303,7 +303,7 @@ impl Config {
 ///
 /// [`Fast`]: RecyclingMethod::Fast
 /// [`Verified`]: RecyclingMethod::Verified
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum RecyclingMethod {
     /// Only run [`Client::is_closed()`][1] when recycling existing connections.
@@ -311,6 +311,7 @@ pub enum RecyclingMethod {
     /// Unless you have special needs this is a safe choice.
     ///
     /// [1]: tokio_postgres::Client::is_closed
+    #[default]
     Fast,
 
     /// Run [`Client::is_closed()`][1] and execute a test query.
@@ -348,12 +349,6 @@ pub enum RecyclingMethod {
     ///
     /// [`Verified`]: RecyclingMethod::Verified
     Custom(String),
-}
-
-impl Default for RecyclingMethod {
-    fn default() -> Self {
-        Self::Fast
-    }
 }
 
 impl RecyclingMethod {

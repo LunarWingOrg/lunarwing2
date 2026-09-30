@@ -15,7 +15,8 @@ use std::fmt;
 
 impl<Static: StaticAtomSet> ::precomputed_hash::PrecomputedHash for Atom<Static> {
     fn precomputed_hash(&self) -> u32 {
-        self.get_hash()
+        let hash64 = self.get_hash();
+        (hash64 >> 32) as u32 ^ hash64 as u32
     }
 }
 
@@ -43,7 +44,7 @@ impl<Static: StaticAtomSet> PartialEq<String> for Atom<Static> {
     }
 }
 
-impl<'a, Static: StaticAtomSet> From<&'a str> for Atom<Static> {
+impl<Static: StaticAtomSet> From<&'_ str> for Atom<Static> {
     #[inline]
     fn from(string_to_add: &str) -> Self {
         Atom::from(Cow::Borrowed(string_to_add))
@@ -65,8 +66,16 @@ impl<Static: StaticAtomSet> fmt::Display for Atom<Static> {
 }
 
 impl<Static: StaticAtomSet> AsRef<str> for Atom<Static> {
+    #[inline]
     fn as_ref(&self) -> &str {
-        self
+        self.as_str()
+    }
+}
+
+impl<Static: StaticAtomSet> AsRef<[u8]> for Atom<Static> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 

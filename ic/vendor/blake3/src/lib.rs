@@ -139,7 +139,6 @@ pub mod traits;
 mod io;
 mod join;
 
-use arrayref::{array_mut_ref, array_ref};
 use arrayvec::{ArrayString, ArrayVec};
 use core::cmp;
 use core::fmt;
@@ -566,7 +565,7 @@ impl ChunkState {
             let block_flags = self.flags | self.start_flag(); // borrowck
             self.platform.compress_in_place(
                 &mut self.cv,
-                array_ref!(input, 0, BLOCK_LEN),
+                (&input[..BLOCK_LEN]).try_into().unwrap(),
                 BLOCK_LEN as u8,
                 self.chunk_counter,
                 block_flags,
@@ -686,7 +685,7 @@ fn compress_chunks_parallel(
     let mut chunks_exact = input.chunks_exact(CHUNK_LEN);
     let mut chunks_array = ArrayVec::<&[u8; CHUNK_LEN], MAX_SIMD_DEGREE>::new();
     for chunk in &mut chunks_exact {
-        chunks_array.push(array_ref!(chunk, 0, CHUNK_LEN));
+        chunks_array.push(chunk.try_into().unwrap());
     }
     platform.hash_many(
         &chunks_array,
@@ -706,7 +705,7 @@ fn compress_chunks_parallel(
         let counter = chunk_counter + chunks_so_far as u64;
         let mut chunk_state = ChunkState::new(key, counter, flags, platform);
         chunk_state.update(chunks_exact.remainder());
-        *array_mut_ref!(out, chunks_so_far * OUT_LEN, OUT_LEN) =
+        *<&mut [u8; OUT_LEN]>::try_from(&mut out[chunks_so_far * OUT_LEN..][..OUT_LEN]).unwrap() =
             chunk_state.output().chaining_value();
         chunks_so_far + 1
     } else {
@@ -736,7 +735,7 @@ fn compress_parents_parallel(
     // the requirements of compress_subtree_wide().
     let mut parents_array = ArrayVec::<&[u8; BLOCK_LEN], MAX_SIMD_DEGREE_OR_2>::new();
     for parent in &mut parents_exact {
-        parents_array.push(array_ref!(parent, 0, BLOCK_LEN));
+        parents_array.push(parent.try_into().unwrap());
     }
     platform.hash_many(
         &parents_array,
@@ -872,7 +871,7 @@ fn compress_subtree_to_parent_node<J: join::Join>(
         num_cvs = compress_parents_parallel(cv_slice, key, flags, platform, &mut out_array);
         cv_array[..num_cvs * OUT_LEN].copy_from_slice(&out_array[..num_cvs * OUT_LEN]);
     }
-    *array_ref!(cv_array, 0, 2 * OUT_LEN)
+    cv_array[..2 * OUT_LEN].try_into().unwrap()
 }
 
 // Hash a complete input all at once. Unlike compress_subtree_wide() and
@@ -1309,8 +1308,8 @@ impl Hasher {
                     self.chunk_state.flags,
                     self.chunk_state.platform,
                 );
-                let left_cv = array_ref!(cv_pair, 0, 32);
-                let right_cv = array_ref!(cv_pair, 32, 32);
+                let left_cv = (&cv_pair[..32]).try_into().unwrap();
+                let right_cv = (&cv_pair[32..64]).try_into().unwrap();
                 // Push the two CVs we received into the CV stack in order. Because
                 // the stack merges lazily, this guarantees we aren't merging the
                 // root.
@@ -1805,7 +1804,7 @@ impl std::io::Read for OutputReader {
 #[cfg(feature = "std")]
 impl std::io::Seek for OutputReader {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let max_position = u64::max_value() as i128;
+        let max_position = u64::MAX as i128;
         let target_position: i128 = match pos {
             std::io::SeekFrom::Start(x) => x as i128,
             std::io::SeekFrom::Current(x) => self.position() as i128 + x as i128,

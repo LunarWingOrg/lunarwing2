@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "c24a947bbc0b780b5cfedfab8e4849934ecbb212"
+    "sha1": "bba260f93ef4f7a63c82799563f92518b9e5d42a"
   },
   "path_in_vcs": "crates/deadpool"
 }

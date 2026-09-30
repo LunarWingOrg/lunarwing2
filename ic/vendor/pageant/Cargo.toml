@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 name = "pageant"
-version = "0.2.1"
+version = "0.2.3"
 authors = ["Eugene <inbox@null.page>"]
 build = false
 autolib = false
@@ -40,6 +40,7 @@ namedpipes = [
     "dep:windows-strings",
     "windows/Win32_Security_Authentication_Identity",
     "windows/Win32_Security_Cryptography",
+    "windows/Win32_System_WindowsProgramming",
 ]
 wmmessage = [
     "tokio/rt",

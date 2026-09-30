@@ -9,6 +9,7 @@
 use crate::converter::Context;
 use crate::converter::dom_context::DomContext;
 use crate::converter::main::walk_node;
+use crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer;
 use crate::options::ConversionOptions;
 
 #[cfg(feature = "visitor")]
@@ -47,11 +48,12 @@ pub fn handle_blockquote(
         return;
     }
 
-    let cite = tag
-        .attributes()
-        .get("cite")
-        .flatten()
-        .map(|v| v.as_utf8_str().to_string());
+    // ~keep Resolved like every other destination the converter renders: a relative `cite`
+    // is useless once the markdown leaves the page it came from. `resolve_url` returns
+    // `None` for an already-absolute or unresolvable reference, which then passes through.
+    let cite = crate::converter::utility::attributes::decoded_attribute(tag, "cite")
+        .map(std::borrow::Cow::into_owned)
+        .map(|value| ctx.resolve_url(&value).unwrap_or(value));
 
     let blockquote_ctx = Context {
         blockquote_depth: ctx.blockquote_depth + 1,
@@ -73,6 +75,12 @@ pub fn handle_blockquote(
             );
         }
     }
+
+    // ~keep A trailing <br> run with no following sibling has no next dispatch to catch it
+    // in `walk_node`'s pre-block-dispatch strip, since the blockquote's content is
+    // simply finished here — so this closes its own trailing run the same way
+    // `paragraph.rs` closes its own (issue #464 follow-up).
+    strip_trailing_backslash_breaks_from_fresh_buffer(&mut content, options.newline_style);
 
     let trimmed_content = content.trim();
 
@@ -118,6 +126,38 @@ pub fn handle_blockquote(
     }
 
     if !trimmed_content.is_empty() {
+        // ~keep Only the outermost blockquote call writes into the real document buffer —
+        // a nested blockquote's own call writes into its parent's local `content`
+        // scratch buffer instead (see above), which the parent then re-prefixes with
+        // its own "> " on the way out. Applying the list continuation indent at every
+        // nesting level would stack it once per level; restricting it to
+        // `blockquote_depth == 0` applies it exactly once, at the boundary where this
+        // content actually reaches the list item's own text.
+        let list_indent = if ctx.in_list_item && ctx.blockquote_depth == 0 {
+            crate::converter::list::utils::continuation_indent_string(ctx.list_depth, ctx.list_indent_columns, options)
+        } else {
+            None
+        };
+
+        // ~keep A blockquote that continues already-started list item content needs its
+        // first quoted line indented too; one that is the item's first content
+        // instead sits right after the marker, which already provides that column
+        // (see `block/paragraph.rs::add_list_continuation_indent` for the identical
+        // first-line distinction, applied there to paragraphs only).
+        // A plain suffix check like `output.ends_with("* ")` also matches the closing
+        // "**"/"*" of `<strong>`/`<em>` immediately followed by a migrated trailing
+        // space (e.g. `<strong>bold</strong> <blockquote>` leaves output ending in
+        // "**bold** "), which is indistinguishable from a real bare bullet by suffix
+        // alone. That false positive misclassified this blockquote as sitting right
+        // after the marker (skipping the continuation indent) when real inline
+        // content actually preceded it, leaving the quoted line unindented and
+        // dropping it (and the rest of the list) out of the item on reparse. See
+        // `list::utils::line_is_bare_list_marker`'s doc comment for the full
+        // rationale; it decomposes the WHOLE line instead of checking a fixed suffix.
+        let is_list_continuation = list_indent.is_some()
+            && !output.is_empty()
+            && !crate::converter::list::utils::line_is_bare_list_marker(output);
+
         if ctx.blockquote_depth > 0 {
             if !output.is_empty() {
                 while output.ends_with('\n') {
@@ -128,6 +168,21 @@ pub fn handle_blockquote(
         } else if !output.is_empty() {
             if output.ends_with("\n\n") {
                 output.truncate(output.len() - 1);
+            } else if ctx.in_list_item {
+                // ~keep A blockquote directly following this item's own leading text (no
+                // explicit <p>, e.g. `<li>a<blockquote>`, which the preceding text
+                // handler ends with a single '\n' since it looks ahead to the next
+                // block-level sibling) still legally interrupts that text per
+                // CommonMark's "blockquote can interrupt a paragraph" rule -- no blank
+                // line is required for the reparse to recover the same two-block split.
+                // Forcing one here anyway (as the two branches below still do for the
+                // top-level, non-list case, and for `output` already ending in a full
+                // blank line) instead makes THIS specific text parse back as its own
+                // `<p>` on reparse, which flips the whole list loose and desyncs the
+                // next conversion pass from this one (spec examples 320, 321).
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
             } else if !output.ends_with('\n') {
                 output.push_str("\n\n");
             } else if !output.ends_with("\n\n") {
@@ -138,9 +193,19 @@ pub fn handle_blockquote(
         let prefix = "> ";
 
         // ~keep Only blank-out whitespace-only lines; preserve leading whitespace on
-        // ~keep real content lines (code block indentation, nested list markers) so
-        // ~keep quoted block children keep their structural meaning (issue #13).
-        for line in trimmed_content.lines() {
+        // real content lines (code block indentation, nested list markers) so
+        // quoted block children keep their structural meaning (issue #13).
+        //
+        // ~keep Every physical line also needs the list item's own continuation indent
+        // when this blockquote is inside a list item — CommonMark's list container
+        // match is per physical line, so an unindented "> " line drops the rest of
+        // the quote (and the item) out of the list on re-parse (spec example 263).
+        for (index, line) in trimmed_content.lines().enumerate() {
+            if let Some(ref indent) = list_indent {
+                if index > 0 || is_list_continuation {
+                    output.push_str(indent);
+                }
+            }
             output.push_str(prefix);
             if !line.trim().is_empty() {
                 output.push_str(line);
@@ -150,13 +215,16 @@ pub fn handle_blockquote(
 
         if let Some(url) = cite {
             output.push('\n');
+            if let Some(ref indent) = list_indent {
+                output.push_str(indent);
+            }
             output.push_str("— <");
             output.push_str(&url);
             output.push_str(">\n\n");
         }
 
         // ~keep Add trailing newlines only when appropriate for proper spacing
-        // ~keep (matching paragraph conditional logic for CommonMark compliance)
+        // (matching paragraph conditional logic for CommonMark compliance)
         if !ctx.convert_as_inline && !ctx.in_table_cell && !ctx.in_list_item {
             while output.ends_with('\n') {
                 output.truncate(output.len() - 1);
