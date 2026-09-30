@@ -9,6 +9,13 @@ cannot yet activate one verified CI artifact safely.
 
 - Merge request pipelines replace branch pipelines once an MR is open.
 - Branch, tag, schedule, API, trigger, and manual pipelines remain supported.
+- MRs targeting the default branch **or** `aragents/kimil00p/*` run the full
+  required validation matrix, including backend checks/tests, Clippy,
+  architecture boundaries, Cavepony WASM, and cargo-deny. Do not use a reduced
+  feature-branch pipeline as proof that integration will pass. An ordinary
+  scratch branch can request that same matrix with the non-secret pipeline
+  variable `LUNARWING_CI_FULL_VALIDATION=1` (for example, in **Run pipeline**).
+  This flag does not enable protected worker publication or cache writes.
 - Validation jobs are interruptible and receive no production credentials.
   Registry-writing candidate/promotion jobs are non-interruptible and exist only
   on a protected default branch or protected, version-shaped push tag.
@@ -187,6 +194,14 @@ candidate job — the scan can only succeed after a candidate publishes
 - Fixture-only shell harnesses for mt-admin rendering, build policy, and health.
 - `python-unit`, `shell-harnesses`, and `cavepony-wasm` (cavepony version assert
   + `wit_compat` test) are all required jobs; failures block merge.
+- `ci-config` cheaply checks Cavepony's registry, capabilities, Cargo package,
+  local lockfile entry, and CI version expectation together. The WASM build
+  uses `--locked`; its runtime compatibility job still requires a fresh
+  artifact and the existing 10-million-fuel budget.
+  Agreement alone does not satisfy `version-policy`: any change under a
+  tool's source directory, including metadata or lockfile corrections, also
+  needs a registry version newer than `CI_MERGE_REQUEST_DIFF_BASE_SHA`.
+  Run `.gitlab/scripts/version-policy.sh` with the actual MR base before push.
 - Blocking ratchets: `rust-clippy-all` (all-features, `-D warnings`) and
   `architecture-boundaries` (changed-line hard violations only; printed
   full-tree debt counts stay informational). Both run in the full-validation

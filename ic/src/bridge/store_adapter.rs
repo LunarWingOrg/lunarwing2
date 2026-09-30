@@ -2669,23 +2669,14 @@ title: \"old doc\"\n\
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn global_mission_listings_see_missions_whose_project_file_is_missing() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use lunarwing_engine::MissionStatus;
 
         // WI#243 recurrence: a mission whose project.json never loads must
         // still be enumerable by the global listings the mission manager
         // bootstraps from — otherwise it never receives daily-budget
         // rollover or dispatch and threads_today_date pins forever.
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let backend = LibSqlBackend::new_local(&temp_dir.path().join("mission-global-list.db"))
-            .await
-            .expect("libsql backend");
-        backend.run_migrations().await.expect("migrations");
-        let workspace = Arc::new(Workspace::new_with_db(
-            "mission-global-list-test",
-            Arc::new(backend) as Arc<dyn Database>,
-        ));
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("mission-global-list-test", db));
         let store = HybridStore::new(Some(Arc::clone(&workspace)));
 
         let project = Project::new("test-user", "orphan host", "test");
