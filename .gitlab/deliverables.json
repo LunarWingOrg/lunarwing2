@@ -205,6 +205,17 @@
       "triggers": ["pebble4lunarwing/**", "pebble/**"]
     },
     {
+      "name": "pebble-worker-upstream-lock-override",
+      "status": "mirror",
+      "owner": "workers",
+      "manifest": "pebble4lunarwing/upstream/Cargo.lock",
+      "lockfile": "pebble4lunarwing/upstream/Cargo.lock",
+      "targets": [],
+      "ci": ["worker-pebble-candidate"],
+      "triggers": ["pebble4lunarwing/upstream/**"],
+      "comment": "Reviewed patched upstream Pebble Cargo.lock (RUSTSEC-2026-0285): upstream at PEBBLE_REF with only the rustls/rustls-webpki package records changed. Not a standalone cargo unit (no sibling Cargo.toml) and never compiled outside the pebble4lunarwing Dockerfile build; it is a digest-verified hashed build input whose coverage is the worker image candidate job that copies it and fails on digest or allowlist drift."
+    },
+    {
       "name": "voice-sidecar",
       "status": "production",
       "owner": "sidecars",
