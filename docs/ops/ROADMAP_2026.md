@@ -12,7 +12,7 @@
 | Beta for Desktop/Mobile companion applications for LunarWing (first alpha version should be available by 2.1.6.0) | v2.1.8.0 |
 | firstmate Integration | v2.1.8.0 |
 | Planned Computer Use Capability | v2.1.8.0 |
-| A new usecase for external workers - Details to be shared in future update | v2.1.8.0 |
+| Lightweight external workers and external worker loops with timers | v2.1.8.0 |
 | LunarHub polish | v2.1.9.0 |
 | DarkIRC key manager & DarkIRC Channel Polishing | v2.2.0.0 |
 | LunarVoice Two Way Voice Communication Full Completion and dedicated multi-agent server support | v2.2.0.0 |
