@@ -26,7 +26,13 @@
 4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264
-7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/244
+7. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/244
+    - WI#244 (completed in code): intermittent TensorZero/FrontierTEEC "error decoding response body" aborts killed orchestrator mission threads because a provider failure after any streamed text was marked non-recoverable, so the engine never issued its bounded model-visible recovery request.
+    - Root cause: `llm_error_result` in `ic/crates/lunarwing_engine/src/executor/orchestrator.rs` gated `recoverable` on `!emitted_text`. A `model_error` surfaces before anything from the failed response is committed (no assistant message, no dispatched actions), so a fresh draft cannot duplicate work; the only exposure is ephemeral deltas, which subscribers already treat as provisional (WI#127 stream-gap clearing).
+    - Fix: transport-class failures (transient/unavailable) now get the same fresh-draft recovery exception already granted to REPL integrity rejections, still bounded by `MODEL_RECOVERY_POLICY` caps; rate limiting stays terminal (provider layer owns Retry-After).
+    - Evidence: engine unit tests `midstream_transient_decode_failure_recovers_with_fresh_request` and `repeated_midstream_transient_failures_stay_bounded` (loop_engine.rs); integration test `midstream_decode_failure_recovers_with_one_fresh_request` over the real SSE adapter chain (`ic/tests/engine_v2_tensorzero_streaming.rs`), including provider-diagnostic exclusion; `cargo test -p lunarwing_engine` 638 passed, `--test engine_v2_tensorzero_streaming` 7 passed, `llm::` lib suite 598 passed.
+    - Docs: `docs/architecture/ENGINE-V2.md` Failure Recovery section records the policy.
+    - Remaining live verification: confirm on the dwarfstar tenant that conversation-insights approach_history no longer records FAILED entries with decode errors (needs a live deployment of this build).
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/220
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191
