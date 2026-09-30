@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.88"
 name = "hickory-resolver"
-version = "0.26.1"
+version = "0.26.3"
 authors = ["The contributors to Hickory DNS"]
 build = false
 autolib = false
@@ -207,11 +207,11 @@ features = ["std"]
 default-features = false
 
 [dependencies.hickory-net]
-version = "0.26.0"
+version = "0.26.3"
 default-features = false
 
 [dependencies.hickory-proto]
-version = "0.26.0"
+version = "0.26.3"
 features = [
     "std",
     "access-control",
@@ -219,7 +219,7 @@ features = [
 default-features = false
 
 [dependencies.ipnet]
-version = "2.3.0"
+version = "2.11.0"
 features = ["serde"]
 default-features = false
 
@@ -258,7 +258,7 @@ features = ["alloc"]
 default-features = false
 
 [dependencies.resolv-conf]
-version = "0.7.0"
+version = "0.7.6"
 features = ["system"]
 optional = true
 
@@ -288,7 +288,7 @@ version = "2"
 default-features = false
 
 [dependencies.tokio]
-version = "1.21"
+version = "1.36"
 optional = true
 
 [dependencies.tokio-rustls]
@@ -308,6 +308,9 @@ default-features = false
 version = "1"
 optional = true
 
+[dev-dependencies.async-trait]
+version = "0.1.43"
+
 [dev-dependencies.criterion]
 version = "0.8.2"
 features = ["async_tokio"]
@@ -318,7 +321,7 @@ features = ["std"]
 default-features = false
 
 [dev-dependencies.hickory-proto]
-version = "0.26.0"
+version = "0.26.3"
 features = ["std"]
 default-features = false
 
@@ -331,7 +334,7 @@ default-features = false
 version = "1"
 
 [dev-dependencies.tokio]
-version = "1.21"
+version = "1.36"
 features = [
     "macros",
     "test-util",
@@ -341,7 +344,7 @@ features = [
 version = "1.0.1"
 
 [dev-dependencies.tracing-subscriber]
-version = "0.3"
+version = "0.3.10"
 features = [
     "env-filter",
     "fmt",

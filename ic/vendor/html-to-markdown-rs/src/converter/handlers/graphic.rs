@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use crate::converter::Context;
 use crate::converter::dom_context::DomContext;
 use crate::converter::inline::link::{append_url_destination, escape_markdown_title};
-use crate::converter::utility::content::escape_link_label;
+use crate::converter::utility::escaping::escape_link_label;
 use crate::converter::utility::preprocessing::sanitize_markdown_url;
 use crate::options::ConversionOptions;
 
@@ -44,28 +44,24 @@ pub fn handle_graphic(
     depth: usize,
     dom_ctx: &DomContext,
 ) {
-    let src = tag
-        .attributes()
-        .get("url")
-        .flatten()
-        .or_else(|| tag.attributes().get("href").flatten())
-        .or_else(|| tag.attributes().get("xlink:href").flatten())
-        .or_else(|| tag.attributes().get("src").flatten())
-        .map_or(Cow::Borrowed(""), |v| {
-            let s = v.as_utf8_str();
-            Cow::Owned(sanitize_markdown_url(&s).into_owned())
+    let src = ["url", "href", "xlink:href", "src"]
+        .into_iter()
+        .find_map(|name| crate::converter::utility::attributes::decoded_attribute(tag, name))
+        .map_or(Cow::Borrowed(""), |s| {
+            let resolved = ctx.resolve_url(&s);
+            Cow::Owned(sanitize_markdown_url(resolved.as_deref().unwrap_or(&s)).into_owned())
         });
 
     // ~keep Use "alt" attribute, fallback to "filename"
-    let alt = tag
-        .attributes()
-        .get("alt")
-        .flatten()
-        .map(|v| v.as_utf8_str())
-        .or_else(|| tag.attributes().get("filename").flatten().map(|v| v.as_utf8_str()))
+    let alt = crate::converter::utility::attributes::decoded_attribute(tag, "alt")
+        .or_else(|| crate::converter::utility::attributes::decoded_attribute(tag, "filename"))
         .unwrap_or(Cow::Borrowed(""));
 
-    let title = tag.attributes().get("title").flatten().map(|v| v.as_utf8_str());
+    // ~keep An empty `title=""` carries no information, and `[t](u "")` / `![a](i "")` is
+    // ~keep noise that no Markdown serializer round-trips: re-rendering the output drops
+    // ~keep the empty title, so the second pass no longer matches the first. Treat it as
+    // ~keep absent, which is what it means.
+    let title = crate::converter::utility::attributes::decoded_attribute(tag, "title").filter(|v| !v.is_empty());
 
     #[cfg(feature = "metadata")]
     #[allow(clippy::useless_let_if_seq)]
@@ -95,7 +91,13 @@ pub fn handle_graphic(
         metadata_payload = Some((attributes_map, width, height));
     }
 
-    let keep_as_markdown = (ctx.in_heading && ctx.heading_allow_inline_images) || ctx.cell_allow_inline_images;
+    // ~keep #492: byte-identical twin of `handlers/image.rs`'s `keep_as_markdown` -- see
+    // ~keep that file's comment for why `|| ctx.link_allow_inline_images` is purely additive
+    // ~keep and why the heading pattern's negative clause is deliberately not mirrored here.
+    // ~keep Kept in lockstep so `<graphic>` and `<img>` never disagree inside the same anchor.
+    let keep_as_markdown = (ctx.in_heading && ctx.heading_allow_inline_images)
+        || ctx.cell_allow_inline_images
+        || ctx.link_allow_inline_images;
 
     let should_use_alt_text =
         !keep_as_markdown && (ctx.convert_as_inline || (ctx.in_heading && !ctx.heading_allow_inline_images));
@@ -226,7 +228,7 @@ fn format_graphic_markdown(
     buf.push_str("![");
     buf.push_str(&escaped_alt);
     buf.push_str("](");
-    append_url_destination(&mut buf, src, url_escape_style);
+    append_url_destination(&mut buf, src, url_escape_style, title.is_some());
     if let Some(title_text) = title {
         buf.push_str(" \"");
         buf.push_str(&escape_markdown_title(title_text));

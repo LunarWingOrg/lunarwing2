@@ -1,5 +1,24 @@
 *If you're reading this because you try make sense of some new API or a breaking change, you might also be interested in coming to the chat for explanations or guidance.*
 
+<a name="v0.35.5"></a>
+### v0.35.5 - 2026-09-23
+- InputField: fix wrong routing of key combination, which made some combinations wrongly interpreted when using the kitty keyboard protocol
+- the event reader thread stops after repeated read errors instead of looping at full CPU when the terminal is gone (eg closed without the process receiving a HUP), so that the application quits
+
+<a name="v0.35.4"></a>
+### v0.35.4 - 2026-09-05
+- fix `parse_color` returning the light variant for `darkblue`, `darkcyan` and `darkyellow`, and accepting strings merely containing a color name
+
+<a name="v0.35.3"></a>
+### v0.35.3 - 2026-09-02
+- fix `CropWriter::queue_char` and `queue_unstyled_char` never writing in the last allowed column
+- `CropWriter::queue_char` replaces tabs like `queue_unstyled_char` does
+- a char which doesn't fit the remaining width stops `CropWriter`'s char-level writing, instead of letting a following narrower char take its column
+
+<a name="v0.35.2"></a>
+### v0.35.2 - 2026-08-21
+- fix code blocks overflowing the available width when a line is wider than it, instead of being wrapped - Fix #80 - Thanks @youdie006
+
 <a name="v0.35.1"></a>
 ### v0.35.1 - 2026-07-11
 - Fix a panic in some cases of tables with rows having more columns than the header row - Fix #77

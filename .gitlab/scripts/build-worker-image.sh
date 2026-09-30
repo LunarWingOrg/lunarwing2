@@ -21,7 +21,9 @@ case "$1" in
         context=.
         dockerfile_dir=pebble4lunarwing
         input_files='pebble4lunarwing/Dockerfile
-pebble4lunarwing/Cargo.lock'
+pebble4lunarwing/Cargo.lock
+pebble4lunarwing/upstream/Cargo.lock
+pebble4lunarwing/scripts/verify_upstream_lock.py'
         source_ref=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
         build_args="PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
 WITH_TOOLCHAINS=false

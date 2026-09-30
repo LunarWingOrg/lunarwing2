@@ -1,5 +1,121 @@
 # Changelog
 
+## 5.4.4 (2026-09-10)
+
+### Bug Fixes
+
+ - <csr-id-ad95c40f98144b368ec759492edecd0b8b20b672/> open Windows paths without wildcard expansion
+   <!-- agent -->
+   Opening a child of a bracket-named directory fails because Start-Process
+   resolves parent directories as PowerShell wildcard patterns. The isolated
+   Windows regression test reproduced WildcardPatternException for a copied
+   executable under "【Tiny Asa】 [77P7V-712MB]\child" before this change.
+   
+   Use Test-Path and Invoke-Item with LiteralPath for existing items, retaining
+   Start-Process for URLs and application names. These cmdlets also work under
+   PowerShell Constrained Language Mode. Share the embedded script between
+   Windows and WSL, keep targets in environment data, and stop on launch errors
+   to report a nonzero exit status. Preserve the security boundary established
+   in fd29861: cmd /c start remains opt-in through the insecure feature. No
+   previously removed launcher options are restored.
+   
+   The integration test launches only a copy of its own test binary, which
+   records its executable path and exits. It checks absolute and relative paths
+   with invalid and valid bracket patterns, Unicode, backticks, quotes, shell
+   metacharacters, and leading dashes in normal and constrained PowerShell
+   sessions, plus failure for a missing executable. It requires neither Explorer
+   nor registered document or URL handlers. Adjust the existing fallback
+   assertion to also allow the opt-in cmd launcher after Explorer with all
+   features enabled.
+   
+   Validated locally on Windows with PowerShell 5.1.26100.33438 and rustc 1.97.1:
+   cargo test and cargo test --all-features each passed all 19 tests, including
+   the behavioral regression. git diff --check passed, and cargo
+   package --list includes the embedded script. Test-Path returned false without
+   errors for representative https, mailto, and file URLs. Actual GUI folder,
+   document, URL handling and WSL interop were not exercised locally.
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 2 commits contributed to the release.
+ - 8 days passed between releases.
+ - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
+ - 1 unique issue was worked on: [#132](https://github.com/Byron/open-rs/issues/132)
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **[#132](https://github.com/Byron/open-rs/issues/132)**
+    - Open Windows paths without wildcard expansion ([`ad95c40`](https://github.com/Byron/open-rs/commit/ad95c40f98144b368ec759492edecd0b8b20b672))
+ * **Uncategorized**
+    - Merge pull request #133 from Byron/fix-open-on-windows ([`45317f8`](https://github.com/Byron/open-rs/commit/45317f8a4fdc43218dcc3418156e677e35662dff))
+</details>
+
+## 5.4.3 (2026-09-02)
+
+### Bug Fixes
+
+ - <csr-id-a78c0caa9608b7487925df9838a1ccee216e4384/> wait for intermediate child to terminate when double-forking
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 4 commits contributed to the release.
+ - 9 days passed between releases.
+ - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release open v5.4.3 ([`9551952`](https://github.com/Byron/open-rs/commit/9551952253676494bb0bc5ccb9e79baf6998bd23))
+    - Merge pull request #131 from ncfavier/reap ([`136d4d0`](https://github.com/Byron/open-rs/commit/136d4d0aebb566449ee5b07151ae90ee3db305cf))
+    - Review ([`43e601d`](https://github.com/Byron/open-rs/commit/43e601dfdec770237fc13d31f8d2469439234caf))
+    - Wait for intermediate child to terminate when double-forking ([`a78c0ca`](https://github.com/Byron/open-rs/commit/a78c0caa9608b7487925df9838a1ccee216e4384))
+</details>
+
+## 5.4.2 (2026-08-24)
+
+### Bug Fixes
+
+ - <csr-id-c4369c5af39633a17a79c471605ef1a7f9143243/> wait in that_detached instead of double-fork
+   On macOS /usr/bin/open already detaches via LaunchServices. spawn_detached()
+   adds another fork and leaves zombie children. Align that_detached with
+   with_detached (PR #119).
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 5 commits contributed to the release over the course of 18 calendar days.
+ - 19 days passed between releases.
+ - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release open v5.4.2 ([`1a3ef5d`](https://github.com/Byron/open-rs/commit/1a3ef5d5f981ed344fc3f08ca52b35efbb0b890a))
+    - Merge pull request #130 from s00d/fix/macos-that-detached-zombies ([`7468760`](https://github.com/Byron/open-rs/commit/7468760c0b149db984ca3ab35624ff028a9830dd))
+    - Review ([`351bb54`](https://github.com/Byron/open-rs/commit/351bb54bcdbdd61ff8509fcb3bdb6712ed69ad4e))
+    - Wait in that_detached instead of double-fork ([`c4369c5`](https://github.com/Byron/open-rs/commit/c4369c5af39633a17a79c471605ef1a7f9143243))
+    - Merge pull request #129 from Byron/fix-wsl ([`beb6a3f`](https://github.com/Byron/open-rs/commit/beb6a3f3fe16d0c9054230cb8b8b57031727fdfb))
+</details>
+
 ## 5.4.1 (2026-08-05)
 
 ### Bug Fixes
@@ -23,7 +139,7 @@
 
 <csr-read-only-do-not-edit/>
 
- - 1 commit contributed to the release.
+ - 2 commits contributed to the release.
  - 24 days passed between releases.
  - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
  - 1 unique issue was worked on: [#128](https://github.com/Byron/open-rs/issues/128)
@@ -36,6 +152,8 @@
 
  * **[#128](https://github.com/Byron/open-rs/issues/128)**
     - Forward WSL targets to PowerShell to make `open` actually work there ([`96fa673`](https://github.com/Byron/open-rs/commit/96fa673a6a152d193c210ff77766270192b42d16))
+ * **Uncategorized**
+    - Release open v5.4.1 ([`e548a4e`](https://github.com/Byron/open-rs/commit/e548a4e9180ef8ca7e6b605f3f248fee534a03d1))
 </details>
 
 ## 5.4.0 (2026-07-12)

@@ -19,6 +19,8 @@ use crate::{
         rr::RecordType,
     },
 };
+#[cfg(feature = "__dnssec")]
+use crate::{net::dnssec::BOGUS_CACHE_TTL, proto::dnssec::DnssecSummary};
 
 /// A cache for DNS responses.
 #[derive(Clone, Debug)]
@@ -46,6 +48,24 @@ impl ResponseCache {
 
     /// Insert a response into the cache.
     pub fn insert(&self, query: Query, result: Result<Message, NetError>, now: Instant) {
+        self.upsert_clamped_ttl(query, result, now, false)
+    }
+
+    /// Inserts a message into the cache, but may clamp the TTL of the entry to that of the existing
+    /// entry, if any.
+    ///
+    /// If `clamp_valid_until` is true, the cache expiration time of any existing entry will not be
+    /// extended when the entry's contents are replaced. This is used in a mitigation for ghost
+    /// domain attacks, where queries for an apex NS RRset keep a cache entry warm, without ever
+    /// checking the referral in the parent zone. This can be eliminated once authoritative
+    /// responses and referral responses are cached separately.
+    pub(super) fn upsert_clamped_ttl(
+        &self,
+        query: Query,
+        result: Result<Message, NetError>,
+        now: Instant,
+        clamp_valid_until: bool,
+    ) {
         let (ttl, result) = match result {
             Ok(mut message) => {
                 let ttl = self.clamp_positive_ttls(query.query_type(), &mut message);
@@ -69,14 +89,24 @@ impl ResponseCache {
             Err(_) => return,
         };
         let valid_until = now + ttl;
-        self.cache.insert(
-            query,
-            Entry {
+        if clamp_valid_until {
+            self.cache.entry(query).and_upsert_with(|entry_opt| Entry {
                 result: Arc::new(result),
                 original_time: now,
-                valid_until,
-            },
-        );
+                valid_until: entry_opt.map_or(valid_until, |entry| {
+                    entry.value().valid_until.min(valid_until)
+                }),
+            });
+        } else {
+            self.cache.insert(
+                query,
+                Entry {
+                    result: Arc::new(result),
+                    original_time: now,
+                    valid_until,
+                },
+            );
+        }
     }
 
     /// Try to retrieve a cached response with the given query.
@@ -100,6 +130,12 @@ impl ResponseCache {
         query_type: RecordType,
         message: &mut Message,
     ) -> Duration {
+        #[cfg(feature = "__dnssec")]
+        let bogus = matches!(
+            DnssecSummary::from_records(message.all_sections()),
+            DnssecSummary::Bogus,
+        );
+
         for record in message
             .answers
             .iter_mut()
@@ -117,18 +153,42 @@ impl ResponseCache {
             .positive_response_ttl_bounds(query_type)
             .into_inner();
 
-        // Derive cache duration from the minimum TTL of records whose type
-        // matches the query, across all sections.  This avoids letting
-        // unrelated authority/additional records skew the cache lifetime.
-        let min_ttl = message
-            .all_sections()
-            .filter(|r| r.record_type() == query_type)
-            .map(|r| Duration::from_secs(r.ttl.into()))
-            .min();
+        let min_ttl = if query_type == RecordType::NS {
+            // Derive cache duration from the minimum TTL of the NS records. Check both the answer
+            // section and the authority section, to handle both apex NS RRsets and referral
+            // responses.
+            message
+                .answers
+                .iter()
+                .chain(message.authorities.iter())
+                .filter(|r| r.record_type() == RecordType::NS)
+                .map(|r| Duration::from_secs(r.ttl.into()))
+                .min()
+        } else {
+            // Derive cache duration from the minimum TTL of records whose type matches the query
+            // (or CNAME records, see RFC2181 sections 5.4.1 and 10.1.1), from the answers section
+            // only. This avoids letting unrelated authority/additional records skew the cache
+            // lifetime.
+            message
+                .answers
+                .iter()
+                .filter(|r| r.record_type() == query_type || r.record_type() == RecordType::CNAME)
+                .map(|r| Duration::from_secs(r.ttl.into()))
+                .min()
+        };
 
-        min_ttl
+        let ttl = min_ttl
             .unwrap_or(positive_min_ttl)
-            .clamp(positive_min_ttl, positive_max_ttl)
+            .clamp(positive_min_ttl, positive_max_ttl);
+
+        // Cap the cache lifetime independently of operator-configured min/max
+        // bounds for bogus DNSSEC responses.
+        // RFC 4035 §4.7 requires implementations to assign a small TTL
+        // since the wire TTL is attacker-influenced
+        #[cfg(feature = "__dnssec")]
+        let ttl = if bogus { ttl.min(BOGUS_CACHE_TTL) } else { ttl };
+
+        ttl
     }
 
     pub(crate) fn clear(&self) {
@@ -477,6 +537,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use hickory_proto::rr::rdata::CNAME;
     #[cfg(feature = "serde")]
     use serde::Deserialize;
 
@@ -484,13 +545,15 @@ mod tests {
     use crate::{
         net::{ForwardNSData, NetError},
         proto::{
-            op::{Message, OpCode, Query, ResponseCode},
+            op::{DnsResponse, Message, OpCode, Query, ResponseCode},
             rr::{
                 Name, RData, Record, RecordType,
                 rdata::{A, AAAA, NS, SOA, TXT},
             },
         },
     };
+    #[cfg(feature = "__dnssec")]
+    use hickory_proto::dnssec::Proof;
     use test_support::subscribe;
 
     #[test]
@@ -646,6 +709,51 @@ mod tests {
 
         // At t=121: cache miss.
         assert!(cache.get(&query, now + Duration::from_secs(121)).is_none());
+    }
+
+    #[cfg(feature = "__dnssec")]
+    #[test]
+    fn test_bogus_record_clamps_cache_ttl() {
+        // RFC 4035 §4.7:
+        //   Since RRsets that fail to validate do not have trustworthy TTLs,
+        //   the implementation MUST assign a TTL.  This TTL SHOULD be small,
+        //   in order to mitigate the effect of caching the results of an
+        //   attack.
+        //
+        // We test against both the default TtlConfig and a config with a long
+        // positive_min_ttl: the latter exercises the case where an operator's
+        // floor for legitimate responses must not re-inflate the lifetime of
+        // an attacker-influenced Bogus verdict.
+        let configs = [
+            TtlConfig::default(),
+            TtlConfig::from(TtlBounds {
+                positive_min_ttl: Some(Duration::from_secs(3600)),
+                ..TtlBounds::default()
+            }),
+        ];
+
+        for ttls in configs {
+            let now = Instant::now();
+            let name = Name::from_str("bogus.example.com.").unwrap();
+            let query = Query::query(name.clone(), RecordType::A);
+
+            let mut message = Message::response(0, OpCode::Query);
+            let mut record = Record::from_rdata(name.clone(), 3600, RData::A(A::new(10, 0, 0, 1)));
+            record.proof = Proof::Bogus;
+            message.add_answer(record);
+
+            let cache = ResponseCache::new(1, ttls);
+            cache.insert(query.clone(), Ok(message), now);
+
+            let valid_until = cache.cache.get(&query).unwrap().valid_until;
+            assert!(
+                // RFC 4035 §3.2:
+                //   resolution failures MUST NOT be cached for longer than 5 minutes.
+                valid_until <= now + Duration::from_secs(60 * 5),
+                "Bogus answer cached for {:?}, must be <= 5m",
+                valid_until.duration_since(now),
+            );
+        }
     }
 
     #[test]
@@ -1037,6 +1145,200 @@ mod tests {
             cache.cache.get(&query_txt).unwrap().valid_until,
             now + Duration::from_secs(7)
         );
+    }
+
+    #[test]
+    fn cname_alias_bounds_cache_lifetime() {
+        let now = Instant::now();
+        let cname = Name::from_ascii("cname-record.com.").unwrap();
+        let a = Name::from_ascii("a-record.com.").unwrap();
+
+        let query = Query::query(cname.clone(), RecordType::A);
+
+        let mut message = Message::response(0, OpCode::Query);
+        message.add_query(query.clone());
+
+        // Short-TTL CNAME alias
+        message.add_answer(Record::from_rdata(cname, 5, RData::CNAME(CNAME(a.clone()))));
+
+        // Terminal A record with 24hr TTL.
+        message.add_answer(Record::from_rdata(
+            a,
+            86_400,
+            RData::A(A::new(51, 34, 100, 105)),
+        ));
+
+        let cache = ResponseCache::new(1, TtlConfig::default());
+        cache.insert(query.clone(), Ok::<Message, NetError>(message), now);
+
+        // Immediately after insert the response is a cache hit.
+        assert!(
+            cache.get(&query, now).is_some(),
+            "freshly inserted response should be a cache hit"
+        );
+
+        // At t=6s — just past the 5s CNAME TTL — the entry MUST be a cache miss so a
+        // re-resolution occurs.
+        assert!(
+            cache.get(&query, now + Duration::from_secs(6)).is_none(),
+            "response served past the 5s CNAME TTL"
+        );
+    }
+
+    // Authority section records (e.g. NS for a delegated zone) must not
+    // shorten the cache TTL derived from answer records.
+    #[test]
+    fn authority_record_cannot_reduce_cache_ttl() {
+        let now = Instant::now();
+
+        let name = Name::from_str("www.example.com.").unwrap();
+        let query = Query::query(name.clone(), RecordType::A);
+
+        let mut message = Message::response(0, OpCode::Query);
+        // Answer with TTL=300
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A::new(93, 184, 216, 34)),
+        ));
+        // Authority NS with TTL=10 — must not pull cache TTL down to 10
+        message.add_authority(Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            10,
+            RData::NS(NS(Name::from_str("ns1.example.com.").unwrap())),
+        ));
+
+        let cache = ResponseCache::new(1, TtlConfig::default());
+        cache.insert(query.clone(), Ok(message), now);
+
+        let valid_until = cache.cache.get(&query).unwrap().valid_until;
+        assert_eq!(valid_until, now + Duration::from_secs(300));
+
+        // Still cached well past the authority TTL of 10s
+        assert!(cache.get(&query, now + Duration::from_secs(60)).is_some());
+    }
+
+    // Additional section records (e.g. glue A/AAAA) must not shorten
+    // the cache TTL derived from answer records.
+    #[test]
+    fn additional_record_cannot_reduce_cache_ttl() {
+        let now = Instant::now();
+
+        let name = Name::from_str("www.example.com.").unwrap();
+        let query = Query::query(name.clone(), RecordType::A);
+
+        let mut message = Message::response(0, OpCode::Query);
+        // Answer with TTL=300
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A::new(93, 184, 216, 34)),
+        ));
+        // Additional glue record with TTL=5 — must not pull cache TTL down
+        message.add_additional(Record::from_rdata(
+            Name::from_str("ns1.example.com.").unwrap(),
+            5,
+            RData::A(A::new(198, 51, 100, 1)),
+        ));
+
+        let cache = ResponseCache::new(1, TtlConfig::default());
+        cache.insert(query.clone(), Ok(message), now);
+
+        let valid_until = cache.cache.get(&query).unwrap().valid_until;
+        assert_eq!(valid_until, now + Duration::from_secs(300));
+
+        // Still cached well past the additional record TTL of 5s
+        assert!(cache.get(&query, now + Duration::from_secs(60)).is_some());
+    }
+
+    // Both authority and additional records present with very low TTLs
+    // must not affect the answer-derived cache TTL.
+    #[test]
+    fn authority_and_additional_combined_cannot_reduce_cache_ttl() {
+        let now = Instant::now();
+
+        let name = Name::from_str("www.example.com.").unwrap();
+        let query = Query::query(name.clone(), RecordType::A);
+
+        let mut message = Message::response(0, OpCode::Query);
+        // Answer with TTL=600
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            600,
+            RData::A(A::new(93, 184, 216, 34)),
+        ));
+        // Authority SOA with TTL=1
+        message.add_authority(Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            1,
+            RData::SOA(SOA::new(
+                Name::from_str("example.com.").unwrap(),
+                Name::from_str("admin.example.com.").unwrap(),
+                2024010100,
+                3600,
+                900,
+                604800,
+                60,
+            )),
+        ));
+        // Authority NS with TTL=2
+        message.add_authority(Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            2,
+            RData::NS(NS(Name::from_str("ns1.example.com.").unwrap())),
+        ));
+        // Additional glue with TTL=3
+        message.add_additional(Record::from_rdata(
+            Name::from_str("ns1.example.com.").unwrap(),
+            3,
+            RData::A(A::new(198, 51, 100, 1)),
+        ));
+        // Additional glue with TTL=4
+        message.add_additional(Record::from_rdata(
+            Name::from_str("ns1.example.com.").unwrap(),
+            4,
+            RData::AAAA(AAAA::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 53)),
+        ));
+
+        let cache = ResponseCache::new(1, TtlConfig::default());
+        cache.insert(query.clone(), Ok(message), now);
+
+        // Cache TTL must be 600 from the answer, not 1/2/3/4 from authority/additional
+        let valid_until = cache.cache.get(&query).unwrap().valid_until;
+        assert_eq!(valid_until, now + Duration::from_secs(600));
+    }
+
+    #[test]
+    fn referral_response_cache_ttl() {
+        let now = Instant::now();
+
+        let name = Name::from_str("example.com.").unwrap();
+        let query = Query::query(name.clone(), RecordType::NS);
+
+        let mut message = Message::response(0, OpCode::Query);
+        message.add_query(query.clone());
+        // Referral NS record with TTL=300
+        message.add_authority(Record::from_rdata(
+            name,
+            300,
+            RData::NS(NS(Name::from_str("ns1.example.com.").unwrap())),
+        ));
+        message.metadata.authoritative = false;
+
+        // Confirm that this response goes down the positive response code path.
+        // This test may need to be updated or deleted when referral response handling is changed.
+        let response = DnsResponse::from_message(message.clone()).unwrap();
+        let result = DnsError::from_response(response);
+        assert!(
+            result.is_ok(),
+            "expected referral response to be returned in Ok: {result:?}"
+        );
+
+        let cache = ResponseCache::new(1, TtlConfig::default());
+        cache.insert(query.clone(), Ok(message), now);
+
+        let valid_until = cache.cache.get(&query).unwrap().valid_until;
+        assert_eq!(valid_until, now + Duration::from_secs(300));
     }
 
     #[cfg(feature = "serde")]

@@ -1,5 +1,16 @@
 # Releases
 
+## 1.2.2 (2026-09-04)
+
+- Fix item hygiene in map and set macros. Previously, an internal `const CAP`
+  could shadow the same name in the caller's namespace.
+- Allow `const` initialization of empty `ordermap_with_default!` and
+  `orderset_with_default!`. The hasher may also be omitted if it's inferrable.
+
+## 1.2.1 (2026-08-28)
+
+- Sync changes from `indexmap v2.14.1`
+
 ## 1.2.0 (2026-02-09)
 
 - **MSRV**: Rust 1.85.0 or later is now required.

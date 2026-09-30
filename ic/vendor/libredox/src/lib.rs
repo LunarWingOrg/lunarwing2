@@ -24,6 +24,10 @@ pub mod error {
         pub fn errno(self) -> i32 {
             self.errno.into()
         }
+        #[expect(
+            unreachable_patterns,
+            reason = "EAGAIN and EWOULDBLOCK share the same number"
+        )]
         pub fn is_wouldblock(self) -> bool {
             matches!(self.errno(), errno::EAGAIN | errno::EWOULDBLOCK)
         }
@@ -153,6 +157,10 @@ pub mod flag {
         SIGWINCH,
         SIGXFSZ,
     };
+
+    pub use libc::{F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD};
+
+    pub use libc::RENAME_NOREPLACE;
 
     #[cfg(target_os = "redox")]
     pub use libc::{O_EXLOCK, O_SHLOCK, O_SYMLINK};
@@ -333,6 +341,7 @@ extern "C" {
     ) -> RawResult;
 
     fn redox_fcntl_v0(fd: usize, cmd: usize, arg: usize) -> RawResult;
+
 }
 
 #[cfg(feature = "call")]
@@ -924,6 +933,33 @@ pub mod protocol {
 
         SetProcPriority = 16,
         GetProcPriority = 17,
+
+        ControlTerm = 18,
+        Rlimit = 19,
+    }
+
+    const RLIM_INFINITY: u64 = !0;
+
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C)]
+    pub struct Rlimit {
+        pub rlim_cur: u64,
+        pub rlim_max: u64,
+    }
+    impl Rlimit {
+        pub const fn const_default() -> Self {
+            Self {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            }
+        }
+    }
+    unsafe impl plain::Plain for Rlimit {}
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[repr(usize)]
+    pub enum PidfdCall {
+        SendSignal = 0,
     }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     #[repr(usize)]
@@ -991,6 +1027,16 @@ pub mod protocol {
                 15 => Self::GetProcCredentials,
                 16 => Self::SetProcPriority,
                 17 => Self::GetProcPriority,
+                18 => Self::ControlTerm,
+                19 => Self::Rlimit,
+                _ => return None,
+            })
+        }
+    }
+    impl PidfdCall {
+        pub fn try_from_raw(raw: usize) -> Option<Self> {
+            Some(match raw {
+                0 => Self::SendSignal,
                 _ => return None,
             })
         }
@@ -1198,7 +1244,42 @@ pub mod protocol {
         }
     }
 
-    // CLOEXEC flags
+    // CLOEXEC flag
     pub const O_CLOEXEC: usize = 0x0100_0000;
+
+    // fcntl flags
+    pub const F_DUPFD: usize = 0;
+    pub const F_GETFD: usize = 1;
+    pub const F_SETFD: usize = 2;
     pub const F_DUPFD_CLOEXEC: usize = 1030;
+}
+
+#[cfg(feature = "numa")]
+pub mod numa {
+    pub use syscall::NumaMemoryPolicy;
+
+    unsafe extern "C" {
+        fn redox_numa_set_mem_policy_v0(policy: *const u8, len: usize) -> RawResult;
+        fn redox_numa_get_mem_policy_v0(policy: *mut u8, len: usize) -> RawResult;
+    }
+
+    use crate::RawResult;
+    use syscall::Error;
+
+    pub fn set_memory_policy(policy: NumaMemoryPolicy) -> syscall::Result<()> {
+        let policy = (policy as u64).to_ne_bytes();
+        Error::demux(unsafe { redox_numa_set_mem_policy_v0(policy.as_ptr(), policy.len()) })?;
+        Ok(())
+    }
+
+    pub fn current_memory_policy() -> syscall::Result<NumaMemoryPolicy> {
+        let mut policy = [0u8; size_of::<NumaMemoryPolicy>()];
+        Error::demux(unsafe {
+            redox_numa_get_mem_policy_v0(policy.as_mut_ptr(), size_of::<NumaMemoryPolicy>())
+        })?;
+        Ok(
+            NumaMemoryPolicy::try_from(u32::from_ne_bytes(policy) as u64)
+                .expect("Kernel must write a valid policy"),
+        )
+    }
 }

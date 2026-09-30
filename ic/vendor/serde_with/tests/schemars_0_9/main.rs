@@ -133,8 +133,8 @@ fn schemars_other_cfg_attrs() {
     #[derive(JsonSchema, Serialize)]
     struct Test {
         #[serde_as(as = "DisplayFromStr")]
-        #[cfg_attr(any(), arbitrary("some" |weird| syntax::<bool, 2>()))]
-        #[cfg_attr(any(), schemars(with = "i32"))]
+        #[cfg_attr(false, arbitrary("some" |weird| syntax::<bool, 2>()))]
+        #[cfg_attr(false, schemars(with = "i32"))]
         custom: i32,
     }
 
@@ -153,11 +153,11 @@ fn schemars_custom_with() {
         custom: i32,
 
         #[serde_as(as = "DisplayFromStr")]
-        #[cfg_attr(any(), schemars(with = "i32"))]
+        #[cfg_attr(false, schemars(with = "i32"))]
         with_disabled: i32,
 
         #[serde_as(as = "DisplayFromStr")]
-        #[cfg_attr(all(), schemars(with = "i32"))]
+        #[cfg_attr(true, schemars(with = "i32"))]
         always_enabled: i32,
     }
 
@@ -225,11 +225,11 @@ fn schemars_custom_schema_with() {
         custom: i32,
 
         #[serde_as(as = "DisplayFromStr")]
-        #[cfg_attr(any(), schemars(schema_with = "custom_int"))]
+        #[cfg_attr(false, schemars(schema_with = "custom_int"))]
         with_disabled: i32,
 
         #[serde_as(as = "DisplayFromStr")]
-        #[cfg_attr(all(), schemars(schema_with = "custom_int"))]
+        #[cfg_attr(true, schemars(schema_with = "custom_int"))]
         always_enabled: i32,
     }
 
@@ -493,7 +493,7 @@ mod derive {
 
     #[serde_as]
     #[derive(Serialize)]
-    #[cfg_attr(all(), derive(JsonSchema))]
+    #[cfg_attr(true, derive(JsonSchema))]
     struct Enabled {
         #[serde_as(as = "DisplayFromStr")]
         field: u32,
@@ -502,7 +502,7 @@ mod derive {
     #[allow(dead_code)]
     #[serde_as]
     #[derive(Serialize)]
-    #[cfg_attr(any(), derive(JsonSchema))]
+    #[cfg_attr(false, derive(JsonSchema))]
     struct Disabled {
         // If we are incorrectly adding `#[schemars(with = ...)]` attributes
         // then we should get an error on this field.
@@ -1268,4 +1268,30 @@ fn test_nonzero() {
 
     check_valid_json_schema(&SUsize(NonZeroUsize::new(0)));
     check_valid_json_schema(&SUsize(NonZeroUsize::new(123)));
+}
+
+mod none_as_empty_string {
+    use super::*;
+
+    #[serde_as]
+    #[derive(JsonSchema, Serialize)]
+    #[serde(transparent)]
+    struct S(#[serde_as(as = "NoneAsEmptyString")] Option<u32>);
+
+    #[test]
+    fn test_serialized_is_valid() {
+        check_valid_json_schema(&S(None));
+        check_valid_json_schema(&S(Some(42)));
+    }
+
+    #[test]
+    fn test_null_is_valid() {
+        check_matches_schema::<S>(&json!(null));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_number_is_invalid() {
+        check_matches_schema::<S>(&json!(42));
+    }
 }

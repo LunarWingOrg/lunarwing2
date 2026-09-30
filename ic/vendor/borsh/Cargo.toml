@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.77.0"
 name = "borsh"
-version = "1.8.0"
+version = "1.8.1"
 authors = ["Near Inc <hello@near.org>"]
 build = "build.rs"
 exclude = ["*.snap"]
@@ -90,7 +90,7 @@ version = "1.1"
 optional = true
 
 [dependencies.borsh-derive]
-version = "~1.8.0"
+version = "~1.8.1"
 optional = true
 
 [dependencies.bson]

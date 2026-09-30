@@ -350,18 +350,23 @@ fn test_br_in_table_cell_issue_429_repro() {
 
 #[test]
 fn test_br_in_table_cell_case_variations() {
+    // ~keep HTML tag names are case-insensitive. Every spelling below used to lose "Line 2":
+    // ~keep the parser matched void elements against an all-lowercase table by raw source
+    // ~keep bytes, so an uppercase <BR> became a container that swallowed its siblings
+    // ~keep (issue #467). This test previously pinned that loss with a `should_work = false`
+    // ~keep column for five of the eight cases.
     let test_cases = vec![
-        ("<br>", "lowercase br", true),
-        ("<BR>", "uppercase BR", false),
-        ("<br/>", "self-closing lowercase", true),
-        ("<BR/>", "self-closing uppercase", false),
-        ("<br />", "self-closing with space", true),
-        ("<BR />", "self-closing uppercase with space", false),
-        ("<Br>", "mixed case Br", false),
-        ("<bR />", "mixed case bR with space", false),
+        ("<br>", "lowercase br"),
+        ("<BR>", "uppercase BR"),
+        ("<br/>", "self-closing lowercase"),
+        ("<BR/>", "self-closing uppercase"),
+        ("<br />", "self-closing with space"),
+        ("<BR />", "self-closing uppercase with space"),
+        ("<Br>", "mixed case Br"),
+        ("<bR />", "mixed case bR with space"),
     ];
 
-    for (html_br, case_name, should_work) in test_cases {
+    for (html_br, case_name) in test_cases {
         let html = format!(
             r"<table>
 <tr><th>Header</th></tr>
@@ -375,17 +380,10 @@ fn test_br_in_table_cell_case_variations() {
         };
         let result = convert(&html, Some(options)).unwrap();
 
-        if should_work {
-            assert!(
-                result.contains("Line 1") && result.contains("Line 2"),
-                "Failed for {case_name}: Both lines should be in output: {result}"
-            );
-        } else {
-            assert!(
-                result.contains("Line 1"),
-                "Failed for {case_name}: At least first line should be in output: {result}"
-            );
-        }
+        assert!(
+            result.contains("Line 1") && result.contains("Line 2"),
+            "Failed for {case_name}: Both lines should be in output: {result}"
+        );
     }
 }
 

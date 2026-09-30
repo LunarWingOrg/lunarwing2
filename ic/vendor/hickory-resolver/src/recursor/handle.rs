@@ -14,7 +14,10 @@ use lru_cache::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
-use super::{DnssecPolicy, RecursorError, RecursorOptions, error::AuthorityData, is_subzone};
+use super::{
+    DnssecPolicy, QNameMinimization, RecursorError, RecursorOptions, error::AuthorityData,
+    is_subzone,
+};
 #[cfg(feature = "metrics")]
 use crate::metrics::recursor::RecursorMetrics;
 #[cfg(feature = "__dnssec")]
@@ -25,7 +28,7 @@ use crate::{
     connection_provider::{ConnectionProvider, TlsConfig},
     name_server::NameServer,
     name_server_pool::{NameServerPool, NameServerTransportState, PoolContext},
-    net::DnsHandle,
+    net::{DnsError, DnsHandle, NetError, NoRecords},
     proto::{
         access_control::{AccessControlSet, AccessControlSetBuilder},
         op::{DnsRequestOptions, Message, Query},
@@ -53,6 +56,7 @@ pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     connection_cache: Arc<Mutex<LruCache<IpAddr, Arc<NameServer<P>>>>>,
     request_options: DnsRequestOptions,
     ttl_config: TtlConfig,
+    qname_minimization: QNameMinimization,
 }
 
 impl<P: ConnectionProvider> RecursorDnsHandle<P> {
@@ -85,6 +89,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             case_randomization,
             opportunistic_encryption,
             edns_payload_len,
+            qname_minimization,
         } = options;
 
         let avoid_local_udp_ports = Arc::new(avoid_local_udp_ports);
@@ -151,6 +156,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             connection_cache: Arc::new(Mutex::new(LruCache::new(ns_cache_size))),
             request_options,
             ttl_config: cache_policy.clone(),
+            qname_minimization,
         })
     }
 
@@ -160,7 +166,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         request_time: Instant,
         query_has_dnssec_ok: bool,
         depth: u8,
-        cname_limit: Arc<AtomicU8>,
+        limits: &RequestLimits,
     ) -> Result<Message, RecursorError> {
         #[cfg(feature = "metrics")]
         let _guard = self.metrics.new_inflight_query();
@@ -183,7 +189,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                         request_time,
                         query_has_dnssec_ok,
                         depth,
-                        cname_limit,
+                        limits,
                     )
                     .await?;
 
@@ -237,7 +243,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         };
 
         let (depth, ns) = match self
-            .ns_pool_for_name(zone.clone(), request_time, depth)
+            .ns_pool_for_name(zone.clone(), request_time, depth, limits)
             .await
         {
             Ok((depth, ns)) => (depth, ns),
@@ -263,7 +269,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         let response = match cached_response {
             Some(result) => result?,
             None => {
-                self.lookup(query.clone(), zone.clone(), ns, request_time)
+                self.lookup(query.clone(), zone, &ns, request_time, limits)
                     .await?
             }
         };
@@ -275,7 +281,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 request_time,
                 query_has_dnssec_ok,
                 depth,
-                cname_limit,
+                limits,
             )
             .await?;
 
@@ -307,7 +313,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         now: Instant,
         query_has_dnssec_ok: bool,
         mut depth: u8,
-        cname_limit: Arc<AtomicU8>,
+        limits: &RequestLimits,
     ) -> Result<Message, RecursorError> {
         let query_type = query.query_type();
 
@@ -316,10 +322,11 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             return Ok(response);
         }
 
-        // Return early if there aren't any CNAME in the response.
+        // Return early if there isn't a matching CNAME in the response.
         let has_cname = response
-            .all_sections()
-            .any(|rec| matches!(rec.data, CNAME(_)));
+            .answers
+            .iter()
+            .any(|rec| matches!(rec.data, CNAME(_)) && rec.name == query.name);
         if !has_cname {
             return Ok(response);
         }
@@ -329,19 +336,37 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         let mut cname_chain = vec![];
 
-        for rec in response.all_sections() {
-            let CNAME(name) = &rec.data else {
-                continue;
-            };
+        let mut effective_qname = &query.name;
+        let mut name_history = vec![effective_qname];
+        loop {
+            // Check if we are done following CNAME records.
+            if response.answers.iter().any(|record| {
+                record.record_type() == query.query_type && &record.name == effective_qname
+            }) {
+                break;
+            }
 
-            // Check if the response has data for the canonical name.
-            if response.answers.iter().any(|record| record.name == name.0) {
+            // Check if there is a CNAME record at the current effective QNAME.
+            let target_name_opt = response.answers.iter().find_map(|record| {
+                let CNAME(cname) = &record.data else {
+                    return None;
+                };
+                (&record.name == effective_qname).then_some(&cname.0)
+            });
+            if let Some(target_name) = target_name_opt {
+                if name_history.contains(&target_name) {
+                    // The CNAME records form a loop.
+                    break;
+                }
+                name_history.push(target_name);
+                effective_qname = target_name;
                 continue;
             }
 
-            let cname_query = Query::query(name.0.clone(), query_type);
+            // Try following the last CNAME record by restarting resolution.
+            let cname_query = Query::query(effective_qname.clone(), query_type);
 
-            let count = cname_limit.fetch_add(1, Ordering::Relaxed) + 1;
+            let count = limits.cname_limit.fetch_add(1, Ordering::Relaxed) + 1;
             if count > MAX_CNAME_LOOKUPS {
                 warn!("cname limit exceeded for query {query}");
                 return Err(RecursorError::MaxRecordLimitExceeded {
@@ -355,13 +380,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             // response.  Resolve will either pull the intermediates out of the cache or query
             // the appropriate nameservers if necessary.
             let response = match self
-                .resolve(
-                    cname_query,
-                    now,
-                    query_has_dnssec_ok,
-                    depth,
-                    cname_limit.clone(),
-                )
+                .resolve(cname_query, now, query_has_dnssec_ok, depth, limits)
                 .await
             {
                 Ok(cname_r) => cname_r,
@@ -387,6 +406,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
                 None
             }));
+
+            break;
         }
 
         if !cname_chain.is_empty() {
@@ -419,32 +440,20 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     async fn lookup(
         &self,
         query: Query,
-        zone: Name,
-        ns: NameServerPool<P>,
+        zone: &Name,
+        ns: &NameServerPool<P>,
         now: Instant,
+        limits: &RequestLimits,
     ) -> Result<Message, RecursorError> {
+        limits.try_charge_query(&query)?;
+
         let mut response = ns.lookup(query.clone(), self.request_options);
 
         #[cfg(feature = "metrics")]
         self.metrics.outgoing_query_counter.increment(1);
 
-        // TODO: we are only expecting one response
-        // TODO: should we change DnsHandle to always be a single response? And build a totally custom handler for other situations?
-        let mut response = match response.next().await {
-            Some(Ok(r)) => r,
-            Some(Err(error)) => {
-                warn!(?query, %error, "lookup error");
-                self.response_cache.insert(query, Err(error.clone()), now);
-                return Err(RecursorError::from(error));
-            }
-            None => {
-                warn!("no response to lookup for {query}");
-                return Err("no response to lookup".into());
-            }
-        };
-
-        let answer_filter = |record: &Record| {
-            if !is_subzone(&zone, &record.name) {
+        let bailiwick_filter = |record: &Record| {
+            if !is_subzone(zone, &record.name) {
                 debug!(
                     %record, %zone,
                     "dropping out of bailiwick record",
@@ -455,12 +464,71 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             true
         };
 
+        // TODO: we are only expecting one response
+        // TODO: should we change DnsHandle to always be a single response? And build a totally custom handler for other situations?
+        let mut response = match response.next().await {
+            Some(Ok(r)) => r,
+            Some(Err(mut error)) => {
+                warn!(?query, %error, "lookup error");
+
+                // Do bailiwick filtering on records embedded in the error, if applicable.
+                match &mut error {
+                    NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                        soa, authorities, ..
+                    })) => {
+                        if let Some(record) = soa {
+                            // We can't reuse bailiwick_filter here because this field has type
+                            // Record<SOA>, not Record<RData>.
+                            if !is_subzone(zone, &record.name) {
+                                debug!(
+                                    %record, %zone,
+                                    "dropping out of bailiwick SOA record",
+                                );
+                                *soa = None;
+                            }
+                        }
+                        if let Some(authorities) = authorities {
+                            if !authorities.iter().all(bailiwick_filter) {
+                                *authorities = authorities
+                                    .iter()
+                                    .filter(|record| bailiwick_filter(record))
+                                    .cloned()
+                                    .collect();
+                            }
+                        }
+                    }
+                    #[cfg(feature = "__dnssec")]
+                    NetError::Dns(DnsError::Nsec { response, .. }) => {
+                        response.answers.retain(bailiwick_filter);
+                        response.authorities.retain(bailiwick_filter);
+                        response.additionals.retain(bailiwick_filter);
+                    }
+                    _ => {}
+                }
+
+                // Ghost domain attack mitigation: see below
+                let query_type_is_ns = query.query_type == RecordType::NS;
+                self.response_cache.upsert_clamped_ttl(
+                    query,
+                    Err(error.clone()),
+                    now,
+                    query_type_is_ns,
+                );
+
+                return Err(RecursorError::from(error));
+            }
+            None => {
+                warn!("no response to lookup for {query}");
+                return Err("no response to lookup".into());
+            }
+        };
+
         let answers_len = response.answers.len();
         let authorities_len = response.authorities.len();
 
-        response.additionals.retain(answer_filter);
-        response.answers.retain(answer_filter);
-        response.authorities.retain(answer_filter);
+        response.answers.retain(bailiwick_filter);
+        response.authorities.retain(bailiwick_filter);
+        response.additionals.retain(bailiwick_filter);
 
         // If we stripped all of the answers out, or if we stripped all of the authorities
         // out and there are no answers, return an NXDomain response.
@@ -479,7 +547,14 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         }
 
         let message = response.into_message();
-        self.response_cache.insert(query, Ok(message.clone()), now);
+        // Ghost domain attack mitigation: Since we use NS queries to probe for referrals, and we
+        // use NS answers to determine which server to connect to, use a different code path for
+        // these queries. This lets us avoid extending the cache TTL of responses without consulting
+        // the parent zone to check if the referral has changed. This workaround can be removed once
+        // we handle caching of referrals and zone cuts differently.
+        let query_type_is_ns = query.query_type == RecordType::NS;
+        self.response_cache
+            .upsert_clamped_ttl(query, Ok(message.clone()), now, query_type_is_ns);
         Ok(message)
     }
 
@@ -490,33 +565,46 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         query_name: Name,
         request_time: Instant,
         mut depth: u8,
+        limits: &RequestLimits,
     ) -> Result<(u8, NameServerPool<P>), RecursorError> {
         // Iterate through zones from TLD down to the query name (not including root)
         let num_labels = query_name.num_labels();
         trace!(num_labels, %query_name, "looking for zones");
 
         let mut nameserver_pool = self.roots.clone().with_zone(Name::root());
+        let mut zone = Name::root();
 
         for i in 1..=num_labels {
-            let zone = query_name.trim_to(i as usize);
-            if let Some(ns) = self.name_server_cache.lock().get_mut(&zone) {
+            let candidate_zone = query_name.trim_to(i as usize);
+            let _in_flight = limits.try_enter_zone(&candidate_zone).inspect_err(|_| {
+                debug!(
+                    ?candidate_zone,
+                    "refusing to re-enter zone already on resolution stack"
+                );
+            })?;
+            if let Some(ns) = self.name_server_cache.lock().get_mut(&candidate_zone) {
                 match ns.ttl_expired() {
-                    true => debug!(?zone, "cached name server pool expired"),
+                    true => debug!(?candidate_zone, "cached name server pool expired"),
                     false => {
-                        debug!(?zone, "already have cached name server pool for zone");
+                        debug!(
+                            ?candidate_zone,
+                            "already have cached name server pool for zone"
+                        );
                         nameserver_pool = ns.clone();
                         continue;
                     }
                 }
             };
 
-            trace!(depth, ?zone, "ns_pool_for_name: depth {depth} for {zone}");
+            trace!(
+                depth,
+                ?candidate_zone,
+                "ns_pool_for_name: depth {depth} for {candidate_zone}"
+            );
             depth += 1;
-            RecursorError::recursion_exceeded(self.ns_recursion_limit, depth, &zone)?;
+            RecursorError::recursion_exceeded(self.ns_recursion_limit, depth, &candidate_zone)?;
 
-            let parent_zone = zone.base_name();
-
-            let query = Query::query(zone.clone(), RecordType::NS);
+            let query = Query::query(candidate_zone.clone(), RecordType::NS);
 
             // Query for nameserver records via the pool for the parent zone.
             let lookup_res = match self.response_cache.get(&query, request_time) {
@@ -526,7 +614,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 }
                 Some(Err(e)) => Err(e.into()),
                 None => {
-                    self.lookup(query, parent_zone, nameserver_pool.clone(), request_time)
+                    self.lookup(query, &zone, &nameserver_pool, request_time, limits)
                         .await
                 }
             };
@@ -534,27 +622,30 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             let response = match lookup_res {
                 Ok(response) => response,
                 // Short-circuit on NXDOMAIN, per RFC 8020.
-                Err(e) if e.is_nx_domain() => return Err(e),
+                // RFC 9156 also describes a relaxed mode where RFC 8020 is not enforced.
+                Err(e)
+                    if e.is_nx_domain() && self.qname_minimization == QNameMinimization::Strict =>
+                {
+                    return Err(e);
+                }
                 // Short-circuit on timeouts. Requesting a longer name from the same pool would likely
                 // encounter them again.
                 Err(e) if e.is_timeout() => return Err(e),
-                // The name `zone` is not a zone cut. Return the same pool of name servers again, but do
-                // not cache it. If this was recursively called by `ns_pool_for_name()`, the outer call
-                // will try again with one more label added to the iterative query name.
+                // The name `candidate_zone` is not a zone cut. Try again with one more label added
+                // to the iterative query name.
                 Err(_) => {
-                    trace!(?zone, "no zone cut at zone");
+                    trace!(?candidate_zone, "no zone cut at name");
                     continue;
                 }
             };
 
-            let any_ns = response
-                .all_sections()
-                .any(|record| record.record_type() == RecordType::NS && record.name == zone);
+            let any_ns = response.all_sections().any(|record| {
+                record.record_type() == RecordType::NS && record.name == candidate_zone
+            });
             if !any_ns {
-                // Not a zone cut, but there is a CNAME or other record at this name. Return the
-                // same pool of name servers as above in the error case, to try again with a
-                // longer name.
-                trace!(?zone, "no zone cut at zone");
+                // Not a zone cut, but there is a CNAME or other record at this name. Try again with
+                // a longer name.
+                trace!(?candidate_zone, "no zone cut at name");
                 continue;
             }
 
@@ -579,10 +670,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     continue;
                 };
 
-                if !is_subzone(&zone.base_name(), &zns.name) {
+                if !is_subzone(&candidate_zone.base_name(), &zns.name) {
                     debug!(
                         name = ?zns.name,
-                        parent = ?zone.base_name(),
+                        parent = ?candidate_zone.base_name(),
                         "dropping out of bailiwick record",
                     );
                     continue;
@@ -622,23 +713,31 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             // For child child name servers, we can use the existing pool, but we *must* use lookup
             // to avoid infinite recursion.
             if config_group.is_empty() && !need_ips_for_names.is_empty() {
-                debug!(?zone, "need glue for zone");
+                debug!(?candidate_zone, "need glue for zone");
 
                 let ttl;
                 (ttl, depth) = self
                     .append_ips_from_lookup(
-                        &zone,
+                        &candidate_zone,
                         depth,
                         request_time,
                         nameserver_pool.clone(),
-                        need_ips_for_names.iter(),
+                        need_ips_for_names.iter().take(MAX_GLUELESS_FOLLOW),
                         &mut config_group,
+                        limits,
                     )
                     .await?;
 
                 if ttl < ns_pool_ttl {
                     ns_pool_ttl = ttl;
                 }
+            }
+
+            if config_group.is_empty() {
+                debug!(?zone, "no glue found for any nameservers for zone");
+                return Err(RecursorError::from(
+                    "no glue found for any nameservers for zone",
+                ));
             }
 
             let servers = {
@@ -668,7 +767,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
             nameserver_pool = NameServerPool::from_nameservers(servers, self.pool_context.clone())
                 .with_ttl(ns_pool_ttl)
-                .with_zone(zone.clone());
+                .with_zone(candidate_zone.clone());
+            zone = candidate_zone.clone();
 
             // store in cache for future usage
             debug!(?zone, "found nameservers for {zone}");
@@ -727,6 +827,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         ttl
     }
 
+    #[expect(clippy::too_many_arguments)] // TODO: consider extracting lookup context struct.
     async fn append_ips_from_lookup<'a, I: Iterator<Item = &'a NS>>(
         &self,
         zone: &Name,
@@ -735,6 +836,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         nameserver_pool: NameServerPool<P>,
         nameservers: I,
         config: &mut Vec<NameServerConfig>,
+        limits: &RequestLimits,
     ) -> Result<(u32, u8), RecursorError> {
         let mut pool_queries = vec![];
 
@@ -747,7 +849,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             // depth as a fixed base for the nameserver lookups
             let nameserver_pool = if !is_subzone(zone, &record_name) {
                 match self
-                    .ns_pool_for_name(record_name.clone(), request_time, depth)
+                    .ns_pool_for_name(record_name.clone(), request_time, depth, limits)
                     .await
                 {
                     Ok((_, pool)) => pool.with_zone(zone.clone()),
@@ -769,10 +871,12 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         let mut futures = FuturesUnordered::new();
 
-        for (pool, query) in pool_queries.iter() {
+        for (pool, query_name) in pool_queries.iter() {
             for rec_type in [RecordType::A, RecordType::AAAA] {
+                let query = Query::query(query_name.clone(), rec_type);
+                limits.try_charge_query(&query)?;
                 futures.push(Box::pin(
-                    pool.lookup(Query::query(query.clone(), rec_type), self.request_options)
+                    pool.lookup(query, self.request_options)
                         .into_future()
                         .map(|(first, _rest)| first),
                 ));
@@ -815,6 +919,59 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 }
 
+pub(crate) struct RequestLimits {
+    req_query_count: AtomicU8,
+    cname_limit: AtomicU8,
+    in_flight_zones: Mutex<HashSet<Name>>,
+}
+
+impl RequestLimits {
+    pub(crate) fn new() -> Self {
+        Self {
+            req_query_count: AtomicU8::new(0),
+            cname_limit: AtomicU8::new(0),
+            in_flight_zones: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn try_charge_query(&self, query: &Query) -> Result<(), RecursorError> {
+        if self
+            .req_query_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_QUERIES_PER_REQUEST).then(|| n + 1)
+            })
+            .is_err()
+        {
+            warn!(?query, "per-request query budget exceeded");
+            return Err(RecursorError::QueryBudgetExceeded);
+        }
+        Ok(())
+    }
+
+    fn try_enter_zone<'a>(&'a self, zone: &Name) -> Result<InFlightZone<'a>, RecursorError> {
+        if !self.in_flight_zones.lock().insert(zone.clone()) {
+            return Err(RecursorError::from(format!(
+                "zone {zone} is already on the resolution stack"
+            )));
+        }
+        Ok(InFlightZone {
+            limits: self,
+            zone: zone.clone(),
+        })
+    }
+}
+
+struct InFlightZone<'a> {
+    limits: &'a RequestLimits,
+    zone: Name,
+}
+
+impl Drop for InFlightZone<'_> {
+    fn drop(&mut self) {
+        self.limits.in_flight_zones.lock().remove(&self.zone);
+    }
+}
+
 #[cfg(feature = "__dnssec")]
 mod for_dnssec {
     use futures_util::{
@@ -852,8 +1009,8 @@ mod for_dnssec {
                 // request the DNSSEC records; we'll strip them if not needed on the caller side
                 let do_bit = true;
 
-                let future =
-                    this.resolve(query, Instant::now(), do_bit, 0, Arc::new(AtomicU8::new(0)));
+                let limits = RequestLimits::new();
+                let future = this.resolve(query, Instant::now(), do_bit, 0, &limits);
                 let response = match future.await {
                     Ok(response) => response,
                     Err(e) => return Err(NetError::from(e)),
@@ -913,6 +1070,12 @@ fn name_server_config(
 /// Maximum number of cname records to look up in a CNAME chain, regardless of the recursion
 /// depth limit
 const MAX_CNAME_LOOKUPS: u8 = 64;
+
+/// Maximum number of glueless NS targets to chase per delegation point.
+const MAX_GLUELESS_FOLLOW: usize = 5;
+
+/// Maximum number of upstream queries the recursor will issue for a single client query.
+const MAX_QUERIES_PER_REQUEST: u8 = 200;
 
 #[cfg(test)]
 mod tests {

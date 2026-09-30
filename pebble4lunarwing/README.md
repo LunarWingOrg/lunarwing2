@@ -20,6 +20,25 @@ docker compose build
 docker compose up -d pebble-worker
 ```
 
+The Dockerfile pins upstream Pebble to a reviewed commit and supplies a
+reviewed `PEBBLE_LOCK_SHA256` default for `upstream/Cargo.lock`. Plain Docker
+builds, both Compose services, mt-admin's Docker/Podman builders, and CI use
+that same default without an extra argument. The build rejects a digest
+mismatch and compares complete parsed package records against the pinned
+upstream lock; only `rustls` and `rustls-webpki` may differ. Package additions,
+removals, or source/checksum/dependency edits outside that allowlist fail even
+when a caller supplies a matching digest override. Update the reviewed digest
+together with any intentional lock change; CI checks they match.
+
+Fast regression checks (no image build):
+
+```bash
+# From the repository root, with Python >= 3.11 and PyYAML installed:
+python3 .gitlab/scripts/validate_config.py
+python3 -m unittest discover -s .gitlab/tests -p 'test_*.py'
+bash ic/scripts/tests/test-mt-admin-pebble-build-inputs.sh
+```
+
 ### CLI mode (one-shot)
 
 ```bash

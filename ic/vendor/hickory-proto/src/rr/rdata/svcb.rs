@@ -232,6 +232,12 @@ impl SVCB {
             // get the value, and remove any quotes
             let mut value = key_value.next();
             if let Some(value) = value.as_mut() {
+                if *value == "\"" {
+                    return Err(ParseError::Message(
+                        "SVCB SvcbParams cannot be a single quote",
+                    ));
+                }
+
                 if value.starts_with('"') && value.ends_with('"') {
                     *value = &value[1..value.len() - 1];
                 }
@@ -324,7 +330,7 @@ fn parse_mandatory(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
 fn parse_alpn(value: Option<&str>) -> Result<SvcParamValue, ParseError> {
     let value = value.ok_or(ParseError::Message("expected at least one ALPN code"))?;
 
-    let alpns = parse_list::<String>(value).expect("infallible");
+    let alpns = parse_list::<String>(value)?;
     Ok(SvcParamValue::Alpn(Alpn(alpns)))
 }
 
@@ -1762,6 +1768,18 @@ mod tests {
             assert_eq!(svcb.svc_priority, 1);
             assert_eq!(svcb.target_name, Name::root());
         }
+    }
+
+    #[test]
+    fn invalid_alpn_token() {
+        let _ = RData::try_from_str(RecordType::SVCB, "1 . alpn=\"h")
+            .expect_err("invalid alpn token should fail");
+    }
+
+    #[test]
+    fn single_quote_value() {
+        let _ = RData::try_from_str(RecordType::SVCB, "1 . alpn=\"")
+            .expect_err("single quoted value should fail");
     }
 
     /// Test with RFC 9460 Appendix D test vectors

@@ -89,6 +89,24 @@ pub struct TableState {
     /// layout-table fallback in close_table on what should be a normal GFM
     /// table (e.g. wikipedia/large_rust infobox).
     pub current_cell_colspan: u16,
+    /// True while the row currently being assembled (`current_row`) holds exactly one
+    /// finalized cell so far and that cell had a nested table flattened into it.
+    ///
+    /// Cleared as soon as a second cell closes into the same row (a sibling means Tier-2
+    /// keeps the existing flatten-and-escape rendering, issue #469). Read by
+    /// `close_table_row`, which folds a still-true value at a one-cell row's close into
+    /// `had_single_cell_nested_table_row` below.
+    pub pending_single_cell_nested_table: bool,
+    /// True once any row in this table closed with exactly one cell that held a nested
+    /// table (see `pending_single_cell_nested_table`).
+    ///
+    /// Checked by `close_table` — after its existing one-cell-*wrapper* check, which takes
+    /// priority when both apply — rather than bailing immediately in `close_table_row`,
+    /// because a row-level decision cannot yet know whether this row turns out to be the
+    /// whole table (the wrapper shape, `TableNestedTable`) or one row among several (Tier-2
+    /// defers just that row's nested table instead, issue #484): only `close_table` has
+    /// seen every row.
+    pub had_single_cell_nested_table_row: bool,
 }
 
 bitflags::bitflags! {
@@ -105,6 +123,8 @@ bitflags::bitflags! {
         const BLOCKQUOTE = 1 << 4;
         /// Inside a heading element.
         const HEADING    = 1 << 5;
+        /// Inside a `<strong>`/`<b>` element.
+        const STRONG     = 1 << 6;
     }
 }
 
@@ -124,6 +144,17 @@ pub struct OpenTag {
     /// Byte range of the tag name in the original input (original case; callers
     /// must lowercase before comparing).
     pub name_range: std::ops::Range<usize>,
+    /// Set (`Strong`/`Emphasis` frames only) when `flush_text` dropped a whitespace-only
+    /// text node at this frame's content start, i.e. before any other content was written.
+    ///
+    /// `close_inline_marker`'s body-emptiness check operates on buffer bytes alone, but by
+    /// the time it runs, `flush_text`'s own block-edge whitespace drop (issue #481) has
+    /// already erased those bytes — a genuinely empty `<em></em>` and a whitespace-only
+    /// `<em> </em>` both look identical (buffer unchanged since `content_start`) from
+    /// `close_inline_marker`'s point of view. This flag is the only surviving signal that
+    /// distinguishes them, so `close_inline_marker` can bail (`WhitespaceOnlyInlineEmphasis`)
+    /// for the latter instead of silently truncating the space away like the former.
+    pub dropped_whitespace_only_text: bool,
 }
 
 /// Minimum capacity for each summary accumulation buffer.
@@ -175,13 +206,21 @@ pub struct Tier1State {
     /// is emitted as `" (title)"` after the abbreviation text, mirroring
     /// Tier-2's `semantic/attributes.rs::handle_abbr` (line 104-111).
     pub abbr_titles: Vec<Option<String>>,
-    /// Stack of `(href, title)` pairs for currently-open `<a>` elements.
+    /// Stack of `(href, title, has_nested_tag)` triples for currently-open `<a>`
+    /// elements.
     ///
     /// HTML5 forbids nested `<a>`, but the stack handles malformed input safely.
     /// Holding link state off `OpenTag` saves two `Option<String>` slots per
     /// every non-link tag frame (24 bytes × every tag on Wikipedia pages with
     /// thousands of tags), and avoids per-frame `Clone` cost.
-    pub link_stack: Vec<(Option<String>, Option<String>)>,
+    ///
+    /// `has_nested_tag` starts `false` and is set `true` by the scanner's tag-open
+    /// dispatch the moment ANY child tag opens while this link is on the stack
+    /// (every entry, not just the innermost, so malformed nested `<a>` still marks
+    /// its ancestor). `close_link` reads it to bail (`BailReason::LinkAutolinkNestedMarkup`)
+    /// rather than risk a false negative against Tier-2's tag-stripped autolink
+    /// predicate — see that bail reason's doc comment.
+    pub link_stack: Vec<(Option<String>, Option<String>, bool)>,
     /// Byte range of `<head>…</head>` content (between the tags) in the
     /// input the scanner walked.  Populated by the `TagKind::Ignored`
     /// dispatch when a non-void Ignored tag (`<head>`) is encountered;
@@ -210,18 +249,75 @@ pub struct Tier1State {
     /// A stack (rather than a single `Option`) handles pathological nesting
     /// without panicking.
     pub summary_buf_stack: Vec<(WrapKind, String)>,
-    /// Tier-2 runs HTML through an html5ever roundtrip when the source
-    /// contains custom-element tags; the roundtrip canonicalizes
-    /// attribute entities (e.g. `&#x22;` → `&quot;`).  Tier-1 sets this
-    /// flag at the start of `scan` so the image emit path mirrors the
-    /// canonicalization for byte-equality (Phase DD).
-    pub canonicalize_attr_entities: bool,
+    /// `true` immediately after closing a custom element (unknown tag
+    /// containing `-`), until the next scanner event consumes or clears it.
+    ///
+    /// ~keep Tier-2's `is_inline_element` whitespace-merge check
+    /// ~keep (`main_helpers.rs`) is a fixed named-tag list that custom
+    /// ~keep elements never match, so a whitespace-only text node right
+    /// ~keep after a custom element's close is NOT treated as "between two
+    /// ~keep inline siblings" and is preserved verbatim even when the
+    /// ~keep custom element's own trailing content already ended in a
+    /// ~keep (decoded-entity) space. Tier-1's general whitespace flush
+    /// ~keep instead asks "does the output already end with a space" and
+    /// ~keep skips a redundant one — correct for real inline tags, wrong
+    /// ~keep here. This flag lets `flush_text` special-case exactly that
+    /// ~keep one boundary instead of relaxing the general dedup rule.
+    pub last_closed_custom_element: bool,
+
+    /// True immediately after an `<img>` is emitted, for exactly the next
+    /// `flush_text` call (read-then-clear, same convention as
+    /// `last_closed_custom_element`). Tier-2's `paragraph.rs` skips a
+    /// whitespace-only text node entirely — not just deduping it to a single
+    /// space — when it sits directly between two "empty inline" siblings
+    /// (`br`/`hr`/`img`/`input`/`meta`/`link`) that are BOTH direct children
+    /// of the same `<p>`; this flag lets `flush_text` detect the "previous
+    /// direct sibling was an `<img>`" half of that condition (the "next
+    /// sibling is an `<img>`" half comes from the scan loop's tag peek, same
+    /// as `next_tag_is_list`).
+    pub last_emitted_was_img: bool,
+
+    /// Byte width of each currently-open list item's own marker (`"- "` = 2,
+    /// `"1. "` = 3, `"10. "` = 4, ...), one entry per open `<li>` frame,
+    /// pushed by `open_list_item` and popped by `close_list_item`.
+    ///
+    /// A block child (`<pre>`, `<blockquote>`, a text sibling after a
+    /// heading, ...) of a list item must indent every physical line to the
+    /// item's continuation column, per CommonMark's per-line list-container
+    /// matching. That column is the SUM of every ancestor `<li>`'s own
+    /// marker width — not a uniform `2 * depth` — because an ordered-list
+    /// marker's width varies with its digit count (`"1. "` vs `"10. "`).
+    /// Summing this stack gives that column directly; see
+    /// `Tier1State::list_continuation_indent_width`.
+    pub list_item_marker_widths: Vec<usize>,
+
+    /// `true` until the first text node carrying real (non-whitespace)
+    /// content has been processed anywhere in the document, then
+    /// permanently `false`.
+    ///
+    /// Mirrors Tier-2's `Context::at_fresh_block_start` (an
+    /// `Rc<Cell<bool>>` shared across the whole conversion): CommonMark
+    /// 4.8 makes leading whitespace at the very start of a document
+    /// insignificant, so `flush_text` strips it there the same way it
+    /// already strips leading whitespace after a block separator.
+    /// Deliberately NOT derived from buffer emptiness — an inline
+    /// wrapper (`<sub>`, `<em>`, a link) accumulates into a fresh local
+    /// buffer via `cell_or_output_mut`, so an empty buffer there means
+    /// "this wrapper's own scratch space is empty", not "we are at
+    /// document start". A dedicated flag distinguishes the two.
+    pub at_document_start: bool,
+
+    /// Effective base URL for resolving relative `href`/`src` destinations, computed
+    /// once in `convert_api.rs` and shared with the Tier-2 path's `Context::base_url`
+    /// so both tiers resolve the same input identically. `None` when `options.base_url`
+    /// is unset (the default), making every resolution call a no-op.
+    pub effective_base: Option<std::rc::Rc<url::Url>>,
 }
 
 impl Tier1State {
     /// Create a new `Tier1State` pre-allocating output capacity based on `input_len`.
     #[must_use]
-    pub fn new(input_len: usize) -> Self {
+    pub fn new(input_len: usize, effective_base: Option<std::rc::Rc<url::Url>>) -> Self {
         Self {
             stack: Vec::with_capacity(16),
             escape_ctx: EscapeCtx::empty(),
@@ -237,8 +333,33 @@ impl Tier1State {
             head_range: None,
             pre_lang: None,
             summary_buf_stack: Vec::new(),
-            canonicalize_attr_entities: false,
+            last_closed_custom_element: false,
+            last_emitted_was_img: false,
+            list_item_marker_widths: Vec::new(),
+            at_document_start: true,
+            effective_base,
         }
+    }
+
+    /// Resolve a `href`/`src` attribute value against [`Self::effective_base`].
+    ///
+    /// Returns `None` (meaning: use the original text unchanged) whenever
+    /// `effective_base` is unset, `value` is empty, already absolute, or fails to
+    /// resolve. See `converter::url_resolve::resolve_attribute_url` for the full
+    /// contract. Mirrors `Context::resolve_url` on the Tier-2 path.
+    #[must_use]
+    pub fn resolve_url(&self, value: &str) -> Option<String> {
+        crate::converter::url_resolve::resolve_attribute_url(self.effective_base.as_deref()?, value)
+    }
+
+    /// Total continuation-indent width (in columns) for a block child of the
+    /// innermost currently-open list item, or `0` when not inside one.
+    ///
+    /// See `list_item_marker_widths`'s doc comment for why this is a sum of
+    /// real marker widths rather than a uniform `2 * depth`.
+    #[must_use]
+    pub fn list_continuation_indent_width(&self) -> usize {
+        self.list_item_marker_widths.iter().sum()
     }
 
     /// Return a mutable reference to the current accumulation target.

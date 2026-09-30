@@ -11,9 +11,9 @@
 
 [package]
 edition = "2021"
-rust-version = "1.71.0"
+rust-version = "1.85"
 name = "web_atoms"
-version = "0.2.6"
+version = "0.3.0"
 authors = ["The html5ever Project Developers"]
 build = "build.rs"
 autolib = false
@@ -36,14 +36,14 @@ name = "web_atoms"
 path = "lib.rs"
 
 [dependencies.phf]
-version = "0.13"
+version = "0.14"
 
 [dependencies.string_cache]
-version = "0.9.0"
+version = "0.11.0"
 default-features = false
 
 [build-dependencies.phf_codegen]
-version = "0.13"
+version = "0.14"
 
 [build-dependencies.string_cache_codegen]
-version = "0.6.1"
+version = "0.11.0"

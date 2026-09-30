@@ -2,7 +2,7 @@
   "name": "ssh",
   "display_name": "SSH",
   "kind": "tool",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "wit_version": "0.3.0",
   "description": "Run a command on a preconfigured SSH host (delivery Option 3: WASM guest + host-side russh client)",
   "keywords": ["ssh", "remote", "shell", "exec"],

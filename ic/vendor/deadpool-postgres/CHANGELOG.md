@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-08-26
+
+- Coalesce concurrent statement preparations. Tasks racing to prepare the same
+  query now share a single `PREPARE` instead of each sending their own. If that
+  preparation fails or is cancelled, one of the waiting tasks starts a fresh one
+  instead of failing along with it.
+- Bump up MSRV to `1.85` and Rust edition to `2024`
+- Re-export `tokio-postgres` features:
+  - `with-bit-vec-0_9`
+- Update `tokio-postgres` dependency to version `0.7.14`
+- Update `deadpool` dependency to version `0.13.1`
+
 ## [0.14.1] - 2024-12-18
 
 - Add missing re-export of `LoadBalanceHosts`
@@ -219,39 +231,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - First release
 
 <!-- next-url -->
-[Unreleased]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.14.1...HEAD
-[0.14.1]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.14.0...deadpool-postgres-v0.14.1
-[0.14.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.13.2...deadpool-postgres-v0.14.0
-[0.13.2]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.13.1...deadpool-postgres-v0.13.2
-[0.13.1]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.13.0...deadpool-postgres-v0.13.1
-[0.13.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.12.1...deadpool-postgres-v0.13.0
-[0.12.1]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.12.0...deadpool-postgres-v0.12.1
-[0.12.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.11.0...deadpool-postgres-v0.12.0
-[0.11.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.10.5...deadpool-postgres-v0.11.0
-[0.10.5]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.10.4...deadpool-postgres-v0.10.5
-[0.10.4]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.10.3...deadpool-postgres-v0.10.4
-[0.10.3]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.10.2...deadpool-postgres-v0.10.3
-[0.10.2]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.10.1...deadpool-postgres-v0.10.2
-[0.10.1]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.10.0...deadpool-postgres-v0.10.1
-[0.10.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.9.0...deadpool-postgres-v0.10.0
-[0.9.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.8.1...deadpool-postgres-v0.9.0
-[0.8.1]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.8.0...deadpool-postgres-v0.8.1
-[0.8.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.7.0...deadpool-postgres-v0.8.0
-[0.7.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.6.0...deadpool-postgres-v0.7.0
-[0.6.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.5.6...deadpool-postgres-v0.6.0
-[0.5.6]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.5.5...deadpool-postgres-v0.5.6
-[0.5.5]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.5.4...deadpool-postgres-v0.5.5
-[0.5.4]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.5.3...deadpool-postgres-v0.5.4
-[0.5.3]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.5.2...deadpool-postgres-v0.5.3
-[0.5.2]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.5.1...deadpool-postgres-v0.5.2
-[0.5.1]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.5.0...deadpool-postgres-v0.5.1
-[0.5.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.4.3...deadpool-postgres-v0.5.0
-[0.4.3]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.4.2...deadpool-postgres-v0.4.3
-[0.4.2]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.4.1...deadpool-postgres-v0.4.2
-[0.4.1]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.4.0...deadpool-postgres-v0.4.1
-[0.4.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.3.0...deadpool-postgres-v0.4.0
-[0.3.0]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.2.3...deadpool-postgres-v0.3.0
-[0.2.3]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.2.2...deadpool-postgres-v0.2.3
-[0.2.2]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.2.1...deadpool-postgres-v0.2.2
-[0.2.1]: https://github.com/bikeshedder/deadpool/compare/deadpool-postgres-v0.2.0...deadpool-postgres-v0.2.1
-[0.2.0]: https://github.com/bikeshedder/deadpool/releases/tag/deadpool-postgres-v0.2.0
+[Unreleased]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.14.2...HEAD
+[0.14.2]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.14.1...deadpool-postgres-v0.14.2
+[0.14.1]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.14.0...deadpool-postgres-v0.14.1
+[0.14.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.13.2...deadpool-postgres-v0.14.0
+[0.13.2]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.13.1...deadpool-postgres-v0.13.2
+[0.13.1]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.13.0...deadpool-postgres-v0.13.1
+[0.13.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.12.1...deadpool-postgres-v0.13.0
+[0.12.1]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.12.0...deadpool-postgres-v0.12.1
+[0.12.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.11.0...deadpool-postgres-v0.12.0
+[0.11.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.10.5...deadpool-postgres-v0.11.0
+[0.10.5]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.10.4...deadpool-postgres-v0.10.5
+[0.10.4]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.10.3...deadpool-postgres-v0.10.4
+[0.10.3]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.10.2...deadpool-postgres-v0.10.3
+[0.10.2]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.10.1...deadpool-postgres-v0.10.2
+[0.10.1]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.10.0...deadpool-postgres-v0.10.1
+[0.10.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.9.0...deadpool-postgres-v0.10.0
+[0.9.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.8.1...deadpool-postgres-v0.9.0
+[0.8.1]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.8.0...deadpool-postgres-v0.8.1
+[0.8.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.7.0...deadpool-postgres-v0.8.0
+[0.7.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.6.0...deadpool-postgres-v0.7.0
+[0.6.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.5.6...deadpool-postgres-v0.6.0
+[0.5.6]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.5.5...deadpool-postgres-v0.5.6
+[0.5.5]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.5.4...deadpool-postgres-v0.5.5
+[0.5.4]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.5.3...deadpool-postgres-v0.5.4
+[0.5.3]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.5.2...deadpool-postgres-v0.5.3
+[0.5.2]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.5.1...deadpool-postgres-v0.5.2
+[0.5.1]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.5.0...deadpool-postgres-v0.5.1
+[0.5.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.4.3...deadpool-postgres-v0.5.0
+[0.4.3]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.4.2...deadpool-postgres-v0.4.3
+[0.4.2]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.4.1...deadpool-postgres-v0.4.2
+[0.4.1]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.4.0...deadpool-postgres-v0.4.1
+[0.4.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.3.0...deadpool-postgres-v0.4.0
+[0.3.0]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.2.3...deadpool-postgres-v0.3.0
+[0.2.3]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.2.2...deadpool-postgres-v0.2.3
+[0.2.2]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.2.1...deadpool-postgres-v0.2.2
+[0.2.1]: https://github.com/deadpool-rs/deadpool/compare/deadpool-postgres-v0.2.0...deadpool-postgres-v0.2.1
+[0.2.0]: https://github.com/deadpool-rs/deadpool/releases/tag/deadpool-postgres-v0.2.0

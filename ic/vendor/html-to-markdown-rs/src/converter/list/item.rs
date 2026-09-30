@@ -8,11 +8,12 @@
 
 use crate::converter::list::utils::add_list_leading_separator;
 use crate::converter::main_helpers::effective_max_depth;
+use crate::converter::main_helpers::strip_trailing_backslash_breaks;
 use crate::converter::main_helpers::tag_name_eq;
 use crate::converter::main_helpers::trim_trailing_whitespace;
 use crate::converter::utility::content::normalized_tag_name;
 use crate::converter::walk_node;
-use crate::options::ConversionOptions;
+use crate::options::{ConversionOptions, NewlineStyle};
 #[cfg(feature = "visitor")]
 use std::borrow::Cow;
 use tl;
@@ -35,7 +36,14 @@ pub fn handle_li(
     depth: usize,
     dom_ctx: &DomContext,
 ) {
-    if ctx.list_depth > 0 {
+    // ~keep A nested list whose enclosing <li> has no other content renders directly after
+    // ~keep that parent's own bare marker on the SAME physical line (see
+    // ~keep `add_list_leading_separator`'s bare-marker exclusion) -- the parent marker's own
+    // ~keep printed width already reaches this item's target column, so pushing this
+    // ~keep indent too double-counts it, deeply nesting single-child lists into runaway
+    // ~keep padding that reparses as an indented code block (spec example 299). The indent is
+    // ~keep only needed when this item genuinely starts a fresh physical line.
+    if ctx.list_depth > 0 && (output.is_empty() || output.ends_with('\n')) {
         let indent = match options.list_indent_type {
             crate::options::ListIndentType::Tabs => "\t".repeat(ctx.list_depth),
             // ~keep `list_indent_columns` is the cumulative width of every ancestor <li>'s own
@@ -239,7 +247,7 @@ pub fn handle_li(
             // ~keep with zero separator. Reuse the same leading-separator helper used before
             // ~keep the enclosing <ul>/<ol> opens so consecutive items get the identical
             // ~keep <br> boundary already established for <p>/<div> siblings in a cell.
-            add_list_leading_separator(output, ctx);
+            add_list_leading_separator(output, ctx, options);
         } else if ctx.in_ordered_list {
             use std::fmt::Write;
             let _ = write!(output, "{}. ", ctx.list_counter);
@@ -275,6 +283,14 @@ pub fn handle_li(
         }
 
         trim_trailing_whitespace(output);
+
+        if options.newline_style == NewlineStyle::Backslash {
+            // ~keep A trailing <br> run with no following sibling has no next dispatch to
+            // ~keep catch it in `walk_node`'s pre-block-dispatch strip, since the item's own
+            // ~keep content is simply finished here — so this closes its own trailing run the
+            // ~keep same way `paragraph.rs` closes its own (issue #464 follow-up).
+            strip_trailing_backslash_breaks(output, item_start_pos);
+        }
 
         if !ctx.in_table_cell {
             if let Some(ref sc) = ctx.structure_collector {

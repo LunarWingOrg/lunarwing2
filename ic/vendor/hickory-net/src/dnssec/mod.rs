@@ -40,7 +40,10 @@ use crate::{
         op::{
             DnsRequest, DnsRequestOptions, DnsResponse, Edns, Message, OpCode, Query, ResponseCode,
         },
-        rr::{Name, RData, Record, RecordRef, RecordSet, RecordSetParts, RecordType, SerialNumber},
+        rr::{
+            LowerName, Name, RData, Record, RecordRef, RecordSet, RecordSetParts, RecordType,
+            SerialNumber,
+        },
     },
     runtime::{RuntimeProvider, Time},
     xfer::{FirstAnswer, dns_handle::DnsHandle},
@@ -50,7 +53,7 @@ mod error;
 pub use error::{ProofError, ProofErrorKind};
 
 mod nsec3;
-use nsec3::verify_nsec3;
+use nsec3::{verify_nsec3, verify_nsec3_insecure_delegation};
 
 /// Performs DNSSEC validation of all DNS responses from the wrapped DnsHandle
 ///
@@ -167,6 +170,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             // DNSSEC handler chain can validate negative responses.
             Err(NetError::Dns(DnsError::NoRecordsFound(NoRecords {
                 query,
+                soa,
                 authorities,
                 response_code,
                 ..
@@ -182,6 +186,16 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                     }
                 }
 
+                // Make sure we preserve the SOA record. It is not obvious whether we need this;
+                // most callers should preserve it, but not every caller might.
+                // TODO: be more principled about how this is handled.
+                if let Some(soa) = soa {
+                    let soa = soa.into_record_of_rdata();
+                    if !msg.authorities.iter().any(|r| r == &soa) {
+                        msg.add_authority(soa);
+                    }
+                }
+
                 match DnsResponse::from_message(msg.into_response()) {
                     Ok(response) => response,
                     Err(err) => {
@@ -193,6 +207,31 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             }
             Err(err) => return Err(err),
         };
+
+        // Reject foreign-class records in answers/authorities/additionals.
+        // We only issue IN-class queries.
+        for record in message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+        {
+            if record.dns_class == query.query_class {
+                continue;
+            }
+            error!(
+                %query,
+                record_name = %record.name,
+                record_class = %record.dns_class,
+                record_type = %record.record_type(),
+                "rejecting response: record class does not match query class",
+            );
+            return Err(NetError::ForeignClassRecord {
+                record_name: record.name.clone(),
+                record_class: record.dns_class,
+                record_type: record.record_type(),
+            });
+        }
 
         debug!(
             "validating message_response: {}, with {} trust_anchors",
@@ -245,11 +284,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             .authorities
             .iter()
             .filter_map(|rr| {
-                if message
-                    .authorities
-                    .iter()
-                    .any(|r| r.name == rr.name && r.proof == Proof::Secure)
-                {
+                if rr.proof == Proof::Secure {
                     match &rr.data {
                         RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some((&rr.name, nsec3)),
                         _ => None,
@@ -264,11 +299,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             .authorities
             .iter()
             .filter_map(|rr| {
-                if message
-                    .authorities
-                    .iter()
-                    .any(|r| r.name == rr.name && r.proof == Proof::Secure)
-                {
+                if rr.proof == Proof::Secure {
                     match &rr.data {
                         RData::DNSSEC(DNSSECRData::NSEC(nsec)) => Some((&rr.name, nsec)),
                         _ => None,
@@ -310,8 +341,13 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                 Proof::Bogus
             }
             (false, false, false) => {
-                // Return Ok if there were no NSEC/NSEC3 records and no wildcard RRSIGs.
-                if !message.answers.is_empty() {
+                // Return Ok if this is a valid positive response with no NSEC/NSEC3 records and no
+                // wildcard RRSIGs.
+                if message.answers.iter().any(|record| {
+                    record.name == query.name
+                        && (record.record_type() == RecordType::CNAME
+                            || record.record_type() == query.query_type)
+                }) {
                     return Ok(message);
                 }
 
@@ -379,7 +415,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                 // TODO: is there a cleaner way to prevent cycles in the evaluations?
                 (self.request_depth <= 1 || matches!(
                     rr.record_type(),
-                    RecordType::DNSKEY | RecordType::DS | RecordType::NSEC | RecordType::NSEC3,
+                    RecordType::DNSKEY | RecordType::DS | RecordType::NSEC | RecordType::NSEC3 | RecordType::SOA,
                 ))
             })
             .map(|rr| (rr.name.clone(), rr.record_type()))
@@ -419,7 +455,6 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             rrset.set_records(current_rrset);
             rrset.set_rrsigs(current_rrsigs);
 
-            // TODO: support non-IN classes?
             debug!(
                 "verifying: {name} record_type: {record_type}, rrsigs: {rrsig_len}",
                 rrsig_len = rrsigs.len()
@@ -573,16 +608,17 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             Vec::<(Proof, Option<u32>, Option<usize>)>::with_capacity(rrset.records_count());
         dnskey_proofs.resize(rrset.records_count(), (Proof::Bogus, None, None));
 
-        // check if the DNSKEYs are in the root store
+        // Check if the DNSKEYs are in the trust anchors.
         for (r, proof) in rrset.records(false).zip(dnskey_proofs.iter_mut()) {
             let Some(dnskey) = r.try_borrow::<DNSKEY>() else {
                 continue;
             };
 
-            proof.0 = self.is_dnskey_in_root_store(&dnskey);
+            proof.0 = self.is_dnskey_in_root_store(&dnskey, &rrset.name().into());
         }
 
-        // if not all of the DNSKEYs are in the root store, then we need to look for DS records to verify
+        // If not all DNSKEYs are trust anchors, and this isn't the root DNSKEY RRset, then we
+        // should look for DS records to possibly verify more keys.
         let ds_records =
             if !dnskey_proofs.iter().all(|p| p.0.is_secure()) && !rrset.name().is_root() {
                 // Need to get DS records for each DNSKEY.
@@ -810,17 +846,107 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                     .iter()
                     .any(|r| r.record_type() == RecordType::DS)
                 {
+                    // Per RFC 6840 section 4.4, beyond checking the proof of nonexistence of a DS
+                    // record at this name, we also need to check for proof that there is an NS
+                    // record, or could be an NS record, at this name.
+
+                    // Case 1: Matching NSEC record exists that proves NS is present and DS is not
+                    // present. This is definitively an insecure delegation.
+                    if response.authorities.iter().any(|record| {
+                        if record.proof != Proof::Secure {
+                            return false;
+                        }
+                        let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &record.data else {
+                            return false;
+                        };
+                        record.name == zone
+                            && nsec.type_set().contains(RecordType::NS)
+                            && !nsec.type_set().contains(RecordType::DS)
+                            && !nsec.type_set().contains(RecordType::SOA)
+                    }) {
+                        debug!(
+                            %zone,
+                            "marking zone as insecure based on secure NSEC proof",
+                        );
+                        return Err(ProofError::new(
+                            Proof::Insecure,
+                            ProofErrorKind::DsResponseInsecure { name: zone },
+                        ));
+                    }
+
+                    // Gather NSEC3 records.
+                    let nsec3s = response
+                        .authorities
+                        .iter()
+                        .filter_map(|record| {
+                            if record.proof != Proof::Secure {
+                                return None;
+                            }
+
+                            let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &record.data else {
+                                return None;
+                            };
+
+                            Some((&record.name, nsec3))
+                        })
+                        .collect::<Vec<_>>();
+
+                    // Case 2: Matching NSEC3 record exists that proves NS is present and DS is not
+                    // present. This is definitively an insecure delegation.
+                    //
+                    // Case 3: There is an NSEC3 record that covers the name and has the opt-out bit
+                    // set. There could be an insecure delegation at this name, but there is no way
+                    // to know for certain due to the use of the opt-out flag.
+                    if !nsec3s.is_empty() && verify_nsec3_insecure_delegation(&zone, &nsec3s) {
+                        debug!(
+                            %zone,
+                            "marking zone as insecure based on secure NSEC3 proof",
+                        );
+                        return Err(ProofError::new(
+                            Proof::Insecure,
+                            ProofErrorKind::DsResponseInsecure { name: zone },
+                        ));
+                    }
+
+                    // Case 4: There is an insecure delegation further up the tree.
+                    //
+                    // We check that parent zone is insecure by looking for at least one `Proof::Insecure`
+                    // attached to a record with name that is at or above the child zone. Most servers
+                    // will include an SOA record in NODATA responses, so we should see an insecure
+                    // proof on at least that record.
+                    if response
+                        .all_sections()
+                        .any(|r| r.name.zone_of(&zone) && r.proof == Proof::Insecure)
+                    {
+                        debug!(
+                            %zone,
+                            "marking zone as insecure based on insecure parent zone",
+                        );
+                        return Err(ProofError::new(
+                            Proof::Insecure,
+                            ProofErrorKind::DsResponseInsecure { name: zone },
+                        ));
+                    }
+
                     debug!(
                         %zone,
-                        "marking zone as insecure based on secure NSEC/NSEC3 proof or insecure parent zone",
+                        "could not prove insecure delegation",
                     );
                     return Err(ProofError::new(
-                        Proof::Insecure,
-                        ProofErrorKind::DsResponseInsecure { name: zone },
+                        Proof::Bogus,
+                        ProofErrorKind::DsRecordShouldExist { name: zone },
                     ));
                 }
             }
-            Err(_) => {}
+            Err(net) => {
+                return Err(ProofError::new(
+                    Proof::Bogus,
+                    ProofErrorKind::Net {
+                        query: Query::query(zone.clone(), RecordType::DS),
+                        net,
+                    },
+                ));
+            }
         }
 
         Err(ProofError::ds_should_exist(zone))
@@ -831,12 +957,12 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
     /// # Returns
     ///
     /// Proof::Secure if registered in the root store, Proof::Bogus if not
-    fn is_dnskey_in_root_store(&self, rr: &RecordRef<'_, DNSKEY>) -> Proof {
+    fn is_dnskey_in_root_store(&self, rr: &RecordRef<'_, DNSKEY>, name: &LowerName) -> Proof {
         let dns_key = rr.data();
         let pub_key = dns_key.public_key();
 
         // Checks to see if the key is valid against the registered root certificates
-        if self.trust_anchor.contains(pub_key) {
+        if self.trust_anchor.contains_with_name(pub_key, name) {
             debug!(
                 "validated dnskey with trust_anchor: {}, {dns_key}",
                 rr.name(),
@@ -926,15 +1052,24 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             .enumerate()
             .filter_map(|(i, rrsig)| {
                 let rrsig = rrsig.try_borrow::<RRSIG>()?;
-                let query =
-                    Query::query(rrsig.data().input().signer_name.clone(), RecordType::DNSKEY);
-
                 if i > MAX_RRSIGS_PER_RRSET {
                     warn!("too many ({i}) RRSIGs for rrset {rrset:?}; skipping");
                     return None;
                 }
 
-                // TODO: Should this sig.signer_name should be confirmed to be in the same zone as the rrsigs and rrset?
+                // RFC 4035 §5.3.1: signer must be an ancestor of (or equal to) the RRset owner
+                if !rrsig.data().input().signer_name.zone_of(rrset.name()) {
+                    warn!(
+                        signer_name = %rrsig.data().input().signer_name,
+                        rrset_name = %rrset.name(),
+                        "RRSIG signer name is not in the same zone as the RRset; skipping",
+                    );
+                    return None;
+                }
+
+                let query =
+                    Query::query(rrsig.data().input().signer_name.clone(), RecordType::DNSKEY);
+
                 // Break verification cycle
                 if query.name() == original_query.name()
                     && query.query_type() == original_query.query_type()
@@ -954,14 +1089,23 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                         .first_answer()
                         .map(move |result| match result {
                             Ok(message) => {
-                                Ok(
-                                    verify_rrsig_with_keys(message, &rrsig, rrset, *current_time)
-                                        .map(|(proof, adjusted_ttl)| RrsetProof {
-                                            proof,
-                                            adjusted_ttl,
-                                            rrsig_index: Some(i),
-                                        }),
-                                )
+                                // Report a failed signature as an error, so that select_ok()
+                                // below tries the remaining RRSIGs.
+                                match verify_rrsig_with_keys(message, &rrsig, rrset, *current_time)
+                                {
+                                    Some((proof, adjusted_ttl)) => Ok(RrsetProof {
+                                        proof,
+                                        adjusted_ttl,
+                                        rrsig_index: Some(i),
+                                    }),
+                                    None => Err(ProofError::new(
+                                        Proof::Bogus,
+                                        ProofErrorKind::RrsigsUnverified {
+                                            name: rrset.name().clone(),
+                                            record_type: rrset.record_type(),
+                                        },
+                                    )),
+                                }
                             }
                             Err(net) => Err(ProofError::new(
                                 Proof::Bogus,
@@ -984,19 +1128,10 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         }
 
         // as long as any of the verifications is good, then the RRSET is valid.
-        let select = future::select_ok(verifications);
-
-        // this will return either a good result or the errors
-        let (proof, rest) = select.await?;
+        let (proof, rest) = future::select_ok(verifications).await?;
         drop(rest);
 
-        proof.ok_or_else(||
-            // we are in a bogus state, DS records were available (see beginning of function), but RRSIGs couldn't be verified
-            ProofError::new(Proof::Bogus, ProofErrorKind::RrsigsUnverified {
-                name: rrset.name().clone(),
-                record_type: rrset.record_type(),
-            }
-        ))
+        Ok(proof)
     }
 
     /// An internal function used to clone the handle, but maintain some information back to the
@@ -1084,6 +1219,16 @@ fn verify_rrsig_with_keys(
         );
         return None;
     }
+    if rrset.record_type() == RecordType::NSEC3
+        && rrset.name().base_name() != rrsig.data().input().signer_name
+    {
+        warn!(
+            name = %rrset.name(),
+            signer_name = %rrsig.data().input().signer_name,
+            "NSEC3 record name is malformed"
+        );
+        return None;
+    }
 
     // DNSKEYs were already validated by the inner query in the above lookup
     let dnskeys = dnskey_message.answers.iter().filter_map(|r| {
@@ -1144,7 +1289,7 @@ fn verify_rrsig_with_keys(
 /// Expansion, RFC 5155 B.3 - Referral to an Opt-Out Unsigned Zone, and B.4 - Wildcard Expansion.
 fn find_soa_name(verified_message: &DnsResponse) -> Option<&Name> {
     for record in &verified_message.authorities {
-        if record.record_type() == RecordType::SOA {
+        if record.record_type() == RecordType::SOA && record.proof == Proof::Secure {
             return Some(&record.name);
         }
     }
@@ -1375,7 +1520,7 @@ impl RrsigValidity {
             rrsig.dns_class() == rrset.dns_class() &&
 
             // "The RRSIG RR's Signer's Name field MUST be the name of the zone that contains the RRset"
-            // TODO(^) the zone name is in the SOA record, which is not accessible from here
+            sig_input.signer_name.zone_of(rrset.name()) &&
 
             // "The RRSIG RR's Type Covered field MUST equal the RRset's type"
             sig_input.type_covered == rrset.record_type() &&
@@ -1437,7 +1582,7 @@ impl ValidationCache {
     fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(capacity))),
-            negative_ttl: None,
+            negative_ttl: Some(Duration::from_secs(1)..=BOGUS_CACHE_TTL),
             positive_ttl: None,
         }
     }
@@ -1532,12 +1677,18 @@ impl<'a> RrsetVerificationContext<'a> {
             rec.data.hash(&mut hasher);
         }
 
-        ValidationCacheKey(hasher.finish())
+        ValidationCacheKey(hasher.finish(), self.query.clone())
     }
 }
 
-#[derive(Hash, Eq, PartialEq)]
-struct ValidationCacheKey(u64);
+#[derive(Eq, PartialEq)]
+struct ValidationCacheKey(u64, Query);
+
+impl Hash for ValidationCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 /// Verifies NSEC records
 ///
@@ -1619,15 +1770,31 @@ fn verify_nsec(
         query.name().base_name()
     };
 
-    let have_answer = !answers.is_empty();
+    let have_answer = answers.iter().any(|record| {
+        record.name == query.name
+            && (record.record_type() == RecordType::CNAME
+                || record.record_type() == query.query_type)
+    });
 
     // For a no data response with a directly matching NSEC record, we just need to verify the NSEC
     // type set does not contain the query type or CNAME.
     if let Some((_, nsec_data)) = nsecs.iter().find(|(name, _)| query.name() == *name) {
-        return if nsec_data.type_set().contains(query.query_type())
-            || nsec_data.type_set().contains(RecordType::CNAME)
-        {
+        let types = nsec_data.type_set();
+        return if types.contains(query.query_type()) || types.contains(RecordType::CNAME) {
             nsec1_yield(Proof::Bogus, "direct match, record type should be present")
+        } else if query.query_type() != RecordType::DS && nsec_data.is_ancestor_delegation() {
+            // RFC 6840 §4.1: a parent-side NSEC at the cut only authenticates the
+            // absence of DS at that owner; it cannot deny other types there.
+            nsec1_yield(Proof::Bogus, "direct match is an ancestor-delegation NSEC")
+        } else if query.query_type == RecordType::DS
+            && nsec_data.type_set().contains(RecordType::SOA)
+        {
+            // RFC 4035 §5.2: "A security-aware resolver MUST use the parent NSEC RR when attempting
+            // to prove that a DS RRset does not exist."
+            nsec1_yield(
+                Proof::Bogus,
+                "direct match for DS query is an NSEC record from the child side of the zone cut",
+            )
         } else if response_code == ResponseCode::NoError && !have_answer {
             nsec1_yield(Proof::Secure, "direct match")
         } else {
@@ -1639,7 +1806,7 @@ fn verify_nsec(
     }
 
     let Some((covering_nsec_name, covering_nsec_data)) =
-        find_nsec_covering_record(soa_name, query.name(), nsecs)
+        find_nsec_covering_record(query.name(), nsecs)
     else {
         return nsec1_yield(
             Proof::Bogus,
@@ -1647,13 +1814,28 @@ fn verify_nsec(
         );
     };
 
+    // RFC 4035 §3.1.3.2 / §5.4 / RFC 8020 §3.1: a next-domain below the
+    // query name puts the query name on the path from owner to next, so
+    // it exists as an empty non-terminal. NODATA is correct, NXDOMAIN
+    // contradicts the proof. Skip the wrap-around NSEC (next is the
+    // apex) and wildcard expansion (have_answer needs the full
+    // closest-encloser proof).
+    let covering_next = covering_nsec_data.next_domain_name();
+    if !have_answer && Some(covering_next) != soa_name && query.name.zone_of(covering_next) {
+        return if response_code == ResponseCode::NXDomain {
+            nsec1_yield(Proof::Bogus, "NXDOMAIN at proven empty non-terminal")
+        } else {
+            nsec1_yield(Proof::Secure, "empty non-terminal NODATA")
+        };
+    }
+
     // Identify the names that exist (including names of empty non terminals) that are parents of
     // the query name. Pick the longest such name, because wildcard synthesis would start looking
     // for a wildcard record there.
     for seed_name in [covering_nsec_name, covering_nsec_data.next_domain_name()] {
         let mut candidate_name = seed_name.clone();
         while candidate_name.num_labels() > next_closest_encloser.num_labels() {
-            if candidate_name.zone_of(query.name()) {
+            if &candidate_name != query.name() && candidate_name.zone_of(query.name()) {
                 next_closest_encloser = candidate_name;
                 break;
             }
@@ -1719,7 +1901,7 @@ fn verify_nsec(
             .map(|(name, _)| (*name).clone())
     };
 
-    match find_nsec_covering_record(soa_name, &wildcard_name, nsecs) {
+    match find_nsec_covering_record(&wildcard_name, nsecs) {
         // For NXDomain responses, we've already proved the record does not exist. Now we just need to prove
         // the wildcard name is covered.
         Some((_, _)) if response_code == ResponseCode::NXDomain && !have_answer => {
@@ -1736,7 +1918,7 @@ fn verify_nsec(
                     nsecs,
                     wildcard_base_name.as_ref(),
                 )
-                && find_nsec_covering_record(soa_name, query.name(), nsecs).is_some() =>
+                && find_nsec_covering_record(query.name(), nsecs).is_some() =>
         {
             nsec1_yield(
                 Proof::Secure,
@@ -1805,7 +1987,7 @@ fn no_closer_matches(
             return false;
         };
 
-        if find_nsec_covering_record(soa, &wildcard, nsecs).is_none() {
+        if find_nsec_covering_record(&wildcard, nsecs).is_none() {
             debug!(%wildcard, %name, ?nsecs, "covering record does not exist for name");
             return false;
         }
@@ -1817,16 +1999,25 @@ fn no_closer_matches(
 }
 
 /// Find the NSEC record covering `test_name`, if any.
+///
+/// A zone-wrap NSEC (the last record in the zone) is detected by checking
+/// that `next_domain_name <= nsec_name`, which is an intrinsic property of
+/// the NSEC chain and does not depend on the SOA owner name.
 fn find_nsec_covering_record<'a>(
-    soa_name: Option<&Name>,
     test_name: &Name,
     nsecs: &[(&'a Name, &'a NSEC)],
 ) -> Option<(&'a Name, &'a NSEC)> {
     nsecs.iter().copied().find(|(nsec_name, nsec_data)| {
-        let next_domain_name = nsec_data.next_domain_name();
+        // RFC 6840 §4.1: a parent-side NSEC at the cut MUST NOT be used to
+        // assume nonexistence of any name below the cut.
+        if nsec_data.is_ancestor_delegation() && nsec_name.zone_of(test_name) {
+            return false;
+        }
 
+        let next_domain_name = nsec_data.next_domain_name();
         test_name > nsec_name
-            && (test_name < next_domain_name || Some(next_domain_name) == soa_name)
+            && (test_name < next_domain_name
+                || next_domain_name <= nsec_name && next_domain_name.zone_of(test_name))
     })
 }
 
@@ -1843,6 +2034,12 @@ pub(super) fn proof_log_yield(
     );
     proof
 }
+
+/// Maximum cache lifetime for an RRset with BOGUS validation.
+///
+/// RFC 4035 §4.7 requires implementations to assign a small TTL since the wire TTL
+/// is attacker-influenced and RFC 9520 §3.2 caps cached resolution failures at 300s.
+pub const BOGUS_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// The maximum number of key tag collisions to accept when:
 ///
@@ -1861,19 +2058,30 @@ const DEFAULT_VALIDATION_CACHE_SIZE: usize = 1_048_576;
 
 #[cfg(test)]
 mod test {
-    use super::{no_closer_matches, verify_nsec};
+    use std::{
+        net::Ipv4Addr,
+        time::{Duration, Instant},
+    };
+
+    use super::{RrsigValidity, find_nsec_covering_record, no_closer_matches, verify_nsec};
     use crate::{
-        dnssec::Proof,
+        dnssec::{
+            DnsRequestOptions, Proof, ProofError, ProofErrorKind, RrsetVerificationContext,
+            ValidationCache,
+        },
         proto::{
             ProtoError,
             dnssec::{
-                Algorithm,
-                rdata::{DNSSECRData, NSEC as rdataNSEC, RRSIG as rdataRRSIG, SigInput},
+                Algorithm, PublicKeyBuf,
+                rdata::{
+                    DNSKEY as rdataDNSKEY, DNSSECRData, NSEC as rdataNSEC, RRSIG as rdataRRSIG,
+                    SigInput,
+                },
             },
             op::{Query, ResponseCode},
             rr::{
-                Name, RData, Record,
-                RecordType::{A, AAAA, DNSKEY, MX, NS, NSEC, RRSIG, SOA, TXT},
+                Name, RData, Record, RecordSet,
+                RecordType::{A, AAAA, DNSKEY, DS, MX, NS, NSEC, RRSIG, SOA, TXT},
                 SerialNumber, rdata,
             },
         },
@@ -2089,6 +2297,305 @@ mod test {
                 ],
             ),
             Proof::Bogus
+        );
+
+        Ok(())
+    }
+
+    // RFC 6840 §4.1: an ancestor-delegation NSEC at a zone cut (parent-side, with NS set
+    // and SOA clear) MUST NOT be used to prove nonexistence of any name strictly below
+    // that cut. The signer is the parent and the only authenticated denial it can carry is
+    // for DS at the cut owner itself.
+    #[test]
+    fn nsec_invalid_ancestor_delegation_nxdomain() -> Result<(), ProtoError> {
+        subscribe();
+
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("www.deleg.")?, A),
+                Some(&Name::root()),
+                ResponseCode::NXDomain,
+                &[],
+                &[
+                    // Parent-side ancestor-delegation NSEC at the zone cut.
+                    (
+                        &Name::from_ascii("deleg.")?,
+                        &rdataNSEC::new(Name::from_ascii("honest.")?, [NS, DS, RRSIG, NSEC],),
+                    ),
+                    // Root NSEC covering `*.` (the slot where a wildcard at the
+                    // root would live), used here to attempt to prove that no
+                    // wildcard at the parent could synthesize the answer.
+                    (
+                        &Name::root(),
+                        &rdataNSEC::new(
+                            Name::from_ascii("deleg.")?,
+                            [NS, SOA, RRSIG, NSEC, DNSKEY],
+                        ),
+                    ),
+                ],
+            ),
+            Proof::Bogus
+        );
+
+        // NODATA at the cut owner itself: the same parent-side NSEC must not
+        // authenticate the absence of any type other than DS at `deleg.`.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("deleg.")?, A),
+                Some(&Name::root()),
+                ResponseCode::NoError,
+                &[],
+                &[(
+                    &Name::from_ascii("deleg.")?,
+                    &rdataNSEC::new(Name::from_ascii("honest.")?, [NS, DS, RRSIG, NSEC],),
+                )],
+            ),
+            Proof::Bogus
+        );
+
+        // RFC 6840 §4.1 exception: the parent-side NSEC at the cut DOES
+        // authenticate the absence of DS at the cut owner. This is the only
+        // legitimate use of this NSEC and must continue to validate.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("insecure-deleg.")?, DS),
+                Some(&Name::root()),
+                ResponseCode::NoError,
+                &[],
+                &[(
+                    &Name::from_ascii("insecure-deleg.")?,
+                    &rdataNSEC::new(Name::from_ascii("next.")?, [NS, RRSIG, NSEC],),
+                )],
+            ),
+            Proof::Secure
+        );
+
+        Ok(())
+    }
+
+    // RFC 4035 §3.1.3.2 / §5.4 / RFC 8020 §3.1: an NSEC whose Next Domain
+    // Name is a strict descendant of the query name proves that the query
+    // name exists as an empty non-terminal (ENT). Such an NSEC must not
+    // authenticate NXDOMAIN at the query name. The correct rcode is
+    // NOERROR/NODATA.
+    #[test]
+    fn nsec_invalid_empty_non_terminal_nxdomain() -> Result<(), ProtoError> {
+        subscribe();
+
+        // Single-label ENT covered by the apex NSEC.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("b.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[(
+                    &Name::from_ascii("poc.")?,
+                    &rdataNSEC::new(
+                        Name::from_ascii("a.b.poc.")?,
+                        [NS, SOA, TXT, RRSIG, NSEC, DNSKEY],
+                    ),
+                )],
+            ),
+            Proof::Bogus
+        );
+
+        // Deeper ENT covered by a mid-zone NSEC.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("y.z.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[(
+                    &Name::from_ascii("z.poc.")?,
+                    &rdataNSEC::new(Name::from_ascii("x.y.z.poc.")?, [TXT, RRSIG, NSEC],),
+                )],
+            ),
+            Proof::Bogus
+        );
+
+        // Single-label ENT covered by a non-apex NSEC.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("b.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[(
+                    &Name::from_ascii("a.poc.")?,
+                    &rdataNSEC::new(Name::from_ascii("c.b.poc.")?, [TXT, RRSIG, NSEC],),
+                )],
+            ),
+            Proof::Bogus
+        );
+
+        // Same proof shape with rcode=NoError is the legitimate ENT NODATA
+        // response per RFC 8020 §3.1 and must validate.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("b.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NoError,
+                &[],
+                &[(
+                    &Name::from_ascii("poc.")?,
+                    &rdataNSEC::new(
+                        Name::from_ascii("a.b.poc.")?,
+                        [NS, SOA, TXT, RRSIG, NSEC, DNSKEY],
+                    ),
+                )],
+            ),
+            Proof::Secure
+        );
+
+        // Deeper ENT NODATA companion.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("y.z.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NoError,
+                &[],
+                &[(
+                    &Name::from_ascii("z.poc.")?,
+                    &rdataNSEC::new(Name::from_ascii("x.y.z.poc.")?, [TXT, RRSIG, NSEC],),
+                )],
+            ),
+            Proof::Secure
+        );
+
+        // True NXDOMAIN with a sibling next-domain must remain Secure.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("b.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[
+                    (
+                        &Name::from_ascii("a.poc.")?,
+                        &rdataNSEC::new(Name::from_ascii("c.poc.")?, [TXT, RRSIG, NSEC],),
+                    ),
+                    // Apex NSEC covering `*.poc.` to rule out a wildcard.
+                    (
+                        &Name::from_ascii("poc.")?,
+                        &rdataNSEC::new(
+                            Name::from_ascii("a.poc.")?,
+                            [NS, SOA, RRSIG, NSEC, DNSKEY],
+                        ),
+                    ),
+                ],
+            ),
+            Proof::Secure
+        );
+
+        // Ancestor-delegation NSEC (NS set, SOA clear) at `a.poc.` marks an
+        // insecure delegation at a sibling of the ENT. Its signer is the
+        // parent zone `poc.`, and a next-domain of `c.b.poc.` proves that
+        // `b.poc.` exists as an ENT in `poc.`. RFC 6840 §4.1 only forbids
+        // using this NSEC to deny names below the cut at `a.poc.`; using it
+        // to prove ENT existence at the sibling `b.poc.` is legitimate.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("b.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NoError,
+                &[],
+                &[(
+                    &Name::from_ascii("a.poc.")?,
+                    &rdataNSEC::new(Name::from_ascii("c.b.poc.")?, [NS, RRSIG, NSEC],),
+                )],
+            ),
+            Proof::Secure
+        );
+
+        // Same shape under NXDOMAIN: the rcode contradicts the proof that
+        // `b.poc.` exists, so the validator must reject as Bogus regardless
+        // of the covering NSEC's ancestor-delegation flag.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("b.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[(
+                    &Name::from_ascii("a.poc.")?,
+                    &rdataNSEC::new(Name::from_ascii("c.b.poc.")?, [NS, RRSIG, NSEC],),
+                )],
+            ),
+            Proof::Bogus
+        );
+
+        // A NoError response with answer records must not short-circuit to
+        // Secure based on an ENT-shaped NSEC alone. Wildcard expansion
+        // requires the full closest-encloser proof.
+        let input = SigInput {
+            type_covered: TXT,
+            algorithm: Algorithm::ED25519,
+            num_labels: 2,
+            original_ttl: 3600,
+            sig_expiration: SerialNumber::new(0),
+            sig_inception: SerialNumber::new(0),
+            key_tag: 0,
+            signer_name: Name::root(),
+        };
+        let rrsig = rdataRRSIG::from_sig(input, vec![]);
+        let mut rrsig_record = Record::from_rdata(
+            Name::from_ascii("b.poc.")?,
+            3600,
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+        );
+        rrsig_record.proof = Proof::Secure;
+        let answers = [
+            Record::from_rdata(
+                Name::from_ascii("b.poc.")?,
+                3600,
+                RData::TXT(rdata::TXT::new(vec!["forged".to_string()])),
+            ),
+            rrsig_record,
+        ];
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("b.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NoError,
+                &answers,
+                &[(
+                    &Name::from_ascii("poc.")?,
+                    &rdataNSEC::new(
+                        Name::from_ascii("a.b.poc.")?,
+                        [NS, SOA, TXT, RRSIG, NSEC, DNSKEY],
+                    ),
+                )],
+            ),
+            Proof::Bogus
+        );
+
+        // Wrap-around NSEC where next-domain is the SOA owner. The SOA is
+        // an ancestor of every name in the zone, so this case must be
+        // excluded from the ENT check.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("zzz.poc.")?, TXT),
+                Some(&Name::from_ascii("poc.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[
+                    (
+                        &Name::from_ascii("last.poc.")?,
+                        &rdataNSEC::new(Name::from_ascii("poc.")?, [TXT, RRSIG, NSEC],),
+                    ),
+                    // Apex NSEC covering `*.poc.` to rule out a wildcard.
+                    (
+                        &Name::from_ascii("poc.")?,
+                        &rdataNSEC::new(
+                            Name::from_ascii("a.poc.")?,
+                            [NS, SOA, RRSIG, NSEC, DNSKEY],
+                        ),
+                    ),
+                ],
+            ),
+            Proof::Secure
         );
 
         Ok(())
@@ -2477,5 +2984,361 @@ mod test {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn rrsig_off_tree_signer_rejected() {
+        subscribe();
+        let (rrset, rrsig_rec, dnskey_rec) =
+            make_rrsig_check_inputs("www.victim.hack.", "evil.hack.");
+        let rrsig_ref = rrsig_rec.try_borrow::<rdataRRSIG>().unwrap();
+        let dnskey_ref = dnskey_rec.try_borrow::<rdataDNSKEY>().unwrap();
+        assert!(matches!(
+            RrsigValidity::check(rrsig_ref, &rrset, dnskey_ref, 1000),
+            RrsigValidity::WrongRrsig
+        ));
+    }
+
+    #[test]
+    fn rrsig_zone_signer_accepted() {
+        subscribe();
+        let (rrset, rrsig_rec, dnskey_rec) =
+            make_rrsig_check_inputs("www.victim.hack.", "victim.hack.");
+        let rrsig_ref = rrsig_rec.try_borrow::<rdataRRSIG>().unwrap();
+        let dnskey_ref = dnskey_rec.try_borrow::<rdataDNSKEY>().unwrap();
+        assert!(matches!(
+            RrsigValidity::check(rrsig_ref, &rrset, dnskey_ref, 1000),
+            RrsigValidity::ValidRrsig
+        ));
+    }
+
+    #[test]
+    fn rrsig_apex_self_signed_accepted() {
+        subscribe();
+        let (rrset, rrsig_rec, dnskey_rec) =
+            make_rrsig_check_inputs("victim.hack.", "victim.hack.");
+        let rrsig_ref = rrsig_rec.try_borrow::<rdataRRSIG>().unwrap();
+        let dnskey_ref = dnskey_rec.try_borrow::<rdataDNSKEY>().unwrap();
+        assert!(matches!(
+            RrsigValidity::check(rrsig_ref, &rrset, dnskey_ref, 1000),
+            RrsigValidity::ValidRrsig
+        ));
+    }
+
+    #[test]
+    fn rrsig_parent_signer_accepted() {
+        subscribe();
+        let (rrset, rrsig_rec, dnskey_rec) = make_rrsig_check_inputs("victim.hack.", "hack.");
+        let rrsig_ref = rrsig_rec.try_borrow::<rdataRRSIG>().unwrap();
+        let dnskey_ref = dnskey_rec.try_borrow::<rdataDNSKEY>().unwrap();
+        assert!(matches!(
+            RrsigValidity::check(rrsig_ref, &rrset, dnskey_ref, 1000),
+            RrsigValidity::ValidRrsig
+        ));
+    }
+
+    #[test]
+    fn rrsig_child_cannot_sign_parent() {
+        subscribe();
+        let (rrset, rrsig_rec, dnskey_rec) = make_rrsig_check_inputs("hack.", "victim.hack.");
+        let rrsig_ref = rrsig_rec.try_borrow::<rdataRRSIG>().unwrap();
+        let dnskey_ref = dnskey_rec.try_borrow::<rdataDNSKEY>().unwrap();
+        assert!(matches!(
+            RrsigValidity::check(rrsig_ref, &rrset, dnskey_ref, 1000),
+            RrsigValidity::WrongRrsig
+        ));
+    }
+
+    /// Build a matching (rrset, rrsig_record, dnskey_record) triplet for testing
+    /// `RrsigValidity::check()`. The RRSIG and DNSKEY have consistent key tags,
+    /// algorithms, and time windows so that only the signer-name/zone relationship
+    /// determines the outcome.
+    fn make_rrsig_check_inputs(rrset_name: &str, signer_name: &str) -> (RecordSet, Record, Record) {
+        let rrset_name = Name::from_ascii(rrset_name).unwrap();
+        let signer_name = Name::from_ascii(signer_name).unwrap();
+
+        let dnskey = rdataDNSKEY::new(
+            true,  // zone_key
+            true,  // secure_entry_point
+            false, // revoke
+            PublicKeyBuf::new(vec![0u8; 32], Algorithm::ED25519),
+        );
+        let key_tag = dnskey.calculate_key_tag().unwrap();
+
+        let sig_input = SigInput {
+            type_covered: A,
+            algorithm: Algorithm::ED25519,
+            num_labels: rrset_name.num_labels(),
+            original_ttl: 300,
+            sig_expiration: SerialNumber::new(1_000_000),
+            sig_inception: SerialNumber::new(0),
+            key_tag,
+            signer_name: signer_name.clone(),
+        };
+        let rrsig = rdataRRSIG::from_sig(sig_input, vec![0u8; 64]);
+
+        let rrset = RecordSet::new(rrset_name.clone(), A, 0);
+        let rrsig_record =
+            Record::from_rdata(rrset_name, 300, RData::DNSSEC(DNSSECRData::RRSIG(rrsig)));
+        let dnskey_record =
+            Record::from_rdata(signer_name, 300, RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)));
+
+        (rrset, rrsig_record, dnskey_record)
+    }
+
+    #[test]
+    fn validation_cache_clamps_bogus_ttl() {
+        // RFC 4035 §4.7:
+        //   Since RRsets that fail to validate do not have trustworthy TTLs,
+        //   the implementation MUST assign a TTL.  This TTL SHOULD be small,
+        //   in order to mitigate the effect of caching the results of an
+        //   attack.
+
+        let name = Name::from_ascii("bogus.example.").unwrap();
+        let query = Query::query(name.clone(), A);
+
+        let mut rrset = RecordSet::new(name.clone(), A, 0);
+        let record = Record::from_rdata(name, 3600, RData::A(rdata::A::new(10, 0, 0, 1)));
+        rrset.set_records(vec![record]);
+
+        let cx = RrsetVerificationContext {
+            query: &query,
+            rrset: &rrset,
+            options: DnsRequestOptions::default(),
+            current_time: 0,
+        };
+
+        let cache = ValidationCache::new(8);
+        let before = Instant::now();
+        cache.insert(
+            Err(ProofError::new(
+                Proof::Bogus,
+                ProofErrorKind::Msg("forced bogus".into()),
+            )),
+            cx.key(),
+            &cx,
+        );
+
+        let stored_until = cache
+            .inner
+            .lock()
+            .get_mut(&cx.key())
+            .expect("entry just inserted")
+            .0;
+        let lifetime = stored_until.duration_since(before);
+        assert!(
+            // RFC 4035 §3.2:
+            //   resolution failures MUST NOT be cached for longer than 5 minutes.
+            lifetime <= Duration::from_secs(60 * 5),
+            "Bogus validation cached for {lifetime:?}, must be <= 5m",
+        );
+    }
+
+    /// Zone-wrap NSEC detection uses the intrinsic `next <= owner` property
+    /// instead of relying on the SOA owner name.
+    #[test]
+    fn find_nsec_covering_record_zone_wrap() -> Result<(), ProtoError> {
+        // A zone-wrap NSEC: last record in the zone points back to the zone apex.
+        // `record.example. NSEC example.` covers everything > record.example.
+        let nsec_name = Name::from_ascii("record.example.")?;
+        let nsec_data = rdataNSEC::new(Name::from_ascii("example.")?, [A, NSEC, RRSIG]);
+        let nsecs = [(&nsec_name, &nsec_data)];
+
+        // A name canonically after the NSEC owner should be covered by the wrap.
+        let covered = Name::from_ascii("zzzz.example.")?;
+        assert!(find_nsec_covering_record(&covered, &nsecs).is_some());
+
+        // A name canonically before the NSEC owner should NOT be covered.
+        let not_covered = Name::from_ascii("aaa.example.")?;
+        assert!(find_nsec_covering_record(&not_covered, &nsecs).is_none());
+
+        Ok(())
+    }
+
+    /// Confirm that a wraparound NSEC record from a different zone won't be accepted as a covering
+    /// NSEC record.
+    #[test]
+    fn find_nsec_covering_record_unrelated_zone() -> Result<(), ProtoError> {
+        subscribe();
+        // A zone-wrap NSEC record from a different zone.
+        let nsecs = [(
+            &Name::from_ascii("record.aaaaaa.")?,
+            &rdataNSEC::new(Name::from_ascii("aaaaaa.")?, [A, NSEC, RRSIG]),
+        )];
+
+        // This should fail to find a covering record since the the NSEC record and the target name
+        // are in different zones.
+        assert_eq!(
+            find_nsec_covering_record(&Name::from_ascii("zzzz.example.")?, &nsecs),
+            None
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for forged-SOA NXDOMAIN attack.
+    ///
+    /// An attacker harvests a legitimate signed NSEC `a.zone. -> b.zone.` and
+    /// forges an unsigned SOA with owner `b.zone.` (the NSEC's next field).
+    /// The old code would treat the gap NSEC as the zone-wrap record because
+    /// `next == soa_name`, accepting the forged denial. The fix detects wrap
+    /// via `next <= owner` which is false for `b > a`, so the NSEC does NOT
+    /// cover the target and the proof must be Bogus.
+    #[test]
+    fn forged_soa_nxdomain_attack() -> Result<(), ProtoError> {
+        subscribe();
+
+        // Attacker-replayed NSEC: a.zone.test. -> b.zone.test.
+        // This is NOT a zone-wrap NSEC because b > a.
+        let nsec_name = Name::from_ascii("a.zone.test.")?;
+        let nsec_data = rdataNSEC::new(Name::from_ascii("b.zone.test.")?, [A, NSEC, RRSIG]);
+        let nsecs = [(&nsec_name, &nsec_data)];
+
+        // Target: target.zone.test. (canonically > b.zone.test.)
+        // The forged SOA has owner b.zone.test., so old code would match.
+        // With the fix, this NSEC does not cover the target.
+        let target = Name::from_ascii("target.zone.test.")?;
+        assert!(find_nsec_covering_record(&target, &nsecs).is_none());
+
+        // Full verify_nsec must also reject the forged denial.
+        // The attacker's forged SOA at b.zone.test. is not Proof::Secure,
+        // so find_soa_name won't return it. Even passing the forged SOA name
+        // directly, the proof should be Bogus.
+        assert_eq!(
+            verify_nsec(
+                &Query::query(Name::from_ascii("target.zone.test.")?, A),
+                Some(&Name::from_ascii("b.zone.test.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[(&nsec_name, &nsec_data)],
+            ),
+            Proof::Bogus
+        );
+
+        Ok(())
+    }
+
+    /// Ensure that the forged-SOA attack also fails for wildcard coverage.
+    #[test]
+    fn forged_soa_wildcard_attack() -> Result<(), ProtoError> {
+        subscribe();
+
+        // The attacker uses the same NSEC a.zone.test. -> b.zone.test. and
+        // a forged SOA at b.zone.test. to try to prove wildcard non-existence.
+        let nsec_name = Name::from_ascii("a.zone.test.")?;
+        let nsec_data = rdataNSEC::new(Name::from_ascii("b.zone.test.")?, [A, NSEC, RRSIG]);
+        let nsecs = [(&nsec_name, &nsec_data)];
+
+        // *.zone.test. is canonically > b.zone.test. so the old code would
+        // have treated the NSEC as covering it via the forged SOA match.
+        let wildcard = Name::from_ascii("*.zone.test.")?;
+        assert!(find_nsec_covering_record(&wildcard, &nsecs).is_none());
+
+        Ok(())
+    }
+
+    /// Regression test for GHSA-896p-wpw8-vf4r.
+    ///
+    /// This scenario involves a parent zone with a wildcard record, a child zone with a wildcard
+    /// record, and a network attacker that combines records retrieved from both name servers. The
+    /// response claims to be a wildcard expansion of the parent zone's wildcard record, for a query
+    /// that should instead have its response expanded from the child zone's wildcard record. It
+    /// includes the NSEC record from the parent that is at the delegation point to the child zone.
+    /// The issue was that the verifier accepted this NSEC record as a purported proof the child
+    /// zone's wildcard record doesn't exist, though it can't prove anything about names directly
+    /// descended from the delegation point.
+    ///
+    /// Parent zone:
+    ///
+    /// ```text
+    /// com. SOA ...
+    /// com. NS ...
+    /// com. NSEC *.com. NS SOA RRSIG NSEC
+    /// com. RRSIG SOA ...
+    /// com. RRSIG NS ...
+    /// com. RRSIG NSEC ...
+    /// *.com. A 192.0.2.1
+    /// *.com. NSEC example.com. A RRSIG NSEC
+    /// *.com. RRSIG A ...
+    /// *.com. RRSIG NSEC ...
+    /// example.com. NS ...
+    /// example.com. DS ...
+    /// example.com. NSEC foobar.com. NS DS RRSIG NSEC
+    /// example.com. RRSIG DS ...
+    /// example.com. RRSIG NSEC ...
+    /// foobar.com. NS ...
+    /// foobar.com. NSEC com. NS RRSIG NSEC
+    /// foobar.com. RRSIG NSEC ...
+    /// ```
+    ///
+    /// Child zone:
+    ///
+    /// ```text
+    /// example.com. SOA ...
+    /// example.com. NS ...
+    /// example.com. NSEC *.example.com. NS SOA RRSIG NSEC
+    /// example.com. RRSIG SOA ...
+    /// example.com. RRSIG NSEC ...
+    /// *.example.com. A 192.0.2.2
+    /// *.example.com. NSEC example.com. A RRSIG NSEC
+    /// *.example.com. RRSIG A ...
+    /// *.example.com. RRSIG NSEC ...
+    /// ```
+    #[test]
+    fn nsec_invalid_wildcard_expansion_parent_nsec_record() -> Result<(), ProtoError> {
+        subscribe();
+
+        let parent_zone = Name::parse("com.", None)?;
+        let child_zone = Name::parse("example.com.", None)?;
+        let qname = Name::parse("www.example.com.", None)?;
+        let query = Query::query(qname.clone(), A);
+        let answers = [
+            mark_secure(Record::from_rdata(
+                qname.clone(),
+                0,
+                RData::A(Ipv4Addr::new(192, 0, 2, 1).into()),
+            )),
+            mark_secure(Record::from_rdata(
+                qname.clone(),
+                0,
+                RData::DNSSEC(DNSSECRData::RRSIG(rdataRRSIG::from_sig(
+                    SigInput {
+                        type_covered: A,
+                        algorithm: Algorithm::ECDSAP256SHA256,
+                        num_labels: 1, // expanded from *.com.
+                        original_ttl: 0,
+                        sig_expiration: 0.into(),
+                        sig_inception: 0.into(),
+                        key_tag: 0,
+                        signer_name: parent_zone.clone(),
+                    },
+                    Vec::new(),
+                ))),
+            )),
+        ];
+        // Both of these NSEC records are taken from the parent zone.
+        let nsecs = [
+            // Matching record for com.
+            (
+                &parent_zone,
+                &rdataNSEC::new(Name::parse("*.com.", None)?, [NS, SOA, RRSIG, NSEC]),
+            ),
+            // Bogus proof of nonexistence of *.example.com.
+            (
+                &child_zone,
+                &rdataNSEC::new(Name::parse("foobar.com.", None)?, [NS, DS, RRSIG, NSEC]),
+            ),
+        ];
+
+        let result = verify_nsec(&query, None, ResponseCode::NoError, &answers, &nsecs);
+        assert_eq!(result, Proof::Bogus);
+
+        Ok(())
+    }
+
+    /// Set the proof on a record to Secure and return it.
+    fn mark_secure(mut record: Record) -> Record {
+        record.proof = Proof::Secure;
+        record
     }
 }

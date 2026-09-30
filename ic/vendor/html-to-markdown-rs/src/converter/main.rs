@@ -16,18 +16,19 @@ use std::collections::{BTreeMap, HashSet};
 use crate::converter::dom_context::DomContext;
 use crate::converter::main_helpers::{
     collapse_excess_blank_lines, effective_max_depth, extract_head_metadata, format_metadata_frontmatter,
-    has_custom_element_tags, repair_with_html5ever, trim_line_end_whitespace, trim_trailing_whitespace,
+    has_custom_element_tags, repair_with_html5ever, strip_trailing_backslash_breaks, trim_line_end_whitespace,
+    trim_trailing_whitespace,
 };
 use crate::converter::plain_text::extract_plain_text;
 use crate::converter::preprocessing_helpers::{has_inline_block_misnest, should_drop_for_preprocessing};
 use crate::converter::utility::caching::build_dom_context;
-use crate::converter::utility::content::normalized_tag_name;
+use crate::converter::utility::content::{is_block_level_element, normalized_tag_name};
 use crate::converter::utility::preprocessing::{
     normalize_bogus_comment_endings, normalize_split_closing_tags, normalize_unclosed_list_items, preprocess_html,
-    strip_hidden_elements, strip_script_and_style_tags,
+    strip_bogus_comments, strip_hidden_elements, strip_script_and_style_tags,
 };
 use crate::converter::utility::serialization::serialize_tag_to_html;
-use crate::options::OutputFormat;
+use crate::options::{NewlineStyle, OutputFormat};
 
 use crate::converter::handlers::{handle_blockquote, handle_code, handle_graphic, handle_img, handle_link, handle_pre};
 use crate::error::Result;
@@ -61,8 +62,14 @@ pub fn convert_html_impl(
     #[cfg(feature = "visitor")] visitor: Option<crate::visitor::VisitorHandle>,
     #[cfg(not(feature = "visitor"))] _visitor: Option<()>,
     structure_collector: Option<StructureCollectorHandle>,
+    base_url: Option<std::rc::Rc<url::Url>>,
 ) -> Result<ConversionOutput> {
     let stripped = strip_script_and_style_tags(html);
+    // ~keep Before anything else looks for tags: an HTML5 bogus comment (`<?php … ?>`,
+    // ~keep `<!bogus>`, `</3>`) is a comment token, so it must render as nothing rather
+    // ~keep than leak its text. Running it here also keeps it from confusing the passes
+    // ~keep below, which do look for tag-shaped runs.
+    let stripped = strip_bogus_comments(&stripped);
     let stripped = strip_hidden_elements(&stripped);
     // ~keep Normalise bogus HTML comment endings (`--->`, `---->`, …) that cause the
     // ~keep `tl` parser to silently discard all document content that follows them.
@@ -141,7 +148,7 @@ pub fn convert_html_impl(
         if let Some(repaired_html) = repair_with_html5ever(&preprocessed) {
             tracing::warn!(
                 target: "html_to_markdown::convert",
-                "block-level element misnested under an inline ancestor; re-parsed with html5ever repair"
+                "misnested HTML elements detected; re-parsed with html5ever repair"
             );
             drop(dom);
             let stripped = strip_script_and_style_tags(&repaired_html);
@@ -251,6 +258,7 @@ pub fn convert_html_impl(
         visitor,
         structure_collector.as_ref().map(std::rc::Rc::clone),
         reference_collector.as_ref().map(std::rc::Rc::clone),
+        base_url,
     );
     #[cfg(all(feature = "metadata", not(feature = "visitor")))]
     #[allow(clippy::used_underscore_binding)]
@@ -261,6 +269,7 @@ pub fn convert_html_impl(
         _visitor,
         structure_collector.as_ref().map(std::rc::Rc::clone),
         reference_collector.as_ref().map(std::rc::Rc::clone),
+        base_url,
     );
     #[cfg(all(not(feature = "metadata"), feature = "visitor"))]
     let mut ctx = Context::new(
@@ -270,6 +279,7 @@ pub fn convert_html_impl(
         visitor,
         structure_collector.as_ref().map(std::rc::Rc::clone),
         reference_collector.as_ref().map(std::rc::Rc::clone),
+        base_url,
     );
     #[cfg(all(not(feature = "metadata"), not(feature = "visitor")))]
     let mut ctx = Context::new(
@@ -279,6 +289,7 @@ pub fn convert_html_impl(
         _visitor,
         structure_collector.as_ref().map(std::rc::Rc::clone),
         reference_collector.as_ref().map(std::rc::Rc::clone),
+        base_url,
     );
 
     if !options.exclude_selectors.is_empty() {
@@ -293,8 +304,18 @@ pub fn convert_html_impl(
         ctx.set_excluded_node_ids(excluded);
     }
 
+    let top_level_start = output.len();
     for child_handle in dom.children() {
         walk_node(child_handle, parser, &mut output, options, &ctx, 0, &dom_ctx);
+    }
+
+    // ~keep Mirrors the pre-block-dispatch strip in `walk_node`, for the one block boundary
+    // ~keep that check can never see: the end of the document itself, when a trailing `<br>`
+    // ~keep run is the last thing at top level with no following sibling to trigger it
+    // ~keep (issue #464 follow-up, e.g. `"A<br>"`). Bounded to `top_level_start` so frontmatter
+    // ~keep already written above is never touched.
+    if options.newline_style == NewlineStyle::Backslash {
+        strip_trailing_backslash_breaks(&mut output, top_level_start);
     }
 
     tracing::debug!(
@@ -420,22 +441,16 @@ pub fn walk_node(
             let visitor_element_state = if ctx.skip_visitor_hooks {
                 None
             } else if let Some(ref visitor_handle) = ctx.visitor {
-                use crate::converter::visitor_hooks::{VisitAction, handle_visitor_element_start};
+                use crate::converter::visitor_hooks::{
+                    VisitAction, build_visitor_element_state, handle_visitor_element_start,
+                };
 
-                let (action, state) = handle_visitor_element_start(
-                    visitor_handle,
-                    tag_name.as_ref(),
-                    node_handle,
-                    tag,
-                    parser,
-                    output,
-                    ctx,
-                    depth,
-                    dom_ctx,
-                );
+                let state = build_visitor_element_state(tag_name.as_ref(), node_handle, parser, dom_ctx);
+                let action =
+                    handle_visitor_element_start(visitor_handle, tag_name.as_ref(), tag, &state, output, depth);
 
                 match action {
-                    VisitAction::Continue => state,
+                    VisitAction::Continue => Some(state),
                     VisitAction::Skip => return,
                     VisitAction::Custom => return,
                     VisitAction::Error => return,
@@ -493,6 +508,26 @@ pub fn walk_node(
             #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
             let element_output_start = output.len();
 
+            // ~keep A hard line break has no effect at the end of a block (CommonMark
+            // ~keep <https://spec.commonmark.org/spec#hard-line-breaks>): the run is only
+            // ~keep ever trailing once it turns out nothing but a new block follows it, and
+            // ~keep this is the single place every block-level dispatch already passes
+            // ~keep through, so it is where that becomes knowable regardless of which
+            // ~keep container the run started in. `is_block_level_element` is the same
+            // ~keep inline/block classification `plain_text.rs` and `visitor_hooks.rs`
+            // ~keep already use, so an inline sibling (real content, e.g. `<em>`/`<span>`)
+            // ~keep never trips this and the marker survives, matching issue #464's
+            // ~keep "only a run with nothing following in the same block is stripped".
+            // ~keep Container endings with no following sibling at all (a trailing `<br>`
+            // ~keep closing a `<div>`/`<li>`/`<blockquote>`, or the whole document) have no
+            // ~keep next dispatch to catch them here, so those close their own trailing run
+            // ~keep at their own point of closing instead (`block/div.rs`, `handlers/blockquote.rs`,
+            // ~keep `list/item.rs`, several `semantic/*.rs` handlers that splice a local
+            // ~keep buffer back into `output`, and the top-level loop in this file).
+            if options.newline_style == NewlineStyle::Backslash && is_block_level_element(tag_name.as_ref()) {
+                strip_trailing_backslash_breaks(output, ctx.block_content_start);
+            }
+
             match tag_name.as_ref() {
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     crate::converter::block::heading::handle(
@@ -519,8 +554,8 @@ pub fn walk_node(
                     );
                 }
 
-                "strong" | "b" | "em" | "i" | "mark" | "del" | "s" | "ins" | "u" | "small" | "sub" | "sup" | "kbd"
-                | "samp" | "var" | "dfn" | "abbr" | "ruby" | "rb" | "rt" | "rp" | "rtc" | "span" => {
+                "strong" | "b" | "em" | "i" | "mark" | "del" | "s" | "strike" | "ins" | "u" | "small" | "sub"
+                | "sup" | "kbd" | "samp" | "var" | "dfn" | "abbr" | "ruby" | "rb" | "rt" | "rp" | "rtc" | "span" => {
                     crate::converter::inline::dispatch_inline_handler(
                         &tag_name,
                         node_handle,
@@ -583,6 +618,20 @@ pub fn walk_node(
                     dom_ctx,
                 ),
                 "div" => {
+                    crate::converter::block::div::handle(node_handle, parser, output, options, ctx, depth, dom_ctx);
+                }
+
+                // ~keep `<address>`/`<search>`/`<hgroup>`/`<center>` are content-bearing block
+                // ~keep containers with no formatting of their own beyond block separation --
+                // ~keep the same shape as `<div>`. Routing them through `div::handle` (rather
+                // ~keep than a semantic-module dispatcher) matters for Tier-1 parity: Tier-1's
+                // ~keep generic `TagKind::Block` open/close handling in
+                // ~keep `tier1/scanner.rs` mirrors `div::handle` byte-for-byte (leading `\n\n`,
+                // ~keep table-cell `"  \n"` continuation, list-item indent), so reusing
+                // ~keep `div::handle` here -- instead of `semantic::sectioning::handle`, which
+                // ~keep has no table-cell/list-item special-casing -- keeps both tiers in
+                // ~keep agreement. See `tests/tier1_address_block_separator_test.rs`.
+                "address" | "search" | "hgroup" | "center" => {
                     crate::converter::block::div::handle(node_handle, parser, output, options, ctx, depth, dom_ctx);
                 }
                 "caption" => crate::converter::block::table::handle_caption(
@@ -756,17 +805,19 @@ pub fn walk_node(
 
             #[cfg(feature = "visitor")]
             if let (Some(visitor_handle), Some(state)) = (ctx.visitor.as_ref(), visitor_element_state.as_ref()) {
-                use crate::converter::visitor_hooks::handle_visitor_element_end;
+                use crate::converter::visitor_hooks::{VisitorElementEndContext, handle_visitor_element_end};
 
                 handle_visitor_element_end(
                     visitor_handle,
                     tag_name.as_ref(),
                     state,
                     tag,
-                    output,
-                    element_output_start,
-                    ctx,
-                    depth,
+                    VisitorElementEndContext {
+                        output,
+                        element_output_start,
+                        ctx,
+                        depth,
+                    },
                 );
             }
         }

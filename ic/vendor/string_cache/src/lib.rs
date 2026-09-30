@@ -25,17 +25,15 @@
 //! In `Cargo.toml`:
 //! ```toml
 //! [dependencies]
-//! string_cache = "0.9"
+//! string_cache = "0.10"
 //!
 //! [dev-dependencies]
-//! string_cache_codegen = "0.6"
+//! string_cache_codegen = "0.7"
 //! ```
 //!
 //! In `build.rs`:
 //!
 //! ```ignore
-//! extern crate string_cache_codegen;
-//!
 //! use std::env;
 //! use std::path::Path;
 //!
@@ -50,8 +48,6 @@
 //! In `lib.rs`:
 //!
 //! ```ignore
-//! extern crate string_cache;
-//!
 //! mod foo {
 //!     include!(concat!(env!("OUT_DIR"), "/foo_atom.rs"));
 //! }
@@ -73,7 +69,6 @@
 //! ## No compile-time atoms
 //!
 //! ```
-//! # extern crate string_cache;
 //! use string_cache::DefaultAtom;
 //!
 //! # fn main() {
@@ -103,37 +98,18 @@
 
 #![cfg_attr(test, deny(warnings))]
 
-// Types, such as Atom, that impl Hash must follow the hash invariant: if two objects match
-// with PartialEq, they must also have the same Hash. Clippy warns on types that derive one while
-// manually impl-ing the other, because it seems easy for the two to drift apart, causing the
-// invariant to be violated.
-//
-// But Atom is a newtype over NonZeroU64, and probably always will be, since cheap comparisons and
-// copying are this library's purpose. So we know what the PartialEq comparison is going to do.
-//
-// The `get_hash` function, seen in `atom.rs`, consults that number, plus the global string interner
-// tables. The only way for the resulting hash for two Atoms with the same inner 64-bit number to
-// differ would be if the table entry changed between invocations, and that would be really bad.
-#![allow(clippy::derive_hash_xor_eq)]
-
 mod atom;
 mod dynamic_set;
 mod static_sets;
 mod trivial_impls;
 
 pub use atom::Atom;
+#[cfg(feature = "malloc_size_of")]
+pub use dynamic_set::malloc_size_of_dynamic_set;
 pub use static_sets::{EmptyStaticAtomSet, PhfStrSet, StaticAtomSet};
 
 /// Use this if you don’t care about static atoms.
 pub type DefaultAtom = Atom<EmptyStaticAtomSet>;
 
-// Some minor tests of internal layout here.
-// See ../integration-tests for much more.
-
-/// Guard against accidental changes to the sizes of things.
-#[test]
-fn assert_sizes() {
-    use std::mem::size_of;
-    assert_eq!(size_of::<DefaultAtom>(), 8);
-    assert_eq!(size_of::<Option<DefaultAtom>>(), size_of::<DefaultAtom>(),);
-}
+const _: () = assert!(std::mem::size_of::<DefaultAtom>() == 8);
+const _: () = assert!(std::mem::size_of::<Option<DefaultAtom>>() == 8);
