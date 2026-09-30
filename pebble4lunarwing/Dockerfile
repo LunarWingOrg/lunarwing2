@@ -30,7 +30,48 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/pebble fetch --depth 1 origin "${PEBBLE_REF}" && \
     git -C /build/pebble checkout --detach FETCH_HEAD && \
     test "$(git -C /build/pebble rev-parse HEAD)" = "${PEBBLE_REF}"
-RUN cd pebble && cargo build --release --locked --bin pebble
+# The pinned upstream checkout ships rustls 0.23.41, which is affected by
+# RUSTSEC-2026-0285 (fixed >= 0.23.45) and upstream has no newer release. So
+# the reviewed patched lock is supplied as a hashed build input instead of an
+# unpinned build-time `cargo update`: it is upstream at PEBBLE_REF with only
+# the rustls and rustls-webpki package records changed. The build fails if
+# the checked-out lock or the pinned digest drift from the reviewed inputs,
+# keeping the locked/reproducible-build guarantee.
+COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
+ARG PEBBLE_LOCK_SHA256
+RUN test "$(sha256sum /tmp/pebble-upstream-Cargo.lock | cut -d' ' -f1)" = "${PEBBLE_LOCK_SHA256}" && \
+    python3 - <<'PY'
+import tomllib, pathlib, sys
+
+ALLOWED = {"rustls", "rustls-webpki"}
+
+def packages(path):
+    parsed = tomllib.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    return {p["name"]: p for p in parsed.get("package", [])}
+
+upstream = packages("pebble/Cargo.lock")
+patched = packages("/tmp/pebble-upstream-Cargo.lock")
+
+extra = sorted(set(patched) - set(upstream))
+missing = sorted(set(upstream) - set(patched))
+if extra or missing:
+    print(f"Cargo.lock package set changed: added {extra}, removed {missing}", file=sys.stderr)
+    sys.exit(1)
+
+changed = sorted(name for name in upstream if upstream[name] != patched[name])
+outside = [name for name in changed if name not in ALLOWED]
+if outside:
+    print(f"Cargo.lock records changed outside allowlist {sorted(ALLOWED)}: {outside}", file=sys.stderr)
+    sys.exit(1)
+if not changed:
+    print("Cargo.lock override is a no-op — the pinned upstream lock no longer needs patching", file=sys.stderr)
+    sys.exit(1)
+
+for name in changed:
+    print(f"override: {name} {upstream[name]['version']} -> {patched[name]['version']}")
+PY
+RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \
+    cd pebble && cargo build --release --locked --bin pebble
 
 # --- Runtime ---
 FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
