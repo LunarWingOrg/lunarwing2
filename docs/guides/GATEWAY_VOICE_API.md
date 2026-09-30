@@ -154,15 +154,19 @@ semantics end-to-end (WI#259): a desktop client can distinguish "this reply is
 too long to synthesize" from "the sidecar is down", which previously collapsed
 into one opaque 502.
 
-A sidecar 504 additionally means the underlying native inference may still be
-running with the caller gone (WI#264); the sidecar itself now fences that
-zombie: while the abandoned call drains, further synthesis attempts fail fast
-with 503 `unavailable` rather than queueing behind it, STT/VAD stay available
-while shared inference permits remain (with
-`VOICE_MAX_CONCURRENT_INFERENCE=1` the draining call holds the sole permit,
-so those components answer 503 too until it exits),
-and the component re-admits itself once the call exits. Clients should retry
-503 synthesis with backoff; no gateway-side intervention is needed.
+**Sidecar admission and recovery (WI#264, v2.1.4.0):** a 504 ends the wait,
+not an already-running native synthesis. The sidecar admits one call per
+component before consuming shared capacity, so subsequent TTS calls receive
+503 while it drains instead of queuing behind its mutex. STT/VAD can use
+remaining permits (none may remain with a concurrency limit of one). Normal
+completion restores admission; a poisoned model/panic or a never-returning
+call requires operator recovery. The sidecar's `/ready` and `/metrics` expose
+per-component `inference` state, and `/ready` stays 503 while abandoned work
+drains or a component is failed. The gateway preserves HTTP 503 as generic
+`unavailable`, not the sidecar's `component_failed` detail; retry with backoff
+for transient busy responses, and escalate persistent failures to an operator.
+See [sidecar recovery](../../projects/voice-sidecar/README.md#inference-timeout-admission-and-recovery-wi264)
+for the supported `restart-tenant` procedure (whole-tenant interruption).
 
 ## Bounds and Security
 
@@ -204,8 +208,8 @@ and the component re-admits itself once the call exits. Clients should retry
 
 ```bash
 # Unit tests (validation, endpoint invariants, proxy mapping)
-taskset -c 0-17 cargo test -j18 --lib -- voice:: lunarvoice
+taskset -c 0-11 cargo test -j12 --lib -- voice:: lunarvoice
 
 # End-to-end (real gateway + mock sidecar, auth + bounds + credential flow)
-taskset -c 0-17 cargo test -j18 --test voice_gateway_integration
+taskset -c 0-11 cargo test -j12 --test voice_gateway_integration
 ```
