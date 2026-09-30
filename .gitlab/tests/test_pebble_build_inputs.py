@@ -41,6 +41,12 @@ class LockDeltaTests(unittest.TestCase):
         self.patched = copy.deepcopy(self.upstream)
         self.patched["package"][0].update(version="0.23.45", checksum="tls-new")
         self.patched["package"][1].update(version="0.103.15", checksum="webpki-new")
+        # The real override also retires upstream's yanked chacha20 0.10.1 pin.
+        for records in (self.upstream, self.patched):
+            records["package"].append(
+                {"name": "chacha20", "version": "0.10.1", "source": "registry+example", "checksum": "chacha-yanked"}
+            )
+        self.patched["package"][-1].update(version="0.10.2", checksum="chacha-new")
 
     def test_intended_tls_patch(self):
         guard.check_package_delta(self.upstream, self.patched)
@@ -81,7 +87,7 @@ class LockDeltaTests(unittest.TestCase):
                 if add:
                     patched["package"].append({"name": "injected", "version": "1.0.0"})
                 else:
-                    patched["package"].pop()
+                    patched["package"].pop(2)  # drop the "unrelated" 1.0.0 record
                 with self.assertRaisesRegex(ValueError, "outside allowlist"):
                     guard.check_package_delta(self.upstream, patched)
 

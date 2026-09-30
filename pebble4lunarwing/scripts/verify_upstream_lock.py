@@ -9,7 +9,11 @@ import sys
 import tomllib
 
 
-ALLOWED_PACKAGES = {"rustls", "rustls-webpki"}
+# rustls/rustls-webpki: RUSTSEC-2026-0285 (TLS 1.3 handshake accepted across
+# encryption-level boundaries; patched >= 0.23.45 / webpki 0.103.15).
+# chacha20: 0.10.1 is yanked on crates.io (upstream's own pin); 0.10.2 is the
+# identical-semver replacement, no advisory either way.
+ALLOWED_PACKAGES = {"rustls", "rustls-webpki", "chacha20"}
 
 
 def package_records(lock: dict) -> dict[tuple[str, str, str], dict]:
@@ -78,7 +82,7 @@ def main() -> int:
     except (OSError, UnicodeError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("Verified Pebble lock SHA256 and rustls/rustls-webpki-only package delta.")
+    print("Verified Pebble lock SHA256 and rustls/rustls-webpki/chacha20-only package delta.")
     return 0
 
 
