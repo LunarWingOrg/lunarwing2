@@ -19,7 +19,13 @@
 
 ## Phase 2 — Features & Polish
 
-3. [ ] audit all crates and ensure there are no security vulnerabilities
+3. [x] audit all crates and ensure there are no security vulnerabilities
+    - Completed 2026-09-30, 100% of actionable findings fixed. Full audit: `docs/ops/v2.1.4.0_CRATE_SECURITY_AUDIT.md`.
+    - All 26 tracked Cargo.lock roots scanned with CI-pinned cargo-deny 0.20.2 + fresh RustSec db (2026-09-29) using an empty advisory ignore list so nothing is silently suppressed.
+    - Fixed: RUSTSEC-2026-0285 (rustls TLS 1.3 encryption-level confusion, GHSA-2mjx-qc3c-rqvc) — `rustls 0.23.43 -> 0.23.45` in `projects/ocr-sidecar` (commit 50acd220e) and `pebble` (commit 6db228fdd); both re-scanned clean and `cargo check` clean.
+    - Remaining: exactly the 8 previously-accepted advisories in `ic/deny.toml` (libsql 0.6.0 legacy TLS chain, rsa Marvin via russh, vendored libsignal `failure`); all upstream blockers re-verified against crates.io on 2026-09-30 and unchanged — no deny.toml edit needed.
+    - Also ran (first time) a full-graph `unmaintained = "all"` pass over `ic`: 7 transitive unmaintained crates, all informational (wasmtime/postcard internals, dev-only atty, pdf-extract ttf-parser, libsql legacy chain) — recorded in the audit doc; CI policy unchanged.
+    - Guards green: `cargo deny check` (advisories/bans/licenses/sources ok) and `.gitlab/scripts/check-lockfile-only-advisories.sh` ok.
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.2.0.md (candidates, weigh each)
 
