@@ -116,6 +116,8 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 
 Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
 
+Upstream's pinned lockfile ships rustls 0.23.41 (RUSTSEC-2026-0285, fixed >= 0.23.45) and has no newer release, so the reviewed patched lock is committed at `pebble4lunarwing/upstream/Cargo.lock` and copied over the checkout during the image build. The Dockerfile supplies the canonical reviewed `PEBBLE_LOCK_SHA256` default for CI, mt-admin, Compose, and plain Docker builds. `scripts/verify_upstream_lock.py` verifies that digest and compares complete parsed package records (including additions/removals, source, checksum, and dependencies), allowing changes only to rustls/rustls-webpki. `.gitlab/deliverables.json` explicitly classifies this lock-only override under `build_inputs`, with ci-config regression checks and worker-image candidate coverage; it is not a standalone Cargo root.
+
 ## Opencode Worker
 
 [opencode](https://opencode.ai) (anomalyco/opencode, formerly sst/opencode) integrated as a persistent LunarWing external worker. A Bun/TypeScript bridge wraps the `@opencode-ai/sdk` and translates between the opencode session/event model and the `lunarwing-agent-v1` WebSocket protocol. The opencode headless server runs internally on `127.0.0.1:4096` (not exposed). Health on 8443, WebSocket on 9090.
@@ -150,8 +152,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.18** at reviewed full commit
-`cd9a14a6b688d4021bee381dfd39d2cef9c0f862`; the v2 bridge uses
+**v2.0.20** at reviewed full commit
+`84c9be93a56304a108f1a22df0c5d62c26d5b6ca`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -279,6 +281,24 @@ moves the lane off the beta-frequent 2.0.15 pin). The Dockerfile patches the
 upstream CLI build script at that SHA; its `prepare_reproducible_build`
 self-test guards the patch contract against a 2.0.17 fixture during the image
 build. Host-side `prepare_reproducible_build_test.py` passed, including the
+untouched-failure contract. Whole-image reproducibility must still pass the CI
+candidate-versus-clean-rebuild gate before promotion.
+
+v2.0.20 bump (2026-09-30): tag SHA `84c9be93a56304a108f1a22df0c5d62c26d5b6ca`
+verified against the anomalyco/opencode remote (v2.1.4.0 checklist item #2).
+The Dockerfile patches the upstream CLI build script at that SHA (exactly one
+`bytecode: true` / `splitting: true` each, so the patch contract holds); the
+`prepare_reproducible_build` self-test fixture moved to 2.0.20 to keep guarding
+the patch contract during the image build. The v2.0.18→v2.0.20 diff is
+additive for this lane's surface: `session.create` (with `permissions`),
+`session.message.list`, `session.permission.reply`, `session.interrupt`,
+`event.subscribe`, `OpenCode.make`, and every event name the bridge matches
+(`session.execution.{succeeded,failed,interrupted}`, `session.idle`,
+`permission.asked`, `session.text.delta`, `session.tool.{success,failed}`) are
+unchanged — the new `credential.list`/`credential.create` client endpoints and
+additive generated-type fields (e.g. `SessionStructuredError.response`,
+`ConnectionStatus`) are not used by the bridge. Host-side
+`prepare_reproducible_build_test.py` passed (3/3), including the
 untouched-failure contract. Whole-image reproducibility must still pass the CI
 candidate-versus-clean-rebuild gate before promotion.
 

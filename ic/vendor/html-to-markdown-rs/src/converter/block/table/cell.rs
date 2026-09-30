@@ -122,7 +122,10 @@ pub fn cell_text_content(
         ..ctx.clone()
     };
 
-    render_cell_text(node_handle, parser, options, &cell_ctx, dom_ctx, depth)
+    // ~keep Width measurement never defers a nested table out to a separate block: the
+    // ~keep result is discarded once its length is measured (capped at 200 chars anyway),
+    // ~keep and deferring here as well as in the render pass would queue it twice (issue #484).
+    render_cell_text(node_handle, parser, options, &cell_ctx, dom_ctx, depth, None)
 }
 
 /// Initial buffer capacity for a rendered cell's markdown.
@@ -134,6 +137,16 @@ const CELL_TEXT_CAPACITY: usize = 128;
 /// the per-row context can be built once instead of cloned per cell.
 ///
 /// `depth` is the cell's own recursion depth; children are walked at `depth + 1`.
+///
+/// `deferred_tables`, when `Some`, receives a child that is, or wraps (e.g. a `<div>`), a
+/// nested `<table>`, rendered as that child's markdown verbatim (trimmed, unescaped,
+/// un-flattened) instead of folding it into this cell's single line. The caller passes `Some`
+/// only when the enclosing row holds no other cell — GFM has no way to express a real nested
+/// table, but a lone cell's content can be lifted out and rendered as its own separate table
+/// after the enclosing one, which keeps the inner table usable instead of flattening it into a
+/// line of escaped pipes (issue #484). `None` (the default, and always the case for a cell
+/// sharing its row with a sibling, per issue #469) keeps the existing flatten-and-escape
+/// behavior.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub fn render_cell_text(
     node_handle: &tl::NodeHandle,
@@ -142,6 +155,7 @@ pub fn render_cell_text(
     cell_ctx: &super::super::super::Context,
     dom_ctx: &super::super::super::DomContext,
     depth: usize,
+    mut deferred_tables: Option<&mut Vec<String>>,
 ) -> String {
     let mut text = String::with_capacity(CELL_TEXT_CAPACITY);
 
@@ -154,7 +168,68 @@ pub fn render_cell_text(
 
         if has_tag_child {
             for child_handle in children.top().iter() {
-                super::super::super::walk_node(child_handle, parser, &mut text, options, cell_ctx, depth + 1, dom_ctx);
+                // ~keep A nested `<table>` renders its own row/separator syntax straight into
+                // ~keep `text` via `walk_node`, bypassing `text_node.rs`'s per-text-node pipe
+                // ~keep escaping entirely -- that escaping only ever sees literal text, never
+                // ~keep structural markdown another handler emitted. The newline-to-space fold
+                // ~keep below then flattens the inner table onto this outer cell's single line,
+                // ~keep so its `|` delimiters would read as *the outer row's* cell boundaries on
+                // ~keep reparse, silently widening -- and on a second parse, truncating -- the
+                // ~keep containing row's column count: real content loss, not a cosmetic diff.
+                // ~keep Scoped to a child that *is, or wraps* (e.g. a `<div>`), a nested table:
+                // ~keep other block content a cell may hold (`<pre>`, code spans) is deliberately
+                // ~keep left byte-for-byte alone by their own handlers (issues #455/#456) and
+                // ~keep must not be touched here. A single-node tag test here used to miss a
+                // ~keep wrapped table entirely, letting it fall through to the `else` branch
+                // ~keep below and emit raw unescaped pipes (issue #488).
+                if super::utils::is_or_contains_table(child_handle, parser, dom_ctx) {
+                    let mut nested = String::new();
+                    super::super::super::walk_node(
+                        child_handle,
+                        parser,
+                        &mut nested,
+                        options,
+                        cell_ctx,
+                        depth + 1,
+                        dom_ctx,
+                    );
+                    if let Some(buf) = deferred_tables.as_deref_mut() {
+                        let trimmed = nested.trim();
+                        if !trimmed.is_empty() {
+                            buf.push(trimmed.to_string());
+                        }
+                        continue;
+                    }
+                    if nested.contains('|') {
+                        nested = crate::converter::utility::escaping::escape_bare_pipes_outside_code_spans(&nested);
+                    }
+                    // ~keep The inner table emits one line per row, and the whole-cell fold
+                    // ~keep below turns every one of those newlines into a space, running the
+                    // ~keep rows together with no boundary left (issue #469). `br_in_tables`
+                    // ~keep says how a line break inside a cell is spelled, so honour it here
+                    // ~keep too: join the flattened rows with the same literal `<br>` the rest
+                    // ~keep of the cell handlers emit. The fold stays unconditional either way,
+                    // ~keep so no raw newline reaches the row (issues #456/#457).
+                    let nested = fold_nested_table_rows(&nested, options.br_in_tables);
+                    if !nested.is_empty() && !text.trim_end().is_empty() {
+                        // ~keep A nested table is a sibling like any other block in the cell:
+                        // ~keep without this, a preceding `<p>` ran straight into the inner
+                        // ~keep table's first pipe (`Before\| ID`). Skipped when the nested
+                        // ~keep table opens the cell, so no leading `<br>` is emitted.
+                        crate::converter::emit_table_cell_break(&mut text, options.br_in_tables);
+                    }
+                    text.push_str(&nested);
+                } else {
+                    super::super::super::walk_node(
+                        child_handle,
+                        parser,
+                        &mut text,
+                        options,
+                        cell_ctx,
+                        depth + 1,
+                        dom_ctx,
+                    );
+                }
             }
         } else {
             let raw = dom_ctx.text_content(*node_handle, parser);
@@ -179,6 +254,22 @@ pub fn render_cell_text(
         text = text.replace('\n', " ");
     }
     text
+}
+
+/// Flatten a nested table's rendered rows onto the single line a Markdown cell allows.
+///
+/// Each row arrives on its own line. `br_in_tables` selects how the boundary between them is
+/// spelled — a literal `<br>` when set, a single space otherwise — matching what every other
+/// in-cell handler does with a line break (`emit_table_cell_break`, issues #453/#454). Blank
+/// lines the inner table emits around itself carry no content and are dropped.
+pub fn fold_nested_table_rows(nested: &str, br_in_tables: bool) -> String {
+    let separator = if br_in_tables { "<br>" } else { " " };
+    nested
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(separator)
 }
 
 /// Trim leading and trailing whitespace without reallocating.
@@ -220,6 +311,7 @@ fn escape_cell_text(text: &str, options: &crate::options::ConversionOptions) -> 
 /// * `dom_ctx` - DOM context for content extraction
 /// * `col_width` - Optional target width for padding (None = no padding)
 /// * `depth` - Current recursion depth (the cell's own depth; children are walked at `depth + 1`)
+/// * `deferred_tables` - See [`render_cell_text`]; forwarded unchanged.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 #[allow(clippy::too_many_arguments)]
 pub fn convert_table_cell(
@@ -232,8 +324,9 @@ pub fn convert_table_cell(
     dom_ctx: &super::super::super::DomContext,
     col_width: Option<usize>,
     depth: usize,
+    deferred_tables: Option<&mut Vec<String>>,
 ) {
-    let text = render_cell_text(node_handle, parser, options, cell_ctx, dom_ctx, depth);
+    let text = render_cell_text(node_handle, parser, options, cell_ctx, dom_ctx, depth, deferred_tables);
     emit_cell_text(node_handle, parser, output, &text, col_width);
 }
 

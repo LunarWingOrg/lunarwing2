@@ -13,11 +13,12 @@ use core::net::SocketAddr;
 use core::pin::Pin;
 use core::str::FromStr;
 use core::task::{Context, Poll};
+use core::time::Duration;
 use std::io;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::Stream;
 use h2::client::SendRequest;
 use http::header::{self, CONTENT_LENGTH};
 use http::{Method, Request};
@@ -28,7 +29,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use crate::error::NetError;
-use crate::http::{RequestContext, SetHeaders, Version};
+use crate::http::{RequestContext, SetHeaders, Version, fetch_body};
 use crate::proto::op::{DnsRequest, DnsResponse};
 use crate::runtime::iocompat::AsyncIoStdAsTokio;
 use crate::runtime::{DnsTcpStream, RuntimeProvider, Spawn};
@@ -41,6 +42,7 @@ pub struct HttpsClientStream {
     context: Arc<RequestContext>,
     h2: SendRequest<Bytes>,
     is_shutdown: bool,
+    request_timeout: Option<Duration>,
 }
 
 impl HttpsClientStream {
@@ -54,6 +56,7 @@ impl HttpsClientStream {
             client_config,
             bind_addr: None,
             set_headers: None,
+            request_timeout: None,
         }
     }
 }
@@ -123,11 +126,17 @@ impl DnsRequestSender for HttpsClientStream {
             Err(err) => return NetError::from(err).into(),
         };
 
-        Box::pin(send(
-            self.h2.clone(),
-            Bytes::from(bytes),
-            self.context.clone(),
-        ))
+        let send_fut = send(self.h2.clone(), Bytes::from(bytes), self.context.clone());
+
+        let Some(request_timeout) = self.request_timeout else {
+            return Box::pin(send_fut).into();
+        };
+
+        Box::pin(async move {
+            timeout(request_timeout, send_fut)
+                .await
+                .map_err(|_| NetError::Timeout)?
+        })
         .into()
     }
 
@@ -166,6 +175,7 @@ pub struct HttpsClientStreamBuilder<P> {
     client_config: Arc<ClientConfig>,
     bind_addr: Option<SocketAddr>,
     set_headers: Option<Arc<dyn SetHeaders>>,
+    request_timeout: Option<Duration>,
 }
 
 impl<P: RuntimeProvider> HttpsClientStreamBuilder<P> {
@@ -177,6 +187,14 @@ impl<P: RuntimeProvider> HttpsClientStreamBuilder<P> {
     /// Set the [`SetHeaders`] trait object used to inject dynamic headers into the DoH request
     pub fn set_headers(&mut self, headers: Arc<dyn SetHeaders>) {
         self.set_headers.replace(headers);
+    }
+
+    /// Set the per-request timeout applied to each DNS send over the H2 connection.
+    ///
+    /// When set, each call to [`DnsRequestSender::send_message`] will be cancelled with
+    /// [`NetError::Timeout`] if no response arrives within this duration.
+    pub fn request_timeout(&mut self, timeout: Duration) {
+        self.request_timeout = Some(timeout);
     }
 
     /// Creates a new [`DnsExchange`] wrapping the [`HttpsClientStream`] from this builder
@@ -206,14 +224,20 @@ impl<P: RuntimeProvider> HttpsClientStreamBuilder<P> {
         server_name: Arc<str>,
         path: Arc<str>,
     ) -> impl Future<Output = Result<HttpsClientStream, NetError>> + Send + 'static {
-        connect(
+        let request_timeout = self.request_timeout;
+        let connect_fut = connect(
             self.provider.connect_tcp(name_server, self.bind_addr, None),
             self.client_config,
             name_server,
             server_name,
             path,
             self.set_headers,
-        )
+        );
+        async move {
+            let mut stream = connect_fut.await?;
+            stream.request_timeout = request_timeout;
+            Ok(stream)
+        }
     }
 }
 
@@ -279,6 +303,7 @@ pub fn connect(
             h2,
             context,
             is_shutdown: false,
+            request_timeout: None,
         })
     }
 }
@@ -288,33 +313,18 @@ async fn send(
     message: Bytes,
     cx: Arc<RequestContext>,
 ) -> Result<DnsResponse, NetError> {
-    let mut h2 = match h2.ready().await {
-        Ok(h2) => h2,
-        Err(err) => {
-            // TODO: make specific error
-            return Err(NetError::from(format!("h2 send_request error: {err}")));
-        }
-    };
+    let mut h2 = h2.ready().await?;
 
     // build up the http request
-    let request = cx
-        .build(message.remaining())
-        .map_err(|err| NetError::from(format!("bad http request: {err}")))?;
+    let request = cx.build(message.remaining())?;
 
     debug!("request: {:#?}", request);
 
     // Send the request
-    let (response_future, mut send_stream) = h2
-        .send_request(request, false)
-        .map_err(|err| NetError::from(format!("h2 send_request error: {err}")))?;
+    let (response_future, mut send_stream) = h2.send_request(request, false)?;
+    send_stream.send_data(message, true)?;
 
-    send_stream
-        .send_data(message, true)
-        .map_err(|e| NetError::from(format!("h2 send_data error: {e}")))?;
-
-    let mut response_stream = response_future
-        .await
-        .map_err(|err| NetError::from(format!("received a stream error: {err}")))?;
+    let mut response_stream = response_future.await?;
 
     debug!("got response: {:#?}", response_stream);
 
@@ -329,38 +339,8 @@ async fn send(
         .transpose()
         .map_err(|e| NetError::from(format!("bad headers received: {e}")))?;
 
-    // TODO: what is a good max here?
-    // clamp(512, 4096) says make sure it is at least 512 bytes, and min 4096 says it is at most 4k
-    // just a little protection from malicious actors.
-    let mut response_bytes =
-        BytesMut::with_capacity(content_length.unwrap_or(512).clamp(512, 4_096));
-
-    while let Some(partial_bytes) = response_stream.body_mut().data().await {
-        let partial_bytes =
-            partial_bytes.map_err(|e| NetError::from(format!("bad http request: {e}")))?;
-
-        debug!("got bytes: {}", partial_bytes.len());
-        response_bytes.extend(partial_bytes);
-
-        // assert the length
-        if let Some(content_length) = content_length {
-            if response_bytes.len() >= content_length {
-                break;
-            }
-        }
-    }
-
-    // assert the length
-    if let Some(content_length) = content_length {
-        if response_bytes.len() != content_length {
-            // TODO: make explicit error type
-            return Err(NetError::from(format!(
-                "expected byte length: {}, got: {}",
-                content_length,
-                response_bytes.len()
-            )));
-        }
-    }
+    // read the response body
+    let response_bytes = fetch_body(response_stream.body_mut(), content_length).await?;
 
     // Was it a successful request?
     if !response_stream.status().is_success() {
@@ -436,45 +416,8 @@ where
 
     match *request.method() {
         Method::GET => Err(format!("GET unimplemented: {}", request.method()).into()),
-        Method::POST => message_from_post(request.into_body(), content_length).await,
+        Method::POST => fetch_body(request.into_body(), content_length).await,
         _ => Err(format!("bad method: {}", request.method()).into()),
-    }
-}
-
-/// Deserialize the message from a POST message
-pub(crate) async fn message_from_post<R>(
-    mut request_stream: R,
-    length: Option<usize>,
-) -> Result<BytesMut, NetError>
-where
-    R: Stream<Item = Result<Bytes, h2::Error>> + 'static + Send + Debug + Unpin,
-{
-    let mut bytes = BytesMut::with_capacity(length.unwrap_or(0).clamp(512, 4_096));
-
-    loop {
-        match request_stream.next().await {
-            Some(Ok(mut frame)) => bytes.extend_from_slice(&frame.split_off(0)),
-            Some(Err(err)) => return Err(err.into()),
-            None => {
-                return if let Some(length) = length {
-                    // wait until we have all the bytes
-                    if bytes.len() == length {
-                        Ok(bytes)
-                    } else {
-                        Err("not all bytes received".into())
-                    }
-                } else {
-                    Ok(bytes)
-                };
-            }
-        };
-
-        if let Some(length) = length {
-            // wait until we have all the bytes
-            if bytes.len() == length {
-                return Ok(bytes);
-            }
-        }
     }
 }
 
@@ -741,6 +684,79 @@ mod tests {
 
         let msg_from_post = Message::from_vec(bytes.as_ref()).expect("bytes failed");
         assert_eq!(message, msg_from_post);
+    }
+
+    /// Verifies that `request_timeout` cancels a stalled DNS-over-H2 request.
+    ///
+    /// Uses an in-process `tokio::io::duplex` pipe — no TLS or external servers needed.
+    /// The server half accepts the H2 request but never sends a response, simulating
+    /// a hung upstream DoH server. The test asserts that `send_message` returns
+    /// `Err(NetError::Timeout)` within the configured timeout.
+    ///
+    /// This test also serves as the representative coverage for the identical
+    /// `request_timeout` logic in `QuicClientStream` and `H3ClientStream`: all three
+    /// apply the same `tokio::time::timeout` wrapper in `send_message`. In-process
+    /// QUIC/H3 tests are impractical because QUIC mandates TLS with no plain-transport
+    /// equivalent of the duplex trick used here.
+    #[tokio::test]
+    async fn test_request_timeout() {
+        use std::str::FromStr;
+
+        use futures_util::StreamExt as _;
+
+        subscribe();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        // Both H2 handshakes must run concurrently to exchange SETTINGS frames.
+        let (client_result, server_result) = tokio::join!(
+            h2::client::Builder::new()
+                .enable_push(false)
+                .handshake(client_io),
+            h2::server::handshake(server_io),
+        );
+        let (h2_send, h2_conn) = client_result.expect("client h2 handshake");
+        let mut server_conn = server_result.expect("server h2 handshake");
+
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        // Accept the incoming request but hold the `SendResponse` without calling
+        // `send_response` — the client's `response_future.await` will block forever.
+        tokio::spawn(async move {
+            if let Some(Ok((_req, respond))) = server_conn.next().await {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(respond);
+            }
+        });
+
+        let context = Arc::new(RequestContext {
+            version: Version::Http2,
+            server_name: Arc::from("test.example"),
+            query_path: Arc::from("/dns-query"),
+            set_headers: None,
+        });
+
+        let mut stream = HttpsClientStream {
+            h2: h2_send,
+            context,
+            is_shutdown: false,
+            request_timeout: Some(Duration::from_millis(50)),
+        };
+
+        let mut msg = Message::query();
+        msg.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let request = DnsRequest::new(msg, DnsRequestOptions::default());
+
+        let result = stream.send_message(request).first_answer().await;
+        assert!(
+            matches!(result, Err(NetError::Timeout)),
+            "expected Timeout, got: {result:?}"
+        );
     }
 
     #[derive(Debug)]

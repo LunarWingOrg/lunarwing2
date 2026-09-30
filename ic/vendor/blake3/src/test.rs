@@ -1,7 +1,5 @@
 use crate::{BLOCK_LEN, CHUNK_LEN, CVBytes, CVWords, IncrementCounter, OUT_LEN};
-use arrayref::array_ref;
 use arrayvec::ArrayVec;
-use core::usize;
 use rand::prelude::*;
 
 // Interesting input lengths to run tests on.
@@ -133,7 +131,11 @@ pub fn test_hash_many_fn(
         // First hash chunks.
         let mut chunks = ArrayVec::<&[u8; CHUNK_LEN], NUM_INPUTS>::new();
         for i in 0..NUM_INPUTS {
-            chunks.push(array_ref!(input_buf, i * CHUNK_LEN, CHUNK_LEN));
+            chunks.push(
+                (&input_buf[i * CHUNK_LEN..][..CHUNK_LEN])
+                    .try_into()
+                    .unwrap(),
+            );
         }
         let mut portable_chunks_out = [0; NUM_INPUTS * OUT_LEN];
         crate::portable::hash_many(
@@ -172,7 +174,11 @@ pub fn test_hash_many_fn(
         // Then hash parents.
         let mut parents = ArrayVec::<&[u8; 2 * OUT_LEN], NUM_INPUTS>::new();
         for i in 0..NUM_INPUTS {
-            parents.push(array_ref!(input_buf, i * 2 * OUT_LEN, 2 * OUT_LEN));
+            parents.push(
+                (&input_buf[i * 2 * OUT_LEN..][..2 * OUT_LEN])
+                    .try_into()
+                    .unwrap(),
+            );
         }
         let mut portable_parents_out = [0; NUM_INPUTS * OUT_LEN];
         crate::portable::hash_many(
@@ -350,18 +356,27 @@ fn test_compare_reference_impl() {
 
             // all at once
             let test_out = crate::hash(input);
-            assert_eq!(test_out, *array_ref!(expected_out, 0, 32));
+            assert_eq!(
+                test_out,
+                *<&[u8; 32]>::try_from(&expected_out[..32]).unwrap()
+            );
             // incremental
             let mut hasher = crate::Hasher::new();
             hasher.update(input);
-            assert_eq!(hasher.finalize(), *array_ref!(expected_out, 0, 32));
+            assert_eq!(
+                hasher.finalize(),
+                *<&[u8; 32]>::try_from(&expected_out[..32]).unwrap()
+            );
             assert_eq!(hasher.finalize(), test_out);
             // incremental (rayon)
             #[cfg(feature = "rayon")]
             {
                 let mut hasher = crate::Hasher::new();
                 hasher.update_rayon(input);
-                assert_eq!(hasher.finalize(), *array_ref!(expected_out, 0, 32));
+                assert_eq!(
+                    hasher.finalize(),
+                    *<&[u8; 32]>::try_from(&expected_out[..32]).unwrap()
+                );
                 assert_eq!(hasher.finalize(), test_out);
             }
             // xof
@@ -379,18 +394,27 @@ fn test_compare_reference_impl() {
 
             // all at once
             let test_out = crate::keyed_hash(&TEST_KEY, input);
-            assert_eq!(test_out, *array_ref!(expected_out, 0, 32));
+            assert_eq!(
+                test_out,
+                *<&[u8; 32]>::try_from(&expected_out[..32]).unwrap()
+            );
             // incremental
             let mut hasher = crate::Hasher::new_keyed(&TEST_KEY);
             hasher.update(input);
-            assert_eq!(hasher.finalize(), *array_ref!(expected_out, 0, 32));
+            assert_eq!(
+                hasher.finalize(),
+                *<&[u8; 32]>::try_from(&expected_out[..32]).unwrap()
+            );
             assert_eq!(hasher.finalize(), test_out);
             // incremental (rayon)
             #[cfg(feature = "rayon")]
             {
                 let mut hasher = crate::Hasher::new_keyed(&TEST_KEY);
                 hasher.update_rayon(input);
-                assert_eq!(hasher.finalize(), *array_ref!(expected_out, 0, 32));
+                assert_eq!(
+                    hasher.finalize(),
+                    *<&[u8; 32]>::try_from(&expected_out[..32]).unwrap()
+                );
                 assert_eq!(hasher.finalize(), test_out);
             }
             // xof
@@ -413,15 +437,27 @@ fn test_compare_reference_impl() {
             // incremental
             let mut hasher = crate::Hasher::new_derive_key(context);
             hasher.update(input);
-            assert_eq!(hasher.finalize(), *array_ref!(expected_out, 0, 32));
-            assert_eq!(hasher.finalize(), *array_ref!(test_out, 0, 32));
+            assert_eq!(
+                hasher.finalize(),
+                *<&[u8; 32]>::try_from(&expected_out[..32]).unwrap()
+            );
+            assert_eq!(
+                hasher.finalize(),
+                *<&[u8; 32]>::try_from(&test_out[..32]).unwrap()
+            );
             // incremental (rayon)
             #[cfg(feature = "rayon")]
             {
                 let mut hasher = crate::Hasher::new_derive_key(context);
                 hasher.update_rayon(input);
-                assert_eq!(hasher.finalize(), *array_ref!(expected_out, 0, 32));
-                assert_eq!(hasher.finalize(), *array_ref!(test_out, 0, 32));
+                assert_eq!(
+                    hasher.finalize(),
+                    *<&[u8; 32]>::try_from(&expected_out[..32]).unwrap()
+                );
+                assert_eq!(
+                    hasher.finalize(),
+                    *<&[u8; 32]>::try_from(&test_out[..32]).unwrap()
+                );
             }
             // xof
             let mut extended = [0; OUT];

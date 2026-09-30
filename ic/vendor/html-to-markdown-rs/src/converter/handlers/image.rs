@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 use crate::converter::Context;
 use crate::converter::dom_context::DomContext;
 use crate::converter::inline::link::{append_url_destination, escape_markdown_title};
-use crate::converter::utility::content::escape_link_label;
+use crate::converter::utility::attributes::decoded_attribute;
+use crate::converter::utility::escaping::escape_link_label;
 use crate::converter::utility::preprocessing::sanitize_markdown_url;
 use crate::options::ConversionOptions;
 
@@ -47,18 +48,19 @@ pub fn handle_img(
     depth: usize,
     dom_ctx: &DomContext,
 ) {
-    let src = tag.attributes().get("src").flatten().map_or(Cow::Borrowed(""), |v| {
-        let s = v.as_utf8_str();
-        Cow::Owned(sanitize_markdown_url(&s).into_owned())
-    });
+    let src: Cow<'_, str> = {
+        let effective_src = resolve_effective_src(tag);
+        let base_resolved = ctx.resolve_url(&effective_src);
+        Cow::Owned(sanitize_markdown_url(base_resolved.as_deref().unwrap_or(&effective_src)).into_owned())
+    };
 
-    let alt = tag
-        .attributes()
-        .get("alt")
-        .flatten()
-        .map_or(Cow::Borrowed(""), |v| v.as_utf8_str());
+    let alt = decoded_attribute(tag, "alt").unwrap_or(Cow::Borrowed(""));
 
-    let title = tag.attributes().get("title").flatten().map(|v| v.as_utf8_str());
+    // ~keep An empty `title=""` carries no information, and `[t](u "")` / `![a](i "")` is
+    // ~keep noise that no Markdown serializer round-trips: re-rendering the output drops
+    // ~keep the empty title, so the second pass no longer matches the first. Treat it as
+    // ~keep absent, which is what it means.
+    let title = decoded_attribute(tag, "title").filter(|v| !v.is_empty());
 
     #[cfg(feature = "metadata")]
     #[allow(clippy::useless_let_if_seq)]
@@ -114,7 +116,18 @@ pub fn handle_img(
         }
     }
 
-    let keep_as_markdown = (ctx.in_heading && ctx.heading_allow_inline_images) || ctx.cell_allow_inline_images;
+    // ~keep #492: `|| ctx.link_allow_inline_images` is purely additive relative to the
+    // ~keep pre-#492 expression -- it can only turn an image ON, never off, because
+    // ~keep `link_allow_inline_images` is `false` whenever "a" is absent from
+    // ~keep `keep_inline_images_in` (its only source, `handlers/link.rs`). So callers who
+    // ~keep never set the option see byte-identical output. Deliberately NOT mirrored with
+    // ~keep the heading pattern's negative clause (`|| (in_link && !link_allow)`): the no-`<p>`
+    // ~keep control already renders an image through the inline branch with
+    // ~keep `convert_as_inline == false`, so `should_use_alt_text` is `false` there today and
+    // ~keep the image survives -- a negative term would delete it, which is a real regression.
+    let keep_as_markdown = (ctx.in_heading && ctx.heading_allow_inline_images)
+        || ctx.cell_allow_inline_images
+        || ctx.link_allow_inline_images;
 
     let should_use_alt_text =
         !keep_as_markdown && (ctx.convert_as_inline || (ctx.in_heading && !ctx.heading_allow_inline_images));
@@ -218,6 +231,119 @@ pub fn handle_img(
     }
 }
 
+/// Single-URL attributes checked, in priority order, when `src` is missing or a
+/// `data:` URI. See [`resolve_effective_src`] for the full precedence rule.
+const LAZY_SINGLE_URL_ATTRIBUTES: [&str; 3] = ["data-src", "data-lazy-src", "data-original"];
+
+/// Resolve the effective image address for an `<img>` element, falling back to
+/// common lazy-loading attributes when `src` is empty or a `data:` URI.
+///
+/// ~keep Precedence, and why:
+/// ~keep 1. `src`, when non-empty and not a `data:` URI — trusted as-is even if it
+/// ~keep    happens to be a tiny placeholder graphic, because this crate cannot fetch
+/// ~keep    the URL to inspect its pixel dimensions, and some real pages already have
+/// ~keep    the genuine image in `src` while only the *other* attributes carry lazy
+/// ~keep    -load scaffolding (see `test_documents/html/issues/gh-190/rbloggers.html`'s
+/// ~keep    "jetpack-lazy-image" `<img>`: `src` is already the real photo URL, while
+/// ~keep    `srcset` holds nothing but the lazy-load 1x1 `data:` placeholder — treating
+/// ~keep    every populated `src` with suspicion would discard that real image).
+/// ~keep 2. `data-src`, `data-lazy-src`, `data-original`, in that order — each holds
+/// ~keep    exactly one URL, deliberately written by a lazy-load library as "the real
+/// ~keep    address", so they outrank the multi-candidate srcset attributes below,
+/// ~keep    which require guessing which listed candidate is "best".
+/// ~keep 3. `data-srcset`, then `srcset` — each may list several URLs with width/
+/// ~keep    density descriptors; the highest-resolution candidate is used (see
+/// ~keep    `pick_best_srcset_candidate`). `data-srcset` (explicitly a lazy-load
+/// ~keep    attribute) outranks plain `srcset`, which may itself have been
+/// ~keep    placeholder-ized by the same lazy-load pass that placeholder-ized `src`.
+/// ~keep 4. Otherwise, the original `src` (possibly empty, possibly a `data:` URI) is
+/// ~keep    kept unchanged. This is also what makes a plain `<img src="...">` with none
+/// ~keep    of the above attributes byte-identical to output produced before this
+/// ~keep    fallback existed.
+fn resolve_effective_src<'a>(tag: &'a tl::HTMLTag<'a>) -> Cow<'a, str> {
+    // ~keep Every read here goes through `decoded_attribute`: a URL attribute carries
+    // ~keep character references like any other (`src="i.png?a=1&amp;b=2"`), and `srcset` is
+    // ~keep parsed *after* decoding because the entity is not part of its comma/descriptor
+    // ~keep grammar. Issue #494.
+    let raw_src = decoded_attribute(tag, "src").unwrap_or(Cow::Borrowed(""));
+
+    if !raw_src.trim().is_empty() && !raw_src.trim_start().starts_with("data:") {
+        return raw_src;
+    }
+
+    for attr_name in LAZY_SINGLE_URL_ATTRIBUTES {
+        if let Some(value) = decoded_attribute(tag, attr_name) {
+            if !value.trim().is_empty() {
+                return value;
+            }
+        }
+    }
+
+    for attr_name in ["data-srcset", "srcset"] {
+        if let Some(value) = decoded_attribute(tag, attr_name) {
+            if let Some(candidate) = pick_best_srcset_candidate(&value) {
+                return Cow::Owned(candidate.to_string());
+            }
+        }
+    }
+
+    raw_src
+}
+
+/// Parse a `srcset`-shaped attribute value and return the URL of its highest
+/// -resolution candidate.
+///
+/// ~keep `srcset` lists one or more `"<url> [descriptor]"` candidates separated by
+/// ~keep commas, where a descriptor is a pixel density (`2x`) or a width (`800w`).
+/// ~keep Markdown has no responsive-image equivalent, so this picks a single URL: the
+/// ~keep candidate with the largest numeric descriptor, i.e. the highest-quality image
+/// ~keep offered (a high-resolution image degrades gracefully wherever it is viewed; a
+/// ~keep low-resolution one does not). A candidate with no descriptor is treated as the
+/// ~keep first candidate when no other candidate carries one either — the HTML spec
+/// ~keep allows at most one descriptor-less candidate, so there is nothing to compare it
+/// ~keep against in that case.
+/// ~keep
+/// ~keep Splitting on `,` is a simplification of the full HTML `srcset` grammar, which
+/// ~keep in rare cases allows a literal comma inside an unescaped URL; it matches every
+/// ~keep real-world `srcset` value this crate has been fed.
+fn pick_best_srcset_candidate(value: &str) -> Option<&str> {
+    let mut best: Option<(&str, f64)> = None;
+    let mut first_url: Option<&str> = None;
+
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let mut parts = entry.split_whitespace();
+        let Some(url) = parts.next() else {
+            continue;
+        };
+        if first_url.is_none() {
+            first_url = Some(url);
+        }
+
+        let score = parts.next().and_then(|descriptor| {
+            if descriptor.len() < 2 || !(descriptor.ends_with('w') || descriptor.ends_with('x')) {
+                return None;
+            }
+            descriptor[..descriptor.len() - 1].parse::<f64>().ok()
+        });
+
+        if let Some(score) = score {
+            let is_better = match best {
+                Some((_, best_score)) => score > best_score,
+                None => true,
+            };
+            if is_better {
+                best = Some((url, score));
+            }
+        }
+    }
+
+    best.map(|(url, _)| url).or(first_url)
+}
+
 /// Format an image as Markdown syntax.
 ///
 /// If `use_alt_only` is true, returns just the alt text.
@@ -256,7 +382,7 @@ fn format_image_markdown(
     buf.push_str(&escaped_alt);
     buf.push_str("](");
 
-    append_url_destination(&mut buf, src, url_escape_style);
+    append_url_destination(&mut buf, src, url_escape_style, title.is_some());
 
     if let Some(title_text) = title {
         buf.push_str(" \"");
@@ -298,6 +424,25 @@ mod tests {
             None,
         );
         assert_eq!(result, "![alt](/img%20%281%29.png)");
+    }
+
+    // ~keep Regression for the CommonMark spec fixpoint gap (spec example 520):
+    // ~keep `<img alt="[foo](uri2)">` previously emitted `![[foo](uri2)](uri3)`, which
+    // ~keep reparses with the alt text's `[foo](uri2)` becoming a real nested link --
+    // ~keep CommonMark parses an image's alt as full inline content, so only `foo`
+    // ~keep survived into the alt attribute on a second conversion and `uri2` was lost.
+    #[test]
+    fn format_image_markdown_escapes_link_shaped_alt_text() {
+        let result = format_image_markdown(
+            "uri3",
+            "[foo](uri2)",
+            None,
+            false,
+            LinkStyle::Inline,
+            UrlEscapeStyle::Angle,
+            None,
+        );
+        assert_eq!(result, "![\\[foo\\](uri2)](uri3)");
     }
 
     #[test]

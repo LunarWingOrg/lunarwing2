@@ -1127,6 +1127,7 @@ impl PartialEq<Self> for Name {
 impl Hash for Name {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.is_fqdn.hash(state);
+        self.label_ends.hash(state);
         // Note: case-insensitive like `PartialEq`
         self.iter()
             .flatten()
@@ -1230,18 +1231,17 @@ impl<'r> BinDecodable<'r> for Name {
     /// This will consume the portions of the `Vec` which it is reading...
     fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let mut name = Self::default();
-        read_inner(decoder, &mut name, None)?;
+        read_inner(decoder, &mut name)?;
         Ok(name)
     }
 }
 
-fn read_inner(
-    decoder: &mut BinDecoder<'_>,
-    name: &mut Name,
-    max_idx: Option<usize>,
-) -> Result<(), DecodeError> {
+fn read_inner(decoder: &mut BinDecoder<'_>, name: &mut Name) -> Result<(), DecodeError> {
     let mut state: LabelParseState = LabelParseState::LabelLengthOrPointer;
-    let name_start = decoder.index();
+    let mut ptr_max_idx = None;
+    let mut decoder_tmp;
+    let mut decoder = &mut *decoder;
+    let mut name_start = decoder.index();
 
     // assume all chars are utf-8. We're doing byte-by-byte operations, no endianness issues...
     // reserved: (1000 0000 aka 0800) && (0100 0000 aka 0400)
@@ -1249,8 +1249,8 @@ fn read_inner(
     // label: 03FF & slice = length; slice.next(length) = label
     // root: 0000
     loop {
-        // this protects against overlapping labels
-        if let Some(max_idx) = max_idx {
+        // this protects against overlapping labels when chasing pointers
+        if let Some(max_idx) = ptr_max_idx {
             if decoder.index() >= max_idx {
                 return Err(DecodeError::LabelOverlapsWithOther {
                     label: name_start,
@@ -1340,11 +1340,12 @@ fn read_inner(
                         ptr: e,
                     })?;
 
-                let mut pointer = decoder.clone(location);
-                read_inner(&mut pointer, name, Some(name_start))?;
-
-                // Pointers always finish the name, break like Root.
-                break;
+                // chase the pointer
+                ptr_max_idx = Some(name_start);
+                decoder_tmp = decoder.clone(location);
+                decoder = &mut decoder_tmp;
+                name_start = decoder.index();
+                LabelParseState::LabelLengthOrPointer
             }
             LabelParseState::Root => {
                 // need to pop() the 0 off the stack...
@@ -1661,6 +1662,31 @@ mod tests {
         let mut d = BinDecoder::new(&bytes);
 
         assert!(Name::read(&mut d).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_long_pointer_chain_small_stack() {
+        // Build a buffer of the form: [0x00, ptr->0, ptr->prev, ptr->prev, ...]
+        let mut bytes = vec![0x00, 0xC0, 0x00];
+        let mut last_ptr_offset: u16 = 1;
+        for _ in 1..8000 {
+            last_ptr_offset = bytes.len() as u16 - 2;
+            bytes.extend(&u16::to_be_bytes(0xC000 | last_ptr_offset));
+        }
+
+        // Formerly a stack overflow
+        let name = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut decoder = BinDecoder::new(&bytes).clone(last_ptr_offset);
+                Name::read(&mut decoder).unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(name, Name::root());
     }
 
     #[test]
@@ -2543,18 +2569,31 @@ mod tests {
     #[test]
     #[cfg(feature = "std")]
     fn test_hash() {
-        // verify that two identical names with and without the trailing dot hashes to the same value
-        let mut hasher = DefaultHasher::new();
+        // verify that two identical names with and without the trailing dot don't hash to the same
+        // value
         let with_dot = Name::from_utf8("com.").unwrap();
-        with_dot.hash(&mut hasher);
-        let hash_with_dot = hasher.finish();
+        let hash_with_dot = hash(&with_dot);
 
-        let mut hasher = DefaultHasher::new();
         let without_dot = Name::from_utf8("com").unwrap();
-        without_dot.hash(&mut hasher);
-        let hash_without_dot = hasher.finish();
+        let hash_without_dot = hash(&without_dot);
         assert_ne!(with_dot, without_dot);
         assert_ne!(hash_with_dot, hash_without_dot);
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_name_hash_label_boundaries() {
+        let ab_c = Name::parse("ab.c.", None).unwrap();
+        let a_bc = Name::parse("a.bc.", None).unwrap();
+        assert_ne!(ab_c, a_bc);
+        assert_ne!(hash(&ab_c), hash(&a_bc));
+    }
+
+    #[cfg(feature = "std")]
+    fn hash(name: &Name) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        hasher.finish()
     }
 
     #[test]

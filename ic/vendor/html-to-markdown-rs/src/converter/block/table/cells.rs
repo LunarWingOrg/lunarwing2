@@ -51,6 +51,70 @@ impl CellTextCache {
     }
 }
 
+/// Read-only conversion inputs threaded together through row/cell rendering: the parser, user
+/// options, conversion `Context`, and DOM lookup context.
+///
+/// ~keep These four are always passed as a group across this module's row-rendering functions;
+/// ~keep bundling them keeps each function's own signature down to its row/cell-specific
+/// ~keep parameters instead of repeating all four everywhere (too-many-parameters).
+#[derive(Clone, Copy)]
+pub struct RowEnv<'p> {
+    pub parser: &'p tl::Parser<'p>,
+    pub options: &'p crate::options::ConversionOptions,
+    pub ctx: &'p super::super::super::Context,
+    pub dom_ctx: &'p super::super::super::DomContext,
+}
+
+/// Append one layout-table cell's converted text to `row_text`, space-joining after the first
+/// non-empty cell.
+///
+/// Extracted from `append_layout_row`'s per-cell loop body — identical cell-name check,
+/// inline-image handling, and whitespace trim, unchanged.
+fn append_layout_cell_text(cell_handle: &tl::NodeHandle, row_text: &mut String, env: RowEnv<'_>, depth: usize) {
+    let Some(tl::Node::Tag(cell_tag)) = cell_handle.get(env.parser) else {
+        return;
+    };
+    let cell_name: Cow<'_, str> = env.dom_ctx.tag_info(cell_handle.get_inner(), env.parser).map_or_else(
+        || normalized_tag_name(cell_tag.name().as_utf8_str()).into_owned().into(),
+        |info| Cow::Borrowed(info.name.as_str()),
+    );
+    if !matches!(cell_name.as_ref(), "td" | "th" | "cell") {
+        return;
+    }
+
+    let mut cell_text = String::new();
+    // ~keep issue #433/#500: a layout row renders as a list item, and list items keep inline
+    // ~keep images by default (only headings degrade an image to its alt text), so this cell
+    // ~keep always allows them regardless of `keep_inline_images_in`. That option still governs
+    // ~keep image handling elsewhere; it is simply not needed to keep images in a layout cell.
+    let cell_allow_inline_images = true;
+    let cell_ctx = super::super::super::Context {
+        convert_as_inline: true,
+        in_layout_cell: true,
+        cell_allow_inline_images,
+        ..env.ctx.clone()
+    };
+    let cell_children = cell_tag.children();
+    for cell_child in cell_children.top().iter() {
+        super::super::super::walk_node(
+            cell_child,
+            env.parser,
+            &mut cell_text,
+            env.options,
+            &cell_ctx,
+            depth + 1,
+            env.dom_ctx,
+        );
+    }
+    let cell_content = crate::text::normalize_whitespace_cow(&cell_text);
+    if !cell_content.trim().is_empty() {
+        if !row_text.is_empty() {
+            row_text.push(' ');
+        }
+        row_text.push_str(cell_content.trim());
+    }
+}
+
 /// Append a layout table row as a list item.
 ///
 /// For tables used for visual layout, converts rows to list items
@@ -58,76 +122,82 @@ impl CellTextCache {
 ///
 /// # Arguments
 /// * `row_handle` - Handle to the row element
-/// * `parser` - HTML parser instance
 /// * `output` - Mutable string to append content
-/// * `options` - Conversion options
-/// * `ctx` - Conversion context
-/// * `dom_ctx` - DOM context
+/// * `env` - Parser, options, conversion context, and DOM context
 /// * `depth` - Current recursion depth (the row's own depth; cell content is walked at `depth + 1`)
 #[allow(clippy::trivially_copy_pass_by_ref)]
-#[allow(clippy::too_many_arguments)]
-pub fn append_layout_row(
-    row_handle: &tl::NodeHandle,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::super::super::Context,
-    dom_ctx: &super::super::super::DomContext,
-    depth: usize,
-) {
-    if let Some(tl::Node::Tag(row_tag)) = row_handle.get(parser) {
-        let mut row_text = String::new();
-        let row_children = row_tag.children();
-        for cell_handle in row_children.top().iter() {
-            if let Some(tl::Node::Tag(cell_tag)) = cell_handle.get(parser) {
-                let cell_name: Cow<'_, str> = dom_ctx.tag_info(cell_handle.get_inner(), parser).map_or_else(
-                    || normalized_tag_name(cell_tag.name().as_utf8_str()).into_owned().into(),
-                    |info| Cow::Borrowed(info.name.as_str()),
-                );
-                if matches!(cell_name.as_ref(), "td" | "th" | "cell") {
-                    let mut cell_text = String::new();
-                    // ~keep issue #433: honor keep_inline_images_in for images in
-                    // ~keep layout-table cells even though cell content is converted
-                    // ~keep as inline. A matching cell tag keeps images as markdown.
-                    let cell_allow_inline_images = ctx.keep_inline_images_in.contains(cell_name.as_ref());
-                    let cell_ctx = super::super::super::Context {
-                        convert_as_inline: true,
-                        cell_allow_inline_images,
-                        ..ctx.clone()
-                    };
-                    let cell_children = cell_tag.children();
-                    for cell_child in cell_children.top().iter() {
-                        super::super::super::walk_node(
-                            cell_child,
-                            parser,
-                            &mut cell_text,
-                            options,
-                            &cell_ctx,
-                            depth + 1,
-                            dom_ctx,
-                        );
-                    }
-                    let cell_content = crate::text::normalize_whitespace_cow(&cell_text);
-                    if !cell_content.trim().is_empty() {
-                        if !row_text.is_empty() {
-                            row_text.push(' ');
-                        }
-                        row_text.push_str(cell_content.trim());
-                    }
-                }
-            }
-        }
+pub fn append_layout_row(row_handle: &tl::NodeHandle, output: &mut String, env: RowEnv<'_>, depth: usize) {
+    let Some(tl::Node::Tag(row_tag)) = row_handle.get(env.parser) else {
+        return;
+    };
+    let mut row_text = String::new();
+    let row_children = row_tag.children();
+    for cell_handle in row_children.top().iter() {
+        append_layout_cell_text(cell_handle, &mut row_text, env, depth);
+    }
 
-        let trimmed = row_text.trim();
-        if !trimmed.is_empty() {
-            if !output.is_empty() && !output.ends_with('\n') {
-                output.push('\n');
-            }
-            let formatted = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
-            output.push_str("- ");
-            output.push_str(formatted);
+    let trimmed = row_text.trim();
+    if !trimmed.is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
+        let marker = layout_row_bullet(env.options, env.ctx);
+        let formatted = strip_leading_bullet(trimmed, env.options);
+        output.push(marker);
+        output.push(' ');
+        output.push_str(formatted);
+        output.push('\n');
+    }
+}
+
+/// The list marker a layout row renders with.
+///
+/// A layout table's rows are list items, so they cycle through `options.bullets` by nesting
+/// depth exactly as `list::item` does. The row sits one level deeper than its surroundings --
+/// `ul_depth` is still the *enclosing* depth here, where `list::item` has already counted its
+/// own `<ul>` -- so the index is `ul_depth` rather than `ul_depth - 1`. A layout table nested
+/// in a list therefore takes the next marker instead of repeating its parent's (issue #472).
+fn layout_row_bullet(options: &crate::options::ConversionOptions, ctx: &super::super::super::Context) -> char {
+    let bullets: Vec<char> = options.bullets.chars().collect();
+    if bullets.is_empty() {
+        return '*';
+    }
+    bullets[ctx.ul_depth % bullets.len()]
+}
+
+/// Drop a leading list marker the cell content already produced, so the row's own marker is not
+/// doubled up. Any configured bullet counts, not just `-`: the marker being stripped was written
+/// by this same cycling rule, so hardcoding one character missed every other configured set.
+fn strip_leading_bullet<'a>(trimmed: &'a str, options: &crate::options::ConversionOptions) -> &'a str {
+    for bullet in options.bullets.chars().chain(['-', '*', '+']) {
+        let mut marker = String::with_capacity(2);
+        marker.push(bullet);
+        marker.push(' ');
+        if let Some(rest) = trimmed.strip_prefix(marker.as_str()) {
+            return rest.trim_start();
+        }
+    }
+    trimmed
+}
+
+/// Advance `col` past any columns whose rowspan tracker still has rows remaining, decrementing
+/// each as it is skipped and clearing the tracker entry once exhausted.
+///
+/// Extracted from `collect_row_cell_widths`'s inner loop — identical decrement-and-clear logic,
+/// unchanged.
+fn skip_rowspan_columns(col: &mut usize, rowspan_tracker: &mut [Option<usize>]) {
+    while *col < rowspan_tracker.len() {
+        let Some(Some(remaining)) = rowspan_tracker.get_mut(*col) else {
+            break;
+        };
+        if *remaining == 0 {
+            break;
+        }
+        *remaining -= 1;
+        if *remaining == 0 {
+            rowspan_tracker[*col] = None;
+        }
+        *col += 1;
     }
 }
 
@@ -138,45 +208,37 @@ pub fn append_layout_row(
 /// Pass a shared tracker across all row calls to correctly handle multi-row spans.
 ///
 /// `depth` is the row's own recursion depth; cell content is measured at `depth + 1`.
+///
+/// # Arguments
+/// * `node_handle` - Handle to the row element
+/// * `env` - Parser, options, conversion context, and DOM context
+/// * `col_widths` - Per-column max content widths accumulated so far
+/// * `rowspan_tracker` - Mutable array tracking rowspan remainder for each column
+/// * `cell_cache` - Rendered markdown to store for later reuse by the render pass
+/// * `depth` - Row's own recursion depth
 #[allow(clippy::trivially_copy_pass_by_ref)]
-#[allow(clippy::too_many_arguments)]
 pub fn collect_row_cell_widths(
     node_handle: &tl::NodeHandle,
-    parser: &tl::Parser,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::super::super::Context,
-    dom_ctx: &super::super::super::DomContext,
+    env: RowEnv<'_>,
     col_widths: &mut Vec<usize>,
     rowspan_tracker: &mut Vec<Option<usize>>,
     cell_cache: &mut CellTextCache,
     depth: usize,
 ) {
     let mut cells = Vec::new();
-    collect_table_cells(node_handle, parser, dom_ctx, &mut cells);
+    collect_table_cells(node_handle, env.parser, env.dom_ctx, &mut cells);
 
     let mut col = 0usize;
     let mut cell_iter = cells.iter();
 
     loop {
-        while col < rowspan_tracker.len() {
-            if let Some(Some(remaining)) = rowspan_tracker.get_mut(col) {
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    if *remaining == 0 {
-                        rowspan_tracker[col] = None;
-                    }
-                    col += 1;
-                    continue;
-                }
-            }
-            break;
-        }
+        skip_rowspan_columns(&mut col, rowspan_tracker);
 
         let Some(cell_handle) = cell_iter.next() else {
             break;
         };
 
-        let text = cell_text_content(cell_handle, parser, options, ctx, dom_ctx, depth + 1);
+        let text = cell_text_content(cell_handle, env.parser, env.options, env.ctx, env.dom_ctx, depth + 1);
         const MAX_CELL_WIDTH: usize = 200;
         let width = text.chars().count().min(MAX_CELL_WIDTH);
         cell_cache.store(cell_handle.get_inner(), text);
@@ -188,7 +250,7 @@ pub fn collect_row_cell_widths(
             col_widths[col] = width;
         }
 
-        let (colspan, rowspan) = get_colspan_rowspan(cell_handle, parser);
+        let (colspan, rowspan) = get_colspan_rowspan(cell_handle, env.parser);
 
         if rowspan > 1 {
             if col >= rowspan_tracker.len() {
@@ -203,39 +265,80 @@ pub fn collect_row_cell_widths(
 
 /// Emit one cell of a rendered row, reusing the pre-pass rendering when it is cached.
 ///
-/// `depth` is the cell's own recursion depth.
+/// `env.ctx` is used as the cell's own context (already carrying `in_table_cell = true`).
+/// `depth` is the cell's own recursion depth. `deferred_tables` is forwarded to
+/// [`convert_table_cell`]; see [`super::cell::render_cell_text`] for what it does.
 #[allow(clippy::trivially_copy_pass_by_ref)]
-#[allow(clippy::too_many_arguments)]
 fn emit_row_cell(
     cell_handle: &tl::NodeHandle,
-    parser: &tl::Parser,
     row_text: &mut String,
-    options: &crate::options::ConversionOptions,
-    cell_ctx: &super::super::super::Context,
-    dom_ctx: &super::super::super::DomContext,
+    env: RowEnv<'_>,
     col_width: Option<usize>,
     depth: usize,
     cell_cache: &mut CellTextCache,
+    deferred_tables: Option<&mut Vec<String>>,
 ) {
     if let Some(text) = cell_cache.take(cell_handle.get_inner()) {
-        emit_cell_text(cell_handle, parser, row_text, &text, col_width);
+        emit_cell_text(cell_handle, env.parser, row_text, &text, col_width);
     } else {
         convert_table_cell(
             cell_handle,
-            parser,
+            env.parser,
             row_text,
-            options,
-            cell_ctx,
+            env.options,
+            env.ctx,
             "",
-            dom_ctx,
+            env.dom_ctx,
             col_width,
             depth,
+            deferred_tables,
         );
     }
 }
 
 /// Minimum separator dash count per column (matches `---`).
 const MIN_SEPARATOR_DASHES: usize = 3;
+
+/// If `col_index` still has pending rowspan rows, emit its blank continuation cell (padded to
+/// `col_widths`) into `row_text` and advance `col_index` past it.
+///
+/// Returns `true` when a continuation cell was emitted (caller should retry from the top of the
+/// loop) and `false` when `col_index` is not a pending rowspan continuation.
+///
+/// Extracted from `convert_table_row`'s has-span loop — identical padding and rowspan-tracker
+/// bookkeeping, unchanged.
+fn emit_rowspan_continuation(
+    col_index: &mut usize,
+    total_cols: usize,
+    rowspan_tracker: &mut [Option<usize>],
+    col_widths: &[usize],
+    row_text: &mut String,
+) -> bool {
+    if *col_index >= total_cols {
+        return false;
+    }
+    let Some(Some(remaining_rows)) = rowspan_tracker.get_mut(*col_index) else {
+        return false;
+    };
+    if *remaining_rows == 0 {
+        return false;
+    }
+
+    let width = col_widths.get(*col_index).copied();
+    row_text.push(' ');
+    if let Some(w) = width {
+        for _ in 0..w {
+            row_text.push(' ');
+        }
+    }
+    row_text.push_str(" |");
+    *remaining_rows -= 1;
+    if *remaining_rows == 0 {
+        rowspan_tracker[*col_index] = None;
+    }
+    *col_index += 1;
+    true
+}
 
 /// Convert a table row (tr) to Markdown format.
 ///
@@ -259,32 +362,37 @@ const MIN_SEPARATOR_DASHES: usize = 3;
 /// * `is_header` - Whether this is a header row
 /// * `col_widths` - Per-column max content widths for padding (empty = no padding)
 /// * `cell_cache` - Markdown already rendered for these cells by the width pre-pass
+/// * `deferred_tables` - Collects a nested table's markdown when this row's sole cell holds
+///   one; see [`super::cell::render_cell_text`]. The caller renders these separately, after the
+///   enclosing table, once every row has been processed (issue #484).
+///
+/// # Returns
+/// `false` when the row collected zero cells (nothing was emitted); `true` otherwise. Callers
+/// must only advance their own row counter when this returns `true` (issue #489).
+/// Run the row-level visitor hook, if one is registered.
+///
+/// Returns `Some(bool)` when the visitor decided the row is fully handled and
+/// `convert_table_row` must return that value immediately; `None` when rendering should
+/// continue as normal. Split out of `convert_table_row` to keep that function under the
+/// cyclomatic-complexity gate.
+#[cfg(feature = "visitor")]
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-#[allow(clippy::trivially_copy_pass_by_ref)]
-pub fn convert_table_row(
+fn run_row_visitor_hook(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
     options: &crate::options::ConversionOptions,
     ctx: &super::super::super::Context,
     row_index: usize,
-    has_span: bool,
-    rowspan_tracker: &mut [Option<usize>],
-    total_cols: usize,
-    header_cols: usize,
-    dom_ctx: &super::super::super::DomContext,
-    depth: usize,
     is_header: bool,
-    col_widths: &[usize],
-    cell_cache: &mut CellTextCache,
-) {
-    let mut row_text = String::with_capacity(256);
-    let mut cells = Vec::new();
+    cells: &[tl::NodeHandle],
+    depth: usize,
+    dom_ctx: &super::super::super::DomContext,
+) -> Option<bool> {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
 
-    collect_table_cells(node_handle, parser, dom_ctx, &mut cells);
+    let visitor_handle = ctx.visitor.as_ref()?;
 
-    #[cfg(feature = "visitor")]
     let cell_contents: Vec<String> = if ctx.visitor.is_some() {
         // ~keep Same rule as the width pre-pass: this walk only feeds the `visit_table_row`
         // ~keep callback, the render pass below walks these cells again (a visitor disables
@@ -327,44 +435,102 @@ pub fn convert_table_row(
         Vec::new()
     };
 
-    #[cfg(feature = "visitor")]
-    if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
+    let tl::Node::Tag(tag) = node_handle.get(parser)? else {
+        return None;
+    };
 
-        if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::TableRow,
-                Cow::Borrowed("tr"),
-                tag,
-                depth,
-                row_index,
-                Some(Cow::Borrowed("table")),
-                false,
-            );
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::TableRow,
+        Cow::Borrowed("tr"),
+        tag,
+        depth,
+        row_index,
+        Some(Cow::Borrowed("table")),
+        false,
+    );
 
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_table_row(&node_ctx, &cell_contents, is_header)
-            };
-            match visit_result {
-                VisitResult::Continue => {}
-                VisitResult::Skip => return,
-                VisitResult::Custom(custom) => {
-                    output.push_str(&custom);
-                    return;
-                }
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    return;
-                }
-                VisitResult::PreserveHtml => {
-                    output.push_str(&super::super::super::serialize_node(node_handle, parser));
-                    return;
-                }
-            }
+    let visit_result = {
+        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
+        visitor.visit_table_row(&node_ctx, &cell_contents, is_header)
+    };
+
+    match visit_result {
+        VisitResult::Continue => None,
+        // ~keep Pre-existing visitor early returns, unrelated to issue #489: `true`
+        // ~keep preserves prior behavior of always advancing `row_index` here.
+        VisitResult::Skip => Some(true),
+        VisitResult::Custom(custom) => {
+            output.push_str(&custom);
+            Some(true)
         }
+        VisitResult::Error(err) => {
+            if ctx.visitor_error.borrow().is_none() {
+                *ctx.visitor_error.borrow_mut() = Some(err);
+            }
+            Some(true)
+        }
+        VisitResult::PreserveHtml => {
+            output.push_str(&super::super::super::serialize_node(node_handle, parser));
+            Some(true)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub fn convert_table_row(
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    options: &crate::options::ConversionOptions,
+    ctx: &super::super::super::Context,
+    row_index: usize,
+    has_span: bool,
+    rowspan_tracker: &mut [Option<usize>],
+    total_cols: usize,
+    header_cols: usize,
+    dom_ctx: &super::super::super::DomContext,
+    depth: usize,
+    is_header: bool,
+    col_widths: &[usize],
+    cell_cache: &mut CellTextCache,
+    deferred_tables: &mut Vec<String>,
+) -> bool {
+    let mut row_text = String::with_capacity(256);
+    let mut cells = Vec::new();
+
+    collect_table_cells(node_handle, parser, dom_ctx, &mut cells);
+    // ~keep A nested table may only be deferred out of a cell that shares its row with no
+    // ~keep other cell -- pulling it out of a row with a sibling would leave that sibling's
+    // ~keep column position undefined (issue #469 locks the sibling-cell shape to the
+    // ~keep existing flatten-and-escape behavior; issue #484 is the single-cell-row shape).
+    let is_single_cell_row = cells.len() == 1;
+
+    // ~keep A row whose only children were non-cell elements (e.g. `tl`'s `read_end`
+    // ~keep dropped an unmatched `</table>`, stranding a `<p>` inside this `<tr>`)
+    // ~keep collects zero cells here. Bailing before any output lets the *next* real
+    // ~keep row become row 0 -- and thus the header -- matching Tier 1's behavior
+    // ~keep (issue #489). The caller only advances `row_index` when this returns
+    // ~keep `true`, so a skipped row does not consume a row-index slot.
+    if cells.is_empty() {
+        return false;
+    }
+
+    #[cfg(feature = "visitor")]
+    if let Some(early_return) = run_row_visitor_hook(
+        node_handle,
+        parser,
+        output,
+        options,
+        ctx,
+        row_index,
+        is_header,
+        &cells,
+        depth,
+        dom_ctx,
+    ) {
+        return early_return;
     }
 
     // ~keep Build the per-cell context once for the entire row.  Tier-2 hot-spot
@@ -375,44 +541,33 @@ pub fn convert_table_row(
         ..ctx.clone()
     };
 
+    let row_env = RowEnv {
+        parser,
+        options,
+        ctx: &cell_ctx,
+        dom_ctx,
+    };
+
     let mut filled_cols = if has_span {
         let mut col_index = 0;
         let mut cell_iter = cells.iter();
 
         loop {
-            if col_index < total_cols {
-                if let Some(Some(remaining_rows)) = rowspan_tracker.get_mut(col_index) {
-                    if *remaining_rows > 0 {
-                        let width = col_widths.get(col_index).copied();
-                        row_text.push(' ');
-                        if let Some(w) = width {
-                            for _ in 0..w {
-                                row_text.push(' ');
-                            }
-                        }
-                        row_text.push_str(" |");
-                        *remaining_rows -= 1;
-                        if *remaining_rows == 0 {
-                            rowspan_tracker[col_index] = None;
-                        }
-                        col_index += 1;
-                        continue;
-                    }
-                }
+            if emit_rowspan_continuation(&mut col_index, total_cols, rowspan_tracker, col_widths, &mut row_text) {
+                continue;
             }
 
             if let Some(cell_handle) = cell_iter.next() {
                 let col_width = col_widths.get(col_index).copied();
+                let deferred = is_single_cell_row.then_some(&mut *deferred_tables);
                 emit_row_cell(
                     cell_handle,
-                    parser,
                     &mut row_text,
-                    options,
-                    &cell_ctx,
-                    dom_ctx,
+                    row_env,
                     col_width,
                     depth + 1,
                     cell_cache,
+                    deferred,
                 );
 
                 let (colspan, rowspan) = get_colspan_rowspan(cell_handle, parser);
@@ -430,16 +585,15 @@ pub fn convert_table_row(
     } else {
         for (cell_idx, cell_handle) in cells.iter().enumerate() {
             let col_width = col_widths.get(cell_idx).copied();
+            let deferred = is_single_cell_row.then_some(&mut *deferred_tables);
             emit_row_cell(
                 cell_handle,
-                parser,
                 &mut row_text,
-                options,
-                &cell_ctx,
-                dom_ctx,
+                row_env,
                 col_width,
                 depth + 1,
                 cell_cache,
+                deferred,
             );
         }
         cells.len()
@@ -480,4 +634,6 @@ pub fn convert_table_row(
         }
         output.push_str(" |\n");
     }
+
+    true
 }

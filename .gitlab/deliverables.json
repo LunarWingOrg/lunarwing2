@@ -1,6 +1,19 @@
 {
   "schema": 1,
-  "comment": "Canonical classification of every tracked non-vendor Cargo.lock root (GOAL32 P1.4). CI validation fails when a lockfile is missing from this manifest, an entry points at a missing manifest/lockfile, or a classified production unit loses its CI coverage. status: production | experimental | fixture | mirror | retired | staging.",
+  "comment": "Canonical classification of every tracked non-vendor Cargo.lock (GOAL32 P1.4). deliverables have Cargo manifests; build_inputs classify lock-only overrides consumed by worker images. CI rejects missing classifications, missing files, or lost coverage. status: production | experimental | fixture | mirror | retired | staging.",
+  "build_inputs": [
+    {
+      "name": "pebble-upstream-lock-override",
+      "kind": "cargo-lock-override",
+      "owner": "workers",
+      "consumer": "pebble4lunarwing",
+      "lockfile": "pebble4lunarwing/upstream/Cargo.lock",
+      "dockerfile": "pebble4lunarwing/Dockerfile",
+      "ci": ["ci-config", "worker-pebble-candidate"],
+      "triggers": ["pebble4lunarwing/**", ".gitlab/scripts/build-worker-image.sh"],
+      "comment": "No standalone Cargo.toml: replaces the pinned upstream checkout's lock during the protected worker build; ci-config verifies its canonical digest and regression-tests the package-record allowlist."
+    }
+  ],
   "deliverables": [
     {
       "name": "lunarwing-daemon-workspace",

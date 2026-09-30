@@ -124,28 +124,44 @@ fn should_handle_list_in_table_cell() {
 // ~keep markdown.  The parent cell's newline collapse then squashes the inner
 // ~keep table's `\n`-separated rows into a single inline run, matching Tier-2.
 // ~keep The `TableNestedTable` bail variant is retained for back-compat but is
-// ~keep no longer reachable from the scanner.
+// ~keep used for single-cell layout wrappers, which Tier-2 unwraps (issue #478).
 
 #[test]
 fn should_handle_nested_table_inside_cell() {
-    let html = "<table><tr><td><table><tr><td>inner</td></tr></table></td></tr></table>";
+    let html = "<table><tr><td><table><tr><td>inner</td></tr></table></td><td>Other</td></tr></table>";
     let t1 = tier1_run(html).expect("Tier-1 should not bail on nested <table> (Phase HH)");
     let t2 = tier2(html);
-    // ~keep Both tiers emit the same outer row content (nested table flattened to inline GFM
-    // ~keep markdown).  Separator-row dash counts diverge: Tier-1 measures the rendered cell
-    // ~keep text (including the flattened nested-table separator) so it pads to the full width,
-    // ~keep while Tier-2's measurement pre-pass deliberately skips nested-table rendering to
-    // ~keep avoid the O(N²) cell × nested-cell measurement explosion (#406).  Both shapes are
-    // ~keep valid GFM; bringing Tier-1 into alignment with Tier-2's narrower measurement is a
-    // ~keep follow-up.
+    // ~keep The two tiers still intentionally diverge on the pre-existing separator-row
+    // ~keep dash-count difference from #406 (Tier-1 measures the full rendered cell text;
+    // ~keep Tier-2's measurement pre-pass skips nested-table rendering to avoid the O(N²)
+    // ~keep cell × nested-cell explosion) -- that one stays. But Tier-1 now also escapes
+    // ~keep the bare `|` a nested table's own row/separator syntax leaves in the flattened
+    // ~keep cell, matching Tier-2's `render_cell_text` (block/table/cell.rs, commit
+    // ~keep ee77eb2a18): left unescaped, those characters are read as *the outer row's*
+    // ~keep cell boundaries on a real reparse, silently widening -- and on a second parse,
+    // ~keep truncating -- the containing row's column count (genuine content loss).
     assert!(
-        t1.starts_with("| | inner | | ----- | |\n"),
-        "Tier-1 outer row content must include flattened nested table; got: {t1:?}"
+        t1.starts_with(r"| \| inner \| \| ----- \| |") && t1.ends_with('\n'),
+        "Tier-1 outer row content must include the flattened, pipe-escaped nested table; got: {t1:?}"
     );
     assert!(
-        t2.starts_with("| | inner | | ----- | |\n"),
-        "Tier-2 outer row content must include flattened nested table; got: {t2:?}"
+        t2.starts_with(r"| \| inner \| \| ----- \| |") && t2.ends_with('\n'),
+        "Tier-2 outer row content must include the flattened, pipe-escaped nested table; got: {t2:?}"
     );
+}
+
+#[test]
+fn should_fall_back_for_single_cell_nested_table_wrappers() {
+    let html = "<table><tr><td><table><tr><td>inner</td></tr></table></td></tr></table>";
+    assert!(matches!(tier1_run(html), Err(BailReason::TableNestedTable)));
+    let expected = "| inner |\n| ----- |\n";
+    assert_eq!(tier2(html), expected);
+    assert_eq!(force_tier1(html), expected);
+    let options = ConversionOptions {
+        extract_metadata: false,
+        ..Default::default()
+    };
+    assert_eq!(convert(html, Some(options)).unwrap().content.unwrap(), expected);
 }
 
 // ~keep ── TableCaption ──────────────────────────────────────────────────────────────
@@ -204,25 +220,49 @@ fn sibling_list_items_in_a_table_cell_are_separated() {
     // ~keep `should_handle_list_in_table_cell` above uses a single <li>, which is why
     // ~keep this regression went unnoticed: with the marker stripped for cell context,
     // ~keep consecutive items were appended with no separator at all, so <li>a</li><li>b</li>
-    // ~keep rendered as the fabricated word `ab`. Both tiers now emit the same <br>
-    // ~keep boundary already used between sibling <p>/<div> in a cell.
-    for (html, expected_cell) in [
+    // ~keep rendered as the fabricated word `ab`. Both tiers now emit the same
+    // ~keep `br_in_tables`-gated boundary already used between sibling <p>/<div> in a
+    // ~keep cell: a literal `<br>` when true, a single space when false (see
+    // ~keep `main_helpers::emit_table_cell_break`) -- `br_in_tables: false` used to be
+    // ~keep ignored here and a literal `<br>` was emitted regardless of the option.
+    for (html, expected_cell_br_true, expected_cell_br_false) in [
         (
             "<table><tr><td><ul><li>a</li><li>b</li></ul></td></tr></table>",
             "a<br>b",
+            "a b",
         ),
         (
             "<table><tr><td><ol><li>one</li><li>two</li></ol></td></tr></table>",
             "one<br>two",
+            "one two",
         ),
     ] {
-        let t2 = tier2(html);
-        assert!(
-            t2.contains(expected_cell),
-            "Tier-2 cell should contain `{expected_cell}`, got:\n{t2}"
-        );
-        assert!(!t2.contains("ab |"), "list items must not be concatenated, got:\n{t2}");
-        let t1 = tier1_run(html).expect("Tier-1 should not bail on a list in a cell");
-        assert_eq!(t1, t2, "Tier-1 and Tier-2 must agree byte-for-byte");
+        for (br_in_tables, expected_cell) in [(true, expected_cell_br_true), (false, expected_cell_br_false)] {
+            let opts = ConversionOptions {
+                tier_strategy: TierStrategy::Tier2,
+                extract_metadata: false,
+                br_in_tables,
+                ..ConversionOptions::default()
+            };
+            let t2 = convert(html, Some(opts)).unwrap().content.unwrap_or_default();
+            assert!(
+                t2.contains(expected_cell),
+                "Tier-2 cell (br_in_tables: {br_in_tables}) should contain `{expected_cell}`, got:\n{t2}"
+            );
+            assert!(!t2.contains("ab |"), "list items must not be concatenated, got:\n{t2}");
+
+            let (cleaned, report) = prescan::run(html);
+            let opts1 = ConversionOptions {
+                tier_strategy: TierStrategy::Tier1,
+                extract_metadata: false,
+                br_in_tables,
+                ..ConversionOptions::default()
+            };
+            let t1 = tier1::run(cleaned.as_ref(), &report, &opts1).expect("Tier-1 should not bail on a list in a cell");
+            assert_eq!(
+                t1, t2,
+                "Tier-1 and Tier-2 must agree byte-for-byte (br_in_tables: {br_in_tables})"
+            );
+        }
     }
 }

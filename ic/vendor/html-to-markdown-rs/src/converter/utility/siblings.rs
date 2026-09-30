@@ -73,6 +73,75 @@ pub fn next_sibling_is_inline_tag(node_handle: &tl::NodeHandle, parser: &tl::Par
     dom_ctx.next_inline_like(*node_handle, parser)
 }
 
+/// What follows a node among its siblings, as far as a word separator is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FollowingContent {
+    /// The next meaningful sibling is inline content that butts against this node.
+    Inline,
+    /// The next meaningful sibling is a block, or text that opens with its own whitespace.
+    NotInline,
+    /// Nothing but whitespace-only text follows this node in its parent.
+    Absent,
+}
+
+/// Classify what follows `id`: inline *content* — an inline-like tag, or a bare text node — a
+/// block or self-separating text, or nothing at all.
+///
+/// `next_sibling_is_inline_tag` answers a narrower question: its scan stops and returns `false` at
+/// the first non-whitespace text sibling, because its callers care specifically about an adjacent
+/// *element*. A newline-only inline wrapper needs the broader question, since `a<span>\n</span>b`
+/// separates two words exactly as `a<span>\n</span><span>b</span>` does (issue #491); asking the
+/// narrower one welded them together. Kept separate rather than widening
+/// `DomContext::next_inline_like`, which is memoised and shared with an unrelated caller.
+/// `Absent` is distinct from `NotInline` so a caller can climb to the parent and ask again:
+/// the newline at the end of `<span><span>\n</span></span>Beta` still separates words, but only
+/// the outer wrapper can see `Beta` (issue #505). ~keep
+pub fn following_sibling_content(id: u32, parser: &tl::Parser, dom_ctx: &DomContext) -> FollowingContent {
+    let siblings = match dom_ctx.parent_of(id) {
+        Some(parent_id) => match dom_ctx.children_of(parent_id) {
+            Some(children) => children,
+            None => return FollowingContent::Absent,
+        },
+        None => &dom_ctx.root_children,
+    };
+
+    let Some(position) = dom_ctx
+        .sibling_index(id)
+        .or_else(|| siblings.iter().position(|handle| handle.get_inner() == id))
+    else {
+        return FollowingContent::Absent;
+    };
+
+    for sibling in siblings.iter().skip(position + 1) {
+        if let Some(info) = dom_ctx.tag_info(sibling.get_inner(), parser) {
+            return if info.is_inline_like {
+                FollowingContent::Inline
+            } else {
+                FollowingContent::NotInline
+            };
+        }
+        if let Some(tl::Node::Raw(raw)) = sibling.get(parser) {
+            let decoded = raw.as_utf8_str();
+            if decoded.trim().is_empty() {
+                continue;
+            }
+            // ~keep Text that already opens with whitespace supplies the separator itself, so
+            // ~keep reporting it as inline content here stacks a second space on top of it.
+            // ~keep `<span>\n</span>\n   Tip` (a Docusaurus admonition icon) regressed from
+            // ~keep ") Tip" to ")  Tip" exactly this way -- the wrapper is only load-bearing
+            // ~keep when the next word butts straight up against it, as in issue #491's
+            // ~keep `Alpha<span>\n</span>13`.
+            return if decoded.starts_with(char::is_whitespace) {
+                FollowingContent::NotInline
+            } else {
+                FollowingContent::Inline
+            };
+        }
+    }
+
+    FollowingContent::Absent
+}
+
 /// Append an inline suffix to output, with smart whitespace handling.
 ///
 /// Avoids adding spaces before siblings that are already whitespace.

@@ -19,17 +19,15 @@
 //! build = "build.rs"
 //!
 //! [dependencies]
-//! string_cache = "0.9"
+//! string_cache = "0.10"
 //!
 //! [build-dependencies]
-//! string_cache_codegen = "0.6"
+//! string_cache_codegen = "0.7"
 //! ```
 //!
 //! In `build.rs`:
 //!
 //! ```no_run
-//! extern crate string_cache_codegen;
-//!
 //! use std::env;
 //! use std::path::Path;
 //!
@@ -44,8 +42,6 @@
 //! In `lib.rs`:
 //!
 //! ```ignore
-//! extern crate string_cache;
-//!
 //! mod foo {
 //!     include!(concat!(env!("OUT_DIR"), "/foo_atom.rs"));
 //! }
@@ -72,7 +68,7 @@ use proc_macro2::Ident;
 use quote::quote;
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
 /// A builder for a static atom set and relevant macros
@@ -170,16 +166,41 @@ impl AtomType {
     where
         W: Write,
     {
-        destination.write_all(
-            self.to_tokens()
-                .to_string()
-                // Insert some newlines to make the generated code slightly easier to read.
-                .replace(" [ \"", "[\n\"")
-                .replace("\" , ", "\",\n")
-                .replace(" ( \"", "\n( \"")
-                .replace("; ", ";\n")
-                .as_bytes(),
-        )
+        let unformatted = self.to_tokens().to_string();
+        if let Ok(formatted) = Self::rustfmt(&unformatted) {
+            destination.write_all(&formatted)
+        } else {
+            // Maybe rustfmt isn’t installed
+            destination.write_all(unformatted.as_bytes())
+        }
+    }
+
+    fn rustfmt(unformatted: &str) -> Result<Vec<u8>, std::io::Error> {
+        if cfg!(miri) {
+            // Miri does’t support `Command::spawn` as of rustc 1.100.0-nightly (4b6d04e70 2026-09-13):
+            // ```
+            // error: unsupported operation: can't call foreign function `posix_spawnattr_init` on OS `linux`
+            // ```
+            return Err(std::io::Error::other("rustfmt skipped for miri"));
+        }
+        let mut process = std::process::Command::new("rustfmt")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut child_stdin = process.stdin.take().unwrap();
+        child_stdin.write_all(unformatted.as_bytes())?;
+        child_stdin.flush()?;
+        drop(child_stdin);
+        let mut formatted = Vec::new();
+        process.stdout.take().unwrap().read_to_end(&mut formatted)?;
+        let status = process.wait()?;
+        if status.success() {
+            Ok(formatted)
+        } else {
+            Err(std::io::Error::other(format!(
+                "rustfmt exited with status {status:?}"
+            )))
+        }
     }
 
     #[cfg(test)]
@@ -187,40 +208,38 @@ impl AtomType {
     ///
     /// Used mostly for testing or displaying a value.
     pub fn write_to_string(&mut self, mut destination: Vec<u8>) -> io::Result<String> {
-        destination.write_all(
-            self.to_tokens()
-                .to_string()
-                // Insert some newlines to make the generated code slightly easier to read.
-                .replace(" [ \"", "[\n\"")
-                .replace("\" , ", "\",\n")
-                .replace(" ( \"", "\n( \"")
-                .replace("; ", ";\n")
-                .as_bytes(),
-        )?;
+        self.write_to(&mut destination)?;
         let str = String::from_utf8(destination).unwrap();
         Ok(str)
     }
 
+    #[expect(clippy::wrong_self_convention)] // Doesn’t matter on a private method
     fn to_tokens(&mut self) -> proc_macro2::TokenStream {
-        // `impl Default for Atom` requires the empty string to be in the static set.
-        // This also makes sure the set in non-empty,
-        // which would cause divisions by zero in rust-phf.
+        // Make `atom!("")` always work
         self.atoms.insert(String::new());
 
-        // Strings over 7 bytes + empty string added to static set.
-        // Otherwise stored inline.
-        let (static_strs, inline_strs): (Vec<_>, Vec<_>) = self
+        const MAX_INLINE_LEN: usize = 7;
+
+        // Strings over 7 bytes added to static set, otherwise stored inline.
+        let (mut static_strs, inline_strs): (Vec<_>, Vec<_>) = self
             .atoms
             .iter()
             .map(String::as_str)
-            .partition(|s| s.len() > 7 || s.is_empty());
+            .partition(|s| s.len() > MAX_INLINE_LEN);
+
+        let dummy;
+        if static_strs.is_empty() {
+            // Some arbitrary string that `Atom::from(&str)` won’t represent inline
+            dummy = " ".repeat(MAX_INLINE_LEN + 1);
+            // Make the static set non-empty to avoid divisions by zero in rust-phf
+            static_strs.push(&dummy);
+        }
 
         // Static strings
         let hash_state = phf_generator::generate_hash(&static_strs);
         let phf_generator::HashState { key, disps, map } = hash_state;
         let (disps0, disps1): (Vec<_>, Vec<_>) = disps.into_iter().unzip();
         let atoms: Vec<&str> = map.iter().map(|&idx| static_strs[idx]).collect();
-        let empty_string_index = atoms.iter().position(|s| s.is_empty()).unwrap() as u32;
         let indices = 0..atoms.len() as u32;
 
         fn is_valid_ident(name: &str) -> bool {
@@ -247,11 +266,13 @@ impl AtomType {
             .collect();
         let istr_idents: Vec<Ident> = istrs_for_idents.iter().map(|atom| new_term(atom)).collect();
 
-        let hashes: Vec<u32> = atoms
+        let hashes: Vec<u64> = atoms
             .iter()
             .map(|string| {
                 let hash = phf_shared::hash(string, &key);
-                (hash.g ^ hash.f1) as u32
+                // Reconstitute 64-bit `Hash128::h1`
+                // https://docs.rs/phf_shared/0.14.0/src/phf_shared/lib.rs.html#45-54
+                (hash.g as u64) << 32 | (hash.f1 as u64)
             })
             .collect();
 
@@ -259,7 +280,7 @@ impl AtomType {
         let type_name = path_parts.next().unwrap();
         let module = match path_parts.next() {
             Some(m) => format!("$crate::{}", m),
-            None => format!("$crate"),
+            None => "$crate".to_string(),
         };
         let atom_doc = match self.atom_doc {
             Some(ref doc) => quote!(#[doc = #doc]),
@@ -278,7 +299,7 @@ impl AtomType {
         }
         let static_set_name = new_term(&format!("{}StaticSet", type_name));
         let type_name = new_term(type_name);
-        let macro_name = new_term(&*self.macro_name);
+        let macro_name = new_term(&self.macro_name);
         let module = module.parse::<proc_macro2::TokenStream>().unwrap();
         let atom_prefix = format!("ATOM_{}_", type_name.to_string().to_uppercase());
         let new_const_name = |atom: &str| {
@@ -308,7 +329,7 @@ impl AtomType {
 
                 let mut value = 0u64;
                 for (index, c) in s.bytes().enumerate() {
-                    value = value | ((c as u64) << (index * 8 + 8));
+                    value |= (c as u64) << (index * 8 + 8);
                 }
 
                 let len = s.len() as u8;
@@ -336,9 +357,6 @@ impl AtomType {
                         hashes: &[#(#hashes),*]
                     };
                     &SET
-                }
-                fn empty_string_index() -> u32 {
-                    #empty_string_index
                 }
             }
 

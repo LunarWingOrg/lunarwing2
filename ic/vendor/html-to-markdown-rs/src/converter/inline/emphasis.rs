@@ -49,6 +49,129 @@ pub fn handle(
     }
 }
 
+use crate::converter::inline::wrapped::{
+    EMPHASIS_SIBLING_TAGS, InlineDelimiters, InlineSite, STRONG_SIBLING_TAGS, emit_wrapped_inline,
+};
+
+/// Resolve `<strong>`/`<b>`'s wrapping delimiters for the current context and options, then
+/// emit via [`emit_wrapped_inline`].
+fn emit_strong_wrapped(
+    output: &mut String,
+    content: &str,
+    options: &ConversionOptions,
+    ctx: &Context,
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    dom_ctx: &DomContext,
+) {
+    if ctx.in_strong {
+        emit_wrapped_inline(
+            output,
+            content,
+            &InlineDelimiters {
+                open: "",
+                close: "",
+                merge_symbol: Some(options.strong_em_symbol),
+                sibling_tag_names: &STRONG_SIBLING_TAGS,
+            },
+            InlineSite {
+                node_handle,
+                parser,
+                dom_ctx,
+                ctx,
+            },
+        );
+    } else if options.output_format == OutputFormat::Djot {
+        // ~keep Djot strong always uses `*`, independent of `options.strong_em_symbol`
+        // ~keep (pre-existing behaviour, unchanged by this refactor).
+        emit_wrapped_inline(
+            output,
+            content,
+            &InlineDelimiters {
+                open: "*",
+                close: "*",
+                merge_symbol: Some('*'),
+                sibling_tag_names: &STRONG_SIBLING_TAGS,
+            },
+            InlineSite {
+                node_handle,
+                parser,
+                dom_ctx,
+                ctx,
+            },
+        );
+    } else {
+        let marker: String = [options.strong_em_symbol; 2].iter().collect();
+        emit_wrapped_inline(
+            output,
+            content,
+            &InlineDelimiters {
+                open: &marker,
+                close: &marker,
+                merge_symbol: Some(options.strong_em_symbol),
+                sibling_tag_names: &STRONG_SIBLING_TAGS,
+            },
+            InlineSite {
+                node_handle,
+                parser,
+                dom_ctx,
+                ctx,
+            },
+        );
+    }
+}
+
+/// Resolve `<em>`/`<i>`'s wrapping delimiters for the current context and options, then emit
+/// via [`emit_wrapped_inline`].
+fn emit_emphasis_wrapped(
+    output: &mut String,
+    content: &str,
+    options: &ConversionOptions,
+    ctx: &Context,
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    dom_ctx: &DomContext,
+) {
+    if options.output_format == OutputFormat::Djot {
+        // ~keep Djot emphasis always uses `_`, independent of `options.strong_em_symbol`
+        // ~keep (pre-existing behaviour, unchanged by this refactor).
+        emit_wrapped_inline(
+            output,
+            content,
+            &InlineDelimiters {
+                open: "_",
+                close: "_",
+                merge_symbol: Some('_'),
+                sibling_tag_names: &EMPHASIS_SIBLING_TAGS,
+            },
+            InlineSite {
+                node_handle,
+                parser,
+                dom_ctx,
+                ctx,
+            },
+        );
+    } else {
+        let marker = options.strong_em_symbol.to_string();
+        emit_wrapped_inline(
+            output,
+            content,
+            &InlineDelimiters {
+                open: &marker,
+                close: &marker,
+                merge_symbol: Some(options.strong_em_symbol),
+                sibling_tag_names: &EMPHASIS_SIBLING_TAGS,
+            },
+            InlineSite {
+                node_handle,
+                parser,
+                dom_ctx,
+                ctx,
+            },
+        );
+    }
+}
+
 /// Handle strong/bold emphasis (strong, b tags).
 fn handle_strong(
     node_handle: &NodeHandle,
@@ -62,7 +185,7 @@ fn handle_strong(
     // ~keep reason: serialize_node is only used with the visitor feature; other imports depend
     // ~keep on feature-gated code paths in this function.
     #[allow(unused_imports)]
-    use crate::converter::{append_inline_suffix, chomp_inline, get_text_content, serialize_node, walk_node};
+    use crate::converter::{get_text_content, serialize_node, walk_node};
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -142,53 +265,11 @@ fn handle_strong(
         if let Some(custom_output) = strong_output {
             output.push_str(&custom_output);
         } else {
-            let (prefix, suffix, trimmed) = chomp_inline(&content);
-            if !content.trim().is_empty() {
-                output.push_str(prefix);
-                if ctx.in_strong {
-                    output.push_str(trimmed);
-                } else if options.output_format == OutputFormat::Djot {
-                    output.push('*');
-                    output.push_str(trimmed);
-                    output.push('*');
-                } else {
-                    output.push(options.strong_em_symbol);
-                    output.push(options.strong_em_symbol);
-                    output.push_str(trimmed);
-                    output.push(options.strong_em_symbol);
-                    output.push(options.strong_em_symbol);
-                }
-                append_inline_suffix(output, suffix, !trimmed.is_empty(), node_handle, parser, dom_ctx);
-            } else if !content.is_empty() {
-                output.push_str(prefix);
-                append_inline_suffix(output, suffix, false, node_handle, parser, dom_ctx);
-            }
+            emit_strong_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
         }
 
         #[cfg(not(feature = "visitor"))]
-        {
-            let (prefix, suffix, trimmed) = chomp_inline(&content);
-            if !content.trim().is_empty() {
-                output.push_str(prefix);
-                if ctx.in_strong {
-                    output.push_str(trimmed);
-                } else if options.output_format == OutputFormat::Djot {
-                    output.push('*');
-                    output.push_str(trimmed);
-                    output.push('*');
-                } else {
-                    output.push(options.strong_em_symbol);
-                    output.push(options.strong_em_symbol);
-                    output.push_str(trimmed);
-                    output.push(options.strong_em_symbol);
-                    output.push(options.strong_em_symbol);
-                }
-                append_inline_suffix(output, suffix, !trimmed.is_empty(), node_handle, parser, dom_ctx);
-            } else if !content.is_empty() {
-                output.push_str(prefix);
-                append_inline_suffix(output, suffix, false, node_handle, parser, dom_ctx);
-            }
-        }
+        emit_strong_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
     }
 }
 
@@ -205,7 +286,7 @@ fn handle_emphasis(
     // ~keep reason: serialize_node is only used with the visitor feature; other imports depend
     // ~keep on feature-gated code paths in this function.
     #[allow(unused_imports)]
-    use crate::converter::{append_inline_suffix, chomp_inline, get_text_content, serialize_node, walk_node};
+    use crate::converter::{get_text_content, serialize_node, walk_node};
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -276,60 +357,34 @@ fn handle_emphasis(
         if let Some(custom_output) = em_output {
             output.push_str(&custom_output);
         } else {
-            let (prefix, suffix, trimmed) = chomp_inline(&content);
-            if !content.trim().is_empty() {
-                output.push_str(prefix);
-                if options.output_format == OutputFormat::Djot {
-                    output.push('_');
-                    output.push_str(trimmed);
-                    output.push('_');
-                } else {
-                    output.push(options.strong_em_symbol);
-                    output.push_str(trimmed);
-                    output.push(options.strong_em_symbol);
-                }
-                append_inline_suffix(output, suffix, !trimmed.is_empty(), node_handle, parser, dom_ctx);
-            } else if !content.is_empty() {
-                output.push_str(prefix);
-                append_inline_suffix(output, suffix, false, node_handle, parser, dom_ctx);
-            } else if let Some(class_value) = tag
-                .attributes()
-                .get("class")
-                .and_then(|v| v.as_ref().map(|val| val.as_utf8_str()))
-            {
-                if class_value.contains("caret") && !output.ends_with(' ') {
-                    output.push_str(" > ");
-                }
-            }
+            emit_emphasis_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
+            maybe_emit_caret(output, &content, tag);
         }
 
         #[cfg(not(feature = "visitor"))]
         {
-            let (prefix, suffix, trimmed) = chomp_inline(&content);
-            if !content.trim().is_empty() {
-                output.push_str(prefix);
-                if options.output_format == OutputFormat::Djot {
-                    output.push('_');
-                    output.push_str(trimmed);
-                    output.push('_');
-                } else {
-                    output.push(options.strong_em_symbol);
-                    output.push_str(trimmed);
-                    output.push(options.strong_em_symbol);
-                }
-                append_inline_suffix(output, suffix, !trimmed.is_empty(), node_handle, parser, dom_ctx);
-            } else if !content.is_empty() {
-                output.push_str(prefix);
-                append_inline_suffix(output, suffix, false, node_handle, parser, dom_ctx);
-            } else if let Some(class_value) = tag
-                .attributes()
-                .get("class")
-                .and_then(|v| v.as_ref().map(|val| val.as_utf8_str()))
-            {
-                if class_value.contains("caret") && !output.ends_with(' ') {
-                    output.push_str(" > ");
-                }
-            }
+            emit_emphasis_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
+            maybe_emit_caret(output, &content, tag);
+        }
+    }
+}
+
+/// Detect a Bootstrap `.caret` marker (`<i class="caret"></i>` and similar) on a genuinely
+/// empty (not merely whitespace-only) `<em>`/`<i>` body and render it as `" > "`.
+///
+/// Only reachable when `content` is empty: [`emit_wrapped_inline`] already handles the
+/// non-empty and whitespace-only-but-non-empty cases and leaves `output` untouched otherwise.
+fn maybe_emit_caret(output: &mut String, content: &str, tag: &tl::HTMLTag) {
+    if !content.is_empty() {
+        return;
+    }
+    if let Some(class_value) = tag
+        .attributes()
+        .get("class")
+        .and_then(|v| v.as_ref().map(|val| val.as_utf8_str()))
+    {
+        if class_value.contains("caret") && !output.ends_with(' ') {
+            output.push_str(" > ");
         }
     }
 }

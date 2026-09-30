@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "keccak"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["RustCrypto Developers"]
 build = false
 autolib = false
@@ -108,7 +108,4 @@ unused_qualifications = "warn"
 [lints.rust.unexpected_cfgs]
 level = "warn"
 priority = 0
-check-cfg = [
-    'cfg(keccak_backend_soft, values("compact"))',
-    'cfg(keccak_backend, values("aarch64_sha3", "simd128", "simd256", "simd512", "soft"))',
-]
+check-cfg = ['cfg(keccak_backend, values("aarch64_sha3", "simd128", "simd256", "simd512", "soft"))']

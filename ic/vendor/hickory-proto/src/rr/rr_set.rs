@@ -516,6 +516,10 @@ impl<'r> Iterator for RecordsAndRrsigsIter<'r> {
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next()
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
 }
 
 /// An iterator over the RecordSet data
@@ -542,10 +546,19 @@ impl<'r> Iterator for RrsetRecords<'r> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            RrsetRecords::Empty => None,
-            RrsetRecords::RecordsOnly(i) => i.next(),
+            Self::Empty => None,
+            Self::RecordsOnly(i) => i.next(),
             #[cfg(feature = "__dnssec")]
-            RrsetRecords::RecordsAndRrsigs(i) => i.next(),
+            Self::RecordsAndRrsigs(i) => i.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Empty => (0, Some(0)),
+            Self::RecordsOnly(i) => i.size_hint(),
+            #[cfg(feature = "__dnssec")]
+            Self::RecordsAndRrsigs(i) => i.size_hint(),
         }
     }
 }
@@ -589,6 +602,48 @@ mod test {
         assert_eq!(rr_set.records_without_rrsigs().count(), 2);
         assert!(rr_set.records_without_rrsigs().any(|x| x == &insert));
         assert!(rr_set.records_without_rrsigs().any(|x| x == &insert1));
+    }
+
+    #[test]
+    fn test_size_hint() {
+        let name = Name::from_str("www.example.com.").unwrap();
+        let mut rr_set = RecordSet::with_ttl(name.clone(), RecordType::A, 3600);
+
+        assert_eq!(rr_set.records_without_rrsigs().size_hint(), (0, Some(0)));
+
+        assert!(rr_set.add_rdata(RData::A(Ipv4Addr::new(192, 0, 2, 1).into())));
+        assert!(rr_set.add_rdata(RData::A(Ipv4Addr::new(192, 0, 2, 2).into())));
+
+        let mut iter = rr_set.records_without_rrsigs();
+        assert_eq!(iter.size_hint(), (2, Some(2)));
+        assert!(iter.next().is_some());
+        assert_eq!(iter.size_hint(), (1, Some(1)));
+
+        #[cfg(feature = "__dnssec")]
+        {
+            use crate::dnssec::{
+                Algorithm,
+                rdata::{DNSSECRData, RRSIG, sig::SigInput},
+            };
+
+            let input = SigInput {
+                type_covered: RecordType::A,
+                algorithm: Algorithm::ED25519,
+                num_labels: 0,
+                original_ttl: 0,
+                sig_expiration: SerialNumber(0),
+                sig_inception: SerialNumber(0),
+                key_tag: 0,
+                signer_name: Name::root(),
+            };
+            rr_set.insert_rrsig(Record::from_rdata(
+                name,
+                3600,
+                RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, vec![]))),
+            ));
+
+            assert_eq!(rr_set.records_with_rrsigs().size_hint(), (3, Some(3)));
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends git; \
+    apt-get install -y --no-install-recommends git python3; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -30,7 +30,21 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/pebble fetch --depth 1 origin "${PEBBLE_REF}" && \
     git -C /build/pebble checkout --detach FETCH_HEAD && \
     test "$(git -C /build/pebble rev-parse HEAD)" = "${PEBBLE_REF}"
-RUN cd pebble && cargo build --release --locked --bin pebble
+# The pinned upstream checkout ships rustls 0.23.41, which is affected by
+# RUSTSEC-2026-0285 (fixed >= 0.23.45) and upstream has no newer release. So
+# the reviewed patched lock is supplied as a hashed build input instead of an
+# unpinned build-time `cargo update`: it is upstream at PEBBLE_REF with only
+# rustls 0.23.41 -> 0.23.45 and rustls-webpki 0.103.13 -> 0.103.15 changed.
+# The build fails if the checked-out lock or the pinned digest drift from the
+# reviewed inputs, keeping the locked/reproducible-build guarantee.
+COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
+COPY pebble4lunarwing/scripts/verify_upstream_lock.py /tmp/verify-pebble-lock.py
+# Canonical reviewed pin also covers mt-admin, Compose and plain docker builds.
+ARG PEBBLE_LOCK_SHA256=056cc561f07d9b207ec76dec8ea7413110056ae3214a8e0058f71f917350025b
+RUN python3 /tmp/verify-pebble-lock.py pebble/Cargo.lock \
+    /tmp/pebble-upstream-Cargo.lock "${PEBBLE_LOCK_SHA256}"
+RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \
+    cd pebble && cargo build --release --locked --bin pebble
 
 # --- Runtime ---
 FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171

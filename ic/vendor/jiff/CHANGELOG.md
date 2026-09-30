@@ -1,8 +1,51 @@
 # CHANGELOG
 
-0.2.34 (TBD)
-============
-TODO
+0.2.37 (2026-09-12)
+===================
+This is a redux release of `0.2.36` that fixes a compilation bug.
+
+Bug fixes:
+
+* [#647](https://github.com/BurntSushi/jiff/issues/647):
+Fixes a compilation bug due to incorrect include paths.
+
+
+0.2.36 (2026-09-12)
+===================
+This release has a couple bug fixes and adds opt-in integration with the
+`arbitrary` crate.
+
+Enhancements:
+
+* [#631](https://github.com/BurntSushi/jiff/issues/631):
+Add optional `Arbitrary` trait implementations from the `arbitrary` crate.
+
+Bug fixes:
+
+* [#617](https://github.com/BurntSushi/jiff/pull/617):
+Fixes a bug in `jiff_core::tz::Offset` checked subtraction routine.
+* [#627](https://github.com/BurntSushi/jiff/issues/627):
+Use `serialize_some` for optional Serde helpers in `jiff::fmt::serde`.
+
+
+0.2.35 (2026-07-25)
+===================
+This release fixes a bug in duration parsing where, e.g., `-PT0.5S` would be
+parsed as if the `-` sign didn't exist. This bug also affects friendly
+durations such as `-0.5s`.
+
+Bug fixes:
+
+* [#613](https://github.com/BurntSushi/jiff/issues/613):
+Fixes a bug where the sign in a duration could be ignored while parsing.
+
+
+0.2.34 (2026-07-19)
+===================
+This release contains a few small enhancements. Namely, some error messages
+for parsing datetime values have been improved by removing some redundant
+messaging. Additionally, the `strftime` APIs on datetime values can no longer
+panic. Instead, they'll silently pass through invalid formatting directives.
 
 Enhancements:
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import fnmatch
+import hashlib
 import json
 import pathlib
 import re
@@ -428,6 +430,13 @@ def validate_worker_versions(errors: list[str]) -> None:
     opencode2_text = OPENCODE2_DOCKERFILE.read_text(encoding="utf-8")
     kimi_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
 
+    lock_path = ROOT / "pebble4lunarwing/upstream/Cargo.lock"
+    lock_digest = extract_arg_default(pebble_text, "PEBBLE_LOCK_SHA256") or ""
+    if not re.fullmatch(r"[0-9a-f]{64}", lock_digest):
+        errors.append("Pebble Dockerfile must declare a reviewed PEBBLE_LOCK_SHA256 default")
+    elif not lock_path.is_file() or hashlib.sha256(lock_path.read_bytes()).hexdigest() != lock_digest:
+        errors.append("Pebble upstream Cargo.lock differs from the Dockerfile's reviewed SHA256")
+
     canonical_pins = (
         ("PEBBLE_REF", pebble_text, "PEBBLE_REF"),
         ("OPENCODE_REF", opencode_text, "OPENCODE_REF"),
@@ -490,6 +499,70 @@ def safe_relative_path(path: object) -> str | None:
     if normalized.is_absolute() or ".." in normalized.parts:
         return None
     return path
+
+
+def validate_build_inputs(data: dict, merged: dict, errors: list[str]) -> dict[str, str]:
+    """Lock-only build overrides are inputs, not standalone Cargo roots."""
+    inputs = data.get("build_inputs", [])
+    if not isinstance(inputs, list):
+        errors.append(".gitlab/deliverables.json build_inputs must be a list")
+        return {}
+    consumers = {entry.get("name"): entry for entry in data.get("deliverables", [])}
+    seen_names = set(consumers)
+    lockfiles: dict[str, str] = {}
+    required = ("name", "kind", "owner", "consumer", "lockfile", "dockerfile", "ci", "triggers")
+    for entry in inputs:
+        if not isinstance(entry, dict):
+            errors.append("build input entry must be a JSON object")
+            continue
+        name = entry.get("name", "<unnamed>")
+        for key in required:
+            if key not in entry:
+                errors.append(f"build input {name!r} missing key {key!r}")
+        if name in seen_names:
+            errors.append(f"build input {name!r} is declared twice")
+        seen_names.add(name)
+        if entry.get("kind") != "cargo-lock-override":
+            errors.append(f"build input {name!r} has unknown kind {entry.get('kind')!r}")
+        if not isinstance(entry.get("owner"), str) or not entry["owner"]:
+            errors.append(f"build input {name!r} must declare an owner")
+        consumer = consumers.get(entry.get("consumer"), {})
+        if consumer.get("status") != "production":
+            errors.append(f"build input {name!r} must reference a production consumer")
+        for key in ("lockfile", "dockerfile"):
+            safe = safe_relative_path(entry.get(key))
+            if safe is None or not (ROOT / safe).is_file():
+                errors.append(f"build input {name!r} {key} is missing or unsafe")
+        lockfile = entry.get("lockfile")
+        if isinstance(lockfile, str):
+            if not lockfile.endswith("/Cargo.lock"):
+                errors.append(f"build input {name!r} must classify a Cargo.lock")
+            if lockfile in lockfiles:
+                errors.append(f"build input {name!r} repeats lockfile {lockfile}")
+            lockfiles[lockfile] = name
+        dockerfile = safe_relative_path(entry.get("dockerfile"))
+        if dockerfile is not None and (ROOT / dockerfile).is_file() and isinstance(lockfile, str):
+            text = (ROOT / dockerfile).read_text(encoding="utf-8")
+            if not re.search(rf"^COPY\s+{re.escape(lockfile)}\s", text, re.MULTILINE):
+                errors.append(f"build input {name!r} is not copied by its Dockerfile")
+        ci = entry.get("ci", [])
+        if not isinstance(ci, list) or "ci-config" not in ci:
+            errors.append(f"build input {name!r} must declare ci-config coverage")
+        else:
+            for job in ci:
+                if not isinstance(job, str) or job not in merged or job.startswith("."):
+                    errors.append(f"build input {name!r} references unknown CI job {job!r}")
+            if not any(extends_template(merged.get(job), ".worker-candidate") for job in ci if isinstance(job, str)):
+                errors.append(f"build input {name!r} must declare worker-candidate coverage")
+            if "standalone-deliverables" in ci:
+                errors.append(f"build input {name!r} has no standalone Cargo manifest")
+        triggers = entry.get("triggers", [])
+        if not isinstance(triggers, list) or not any(
+            isinstance(pattern, str) and isinstance(lockfile, str)
+            and fnmatch.fnmatchcase(lockfile, pattern) for pattern in triggers
+        ):
+            errors.append(f"build input {name!r} triggers must cover its lockfile")
+    return lockfiles
 
 
 def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
@@ -559,6 +632,11 @@ def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
                         f"deliverable {name!r} references unknown CI job {job!r}"
                     )
 
+    build_lockfiles = validate_build_inputs(data, merged, errors)
+    for lockfile, name in build_lockfiles.items():
+        if lockfile in seen_lockfiles:
+            errors.append(f"build input {name!r} shares deliverable lockfile {lockfile}")
+        seen_lockfiles[lockfile] = name
     tracked = collect_tracked_lockfiles()
     unclassified = sorted(tracked - set(seen_lockfiles))
     if unclassified:

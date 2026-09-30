@@ -116,74 +116,43 @@ pub(super) fn verify_nsec3(
 ) -> Proof {
     debug_assert!(!nsec3s.is_empty()); // checked in the caller
 
-    // For every NSEC3 record that in text form looks like:
-    // <base32-hash>.soa.name NSEC3 <data>
-    // we extract (<base32-hash>, <data>) pair from deeply nested structures
-    let mut pairs = Vec::with_capacity(nsec3s.len());
-    for (name, data) in nsec3s {
-        let Some((base32_hashed_name, base)) = split_first_label(name) else {
-            return nsec3_yield(Proof::Bogus, query, "record name format is invalid");
-        };
+    let records = match convert_nsec3_records(query, soa, nsec3s) {
+        Ok(records) => records,
+        Err(proof) => return proof,
+    };
+    debug_assert!(!records.is_empty()); // `nsec3s` was not empty, and we returned on any invalid values
 
-        // If the SOA record is present, the base name of any NSEC3 records must match it.
-        if soa.is_some_and(|soa| &base != soa) {
-            return nsec3_yield(Proof::Bogus, query, "record name is not in the zone");
-        }
-
-        let Ok(base32_hashed_name) = Label::from_raw_bytes(base32_hashed_name) else {
-            return nsec3_yield(Proof::Bogus, query, "base32-hashed name is invalid");
-        };
-
-        pairs.push(Nsec3RecordPair {
-            base32_hashed_name,
-            nsec3_data: data,
-        });
-    }
-
-    debug_assert!(!pairs.is_empty()); // `nsec3s` was not empty, and we returned on any invalid values
-
-    // RFC 5155 8.2 - all NSEC3 records share the same NSEC3 params
-    let first = &pairs[0];
-    let hash_algorithm = first.nsec3_data.hash_algorithm();
-    let salt = first.nsec3_data.salt();
-    let iterations = first.nsec3_data.iterations();
-    if pairs.iter().any(|r| {
-        r.nsec3_data.hash_algorithm() != hash_algorithm
-            || r.nsec3_data.salt() != salt
-            || r.nsec3_data.iterations() != iterations
-    }) {
-        return nsec3_yield(Proof::Bogus, query, "parameter mismatch");
-    }
+    let cx = match Context::new(query, soa, &records) {
+        Ok(cx) => cx,
+        Err(proof) => return proof,
+    };
 
     // Protect against high iteration counts by returning Proof::Bogus (triggering a SERVFAIL
     // response) if iterations > than the hard limit, or an insecure response if iterations > the
     // soft limit.
     //
     // [RFC 9276 3.2](https://www.rfc-editor.org/rfc/rfc9276.html#name-recommendation-for-validati).
-    if iterations > nsec3_hard_iteration_limit {
+    if cx.iterations > nsec3_hard_iteration_limit {
         return nsec3_yield(
             Proof::Bogus,
             query,
-            format_args!("iteration count {iterations} is over {nsec3_hard_iteration_limit}"),
+            format_args!(
+                "iteration count {iterations} is over {nsec3_hard_iteration_limit}",
+                iterations = cx.iterations
+            ),
         );
-    } else if iterations > nsec3_soft_iteration_limit {
+    } else if cx.iterations > nsec3_soft_iteration_limit {
         return nsec3_yield(
             Proof::Insecure,
             query,
-            format_args!("iteration count {iterations} is over {nsec3_soft_iteration_limit}"),
+            format_args!(
+                "iteration count {iterations} is over {nsec3_soft_iteration_limit}",
+                iterations = cx.iterations
+            ),
         );
     }
 
     // Basic sanity checks are done.
-    let cx = Context {
-        query,
-        soa,
-        nsec3s: &pairs,
-        hash_algorithm,
-        salt,
-        iterations,
-    };
-
     // From here on 4 big situations are possible:
     // 1. No such name, and no servicing wildcard
     // 2. Name exists but there's no record of this type
@@ -205,13 +174,69 @@ pub(super) fn verify_nsec3(
                 RData::DNSSEC(DNSSECRData::RRSIG(data)) => Some(data.input().num_labels),
                 _ => None,
             });
-            validate_nodata_response(query.query_type(), wildcard_num_labels, &cx)
+            validate_nodata_response(
+                query.query_type(),
+                wildcard_num_labels,
+                answers.is_empty(),
+                &cx,
+            )
         }
         _ => cx.proof(
             Proof::Bogus,
             format_args!("unsupported response code ({response_code})"),
         ),
     }
+}
+
+/// Verifies whether these NSEC3 records prove that there is an insecure delegation at this name, or
+/// that there could be.
+///
+/// This returns true if either there is an NSEC3 record matching the zone name with the NS bit set,
+/// the SOA bit unset, and the DS bit unset, or if there is an opt-out NSEC3 record that covers the
+/// zone name.
+pub(super) fn verify_nsec3_insecure_delegation(zone: &Name, nsec3s: &[(&Name, &NSEC3)]) -> bool {
+    let query = Query::query(zone.clone(), RecordType::DS);
+    let Ok(records) = convert_nsec3_records(&query, None, nsec3s) else {
+        return false;
+    };
+
+    let Ok(cx) = Context::new(&query, None, &records) else {
+        return false;
+    };
+
+    // Check for matching record.
+    let (hashed_zone_name, base32_hashed_zone_name) = cx.hash_and_label(zone);
+    if let Some(info) = records
+        .iter()
+        .find(|info| info.matches(zone, &base32_hashed_zone_name))
+    {
+        let type_set = info.nsec3_data.type_set();
+        return type_set.contains(RecordType::NS)
+            && !type_set.contains(RecordType::DS)
+            && !type_set.contains(RecordType::SOA);
+    }
+
+    // Check for covering record with opt-out flag set.
+    if let Some(info) =
+        find_covering_record(&records, zone, &hashed_zone_name, &base32_hashed_zone_name)
+    {
+        return info.nsec3_data.opt_out();
+    }
+
+    false
+}
+
+/// Convert pairs of record names and NSEC3 RDATA to structures containing hashed record names, zone
+/// names, and NSEC3 RDATA.
+fn convert_nsec3_records<'a>(
+    query: &Query,
+    soa: Option<&Name>,
+    nsec3s: &'a [(&Name, &'a NSEC3)],
+) -> Result<Vec<Nsec3RecordInfo<'a>>, Proof> {
+    nsec3s
+        .iter()
+        .map(|(name, data)| Nsec3RecordInfo::new(name, data, query, soa))
+        .collect()
 }
 
 /// There is no such `query_name` in the zone and there's no wildcard that
@@ -227,7 +252,7 @@ fn validate_nxdomain_response(cx: &Context<'_>) -> Proof {
     if cx
         .nsec3s
         .iter()
-        .any(|r| r.base32_hashed_name == base32_hashed_query_name)
+        .any(|r| r.matches(&cx.query.name, &base32_hashed_query_name))
     {
         return cx.proof(Proof::Bogus, "NXDomain response with record for query name");
     }
@@ -252,13 +277,18 @@ fn validate_nxdomain_response(cx: &Context<'_>) -> Proof {
         // Got all three components - we proved that there's no `query_name`
         // in the zone
         (Some(_), Some(_), Some(_)) => cx.proof(Proof::Secure, "direct proof"),
-        // `query_name`'s parent is the `soa_name` itself, so there's no need
-        // to send `soa_name`'s NSEC3 record. Still we have to show that
-        // both `query_name` doesn't exist and there's no wildcard to service it
-        (None, Some(_), Some(_)) if Some(&cx.query.name().base_name()) == cx.soa => cx.proof(
-            Proof::Secure,
-            "no direct or wildcard proof, but parent name of query is SOA",
-        ),
+        // `query_name`'s parent is the zone apex itself, so there's no need to send its NSEC3
+        // record. Still we have to show that both `query_name` doesn't exist and there's no
+        // wildcard to service it.
+        (None, Some((_, next_closer_nsec3)), Some((_, wildcard_nsec3)))
+            if cx.query.name().base_name() == next_closer_nsec3.zone_name
+                && next_closer_nsec3.zone_name == wildcard_nsec3.zone_name =>
+        {
+            cx.proof(
+                Proof::Secure,
+                "no direct or wildcard proof, but parent name of query is zone apex",
+            )
+        }
         _ => cx.proof(Proof::Bogus, "no proof of non-existence"),
     }
 }
@@ -272,6 +302,7 @@ fn validate_nxdomain_response(cx: &Context<'_>) -> Proof {
 fn validate_nodata_response(
     query_type: RecordType,
     wildcard_encloser_num_labels: Option<u8>,
+    answers_is_empty: bool,
     cx: &Context<'_>,
 ) -> Proof {
     // 2. Name exists but there's no record of this type
@@ -283,7 +314,7 @@ fn validate_nodata_response(
     let query_name_record = cx
         .nsec3s
         .iter()
-        .find(|record| record.base32_hashed_name == base32_hashed_query_name);
+        .find(|record| record.matches(&cx.query.name, &base32_hashed_query_name));
 
     // Case 2:
     // Name exists but there's no record of this type
@@ -320,6 +351,26 @@ fn validate_nodata_response(
             return cx.proof(
                 Proof::Bogus,
                 format_args!("nsec3 type map covers {query_type} or CNAME"),
+            );
+        } else if query_type != RecordType::DS && query_record.nsec3_data.is_ancestor_delegation() {
+            // RFC 6840 §4.1: a parent-side NSEC3 at the cut only authenticates
+            // the absence of DS at that owner, it cannot deny other types there.
+            return cx.proof(Proof::Bogus, "direct match is an ancestor-delegation NSEC3");
+        } else if query_type == RecordType::DS
+            && query_record.nsec3_data.type_set().contains(RecordType::SOA)
+        {
+            // RFC 5155 §8.9: "The validator MUST also ensure that the NSEC3 RR is from the correct
+            // (i.e., parent) zone. This is done by ensuring that the SOA bit is not set in the Type
+            // Bit Maps field of this NSEC3 RR."
+            return cx.proof(
+                Proof::Bogus,
+                "direct match for DS query is an NSEC3 record from the child side of the zone cut",
+            );
+        } else if !answers_is_empty {
+            return cx.proof(
+                Proof::Bogus,
+                "query name exists, no records of matching type exist, \
+                and answer section is not empty",
             );
         } else {
             return cx.proof(
@@ -372,8 +423,13 @@ fn validate_nodata_response(
     // name as the hashed query name and not having the DS bit set in the type flags
     // is covered here by case 2.
     if query_type == RecordType::DS
-        && find_covering_record(cx.nsec3s, &hashed_query_name, &base32_hashed_query_name)
-            .is_some_and(|x| x.nsec3_data.opt_out())
+        && find_covering_record(
+            cx.nsec3s,
+            &cx.query.name,
+            &hashed_query_name,
+            &base32_hashed_query_name,
+        )
+        .is_some_and(|x| x.nsec3_data.opt_out())
     {
         return cx.proof(Proof::Secure, "DS query covered by opt-out proof");
     }
@@ -406,6 +462,7 @@ fn validate_nodata_response(
             let next_closer_name_info = HashedNameInfo::new(next_closer_name, cx);
             let next_closer_record = find_covering_record(
                 cx.nsec3s,
+                &next_closer_name_info.name,
                 &next_closer_name_info.hashed_name,
                 &next_closer_name_info.base32_hashed_name,
             );
@@ -436,14 +493,9 @@ fn validate_nodata_response(
                         "servicing wildcard with closest encloser proof",
                     )
                 }
-                (None, Some(_), Some(_)) if Some(&cx.query.name().base_name()) == cx.soa => (
-                    Proof::Secure,
-                    "servicing wildcard without closest encloser proof, but query parent name == SOA",
-                ),
-                (None, None, None) if Some(cx.query.name()) == cx.soa => (
-                    Proof::Secure,
-                    "no servicing wildcard, but query name == SOA",
-                ),
+                (None, None, None) if Some(cx.query.name()) == cx.soa => {
+                    (Proof::Bogus, "apex NODATA with no NSEC3 matching H(QNAME)")
+                }
                 _ => (Proof::Bogus, "no valid servicing wildcard proof"),
             }
         }
@@ -460,20 +512,48 @@ fn split_first_label(name: &Name) -> Option<(&[u8], Name)> {
 
 #[derive(Default)]
 struct ClosestEncloserProofInfo<'a> {
-    closest_encloser: Option<(HashedNameInfo, &'a Nsec3RecordPair<'a>)>,
-    next_closer: Option<(HashedNameInfo, &'a Nsec3RecordPair<'a>)>,
+    closest_encloser: Option<(HashedNameInfo, &'a Nsec3RecordInfo<'a>)>,
+    next_closer: Option<(HashedNameInfo, &'a Nsec3RecordInfo<'a>)>,
 }
 
 struct Context<'a> {
     query: &'a Query,
     soa: Option<&'a Name>,
-    nsec3s: &'a [Nsec3RecordPair<'a>],
+    nsec3s: &'a [Nsec3RecordInfo<'a>],
     hash_algorithm: Nsec3HashAlgorithm,
     salt: &'a [u8],
     iterations: u16,
 }
 
 impl<'a> Context<'a> {
+    /// Checks for consistent NSEC3 parameters, and constructs a verification context.
+    fn new(
+        query: &'a Query,
+        soa: Option<&'a Name>,
+        nsec3s: &'a [Nsec3RecordInfo<'a>],
+    ) -> Result<Self, Proof> {
+        // RFC 5155 8.2 - all NSEC3 records share the same NSEC3 params
+        let first = &nsec3s[0];
+        let hash_algorithm = first.nsec3_data.hash_algorithm();
+        let salt = first.nsec3_data.salt();
+        let iterations = first.nsec3_data.iterations();
+        if nsec3s.iter().any(|r| {
+            r.nsec3_data.hash_algorithm() != hash_algorithm
+                || r.nsec3_data.salt() != salt
+                || r.nsec3_data.iterations() != iterations
+        }) {
+            return Err(nsec3_yield(Proof::Bogus, query, "parameter mismatch"));
+        }
+        Ok(Self {
+            query,
+            soa,
+            nsec3s,
+            hash_algorithm,
+            salt,
+            iterations,
+        })
+    }
+
     /// Return a closest encloser proof and a proof of non-existence for the wildcard at the closest encloser.
     ///
     /// For example, if the closest encloser is `w.example.`, the wildcard at the closest encloser is `*.w.example`.
@@ -485,7 +565,7 @@ impl<'a> Context<'a> {
         matching: bool,
     ) -> (
         ClosestEncloserProofInfo<'a>,
-        Option<(HashedNameInfo, &'a Nsec3RecordPair<'a>)>,
+        Option<(HashedNameInfo, &'a Nsec3RecordInfo<'a>)>,
     ) {
         let closest_encloser_proof = self.closest_encloser_proof();
 
@@ -500,12 +580,16 @@ impl<'a> Context<'a> {
 
         let wildcard_name_info = HashedNameInfo::new(wildcard_encloser_name, self);
         let wildcard_record = if matching {
-            self.nsec3s
-                .iter()
-                .find(|record| record.base32_hashed_name == wildcard_name_info.base32_hashed_name)
+            self.nsec3s.iter().find(|record| {
+                record.matches(
+                    &wildcard_name_info.name,
+                    &wildcard_name_info.base32_hashed_name,
+                )
+            })
         } else {
             find_covering_record(
                 self.nsec3s,
+                &wildcard_name_info.name,
                 &wildcard_name_info.hashed_name,
                 &wildcard_name_info.base32_hashed_name,
             )
@@ -538,11 +622,16 @@ impl<'a> Context<'a> {
             .collect::<Vec<_>>();
 
         // Find the longest candidate name, if any, with a matching NSEC3 record and get the record.
+        //
+        // Per RFC 5155 §8.3 / RFC 6840 §4.1, an ancestor-delegation NSEC3
+        // (parent-side at a zone cut) cannot serve as a closest-encloser match.
+        // It does not authenticate names below the cut.
         let Some(closest_encloser_matching_record) =
             closest_encloser_candidates.iter().find_map(|candidate| {
-                self.nsec3s
-                    .iter()
-                    .find(|nsec| nsec.base32_hashed_name == candidate.base32_hashed_name)
+                self.nsec3s.iter().find(|nsec| {
+                    nsec.matches(&candidate.name, &candidate.base32_hashed_name)
+                        && !nsec.nsec3_data.is_ancestor_delegation()
+                })
             })
         else {
             return ClosestEncloserProofInfo::default();
@@ -569,6 +658,7 @@ impl<'a> Context<'a> {
         // Now find a covering record for the next closer, which is one label longer than the closest encloser
         let next_closer_covering_record = find_covering_record(
             self.nsec3s,
+            &next_closer_name_info.name,
             &next_closer_name_info.hashed_name,
             &next_closer_name_info.base32_hashed_name,
         );
@@ -617,20 +707,26 @@ impl<'a> Context<'a> {
 }
 
 fn find_covering_record<'a>(
-    nsec3s: &'a [Nsec3RecordPair<'a>],
+    nsec3s: &'a [Nsec3RecordInfo<'a>],
+    name: &Name,
     target_hashed_name: &[u8],
     // Strictly speaking we don't need this parameter, we can calculate
     // base32(target_hashed_name) inside the function.
     // However, we already have it available at call sites, may as well use
     // it and save on repeated base32 encodings.
     target_base32_hashed_name: &Label,
-) -> Option<&'a Nsec3RecordPair<'a>> {
+) -> Option<&'a Nsec3RecordInfo<'a>> {
     nsec3s.iter().find(|record| {
         let Some(record_next_hashed_owner_name_base32) =
             record.nsec3_data.next_hashed_owner_name_base32()
         else {
             return false;
         };
+
+        // Ignore NSEC3 records from outside the zone.
+        if !record.zone_name.zone_of(name) {
+            return false;
+        }
 
         // Matching records don't count as covering records
         if record.base32_hashed_name == *target_base32_hashed_name {
@@ -643,10 +739,10 @@ fn find_covering_record<'a>(
             record.base32_hashed_name < *target_base32_hashed_name
                 && target_hashed_name < record.nsec3_data.next_hashed_owner_name()
         } else {
-            // Wraparound case: target must be less than the hashed owner name or greater than the
+            // Wraparound case: target must be greater than the hashed owner name or less than the
             // next hashed owner name.
-            record.base32_hashed_name > *target_base32_hashed_name
-                || target_hashed_name > record.nsec3_data.next_hashed_owner_name()
+            *target_base32_hashed_name > record.base32_hashed_name
+                || target_hashed_name < record.nsec3_data.next_hashed_owner_name()
         }
     })
 }
@@ -700,14 +796,73 @@ fn nsec3_yield(proof: Proof, query: &Query, msg: impl Display) -> Proof {
     proof_log_yield(proof, query, "nsec3", msg)
 }
 
-struct Nsec3RecordPair<'a> {
+/// Preprocessed form of an NSEC3 record.
+struct Nsec3RecordInfo<'a> {
+    /// The leftmost label of the NSEC3 record's name.
     base32_hashed_name: Label,
+    /// The remainder of the NSEC3 record's name.
+    zone_name: Name,
+    /// The NSEC3 record's RDATA.
     nsec3_data: &'a NSEC3,
+}
+
+impl<'a> Nsec3RecordInfo<'a> {
+    /// Preprocesses an NSEC3 record and performs sanity checks.
+    fn new(
+        name: &'a Name,
+        rdata: &'a NSEC3,
+        query: &Query,
+        soa: Option<&Name>,
+    ) -> Result<Self, Proof> {
+        let Some((base32_hashed_name, base)) = split_first_label(name) else {
+            return Err(nsec3_yield(
+                Proof::Bogus,
+                query,
+                "record name format is invalid",
+            ));
+        };
+
+        // If the SOA record is present, the base name of any NSEC3 records must match it.
+        if soa.is_some_and(|soa| &base != soa) {
+            return Err(nsec3_yield(
+                Proof::Bogus,
+                query,
+                "record name is not in the zone",
+            ));
+        }
+
+        let Ok(base32_hashed_name) = Label::from_raw_bytes(base32_hashed_name) else {
+            return Err(nsec3_yield(
+                Proof::Bogus,
+                query,
+                "base32-hashed name is invalid",
+            ));
+        };
+
+        Ok(Nsec3RecordInfo {
+            base32_hashed_name,
+            zone_name: base,
+            nsec3_data: rdata,
+        })
+    }
+
+    /// Determines whether this NSEC3 record matches a name.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name to test against this NSEC3 record
+    /// * `base32_hashed_name` - A base32-encoded label representing the hash of `name`
+    ///
+    /// While `base32_hashed_name` could be recomputed from `name`, each call site has both values
+    /// available already, so we take both as separate arguments to avoid redundant work.
+    fn matches(&self, name: &Name, base32_hashed_name: &Label) -> bool {
+        self.zone_name.zone_of(name) && &self.base32_hashed_name == base32_hashed_name
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::str::FromStr;
+    use core::{slice, str::FromStr};
 
     use super::*;
     use crate::proto::{
@@ -718,12 +873,14 @@ mod tests {
         },
         rr::{
             RData,
-            RecordType::{A, AAAA, DNSKEY, DS, MX, NS, NSEC3PARAM, RRSIG, SOA},
+            RecordType::{A, AAAA, DNAME, DNSKEY, DS, MX, NS, NSEC3PARAM, RRSIG, SOA},
             SerialNumber, rdata,
         },
     };
 
     use test_support::subscribe;
+
+    use data_encoding::BASE32_DNSSEC;
 
     #[test]
     fn test_hash() {
@@ -850,14 +1007,16 @@ mod tests {
                     .as_ref(),
                     // Matches the closest encloser (x.w.example.)
                     Nsec3Pair::new(
-                        Name::from_ascii("example.")?.prepend_label(hash_with_base32("x.w"))?,
+                        Name::from_ascii("example.")?
+                            .prepend_label(hash_with_base32("x.w.example"))?,
                         hash("ai.example."),
                         [MX, RRSIG],
                     )
                     .as_ref(),
                     // Covers the wildcard at the closest encloser (*.x.w.example.)
                     Nsec3Pair::new(
-                        Name::from_ascii("example.")?.prepend_label(hash_with_base32("a"))?,
+                        Name::from_ascii("example.")?
+                            .prepend_label(hash_with_base32("a.example"))?,
                         hash("x.w.example."),
                         [DS, NS, RRSIG],
                     )
@@ -886,7 +1045,8 @@ mod tests {
                     .as_ref(),
                     // Matches the closest encloser (x.w.example.)
                     Nsec3Pair::new(
-                        Name::from_ascii("example.")?.prepend_label(hash_with_base32("x.w"))?,
+                        Name::from_ascii("example.")?
+                            .prepend_label(hash_with_base32("x.w.example"))?,
                         hash("ai.example."),
                         [MX, RRSIG],
                     )
@@ -908,14 +1068,16 @@ mod tests {
                 &[
                     // Matches the closest encloser (x.w.example.)
                     Nsec3Pair::new(
-                        Name::from_ascii("example.")?.prepend_label(hash_with_base32("x.w"))?,
+                        Name::from_ascii("example.")?
+                            .prepend_label(hash_with_base32("x.w.example"))?,
                         hash("ai.example."),
                         [MX, RRSIG],
                     )
                     .as_ref(),
                     // Covers the wildcard at the closest encloser (*.x.w.example.)
                     Nsec3Pair::new(
-                        Name::from_ascii("example.")?.prepend_label(hash_with_base32("a"))?,
+                        Name::from_ascii("example.")?
+                            .prepend_label(hash_with_base32("a.example"))?,
                         hash("x.w.example."),
                         [DS, NS, RRSIG],
                     )
@@ -944,14 +1106,16 @@ mod tests {
                     .as_ref(),
                     // Matches the closest encloser (x.w.example.)
                     Nsec3Pair::new(
-                        Name::from_ascii("example.")?.prepend_label(hash_with_base32("x.w"))?,
+                        Name::from_ascii("example.")?
+                            .prepend_label(hash_with_base32("x.w.example"))?,
                         hash("ai.example."),
                         [MX, RRSIG],
                     )
                     .as_ref(),
                     // Covers the wildcard at the closest encloser (*.x.w.example.)
                     Nsec3Pair::new(
-                        Name::from_ascii("example.")?.prepend_label(hash_with_base32("a"))?,
+                        Name::from_ascii("example.")?
+                            .prepend_label(hash_with_base32("a.example"))?,
                         hash("x.w.example."),
                         [DS, NS, RRSIG],
                     )
@@ -1069,6 +1233,25 @@ mod tests {
                     Name::from_ascii("example.")?.prepend_label(hash_with_base32("example"))?,
                     hash("a.example."),
                     [A, SOA, DNSKEY, RRSIG],
+                )
+                .as_ref(),],
+                200,
+                500,
+            ),
+            Proof::Bogus,
+        );
+
+        // Apex NODATA without an NSEC3 matching H(QNAME).
+        assert_eq!(
+            verify_nsec3(
+                &Query::query(Name::from_ascii("example.")?, MX),
+                Some(&Name::from_ascii("example.")?),
+                ResponseCode::NoError,
+                &[],
+                &[Nsec3Pair::new(
+                    Name::from_ascii("example.")?.prepend_label(hash_with_base32("ns1.example"))?,
+                    hash("x.y.w.example."),
+                    [A, RRSIG],
                 )
                 .as_ref(),],
                 200,
@@ -1356,6 +1539,193 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // RFC 6840 §4.1 / RFC 5155 §8.3: an ancestor-delegation NSEC3 (a parent-side
+    // record at a zone cut, with NS set and SOA clear, or with DNAME set) MUST
+    // NOT be used to prove nonexistence of any name strictly below the cut, nor
+    // of any type other than DS at the cut owner itself.
+    #[test]
+    fn nsec3_invalid_ancestor_delegation_nxdomain() -> Result<(), ProtoError> {
+        subscribe();
+
+        assert_eq!(
+            verify_nsec3(
+                &Query::query(Name::from_ascii("www.deleg.signed.")?, A),
+                Some(&Name::from_ascii("signed.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[
+                    // Parent-side NSEC3 at the cut: matches H(deleg.signed.) and
+                    // also covers the next-closer H(www.deleg.signed.) since its
+                    // interval is [H(deleg.signed.), H(*.signed.)).
+                    Nsec3Pair::new(
+                        Name::from_ascii("signed.")?
+                            .prepend_label(hash_with_base32("deleg.signed"))?,
+                        hash("*.signed."),
+                        [NS, DS, RRSIG],
+                    )
+                    .as_ref(),
+                    // Apex NSEC3, owned by H(signed.), covers the wildcard
+                    // H(*.deleg.signed.) since its interval is
+                    // [H(signed.), H(ns1.signed.)).
+                    Nsec3Pair::new(
+                        Name::from_ascii("signed.")?.prepend_label(hash_with_base32("signed"))?,
+                        hash("ns1.signed."),
+                        [NS, SOA, RRSIG, NSEC3PARAM, DNSKEY],
+                    )
+                    .as_ref(),
+                ],
+                200,
+                500,
+            ),
+            Proof::Bogus,
+        );
+
+        // NODATA at the cut owner itself: the same parent-side NSEC3 must not
+        // authenticate the absence of any type other than DS at `deleg.signed.`.
+        assert_eq!(
+            verify_nsec3(
+                &Query::query(Name::from_ascii("deleg.signed.")?, AAAA),
+                Some(&Name::from_ascii("signed.")?),
+                ResponseCode::NoError,
+                &[],
+                &[Nsec3Pair::new(
+                    Name::from_ascii("signed.")?.prepend_label(hash_with_base32("deleg.signed"))?,
+                    hash("*.signed."),
+                    [NS, DS, RRSIG],
+                )
+                .as_ref(),],
+                200,
+                500,
+            ),
+            Proof::Bogus,
+        );
+
+        // RFC 5155 §8.6 exemption: the parent-side NSEC3 at the cut DOES
+        // authenticate the absence of DS at that owner. This is the one
+        // legitimate use of an ancestor-delegation NSEC3 and must continue to
+        // validate.
+        assert_eq!(
+            verify_nsec3(
+                &Query::query(Name::from_ascii("deleg.signed.")?, DS),
+                Some(&Name::from_ascii("signed.")?),
+                ResponseCode::NoError,
+                &[],
+                &[Nsec3Pair::new(
+                    Name::from_ascii("signed.")?.prepend_label(hash_with_base32("deleg.signed"))?,
+                    hash("*.signed."),
+                    [NS, RRSIG],
+                )
+                .as_ref(),],
+                200,
+                500,
+            ),
+            Proof::Secure,
+        );
+
+        // RFC 6840 §4.1 also covers the case of an NSEC3 whose bitmap asserts
+        // a DNAME at the owner: such an NSEC3 is an ancestor delegation and
+        // must not prove nonexistence of names below.
+        assert_eq!(
+            verify_nsec3(
+                &Query::query(Name::from_ascii("www.deleg.signed.")?, A),
+                Some(&Name::from_ascii("signed.")?),
+                ResponseCode::NXDomain,
+                &[],
+                &[
+                    Nsec3Pair::new(
+                        Name::from_ascii("signed.")?
+                            .prepend_label(hash_with_base32("deleg.signed"))?,
+                        hash("*.signed."),
+                        [DNAME, RRSIG],
+                    )
+                    .as_ref(),
+                    Nsec3Pair::new(
+                        Name::from_ascii("signed.")?.prepend_label(hash_with_base32("signed"))?,
+                        hash("ns1.signed."),
+                        [NS, SOA, RRSIG, NSEC3PARAM, DNSKEY],
+                    )
+                    .as_ref(),
+                ],
+                200,
+                500,
+            ),
+            Proof::Bogus,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn nsec3_covering_mutual_exclusion() {
+        // Mock up an NSEC3 ring with only two records.
+        let record_1_hash = [0x55; 20];
+        let record_2_hash = [0xBB; 20];
+        let record_1_label = Label::from_ascii(&BASE32_DNSSEC.encode(&record_1_hash)).unwrap();
+        let record_2_label = Label::from_ascii(&BASE32_DNSSEC.encode(&record_2_hash)).unwrap();
+        let record_1_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            record_2_hash.to_vec(),
+            [],
+        );
+        let record_2_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            record_1_hash.to_vec(),
+            [],
+        );
+
+        let zone_name = Name::parse("example.", None).unwrap();
+        let record_1_pair = Nsec3RecordInfo {
+            base32_hashed_name: record_1_label,
+            zone_name: zone_name.clone(),
+            nsec3_data: &record_1_rdata,
+        };
+        let record_2_pair = Nsec3RecordInfo {
+            base32_hashed_name: record_2_label,
+            zone_name: zone_name.clone(),
+            nsec3_data: &record_2_rdata,
+        };
+
+        // Each hash should be covered by only one of the two NSEC3 records.
+        for query_hash in [[0x44; 20], [0x88; 20], [0xDD; 20]] {
+            let query_label = Label::from_ascii(&BASE32_DNSSEC.encode(&query_hash)).unwrap();
+            let covered_by_1 = find_covering_record(
+                slice::from_ref(&record_1_pair),
+                &zone_name,
+                &query_hash,
+                &query_label,
+            );
+            let covered_by_2 = find_covering_record(
+                slice::from_ref(&record_2_pair),
+                &zone_name,
+                &query_hash,
+                &query_label,
+            );
+            let covered_by = covered_by_1
+                .iter()
+                .chain(covered_by_2.iter())
+                .map(|pair| {
+                    (
+                        pair.base32_hashed_name.clone(),
+                        pair.nsec3_data
+                            .next_hashed_owner_name_base32()
+                            .unwrap()
+                            .clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                covered_by_1.is_some() ^ covered_by_2.is_some(),
+                "{query_label} is covered by {covered_by:?}"
+            );
+        }
     }
 
     #[derive(Debug)]

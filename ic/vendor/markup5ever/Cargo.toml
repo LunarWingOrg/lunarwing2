@@ -11,9 +11,9 @@
 
 [package]
 edition = "2021"
-rust-version = "1.71.0"
+rust-version = "1.85"
 name = "markup5ever"
-version = "0.39.0"
+version = "0.40.0"
 authors = ["The html5ever Project Developers"]
 build = false
 autolib = false
@@ -45,4 +45,4 @@ version = "0.4"
 version = "0.5"
 
 [dependencies.web_atoms]
-version = "0.2.3"
+version = "0.3.0"

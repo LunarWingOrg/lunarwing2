@@ -10,12 +10,13 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 name = "deadpool-postgres"
-version = "0.14.1"
+version = "0.14.2"
 authors = ["Michael P. Jung <michael.jung@terreon.de>"]
 build = false
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false
@@ -29,10 +30,45 @@ keywords = [
     "postgres",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/bikeshedder/deadpool"
+repository = "https://github.com/deadpool-rs/deadpool"
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[features]
+array-impls = ["tokio-postgres/array-impls"]
+default = ["rt_tokio_1"]
+js = ["tokio-postgres/js"]
+rt_async-std_1 = ["deadpool/rt_async-std_1"]
+rt_tokio_1 = ["deadpool/rt_tokio_1"]
+runtime = ["tokio-postgres/runtime"]
+serde = [
+    "deadpool/serde",
+    "dep:serde",
+]
+with-bit-vec-0_6 = ["tokio-postgres/with-bit-vec-0_6"]
+with-bit-vec-0_7 = ["tokio-postgres/with-bit-vec-0_7"]
+with-bit-vec-0_8 = ["tokio-postgres/with-bit-vec-0_8"]
+with-bit-vec-0_9 = ["tokio-postgres/with-bit-vec-0_9"]
+with-chrono-0_4 = ["tokio-postgres/with-chrono-0_4"]
+with-cidr-0_2 = ["tokio-postgres/with-cidr-0_2"]
+with-cidr-0_3 = ["tokio-postgres/with-cidr-0_3"]
+with-eui48-0_4 = ["tokio-postgres/with-eui48-0_4"]
+with-eui48-1 = ["tokio-postgres/with-eui48-1"]
+with-geo-types-0_6 = ["tokio-postgres/with-geo-types-0_6"]
+with-geo-types-0_7 = ["tokio-postgres/with-geo-types-0_7"]
+with-jiff-0_1 = ["tokio-postgres/with-jiff-0_1"]
+with-jiff-0_2 = ["tokio-postgres/with-jiff-0_2"]
+with-serde_json-1 = ["tokio-postgres/with-serde_json-1"]
+with-smol_str-01 = ["tokio-postgres/with-smol_str-01"]
+with-time-0_2 = ["tokio-postgres/with-time-0_2"]
+with-time-0_3 = ["tokio-postgres/with-time-0_3"]
+with-uuid-0_8 = ["tokio-postgres/with-uuid-0_8"]
+with-uuid-1 = ["tokio-postgres/with-uuid-1"]
 
 [lib]
 name = "deadpool_postgres"
@@ -50,7 +86,7 @@ path = "tests/postgres.rs"
 version = "0.1.80"
 
 [dependencies.deadpool]
-version = "0.12.0"
+version = "0.13.1"
 features = ["managed"]
 default-features = false
 
@@ -62,13 +98,16 @@ package = "serde"
 
 [dependencies.tokio]
 version = "1.29"
-features = ["rt"]
+features = [
+    "rt",
+    "sync",
+]
 
 [dependencies.tracing]
 version = "0.1.37"
 
 [dev-dependencies.config]
-version = "0.14"
+version = "0.15"
 features = ["json"]
 
 [dev-dependencies.dotenvy]
@@ -85,24 +124,17 @@ version = "1.0"
 features = [
     "macros",
     "rt-multi-thread",
-]
-
-[features]
-default = ["rt_tokio_1"]
-rt_async-std_1 = ["deadpool/rt_async-std_1"]
-rt_tokio_1 = ["deadpool/rt_tokio_1"]
-serde = [
-    "deadpool/serde",
-    "dep:serde",
+    "sync",
 ]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokio-postgres]
-version = "0.7.9"
+version = "0.7.14"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
-version = "0.2"
-features = ["js"]
+version = "0.4"
+features = ["wasm_js"]
+package = "getrandom"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.tokio-postgres]
-version = "0.7.9"
+version = "0.7.14"
 default-features = false

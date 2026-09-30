@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "c776ff5119cd01f48c9d3a6adb505b0bf957d4bd"
+    "sha1": "362391f640a0a041ec246370c67a99e7b34c9312"
   },
-  "path_in_vcs": "runtime"
+  "path_in_vcs": "crates/deadpool-runtime"
 }

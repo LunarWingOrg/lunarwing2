@@ -8,7 +8,8 @@ use self::version::{Version, rustc_version};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=version.rs");
+
+    let target = &*env::var("TARGET").expect("TARGET not set");
 
     let version = match rustc_version() {
         Some(version) => version,
@@ -29,7 +30,7 @@ fn main() {
         // Custom cfgs set by build script. Not public API.
         // grep -F 'cargo:rustc-cfg=' portable-atomic-util/build.rs | grep -Ev '^ *//' | sed -E 's/^.*cargo:rustc-cfg=//; s/(=\\)?".*$//' | LC_ALL=C sort -u | tr '\n' ',' | sed -E 's/,$/\n/'
         println!(
-            "cargo:rustc-check-cfg=cfg(portable_atomic_no_alloc,portable_atomic_no_core_unwind_safe,portable_atomic_no_error_in_core,portable_atomic_no_futures_api,portable_atomic_no_io_safety,portable_atomic_no_io_vec,portable_atomic_no_maybe_uninit,portable_atomic_no_min_const_generics,portable_atomic_no_strict_provenance,portable_atomic_no_track_caller,portable_atomic_no_unsafe_op_in_unsafe_fn,portable_atomic_sanitize_thread)"
+            "cargo:rustc-check-cfg=cfg(portable_atomic_no_core_unwind_safe,portable_atomic_no_error_in_core,portable_atomic_no_io_safety,portable_atomic_no_min_const_generics,portable_atomic_no_strict_provenance,portable_atomic_no_track_caller,portable_atomic_no_unsafe_op_in_unsafe_fn,portable_atomic_sanitize_thread)"
         );
     }
 
@@ -37,22 +38,6 @@ fn main() {
     // stable rustc is used when the build script doesn't run. This is useful
     // for non-cargo build systems that don't run the build script.
 
-    // alloc stabilized in Rust 1.36 (nightly-2019-04-15) https://github.com/rust-lang/rust/pull/59675
-    if !version.probe(36, 2019, 4, 14) {
-        println!("cargo:rustc-cfg=portable_atomic_no_alloc");
-    }
-    // std::{future,task} stabilized in Rust 1.36 (nightly-2019-04-25) https://github.com/rust-lang/rust/pull/59739
-    if !version.probe(36, 2019, 4, 24) {
-        println!("cargo:rustc-cfg=portable_atomic_no_futures_api");
-    }
-    // {read,write}_vectored stabilized in Rust 1.36 (nightly-2019-04-30) https://github.com/rust-lang/rust/pull/60334
-    if !version.probe(36, 2019, 4, 29) {
-        println!("cargo:rustc-cfg=portable_atomic_no_io_vec");
-    }
-    // MaybeUninit stabilized in Rust 1.36 (nightly-2019-05-21) https://github.com/rust-lang/rust/pull/60445
-    if !version.probe(36, 2019, 5, 20) {
-        println!("cargo:rustc-cfg=portable_atomic_no_maybe_uninit");
-    }
     // track_caller stabilized in Rust 1.46 (nightly-2020-07-02): https://github.com/rust-lang/rust/pull/72445
     if !version.probe(46, 2020, 7, 1) {
         println!("cargo:rustc-cfg=portable_atomic_no_track_caller");
@@ -86,12 +71,11 @@ fn main() {
         println!("cargo:rustc-cfg=portable_atomic_no_strict_provenance");
     }
 
-    if version.nightly {
-        // `cfg(sanitize = "..")` is not stabilized.
-        let sanitize = env::var("CARGO_CFG_SANITIZE").unwrap_or_default();
-        if sanitize.contains("thread") {
-            println!("cargo:rustc-cfg=portable_atomic_sanitize_thread");
-        }
+    // `cfg(sanitize = "..")` is not stabilized.
+    // x86_64-unknown-linux-gnutsan is available on stable since Rust 1.96: https://github.com/rust-lang/rust/pull/152757
+    let sanitize = env::var("CARGO_CFG_SANITIZE").unwrap_or_default();
+    if sanitize.contains("thread") || target == "x86_64-unknown-linux-gnutsan" {
+        println!("cargo:rustc-cfg=portable_atomic_sanitize_thread");
     }
 }
 
@@ -128,7 +112,7 @@ mod version {
         // The known latest stable version. If we unable to determine
         // the rustc version, we assume this is the current version.
         // It is no problem if this is older than the actual latest stable.
-        pub(crate) const LATEST: Self = Self::stable(94);
+        pub(crate) const LATEST: Self = Self::stable(98);
 
         pub(crate) const fn stable(rustc_minor: u32) -> Self {
             Self { minor: rustc_minor, nightly: false, commit_date: Date::UNKNOWN }
@@ -161,6 +145,7 @@ mod version {
             let nightly = match env::var_os("RUSTC_BOOTSTRAP") {
                 // When -1 is passed rustc works like stable, e.g., cfg(target_feature = "unstable_target_feature") will never be set. https://github.com/rust-lang/rust/pull/132993
                 Some(ref v) if v == "-1" => false,
+                // When 1 is passed stable rustc works like nightly, but we ignore it for now.
                 _ => channel == "nightly" || channel == "dev",
             };
 
