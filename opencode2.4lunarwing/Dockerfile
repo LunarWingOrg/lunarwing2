@@ -1,11 +1,11 @@
-# v2.0.18 resolves to this reviewed commit. Both must move together.
+# v2.0.20 resolves to this reviewed commit. Both must move together.
 # OpenCode 2 is beta in practice (upstream's own migration doc: "server and
 # plugin APIs may continue to change"). This lane is deliberately SEPARATE
 # from the proven v1 worker (opencode4lunarwing, pinned v1.18.25) so tenants
 # opt into v2 explicitly — see docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
 # Re-bump only after re-verifying the bridge against the v2 server API.
-ARG OPENCODE_VERSION=v2.0.18
-ARG OPENCODE_REF=cd9a14a6b688d4021bee381dfd39d2cef9c0f862
+ARG OPENCODE_VERSION=v2.0.20
+ARG OPENCODE_REF=84c9be93a56304a108f1a22df0c5d62c26d5b6ca
 ARG DEBIAN_SNAPSHOT=20260906T000000Z
 ARG SOURCE_REVISION=unknown
 
