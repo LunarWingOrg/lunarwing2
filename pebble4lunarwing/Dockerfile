@@ -30,7 +30,39 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/pebble fetch --depth 1 origin "${PEBBLE_REF}" && \
     git -C /build/pebble checkout --detach FETCH_HEAD && \
     test "$(git -C /build/pebble rev-parse HEAD)" = "${PEBBLE_REF}"
-RUN cd pebble && cargo build --release --locked --bin pebble
+# The pinned upstream checkout ships rustls 0.23.41, which is affected by
+# RUSTSEC-2026-0285 (fixed >= 0.23.45) and upstream has no newer release. So
+# the reviewed patched lock is supplied as a hashed build input instead of an
+# unpinned build-time `cargo update`: it is upstream at PEBBLE_REF with only
+# rustls 0.23.41 -> 0.23.45 and rustls-webpki 0.103.13 -> 0.103.15 changed.
+# The build fails if the checked-out lock or the pinned digest drift from the
+# reviewed inputs, keeping the locked/reproducible-build guarantee.
+COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
+ARG PEBBLE_LOCK_SHA256
+RUN test "$(sha256sum /tmp/pebble-upstream-Cargo.lock | cut -d' ' -f1)" = "${PEBBLE_LOCK_SHA256}" && \
+    python3 - <<'PY'
+import difflib, pathlib, sys
+
+upstream = pathlib.Path("pebble/Cargo.lock").read_text().splitlines()
+patched = pathlib.Path("/tmp/pebble-upstream-Cargo.lock").read_text().splitlines()
+diff = list(difflib.unified_diff(upstream, patched, n=3))
+current = None
+changed = set()
+for line in diff:
+    if line.startswith(" "):
+        field = line[1:].strip()
+        if field.startswith("name = "):
+            current = field.split('"')[1]
+    elif line.startswith("-version"):
+        changed.add(current)
+allowed = {"rustls", "rustls-webpki"}
+extra = changed - allowed
+if extra:
+    print(f"Cargo.lock delta outside allowlist {sorted(allowed)}: {sorted(extra)}", file=sys.stderr)
+    sys.exit(1)
+PY
+RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \
+    cd pebble && cargo build --release --locked --bin pebble
 
 # --- Runtime ---
 FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
