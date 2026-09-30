@@ -49,7 +49,7 @@
 17. [ ] update all docs in docs/architecture
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/270
-20. [x] fix issues in CI/CD
+20. [ ] fix issues in CI/CD (if any)
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
 22. [x] (S) (H) Consider web gateway additional functionality (seperate from goal 38)
 23. [x] (S) new reconcile method for MR review process
