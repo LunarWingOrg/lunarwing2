@@ -1539,6 +1539,49 @@ openrc_service_state() {
   fi
 }
 
+# Print the PID of the tenant's *daemon process* — the process that actually
+# loaded the tenant env file — for read-only diagnostics such as
+# /proc/<pid>/environ inspection (WI#268 overlay audits).
+#
+# On systemd this is the unit's MainPID, read through the tenant user manager
+# (never the system bus). On OpenRC the daemon runs under supervise-daemon,
+# whose pidfile holds the SUPERVISOR's PID (supervise-daemon(8): "-p pidfile
+# Sets a path for the supervisor's pid file. Note that this is not the pid
+# file of the process that is being supervised."). The tenant env file is
+# applied even later, by lunarwing-openrc-env-exec.sh in the child. So the
+# daemon PID comes from OpenRC's own per-service value record —
+# $(rc_svcdir)/options/<svc>/child_pid, written by supervise-daemon itself
+# (default rc_svcdir /run/openrc, overridable via RC_SVCDIR) — never from the
+# supervisor pidfile.
+#
+# Prints the numeric PID and returns 0, or prints nothing and returns 1 when
+# the PID cannot be resolved (unit not running/unknown state, missing or
+# non-numeric record, or a PID that is no longer alive). A failed probe must
+# be treated as *uninspected*, not as evidence of anything.
+#
+# Usage: tenant_daemon_pid <name>
+tenant_daemon_pid() {
+  local name="$1" svc pid
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  svc="lunarwing-${name}"
+
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    local record="${RC_SVCDIR:-/run/openrc}/options/${svc}/child_pid"
+    [[ -r "$record" ]] || return 1
+    pid="$(tr -cd '0-9' <"$record" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  else
+    pid="$(_systemctl_user "$name" show "${svc}.service" -p MainPID --value 2>/dev/null || true)"
+    pid="$(tr -cd '0-9' <<<"${pid:-}" || true)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  fi
+
+  [[ -d "/proc/$pid" ]] || return 1
+  printf '%s\n' "$pid"
+}
+
 status_tenant() {
   local name="$1"
   name="$(sanitize_name "$name")"
