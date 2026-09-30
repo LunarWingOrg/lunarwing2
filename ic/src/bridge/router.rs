@@ -4278,6 +4278,32 @@ pub struct EngineMissionDetail {
     pub threads: Vec<EngineThreadInfo>,
 }
 
+/// One mission fire rendered for the legacy `routine_history` tool (WI#265).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineMissionRun {
+    pub thread_id: String,
+    pub status: String,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    pub tokens_used: u64,
+    pub step_count: usize,
+}
+
+/// Mission history resolved by name, for the legacy `routine_history` tool
+/// fallback (WI#265).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineMissionHistory {
+    #[serde(flatten)]
+    pub info: EngineMissionInfo,
+    pub cadence: serde_json::Value,
+    pub runs: Vec<EngineMissionRun>,
+}
+
 // ── Engine query functions ───────────────────────────────────
 
 fn cadence_type_label(cadence: &lunarwing_engine::types::mission::MissionCadence) -> &'static str {
@@ -4649,6 +4675,110 @@ pub async fn get_engine_mission(
         next_fire_at: m.next_fire_at.map(|dt| dt.to_rfc3339()),
         threads,
     }))
+}
+
+/// Resolve a mission by name and render its run history for the legacy
+/// `routine_history` tool (WI#265).
+///
+/// Engine V2 missions live in a different registry from v1 routines, so a name
+/// that misses the v1 `routines` table can still name a live mission. The
+/// default project is searched first (the common case); a global scan over all
+/// projects, filtered to missions the user owns or that are shared, covers
+/// per-user default projects. Recent fires are the newest `thread_history`
+/// entries whose threads still load.
+pub async fn get_engine_mission_history_by_name(
+    name: &str,
+    user_id: &str,
+    limit: usize,
+) -> Result<Option<EngineMissionHistory>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(None);
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(None);
+    };
+
+    let mission = resolve_mission_by_name(state, name, user_id).await?;
+    let Some(mission) = mission else {
+        return Ok(None);
+    };
+
+    let mut threads = Vec::new();
+    for tid in mission.thread_history.iter().rev() {
+        if threads.len() >= limit {
+            break;
+        }
+        if let Ok(Some(thread)) = state.store.load_thread(*tid).await {
+            threads.push(thread);
+        }
+    }
+
+    Ok(Some(EngineMissionHistory {
+        info: mission_to_info(&mission),
+        cadence: public_cadence_json(&mission.cadence),
+        runs: threads.iter().map(mission_thread_run).collect(),
+    }))
+}
+
+/// Find a mission by name visible to `user_id`, or `None` when no mission
+/// carries that name.
+async fn resolve_mission_by_name(
+    state: &EngineState,
+    name: &str,
+    user_id: &str,
+) -> Result<Option<lunarwing_engine::Mission>, Error> {
+    let missions = state
+        .store
+        .list_missions_with_shared(state.default_project_id, user_id)
+        .await
+        .map_err(|e| engine_err("list missions", e))?;
+    if let Some(mission) = missions.into_iter().find(|mission| mission.name == name) {
+        return Ok(Some(mission));
+    }
+
+    // The default project may belong to another user in multi-tenant hosts;
+    // fall back to a global scan filtered to visible missions.
+    let candidates = state
+        .store
+        .list_all_missions_global()
+        .await
+        .map_err(|e| engine_err("list missions", e))?;
+    Ok(candidates
+        .into_iter()
+        .find(|mission| mission.name == name && mission_visible_to(mission, user_id)))
+}
+
+/// Ownership check shared with `get_engine_mission`: a mission is visible to
+/// its owner and to everyone when shared-owned.
+fn mission_visible_to(mission: &lunarwing_engine::Mission, user_id: &str) -> bool {
+    mission.user_id == user_id || is_shared_owner(&mission.user_id)
+}
+
+/// Render one mission fire as a `routine_history`-shaped run entry.
+fn mission_thread_run(thread: &lunarwing_engine::Thread) -> EngineMissionRun {
+    let duration_secs = thread
+        .completed_at
+        .map(|completed| completed.signed_duration_since(thread.created_at).num_seconds());
+    EngineMissionRun {
+        thread_id: thread.id.to_string(),
+        status: format!("{:?}", thread.state),
+        started_at: thread.created_at.to_rfc3339(),
+        completed_at: thread.completed_at.map(|dt| dt.to_rfc3339()),
+        duration_secs,
+        result_summary: thread
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == lunarwing_engine::MessageRole::Assistant)
+            .map(|message| {
+                let mut summary = message.content.clone();
+                summary.truncate(200);
+                summary
+            }),
+        tokens_used: thread.total_tokens_used,
+        step_count: thread.step_count,
+    }
 }
 
 /// Manually fire a mission (spawn a new thread).
