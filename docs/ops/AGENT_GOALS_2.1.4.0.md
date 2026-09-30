@@ -45,11 +45,11 @@
 20. [x] fix issues in CI/CD
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
 22. [x] (S) (H) Consider web gateway additional functionality (seperate from goal 38)
-23. [x] (S) test goal reconciler....so far, useless....
+23. [x] (S) new reconcile method for MR review process
 24. [x] (S) record deferred items somewhere in one place
 25. [ ] come up with ideas for names for 2.1.4.0
 26. [x] (S) (HUMAN) start thinking about scope of 2.1.6.0 next real feature set
 27. [x] (S) (HUMAN) Findings from sb and kumo
-28. [x] (S) Reserved
+28. [ ] Repo housecleaning - get rid of old stuff in docs/ops and move it to history
 
 ---
