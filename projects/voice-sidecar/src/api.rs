@@ -20,7 +20,10 @@ use subtle::ConstantTimeEq;
 
 use crate::audio::{AudioFormat, decode_audio, encode_wav};
 use crate::config::{Config, normalize_stt_language};
-use crate::engine::{EngineError, SpeechSegment, TranscriptSegment, VoiceEngine};
+use crate::engine::{
+    AbandonedInference, ComponentAbandonment, EngineError, SpeechSegment, TranscriptSegment,
+    VoiceComponent, VoiceEngine,
+};
 
 type DirectRateLimiter = governor::RateLimiter<
     governor::state::NotKeyed,
@@ -63,6 +66,8 @@ struct Metrics {
     cache_hits: AtomicU64,
     rate_limited: AtomicU64,
     errors: AtomicU64,
+    /// Requests whose caller gave up before inference finished (WI#264).
+    abandoned_inference: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -133,6 +138,17 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ReadyResponse {
+    ready: bool,
+    stt_engine: Option<String>,
+    tts_engine: Option<String>,
+    vad_engine: Option<String>,
+    models_loaded: Vec<String>,
+    #[serde(rename = "abandoned_inference")]
+    abandoned: AbandonedInference,
+}
+
+#[derive(Debug, Serialize)]
 struct MetricsResponse {
     total_requests: u64,
     transcription_requests: u64,
@@ -141,6 +157,8 @@ struct MetricsResponse {
     cache_hits: u64,
     rate_limited: u64,
     errors: u64,
+    abandoned_inference_in_flight: u64,
+    abandoned_inference_total: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +236,54 @@ pub fn health_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Runs one engine call under the configured request timeout (WI#264).
+///
+/// A timeout means the caller is gone but the native inference may still be
+/// running while holding a shared inference permit and its component mutex.
+/// The engine's per-component abandonment tracker records that; this helper
+/// mirrors it into metrics and logs one line so operators can see which
+/// component is draining. New requests for that component are rejected fast
+/// with 503 until the underlying call returns.
+async fn run_engine_call<T, F>(
+    state: &AppState,
+    component: VoiceComponent,
+    call: F,
+) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = Result<T, EngineError>>,
+{
+    let before = state.engine.abandoned_inference();
+    let before_in_flight = component_view(before, component).in_flight;
+    match tokio::time::timeout(Duration::from_secs(state.config.request_timeout_secs), call).await {
+        Ok(result) => result.map_err(map_engine_error),
+        Err(_) => {
+            // The caller is gone; if the engine actually started inference,
+            // its in-flight abandonment counter is now higher than before.
+            let after = state.engine.abandoned_inference();
+            if component_view(after, component).in_flight > before_in_flight {
+                state
+                    .metrics
+                    .abandoned_inference
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    component = component.as_str(),
+                    timeout_secs = state.config.request_timeout_secs,
+                    "request timed out while inference is still running; component is draining"
+                );
+            }
+            Err(ApiError::Timeout)
+        }
+    }
+}
+
+fn component_view(snapshot: AbandonedInference, component: VoiceComponent) -> ComponentAbandonment {
+    match component {
+        VoiceComponent::Stt => snapshot.stt,
+        VoiceComponent::Tts => snapshot.tts,
+        VoiceComponent::Vad => snapshot.vad,
+    }
+}
+
 async fn transcribe(
     State(state): State<AppState>,
     Json(mut request): Json<TranscribeRequest>,
@@ -240,13 +306,12 @@ async fn transcribe(
     } else {
         request.model
     };
-    let result = tokio::time::timeout(
-        Duration::from_secs(state.config.request_timeout_secs),
+    let result = run_engine_call(
+        &state,
+        VoiceComponent::Stt,
         state.engine.transcribe(audio, &request.language, &model),
     )
-    .await
-    .map_err(|_| ApiError::Timeout)?
-    .map_err(map_engine_error)?;
+    .await?;
     let response = TranscribeResponse {
         text: result.text,
         language: result.language,
@@ -283,15 +348,14 @@ async fn synthesize(
     } else {
         request.voice
     };
-    let audio = tokio::time::timeout(
-        Duration::from_secs(state.config.request_timeout_secs),
+    let audio = run_engine_call(
+        &state,
+        VoiceComponent::Tts,
         state
             .engine
             .synthesize(&request.text, &voice, request.speed),
     )
-    .await
-    .map_err(|_| ApiError::Timeout)?
-    .map_err(map_engine_error)?;
+    .await?;
     if audio.sample_rate == 0
         || audio.samples.len() as u64
             > u64::from(audio.sample_rate).saturating_mul(state.config.max_tts_audio_secs)
@@ -314,13 +378,7 @@ async fn detect(
 ) -> Result<Json<DetectResponse>, ApiError> {
     state.metrics.vad_requests.fetch_add(1, Ordering::Relaxed);
     let audio = decode_request_audio(&state, request.audio, request.format).await?;
-    let segments = tokio::time::timeout(
-        Duration::from_secs(state.config.request_timeout_secs),
-        state.engine.detect(audio),
-    )
-    .await
-    .map_err(|_| ApiError::Timeout)?
-    .map_err(map_engine_error)?;
+    let segments = run_engine_call(&state, VoiceComponent::Vad, state.engine.detect(audio)).await?;
     Ok(Json(DetectResponse {
         has_speech: !segments.is_empty(),
         segments,
@@ -338,15 +396,26 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     let readiness = state.engine.readiness();
-    let status = if readiness.ready {
+    let abandoned = state.engine.abandoned_inference();
+    let ready = readiness.ready && !abandoned.any_in_flight();
+    let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(readiness))
+    let body = ReadyResponse {
+        ready,
+        stt_engine: readiness.stt_engine,
+        tts_engine: readiness.tts_engine,
+        vad_engine: readiness.vad_engine,
+        models_loaded: readiness.models_loaded,
+        abandoned,
+    };
+    (status, Json(body))
 }
 
 async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
+    let abandoned = state.engine.abandoned_inference();
     Json(MetricsResponse {
         total_requests: state.metrics.total_requests.load(Ordering::Relaxed),
         transcription_requests: state.metrics.transcription_requests.load(Ordering::Relaxed),
@@ -355,6 +424,10 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
         cache_hits: state.metrics.cache_hits.load(Ordering::Relaxed),
         rate_limited: state.metrics.rate_limited.load(Ordering::Relaxed),
         errors: state.metrics.errors.load(Ordering::Relaxed),
+        abandoned_inference_in_flight: abandoned.stt.in_flight as u64
+            + abandoned.tts.in_flight as u64
+            + abandoned.vad.in_flight as u64,
+        abandoned_inference_total: abandoned.stt.total + abandoned.tts.total + abandoned.vad.total,
     })
 }
 
@@ -498,7 +571,7 @@ mod tests {
 
     use super::*;
     use crate::audio::{AudioData, encode_wav};
-    use crate::engine::{EngineReadiness, SynthesizedAudio, Transcription};
+    use crate::engine::{EngineReadiness, InferenceTracker, SynthesizedAudio, Transcription};
 
     struct MockEngine;
 
@@ -811,5 +884,208 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ready.status(), StatusCode::OK);
+    }
+
+    /// Slow mock engine used to exercise timeout abandonment (WI#264).
+    ///
+    /// `synthesize` mirrors the real engine's tracker usage: it checks the
+    /// admission gate, then runs a blocking task that holds until the test
+    /// releases it — mimicking a Kokoro inference that outlives its caller
+    /// without a live model or a permanent hang. It uses the production
+    /// `InferenceTracker`, so API tests exercise the real accounting.
+    struct SlowEngine {
+        /// First synthesis blocks on this channel; later calls return
+        /// immediately once the channel is consumed.
+        release: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>,
+        tracker: Arc<InferenceTracker>,
+    }
+
+    #[async_trait]
+    impl VoiceEngine for SlowEngine {
+        async fn transcribe(
+            &self,
+            _audio: AudioData,
+            _language: &str,
+            _model: &str,
+        ) -> Result<Transcription, EngineError> {
+            Ok(Transcription {
+                text: "slow".into(),
+                language: "en".into(),
+                confidence: None,
+                segments: vec![],
+            })
+        }
+
+        async fn synthesize(
+            &self,
+            _text: &str,
+            _voice: &str,
+            _speed: f32,
+        ) -> Result<SynthesizedAudio, EngineError> {
+            self.tracker.reject_if_abandoned(VoiceComponent::Tts)?;
+            let (caller, worker) = self.tracker.begin(VoiceComponent::Tts);
+            let release = Arc::clone(&self.release);
+            let joined = tokio::task::spawn_blocking(move || {
+                let _worker = worker;
+                let mut slot = match release.lock() {
+                    Ok(guard) => guard,
+                    Err(poison) => poison.into_inner(),
+                };
+                // Stand in for uninterruptible native inference: block until
+                // the test releases, then finish. Later calls have no
+                // receiver left and complete immediately.
+                if let Some(receiver) = slot.take() {
+                    let mut receiver = receiver;
+                    let _ = receiver.blocking_recv();
+                }
+            })
+            .await;
+            drop(caller);
+            joined.map_err(|_| EngineError::Inference)?;
+            Ok(SynthesizedAudio {
+                samples: vec![0.0; 160],
+                sample_rate: 16_000,
+            })
+        }
+
+        async fn detect(&self, _audio: AudioData) -> Result<Vec<SpeechSegment>, EngineError> {
+            Ok(vec![])
+        }
+
+        fn readiness(&self) -> EngineReadiness {
+            EngineReadiness {
+                ready: true,
+                stt_engine: Some("mock".into()),
+                tts_engine: Some("mock".into()),
+                vad_engine: Some("mock".into()),
+                models_loaded: vec!["stt".into(), "tts".into(), "vad".into()],
+            }
+        }
+
+        fn abandoned_inference(&self) -> AbandonedInference {
+            self.tracker.snapshot()
+        }
+    }
+
+    fn slow_state(
+        release: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>,
+    ) -> AppState {
+        let mut config = test_config();
+        config.request_timeout_secs = 1;
+        AppState::new(
+            Arc::new(config),
+            Arc::new(SlowEngine {
+                release,
+                tracker: Arc::new(InferenceTracker::default()),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn timed_out_synthesis_records_abandonment_and_fails_fast() {
+        let (release_tx, release_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let state = slow_state(Arc::new(std::sync::Mutex::new(Some(release_rx))));
+        let router = api_router(state.clone());
+
+        // First request times out while the mock inference holds.
+        let timed_out = router
+            .clone()
+            .oneshot(authorized_json_request(
+                "/v1/voice/synthesize",
+                serde_json::json!({"text": "hello herd"}).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("timed-out request failed: {error}"));
+        assert_eq!(timed_out.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(state.metrics.abandoned_inference.load(Ordering::Relaxed), 1);
+
+        // While abandoned inference is in flight the component fails fast
+        // instead of queueing behind the zombie.
+        let rejected = router
+            .clone()
+            .oneshot(authorized_json_request(
+                "/v1/voice/synthesize",
+                serde_json::json!({"text": "hello again"}).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("rejected request failed: {error}"));
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // /ready reports not-ready while a component is draining.
+        let ready = health_router(state.clone())
+            .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap_or_else(|error| panic!("ready probe failed: {error}"));
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = response_json(ready).await;
+        assert_eq!(body["abandoned_inference"]["tts"]["in_flight"], 1);
+
+        // Repeated timed-out requests cannot degrade the sidecar forever:
+        // once the underlying call returns, the component is re-admitted.
+        release_tx.send(()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let recovered = router
+            .oneshot(authorized_json_request(
+                "/v1/voice/synthesize",
+                serde_json::json!({"text": "recovered"}).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("recovery request failed: {error}"));
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let snapshot = state.engine.abandoned_inference();
+        assert_eq!(snapshot.tts.in_flight, 0);
+        assert_eq!(snapshot.tts.total, 1);
+    }
+
+    #[tokio::test]
+    async fn abandoned_tts_does_not_block_other_components() {
+        let (release_tx, release_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let state = slow_state(Arc::new(std::sync::Mutex::new(Some(release_rx))));
+        let router = api_router(state.clone());
+
+        let timed_out = router
+            .clone()
+            .oneshot(authorized_json_request(
+                "/v1/voice/synthesize",
+                serde_json::json!({"text": "stuck tts"}).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("timed-out request failed: {error}"));
+        assert_eq!(timed_out.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        // STT and VAD stay available while TTS is draining.
+        let wav = encode_wav(&vec![0.0; 160], 16_000);
+        let transcription = router
+            .clone()
+            .oneshot(authorized_json_request(
+                "/v1/voice/transcribe",
+                serde_json::json!({
+                    "audio": base64::engine::general_purpose::STANDARD.encode(wav),
+                    "format": "wav"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("transcription request failed: {error}"));
+        assert_eq!(transcription.status(), StatusCode::OK);
+
+        let detection = router
+            .clone()
+            .oneshot(authorized_json_request(
+                "/v1/voice/detect",
+                serde_json::json!({
+                    "audio": base64::engine::general_purpose::STANDARD.encode(encode_wav(
+                        &vec![0.0; 160],
+                        16_000
+                    )),
+                    "format": "wav"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("detection request failed: {error}"));
+        assert_eq!(detection.status(), StatusCode::OK);
+
+        release_tx.send(()).await.unwrap();
     }
 }

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "onnx")]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -156,8 +156,7 @@ impl InferenceTracker {
     }
 
     fn worker_returned_after_abandonment(&self, component: VoiceComponent) {
-        self.in_flight_abandoned[Self::slot(component)]
-            .fetch_sub(1, Ordering::Relaxed);
+        self.in_flight_abandoned[Self::slot(component)].fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Current abandoned-inference counters, for health/metrics surfaces.
@@ -236,7 +235,8 @@ impl Drop for WorkerGuard {
     fn drop(&mut self) {
         if self.settled.swap(WORKER_RETURNED, Ordering::SeqCst) == CALLER_LEFT {
             // The caller had already left; settle the in-flight abandonment.
-            self.tracker.worker_returned_after_abandonment(self.component);
+            self.tracker
+                .worker_returned_after_abandonment(self.component);
         }
     }
 }
@@ -510,7 +510,7 @@ impl VoiceEngine for SherpaVoiceEngine {
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _worker = worker;
-            let mut tts = tts.try_lock().ok_or(EngineError::Busy)?;
+            let mut tts = tts.try_lock().map_err(|_| EngineError::Busy)?;
             let audio = tts
                 .create(&text, speaker_id, speed.clamp(0.5, 2.0))
                 .map_err(|_| EngineError::Inference)?;
