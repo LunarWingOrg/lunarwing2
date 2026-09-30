@@ -424,6 +424,9 @@ Commands:
     --skip-render                  Keep existing unit files (run render-units later;
                                    must happen before v2.0.0 for pre-1.1.9 tenants)
   rotate-pg-password <name>       Generate a new random PG password (ALTER ROLE + env update)
+  psql <name> [args...]           Run psql inside the tenant's own pg container via the
+                                  init/runtime-agnostic _ctr path (read-only audits;
+                                  fingerprint rows, don't dump content)
 
   configure-gotify <name> <url>    Set custom Gotify URL for a tenant
                                    (updates workspace config + capabilities)
@@ -1159,6 +1162,12 @@ main() {
       require_root
       [[ -n "${1:-}" ]] || die "usage: rotate-pg-password <name>"
       rotate_tenant_pg_password "$1"
+      ;;
+
+    psql)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: psql <name> [psql args...]"
+      tenant_psql "$@"
       ;;
 
     list-tenants|list)

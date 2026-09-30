@@ -254,6 +254,26 @@ rotate_tenant_pg_password() {
   say "    lunarwing-mt-admin.sh restart-tenant $name"
 }
 
+# Run psql inside the tenant's own PostgreSQL container via `_ctr`, so the
+# query hits the same store that owns the container on every init system and
+# container runtime (rootless podman under the tenant user, or rootful
+# docker). Read-only operator diagnostics (audits, health inspection) are the
+# intended use: SELECTs and fingerprints, not content dumps — env/DB rows can
+# be secret-bearing. Extra argv is passed through to psql verbatim.
+# Usage: tenant_psql <name> [psql args...]
+tenant_psql() {
+  local name="$1"; shift
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_container_runtime
+
+  local container_name="lunarwing-pg-$name"
+  _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
+    || die "PostgreSQL container $container_name is not running; start the tenant first"
+
+  _ctr "$name" exec -i "$container_name" psql -U lunarwing -d lunarwing "$@"
+}
+
 # ── PostgreSQL backup / restore ──────────────────────────────────────────────
 
 # pg_dump a tenant's database to a timestamped custom-format file under
