@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(feature = "onnx")]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -134,17 +134,17 @@ impl InferenceTracker {
     /// [`WorkerGuard`] is moved into the blocking closure and settles the
     /// accounting when the native inference returns.
     pub fn begin(self: &Arc<Self>, component: VoiceComponent) -> (CallerGuard, WorkerGuard) {
-        let settled = Arc::new(AtomicU8::new(CALL_ACTIVE));
+        let phase = Arc::new(Mutex::new(CallPhase::Active));
         (
             CallerGuard {
                 tracker: Arc::clone(self),
                 component,
-                settled: Arc::clone(&settled),
+                phase: Arc::clone(&phase),
             },
             WorkerGuard {
                 tracker: Arc::clone(self),
                 component,
-                settled,
+                phase,
             },
         )
     }
@@ -190,29 +190,51 @@ impl InferenceTracker {
     }
 }
 
-const CALL_ACTIVE: u8 = 0b00;
-const CALLER_LEFT: u8 = 0b01;
-const WORKER_RETURNED: u8 = 0b10;
+/// Phase of one tracked call, advanced exactly once per side (WI#264).
+///
+/// All transitions go through the per-call mutex shared by the guards, so a
+/// phase change and its counter accounting are one atomic step: the worker
+/// can never observe `CallerLeft` and decrement `in_flight_abandoned` before
+/// the caller's increment is visible. A settled-flag swap alone cannot
+/// guarantee that ordering — publishing `CALLER_LEFT` and incrementing the
+/// counter were separate operations, so a descheduled caller let the worker
+/// decrement a still-zero counter and wrap it to `usize::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CallPhase {
+    #[default]
+    Active,
+    CallerLeft,
+    WorkerReturned,
+}
+
+/// Locks a mutex, recovering from poisoning.
+///
+/// Abandonment accounting is advisory (health/admission), never a reason to
+/// fail an inference call, so a panicked sibling thread's lock is taken over
+/// rather than propagated.
+fn lock_or_recover<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 
 /// Half of the abandonment detector owned by the caller's async future.
 ///
 /// Created by [`InferenceTracker::begin`] alongside its [`WorkerGuard`] pair.
-/// When the caller's future is dropped while the shared settled-flag still
-/// reads `CALL_ACTIVE` (worker still running), the drop records the call as
+/// When the caller's future is dropped while the call is still
+/// [`CallPhase::Active`] (worker still running), the drop records the call as
 /// abandoned; on normal completion the future's drop happens after the join
-/// handle already observed `WORKER_RETURNED`, so nothing is recorded.
+/// handle already observed `WorkerReturned`, so nothing is recorded.
 #[derive(Debug)]
 pub struct CallerGuard {
     tracker: Arc<InferenceTracker>,
     component: VoiceComponent,
-    settled: Arc<AtomicU8>,
+    phase: Arc<Mutex<CallPhase>>,
 }
 
 impl Drop for CallerGuard {
     fn drop(&mut self) {
-        // Dropped on the caller side while the worker half still exists and
-        // inference is running — abandonment.
-        if self.settled.swap(CALLER_LEFT, Ordering::SeqCst) == CALL_ACTIVE {
+        let mut phase = lock_or_recover(&self.phase);
+        if *phase == CallPhase::Active {
+            *phase = CallPhase::CallerLeft;
             self.tracker.caller_left_while_running(self.component);
         }
     }
@@ -220,7 +242,7 @@ impl Drop for CallerGuard {
 
 /// Half of the abandonment detector owned by the blocking closure.
 ///
-/// Its drop sets the shared settled-flag to `WORKER_RETURNED` and, when the
+/// Its drop advances the shared phase to `WorkerReturned` and, when the
 /// caller half already recorded abandonment, clears the in-flight count so
 /// the component is re-admitted. Because settlement happens in `Drop`, a
 /// panic inside the blocking closure still re-admits the component.
@@ -228,13 +250,15 @@ impl Drop for CallerGuard {
 pub struct WorkerGuard {
     tracker: Arc<InferenceTracker>,
     component: VoiceComponent,
-    settled: Arc<AtomicU8>,
+    phase: Arc<Mutex<CallPhase>>,
 }
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        if self.settled.swap(WORKER_RETURNED, Ordering::SeqCst) == CALLER_LEFT {
-            // The caller had already left; settle the in-flight abandonment.
+        let mut phase = lock_or_recover(&self.phase);
+        let previous = *phase;
+        *phase = CallPhase::WorkerReturned;
+        if previous == CallPhase::CallerLeft {
             self.tracker
                 .worker_returned_after_abandonment(self.component);
         }
@@ -713,6 +737,106 @@ impl VoiceEngine for SherpaVoiceEngine {
             tts_engine: None,
             vad_engine: None,
             models_loaded: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::Barrier;
+    use std::thread;
+
+    #[test]
+    fn normal_completion_records_no_abandonment() {
+        let tracker = Arc::new(InferenceTracker::default());
+        let (caller, worker) = tracker.begin(VoiceComponent::Tts);
+
+        drop(worker);
+        drop(caller);
+        // Worker finished first: caller's drop sees WorkerReturned and does
+        // nothing. Neither counter moved.
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.tts.total, 0);
+        assert_eq!(snapshot.tts.in_flight, 0);
+        assert!(tracker.reject_if_abandoned(VoiceComponent::Tts).is_ok());
+    }
+
+    #[test]
+    fn abandonment_then_worker_return_re_admits_component() {
+        let tracker = Arc::new(InferenceTracker::default());
+        let (caller, worker) = tracker.begin(VoiceComponent::Tts);
+
+        drop(caller);
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.tts.total, 1);
+        assert_eq!(snapshot.tts.in_flight, 1);
+        assert!(matches!(
+            tracker.reject_if_abandoned(VoiceComponent::Tts),
+            Err(EngineError::Busy)
+        ));
+
+        drop(worker);
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.tts.total, 1);
+        assert_eq!(snapshot.tts.in_flight, 0);
+        assert!(tracker.reject_if_abandoned(VoiceComponent::Tts).is_ok());
+    }
+
+    #[test]
+    fn worker_panic_still_re_admits_component() {
+        let tracker = Arc::new(InferenceTracker::default());
+        let (caller, worker) = tracker.begin(VoiceComponent::Stt);
+
+        drop(caller);
+        // A panic inside the blocking closure unwinds through WorkerGuard's
+        // drop, which must still settle the accounting.
+        let caught = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _held = worker;
+            panic!("native inference panicked");
+        }));
+        assert!(caught.is_err());
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.stt.total, 1);
+        assert_eq!(snapshot.stt.in_flight, 0);
+        assert!(tracker.reject_if_abandoned(VoiceComponent::Stt).is_ok());
+    }
+
+    /// Concurrent caller-drop/worker-return races must never underflow the
+    /// in-flight counter (WI#264 review P2): the worker cannot decrement
+    /// before the abandonment increment is visible because both go through
+    /// the shared per-call phase lock.
+    #[test]
+    fn concurrent_guard_drops_never_underflow_in_flight_counter() {
+        const DROPS: usize = 64;
+        for _ in 0..DROPS {
+            let tracker = Arc::new(InferenceTracker::default());
+            let (caller, worker) = tracker.begin(VoiceComponent::Tts);
+            let barrier = Arc::new(Barrier::new(2));
+            let caller_barrier = Arc::clone(&barrier);
+            let worker_barrier = barrier;
+
+            let caller_thread = thread::spawn(move || {
+                caller_barrier.wait();
+                drop(caller);
+            });
+            let worker_thread = thread::spawn(move || {
+                worker_barrier.wait();
+                drop(worker);
+            });
+            caller_thread.join().expect("caller thread panicked");
+            worker_thread.join().expect("worker thread panicked");
+
+            let snapshot = tracker.snapshot();
+            // Either drop order is a valid settled state: caller-first
+            // records total=1 then settles in_flight to 0; worker-first
+            // settles first and the caller's drop records nothing. What is
+            // never valid is the wrap-to-usize::MAX failure mode from the
+            // rejected MR, where the worker decremented before the caller's
+            // increment was visible.
+            assert!(snapshot.tts.total <= 1);
+            assert_eq!(snapshot.tts.in_flight, 0);
         }
     }
 }
