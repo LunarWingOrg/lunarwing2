@@ -126,6 +126,8 @@ async fn learned_approval_hint_is_identical_in_live_and_recovered_views() {
     assert_auth_has_no_hint(&manager, &state, &message, original).await;
 }
 
+// Keep helper test context explicit for the per-file panic-policy scanner.
+#[cfg(test)]
 async fn warmed_state(params: &Value) -> EngineState {
     let mut state = make_expected_test_state(Arc::new(TestStore::new()));
     state.effect_adapter = Arc::new(EffectBridgeAdapter::new(
@@ -229,6 +231,7 @@ async fn pause_action(
     }
 }
 
+#[cfg(test)]
 async fn assert_recovered_hint(path: std::path::PathBuf, original: &PendingGate) {
     let recovered = PendingGateStore::new(Some(Arc::new(FileGatePersistence::new(path))));
     recovered.restore_from_persistence().await.unwrap();
@@ -252,6 +255,7 @@ async fn assert_recovered_hint(path: std::path::PathBuf, original: &PendingGate)
     assert_eq!(view.parameters, "null");
 }
 
+#[cfg(test)]
 async fn assert_auth_has_no_hint(
     manager: &Arc<crate::channels::ChannelManager>,
     state: &EngineState,

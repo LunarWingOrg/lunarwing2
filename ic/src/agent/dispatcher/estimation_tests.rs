@@ -108,6 +108,8 @@ impl LlmProvider for ToolLlm {
     }
 }
 
+// Keep helper test context explicit for the per-file panic-policy scanner.
+#[cfg(test)]
 async fn run_turn(
     agent: &crate::agent::Agent,
     message: &IncomingMessage,
