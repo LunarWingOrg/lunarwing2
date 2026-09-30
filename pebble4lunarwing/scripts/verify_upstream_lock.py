@@ -42,6 +42,8 @@ def check_package_delta(upstream: dict, patched: dict) -> None:
         for identity in before.keys() | after.keys()
         if before.get(identity) != after.get(identity)
     }
+    if not changed:
+        raise ValueError("Cargo.lock override is a no-op — the pinned upstream lock no longer needs patching")
     extra = changed - ALLOWED_PACKAGES
     if extra:
         raise ValueError(f"Cargo.lock delta outside allowlist: {sorted(extra)}")
@@ -49,6 +51,8 @@ def check_package_delta(upstream: dict, patched: dict) -> None:
     after_metadata = {key: value for key, value in patched.items() if key != "package"}
     if before_metadata != after_metadata:
         raise ValueError("Cargo.lock metadata changed outside package allowlist")
+    for name in sorted(changed):
+        print(f"override: {name}")
 
 
 def verify(upstream: pathlib.Path, patched: pathlib.Path, expected_digest: str) -> None:
