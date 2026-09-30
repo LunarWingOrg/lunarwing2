@@ -6,6 +6,7 @@ ci-config:
     - python3 -m pip install --no-deps PyYAML==6.0.3
   script:
     - python3 .gitlab/scripts/validate_config.py
+    - python3 -m unittest discover -s .gitlab/tests -p 'test_*.py'
     - python3 .gitlab/scripts/verify_release_version.py --self-test
     - python3 .gitlab/scripts/promote-worker-image.py self-test
 

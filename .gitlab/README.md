@@ -195,8 +195,14 @@ candidate job — the scan can only succeed after a candidate publishes
   `ic/crates` only; test bodies are excluded via the `#[test]`-attribute and
   `mod tests` walk in `ic/scripts/check_no_panics.py`.
 - `standalone-deliverables` verifies locked Cargo metadata for every unit
-  classified in `.gitlab/deliverables.json`; an unclassified tracked lockfile
-  fails `ci-config` validation.
+  selected for that job in `.gitlab/deliverables.json`. Every non-vendor
+  lockfile must be classified: Cargo roots belong in `deliverables`, while
+  lock-only worker overrides belong in `build_inputs` (no invented sibling
+  Cargo.toml). Build inputs must name a production consumer, the Dockerfile
+  that copies them, and both `ci-config` and worker-candidate coverage;
+  unclassified locks still fail validation. Pebble's patched upstream lock is
+  one such input. `ci-config` checks its reviewed SHA256 default and runs
+  `.gitlab/tests` regressions for the inventory and full package-record guard.
 - `ci-config` validation rejects jobs whose `stage:` is missing from the root
   `stages` list, so stage renames/removals fail at validation time instead of
   killing the whole pipeline after push.
@@ -482,6 +488,7 @@ Phase 1 scope and exit criteria are defined in
 
 ```bash
 python3 .gitlab/scripts/validate_config.py
+python3 -m unittest discover -s .gitlab/tests -p 'test_*.py'
 bash .gitlab/scripts/shell-syntax.sh
 bash .gitlab/scripts/install-shellcheck.sh && PATH="$PWD/.ci-bin:$PATH" bash .gitlab/scripts/shellcheck.sh
 python3 .gitlab/scripts/python_syntax.py

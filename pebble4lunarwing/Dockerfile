@@ -14,7 +14,7 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends git; \
+    apt-get install -y --no-install-recommends git python3; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -38,29 +38,11 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 # The build fails if the checked-out lock or the pinned digest drift from the
 # reviewed inputs, keeping the locked/reproducible-build guarantee.
 COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
-ARG PEBBLE_LOCK_SHA256
-RUN test "$(sha256sum /tmp/pebble-upstream-Cargo.lock | cut -d' ' -f1)" = "${PEBBLE_LOCK_SHA256}" && \
-    python3 - <<'PY'
-import difflib, pathlib, sys
-
-upstream = pathlib.Path("pebble/Cargo.lock").read_text().splitlines()
-patched = pathlib.Path("/tmp/pebble-upstream-Cargo.lock").read_text().splitlines()
-diff = list(difflib.unified_diff(upstream, patched, n=3))
-current = None
-changed = set()
-for line in diff:
-    if line.startswith(" "):
-        field = line[1:].strip()
-        if field.startswith("name = "):
-            current = field.split('"')[1]
-    elif line.startswith("-version"):
-        changed.add(current)
-allowed = {"rustls", "rustls-webpki"}
-extra = changed - allowed
-if extra:
-    print(f"Cargo.lock delta outside allowlist {sorted(allowed)}: {sorted(extra)}", file=sys.stderr)
-    sys.exit(1)
-PY
+COPY pebble4lunarwing/scripts/verify_upstream_lock.py /tmp/verify-pebble-lock.py
+# Canonical reviewed pin also covers mt-admin, Compose and plain docker builds.
+ARG PEBBLE_LOCK_SHA256=056cc561f07d9b207ec76dec8ea7413110056ae3214a8e0058f71f917350025b
+RUN python3 /tmp/verify-pebble-lock.py pebble/Cargo.lock \
+    /tmp/pebble-upstream-Cargo.lock "${PEBBLE_LOCK_SHA256}"
 RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \
     cd pebble && cargo build --release --locked --bin pebble
 
