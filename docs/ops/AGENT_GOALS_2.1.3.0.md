@@ -169,6 +169,6 @@
 52. [x] (S) come back to ones that were marked for come back to later
 53. [ ] (S) Reserved
 54. [ ] Work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
-55. [ ] (S) Reserved
+55. [ ] (S) record deferred items somewhere in one place
 
 ---
