@@ -873,15 +873,39 @@ fn llm_error_result(
     ExtFunctionResult::Return(json_to_monty(&serde_json::json!({
         "type": "model_error",
         "kind": kind.as_str(),
-        // Integrity rejection happens before any action dispatch. Unlike a
-        // transport failure after partial text, a fresh draft is safe even
-        // when some of the rejected text was already streamed to the UI.
-        "recoverable": (retry_safe || kind == ModelFailureKind::ReplArgumentCorruption)
+        // Every model_error surfaces before anything from the failed response
+        // is committed: no assistant message is appended and no actions are
+        // dispatched, so a fresh draft cannot duplicate committed work. The
+        // only exposure is ephemeral streamed deltas, which subscribers
+        // already treat as provisional (WI#127 stream-gap clearing). The
+        // per-kind caps in MODEL_RECOVERY_POLICY still bound how often a
+        // partial stream is retried; rate limiting stays terminal because the
+        // provider layer owns Retry-After waiting (WI#244).
+        "recoverable": (retry_safe || midstream_retry_safe(kind))
             && kind.is_recoverable(),
         "instruction": kind.recovery_instruction(),
         "terminal_message": kind.terminal_message(),
         "provider_observation": provider_observation,
     })))
+}
+
+/// Whether a mid-stream failure of this kind warrants one model-visible
+/// recovery request even though partial text was already streamed.
+///
+/// Transport-class failures (transient/unavailable) may decode badly on one
+/// attempt and succeed on the next — the FrontierTEEC/TensorZero
+/// "error decoding response body" aborts (WI#244) — and their retry policy
+/// caps (2 and 1) already bound the attempt count. Integrity rejections are
+/// handled by the same exception because they fire before any action
+/// dispatch. Rate limiting is excluded: the provider layer owns Retry-After
+/// waiting and the engine must not re-hammer a limited backend.
+fn midstream_retry_safe(kind: ModelFailureKind) -> bool {
+    matches!(
+        kind,
+        ModelFailureKind::Transient
+            | ModelFailureKind::Unavailable
+            | ModelFailureKind::ReplArgumentCorruption
+    )
 }
 
 fn observation_context(observations: &[ProviderStreamObservation]) -> Option<String> {
