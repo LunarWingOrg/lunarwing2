@@ -14,8 +14,8 @@
 
 ## Phase 1 — Foundation (engine, crates & architecture)
 
-1. [ ] Update all external crates that need updating for the entire project. See previous release notes for examples of such crates. Ensure CI/CD is also updated for the new crate versions. Exit criteria: cargo check clean on all feature combos, cargo deny check clean, CI green on a scratch branch. worker pins, external crates, ci/cd must all be included in this. LunarWing crates must be bumped from 2.1.3 to 2.1.4 and all crates which require a version bump must also be bumped such as channel wasms. There should not be any 2.1.3 LunarWing crates left. Refer to goals doc from aragents/kimil00p/v2.1.3.0 in order to be thorough. all LunarWing-owned release packages, workspace crates, XMPP bridge, and WASM channels must be updated and lockfiles refreshed. All channel registry packages need bump. A tracked-manifest/lock audit must confirm no project-owned package or path dependency remains at 2.1.3 - External crates audit and update must be completed - ic/vendor/ must be regenerated - Worker/CI audit must be completed - cargo deny check and all associated things usually done with each release should be done. See older releases for more info on this if any clarification is needed. External workers such as kimi, opencode2, pebble, etc may be done in a seperate goal item
-2. [ ] update external workers - kimi to @moonshot-ai/kimi-code@2.1.1 (already did last time) and opencode2 to 2.0.20 - NEW VERSION
+1. [ ] Update all external crates that need updating for the entire project. See previous release notes for examples of such crates. Ensure CI/CD is also updated for the new crate versions. Exit criteria: cargo check clean on all feature combos, cargo deny check clean, CI green on a scratch branch. worker pins, external crates, ci/cd must all be included in this. LunarWing crates must be bumped from 2.1.3 to 2.1.4 and all crates which require a version bump must also be bumped such as channel wasms. There should not be any 2.1.3 LunarWing crates left. Refer to goals doc from aragents/kimil00p/v2.1.3.0 in order to be thorough. all LunarWing-owned release packages, workspace crates, XMPP bridge, and WASM channels must be updated and lockfiles refreshed. All channel registry packages need bump. A tracked-manifest/lock audit must confirm no project-owned package or path dependency remains at 2.1.3 - External crates audit and update must be completed - ic/vendor/ must be regenerated - Worker/CI audit must be completed - cargo deny check and all associated things usually done with each release should be done. See older releases for more info on this if any clarification is needed. External worker upgrades such as kimi, opencode2, pebble, etc may be done in a seperate goal item
+2. [ ] update external workers - opencode2 to 2.0.20 - NEW VERSION - update from 2.0.18
 
 ## Phase 2 — Features & Polish
 
@@ -48,5 +48,8 @@
 23. [x] (S) test goal reconciler....so far, useless....
 24. [x] (S) record deferred items somewhere in one place
 25. [ ] come up with ideas for names for 2.1.4.0
+26. [x] (S) (HUMAN) start thinking about scope of 2.1.6.0 next real feature set
+27. [x] (S) (HUMAN) Findings from sb and kumo
+28. [x] (S) Reserved
 
 ---
