@@ -2,7 +2,10 @@
 
 ## Codename: Ō-Yoroi (大鎧, the Great Armor)
 
-**Release date** 2026-09-28
+**Release date** To be announced (draft)
+
+**Draft refreshed** 2026-09-30 against `cmc/g51/v2.1.3.0` at `48f5902c4`.
+This pass covers merged source, not a new live-tenant or release-CI acceptance run.
 
 > Yoroi laced plate over plate
 >
@@ -19,14 +22,15 @@ release — the fitting of the great armor over the v2.1.2.0 (Yoroi) isolation
 work. Where Yoroi built the plates, Ō-Yoroi lacquers the joints: the release
 is dominated by defense-in-depth on the multi-tenant operator surface, the
 sealing of machine-generated engine output out of the human transcript, and
-the closing of a year-old credential-rotation gap.
+the closing of the managed credential-rotation gap.
 
 The headline engine work seals CodeAct interpreter step records out of the
 user-visible transcript (work item #227 follow-up). Engine-authored step
 blobs (`[stdout]`, `[name ERROR]`, `[return]`) were previously recorded as
 role-User messages and synced into every surface that documents human
-statements; the class of leak behind the Kageho "stale date system error"
-incident is now closed structurally — a new `SealedStepRecord` role is
+statements. The seal is defense-in-depth, not the fix for Kageho's original
+"stale date system error" incident: host-clock OS calls already removed that
+denial-path output in v2.1.2.0. A new `SealedStepRecord` role is
 host-minted, rerouted into `internal_messages`, excluded from delegated-worker
 context, and classified by a host-owned decision that only two VM-unforgeable
 shapes can claim. The trace analyzer still surfaces actionable code errors
@@ -37,11 +41,12 @@ exposed.
 The multi-tenant operator surface received the release's largest hardening
 program. WeeChat relay credentials gained a managed rotation verb
 (`rotate-relay-password`) with lifecycle-locking against concurrent starts,
-hard-link and symlink refusal, a setuid-free exec helper that never passes
-the secret through argv or the environment, and consumer-aware restarts
+hard-link and symlink refusal, a setuid-free exec helper that reloads the
+credential at the launch boundary, and consumer-aware restarts
 (closing WI#202's no-rotation gap). Tenant env and capability secret writes
 were hardened against temp-path swaps and partial writes: a root-tenant
-writer separation replaces mktemp-and-rename everywhere, and — the WI#257
+writer separation replaces root temp-file writes on the audited tenant-secret
+paths, and — the WI#257
 review finding — every fallible producer now stages its complete result in
 root-private space and has its exit status checked before the tenant-side
 atomic commit, so a failed read or jq parse can no longer replace a valid
@@ -64,21 +69,26 @@ PID and unlink `pause.pid`; the version probe now uses the client-only
 `podman version --format` shape, and the reaper's sweep commands run through
 the same manager-forked transient-service isolation as sandbox execution so
 even `podman ps` from the hardened daemon cannot invalidate live pause
-state. Writer quiescence and sandbox-image builds were hardened the same
-way.
+state. Writer-quiescence and sandbox-image recovery paths were also hardened
+in goal 12.
 
 The web gateway gained a read-only tenant-facing Missions surface (WI#217):
 `GET /api/missions`, `/api/missions/summary`, and `/api/missions/{id}` over
 the existing bridge ownership checks, plus a Missions tab with summary cards
 and mission detail — observability without a chat turn. The web onboarding
-demo now builds v2.1.3 and the mascot is hidden by default (WI#234).
+demo now builds v2.1.3 and the mascot is hidden by default (WI#234); real
+provisioning now offers OpenCode 2 in both the CLI and web wizard (goal 47).
+Late-cycle fixes make long voice replies return actionable 422/503/504 errors,
+preserve genuine worker timeout output without treating heartbeats as evidence,
+paginate large tool inventories without clipped JSON, and persist daily mission
+budget rollover even when an active mission has not fired.
 External workers were refreshed: kimi-code moves to `2.1.1` with a restored
 NetBird-overlay default endpoint and a dedicated `FrontierCODEK` TensorZero
 function (plus retuned runtime defaults — longer heartbeat, longer kill
 grace, 8 concurrent tasks, 4-hour timeout), and opencode2 advances to
 `v2.0.18` at reviewed commit `cd9a14a6b…`. The cargo-deny advisory ignore
 list was re-verified against upstream (all 8 still required, each with a
-self-contained reason), and the release identifier moves to `2.1.3` across
+dated reason and dependency-chain evidence), and the release identifier moves to `2.1.3` across
 all eleven LunarWing-owned release packages with the four channel registry
 packages bumped in step.
 
@@ -115,9 +125,11 @@ previous compatibility baseline.
   existed). The rotation runs under the tenant lifecycle lock with a
   start barrier against concurrent units, refuses missing/symlinked
   credential files and unsafe hard links, stages the new secret through a
-  root-private temp path committed by the tenant-side atomic writer via a
-  dedicated `lunarwing-relay-env-exec` helper (no secret in argv or the
-  child environment), rewrites `relay.conf` as the tenant, and restarts
+   root-private staging path committed by the tenant-side atomic writer
+   (no secret in writer argv/environment). The dedicated
+   `lunarwing-relay-env-exec` helper guards launches and reloads the runtime
+   credential; rotation preserves the literal `${env:RELAY_PASSWORD}` in
+   `relay.conf`, and restarts
   only the running consumers with a brief, documented interruption.
 - **Tenant env/capability writers hardened against temp-path swaps and
   partial writes (WI#257 and the goal-8/12 hardening).** Root no longer
@@ -197,12 +209,38 @@ previous compatibility baseline.
   0.63.3 still requests rsa 0.10.0-rc.18, no constant-time rsa release
   exists, the libsql rustls-webpki 0.102 chain survives even a libsql
   bump, and `failure` 0.1.8 remains final — and each ignore now carries a
-  self-contained reason with the re-verification date and the exact
-  upstream pin keeping it blocked. No ids were removed. Evidence:
+  dated reason with dependency-chain evidence and the blocking
+  upstream pins in the policy/audit. No ids were removed. Evidence:
   `docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md`.
 - **Web onboarding demo and mascot default (WI#234).** The onboard-web
   demo's fake mt-admin compiles v2.1.3 (not v1.1.9), and the bat mascot is
   hidden by default with opt-in via settings.
+- **Actionable voice errors for long replies (WI#259, goal 44).** The gateway
+  preserves sidecar 422/503/504 semantics instead of collapsing them into 502,
+  performs a speed-aware synthesis-duration pre-flight (`text_too_long`), and
+  gives the sidecar timeout 30 seconds of proxy headroom. mt-admin propagates
+  the sidecar's duration and timeout settings to the daemon.
+- **Recoverable worker timeouts (WI#263/#267, goals 43/48).** Stuck detection
+  measures idle time rather than elapsed runtime; late genuine completion can
+  move a stuck job to Completed. Genuine timed-out output is retained as a
+  bounded 16 KiB tail, recoverable through `job_status` after restart. Synthetic
+  keep-alives do not masquerade as evidence; real diagnostics and whitespace
+  separator deltas remain intact. Kimi gains a CLI-silence watchdog.
+- **Complete tool inventories (WI#245, goal 46).** `tool_list` now has entry
+  and per-server tool-name pagination with explicit continuation metadata and
+  serialized byte budgets. Identifiers remain lossless, MCP status/config
+  fields remain available, and already-installed long-named extensions remain
+  manageable after upgrade.
+- **GitLab issue-write alias (WI#266, goal 49).** GitLab tool 0.1.6 accepts
+  `body` as an alias for `description` on `create_issue`/`update_issue` only;
+  conflicting values are rejected rather than silently chosen.
+- **Idle mission daily-budget rollover (WI#243, goal 54).** Startup and every
+  scheduler tick persist UTC rollover for active missions of every cadence,
+  without firing idle missions or overwriting concurrent spawn reservations.
+- **WASM runtime security update.** Wasmtime/wasmtime-wasi advance to 36.0.16
+  for RUSTSEC-2026-0314/0316, with the vendor snapshot refreshed. A separate
+  lockfile-only advisory CI guard catches activation of the currently unused
+  PyO3 dependency (WI#255).
 
 ## Compatibility
 
@@ -216,7 +254,7 @@ previous compatibility baseline.
 | Channel registry patches | darkirc 0.1.9, multica 0.1.12, weechat 0.2.10, xmpp 0.1.15 (behavior unchanged; rebuild required) |
 | Tool registry patches | gitlab 0.1.6 (issue writes accept `body` as a `description` alias, WI#266); other tools unchanged from v2.1.2.0 |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.16 (36.0.14→36.0.16 for RUSTSEC-2026-0314/0316; vendored set regenerated) |
-| External crate updates | aws-lc-rs 1.18.0→1.18.1, aws-lc-sys 0.44.0→0.45.0, rustls-webpki 0.103.14→0.103.15, zerovec-derive 0.11.4→0.11.5; `ic/vendor/` regenerated with no source drift |
+| External crate updates | aws-lc-rs 1.18.0→1.18.1, aws-lc-sys 0.44.0→0.45.0, rustls-webpki 0.103.14→0.103.15, zerovec-derive 0.11.4→0.11.5, plus Wasmtime 36.0.16; `ic/vendor/` refreshed |
 | Worker image tool pins | kimi-code `2.1.1` (2.x line; default endpoint back on the NetBird overlay with the `FrontierCODEK` function); opencode2 `v2.0.18` at `cd9a14a6b688d4021bee381dfd39d2cef9c0f862`; opencode `v1.18.25` at `cb7d8b2f…` (no change); pebble `2d0f3786…` (no change) |
 | Engine transcript roles | New `SealedStepRecord`/`StepRecord` wire role for interpreter step records; legacy pre-seal transcripts keep the `User` spelling and remain readable |
 | Podman version probe | `podman version --format …` (client-only) replaces `podman --version` in the sandbox detect/probe/reaper paths; same `(major, minor)` output contract |
@@ -224,21 +262,29 @@ previous compatibility baseline.
 | XMPP defaults (new tenants) | `XMPP_JID=<tenant>@xmpp.localhost`, `XMPP_ALLOW_FROM=user@xmpp.localhost`; bridge JSON allowlist matches; existing JIDs/allowlists and explicit flags keep precedence |
 | Auto-approve env key | `AGENT_AUTO_APPROVE_TOOLS` is the only key written for new tenants; legacy `AUTO_APPROVE_TOOLS` is migrated on re-render and dropped from generated files |
 | mt-admin verbs | New: `rotate-relay-password <tenant>`; all existing verbs unchanged |
-| Mascot default | Hidden (opt-in via `MASCOT_ENABLED=true` / settings); web onboard demo targets v2.1.3 |
-| Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8); each entry now carries a self-contained reason, re-verification date, and blocking upstream pin |
+| Onboarding mascot default | Hidden (opt-in via settings); web onboard demo targets v2.1.3 |
+| Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8); dated reasons and blocking dependency chains documented in the policy/audit |
+| Voice synthesis | Speed-aware 422 `text_too_long` pre-flight; sidecar 422/503/504 preserved; proxy timeout is `VOICE_REQUEST_TIMEOUT_SECS` + 30s |
+| External worker evidence | `partial_output` is a bounded genuine-output tail recoverable after restart; heartbeat-only timeouts provide no fabricated evidence |
+| Kimi silence watchdog | `KIMI_SILENCE_TIMEOUT_MS=900000` by default, capped at the task deadline; 0 disables it |
+| Agent-facing `tool_list` | Paginated entries and tool-name windows; callers must follow `next_offset` and `tools_next_offset` to enumerate everything |
+| New identifier bounds | Extension names ≤200 bytes on install; existing longer names remain addressable. MCP tool names ≤256 characters at discovery |
+| Mission daily budget | Active missions roll over at startup/tick as well as fire time; undated legacy counts are preserved on the upgrade day |
+| OpenCode 2 onboarding | CLI/web provision selection and model/base-URL overrides supported; Kawarimi import selection remains unsupported |
 
 ## Changes
 
-### Sealed Interpreter Step Records (WI#227, goal 34)
+### Sealed Interpreter Step Records (WI#227, goal 13)
 
 The orchestrator recorded every CodeAct step blob (`[stdout]`, `[name
 ERROR]`, `[return]`) as a role-User message in its working transcript, which
 synced into `thread.messages` through the `json_to_thread_messages` user
 fallback — so engine-authored interpreter output entered records and API
-surfaces that document human statements. That was the remaining root cause
-behind the Kageho-reported leak class (the old "stale date system error"
-OSError line read as a prompt-injection attempt; denial-path text could land
-the same way).
+surfaces that document human statements. The seal prevents this authorship
+misclassification as defense-in-depth. The original Kageho "stale date system
+error" incident was fixed separately by host-clock OS calls (`605971dfd`,
+v2.1.2.0), which stopped producing the CodeAct OS-denial blob; the seal is not
+a claim that model hallucinations or reinterpretations are eliminated.
 
 Machine-generated step output is inference data, not conversation; it is now
 sealed at the boundary instead of trusting the Python VM to behave:
@@ -264,7 +310,7 @@ sealed at the boundary instead of trusting the Python VM to behave:
   its own step output, it never claims human authorship, and the existing
   WI#161/goal-8 neutralization stack still applies downstream.
 
-Review remediation (the `!1183` findings) kept the seal defense-in-depth
+Review remediation (including the `!1191` findings) kept the seal defense-in-depth
 without losing the diagnostics: the trace `code_error` analyzer matches
 sealed records as well as legacy user blobs so interpreter errors keep
 producing the actionable warnings the mission self-improvement trigger
@@ -272,6 +318,9 @@ consumes; the orchestrator regression drives `sync_runtime_state` over
 flagged working messages and asserts zero leakage into `thread.messages`;
 and the router test pins that the operator thread DTO (`get_engine_thread`'s
 served set) can never carry a sealed role or sealed diagnostic text.
+A response-boundary regression also verifies that a model quoting or
+reinterpreting sealed output produces an Assistant-authored visible response,
+never a new human-authored message.
 
 A follow-up pass fixed the UX regression the seal introduced and a latent
 precedence bug: sealed records previously bypassed `Thread::add_message`'s
@@ -292,24 +341,35 @@ executed". Evidence:
 effectively permanent for a tenant's lifetime. The new mt-admin verb
 `rotate-relay-password <tenant>`:
 
-- runs under the tenant lifecycle lock with a relay start barrier
+- runs under the tenant lifecycle lock with a shared exec-boundary start barrier
   (`ic/scripts/lunarwing-relay-env-exec.py` installs as
-  `/usr/local/libexec/lunarwing-relay-env-exec`) so a concurrent
-  `start-tenant` cannot race the credential swap;
+  `/usr/local/libexec/lunarwing-relay-env-exec`). All three consumers
+  (daemon, WeeChat adapter, WeeChat) are guarded on systemd user units and
+  OpenRC, including self-heal/supervisor launches. Rotation takes exclusive
+  admission before stopping services and cancels pending starts;
 - refuses missing, symlinked, or hard-linked credential files and verifies
   the env directory contract before touching anything;
-- stages the new secret through a root-private temp path and commits it via
-  the tenant-side atomic writer — the secret never appears in argv or any
-  child environment, and the dedicated `weechat.env` (mode 0600,
-  `RELAY_PASSWORD` only) is never reopenable by root;
-- reads the old credential as the tenant so a swapped source path cannot
-  make root read another file, and rewrites `relay.conf` as the tenant;
+- stages complete credential writes and commits them via the tenant-side
+  atomic writer, without passing the password in writer-process argv or
+  environment. The dedicated `weechat.env` is mode 0600 and contains only
+  `RELAY_PASSWORD`. The runtime launcher deliberately reloads that password
+  into the consumer environment under lock, including inside the tmux pane,
+  rather than trusting an old init/tmux environment;
+- validates and preserves `relay.conf`'s literal `${env:RELAY_PASSWORD}`
+  expression; it does not replace it with plaintext;
+- rolls both env files back on write failure. A durable recovery marker blocks
+  starts after interruption or failed rollback; repair matching credentials
+  and rerun rotation to clear it through a successful reconciled retry;
 - restarts only the running WeeChat consumers (brief service interruption)
   so the daemon and adapters converge on the new credential.
 
-Harness coverage: `test-rotate-relay-password.sh` (271 lines, including the
-concurrency symlink/ownership pre-tests), `test-relay-start-barrier.py`,
-and `test-relay-password-live.sh`.
+Existing tenants must re-render their units before rotation; the command
+rejects unguarded deployed units. Coverage includes systemd/OpenRC rendering,
+real self-heal dispatch, concurrent launcher processes, SIGKILL/rollback
+recovery, and root/post-drop boundary tests. An isolated real WeeChat run
+verified the rendered tmux launcher, password replacement, preserved config
+expression, and restart persistence. Full deployed-tenant init acceptance
+was not repeated after the final barrier revision.
 
 ### Tenant Env and Capability Secret Writes Hardened (WI#257, goals 8/12)
 
@@ -413,6 +473,14 @@ encrypted export. Lifecycle, reaper, verifier, and migration regressions
 were added, and a successful real-tenant export, restore verification, and
 restart rehearsal was recorded.
 
+This was the scoped `g12probe` systemd-user/rootless-Podman rehearsal with
+Pebble and OpenCode: real provisioning, secret storage, encrypted export,
+restoration of the exported PostgreSQL dump into a temporary database,
+encrypted import **dry-run**, and source restart. No import-apply target was
+created. OpenRC live acceptance, Kimi/OpenCode 2, model-backed jobs, and
+cross-host cutover remain outside that run. Evidence:
+[goal 12 real web acceptance](docs/ops/GOAL12_REAL_WEB_ACCEPTANCE.md).
+
 ### Tenant-Facing Missions API and UI (WI#217)
 
 Work item #217 asked for a tenant-facing mission-management surface. The
@@ -428,6 +496,24 @@ a spawned-thread table — EN and zh-CN strings. Missions remain managed via
 the model-facing tools. Gateway tests cover bearer-auth enforcement and
 graceful no-engine degradation.
 
+### Mission Daily-Budget Maintenance (WI#243, goal 54)
+
+Fire-time rollover already reset dated counters before checking
+`max_threads_per_day`; the reported old `threads_today_date` was primarily
+persisted-state/observability drift for missions that did not reach that path.
+Startup and every scheduler tick now persist rollover for active manual,
+event, system-event, webhook, and cron missions, including idle/not-yet-due
+missions. Maintenance does not spawn threads or advance schedules, and reloads
+under the existing fire/update lock so it cannot overwrite a new reservation.
+
+Same-day counters are unchanged; a missing legacy date is stamped with today's
+UTC date without granting extra quota. Paused and terminal missions are not
+swept. Failed maintenance saves are isolated to that mission and retried next
+tick. Five new regressions cover cadence parity, startup/reload, save-failure
+recovery, same-day/legacy handling, and concurrent reservation boundaries;
+the engine suite passed 636/636. Live dwarfstar persistence acceptance remains
+an operator step.
+
 ### Web Onboarding Demo and Mascot Default (WI#234)
 
 The onboard-web demo's fake mt-admin now compiles v2.1.3 instead of
@@ -436,6 +522,9 @@ aligning the demo with the current release line and the production mascot
 default. In-browser tests drive all five onboarding flows.
 
 ### External Workers: kimi 2.1.1 and opencode2 v2.0.18 (goal 2)
+
+The kimi 2.1.1 pin was already present when goal 2 was verified; that goal's
+new version change was opencode2 v2.0.17 → v2.0.18.
 
 - **kimi-code `2.1.1`.** The worker image build arg, CI source ref, and
   entrypoint contract move to `@moonshot-ai/kimi-code@2.1.1`. The default
@@ -456,6 +545,92 @@ default. In-browser tests drive all five onboarding flows.
 - opencode stays at `v1.18.25` (`cb7d8b2f…`, deliberately un-adopted
   beyond) and pebble stays at `2d0f3786…`.
 
+### Worker Liveness and Timeout Evidence (WI#263/#267, goals 43/48)
+
+- `JobContext.last_activity_at` tracks genuine CLI progress. Stuck detection
+  uses idleness (falling back to `started_at`), not total elapsed runtime;
+  synthetic `[worker]` notices do not refresh that idle baseline. A genuine
+  late worker result can transition Stuck → Completed; rejected transitions
+  are logged.
+- Kimi's `KIMI_SILENCE_TIMEOUT_MS` watchdog defaults to 15 minutes (0 disables
+  it), capped by the task deadline. Real CLI stdout refreshes it; executor
+  heartbeats do not. A silent CLI is terminated with a timed-out result carrying
+  any genuine streamed partial work.
+- Both daemon-deadline and worker-reported timeouts retain a bounded 16 KiB
+  tail in `metadata.partial_output` and a persisted `partial_output` job event,
+  for `wait=true` and `wait=false`. `job_status` recovers the snapshot from
+  events after daemon restart, and the timed-out result message includes output.
+  Short genuine output is retained too; there is no 512-byte minimum.
+- Evidence filtering is narrower than idle detection: only the synthetic
+  `[worker] Still waiting for …; task remains active.` keep-alive sentence is
+  stripped. Genuine `[worker]` provider-retry diagnostics and standalone
+  whitespace deltas remain in order, preserving `alpha beta\ngamma` rather than
+  collapsing it into `alphabetagamma`. Empty heartbeat-stripped timeout results
+  fall back to the daemon's evidence buffer; non-timeout results are unchanged.
+
+### Voice Long-Reply Failures (WI#259, goal 44)
+
+The gateway now preserves the sidecar's 422 processing failure, 503 unavailable,
+and 504 timeout semantics rather than returning one opaque 502. A duration
+pre-flight rejects over-cap synthesis requests with 422 `text_too_long` and
+accounts for the requested speed across 0.5–2.0; a reply exceeding the cap at
+1x may fit at 2x. `/api/voice/status` exposes `max_synth_audio_secs`.
+
+The proxy timeout derives from `VOICE_REQUEST_TIMEOUT_SECS` plus 30 seconds
+of headroom, and mt-admin mirrors that knob and `VOICE_MAX_TTS_AUDIO_SECS`
+from `voice.env` into `lunarwing.env` on voice mutation paths. Response details
+stay generic for clients; upstream diagnostics remain server-side. This does
+not fix the separate sidecar inference-permit/TTS-mutex retention defect
+(WI#264), which remains deferred. See the
+[gateway voice API guide](docs/guides/GATEWAY_VOICE_API.md).
+
+### Tool Inventory Completeness and Identifier Compatibility (WI#245, goal 46)
+
+`tool_list` returns deterministic entry pages (`offset`, `limit`, `next_offset`,
+`truncated`) and per-entry tool-name windows (`tools_offset`, `tools_limit`,
+`tools_total`, `tools_next_offset`, `tools_truncated`). Callers must follow both
+continuation layers; a single page is not the full inventory. Serialized
+entries are capped at 32 KiB and pretty-printed pages at 60 KiB before the
+safety layer, with continuation metadata recomputed when entries are dropped.
+
+Identifiers are not elided. MCP `enabled`, `placement`, `transport`, `url`, and
+`command` remain available; bounded free text carries an explicit elision
+marker. Genuinely empty results return an empty page, while a nonempty page
+that cannot fit the budget errors instead of pretending to be complete.
+New extension names are limited to 200 bytes and discovered MCP tool names
+to 256 characters. Lifecycle operations grandfather longer already-installed
+extension names while still rejecting traversal-shaped names. The web gateway's
+internal extension listing remains full-sized. Contract:
+[tools README](ic/src/tools/README.md#tool_list-pagination-and-completeness-wi245).
+
+### GitLab Issue Description Alias (WI#266, goal 49)
+
+GitLab tool 0.1.6 accepts either `description` or its `body` alias on
+`create_issue`/`update_issue`. Supplying both non-null values fails with a clear
+same-field error; a null twin is dropped before deserialization. Notes keep
+their real `body` field, and merge-request writes and issue reads do not acquire
+the alias. The crate, capability file, registry entry, and tool lockfile advance
+together. Live issue creation using the alias remains an operator step.
+
+### OpenCode 2 Provisioning Selection (goal 47)
+
+CLI and web onboarding now offer `opencode2` with optional model/base-URL
+overrides, forwarding selection to mt-admin's add/build phases. Configuration
+round-trips the fields; deselecting the worker drops its overrides. The
+`opencode2-` tenant-name prefix is reserved consistently with mt-admin.
+Kawarimi import does not yet forward `--with-opencode2`, so the import form
+deliberately omits this option. This is provisioning support, not a claim of
+live OpenCode 2 lifecycle acceptance in goal 12.
+
+### Standalone WASM Capability Ownership (goal 41)
+
+`install-wasm` now transfers channel/tool directory and copied-file ownership
+to the tenant **before** invoking tenant-UID capability writers. Fresh WeeChat
+capabilities therefore receive allocated tenant ports instead of retaining
+generic 9001/6681 endpoints. Root/unprivileged fixtures cover first install,
+writer refusal on root-owned inputs, mode 0600, allocated ports, and repeat
+install; the root fixture also handles CI images without a `nobody` group.
+
 ### Cargo-Deny Advisory Ignore Audit (WI#198/#199, goal 3)
 
 All 8 advisory ignores in `ic/deny.toml` were re-verified against upstream
@@ -466,20 +641,32 @@ constant-time fix for the Marvin advisory, libsql 0.9.30 stable and
 0.10.0-pre.4 prerelease both still request hyper-rustls ^0.25 / hyper ^0.14
 so the rustls-webpki 0.102 chain survives even a libsql bump, and
 `failure` 0.1.8 remains the final release. Each ignore now carries its own
-self-contained reason with a re-verification date and the exact upstream
-pin keeping it blocked — no more bare strings or "same as X" boilerplate.
+dated reason, with blocking upstream pins documented in the policy comments
+and audit. No advisory IDs were removed.
 Verified with cargo-deny 0.20.2 (advisories/bans/licenses/sources all ok).
 Evidence: `docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md`.
 
+The late-cycle Wasmtime/wasmtime-wasi 36.0.14 → 36.0.16 update addresses
+RUSTSEC-2026-0314/0316 and refreshes the vendored set. WI#255's alert was
+misattributed: RUSTSEC-2026-0101 concerns `safe-agent-rs`, which is absent here,
+not PyO3. PyO3 0.28.3 is lockfile-only through jiter's unused Python feature;
+the `lockfile-only-advisory-guard` CI job detects activation of that dependency
+and its separate RUSTSEC-2026-0176 risk. It is not a PyO3 version bump or an
+additional advisory ignore. The job-83933 clippy failure was separately fixed
+with `std::slice::from_ref`, without suppressing the lint (goal 39).
+
 ### Open Work-Item Audit and Half-Broken-Tenant Runbook (goals 19, 4)
 
-The full open-item tracker was re-audited at HEAD `eaa9c7ea5`
-(`docs/ops/v2.1.3.0_OPEN_WORK_ITEMS_STATUS.md`): of 13 open items, 6 were
-addressed in this goal cycle (WI#240, #239, #234, #217, #185, #198 —
-tracker closure outstanding), 1 explicitly deferred by its own body (#191,
-post-2.1.3.0 EMA wiring), 2 deferred to 2.1.4.0 (#184, #220), 1 stopgap in
-place (#200 WeeChat pairing patch), and no 2.1.3.0 code blocker remains
-among the open items. A new troubleshooting runbook for half-broken
+Goal 19's audit at `eaa9c7ea5`
+(`docs/ops/v2.1.3.0_OPEN_WORK_ITEMS_STATUS.md`) is a historical 2026-09-27
+snapshot, not today's tracker state. A read-only tracker listing for this
+2026-09-30 draft pass found 16 open items, all labeled for 2.1.4.0 or later;
+labels alone are not release-acceptance evidence. WI#243 is now source-fixed
+by goal 54 even though its tracker item remains open. Deferred work includes
+the WeeChat pairing redesign/stopgap, EMA wiring, prompt management,
+LunarVoice's separate timeout resource-retention issue, and future gateway,
+Hermes, WireGuard, and DarkIRC work. No new full body/comment-thread audit is
+claimed by this release-notes pass. A new troubleshooting runbook for half-broken
 tenants after upgrade (WI#240/#238 sandbox-image and WI#229 voice-store
 symptoms) landed at
 `docs/ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md` and is indexed
@@ -496,9 +683,10 @@ the daemon, the five workspace crates (`lunarwing_common`,
 tracked manifest/lock audit confirmed zero project-owned packages remain at
 2.1.2. External crate updates in the same sweep: aws-lc-rs 1.18.1,
 aws-lc-sys 0.45.0, rustls-webpki 0.103.15, zerovec-derive 0.11.5; the
-vendored set was regenerated (1,056 dirs) with no source drift, and
-`cargo deny check` passes all categories. Channel behavior is unchanged —
-the bumps are rebuild-only.
+initial vendoring audit found no drift for those four already-vendored pins;
+the later Wasmtime 36.0.16 security update regenerated the vendor snapshot.
+The recorded `cargo deny check` passed all categories. Channel behavior is
+unchanged — the bumps are rebuild-only.
 
 ### Documentation Parity (goals 14, 17, 21)
 
@@ -522,14 +710,15 @@ pins were refreshed for the cycle.
 3. Rebuild the daemon and installed WASM extensions through the normal
    deployment path. All four channel registry versions changed (darkirc
    0.1.9, multica 0.1.12, weechat 0.2.10, xmpp 0.1.15) — behavior is
-   unchanged, but the channels must be rebuilt/reinstalled. Tool registry
-   versions are unchanged from v2.1.2.0.
+   unchanged, but the channels must be rebuilt/reinstalled. Rebuild/reinstall
+   GitLab tool 0.1.6 for the issue-write alias; other tool registry versions
+   are unchanged from v2.1.2.0.
 4. **New-tenant env defaults (WI#239).** Newly provisioned tenants render
    the explicit defaults listed under Compatibility; existing tenants are
-   untouched except that a re-render preserves any operator-set value and
-   gains nothing the operator did not already have. If you relied on an
-   in-code fallback differing from these defaults for new tenants, review
-   the WI#239 list before provisioning.
+   not rewritten merely by replacing the binary. On an mt-admin re-render,
+   existing values are preserved, but missing keys receive the new explicit
+   defaults. Review the WI#239 list before provisioning or re-rendering if
+   you previously relied on different in-code fallbacks.
 5. **Legacy `AUTO_APPROVE_TOOLS` migration (goal 37).** On the next mt-admin
    re-render, a legacy-only `AUTO_APPROVE_TOOLS` value is migrated to the
    canonical `AGENT_AUTO_APPROVE_TOOLS` key and the legacy key is dropped
@@ -552,21 +741,42 @@ pins were refreshed for the cycle.
 9. **Sealed step records.** Existing (pre-2.1.3.0) transcripts are
    unaffected and remain readable under the legacy `User` spelling. New
    CodeAct step output is sealed into `internal_messages`; if you have
-   tooling that scraped step blobs from `thread.messages`, read the
-   operator DTO (`get_engine_thread`) instead — it never carries sealed
-   content. Channel status hints ("Code executed", etc.) continue to work
+   tooling that scraped step blobs from `thread.messages`, use trace
+   diagnostics or engine-internal records instead; the operator DTO
+   (`get_engine_thread`) intentionally excludes sealed content too.
+   Channel status hints ("Code executed", etc.) continue to work
    for both record shapes.
 10. **WeeChat relay rotation (WI#202).** `rotate-relay-password <tenant>`
     briefly interrupts the tenant's running WeeChat consumers; schedule it
-    accordingly. The verb requires the tenant lifecycle lock path and
-    installs `lunarwing-relay-env-exec` under `/usr/local/libexec` on
-    first use — re-run the mt-admin install/refresh step if you deploy the
-    script tree manually.
-11. **Vendor snapshot.** `ic/vendor/` was regenerated for the four external
-    crate updates; if you maintain a local vendor override, refresh it
+    accordingly. Before rotating an existing tenant, run
+    `lunarwing-mt-admin.sh render-units <tenant>` through the deployed
+    mt-admin path to install the launcher/barrier and refresh systemd-user
+    or OpenRC units. Rotation refuses unguarded effective units. Interrupted
+    rotation or failed rollback leaves starts blocked: repair matching env
+    credentials and rerun rotation, rather than deleting the recovery marker.
+11. **Vendor snapshot.** `ic/vendor/` includes the Wasmtime 36.0.16 security
+    update and the external crate pins above; if you maintain a local vendor
+    override, refresh it
     with `ic/scripts/refresh-vendor.sh` before building.
 12. The bundled-skills catalog is unchanged from v2.1.2.0 (exactly seven
     product skills); no skill migration is needed.
+13. **Voice limits/timeouts (WI#259).** Re-render managed voice configuration
+    so `VOICE_MAX_TTS_AUDIO_SECS` and `VOICE_REQUEST_TIMEOUT_SECS` agree between
+    sidecar and daemon. Desktop clients should handle 422 `text_too_long` by
+    chunking/trimming replies and distinguish 503/504 from a generic 502.
+14. **Worker timeout behavior (WI#263/#267).** Deploy the updated daemon and
+    Kimi image for idle tracking, durable genuine-output evidence, and the CLI
+    silence watchdog. Configure `KIMI_SILENCE_TIMEOUT_MS` if a workload needs
+    a different stdout-silence budget; 0 disables that watchdog, not the task
+    deadline. Heartbeat-only timeouts intentionally have no partial evidence.
+15. **Tool inventory pagination (WI#245).** Update consumers that assumed one
+    `tool_list` call was exhaustive: follow entry and tool-name continuation
+    offsets. New over-bound MCP tool names fail discovery; grandfathered
+    installed extension names remain manageable without renaming.
+16. **Mission day counters (WI#243).** Active persisted counters roll over at
+    startup/next tick even without a trigger. An undated legacy mission keeps
+    its existing count for the upgrade day. No manual JSON migration is needed;
+    paused/terminal rows remain historical until the mission is active again.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -575,8 +785,9 @@ pins were refreshed for the cycle.
   unchanged).
 - `proxy-enforced` sandbox mode remains implemented and gated; live
   docker-runtime e2e was not run on the dev VM (carried).
-- MCP does not auto-install npm/pip packages and does not pass configured
-  MCP servers into `lunarwing-agent-v1` external workers (carried).
+- MCP does not auto-install npm/pip packages. Core MCP configuration is not
+  automatically inherited by external workers; explicitly configured worker
+  integrations (such as the OpenCode study-notes mount) remain separate.
 - The onboarding web app remains a trusted local console without user
   accounts or TLS; keep its loopback binding and use an SSH tunnel for
   remote access (carried).
@@ -588,22 +799,36 @@ pins were refreshed for the cycle.
 - Kawarimi remains PostgreSQL-only (carried).
 - OpenCode v1.18.29+ remains deliberately un-adopted for the opencode lane
   pending upstream proof (carried).
-- WI#159 (open): terminal triggers
+- Historical WI#159 behavior remains: terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) still
   fire for Research child threads — only Mission threads are filtered — so
   event-triggered missions can self-sustain via their own research
-  children; blast radius remains 30 spawns/day per mission (carried).
+  children; the default budget is 30 spawns/day per mission (custom/unlimited
+  budgets can allow more).
 - WI#191 (deferred by its own item): the EMA estimation module wiring
   starts after this release.
 - WI#184/#220 (deferred to 2.1.4.0): secrets-store pairing redesign and
   per-tenant system-prompt editing; the WI#200 WeeChat pairing 30-day
   stopgap remains in place until #184 lands.
-- WI#41 (open at draft time): on a fresh `install-wasm`,
-  `05-tenant-build.sh` copies `weechat.capabilities.json` as root before
-  the channels-dir chown, so the tenant-UID writer rejects the fresh
-  root-owned file and the standalone install leaves generic 9001/6681
-  ports; a subsequent `start-tenant` repatches it. Ownership must be
-  transferred before patching.
+- WI#264 (2.1.4.0): a timed-out Kokoro synthesis can retain the sidecar's
+  inference permit and TTS mutex. The WI#259 gateway error/timeout changes
+  do not cancel that underlying work or solve resource retention.
+- WI#244 (reported, deferred to 2.1.4.0): intermittent FrontierTEEC/TensorZero
+  response-body decode failures can abort orchestrator mission threads. The
+  daily-counter fix does not establish a fix for that provider failure.
+- WI#265 (2.1.4.0): legacy `routine_history` does not resolve Engine V2 mission
+  names. Use the mission tools and gateway Missions detail view for mission
+  state/history; the routine and mission registries remain distinct.
+- OpenCode 2 is selectable for provisioning, not Kawarimi import. Goal 12's
+  live rehearsal covered Pebble/OpenCode on systemd user units, import
+  dry-run and exported-DB restore verification — not live OpenRC, model-backed
+  jobs, Kimi/OpenCode 2, import apply, or cross-host cutover.
+- Final relay-barrier deployed-tenant init acceptance, dwarfstar mission
+  rollover/tool-inventory acceptance, and real GitLab issue creation with
+  `body` remain operator checks; local fixtures are not substitutes for them.
+- This draft pass ran no release build, worker candidate/rebuild gate, or
+  live upgrade. Keep the draft marker until the operator's release checks,
+  final copy-edit, and move to `docs/releases/` are complete.
 
 ### Resolved or Source-Fixed Since v2.1.2.0
 
@@ -616,7 +841,7 @@ pins were refreshed for the cycle.
   is fixed.
 - WeeChat relay credentials have a managed rotation verb with
   concurrency-safe, symlink/hard-link-refusing, no-secret-in-argv handling
-  (WI#202 closed in source; tracker closure outstanding).
+  (WI#202 source-fixed).
 - Tenant env/capability writes are safe against temp-path swaps (no
   root-created temps in tenant dirs) and partial writes (staged producers
   with checked exit status before the atomic commit) — the WI#257
@@ -630,17 +855,34 @@ pins were refreshed for the cycle.
   constructor, and the sandbox reaper runs isolated from the hardened
   daemon — the pause-pid unlink class is closed (goal 12).
 - The real web onboarding lifecycle (export, restore, restart) is
-  verified end-to-end on a live tenant with regression coverage.
+  verified within the scoped Pebble/OpenCode rehearsal: encrypted export,
+  temporary-DB restore verification, import dry-run, and source restart.
 - The gateway exposes read-only mission list/summary/detail routes and a
   Missions tab with auth enforcement and no-engine degradation (WI#217).
 - The onboard-web demo builds v2.1.3 and the mascot defaults to hidden
   (WI#234).
+- Fresh standalone `install-wasm` transfers ownership before patching
+  tenant capabilities, so WeeChat receives its allocated ports (goal 41).
+- Long voice replies have speed-aware pre-flight and preserved sidecar error
+  semantics with staggered timeouts (WI#259).
+- Worker stuck detection is idle-based, late genuine completion is accepted,
+  Kimi has a silence watchdog, and genuine timeout evidence survives restart
+  without heartbeat pollution or lost whitespace separators (WI#263/#267).
+- `tool_list` has bounded, lossless-identifier pagination; MCP status/config
+  fields and lifecycle access to pre-cap long names are preserved (WI#245).
+- GitLab tool 0.1.6 accepts the issue-write `body` alias with explicit
+  duplicate-field handling (WI#266).
+- OpenCode 2 provisioning selection/overrides are wired through CLI and
+  web onboarding (goal 47).
+- Active missions persist daily-budget rollover at startup/tick, with
+  same-day/legacy handling and concurrent-reservation safety (WI#243).
 - Worker pins: kimi-code 2.1.1 (NetBird-overlay default endpoint restored,
   `FrontierCODEK` function, retuned runtime defaults), opencode2 v2.0.18
   at `cd9a14a6b…`; opencode and pebble unchanged.
 - The cargo-deny advisory ignore list is fully re-verified with
-  self-contained reasons and upstream pins (WI#198); the open-item audit
-  found no remaining 2.1.3.0 code blocker.
+  dated reasons and dependency-chain evidence (WI#198). Wasmtime/wasmtime-wasi
+  36.0.16 addresses RUSTSEC-2026-0314/0316; CI additionally guards the
+  lockfile-only PyO3 activation risk (WI#255) and the clippy regression is fixed.
 - All eleven LunarWing-owned release packages and four channel registry
   packages are at 2.1.3 / current bumps; the vendored snapshot is
-  regenerated and cargo-deny clean.
+  regenerated with recorded cargo-deny verification.
