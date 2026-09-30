@@ -1,6 +1,6 @@
 [package]
 name = "cavepony-tool"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "Cavepony text compression and expansion tool for LunarWing"
 license = "MIT"

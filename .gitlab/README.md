@@ -198,6 +198,10 @@ candidate job — the scan can only succeed after a candidate publishes
   local lockfile entry, and CI version expectation together. The WASM build
   uses `--locked`; its runtime compatibility job still requires a fresh
   artifact and the existing 10-million-fuel budget.
+  Agreement alone does not satisfy `version-policy`: any change under a
+  tool's source directory, including metadata or lockfile corrections, also
+  needs a registry version newer than `CI_MERGE_REQUEST_DIFF_BASE_SHA`.
+  Run `.gitlab/scripts/version-policy.sh` with the actual MR base before push.
 - Blocking ratchets: `rust-clippy-all` (all-features, `-D warnings`) and
   `architecture-boundaries` (changed-line hard violations only; printed
   full-tree debt counts stay informational). Both run in the full-validation
