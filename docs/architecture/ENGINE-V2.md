@@ -363,6 +363,14 @@ that safe class and fixed recovery text, never provider-supplied diagnostics.
   recovery first replaces protocol history with a bounded plain-text view of
   the original goal and recent context. A second failure becomes a typed
   `ThreadFailureKind::Model` outcome with actionable user text.
+- Mid-stream transport failures (transient, unavailable) stay recoverable even
+  when partial text was already streamed (WI#244). A `model_error` surfaces
+  before anything from the failed response is committed — no assistant message
+  is appended and no actions are dispatched — so a fresh draft cannot duplicate
+  committed work, and subscribers already treat streamed deltas as provisional
+  (stream-gap clearing). The per-kind caps still bound how often a partial
+  stream is retried. Rate limiting stays terminal: the provider layer owns
+  Retry-After waiting and the engine must not re-hammer a limited backend.
 - Authentication and rejected-request failures skip model retry because an
   unchanged request cannot repair credentials or compatibility. Their terminal
   text names the operator action required.
