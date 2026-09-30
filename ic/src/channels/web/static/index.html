@@ -358,6 +358,7 @@
         <div class="settings-sidebar">
           <button class="settings-subtab active" data-settings-subtab="inference" data-i18n="settings.inference">Inference</button>
           <button class="settings-subtab" data-settings-subtab="agent" data-i18n="settings.agent">Agent</button>
+          <button class="settings-subtab" data-settings-subtab="prompts" data-i18n="prompts.title">System Prompt</button>
           <button class="settings-subtab" data-settings-subtab="channels" data-i18n="settings.channels">Channels</button>
           <button class="settings-subtab" data-settings-subtab="networking" data-i18n="settings.networking">Networking</button>
           <button class="settings-subtab" data-settings-subtab="extensions" data-i18n="tab.extensions">Extensions</button>
@@ -382,6 +383,37 @@
           <div class="settings-subpanel" id="settings-agent">
             <div class="extensions-container" id="settings-agent-content">
               <div class="empty-state" data-i18n="common.loading">Loading settings...</div>
+            </div>
+          </div>
+          <div class="settings-subpanel" id="settings-prompts">
+            <div class="extensions-container prompt-settings">
+              <h3 data-i18n="prompts.title">System Prompt</h3>
+              <p data-i18n="prompts.intro">Edit the workspace instructions for this authenticated tenant. Files are stored in its database.</p>
+              <p><span data-i18n="prompts.scope">Workspace scope:</span> <code id="prompt-scope"></code></p>
+              <div class="prompt-controls">
+                <label for="prompt-source" data-i18n="prompts.source">Source file</label>
+                <select id="prompt-source" disabled></select>
+                <button id="prompt-reload" class="btn-secondary" data-i18n="prompts.reload">Reload saved files</button>
+              </div>
+              <p id="prompt-source-info" class="prompt-note"></p>
+              <label for="prompt-editor" data-i18n="prompts.content">Source content</label>
+              <textarea id="prompt-editor" rows="16" spellcheck="false" disabled></textarea>
+              <div class="prompt-controls">
+                <button id="prompt-save" class="btn-save" data-i18n="prompts.save" disabled>Save file</button>
+                <button id="prompt-revert" class="btn-secondary" data-i18n="prompts.revert" disabled>Revert draft</button>
+              </div>
+              <p id="prompt-status" role="status" aria-live="polite"></p>
+              <p class="prompt-note" data-i18n="prompts.lifetime">Engine V2 loads workspace instructions at initialization. After saving, restart the tenant with mt-admin, then start a new conversation. Existing threads retain their system-message snapshot even after a restart.</p>
+              <h3 data-i18n="prompts.previewTitle">Saved workspace prompt preview</h3>
+              <p class="prompt-note" data-i18n="prompts.previewNote">This preview includes saved workspace files, daily notes and eligible profile content. Memory, daily notes and profiles may come from configured read scopes. Engine templates, tools, skills, channel constraints and runtime overlays are added separately. This is not a running thread's complete prompt.</p>
+              <div class="prompt-controls">
+                <label><input id="prompt-group" type="checkbox"> <span data-i18n="prompts.group">Group context (exclude MEMORY.md and profile)</span></label>
+                <label for="prompt-timezone" data-i18n="prompts.timezone">Preview timezone</label>
+                <input id="prompt-timezone" type="text" value="UTC" placeholder="Europe/Bucharest">
+                <button id="prompt-preview-refresh" class="btn-secondary" data-i18n="prompts.refreshPreview">Refresh preview</button>
+              </div>
+              <p id="prompt-preview-status" role="status" aria-live="polite"></p>
+              <pre id="prompt-preview" tabindex="0" aria-label="Saved workspace prompt" data-i18n="prompts.previewTitle" data-i18n-attr="aria-label"></pre>
             </div>
           </div>
           <div class="settings-subpanel" id="settings-channels">
@@ -520,6 +552,7 @@
   <!-- M13: polite live region so toasts are announced to screen readers;
        urgent error toasts additionally carry role="alert" (see showToast). -->
   <div id="toasts" aria-live="polite"></div>
+  <script src="/prompts.js" defer></script>
   <script src="/app.js" defer></script>
   <script src="/i18n-app.js" defer></script>
 </body>

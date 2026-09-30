@@ -72,6 +72,21 @@ let results = workspace.search("dark mode preference", 5).await?;
 let prompt = workspace.system_prompt().await?;
 ```
 
+## Operator Prompt Editing (WI#220)
+
+The gateway's **Settings → System Prompt** panel edits the authenticated primary
+scope's `AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`, `MEMORY.md`
+and `BOOTSTRAP.md` through ordinary `Workspace::write()` validation/indexing.
+`GET /api/prompts` lists those primary-scope sources;
+`POST /api/prompts/write` saves one; `GET /api/prompts/preview` invokes
+`system_prompt_for_context_tz()` with explicit group/timezone controls.
+
+The preview shows current saved workspace composition. Engine V2 snapshots that
+component at thread-manager initialization and retains assembled System messages
+on existing threads. Activating edits there requires a tenant restart followed
+by a new conversation. See the [operator guide](../../../docs/guides/TENANT-SYSTEM-PROMPTS.md)
+for scope, preview, activation and API details.
+
 ## Memory Tools
 
 Four tools for LLM use:
