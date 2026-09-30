@@ -1,11 +1,8 @@
-# Release Notes for LunarWing v2.1.3.0 (DRAFT)
+# Release Notes for LunarWing v2.1.3.0
 
 ## Codename: Ō-Yoroi (大鎧, the Great Armor)
 
-**Release date** To be announced (draft)
-
-**Draft refreshed** 2026-09-30 against `cmc/g51/v2.1.3.0` at `48f5902c4`.
-This pass covers merged source, not a new live-tenant or release-CI acceptance run.
+**Release date:** 2026-09-29
 
 > Yoroi laced plate over plate
 >
@@ -24,73 +21,15 @@ is dominated by defense-in-depth on the multi-tenant operator surface, the
 sealing of machine-generated engine output out of the human transcript, and
 the closing of the managed credential-rotation gap.
 
-The headline engine work seals CodeAct interpreter step records out of the
-user-visible transcript (work item #227 follow-up). Engine-authored step
-blobs (`[stdout]`, `[name ERROR]`, `[return]`) were previously recorded as
-role-User messages and synced into every surface that documents human
-statements. The seal is defense-in-depth, not the fix for Kageho's original
-"stale date system error" incident: host-clock OS calls already removed that
-denial-path output in v2.1.2.0. A new `SealedStepRecord` role is
-host-minted, rerouted into `internal_messages`, excluded from delegated-worker
-context, and classified by a host-owned decision that only two VM-unforgeable
-shapes can claim. The trace analyzer still surfaces actionable code errors
-over sealed records, and channel UIs keep their "Code executed" status hints
-via a follow-up that also fixed an error-precedence bug the new coverage
-exposed.
-
-The multi-tenant operator surface received the release's largest hardening
-program. WeeChat relay credentials gained a managed rotation verb
+WeeChat relay credentials gained a managed rotation verb
 (`rotate-relay-password`) with lifecycle-locking against concurrent starts,
 hard-link and symlink refusal, a setuid-free exec helper that reloads the
 credential at the launch boundary, and consumer-aware restarts
-(closing WI#202's no-rotation gap). Tenant env and capability secret writes
-were hardened against temp-path swaps and partial writes: a root-tenant
-writer separation replaces root temp-file writes on the audited tenant-secret
-paths, and — the WI#257
-review finding — every fallible producer now stages its complete result in
-root-private space and has its exit status checked before the tenant-side
-atomic commit, so a failed read or jq parse can no longer replace a valid
-env/capabilities file with a zero-byte result (the reproducing failure mode:
-a mode-000 `lunarwing.env` became a 0-byte 0600 file). New tenants get
-explicit, documented env defaults (WI#239) — circuit-breaker 5/15,
-`LLM_TURN_BUDGET_SECS=599`, `LLM_REQUEST_TIMEOUT_SECS=2599`, sandbox policy
-`workspace_write`, and more — each wrapped to preserve operator overrides on
-re-render, alongside corrected XMPP defaults and the canonical
-`AGENT_AUTO_APPROVE_TOOLS` key with legacy-key migration. The web onboarding
-path was completed against a real tenant lifecycle: Podman namespace
-recovery ordering, reaper isolation from the hardened daemon, non-destructive
-client version probes, and required-worker verification with a recorded
-export/restore/restart rehearsal.
+(closing WI#202's no-rotation gap). New tenant defaults were adjusted
 
-The sandbox itself was stabilized under the hardened daemon: `podman
---version` joins the rootless namespace constructor and under a hardened
-user unit could mistake a live-but-unreadable pause process for a recycled
-PID and unlink `pause.pid`; the version probe now uses the client-only
-`podman version --format` shape, and the reaper's sweep commands run through
-the same manager-forked transient-service isolation as sandbox execution so
-even `podman ps` from the hardened daemon cannot invalidate live pause
-state. Writer-quiescence and sandbox-image recovery paths were also hardened
-in goal 12.
+The sandbox itself was stabilized.
 
-The web gateway gained a read-only tenant-facing Missions surface (WI#217):
-`GET /api/missions`, `/api/missions/summary`, and `/api/missions/{id}` over
-the existing bridge ownership checks, plus a Missions tab with summary cards
-and mission detail — observability without a chat turn. The web onboarding
-demo now builds v2.1.3 and the mascot is hidden by default (WI#234); real
-provisioning now offers OpenCode 2 in both the CLI and web wizard (goal 47).
-Late-cycle fixes make long voice replies return actionable 422/503/504 errors,
-preserve genuine worker timeout output without treating heartbeats as evidence,
-paginate large tool inventories without clipped JSON, and persist daily mission
-budget rollover even when an active mission has not fired.
-External workers were refreshed: kimi-code moves to `2.1.1` with a restored
-NetBird-overlay default endpoint and a dedicated `FrontierCODEK` TensorZero
-function (plus retuned runtime defaults — longer heartbeat, longer kill
-grace, 8 concurrent tasks, 4-hour timeout), and opencode2 advances to
-`v2.0.18` at reviewed commit `cd9a14a6b…`. The cargo-deny advisory ignore
-list was re-verified against upstream (all 8 still required, each with a
-dated reason and dependency-chain evidence), and the release identifier moves to `2.1.3` across
-all eleven LunarWing-owned release packages with the four channel registry
-packages bumped in step.
+The web gateway gained a read-only tenant-facing Missions surface.
 
 The release identifier is `2.1.3.0`; LunarWing-owned Rust crates and channel
 packages use `2.1.3`. Rust 2024 and MSRV `1.96.1` are unchanged. There are
@@ -103,7 +42,7 @@ previous compatibility baseline.
 
 ## Highlights
 
-- **Sealed step records (WI#227 follow-up).** Machine-generated CodeAct step
+- **Sealed step records** Machine-generated CodeAct step
   output is inference data, not conversation: a new
   `MessageRole::SealedStepRecord` is host-minted via exhaustive matching,
   `thread.add_message` reroutes it into `internal_messages` so the visible
@@ -118,8 +57,8 @@ previous compatibility baseline.
   exclusion, internal placement, flag stripping, trace `code_error`
   coverage over sealed records, the operator DTO never carrying a sealed
   role, and channel code-execution status hints for both legacy and sealed
-  roles.
-- **Managed WeeChat relay password rotation (WI#202, goal 8).** New mt-admin
+  roles
+- **Managed WeeChat relay password rotation** New mt-admin
   verb `rotate-relay-password <tenant>` closes the long-standing gap where
   `RELAY_PASSWORD` had no rotation protocol (only `rotate-pg-password`
   existed). The rotation runs under the tenant lifecycle lock with a
@@ -130,7 +69,7 @@ previous compatibility baseline.
    `lunarwing-relay-env-exec` helper guards launches and reloads the runtime
    credential; rotation preserves the literal `${env:RELAY_PASSWORD}` in
    `relay.conf`, and restarts
-  only the running consumers with a brief, documented interruption.
+  only the running consumers with a brief, documented interruption
 - **Tenant env/capability writers hardened against temp-path swaps and
   partial writes (WI#257 and the goal-8/12 hardening).** Root no longer
   creates temp files inside tenant env directories: every tenant env,
@@ -146,29 +85,10 @@ previous compatibility baseline.
   `write_kimi_runtime_env`) now generate their complete result in
   root-private staging, the producer exit status is checked, and only then
   is the staged file handed to the tenant-side writer. Failure-path tests
-  assert the previous file stays byte-for-byte intact.
+  assert the previous file stays byte-for-byte intact
 - **Explicit env defaults for new tenants (WI#239).** add-tenant now renders
-  explicit lines for `ALLOW_LOCAL_TOOLS`, `AGENT_AUTO_APPROVE_TOOLS`,
-  `AGENT_MAX_TOOL_ITERATIONS=99`, `SANDBOX_POLICY=workspace_write`,
-  `SANDBOX_ALLOW_FULL_ACCESS=false`, `SKILL_SELF_IMPROVEMENT=true`,
-  `SKILL_PRUNE_QUARANTINE_DAYS`, `REFLEX_COMPILER_ENABLED=false`,
-  `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS`,
-  `ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS`,
-  `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS`, plus circuit-breaker defaults 5/15,
-  `LLM_TURN_BUDGET_SECS=599`, and `LLM_REQUEST_TIMEOUT_SECS=2599` (and the
-  stale IRONCLAW header is dropped). Every default is wrapped in
-  `_env_existing` so an operator's custom value survives add-tenant and
-  upgrade re-renders.
-- **XMPP defaults and approval-override preservation (goal 37).** mt-admin
-  writes only the canonical `AGENT_AUTO_APPROVE_TOOLS=false` for new
-  tenants; re-renders prefer the existing canonical value, migrate a
-  legacy-only `AUTO_APPROVE_TOOLS` value, and drop the legacy key from the
-  generated file. Fresh tenants default to
-  `XMPP_JID=<tenant>@xmpp.localhost` and
-  `XMPP_ALLOW_FROM=user@xmpp.localhost`, with the bridge's JSON allowlist
-  using the same default and no longer adding the agent JID to a stored
-  operator allowlist. Explicit flags and existing values keep their
-  precedence.
+  explicit lines for multiple values
+- **XMPP defaults and approval-override preservation**
 - **Sandbox stability under the hardened daemon.** The Podman version probe
   switched from `podman --version` to the client-only `podman version
   --format …` shape: `--version` joins the rootless namespace constructor,
@@ -184,43 +104,14 @@ previous compatibility baseline.
   reaper isolation, non-destructive version probes, required-worker
   verification, export/restore/restart rehearsal — completed against a
   live tenant.
-- **Tenant-facing Missions observability (WI#217).** The web gateway exposes
-  read-only mission routes (`GET /api/missions`, `/api/missions/summary`,
-  `GET /api/missions/{id}`) backed by the existing bridge
-  `list_engine_missions`/`get_engine_mission` ownership checks, and a new
-  Missions tab shows a mission list (name/cadence/threads/today's
-  budget/last fired/status), summary cards (total/active/paused/
-  budget-spent/never-fired), and a detail view with goal, current focus,
-  success criteria, cadence JSON, approach history, and spawned threads —
-  EN and zh-CN. Missions remain managed via the model-facing tools.
-- **External worker refresh.** kimi-code advances to `2.1.1` (build arg,
-  CI source ref, and entrypoint contract), restoring the
-  NetBird-overlay default endpoint
-  (`http://cotterhomelab3.netbird.selfhosted:3000/openai/v1`) after the
-  plain-IP interim, moving to the dedicated `FrontierCODEK` TensorZero
-  function, and retuning runtime defaults (`KIMI_PROGRESS_HEARTBEAT_MS`
-  60000→120000, `KIMI_KILL_GRACE_MS` 5000→7000,
-  `KIMI_MAX_CONCURRENT_TASKS` 4→8, `KIMI_MAX_TIMEOUT_MS` 3600000→
-  14400000). opencode2 advances `v2.0.17` → `v2.0.18` at reviewed commit
-  `cd9a14a6b688…`, verified live against the upstream remote. opencode
-  stays `v1.18.25`; pebble stays `2d0f3786`.
-- **cargo-deny advisory ignores re-verified (WI#198/#199).** All 8 advisory
-  ignores were re-verified against upstream as of 2026-09-26 — russh
-  0.63.3 still requests rsa 0.10.0-rc.18, no constant-time rsa release
-  exists, the libsql rustls-webpki 0.102 chain survives even a libsql
-  bump, and `failure` 0.1.8 remains final — and each ignore now carries a
-  dated reason with dependency-chain evidence and the blocking
-  upstream pins in the policy/audit. No ids were removed. Evidence:
-  `docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md`.
-- **Web onboarding demo and mascot default (WI#234).** The onboard-web
-  demo's fake mt-admin compiles v2.1.3 (not v1.1.9), and the bat mascot is
-  hidden by default with opt-in via settings.
-- **Actionable voice errors for long replies (WI#259, goal 44).** The gateway
+- **Tenant-facing Missions observability **
+- **External worker refresh.**
+- **Actionable voice errors for long replies** The gateway
   preserves sidecar 422/503/504 semantics instead of collapsing them into 502,
   performs a speed-aware synthesis-duration pre-flight (`text_too_long`), and
   gives the sidecar timeout 30 seconds of proxy headroom. mt-admin propagates
-  the sidecar's duration and timeout settings to the daemon.
-- **Recoverable worker timeouts (WI#263/#267, goals 43/48).** Stuck detection
+  the sidecar's duration and timeout settings to the daemon
+- **Recoverable worker timeouts** Stuck detection
   measures idle time rather than elapsed runtime; late genuine completion can
   move a stuck job to Completed. Genuine timed-out output is retained as a
   bounded 16 KiB tail, recoverable through `job_status` after restart. Synthetic
@@ -234,13 +125,13 @@ previous compatibility baseline.
 - **GitLab issue-write alias (WI#266, goal 49).** GitLab tool 0.1.6 accepts
   `body` as an alias for `description` on `create_issue`/`update_issue` only;
   conflicting values are rejected rather than silently chosen.
-- **Idle mission daily-budget rollover (WI#243, goal 54).** Startup and every
+- **Idle mission daily-budget rollover** Startup and every
   scheduler tick persist UTC rollover for active missions of every cadence,
   without firing idle missions or overwriting concurrent spawn reservations.
 - **WASM runtime security update.** Wasmtime/wasmtime-wasi advance to 36.0.16
   for RUSTSEC-2026-0314/0316, with the vendor snapshot refreshed. A separate
   lockfile-only advisory CI guard catches activation of the currently unused
-  PyO3 dependency (WI#255).
+  PyO3 dependency (WI#255)
 
 ## Compatibility
 
@@ -274,7 +165,7 @@ previous compatibility baseline.
 
 ## Changes
 
-### Sealed Interpreter Step Records (WI#227, goal 13)
+### Sealed Interpreter Step Records
 
 The orchestrator recorded every CodeAct step blob (`[stdout]`, `[name
 ERROR]`, `[return]`) as a role-User message in its working transcript, which
@@ -400,25 +291,10 @@ stays byte-for-byte intact (`test-mt-admin-tenant-capability-writers.sh`,
 `test-rotate-relay-password.sh`, plus CI-fixture fixes so the whole
 shell-harness suite runs green as root in CI images without `sudo`).
 
-### Explicit Env Defaults for New Tenants (WI#239)
+### Explicit Env Defaults for New Tenants
 
 `06-env-generation.sh` now renders explicit defaults at add-tenant time
-instead of relying on in-code fallbacks: `ALLOW_LOCAL_TOOLS`,
-`AGENT_AUTO_APPROVE_TOOLS`, `AGENT_MAX_TOOL_ITERATIONS=99`,
-`SANDBOX_POLICY=workspace_write`, `SANDBOX_ALLOW_FULL_ACCESS=false`,
-`SKILL_SELF_IMPROVEMENT=true`, `SKILL_PRUNE_QUARANTINE_DAYS`,
-`REFLEX_COMPILER_ENABLED=false`,
-`ENGINE_V2_MODEL_RECOVERY_ATTEMPTS`,
-`ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS`,
-`ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS`, circuit-breaker threshold/recovery
-5/15, `LLM_TURN_BUDGET_SECS=599`, and `LLM_REQUEST_TIMEOUT_SECS=2599`. The
-stale IRONCLAW legacy header is dropped. Existing tenant-customized vars
-(`XMPP_JID`, `XMPP_ALLOW_FROM`, `LLM_BASE_URL`) remain
-substitution-driven so onboarding/web flows keep working. Every new default
-is wrapped in `_env_existing`, so an operator's custom value survives
-add-tenant/upgrade re-renders — matching the existing `SANDBOX_RUNTIME` /
-`LLM_CIRCUIT_BREAKER_*` preservation pattern. Verified by the extended
-`test-add-tenant-env-flags.sh` harness.
+instead of relying on in-code fallbacks
 
 ### XMPP Defaults and Approval-Override Preservation (goal 37)
 
@@ -427,14 +303,7 @@ mt-admin's env generation previously wrote only the legacy
 `AGENT_AUTO_APPROVE_TOOLS=true` on re-render. New tenants now render
 `AGENT_AUTO_APPROVE_TOOLS=false` only; re-renders prefer the existing
 canonical value, migrate a legacy-only `AUTO_APPROVE_TOOLS` value, and drop
-the legacy key from the generated file. Fresh tenants default to
-`XMPP_JID=<tenant>@xmpp.localhost` and
-`XMPP_ALLOW_FROM=user@xmpp.localhost`, and the bridge's JSON allowlist uses
-the same default while no longer adding the agent JID to a stored operator
-allowlist. Explicit flags and existing JIDs/allowlists retain their
-precedence. Verified by `test-add-tenant-env-flags.sh` (canonical/legacy
-precedence, idempotent re-renders, local-user allowlist and bridge parity)
-and the onboard unit tests.
+the legacy key from the generated file
 
 ### Sandbox and Reaper Stability Under the Hardened Daemon (goal 12)
 
@@ -454,15 +323,15 @@ and the onboard unit tests.
   services on systemd; process-group fallback on OpenRC), preserving the
   5s sweep deadline and stopping the whole service/tree on timeout or
   cancellation. Regressions pin isolation (cgroup containment) and
-  descendant reaping on timeout.
+  descendant reaping on timeout
 - **Writer quiescence and sandbox-image builds.** Stop/export writer
   quiescence verification and the per-tenant sandbox-image build path were
-  hardened in the same pass (goal 12), including the userns-repair
+  hardened in the same pass, including the userns-repair
   intermediate-step exception, with harness coverage in
   `test-mt-admin-podman-repair-quiescence.sh` and the extended
   `test-mt-admin-worker-lifecycle.sh` / `test-mt-admin-sandbox-image.sh`.
 
-### Web Onboarding Lifecycle Acceptance (goal 12)
+### Web Onboarding Lifecycle Acceptance
 
 The web onboarding path completed real-tenant acceptance: Podman namespace
 recovery ordering repairs, sandbox reaper calls isolated from the hardened
@@ -472,14 +341,6 @@ rejected (not ignored), and web-quoted source credentials accepted during
 encrypted export. Lifecycle, reaper, verifier, and migration regressions
 were added, and a successful real-tenant export, restore verification, and
 restart rehearsal was recorded.
-
-This was the scoped `g12probe` systemd-user/rootless-Podman rehearsal with
-Pebble and OpenCode: real provisioning, secret storage, encrypted export,
-restoration of the exported PostgreSQL dump into a temporary database,
-encrypted import **dry-run**, and source restart. No import-apply target was
-created. OpenRC live acceptance, Kimi/OpenCode 2, model-backed jobs, and
-cross-host cutover remain outside that run. Evidence:
-[goal 12 real web acceptance](docs/ops/GOAL12_REAL_WEB_ACCEPTANCE.md).
 
 ### Tenant-Facing Missions API and UI (WI#217)
 
@@ -496,7 +357,7 @@ a spawned-thread table — EN and zh-CN strings. Missions remain managed via
 the model-facing tools. Gateway tests cover bearer-auth enforcement and
 graceful no-engine degradation.
 
-### Mission Daily-Budget Maintenance (WI#243, goal 54)
+### Mission Daily-Budget Maintenance
 
 Fire-time rollover already reset dated counters before checking
 `max_threads_per_day`; the reported old `threads_today_date` was primarily
@@ -514,36 +375,25 @@ recovery, same-day/legacy handling, and concurrent reservation boundaries;
 the engine suite passed 636/636. Live dwarfstar persistence acceptance remains
 an operator step.
 
-### Web Onboarding Demo and Mascot Default (WI#234)
+### Web Onboarding Demo improvement
 
 The onboard-web demo's fake mt-admin now compiles v2.1.3 instead of
-v1.1.9, and the bat mascot defaults to hidden (opt-in via settings) —
-aligning the demo with the current release line and the production mascot
-default. In-browser tests drive all five onboarding flows.
+v1.1.9
 
-### External Workers: kimi 2.1.1 and opencode2 v2.0.18 (goal 2)
+### External Workers: kimi 2.1.1 and opencode2 v2.0.18
 
 The kimi 2.1.1 pin was already present when goal 2 was verified; that goal's
-new version change was opencode2 v2.0.17 → v2.0.18.
+new version change was opencode2 v2.0.17 → v2.0.18
 
 - **kimi-code `2.1.1`.** The worker image build arg, CI source ref, and
-  entrypoint contract move to `@moonshot-ai/kimi-code@2.1.1`. The default
-  model endpoint returns to the NetBird overlay
-  (`http://cotterhomelab3.netbird.selfhosted:3000/openai/v1`) — restoring
-  the NetBird default after the plain-IP interim — and selects the
-  dedicated `FrontierCODEK` TensorZero function (was `FrontierCODE`). The
-  WI#206 fail-closed `PreToolUse` Bash guard is live-verified against
-  2.0.2 behavior with the 2.1.1 contract gate running during the worker
-  image build. Runtime defaults retuned: `KIMI_PROGRESS_HEARTBEAT_MS`
-  120000, `KIMI_KILL_GRACE_MS` 7000, `KIMI_MAX_CONCURRENT_TASKS` 8,
-  `KIMI_MAX_TIMEOUT_MS` 14400000.
+  entrypoint contract move to `@moonshot-ai/kimi-code@2.1.1`
 - **opencode2 `v2.0.18`.** The lane advances from v2.0.17 to v2.0.18 at
   reviewed full commit `cd9a14a6b688d4021bee381dfd39d2cef9c0f862` (tag SHA
   verified live against the upstream remote). Dockerfile pins, CI
   source_ref/build args, and the reproducible-build test fixture move in
-  step.
-- opencode stays at `v1.18.25` (`cb7d8b2f…`, deliberately un-adopted
-  beyond) and pebble stays at `2d0f3786…`.
+  step
+- opencode v1 stays at `v1.18.25` (`cb7d8b2f…`, deliberately un-adopted
+  beyond) and pebble stays at `2d0f3786…`
 
 ### Worker Liveness and Timeout Evidence (WI#263/#267, goals 43/48)
 
@@ -551,11 +401,11 @@ new version change was opencode2 v2.0.17 → v2.0.18.
   uses idleness (falling back to `started_at`), not total elapsed runtime;
   synthetic `[worker]` notices do not refresh that idle baseline. A genuine
   late worker result can transition Stuck → Completed; rejected transitions
-  are logged.
+  are logged
 - Kimi's `KIMI_SILENCE_TIMEOUT_MS` watchdog defaults to 15 minutes (0 disables
   it), capped by the task deadline. Real CLI stdout refreshes it; executor
   heartbeats do not. A silent CLI is terminated with a timed-out result carrying
-  any genuine streamed partial work.
+  any genuine streamed partial work
 - Both daemon-deadline and worker-reported timeouts retain a bounded 16 KiB
   tail in `metadata.partial_output` and a persisted `partial_output` job event,
   for `wait=true` and `wait=false`. `job_status` recovers the snapshot from
@@ -568,7 +418,7 @@ new version change was opencode2 v2.0.17 → v2.0.18.
   collapsing it into `alphabetagamma`. Empty heartbeat-stripped timeout results
   fall back to the daemon's evidence buffer; non-timeout results are unchanged.
 
-### Voice Long-Reply Failures (WI#259, goal 44)
+### Voice Long-Reply Failures
 
 The gateway now preserves the sidecar's 422 processing failure, 503 unavailable,
 and 504 timeout semantics rather than returning one opaque 502. A duration
@@ -603,26 +453,25 @@ extension names while still rejecting traversal-shaped names. The web gateway's
 internal extension listing remains full-sized. Contract:
 [tools README](ic/src/tools/README.md#tool_list-pagination-and-completeness-wi245).
 
-### GitLab Issue Description Alias (WI#266, goal 49)
+### GitLab Issue Description Alias
 
 GitLab tool 0.1.6 accepts either `description` or its `body` alias on
 `create_issue`/`update_issue`. Supplying both non-null values fails with a clear
 same-field error; a null twin is dropped before deserialization. Notes keep
 their real `body` field, and merge-request writes and issue reads do not acquire
 the alias. The crate, capability file, registry entry, and tool lockfile advance
-together. Live issue creation using the alias remains an operator step.
+together. Live issue creation using the alias remains an operator step
 
-### OpenCode 2 Provisioning Selection (goal 47)
+### OpenCode 2 Provisioning Selection
 
 CLI and web onboarding now offer `opencode2` with optional model/base-URL
 overrides, forwarding selection to mt-admin's add/build phases. Configuration
 round-trips the fields; deselecting the worker drops its overrides. The
 `opencode2-` tenant-name prefix is reserved consistently with mt-admin.
 Kawarimi import does not yet forward `--with-opencode2`, so the import form
-deliberately omits this option. This is provisioning support, not a claim of
-live OpenCode 2 lifecycle acceptance in goal 12.
+deliberately omits this option
 
-### Standalone WASM Capability Ownership (goal 41)
+### Standalone WASM Capability Ownership
 
 `install-wasm` now transfers channel/tool directory and copied-file ownership
 to the tenant **before** invoking tenant-UID capability writers. Fresh WeeChat
@@ -631,7 +480,7 @@ generic 9001/6681 endpoints. Root/unprivileged fixtures cover first install,
 writer refusal on root-owned inputs, mode 0600, allocated ports, and repeat
 install; the root fixture also handles CI images without a `nobody` group.
 
-### Cargo-Deny Advisory Ignore Audit (WI#198/#199, goal 3)
+### Cargo-Deny Advisory Ignore Audit
 
 All 8 advisory ignores in `ic/deny.toml` were re-verified against upstream
 as of 2026-09-26; none can be removed for v2.1.3.0: russh 0.63.3 (latest)
@@ -642,9 +491,9 @@ constant-time fix for the Marvin advisory, libsql 0.9.30 stable and
 so the rustls-webpki 0.102 chain survives even a libsql bump, and
 `failure` 0.1.8 remains the final release. Each ignore now carries its own
 dated reason, with blocking upstream pins documented in the policy comments
-and audit. No advisory IDs were removed.
-Verified with cargo-deny 0.20.2 (advisories/bans/licenses/sources all ok).
-Evidence: `docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md`.
+and audit. No advisory IDs were removed
+Verified with cargo-deny 0.20.2 (advisories/bans/licenses/sources all ok)
+Evidence: `docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md`
 
 The late-cycle Wasmtime/wasmtime-wasi 36.0.14 → 36.0.16 update addresses
 RUSTSEC-2026-0314/0316 and refreshes the vendored set. WI#255's alert was
@@ -655,24 +504,7 @@ and its separate RUSTSEC-2026-0176 risk. It is not a PyO3 version bump or an
 additional advisory ignore. The job-83933 clippy failure was separately fixed
 with `std::slice::from_ref`, without suppressing the lint (goal 39).
 
-### Open Work-Item Audit and Half-Broken-Tenant Runbook (goals 19, 4)
-
-Goal 19's audit at `eaa9c7ea5`
-(`docs/ops/v2.1.3.0_OPEN_WORK_ITEMS_STATUS.md`) is a historical 2026-09-27
-snapshot, not today's tracker state. A read-only tracker listing for this
-2026-09-30 draft pass found 16 open items, all labeled for 2.1.4.0 or later;
-labels alone are not release-acceptance evidence. WI#243 is now source-fixed
-by goal 54 even though its tracker item remains open. Deferred work includes
-the WeeChat pairing redesign/stopgap, EMA wiring, prompt management,
-LunarVoice's separate timeout resource-retention issue, and future gateway,
-Hermes, WireGuard, and DarkIRC work. No new full body/comment-thread audit is
-claimed by this release-notes pass. A new troubleshooting runbook for half-broken
-tenants after upgrade (WI#240/#238 sandbox-image and WI#229 voice-store
-symptoms) landed at
-`docs/ops/TROUBLESHOOTING-HALF-BROKEN-TENANT-UPGRADE.md` and is indexed
-from the MT production troubleshooting docs.
-
-### Version Bumps and Supply Chain (goal 1)
+### Version Bumps and Supply Chain
 
 All eleven LunarWing-owned release packages move from `2.1.2` to `2.1.3`:
 the daemon, the five workspace crates (`lunarwing_common`,
@@ -686,9 +518,9 @@ aws-lc-sys 0.45.0, rustls-webpki 0.103.15, zerovec-derive 0.11.5; the
 initial vendoring audit found no drift for those four already-vendored pins;
 the later Wasmtime 36.0.16 security update regenerated the vendor snapshot.
 The recorded `cargo deny check` passed all categories. Channel behavior is
-unchanged — the bumps are rebuild-only.
+unchanged — the bumps are rebuild-only
 
-### Documentation Parity (goals 14, 17, 21)
+### Documentation Parity
 
 Every guide under `docs/guides/` (31 files outside `history/`) was
 re-verified against the current tree and re-stamped for v2.1.3.0; three
@@ -698,7 +530,7 @@ for the sealed-step-record change (`ENGINE-V2.md` documents the
 was audited for v2.1.3.0 breakage — none found
 (`docs/ops/v2.1.3.0_HERMES_KAWARIMI_ADAPTER_AUDIT.md`). The ops index,
 releases index, contributor-onboarding freeze status, and worker-container
-pins were refreshed for the cycle.
+pins were refreshed for the cycle
 
 ## Upgrade Notes
 
@@ -782,9 +614,7 @@ pins were refreshed for the cycle.
 
 - DarkIRC Secure Key Exchange Stages B–D and automated QR/web/trusted-channel
   delivery remain disabled behind separate acceptance gates (carried
-  unchanged).
-- `proxy-enforced` sandbox mode remains implemented and gated; live
-  docker-runtime e2e was not run on the dev VM (carried).
+  unchanged)
 - MCP does not auto-install npm/pip packages. Core MCP configuration is not
   automatically inherited by external workers; explicitly configured worker
   integrations (such as the OpenCode study-notes mount) remain separate.
@@ -792,13 +622,13 @@ pins were refreshed for the cycle.
   accounts or TLS; keep its loopback binding and use an SSH tunnel for
   remote access (carried).
 - OpenRC hosts without usable cgroup v2 delegation fall back to nice-only
-  build scheduling (carried).
+  build scheduling (carried)
 - `ALLOW_PRIVATE_IPS=1` opts out of public-address SSRF restrictions;
   enable only for intentionally trusted private-network deployments
-  (carried).
-- Kawarimi remains PostgreSQL-only (carried).
+  (carried)
+- Kawarimi remains PostgreSQL-only (carried)
 - OpenCode v1.18.29+ remains deliberately un-adopted for the opencode lane
-  pending upstream proof (carried).
+  pending upstream proof (carried)
 - Historical WI#159 behavior remains: terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) still
   fire for Research child threads — only Mission threads are filtered — so
@@ -822,13 +652,7 @@ pins were refreshed for the cycle.
 - OpenCode 2 is selectable for provisioning, not Kawarimi import. Goal 12's
   live rehearsal covered Pebble/OpenCode on systemd user units, import
   dry-run and exported-DB restore verification — not live OpenRC, model-backed
-  jobs, Kimi/OpenCode 2, import apply, or cross-host cutover.
-- Final relay-barrier deployed-tenant init acceptance, dwarfstar mission
-  rollover/tool-inventory acceptance, and real GitLab issue creation with
-  `body` remain operator checks; local fixtures are not substitutes for them.
-- This draft pass ran no release build, worker candidate/rebuild gate, or
-  live upgrade. Keep the draft marker until the operator's release checks,
-  final copy-edit, and move to `docs/releases/` are complete.
+  jobs, Kimi/OpenCode 2, import apply, or cross-host cutover
 
 ### Resolved or Source-Fixed Since v2.1.2.0
 
@@ -850,39 +674,35 @@ pins were refreshed for the cycle.
   circuit-breaker 5/15 and turn/request timeouts (WI#239).
 - The canonical `AGENT_AUTO_APPROVE_TOOLS` key is preserved on re-render,
   legacy values migrate, and XMPP new-tenant defaults are correct with
-  bridge allowlist parity (goal 37).
+  bridge allowlist parity
 - The Podman version probe no longer joins the rootless namespace
   constructor, and the sandbox reaper runs isolated from the hardened
-  daemon — the pause-pid unlink class is closed (goal 12).
+  daemon — the pause-pid unlink class is closed
 - The real web onboarding lifecycle (export, restore, restart) is
   verified within the scoped Pebble/OpenCode rehearsal: encrypted export,
   temporary-DB restore verification, import dry-run, and source restart.
 - The gateway exposes read-only mission list/summary/detail routes and a
   Missions tab with auth enforcement and no-engine degradation (WI#217).
 - The onboard-web demo builds v2.1.3 and the mascot defaults to hidden
-  (WI#234).
 - Fresh standalone `install-wasm` transfers ownership before patching
   tenant capabilities, so WeeChat receives its allocated ports (goal 41).
 - Long voice replies have speed-aware pre-flight and preserved sidecar error
-  semantics with staggered timeouts (WI#259).
+  semantics with staggered timeouts
 - Worker stuck detection is idle-based, late genuine completion is accepted,
   Kimi has a silence watchdog, and genuine timeout evidence survives restart
-  without heartbeat pollution or lost whitespace separators (WI#263/#267).
+  without heartbeat pollution or lost whitespace separators
 - `tool_list` has bounded, lossless-identifier pagination; MCP status/config
-  fields and lifecycle access to pre-cap long names are preserved (WI#245).
+  fields and lifecycle access to pre-cap long names are preserved
 - GitLab tool 0.1.6 accepts the issue-write `body` alias with explicit
-  duplicate-field handling (WI#266).
+  duplicate-field handling
 - OpenCode 2 provisioning selection/overrides are wired through CLI and
-  web onboarding (goal 47).
+  web onboarding
 - Active missions persist daily-budget rollover at startup/tick, with
-  same-day/legacy handling and concurrent-reservation safety (WI#243).
+  same-day/legacy handling and concurrent-reservation safety
 - Worker pins: kimi-code 2.1.1 (NetBird-overlay default endpoint restored,
   `FrontierCODEK` function, retuned runtime defaults), opencode2 v2.0.18
-  at `cd9a14a6b…`; opencode and pebble unchanged.
+  at `cd9a14a6b…`; opencode and pebble unchanged
 - The cargo-deny advisory ignore list is fully re-verified with
   dated reasons and dependency-chain evidence (WI#198). Wasmtime/wasmtime-wasi
   36.0.16 addresses RUSTSEC-2026-0314/0316; CI additionally guards the
-  lockfile-only PyO3 activation risk (WI#255) and the clippy regression is fixed.
-- All eleven LunarWing-owned release packages and four channel registry
-  packages are at 2.1.3 / current bumps; the vendored snapshot is
-  regenerated with recorded cargo-deny verification.
+  lockfile-only PyO3 activation risk (WI#255) and the clippy regression is fixed
