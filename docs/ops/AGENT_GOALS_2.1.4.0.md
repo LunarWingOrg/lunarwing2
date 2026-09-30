@@ -24,7 +24,11 @@
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.2.0.md (candidates, weigh each)
 
 4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265
+5. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265
+   - DONE 100% (WI#265, 2026-09-30): `routine_history` now resolves Engine V2 mission names.
+     - `ic/src/bridge/router.rs`: new read-only `get_engine_mission_history_by_name` (default-project own+shared lookup, then a global ownership-filtered scan) rendering recent fires from `mission.thread_history`; new `EngineMissionHistory`/`EngineMissionRun` DTOs; ownership check shared with `get_engine_mission`.
+     - `ic/src/tools/builtin/routine.rs`: `RoutineHistoryTool` falls back to the engine query when the v1 routines lookup misses; not-found errors now name both registries and point at `routine_list`/`mission_list`; limit clamped 1..=50.
+     - Tests: 3 router tests (default-project resolve, multi-tenant global scan + non-owner exclusion, uninitialized engine) + 2 tool tests (error contract, result rendering). cargo check/clippy clean; e2e `routine_history` and `skill_install_routine_webhook_sim` pass unchanged.
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/244
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/243
