@@ -51,8 +51,11 @@ zombie call silently monopolize resources:
 - Each component (STT/TTS/VAD) tracks abandoned calls. While an abandoned
   call is still running, new requests for **that component** fail fast with
   `503 unavailable` instead of queueing behind it; the other components stay
-  available. TTS mutex acquisition is `try_lock`, so fresh synthesis never
-  blocks waiting behind a stuck one.
+  available **for as long as shared inference permits remain** — the draining
+  call still holds one permit, so with
+  `VOICE_MAX_CONCURRENT_INFERENCE=1` the single permit is gone and STT/VAD
+  also answer `503 unavailable` until it exits. TTS mutex acquisition is
+  `try_lock`, so fresh synthesis never blocks waiting behind a stuck one.
 - Once the underlying call returns (success, error, or panic unwinding), the
   component is re-admitted automatically. Recovery needs no operator action.
 - `/ready` includes a per-component `abandoned_inference` object
@@ -66,8 +69,9 @@ inference permit (`VOICE_MAX_CONCURRENT_INFERENCE`) and CPU until it exits.
 If a model wedges indefinitely (never observed with Kokoro, but possible with
 a pathological model), the draining component stays 503; operator recovery is
 restarting the sidecar (`mt-admin restart <tenant>` or the systemd/OpenRC
-unit). The shared permit pool and other components are unaffected meanwhile,
-and repeated timeouts cannot leave the sidecar degraded after the call exits.
+unit). The remaining shared permits (and, through them, the other components)
+are unaffected meanwhile, and repeated timeouts cannot leave the sidecar
+degraded after the call exits.
 
 ## Multi-Tenant Lifecycle
 

@@ -157,7 +157,10 @@ into one opaque 502.
 A sidecar 504 additionally means the underlying native inference may still be
 running with the caller gone (WI#264); the sidecar itself now fences that
 zombie: while the abandoned call drains, further synthesis attempts fail fast
-with 503 `unavailable` rather than queueing behind it, STT/VAD stay available,
+with 503 `unavailable` rather than queueing behind it, STT/VAD stay available
+while shared inference permits remain (with
+`VOICE_MAX_CONCURRENT_INFERENCE=1` the draining call holds the sole permit,
+so those components answer 503 too until it exits),
 and the component re-admits itself once the call exits. Clients should retry
 503 synthesis with backoff; no gateway-side intervention is needed.
 
