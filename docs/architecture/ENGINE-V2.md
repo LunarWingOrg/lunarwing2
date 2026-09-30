@@ -502,7 +502,17 @@ Cron missions receive `next_fire_at` when created, updated, or resumed. Startup
 repairs older valid cron missions missing this value. Scheduler fires advance
 the next occurrence even when the daily thread budget blocks a run; manual
 fires do not shift the cron schedule. Daily thread budgets reset on UTC day
-boundaries.
+boundaries. Startup and each scheduler tick persist the rollover for active
+missions of every cadence, including idle manual/event/webhook missions and
+cron missions that are not yet due (WI#243, v2.1.3.0). This maintenance does not
+spawn a thread or change the schedule. Fire-time rollover remains in place for
+triggers arriving before the next tick. Maintenance reloads and saves under
+the same per-mission lock as spawn reservations so it cannot erase a concurrent
+fire's budget usage. Undated legacy counters are stamped with today's UTC date
+without resetting their count, conservatively preserving upgrade-day usage;
+same-day counters are unchanged. Paused and terminal missions are not swept.
+A failed maintenance save skips that mission for the tick and is retried on
+the next tick without preventing other missions from receiving maintenance.
 
 The daily thread budget (`max_threads_per_day`,
 default 30 via `DEFAULT_MAX_THREADS_PER_DAY` since work item #189, 0 =
