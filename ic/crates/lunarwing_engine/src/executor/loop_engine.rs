@@ -621,6 +621,8 @@ mod tests {
         LlmCallConfig, LlmOutput, LlmStream, LlmStreamChunk, ProviderStreamObservation,
     };
     use crate::types::capability::{ActionDef, CapabilityLease, EffectType, GrantedActions};
+    use crate::types::error::ModelFailureKind;
+    use crate::types::message::MessageRole;
     use crate::types::project::ProjectId;
     use crate::types::step::LlmResponse;
     use crate::types::step::{ActionResult, TokenUsage};
@@ -1408,6 +1410,150 @@ mod tests {
             }
         }
         assert_eq!(deltas, vec!["partial"]);
+    }
+
+    #[tokio::test]
+    async fn midstream_transport_failure_recovers_without_committing_the_draft() {
+        for kind in [ModelFailureKind::Transient, ModelFailureKind::Unavailable] {
+            let draft = "```repl\nawait test_tool()\nFINAL('aborted draft')\n```";
+            let diagnostic = "error decoding response body: private provider details";
+            let llm = Arc::new(StreamingMockLlm::new(vec![
+                vec![
+                    Ok(LlmStreamChunk::TextDelta(draft.into())),
+                    Err(EngineError::Llm {
+                        kind,
+                        reason: diagnostic.into(),
+                    }),
+                ],
+                vec![
+                    Ok(LlmStreamChunk::TextDelta(
+                        "```repl\nFINAL('recovered')\n```".into(),
+                    )),
+                    Ok(LlmStreamChunk::Done {
+                        usage: Some(TokenUsage {
+                            input_tokens: 12,
+                            output_tokens: 6,
+                            ..Default::default()
+                        }),
+                        finish_reason: "stop".into(),
+                    }),
+                ],
+            ]));
+            let (mut exec, _signal_tx) =
+                make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+            let outcome = exec.run().await.unwrap();
+
+            assert!(matches!(
+                outcome,
+                ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+            ));
+            assert_eq!(llm.streaming_calls.load(Ordering::Relaxed), 2);
+            assert_eq!(exec.thread.total_tokens_used, 18);
+            // Even syntactically complete code remains provisional until Done.
+            assert!(!exec.thread.events.iter().any(|event| matches!(
+                event.kind,
+                EventKind::ActionExecuted { .. } | EventKind::ActionFailed { .. }
+            )));
+            assert!(
+                exec.thread
+                    .messages
+                    .iter()
+                    .chain(&exec.thread.internal_messages)
+                    .all(|message| !message.content.contains("aborted draft"))
+            );
+            let requests = llm.requests();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].iter().any(|message| {
+                message.role == MessageRole::System
+                    && message.content.contains(kind.recovery_instruction())
+            }));
+            assert!(requests[1].iter().all(|message| {
+                !message.content.contains(diagnostic) && !message.content.contains("aborted draft")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_midstream_failures_respect_all_recovery_caps() {
+        // The per-step, per-kind and lifetime caps still apply after partial text.
+        for (kind, step_cap, total_cap, expected_calls) in [
+            (ModelFailureKind::Transient, 1, 3, 2),
+            (ModelFailureKind::Transient, 5, 5, 3),
+            (ModelFailureKind::Unavailable, 5, 5, 2),
+            (ModelFailureKind::Transient, 0, 5, 1),
+            (ModelFailureKind::Transient, 2, 0, 1),
+            (ModelFailureKind::Transient, 2, 1, 2),
+        ] {
+            let llm = Arc::new(StreamingMockLlm::new(
+                (0..4)
+                    .map(|_| {
+                        vec![
+                            Ok(LlmStreamChunk::TextDelta("aborted draft".into())),
+                            Err(EngineError::Llm {
+                                kind,
+                                reason: "error decoding response body".into(),
+                            }),
+                        ]
+                    })
+                    .collect(),
+            ));
+            let config = ThreadConfig {
+                model_recovery_max_attempts: step_cap,
+                model_recovery_total_attempts: total_cap,
+                ..ThreadConfig::default()
+            };
+            let (mut exec, _signal_tx) = make_loop_with_llm(llm.clone(), Vec::new(), config).await;
+
+            let outcome = exec.run().await.unwrap();
+
+            assert!(matches!(
+                outcome,
+                ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::Model(actual),
+                    error,
+                } if actual == kind && error == kind.terminal_message()
+            ));
+            assert_eq!(llm.streaming_calls.load(Ordering::Relaxed), expected_calls);
+            assert_eq!(exec.thread.total_tokens_used, 0);
+            assert!(exec.thread.messages.iter().all(|message| {
+                !message.content.contains("aborted draft")
+                    && !message.content.contains("error decoding response body")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn midstream_non_transport_failures_do_not_gain_recovery_attempts() {
+        for kind in [
+            ModelFailureKind::RateLimited,
+            ModelFailureKind::Authentication,
+            ModelFailureKind::RequestRejected,
+            ModelFailureKind::InvalidOutput,
+            ModelFailureKind::ContextOverflow,
+            ModelFailureKind::Internal,
+        ] {
+            let llm = Arc::new(StreamingMockLlm::new(vec![vec![
+                Ok(LlmStreamChunk::TextDelta("partial".into())),
+                Err(EngineError::Llm {
+                    kind,
+                    reason: "private diagnostic".into(),
+                }),
+            ]]));
+            let (mut exec, _signal_tx) =
+                make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+            let outcome = exec.run().await.unwrap();
+
+            assert!(matches!(
+                outcome,
+                ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::Model(actual),
+                    ..
+                } if actual == kind
+            ));
+            assert_eq!(llm.streaming_calls.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[tokio::test]

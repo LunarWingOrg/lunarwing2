@@ -873,15 +873,28 @@ fn llm_error_result(
     ExtFunctionResult::Return(json_to_monty(&serde_json::json!({
         "type": "model_error",
         "kind": kind.as_str(),
-        // Integrity rejection happens before any action dispatch. Unlike a
-        // transport failure after partial text, a fresh draft is safe even
-        // when some of the rejected text was already streamed to the UI.
-        "recoverable": (retry_safe || kind == ModelFailureKind::ReplArgumentCorruption)
+        // A failed collection never commits an assistant message or dispatches
+        // actions. Streamed text remains provisional live work; recovery does
+        // not reset it. The orchestrator's per-kind and thread caps still bound
+        // recovery requests after a partial transport failure (WI#244).
+        "recoverable": (retry_safe || midstream_retry_safe(kind))
             && kind.is_recoverable(),
         "instruction": kind.recovery_instruction(),
         "terminal_message": kind.terminal_message(),
         "provider_observation": provider_observation,
     })))
+}
+
+/// These failures can succeed with a fresh draft even after text was streamed.
+/// Rate limits stay provider-owned, and other partial-output failures retain
+/// their existing terminal behavior. Nothing from a failed collection executes.
+fn midstream_retry_safe(kind: ModelFailureKind) -> bool {
+    matches!(
+        kind,
+        ModelFailureKind::Transient
+            | ModelFailureKind::Unavailable
+            | ModelFailureKind::ReplArgumentCorruption
+    )
 }
 
 fn observation_context(observations: &[ProviderStreamObservation]) -> Option<String> {
