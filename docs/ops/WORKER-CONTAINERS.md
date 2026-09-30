@@ -116,6 +116,8 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 
 Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
 
+Upstream's pinned lockfile ships rustls 0.23.41 (RUSTSEC-2026-0285, fixed >= 0.23.45) and has no newer release, so the reviewed patched lock is committed at `pebble4lunarwing/upstream/Cargo.lock` and copied over the checkout during the image build. The build verifies the pinned `PEBBLE_LOCK_SHA256` digest and that the lock delta stays within the rustls/rustls-webpki allowlist, so drift from either reviewed input fails the build rather than silently compiling the affected TLS stack.
+
 ## Opencode Worker
 
 [opencode](https://opencode.ai) (anomalyco/opencode, formerly sst/opencode) integrated as a persistent LunarWing external worker. A Bun/TypeScript bridge wraps the `@opencode-ai/sdk` and translates between the opencode session/event model and the `lunarwing-agent-v1` WebSocket protocol. The opencode headless server runs internally on `127.0.0.1:4096` (not exposed). Health on 8443, WebSocket on 9090.
