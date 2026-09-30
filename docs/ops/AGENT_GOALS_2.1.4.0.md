@@ -48,7 +48,7 @@
 16. [ ] update all docs in docs/guides
 17. [ ] update all docs in docs/architecture
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269
-19. [x] (S) compile proper list of changes wanted for web gateway itself
+19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/270
 20. [x] fix issues in CI/CD
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
 22. [x] (S) (H) Consider web gateway additional functionality (seperate from goal 38)
