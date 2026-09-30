@@ -5948,6 +5948,7 @@ mod tests {
         conversations: TokioRwLock<Vec<lunarwing_engine::ConversationSurface>>,
         threads: TokioRwLock<HashMap<lunarwing_engine::ThreadId, lunarwing_engine::Thread>>,
         docs: TokioRwLock<HashMap<lunarwing_engine::DocId, lunarwing_engine::MemoryDoc>>,
+        missions: TokioRwLock<HashMap<lunarwing_engine::MissionId, lunarwing_engine::Mission>>,
         block_next_thread_load: AtomicBool,
         thread_load_started: Notify,
         continue_thread_load: Notify,
@@ -5960,6 +5961,7 @@ mod tests {
                 conversations: TokioRwLock::new(Vec::new()),
                 threads: TokioRwLock::new(HashMap::new()),
                 docs: TokioRwLock::new(HashMap::new()),
+                missions: TokioRwLock::new(HashMap::new()),
                 block_next_thread_load: AtomicBool::new(false),
                 thread_load_started: Notify::new(),
                 continue_thread_load: Notify::new(),
@@ -6164,22 +6166,46 @@ mod tests {
         }
         async fn save_mission(
             &self,
-            _: &lunarwing_engine::Mission,
+            mission: &lunarwing_engine::Mission,
         ) -> Result<(), lunarwing_engine::EngineError> {
+            self.missions
+                .write()
+                .await
+                .insert(mission.id, mission.clone());
             Ok(())
         }
         async fn load_mission(
             &self,
-            _: lunarwing_engine::MissionId,
+            id: lunarwing_engine::MissionId,
         ) -> Result<Option<lunarwing_engine::Mission>, lunarwing_engine::EngineError> {
-            Ok(None)
+            Ok(self.missions.read().await.get(&id).cloned())
         }
         async fn list_missions(
             &self,
-            _: lunarwing_engine::ProjectId,
-            _user_id: &str,
+            project_id: lunarwing_engine::ProjectId,
+            user_id: &str,
         ) -> Result<Vec<lunarwing_engine::Mission>, lunarwing_engine::EngineError> {
-            Ok(vec![])
+            Ok(self
+                .missions
+                .read()
+                .await
+                .values()
+                .filter(|mission| mission.project_id == project_id && mission.user_id == user_id)
+                .cloned()
+                .collect())
+        }
+        async fn list_all_missions(
+            &self,
+            project_id: lunarwing_engine::ProjectId,
+        ) -> Result<Vec<lunarwing_engine::Mission>, lunarwing_engine::EngineError> {
+            Ok(self
+                .missions
+                .read()
+                .await
+                .values()
+                .filter(|mission| mission.project_id == project_id)
+                .cloned()
+                .collect())
         }
         async fn update_mission_status(
             &self,
@@ -6587,6 +6613,114 @@ mod tests {
 
         let resolved = resolve_pending_gate_for_user(&store, "alice", None).await;
         assert!(matches!(resolved, PendingGateResolution::Ambiguous));
+    }
+
+    // ── mission history by name (WI#265) ────────────────────────
+
+    /// Seed a mission with two recorded fires and persist its threads.
+    async fn seed_mission_with_runs(
+        store: &TestStore,
+        project_id: lunarwing_engine::ProjectId,
+        user_id: &str,
+        name: &str,
+    ) -> lunarwing_engine::MissionId {
+        let mut mission = lunarwing_engine::Mission::new(
+            project_id,
+            user_id,
+            name,
+            "test goal",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        for index in 0..2 {
+            let mut thread = lunarwing_engine::Thread::new(
+                format!("{name} run {index}"),
+                lunarwing_engine::ThreadType::Mission,
+                project_id,
+                user_id,
+                lunarwing_engine::ThreadConfig::default(),
+            );
+            thread
+                .add_message(lunarwing_engine::ThreadMessage::assistant(format!(
+                    "run {index} done"
+                )));
+            store.save_thread(&thread).await.unwrap();
+            mission.record_thread(thread.id);
+        }
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn mission_history_by_name_renders_recent_fires() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let project = lunarwing_engine::ProjectId::new();
+        seed_mission_with_runs(&store, project, "alice", "conversation-insights").await;
+
+        let mut state = make_expected_test_state(store.clone());
+        state.default_project_id = project;
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+        *lock.write().await = Some(state);
+
+        let history = get_engine_mission_history_by_name("conversation-insights", "alice", 10)
+            .await
+            .expect("query must not error")
+            .expect("mission must resolve by name");
+
+        assert_eq!(history.info.name, "conversation-insights");
+        assert_eq!(history.info.thread_count, 2);
+        assert_eq!(history.runs.len(), 2);
+        assert!(history.runs.iter().all(|run| run
+            .result_summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("run"))));
+
+        *lock.write().await = None;
+    }
+
+    #[tokio::test]
+    async fn mission_history_by_name_finds_foreign_project_mission_for_owner() {
+        // Multi-tenant fallback: the mission lives outside the default
+        // project, so only the global scan finds it.
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let tenant_project = lunarwing_engine::ProjectId::new();
+        seed_mission_with_runs(&store, tenant_project, "bob", "self-improvement").await;
+
+        let state = make_expected_test_state(store.clone());
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+        *lock.write().await = Some(state);
+
+        let found = get_engine_mission_history_by_name("self-improvement", "bob", 10)
+            .await
+            .expect("query must not error")
+            .expect("owner must see their own mission via the global scan");
+        assert_eq!(found.info.thread_count, 2);
+
+        let other_user = get_engine_mission_history_by_name("self-improvement", "mallory", 10)
+            .await
+            .expect("query must not error");
+        assert!(
+            other_user.is_none(),
+            "a non-owner must not see another user's mission"
+        );
+
+        *lock.write().await = None;
+    }
+
+    #[tokio::test]
+    async fn mission_history_by_name_returns_none_when_engine_uninitialized() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+
+        let history = get_engine_mission_history_by_name("anything", "alice", 10)
+            .await
+            .expect("query must not error");
+        assert!(history.is_none());
     }
 
     #[tokio::test]

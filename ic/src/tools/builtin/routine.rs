@@ -1601,6 +1601,14 @@ async fn engine_mission_runs(
             ))
         })?;
 
+    Ok(Some(render_engine_mission_history(name, &history)))
+}
+
+/// Render resolved mission history in the `routine_history` result shape.
+fn render_engine_mission_history(
+    name: &str,
+    history: &crate::bridge::EngineMissionHistory,
+) -> serde_json::Value {
     let runs: Vec<serde_json::Value> = history
         .runs
         .iter()
@@ -1619,7 +1627,7 @@ async fn engine_mission_runs(
         })
         .collect();
 
-    Ok(Some(serde_json::json!({
+    serde_json::json!({
         "routine": name,
         "kind": "engine_mission",
         "mission_id": history.info.id,
@@ -1629,7 +1637,7 @@ async fn engine_mission_runs(
         "last_fired_at": history.info.last_fired_at,
         "never_fired": history.info.never_fired,
         "runs": runs,
-    })))
+    })
 }
 
 #[async_trait]
@@ -2526,5 +2534,79 @@ mod tests {
                 && description == "Run it"
                 && max_iterations == 10
         ));
+    }
+
+    #[tokio::test]
+    async fn routine_history_falls_back_to_engine_missions_and_names_the_registry_gap() {
+        // With no engine state initialized, neither registry can resolve the
+        // name. The fallback must surface a clear not-found error that points
+        // at both registries (WI#265) instead of the old bare
+        // "routine '<name>' not found".
+        let ctx = crate::context::JobContext::with_user(
+            "alice",
+            "history probe",
+            "routine_history fallback probe",
+        );
+
+        let error = engine_mission_runs(&ctx, "conversation-insights", 10)
+            .await
+            .expect_err("uninitialized engine cannot resolve a mission name");
+        let message = error.to_string();
+        assert!(
+            message.contains("not found in routines or engine missions"),
+            "error should name both registries: {message}"
+        );
+        assert!(
+            message.contains("mission_list"),
+            "error should point at discovery tools: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn routine_history_renders_engine_mission_runs() {
+        let history = crate::bridge::EngineMissionHistory {
+            info: crate::bridge::EngineMissionInfo {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                name: "conversation-insights".to_string(),
+                goal: "digest conversations".to_string(),
+                status: "Active".to_string(),
+                cadence_type: "cron".to_string(),
+                thread_count: 1,
+                current_focus: None,
+                threads_today: 1,
+                max_threads_per_day: 30,
+                budget_exhausted: false,
+                last_fired_at: Some("2026-09-30T00:00:00Z".to_string()),
+                never_fired: false,
+                created_at: "2026-09-01T00:00:00Z".to_string(),
+                updated_at: "2026-09-30T00:00:00Z".to_string(),
+            },
+            cadence: serde_json::json!({"Cron": {"expression": "0 0 9 * * *"}}),
+            runs: vec![crate::bridge::EngineMissionRun {
+                thread_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                status: "Done".to_string(),
+                started_at: "2026-09-30T00:00:00Z".to_string(),
+                completed_at: Some("2026-09-30T00:01:00Z".to_string()),
+                duration_secs: Some(60),
+                result_summary: Some("insights written".to_string()),
+                tokens_used: 1234,
+                step_count: 2,
+            }],
+        };
+
+        let rendered = render_engine_mission_history("conversation-insights", &history);
+
+        assert_eq!(rendered["routine"], "conversation-insights");
+        assert_eq!(rendered["kind"], "engine_mission");
+        assert_eq!(
+            rendered["mission_id"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(rendered["total_runs"], 1);
+        let run = &rendered["runs"][0];
+        assert_eq!(run["trigger_type"], "mission_thread");
+        assert_eq!(run["id"], "22222222-2222-2222-2222-222222222222");
+        assert_eq!(run["duration_secs"], 60);
+        assert_eq!(run["result_summary"], "insights written");
     }
 }
