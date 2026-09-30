@@ -3,8 +3,10 @@ use std::collections::HashMap;
 #[cfg(feature = "onnx")]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(feature = "onnx")]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -55,6 +57,190 @@ pub struct EngineReadiness {
     pub models_loaded: Vec<String>,
 }
 
+/// Voice component sharing the sidecar's inference permits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VoiceComponent {
+    Stt,
+    Tts,
+    Vad,
+}
+
+impl VoiceComponent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stt => "stt",
+            Self::Tts => "tts",
+            Self::Vad => "vad",
+        }
+    }
+}
+
+/// Per-component view of abandoned inference calls (WI#264).
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct ComponentAbandonment {
+    /// Abandoned calls whose native inference has not returned yet.
+    pub in_flight: usize,
+    /// Total calls abandoned since process start.
+    pub total: u64,
+}
+
+/// Abandonment accounting for all voice components.
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct AbandonedInference {
+    pub stt: ComponentAbandonment,
+    pub tts: ComponentAbandonment,
+    pub vad: ComponentAbandonment,
+}
+
+impl AbandonedInference {
+    pub fn any_in_flight(&self) -> bool {
+        self.stt.in_flight > 0 || self.tts.in_flight > 0 || self.vad.in_flight > 0
+    }
+}
+
+/// Detects callers that stopped waiting on a blocking inference call.
+///
+/// Native ONNX inference (WI#264) cannot be safely interrupted once
+/// `spawn_blocking` has entered it, so the sidecar never tries to cancel it.
+/// Instead each in-flight call is tracked by a [`CallerGuard`] held by the
+/// caller's future and a [`WorkerGuard`] held by the blocking closure. If the
+/// caller's future is dropped while inference is still running (HTTP timeout
+/// or client disconnect), the call is recorded as abandoned; new work for
+/// that component is then rejected fast with [`EngineError::Busy`] until the
+/// underlying inference returns. This bounds how long a zombie inference can
+/// monopolize its component mutex and one of the shared permits, and keeps
+/// unrelated components (e.g. STT while TTS is stuck) available.
+#[derive(Debug, Default)]
+pub struct InferenceTracker {
+    abandoned: [AtomicU64; COMPONENT_COUNT],
+    in_flight_abandoned: [AtomicUsize; COMPONENT_COUNT],
+}
+
+const COMPONENT_COUNT: usize = 3;
+
+impl InferenceTracker {
+    fn slot(component: VoiceComponent) -> usize {
+        match component {
+            VoiceComponent::Stt => 0,
+            VoiceComponent::Tts => 1,
+            VoiceComponent::Vad => 2,
+        }
+    }
+
+    /// Begins tracking one inference call, returning both halves.
+    ///
+    /// The [`CallerGuard`] stays with the caller's async future — its drop on
+    /// a timeout or client disconnect is the abandonment signal. The
+    /// [`WorkerGuard`] is moved into the blocking closure and settles the
+    /// accounting when the native inference returns.
+    pub fn begin(self: &Arc<Self>, component: VoiceComponent) -> (CallerGuard, WorkerGuard) {
+        let settled = Arc::new(AtomicU8::new(CALL_ACTIVE));
+        (
+            CallerGuard {
+                tracker: Arc::clone(self),
+                component,
+                settled: Arc::clone(&settled),
+            },
+            WorkerGuard {
+                tracker: Arc::clone(self),
+                component,
+                settled,
+            },
+        )
+    }
+
+    fn caller_left_while_running(&self, component: VoiceComponent) {
+        let slot = Self::slot(component);
+        self.abandoned[slot].fetch_add(1, Ordering::Relaxed);
+        self.in_flight_abandoned[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn worker_returned_after_abandonment(&self, component: VoiceComponent) {
+        self.in_flight_abandoned[Self::slot(component)]
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Current abandoned-inference counters, for health/metrics surfaces.
+    pub fn snapshot(&self) -> AbandonedInference {
+        let read = |slot: usize| ComponentAbandonment {
+            in_flight: self.in_flight_abandoned[slot].load(Ordering::Relaxed),
+            total: self.abandoned[slot].load(Ordering::Relaxed),
+        };
+        AbandonedInference {
+            stt: read(0),
+            tts: read(1),
+            vad: read(2),
+        }
+    }
+
+    fn in_flight(&self, component: VoiceComponent) -> usize {
+        self.in_flight_abandoned[Self::slot(component)].load(Ordering::Relaxed)
+    }
+
+    /// Rejects new work for a component whose previous call was abandoned.
+    ///
+    /// The abandoned native inference still holds its permit and component
+    /// mutex; failing fast here keeps callers from queueing behind it and
+    /// lets the component recover the moment the underlying call returns.
+    pub fn reject_if_abandoned(&self, component: VoiceComponent) -> Result<(), EngineError> {
+        if self.in_flight(component) > 0 {
+            Err(EngineError::Busy)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+const CALL_ACTIVE: u8 = 0b00;
+const CALLER_LEFT: u8 = 0b01;
+const WORKER_RETURNED: u8 = 0b10;
+
+/// Half of the abandonment detector owned by the caller's async future.
+///
+/// Created by [`InferenceTracker::begin`] alongside its [`WorkerGuard`] pair.
+/// When the caller's future is dropped while the shared settled-flag still
+/// reads `CALL_ACTIVE` (worker still running), the drop records the call as
+/// abandoned; on normal completion the future's drop happens after the join
+/// handle already observed `WORKER_RETURNED`, so nothing is recorded.
+#[derive(Debug)]
+pub struct CallerGuard {
+    tracker: Arc<InferenceTracker>,
+    component: VoiceComponent,
+    settled: Arc<AtomicU8>,
+}
+
+impl Drop for CallerGuard {
+    fn drop(&mut self) {
+        // Dropped on the caller side while the worker half still exists and
+        // inference is running — abandonment.
+        if self.settled.swap(CALLER_LEFT, Ordering::SeqCst) == CALL_ACTIVE {
+            self.tracker.caller_left_while_running(self.component);
+        }
+    }
+}
+
+/// Half of the abandonment detector owned by the blocking closure.
+///
+/// Its drop sets the shared settled-flag to `WORKER_RETURNED` and, when the
+/// caller half already recorded abandonment, clears the in-flight count so
+/// the component is re-admitted. Because settlement happens in `Drop`, a
+/// panic inside the blocking closure still re-admits the component.
+#[derive(Debug)]
+pub struct WorkerGuard {
+    tracker: Arc<InferenceTracker>,
+    component: VoiceComponent,
+    settled: Arc<AtomicU8>,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if self.settled.swap(WORKER_RETURNED, Ordering::SeqCst) == CALLER_LEFT {
+            // The caller had already left; settle the in-flight abandonment.
+            self.tracker.worker_returned_after_abandonment(self.component);
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("{0} model is unavailable")]
@@ -98,6 +284,16 @@ pub trait VoiceEngine: Send + Sync {
 
     async fn detect(&self, audio: AudioData) -> Result<Vec<SpeechSegment>, EngineError>;
 
+    /// Per-component abandoned-inference accounting (WI#264).
+    ///
+    /// Non-zero `in_flight` for a component means a caller timed out or
+    /// disconnected while its native inference was running; new work for that
+    /// component is rejected with [`EngineError::Busy`] until the underlying
+    /// call returns.
+    fn abandoned_inference(&self) -> AbandonedInference {
+        AbandonedInference::default()
+    }
+
     fn readiness(&self) -> EngineReadiness;
 }
 
@@ -117,6 +313,7 @@ pub struct SherpaVoiceEngine {
     voice_ids: HashMap<String, i32>,
     default_voice: String,
     inference_limit: Arc<tokio::sync::Semaphore>,
+    tracker: Arc<InferenceTracker>,
 }
 
 #[cfg(feature = "onnx")]
@@ -179,6 +376,7 @@ impl SherpaVoiceEngine {
             voice_ids: config.tts_voice_ids.clone(),
             default_voice: config.tts_default_voice.clone(),
             inference_limit: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_inference)),
+            tracker: Arc::new(InferenceTracker::default()),
         })
     }
 }
@@ -264,13 +462,16 @@ impl VoiceEngine for SherpaVoiceEngine {
             return Err(EngineError::LanguageMismatch);
         }
         let fallback_language = self.language.clone();
+        self.tracker.reject_if_abandoned(VoiceComponent::Stt)?;
         let permit = self
             .inference_limit
             .clone()
             .try_acquire_owned()
             .map_err(|_| EngineError::Busy)?;
+        let (_caller, worker) = self.tracker.begin(VoiceComponent::Stt);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _worker = worker;
             transcribe_chunks(&stt, &audio, &fallback_language)
         })
         .await
@@ -299,17 +500,21 @@ impl VoiceEngine for SherpaVoiceEngine {
             .or_else(|| voice.parse::<i32>().ok())
             .ok_or(EngineError::UnknownVoice)?;
         let text = text.to_string();
+        self.tracker.reject_if_abandoned(VoiceComponent::Tts)?;
         let permit = self
             .inference_limit
             .clone()
             .try_acquire_owned()
             .map_err(|_| EngineError::Busy)?;
+        let (_caller, worker) = self.tracker.begin(VoiceComponent::Tts);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let mut tts = tts.lock().map_err(|_| EngineError::State)?;
+            let _worker = worker;
+            let mut tts = tts.try_lock().ok_or(EngineError::Busy)?;
             let audio = tts
                 .create(&text, speaker_id, speed.clamp(0.5, 2.0))
                 .map_err(|_| EngineError::Inference)?;
+            drop(tts);
             Ok(SynthesizedAudio {
                 samples: audio.samples,
                 sample_rate: audio.sample_rate,
@@ -324,13 +529,16 @@ impl VoiceEngine for SherpaVoiceEngine {
             .vad
             .clone()
             .ok_or(EngineError::ModelUnavailable("VAD"))?;
+        self.tracker.reject_if_abandoned(VoiceComponent::Vad)?;
         let permit = self
             .inference_limit
             .clone()
             .try_acquire_owned()
             .map_err(|_| EngineError::Busy)?;
+        let (_caller, worker) = self.tracker.begin(VoiceComponent::Vad);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _worker = worker;
             detect_segments(&vad, &audio)
         })
         .await
@@ -355,6 +563,10 @@ impl VoiceEngine for SherpaVoiceEngine {
             vad_engine: self.vad.as_ref().map(|_| "silero-v5".to_string()),
             models_loaded,
         }
+    }
+
+    fn abandoned_inference(&self) -> AbandonedInference {
+        self.tracker.snapshot()
     }
 }
 
