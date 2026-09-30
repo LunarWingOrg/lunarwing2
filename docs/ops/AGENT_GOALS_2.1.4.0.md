@@ -26,7 +26,13 @@
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.2.0.md (candidates, weigh each)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1253
+4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268 - prior attempt rejected at !1253 (review P2 runbook init-agnosticism, P3 fence breakage); both findings addressed on this branch.
+    - Audit doc + operator runbook at `docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md` (prior attempt `aj/kimi-4-20260930-0601`, review findings fixed on `aj/kimi-4-20260930-1500`), pointer in `docs/architecture/ENGINE-V2.md` (moved outside the config bash fence per review P3).
+    - Source-verified overlay storage, all three gated writers, consumption gates, thread-lifetime caveat; every citation from the work item re-checked against the current tree.
+    - Read-only live audit of both registered tenants (antelope 2.1.3, hermes 2.0.4): `ORCHESTRATOR_SELF_MODIFY` unset in env and live process, zero stored overlay docs, zero injected thread snapshots. Both classified "absent". Tenants outside this host uninspected (documented as such).
+    - P2 fix: runbook live-verification section rewritten to go through `lunarwing-mt-admin.sh` with explicitly labeled systemd and OpenRC paths; probe-failure vs absent-flag/absent-overlay outcomes tabulated so an uninspected tenant is never classified clean.
+    - One test gap found and closed: `self_improvement_outcome_skips_prompt_additions_when_gate_off` in `ic/crates/lunarwing_engine/src/runtime/mission.rs`. cargo test + clippy -D warnings + fmt clean on the engine crate.
+    - No defect found; opt-in mechanism is not a bug (per item scope). Broader per-tenant prompt management stays in #220.
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1256
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1255
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/244 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1258
