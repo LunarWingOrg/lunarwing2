@@ -13,9 +13,13 @@
 edition = "2024"
 rust-version = "1.88"
 name = "html-to-markdown-rs"
-version = "3.11.6"
+version = "3.15.1"
 authors = ["Na'aman Hirschfeld <naaman@xberg.io>"]
 build = false
+exclude = [
+    "tests/commonmark_compliance_test.rs",
+    "tests/commonmark_spec_fixpoint.rs",
+]
 autolib = false
 autobins = false
 autoexamples = false
@@ -96,6 +100,7 @@ path = "examples/table.rs"
 [[example]]
 name = "test_deser"
 path = "examples/test_deser.rs"
+required-features = ["serde"]
 
 [[example]]
 name = "test_escape"
@@ -126,16 +131,36 @@ name = "test_whitespace"
 path = "examples/test_whitespace.rs"
 
 [[test]]
+name = "bare_lt_complexity"
+path = "tests/bare_lt_complexity.rs"
+
+[[test]]
+name = "base_url_resolution_test"
+path = "tests/base_url_resolution_test.rs"
+
+[[test]]
+name = "bogus_comments"
+path = "tests/bogus_comments.rs"
+
+[[test]]
 name = "br_in_inline_test"
 path = "tests/br_in_inline_test.rs"
+
+[[test]]
+name = "br_inside_code_spans"
+path = "tests/br_inside_code_spans.rs"
+
+[[test]]
+name = "br_inside_code_spans_context_folding_test"
+path = "tests/br_inside_code_spans_context_folding_test.rs"
 
 [[test]]
 name = "code_fence_widening_test"
 path = "tests/code_fence_widening_test.rs"
 
 [[test]]
-name = "commonmark_compliance_test"
-path = "tests/commonmark_compliance_test.rs"
+name = "commonmark_list_fixpoint_regressions_test"
+path = "tests/commonmark_list_fixpoint_regressions_test.rs"
 
 [[test]]
 name = "compact_tables_test"
@@ -146,12 +171,24 @@ name = "concurrency_test"
 path = "tests/concurrency_test.rs"
 
 [[test]]
+name = "corpus_fixpoint_sweep"
+path = "tests/corpus_fixpoint_sweep.rs"
+
+[[test]]
+name = "corpus_robustness"
+path = "tests/corpus_robustness.rs"
+
+[[test]]
 name = "deep_nesting_overflow"
 path = "tests/deep_nesting_overflow.rs"
 
 [[test]]
 name = "djot_output_test"
 path = "tests/djot_output_test.rs"
+
+[[test]]
+name = "empty_title_attribute"
+path = "tests/empty_title_attribute.rs"
 
 [[test]]
 name = "exclude_selectors_test"
@@ -168,6 +205,18 @@ path = "tests/hidden_element_nesting_test.rs"
 [[test]]
 name = "hidden_element_opaque_regions_test"
 path = "tests/hidden_element_opaque_regions_test.rs"
+
+[[test]]
+name = "hidden_elements_tag_open_state"
+path = "tests/hidden_elements_tag_open_state.rs"
+
+[[test]]
+name = "html5ever_repair_non_ascii_test"
+path = "tests/html5ever_repair_non_ascii_test.rs"
+
+[[test]]
+name = "inline_delimiter_and_whitespace_regressions"
+path = "tests/inline_delimiter_and_whitespace_regressions.rs"
 
 [[test]]
 name = "inline_image_options_forwarded_test"
@@ -318,12 +367,152 @@ name = "issue_464_br_run_hard_breaks"
 path = "tests/issue_464_br_run_hard_breaks.rs"
 
 [[test]]
+name = "issue_467_uppercase_void_tags"
+path = "tests/issue_467_uppercase_void_tags.rs"
+
+[[test]]
+name = "issue_468_regressions"
+path = "tests/issue_468_regressions.rs"
+
+[[test]]
+name = "issue_469_nested_table_br_in_tables_test"
+path = "tests/issue_469_nested_table_br_in_tables_test.rs"
+
+[[test]]
+name = "issue_470_layout_cell_paragraph_separator_test"
+path = "tests/issue_470_layout_cell_paragraph_separator_test.rs"
+
+[[test]]
+name = "issue_472_layout_row_bullets_test"
+path = "tests/issue_472_layout_row_bullets_test.rs"
+
+[[test]]
+name = "issue_474_nested_list_visitor"
+path = "tests/issue_474_nested_list_visitor.rs"
+
+[[test]]
+name = "issue_476_477_regressions"
+path = "tests/issue_476_477_regressions.rs"
+
+[[test]]
+name = "issue_481_483_regressions"
+path = "tests/issue_481_483_regressions.rs"
+
+[[test]]
+name = "issue_484_486_regressions"
+path = "tests/issue_484_486_regressions.rs"
+
+[[test]]
+name = "issue_485_regressions"
+path = "tests/issue_485_regressions.rs"
+
+[[test]]
+name = "issue_488_regressions"
+path = "tests/issue_488_regressions.rs"
+
+[[test]]
+name = "issue_489_regressions"
+path = "tests/issue_489_regressions.rs"
+
+[[test]]
+name = "issue_490_492_regressions"
+path = "tests/issue_490_492_regressions.rs"
+
+[[test]]
+name = "issue_491_whitespace_span_separator_test"
+path = "tests/issue_491_whitespace_span_separator_test.rs"
+
+[[test]]
+name = "issue_493_split_anchor_collapse_test"
+path = "tests/issue_493_split_anchor_collapse_test.rs"
+
+[[test]]
+name = "issue_494_attribute_entity_decoding"
+path = "tests/issue_494_attribute_entity_decoding.rs"
+
+[[test]]
+name = "issue_496_label_block_openers_test"
+path = "tests/issue_496_label_block_openers_test.rs"
+
+[[test]]
+name = "issue_497_label_boundary_hard_break_test"
+path = "tests/issue_497_label_boundary_hard_break_test.rs"
+
+[[test]]
+name = "issue_498_entity_ampersand_destination_test"
+path = "tests/issue_498_entity_ampersand_destination_test.rs"
+
+[[test]]
+name = "issue_499_unmatched_open_bracket_test"
+path = "tests/issue_499_unmatched_open_bracket_test.rs"
+
+[[test]]
+name = "issue_500_ragged_table_test"
+path = "tests/issue_500_ragged_table_test.rs"
+
+[[test]]
+name = "issue_501_line_start_whitespace_span_test"
+path = "tests/issue_501_line_start_whitespace_span_test.rs"
+
+[[test]]
+name = "issue_502_whitespace_only_wrapper_body_test"
+path = "tests/issue_502_whitespace_only_wrapper_body_test.rs"
+
+[[test]]
+name = "issue_503_anchor_wrapped_table_in_layout_cell_test"
+path = "tests/issue_503_anchor_wrapped_table_in_layout_cell_test.rs"
+
+[[test]]
+name = "issue_504_nested_whitespace_only_wrapper_test"
+path = "tests/issue_504_nested_whitespace_only_wrapper_test.rs"
+
+[[test]]
+name = "issue_504_nested_wrapper_line_start_test"
+path = "tests/issue_504_nested_wrapper_line_start_test.rs"
+
+[[test]]
+name = "issue_505_doubly_nested_inline_newline_test"
+path = "tests/issue_505_doubly_nested_inline_newline_test.rs"
+
+[[test]]
+name = "issue_505_nested_newline_span_separator_test"
+path = "tests/issue_505_nested_newline_span_separator_test.rs"
+
+[[test]]
 name = "json_ld_script_extraction"
 path = "tests/json_ld_script_extraction.rs"
 
 [[test]]
+name = "lazy_image_src_test"
+path = "tests/lazy_image_src_test.rs"
+
+[[test]]
+name = "leading_block_whitespace_test"
+path = "tests/leading_block_whitespace_test.rs"
+
+[[test]]
+name = "list_item_block_child_indent_test"
+path = "tests/list_item_block_child_indent_test.rs"
+
+[[test]]
+name = "list_item_unclosed_block_sibling_test"
+path = "tests/list_item_unclosed_block_sibling_test.rs"
+
+[[test]]
+name = "list_marker_suffix_ambiguity_test"
+path = "tests/list_marker_suffix_ambiguity_test.rs"
+
+[[test]]
 name = "lists_test"
 path = "tests/lists_test.rs"
+
+[[test]]
+name = "manifest_consistency_test"
+path = "tests/manifest_consistency_test.rs"
+
+[[test]]
+name = "nested_content_regressions"
+path = "tests/nested_content_regressions.rs"
 
 [[test]]
 name = "nested_list_duplication"
@@ -362,6 +551,14 @@ name = "regression_380"
 path = "tests/regression_380.rs"
 
 [[test]]
+name = "roundtrip_fixpoint"
+path = "tests/roundtrip_fixpoint.rs"
+
+[[test]]
+name = "roundtrip_fixpoint_bucket_b_test"
+path = "tests/roundtrip_fixpoint_bucket_b_test.rs"
+
+[[test]]
 name = "script_raw_text_content_loss_test"
 path = "tests/script_raw_text_content_loss_test.rs"
 
@@ -376,6 +573,10 @@ path = "tests/skip_images_test.rs"
 [[test]]
 name = "table_cell_metadata_duplication_test"
 path = "tests/table_cell_metadata_duplication_test.rs"
+
+[[test]]
+name = "table_foster_parenting_test"
+path = "tests/table_foster_parenting_test.rs"
 
 [[test]]
 name = "table_prepass_observability_test"
@@ -426,8 +627,32 @@ name = "test_spa_bisect"
 path = "tests/test_spa_bisect.rs"
 
 [[test]]
+name = "text_node_block_whitespace_fixpoint_test"
+path = "tests/text_node_block_whitespace_fixpoint_test.rs"
+
+[[test]]
+name = "tier1_address_block_separator_test"
+path = "tests/tier1_address_block_separator_test.rs"
+
+[[test]]
 name = "tier1_alt_entity_test"
 path = "tests/tier1_alt_entity_test.rs"
+
+[[test]]
+name = "tier1_autolink_test"
+path = "tests/tier1_autolink_test.rs"
+
+[[test]]
+name = "tier1_bail_display_test"
+path = "tests/tier1_bail_display_test.rs"
+
+[[test]]
+name = "tier1_bail_emphasis_test"
+path = "tests/tier1_bail_emphasis_test.rs"
+
+[[test]]
+name = "tier1_bail_inline_families_test"
+path = "tests/tier1_bail_inline_families_test.rs"
 
 [[test]]
 name = "tier1_bail_test"
@@ -436,6 +661,10 @@ path = "tests/tier1_bail_test.rs"
 [[test]]
 name = "tier1_bail_variants_test"
 path = "tests/tier1_bail_variants_test.rs"
+
+[[test]]
+name = "tier1_blockquote_trailing_separator_test"
+path = "tests/tier1_blockquote_trailing_separator_test.rs"
 
 [[test]]
 name = "tier1_byte_equality_test"
@@ -454,6 +683,18 @@ name = "tier1_figcaption_test"
 path = "tests/tier1_figcaption_test.rs"
 
 [[test]]
+name = "tier1_heading_wrap_buffer_test"
+path = "tests/tier1_heading_wrap_buffer_test.rs"
+
+[[test]]
+name = "tier1_image_lazy_load_bail_test"
+path = "tests/tier1_image_lazy_load_bail_test.rs"
+
+[[test]]
+name = "tier1_inline_boundary_whitespace_test"
+path = "tests/tier1_inline_boundary_whitespace_test.rs"
+
+[[test]]
 name = "tier1_inter_tag_whitespace_test"
 path = "tests/tier1_inter_tag_whitespace_test.rs"
 
@@ -468,6 +709,14 @@ path = "tests/tier1_keep_inline_images_test.rs"
 [[test]]
 name = "tier1_layout_parity_test"
 path = "tests/tier1_layout_parity_test.rs"
+
+[[test]]
+name = "tier1_leading_inline_whitespace_test"
+path = "tests/tier1_leading_inline_whitespace_test.rs"
+
+[[test]]
+name = "tier1_list_item_block_child_bail_test"
+path = "tests/tier1_list_item_block_child_bail_test.rs"
 
 [[test]]
 name = "tier1_list_nested_ordered_bail_test"
@@ -522,6 +771,10 @@ name = "tier1_summary_test"
 path = "tests/tier1_summary_test.rs"
 
 [[test]]
+name = "tier1_table_foster_parenting_test"
+path = "tests/tier1_table_foster_parenting_test.rs"
+
+[[test]]
 name = "tier1_tables_test"
 path = "tests/tier1_tables_test.rs"
 
@@ -532,6 +785,14 @@ path = "tests/tier1_tags_test.rs"
 [[test]]
 name = "tier1_text_chomp_test"
 path = "tests/tier1_text_chomp_test.rs"
+
+[[test]]
+name = "tier_parity_corpus"
+path = "tests/tier_parity_corpus.rs"
+
+[[test]]
+name = "uppercase_attribute_names_test"
+path = "tests/uppercase_attribute_names_test.rs"
 
 [[test]]
 name = "utf8_dedent_regression_test"
@@ -579,7 +840,7 @@ version = "2"
 version = "0.2.15"
 
 [dependencies.html5ever]
-version = "0.39.0"
+version = "0.40.1"
 
 [dependencies.image]
 version = "0.25"
@@ -607,7 +868,7 @@ features = ["macros"]
 version = "1.13"
 
 [dependencies.rmcp]
-version = "3.1.4"
+version = "3.4.1"
 features = [
     "server",
     "macros",
@@ -634,7 +895,7 @@ optional = true
 version = "2.0"
 
 [dependencies.tl]
-version = "0.7.11"
+version = "0.8.0"
 package = "astral-tl"
 
 [dependencies.tokio]
@@ -664,12 +925,22 @@ default-features = false
 [dependencies.tracing]
 version = "0.1"
 
+[dependencies.url]
+version = "2.5"
+
+[dev-dependencies.comrak]
+version = "0.55.0"
+default-features = false
+
 [dev-dependencies.serde]
 version = "1.0"
 features = ["derive"]
 
 [dev-dependencies.serde_json]
 version = "1.0"
+
+[dev-dependencies.toml]
+version = "1.1"
 
 [lints.clippy]
 dbg_macro = "deny"

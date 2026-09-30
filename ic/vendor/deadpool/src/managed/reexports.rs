@@ -15,8 +15,8 @@
 //! ```
 
 pub use crate::{
-    managed::{Metrics, ObjectId, PoolConfig, Status, TimeoutType, Timeouts},
     Runtime,
+    managed::{Metrics, ObjectId, PoolConfig, Status, TimeoutType, Timeouts},
 };
 
 /// This macro creates all the type aliases usually reexported by
@@ -54,5 +54,7 @@ macro_rules! managed_reexports {
         #[doc=concat!("Type alias for using [`deadpool::managed::HookError`] with [`", $crate_name, "`].")]
         pub type HookError = deadpool::managed::HookError<$Error>;
 
+        #[doc=concat!("Type alias for using [`deadpool::managed::QueueMode`] with [`", $crate_name, "`].")]
+        pub type QueueMode = deadpool::managed::QueueMode;
     };
 }

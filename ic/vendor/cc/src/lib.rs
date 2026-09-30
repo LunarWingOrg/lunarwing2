@@ -238,7 +238,7 @@
 #![doc(html_root_url = "https://docs.rs/cc/1.0")]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display};
@@ -246,7 +246,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use shlex::Shlex;
 
@@ -366,8 +367,10 @@ struct BuildCache {
     apple_sdk_root_cache: RwLock<HashMap<Box<str>, Arc<OsStr>>>,
     apple_versions_cache: RwLock<HashMap<Box<str>, Arc<str>>>,
     cached_compiler_family: RwLock<CompilerFamilyLookupCache>,
+    emitted_cpp_link_stdlibs: Mutex<HashSet<Box<str>>>,
     known_flag_support_status_cache: RwLock<HashMap<CompilerFlag, bool>>,
     target_info_parser: target::TargetInfoParser,
+    warned_about_msvc_linker_flags: AtomicBool,
 }
 
 /// A builder for compilation of a native library.
@@ -866,6 +869,12 @@ impl Build {
     /// 2. Else if the `CXXSTDLIB` environment variable is set, use its value.
     /// 3. Else the default is `c++` for OS X and BSDs, `c++_shared` for Android,
     ///    `None` for MSVC and `stdc++` for anything else.
+    ///
+    /// On MSVC this also passes `-Tp` immediately before each `.cc` source file
+    /// to ensure that they are compiled as C++ rather than assumed to be
+    /// object files. The per-file form is used instead of `/TP`, which would
+    /// compile every following input as C++. clang-cl recognizes `.cc` itself
+    /// and is not passed `-Tp`.
     pub fn cpp(&mut self, cpp: bool) -> &mut Build {
         self.cpp = cpp;
         self
@@ -1053,6 +1062,24 @@ impl Build {
     /// Provide value of `true` if linking against system library is not desired
     ///
     /// Note that for `wasm32` target C++ stdlib will always be linked statically
+    ///
+    /// The C++ stdlib is emitted as `cargo:rustc-link-lib=static:-bundle=<stdlib>`,
+    /// so the linker of the final binary finds it in the toolchain's search paths
+    /// instead of rustc bundling it into the rlib. On `wasm32` and `pauthtest`
+    /// targets, where cc may also link the C++ stdlib through `cargo:rustc-flags`,
+    /// and on Apple targets, where the linker would pick the dynamic library over
+    /// an unbundled static one, it is emitted as `static=<stdlib>`. A stdlib value
+    /// that already names a link kind, such as `CXXSTDLIB=static:-bundle=stdc++`,
+    /// is emitted unchanged.
+    ///
+    /// rustc rejects a library that is passed twice when either mention has link
+    /// modifiers ("overriding linking modifiers from command line is not
+    /// supported"). The C++ stdlib is therefore emitted only once per `Build`,
+    /// shared with its clones, however many times it is compiled. A build script
+    /// that links the same C++ stdlib from two separate `Build`s with this option,
+    /// or links it both statically and dynamically, fails to build. Compile such
+    /// libraries with one `Build` or its clones, or set
+    /// [`cpp_link_stdlib(None)`](Build::cpp_link_stdlib) on all but one of them.
     ///
     /// # Example
     ///
@@ -1445,6 +1472,19 @@ impl Build {
     }
 }
 
+/// Source, object, and working directory for an `is_flag_supported` probe.
+///
+/// Tempfiles, when used, are removed when this value is dropped.
+struct FlagSupportProbeFiles<'a> {
+    dir: Cow<'a, Path>,
+    src: PathBuf,
+    obj: PathBuf,
+    _temp_files: Option<(
+        crate::tempfile::NamedTempfile,
+        crate::tempfile::NamedTempfile,
+    )>,
+}
+
 /// Invoke or fetch the compiler or archiver.
 impl Build {
     /// Run the compiler to test if it accepts the given flag.
@@ -1466,23 +1506,79 @@ impl Build {
         )
     }
 
-    fn ensure_check_file(&self) -> Result<PathBuf, Error> {
-        let out_dir = self.get_out_dir()?;
-        let src = if self.cuda {
+    fn flag_check_src_name(&self) -> &'static str {
+        if self.cuda {
             assert!(self.cpp);
-            out_dir.join("flag_check.cu")
+            "flag_check.cu"
         } else if self.cpp {
-            out_dir.join("flag_check.cpp")
+            "flag_check.cpp"
         } else {
-            out_dir.join("flag_check.c")
-        };
+            "flag_check.c"
+        }
+    }
+
+    fn write_flag_check_src(file: &mut fs::File) -> io::Result<()> {
+        write!(file, "int main(void) {{ return 0; }}")?;
+        file.flush()?;
+        file.sync_data()
+    }
+
+    fn ensure_check_file(&self) -> Result<PathBuf, Error> {
+        let src = self.get_out_dir()?.join(self.flag_check_src_name());
 
         if !src.exists() {
             let mut f = fs::File::create(&src)?;
-            write!(f, "int main(void) {{ return 0; }}")?;
+            Self::write_flag_check_src(&mut f)?;
         }
 
         Ok(src)
+    }
+
+    /// Directory, source, and object for a flag-support probe.
+    ///
+    /// Cargo build scripts have `OUT_DIR`; reuse `flag_check.c` there so
+    /// probes stay cheap. Callers such as rustc bootstrap do not, and
+    /// treating a missing dir as "unsupported" silently drops flags.
+    /// Fall back to unique tempfiles instead of a shared name in `/tmp`.
+    fn flag_support_probe_files(&self) -> Result<FlagSupportProbeFiles<'_>, Error> {
+        match self.get_out_dir() {
+            Ok(dir) => {
+                let src = self.ensure_check_file()?;
+                let obj = dir.join("flag_check");
+                Ok(FlagSupportProbeFiles {
+                    dir,
+                    src,
+                    obj,
+                    _temp_files: None,
+                })
+            }
+            Err(_) => {
+                let dir = env::temp_dir();
+                fs::create_dir_all(&dir)?;
+
+                let mut tmp_src =
+                    crate::tempfile::NamedTempfile::new(&dir, self.flag_check_src_name())?;
+                let mut tmp_file = tmp_src.take_file().unwrap();
+                Self::write_flag_check_src(&mut tmp_file)?;
+                // Close the handle before invoking the compiler; Windows
+                // cannot open a file that another handle still holds.
+                drop(tmp_file);
+
+                let mut tmp_obj = crate::tempfile::NamedTempfile::new(&dir, "flag_check")?;
+                // Same as the source file: the compiler must be able to
+                // overwrite this path, so drop the open handle first.
+                drop(tmp_obj.take_file());
+
+                let src = tmp_src.path().to_owned();
+                let obj = tmp_obj.path().to_owned();
+                Ok(FlagSupportProbeFiles {
+                    dir: Cow::Owned(dir),
+                    src,
+                    obj,
+                    _temp_files: Some((tmp_src, tmp_obj)),
+                })
+            }
+        }
     }
 
     fn is_flag_supported_inner(
@@ -1507,9 +1603,13 @@ impl Build {
             return Ok(is_supported);
         }
 
-        let out_dir = self.get_out_dir()?;
-        let src = self.ensure_check_file()?;
-        let obj = out_dir.join("flag_check");
+        // The probe build drops `/link` in `try_get_compiler`, so it would
+        // compile fine and wrongly report `/link` as supported.
+        if tool.is_like_msvc() && is_msvc_link_flag(flag) {
+            return Ok(false);
+        }
+
+        let probe = self.flag_support_probe_files()?;
 
         let mut compiler = {
             let mut cfg = Build::new();
@@ -1520,9 +1620,17 @@ impl Build {
                 .debug(false)
                 .cpp(self.cpp)
                 .cuda(self.cuda)
+                .out_dir(&*probe.dir)
                 .inherit_rustflags(false)
                 .inherit_trim_paths(false)
                 .emit_rerun_if_env_changed(self.emit_rerun_if_env_changed);
+            // The probe has to see the environment the compiler is invoked in,
+            // or it answers a question about a different compiler than the one
+            // being built with: a bare compiler name resolves through this
+            // `PATH`, not the ambient one. Also share the caches, so that a
+            // compiler family already worked out is not worked out again.
+            cfg.env.clone_from(&self.env);
+            cfg.build_cache = Arc::clone(&self.build_cache);
             if let Some(target) = &self.target {
                 cfg.target(target);
             }
@@ -1544,9 +1652,10 @@ impl Build {
         }
 
         let mut cmd = compiler.to_command();
+        cmd.set_flag_supported_env(&self.env);
         command_add_output_file(
             &mut cmd,
-            &obj,
+            &probe.obj,
             CmdAddOutputFileArgs {
                 cuda: self.cuda,
                 is_assembler_msvc: false,
@@ -1568,7 +1677,7 @@ impl Build {
             cmd.arg("--");
         }
 
-        cmd.arg(&src);
+        cmd.arg(&probe.src);
 
         if compiler.is_like_msvc() {
             // On MSVC we need to make sure the LIB directory is included
@@ -1581,7 +1690,11 @@ impl Build {
             }
         }
 
-        let output = cmd.current_dir(out_dir).output()?;
+        cmd.current_dir(&*probe.dir);
+        self.cargo_output
+            .print_debug(&format_args!("running: {cmd:?}"));
+        let output = cmd.output()?;
+        drop(probe);
         let is_supported = output.status.success() && output.stderr.is_empty();
 
         self.build_cache
@@ -1674,14 +1787,36 @@ impl Build {
         // Add specific C++ libraries, if enabled.
         if self.cpp {
             if let Some(stdlib) = self.get_cpp_link_stdlib()? {
-                if self.cpp_link_stdlib_static {
-                    self.cargo_output.print_metadata(&format_args!(
-                        "cargo:rustc-link-lib=static={}",
-                        stdlib.display()
-                    ));
+                let stdlib = stdlib.to_string_lossy();
+                // rustc rejects a library passed twice when either mention has
+                // link modifiers, so a value that may carry them is emitted once
+                // per `Build`. `wasm32` and `pauthtest` may link the C++ stdlib
+                // below as well, so they keep a plain `static=`. So does Apple:
+                // rustc passes no static hint there and ld64 prefers the dylib,
+                // so an unbundled stdlib would silently link dynamically.
+                let (link_lib, once) = if stdlib.contains('=') {
+                    (stdlib.into_owned(), true)
+                } else if !self.cpp_link_stdlib_static {
+                    (stdlib.into_owned(), false)
+                } else if target.arch == "wasm32"
+                    || target.abi == "pauthtest"
+                    || target.vendor == "apple"
+                {
+                    (format!("static={stdlib}"), false)
                 } else {
+                    (format!("static:-bundle={stdlib}"), true)
+                };
+                let emit = !once
+                    || (self.cargo_output.metadata
+                        && self
+                            .build_cache
+                            .emitted_cpp_link_stdlibs
+                            .lock()
+                            .unwrap()
+                            .insert(link_lib.as_str().into()));
+                if emit {
                     self.cargo_output
-                        .print_metadata(&format_args!("cargo:rustc-link-lib={}", stdlib.display()));
+                        .print_metadata(&format_args!("cargo:rustc-link-lib={link_lib}"));
                 }
             }
             // Link c++ lib from WASI sysroot
@@ -1737,6 +1872,10 @@ impl Build {
                 } else if cfg!(target_env = "msvc") {
                     libdir.push("lib");
                     match target.arch {
+                        "aarch64" => {
+                            libdir.push("arm64");
+                            libtst = true;
+                        }
                         "x86_64" => {
                             libdir.push("x64");
                             libtst = true;
@@ -1896,7 +2035,40 @@ impl Build {
             cmd.arg("--device-c");
         }
         if is_asm {
-            cmd.args(self.asm_flags.iter().map(std::ops::Deref::deref));
+            cmd.args(self.asm_flags.iter().map(core::ops::Deref::deref));
+        }
+
+        self.add_compile_source_arg(&mut cmd, &compiler, &obj.src, is_assembler_msvc);
+
+        if cfg!(target_os = "macos") {
+            self.fix_env_for_apple_os(&mut cmd)?;
+        }
+
+        Ok(cmd)
+    }
+
+    /// Append a source path to `cmd`, using MSVC's per-file `-Tp` for `.cc`
+    /// sources so they are not treated as objects.
+    ///
+    /// `-Tp` applies only to the immediately following file, unlike `/TP` which
+    /// would compile every subsequent input as C++ (including C sources).
+    /// clang-cl recognizes `.cc` and is not passed `-Tp` (it uses `--` instead).
+    fn add_compile_source_arg(
+        &self,
+        cmd: &mut Command,
+        compiler: &Tool,
+        src: &Path,
+        is_assembler_msvc: bool,
+    ) {
+        if self.cpp
+            && src.extension() == Some(OsStr::new("cc"))
+            && matches!(compiler.family, ToolFamily::Msvc { clang_cl: false })
+        {
+            // MSVC recognizes only `.c` / `.cpp` / `.cxx` as source. A `.cc`
+            // file (mimalloc 0.1.52 writes `OUT_DIR/mimalloc-static.cc`) is
+            // assumed to be an object unless `-Tp` forces C++ compilation
+            // (#1877).
+            cmd.arg("-Tp");
         }
 
         if compiler.supports_path_delimiter() && !is_assembler_msvc {
@@ -1906,13 +2078,7 @@ impl Build {
             // `-Wslash-u-filename` warning.
             cmd.arg("--");
         }
-        cmd.arg(&obj.src);
-
-        if cfg!(target_os = "macos") {
-            self.fix_env_for_apple_os(&mut cmd)?;
-        }
-
-        Ok(cmd)
+        cmd.arg(src);
     }
 
     /// This will return a result instead of panicking; see [`Self::expand()`] for
@@ -1930,21 +2096,30 @@ impl Build {
         let is_asm = self
             .files
             .iter()
-            .map(std::ops::Deref::deref)
+            .map(core::ops::Deref::deref)
             .find_map(AsmFileExt::from_path)
             .is_some();
 
-        if compiler.family == (ToolFamily::Msvc { clang_cl: true }) && !is_asm {
-            // #513: For `clang-cl`, separate flags/options from the input file.
-            // When cross-compiling macOS -> Windows, this avoids interpreting
-            // common `/Users/...` paths as the `/U` flag and triggering
-            // `-Wslash-u-filename` warning.
-            cmd.arg("--");
+        for src in self.files.iter().map(std::ops::Deref::deref) {
+            self.add_compile_source_arg(&mut cmd, &compiler, src, is_asm);
         }
 
-        cmd.args(self.files.iter().map(std::ops::Deref::deref));
+        // cl.exe echoes the name of the file it compiles on stderr. That is
+        // not a warning, so don't forward it as one (#896).
+        let echoed_file_name = if matches!(compiler.family, ToolFamily::Msvc { clang_cl: false }) {
+            self.files
+                .first()
+                .and_then(|src| src.file_name())
+                .and_then(OsStr::to_str)
+        } else {
+            None
+        };
 
-        run_output(&mut cmd, &self.cargo_output)
+        run_output_ignoring_line(
+            &mut cmd,
+            &self.cargo_output,
+            echoed_file_name.map(str::as_bytes),
+        )
     }
 
     /// Run the compiler, returning the macro-expanded version of the input files.
@@ -2089,10 +2264,17 @@ impl Build {
 
         // Set flags configured in the builder (do this second-to-last, to allow these to override
         // everything above).
-        for flag in self.flags.iter() {
+        let (flags, linker_flags) = split_off_msvc_linker_flags(cmd.family, &self.flags);
+        let mut ignored_flags: Vec<&OsStr> = linker_flags.iter().map(|f| &**f).collect();
+        for flag in flags {
             cmd.args.push((**flag).into());
         }
-        for flag in self.flags_supported.iter() {
+        // Like `self.flags` above, drop `/link` and the entries after it in
+        // this list without probing them.
+        let (flags_supported, linker_flags) =
+            split_off_msvc_linker_flags(cmd.family, &self.flags_supported);
+        ignored_flags.extend(linker_flags.iter().map(|f| &**f));
+        for flag in flags_supported {
             if self
                 .is_flag_supported_inner(flag, &cmd, &target)
                 .unwrap_or(false)
@@ -2110,9 +2292,24 @@ impl Build {
 
         // Set flags from the environment (do this last, to allow these to override everything else).
         if let Some(flags) = &envflags {
+            let (flags, linker_flags) = split_off_msvc_linker_flags(cmd.family, flags);
+            ignored_flags.extend(linker_flags.iter().map(OsStr::new));
             for arg in flags {
                 cmd.push_cc_arg(arg.into());
             }
+        }
+
+        if !ignored_flags.is_empty()
+            && !self
+                .build_cache
+                .warned_about_msvc_linker_flags
+                .swap(true, Ordering::Relaxed)
+        {
+            self.cargo_output.print_warning(&format_args!(
+                "Ignoring {ignored_flags:?}: cl passes `/link` and the arguments after it to the \
+                linker, but cc only compiles. Use `cargo:rustc-link-arg` for linker flags, and \
+                `/Zl` instead of `/link /NODEFAULTLIB`."
+            ));
         }
 
         // Set custom env vars that the user specified with `Build::env`.
@@ -2385,11 +2582,8 @@ impl Build {
                     // So instead, we pass the deployment target with `-m*-version-min=`, and only
                     // pass it here on visionOS and Mac Catalyst where that option does not exist:
                     // https://github.com/rust-lang/cc-rs/issues/1383
-                    let version = if target.os == "visionos" || target.env == "macabi" {
-                        Some(self.apple_deployment_target(target))
-                    } else {
-                        None
-                    };
+                    let version = (target.os == "visionos" || target.env == "macabi")
+                        .then(|| self.apple_deployment_target(target));
 
                     let clang_target =
                         target.llvm_target(&self.get_raw_target()?, version.as_deref());
@@ -2619,7 +2813,10 @@ impl Build {
                     // get the 32i/32imac/32imc/64gc/64imac/... part
                     let arch = &target.full_arch[5..];
                     if arch.starts_with("64") {
-                        if matches!(target.os, "linux" | "freebsd" | "netbsd" | "managarm") {
+                        if matches!(
+                            target.os,
+                            "linux" | "freebsd" | "netbsd" | "managarm" | "redox"
+                        ) {
                             cmd.args.push(("-march=rv64gc").into());
                             cmd.args.push("-mabi=lp64d".into());
                         } else {
@@ -2913,7 +3110,7 @@ impl Build {
         let mut objs = objs
             .iter()
             .map(|o| o.dst.as_path())
-            .chain(self.objects.iter().map(std::ops::Deref::deref))
+            .chain(self.objects.iter().map(core::ops::Deref::deref))
             .peekable();
         let mut batch = Vec::new();
         while objs.peek().is_some() {
@@ -3170,6 +3367,7 @@ impl Build {
         if let Some(c) = &self.compiler {
             return Ok(Tool::new(
                 (**c).to_owned(),
+                &self.env,
                 &self.build_cache.cached_compiler_family,
                 &self.cargo_output,
                 out_dir,
@@ -3217,6 +3415,7 @@ impl Build {
                 let mut t = Tool::with_args(
                     tool,
                     args.clone(),
+                    &self.env,
                     &self.build_cache.cached_compiler_family,
                     &self.cargo_output,
                     out_dir,
@@ -3244,6 +3443,7 @@ impl Build {
                     } else {
                         Some(Tool::new(
                             PathBuf::from(tool),
+                            &self.env,
                             &self.build_cache.cached_compiler_family,
                             &self.cargo_output,
                             out_dir,
@@ -3309,6 +3509,7 @@ impl Build {
 
                 let mut t = Tool::new(
                     compiler,
+                    &self.env,
                     &self.build_cache.cached_compiler_family,
                     &self.cargo_output,
                     out_dir,
@@ -3333,6 +3534,7 @@ impl Build {
                 nvcc,
                 vec![],
                 self.cuda,
+                &self.env,
                 &self.build_cache.cached_compiler_family,
                 &self.cargo_output,
                 out_dir,
@@ -3459,11 +3661,9 @@ impl Build {
         let wrapper_path = Path::new(&rustc_wrapper);
         let wrapper_stem = wrapper_path.file_stem()?;
 
-        if VALID_WRAPPERS.contains(&wrapper_stem.to_str()?) {
-            Some(Cow::Owned(rustc_wrapper))
-        } else {
-            None
-        }
+        VALID_WRAPPERS
+            .contains(&wrapper_stem.to_str()?)
+            .then_some(Cow::Owned(rustc_wrapper))
     }
 
     /// Returns compiler path, optional modifier name from whitelist, and arguments vec
@@ -3548,11 +3748,10 @@ impl Build {
             Some(s) => Ok(s.as_deref().map(Path::new).map(Cow::Borrowed)),
             None => {
                 if let Ok(stdlib) = self.getenv_with_target_prefixes("CXXSTDLIB") {
-                    if stdlib.is_empty() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(Cow::Owned(Path::new(&stdlib).to_owned())))
-                    }
+                    Ok((!stdlib.is_empty())
+                        .then_some(stdlib)
+                        .map(PathBuf::from)
+                        .map(Cow::from))
                 } else {
                     let target = self.get_target()?;
                     if target.env == "msvc" {
@@ -3720,7 +3919,13 @@ impl Build {
             None => {
                 if target.os == "android" {
                     name = format!("llvm-{tool}").into();
-                    match Command::new(&name).arg("--version").status() {
+                    // This probe decides which archiver the build uses, so it has
+                    // to run in the environment the build was configured with: a
+                    // bare name resolves through `Build::env`'s `PATH`, not the
+                    // ambient one.
+                    let mut probe = Command::new(&name);
+                    probe.arg("--version").set_ar_detection_env(&self.env);
+                    match probe.status() {
                         Ok(status) if status.success() => (),
                         _ => {
                             // FIXME: Use parsed target.
@@ -4374,7 +4579,7 @@ impl Build {
             )
             .ok()?;
 
-            Some(Arc::from(std::str::from_utf8(&version).ok()?.trim()))
+            Some(Arc::from(core::str::from_utf8(&version).ok()?.trim()))
         };
 
         let deployment_from_env = |name: &str| -> Option<Arc<str>> {
@@ -4539,7 +4744,7 @@ impl Build {
         .ok()?;
         // clang driver appears to be forcing UTF-8 output even on Windows,
         // hence from_utf8 is assumed to be usable in all cases.
-        let search_dirs = std::str::from_utf8(&search_dirs).ok()?;
+        let search_dirs = core::str::from_utf8(&search_dirs).ok()?;
         for dirs in search_dirs.split(['\r', '\n']) {
             if let Some(path) = dirs.strip_prefix("programs: =") {
                 return self.which(prog, Some(OsStr::new(path)));
@@ -4629,6 +4834,26 @@ impl Default for Build {
     fn default() -> Build {
         Build::new()
     }
+}
+
+/// `cl` and `clang-cl` pass `/link` and every argument after it to the linker.
+/// cc only compiles, and appends the source file after the flags, so such flags
+/// would never reach a linker and would hide the source file from the compiler
+/// (#1331). Splits `flags` into the flags before `/link` and the rest.
+fn split_off_msvc_linker_flags<T: AsRef<OsStr>>(family: ToolFamily, flags: &[T]) -> (&[T], &[T]) {
+    let start = match family {
+        ToolFamily::Msvc { .. } => flags
+            .iter()
+            .position(|flag| is_msvc_link_flag(flag.as_ref())),
+        ToolFamily::Gnu | ToolFamily::Clang { .. } => None,
+    };
+    flags.split_at(start.unwrap_or(flags.len()))
+}
+
+/// Whether `flag` is the `/link` option of `cl` and `clang-cl`. clang-cl also
+/// accepts a joined `-link<args>` form, which this does not detect.
+fn is_msvc_link_flag(flag: &OsStr) -> bool {
+    matches!(flag.to_str(), Some("/link" | "-link"))
 }
 
 fn fail(s: &str) -> ! {
@@ -4772,10 +4997,23 @@ impl AsmFileExt {
     }
 }
 
-fn check_exe(mut exe: PathBuf) -> Option<PathBuf> {
+fn check_exe(exe: PathBuf) -> Option<PathBuf> {
+    if exe.exists() {
+        return Some(exe);
+    }
     let exe_ext = std::env::consts::EXE_EXTENSION;
-    let check = exe.exists() || (!exe_ext.is_empty() && exe.set_extension(exe_ext) && exe.exists());
-    check.then_some(exe)
+    if exe_ext.is_empty() {
+        return None;
+    }
+    // TODO: Replace the code below with `exe.add_extension(exe_ext)` when MSRV supports it.
+    let _ = exe.file_name()?;
+    let with_ext = {
+        let mut buf = exe.into_os_string();
+        buf.push(".");
+        buf.push(exe_ext);
+        PathBuf::from(buf)
+    };
+    with_ext.exists().then_some(with_ext)
 }
 
 #[cfg(test)]

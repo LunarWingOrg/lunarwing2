@@ -14,7 +14,7 @@ use crate::converter::Context;
 use crate::converter::dom_context::DomContext;
 use crate::converter::inline::link::append_markdown_link;
 use crate::converter::main_helpers::tag_name_eq;
-use crate::converter::utility::content::escape_link_label;
+use crate::converter::utility::escaping::escape_link_label;
 use crate::converter::utility::preprocessing::sanitize_markdown_url;
 use crate::options::ConversionOptions;
 
@@ -42,10 +42,7 @@ fn append_media_src_link(output: &mut String, src: &str, options: &ConversionOpt
 
 /// Extract src attribute from media element (audio, video, iframe).
 pub fn extract_media_src<'a>(tag: &'a HTMLTag<'a>) -> Cow<'a, str> {
-    tag.attributes()
-        .get("src")
-        .flatten()
-        .map_or_else(|| Cow::Borrowed(""), |v| v.as_utf8_str())
+    crate::converter::utility::attributes::decoded_attribute(tag, "src").unwrap_or(Cow::Borrowed(""))
 }
 
 /// Try to find source src from nested source element.
@@ -59,7 +56,7 @@ where
     for child_handle in children {
         if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
             if tag_name_eq(child_tag.name().as_utf8_str(), "source") {
-                return child_tag.attributes().get("src").flatten().map(|v| v.as_utf8_str());
+                return crate::converter::utility::attributes::decoded_attribute(child_tag, "src");
             }
         }
     }
@@ -101,7 +98,8 @@ pub fn handle_audio(
     } else {
         extract_media_src(tag)
     };
-    let src = sanitize_markdown_url(&raw_src).into_owned();
+    let base_resolved_src = ctx.resolve_url(&raw_src);
+    let src = sanitize_markdown_url(base_resolved_src.as_deref().unwrap_or(&raw_src)).into_owned();
     let src_opt: Option<&str> = if src.is_empty() { None } else { Some(src.as_str()) };
 
     #[cfg(feature = "visitor")]
@@ -198,7 +196,8 @@ pub fn handle_video(
     } else {
         extract_media_src(tag)
     };
-    let src = sanitize_markdown_url(&raw_src).into_owned();
+    let base_resolved_src = ctx.resolve_url(&raw_src);
+    let src = sanitize_markdown_url(base_resolved_src.as_deref().unwrap_or(&raw_src)).into_owned();
     let src_opt: Option<&str> = if src.is_empty() { None } else { Some(src.as_str()) };
 
     #[cfg(feature = "visitor")]
@@ -312,12 +311,9 @@ pub fn handle_iframe(
     dom_ctx: &DomContext,
     parser: &Parser,
 ) {
-    let raw_src = tag
-        .attributes()
-        .get("src")
-        .flatten()
-        .map_or(Cow::Borrowed(""), |v| v.as_utf8_str());
-    let src = sanitize_markdown_url(&raw_src).into_owned();
+    let raw_src = crate::converter::utility::attributes::decoded_attribute(tag, "src").unwrap_or(Cow::Borrowed(""));
+    let base_resolved_src = ctx.resolve_url(&raw_src);
+    let src = sanitize_markdown_url(base_resolved_src.as_deref().unwrap_or(&raw_src)).into_owned();
     let src_opt: Option<&str> = if src.is_empty() { None } else { Some(src.as_str()) };
 
     #[cfg(feature = "visitor")]

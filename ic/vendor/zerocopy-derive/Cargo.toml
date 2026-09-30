@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "zerocopy-derive"
-version = "0.8.56"
+version = "0.8.59"
 build = false
 exclude = [
     ".*",
@@ -33,6 +33,10 @@ repository = "https://github.com/google/zerocopy"
 name = "zerocopy_derive"
 path = "src/lib.rs"
 proc-macro = true
+
+[[test]]
+name = "clippy"
+path = "tests/clippy.rs"
 
 [[test]]
 name = "deprecated"
@@ -79,6 +83,10 @@ name = "include"
 path = "tests/include.rs"
 
 [[test]]
+name = "invariant"
+path = "tests/invariant.rs"
+
+[[test]]
 name = "issue_2117"
 path = "tests/issue_2117.rs"
 
@@ -105,6 +113,22 @@ path = "tests/paths_and_modules.rs"
 [[test]]
 name = "priv_in_pub"
 path = "tests/priv_in_pub.rs"
+
+[[test]]
+name = "project"
+path = "tests/project.rs"
+
+[[test]]
+name = "project_enum"
+path = "tests/project_enum.rs"
+
+[[test]]
+name = "project_struct"
+path = "tests/project_struct.rs"
+
+[[test]]
+name = "raw_identifiers"
+path = "tests/raw_identifiers.rs"
 
 [[test]]
 name = "struct_from_bytes"
@@ -201,6 +225,9 @@ level = "warn"
 priority = 0
 check-cfg = [
     "cfg(__ZEROCOPY_INTERNAL_USE_ONLY_NIGHTLY_FEATURES_IN_TESTS)",
+    'cfg(__ZEROCOPY_INTERNAL_USE_ONLY_TOOLCHAIN, values("msrv", "stable", "nightly"))',
+    "cfg(coverage_nightly)",
     "cfg(zerocopy_derive_union_into_bytes)",
     "cfg(zerocopy_unstable_linux)",
+    "cfg(zerocopy_unstable_ptr)",
 ]

@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.88"
 name = "hickory-proto"
-version = "0.26.1"
+version = "0.26.3"
 authors = ["The contributors to Hickory DNS"]
 build = false
 autolib = false
@@ -155,7 +155,7 @@ features = [
 default-features = false
 
 [dependencies.ipnet]
-version = "2.3.0"
+version = "2.11.0"
 default-features = false
 
 [dependencies.js-sys]
@@ -168,7 +168,7 @@ features = ["critical-section"]
 default-features = false
 
 [dependencies.prefix-trie]
-version = "0.8"
+version = "0.8.4"
 optional = true
 
 [dependencies.rand]
@@ -214,7 +214,7 @@ version = "2.5.4"
 default-features = false
 
 [dependencies.wasm-bindgen-crate]
-version = "0.2.58"
+version = "0.2.107"
 optional = true
 package = "wasm-bindgen"
 

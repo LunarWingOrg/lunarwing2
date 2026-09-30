@@ -37,6 +37,17 @@ pub type ImageMetadataPayload = (BTreeMap<String, String>, Option<u32>, Option<u
 pub struct Context {
     /// Are we inside a code-like element (pre, code, kbd, samp)?
     pub(crate) in_code: bool,
+    /// Are we inside a `<pre>` code BLOCK specifically, as opposed to an inline code SPAN
+    /// (`<code>`/`<kbd>`/`<samp>` outside a `<pre>`)?
+    ///
+    /// Set only by `handle_pre` (`handlers/code_block.rs`); `handle_code` and
+    /// `inline::code::handle` never set it themselves, so it propagates unchanged through
+    /// their `..ctx.clone()` spread into any code nested inside a `<pre>`. `line_break.rs`
+    /// needs this distinction that `in_code` alone cannot make: a `<br>` inside a code
+    /// BLOCK keeps its literal `\n` (real content structure), while a `<br>` inside a code
+    /// SPAN must split the span in two rather than embed a newline inside the backticks
+    /// (issue #487). ~keep
+    pub(crate) in_code_block: bool,
     /// Current list item counter for ordered lists.
     ///
     /// Signed so a negative `start` attribute (permitted by the HTML spec and honored by
@@ -48,6 +59,15 @@ pub struct Context {
     pub(crate) blockquote_depth: usize,
     /// Are we inside a table cell (td/th)?
     pub(crate) in_table_cell: bool,
+    /// Are we inside a *layout*-table cell, whose row renders as a list item rather than a
+    /// pipe row?
+    ///
+    /// Such a cell converts as inline, so neither the ordinary block separator nor the
+    /// `in_table_cell` continuation rule applied and adjacent `<p>`/`<div>` children abutted
+    /// (issue #470). This flag routes only the sibling-boundary decision through
+    /// `emit_table_cell_break`; it deliberately does not enable `in_table_cell`'s pipe and
+    /// emphasis escaping, which a list item does not need.
+    pub(crate) in_layout_cell: bool,
     /// Should we convert block elements as inline?
     pub(crate) convert_as_inline: bool,
     /// Depth of inline formatting elements (strong/emphasis/span/etc).
@@ -80,12 +100,50 @@ pub struct Context {
     /// Whether inline images should remain markdown inside the current
     /// layout-table cell (its tag name is in `keep_inline_images_in`).
     pub(crate) cell_allow_inline_images: bool,
+    /// Whether inline images should remain markdown inside the current `<a>` link label
+    /// ("a" is in `keep_inline_images_in`). Set once per `handle_link` call and carried
+    /// unchanged into both the block-label and inline-label branches, so the option means
+    /// the same thing whether or not the anchor happens to contain a block child (#492).
+    pub(crate) link_allow_inline_images: bool,
     /// Are we inside a paragraph element?
     pub(crate) in_paragraph: bool,
     /// Output buffer position where the current block's content starts.
     /// Used to distinguish paragraph-break newlines from a previous block
     /// vs. newlines generated within the current block.
     pub(crate) block_content_start: usize,
+    /// Address of the `output` buffer `block_content_start` was measured against (set
+    /// alongside it in `block/paragraph.rs`), as `*const String as usize`.
+    ///
+    /// `block_content_start` alone cannot tell "this text node's `output` is the SAME
+    /// buffer the paragraph started measuring" from "it coincidentally has the same
+    /// length" -- an inline wrapper (`em`/`strong`/link) builds its content into a
+    /// *different, fresh local `String`* before splicing it into the real output, and that
+    /// scratch buffer's length can coincidentally equal the ANCESTOR paragraph's
+    /// `block_content_start` even when real content already precedes this point in the
+    /// actual document (issue #481: `<p>A<i> </i>B</p>` saw the space inside `<i>`'s own
+    /// empty scratch buffer misidentified as the paragraph's own leading whitespace and
+    /// dropped). A raw address comparison, unlike `ctx.inline_depth == 0`, correctly
+    /// still fires when a block-level tag-soup wrapper (e.g. a stray `<b>` wrapping whole
+    /// paragraphs, as Google Docs exports) puts a genuine, buffer-sharing paragraph body
+    /// at non-zero `inline_depth`.
+    pub(crate) block_output_ptr: usize,
+    /// Shared flag: true until the first non-whitespace text content is emitted.
+    ///
+    /// ~keep `block_content_start` cannot answer "is this text node at the very start of a
+    /// ~keep fresh block" on its own: it is a byte offset compared against `output.len()`,
+    /// ~keep but every inline wrapper (`sub`/`sup`/`em`/`strong`/links/...) builds its content
+    /// ~keep into a *fresh local `String`* before splicing it into the real output, so that
+    /// ~keep comparison sees an empty scratch buffer (len 0) that can coincidentally equal a
+    /// ~keep real block start of 0 -- indistinguishable from genuine document start. This
+    /// ~keep flag is `Rc<Cell<bool>>` instead so every clone of `Context` -- scratch-buffer
+    /// ~keep handlers included -- observes one shared, buffer-independent truth about
+    /// ~keep whether real content already precedes this point in the actual document.
+    /// ~keep Currently reset to `true` only at document start (`Context::new`); nothing
+    /// ~keep flips it back to `true` mid-document, so it only ever fires exactly once, but
+    /// ~keep the mechanism is ready for additional reset points (e.g. per-block handlers) to
+    /// ~keep extend the same "insignificant leading whitespace" treatment to fresh blocks
+    /// ~keep beyond the very first one, without changing how consumers read it.
+    pub(crate) at_fresh_block_start: Rc<Cell<bool>>,
     /// Are we inside a ruby element?
     pub(crate) in_ruby: bool,
     /// Are we inside a `<strong>` / `<b>` element?
@@ -153,6 +211,11 @@ pub struct Context {
     /// Set together with `skip_visitor_hooks` when constructing `prepass_ctx`
     /// in `block::table::builder::handle_table`. Resolves issue #406.
     pub(crate) measure_width_only: bool,
+    /// Effective base URL for resolving relative `href`/`src` destinations, already
+    /// combined with any document `<base href>` (see `converter::url_resolve`).
+    /// `None` when `options.base_url` is unset -- every resolution call becomes a
+    /// no-op then, so output is byte-identical to before this option existed.
+    pub(crate) base_url: Option<Rc<url::Url>>,
 }
 
 impl Context {
@@ -178,6 +241,7 @@ impl Context {
         #[cfg(not(feature = "visitor"))] _visitor: Option<()>,
         structure_collector: Option<StructureCollectorHandle>,
         reference_collector: Option<ReferenceCollectorHandle>,
+        base_url: Option<Rc<url::Url>>,
     ) -> Self {
         #[cfg(feature = "metadata")]
         let (
@@ -201,10 +265,12 @@ impl Context {
 
         Self {
             in_code: false,
+            in_code_block: false,
             list_counter: 0,
             in_ordered_list: false,
             blockquote_depth: 0,
             in_table_cell: false,
+            in_layout_cell: false,
             convert_as_inline: options.convert_as_inline,
             inline_depth: 0,
             in_list_item: false,
@@ -217,8 +283,11 @@ impl Context {
             in_heading: false,
             heading_allow_inline_images: false,
             cell_allow_inline_images: false,
+            link_allow_inline_images: false,
             in_paragraph: false,
             block_content_start: 0,
+            block_output_ptr: 0,
+            at_fresh_block_start: Rc::new(Cell::new(true)),
             in_ruby: false,
             in_strong: false,
             in_link: false,
@@ -249,6 +318,16 @@ impl Context {
             reference_collector,
             skip_visitor_hooks: false,
             measure_width_only: false,
+            base_url,
         }
+    }
+
+    /// Resolve a `href`/`src` attribute value against [`Self::base_url`].
+    ///
+    /// Returns `None` (meaning: use the original text unchanged) whenever `base_url`
+    /// is unset, `value` is empty, already absolute, or fails to resolve. See
+    /// `converter::url_resolve::resolve_attribute_url` for the full contract.
+    pub(crate) fn resolve_url(&self, value: &str) -> Option<String> {
+        crate::converter::url_resolve::resolve_attribute_url(self.base_url.as_deref()?, value)
     }
 }

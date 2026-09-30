@@ -6,6 +6,91 @@
 use std::borrow::Cow;
 use std::str;
 
+/// If `idx` starts an `<svg`/`</svg` tag, adjust `svg_depth` accordingly and return the index
+/// just past the tag. Returns `None` when `idx` does not start an svg tag (or the tag is
+/// unterminated), in which case the caller's scan is unaffected.
+///
+/// Extracted from `strip_script_and_style_tags` — identical `<svg`/`</svg` detection and depth
+/// bookkeeping, unchanged.
+fn track_svg_tag(bytes: &[u8], idx: usize, svg_depth: &mut usize) -> Option<usize> {
+    if matches_tag_start(bytes, idx + 1, b"svg") {
+        if let Some(open_end) = find_tag_end(bytes, idx + 1 + b"svg".len()) {
+            *svg_depth += 1;
+            return Some(open_end);
+        }
+    } else if matches_end_tag_start(bytes, idx + 1, b"svg") {
+        if let Some(close_end) = find_tag_end(bytes, idx + 2 + b"svg".len()) {
+            if *svg_depth > 0 {
+                *svg_depth = svg_depth.saturating_sub(1);
+            }
+            return Some(close_end);
+        }
+    }
+    None
+}
+
+/// Strip a `<script>…</script>` or `<style>…</style>` element starting at `idx` (which must
+/// point at the `<`), appending everything before it to `*output` (lazily allocated) and
+/// inserting a single space if collapsing the removed span would otherwise fuse two
+/// non-whitespace characters together.
+///
+/// `open_tag_pattern` is the lowercase opening-tag prefix including `<` (e.g. `b"<script"`);
+/// `close_tag_name` is the bare lowercase tag name for the closing-tag scan (e.g. `b"script"`).
+/// `json_ld_exempt` additionally requires the opening tag not be a `type="application/ld+json"`
+/// script — only meaningful for the script element, so callers stripping `<style>` pass `false`.
+///
+/// Returns `Some(new_pos)` when the element was stripped — the caller should set both `last`
+/// and `idx` to it and `continue` the scan — or `None` when `idx` does not start a strippable
+/// element of this kind, in which case the caller falls through unchanged.
+///
+/// Extracted from `strip_script_and_style_tags` — identical prefix/whitespace-boundary/
+/// closing-tag-scan logic, unchanged.
+fn strip_raw_text_element(
+    input: &str,
+    bytes: &[u8],
+    idx: usize,
+    len: usize,
+    last: usize,
+    output: &mut Option<String>,
+    open_tag_pattern: &[u8],
+    close_tag_name: &[u8],
+    json_ld_exempt: bool,
+) -> Option<usize> {
+    let prefix_len = open_tag_pattern.len();
+    if idx + prefix_len >= len || !eq_ascii_insensitive(&bytes[idx..idx + prefix_len], open_tag_pattern) {
+        return None;
+    }
+    let after_tag = bytes[idx + prefix_len];
+    if !(after_tag == b'>' || after_tag == b' ' || after_tag == b'\t' || after_tag == b'\n' || after_tag == b'\r') {
+        return None;
+    }
+
+    let mut tag_end = idx + prefix_len;
+    while tag_end < len && bytes[tag_end] != b'>' {
+        tag_end += 1;
+    }
+    if tag_end >= len {
+        return None;
+    }
+    tag_end += 1;
+
+    if json_ld_exempt {
+        let tag_content = &input[idx..tag_end];
+        if is_json_ld_script_open_tag(tag_content) {
+            return None;
+        }
+    }
+
+    let close_idx = find_closing_tag_bytes(bytes, tag_end, close_tag_name)?;
+
+    let out = output.get_or_insert_with(|| String::with_capacity(len));
+    out.push_str(&input[last..idx]);
+    if idx > 0 && close_idx < len && !bytes[idx - 1].is_ascii_whitespace() && !bytes[close_idx].is_ascii_whitespace() {
+        out.push(' ');
+    }
+    Some(close_idx)
+}
+
 /// Strip script and style tags and their content from HTML.
 pub fn strip_script_and_style_tags(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
@@ -26,20 +111,9 @@ pub fn strip_script_and_style_tags(input: &str) -> Cow<'_, str> {
 
     while idx < len {
         if bytes[idx] == b'<' && idx + 1 < len {
-            if matches_tag_start(bytes, idx + 1, b"svg") {
-                if let Some(open_end) = find_tag_end(bytes, idx + 1 + b"svg".len()) {
-                    svg_depth += 1;
-                    idx = open_end;
-                    continue;
-                }
-            } else if matches_end_tag_start(bytes, idx + 1, b"svg") {
-                if let Some(close_end) = find_tag_end(bytes, idx + 2 + b"svg".len()) {
-                    if svg_depth > 0 {
-                        svg_depth = svg_depth.saturating_sub(1);
-                    }
-                    idx = close_end;
-                    continue;
-                }
+            if let Some(new_idx) = track_svg_tag(bytes, idx, &mut svg_depth) {
+                idx = new_idx;
+                continue;
             }
 
             if svg_depth > 0 {
@@ -60,75 +134,20 @@ pub fn strip_script_and_style_tags(input: &str) -> Cow<'_, str> {
                 }
             }
 
-            if idx + 7 < len && eq_ascii_insensitive(&bytes[idx..idx + 7], b"<script") {
-                let after_tag = bytes[idx + 7];
-                if after_tag == b'>'
-                    || after_tag == b' '
-                    || after_tag == b'\t'
-                    || after_tag == b'\n'
-                    || after_tag == b'\r'
-                {
-                    let mut tag_end = idx + 7;
-                    while tag_end < len && bytes[tag_end] != b'>' {
-                        tag_end += 1;
-                    }
+            if let Some(new_pos) =
+                strip_raw_text_element(input, bytes, idx, len, last, &mut output, b"<script", b"script", true)
+            {
+                last = new_pos;
+                idx = new_pos;
+                continue;
+            }
 
-                    if tag_end < len {
-                        tag_end += 1;
-
-                        let tag_content = &input[idx..tag_end];
-                        if !is_json_ld_script_open_tag(tag_content) {
-                            let close_tag = find_closing_tag_bytes(bytes, tag_end, b"script");
-                            if let Some(close_idx) = close_tag {
-                                let out = output.get_or_insert_with(|| String::with_capacity(len));
-                                out.push_str(&input[last..idx]);
-                                if idx > 0
-                                    && close_idx < len
-                                    && !bytes[idx - 1].is_ascii_whitespace()
-                                    && !bytes[close_idx].is_ascii_whitespace()
-                                {
-                                    out.push(' ');
-                                }
-                                last = close_idx;
-                                idx = close_idx;
-                                continue;
-                            }
-                        }
-                    }
-                }
-            } else if idx + 6 < len && eq_ascii_insensitive(&bytes[idx..idx + 6], b"<style") {
-                let after_tag = bytes[idx + 6];
-                if after_tag == b'>'
-                    || after_tag == b' '
-                    || after_tag == b'\t'
-                    || after_tag == b'\n'
-                    || after_tag == b'\r'
-                {
-                    let mut tag_end = idx + 6;
-                    while tag_end < len && bytes[tag_end] != b'>' {
-                        tag_end += 1;
-                    }
-
-                    if tag_end < len {
-                        tag_end += 1;
-
-                        let close_tag = find_closing_tag_bytes(bytes, tag_end, b"style");
-                        if let Some(close_idx) = close_tag {
-                            let out = output.get_or_insert_with(|| String::with_capacity(len));
-                            out.push_str(&input[last..idx]);
-                            if idx > 0
-                                && close_idx < len
-                                && !bytes[idx - 1].is_ascii_whitespace()
-                                && !bytes[close_idx].is_ascii_whitespace()
-                            {
-                                out.push(' ');
-                            }
-                            last = close_idx;
-                            idx = close_idx;
-                            continue;
-                        }
-                    }
-                }
+            if let Some(new_pos) =
+                strip_raw_text_element(input, bytes, idx, len, last, &mut output, b"<style", b"style", false)
+            {
+                last = new_pos;
+                idx = new_pos;
+                continue;
             }
         }
 
@@ -152,6 +171,31 @@ pub fn strip_script_and_style_tags(input: &str) -> Cow<'_, str> {
 /// ~keep the whole document for every such tag.
 const MAX_CLOSING_TAG_SCAN: usize = 100_000_000;
 
+/// If `idx` starts a `</tag>` (or `</tag ...>`) closing tag matching `tag` (case-insensitively),
+/// return the index just past its `>`. Returns `None` when `idx` does not start such a tag.
+///
+/// Extracted from `find_closing_tag_bytes`'s inner match — identical boundary checks and
+/// closing-`>` scan, unchanged.
+fn match_closing_tag_at(bytes: &[u8], idx: usize, len: usize, tag: &[u8]) -> Option<usize> {
+    let tag_len = tag.len();
+    if idx + 2 >= len || bytes[idx + 1] != b'/' {
+        return None;
+    }
+    if idx + 2 + tag_len > len || !eq_ascii_insensitive(&bytes[idx + 2..idx + 2 + tag_len], tag) {
+        return None;
+    }
+    let after_tag = idx + 2 + tag_len;
+    if after_tag >= len || !(bytes[after_tag] == b'>' || bytes[after_tag].is_ascii_whitespace()) {
+        return None;
+    }
+
+    let mut close_idx = after_tag;
+    while close_idx < len && bytes[close_idx] != b'>' {
+        close_idx += 1;
+    }
+    if close_idx < len { Some(close_idx + 1) } else { None }
+}
+
 /// Find the position of the FIRST closing tag in bytes, ignoring nesting.
 /// Returns the position AFTER the closing tag (including the '>').
 /// This is highly optimized for performance and uses a fast-path scan.
@@ -166,8 +210,6 @@ const MAX_CLOSING_TAG_SCAN: usize = 100_000_000;
 #[inline]
 pub fn find_closing_tag_bytes(bytes: &[u8], start: usize, tag: &[u8]) -> Option<usize> {
     let len = bytes.len();
-    let tag_len = tag.len();
-
     let mut idx = start;
 
     while idx < len && (idx - start) < MAX_CLOSING_TAG_SCAN {
@@ -179,19 +221,8 @@ pub fn find_closing_tag_bytes(bytes: &[u8], start: usize, tag: &[u8]) -> Option<
             }
         }
 
-        if idx + 2 < len && bytes[idx + 1] == b'/' {
-            if idx + 2 + tag_len <= len && eq_ascii_insensitive(&bytes[idx + 2..idx + 2 + tag_len], tag) {
-                let after_tag = idx + 2 + tag_len;
-                if after_tag < len && (bytes[after_tag] == b'>' || bytes[after_tag].is_ascii_whitespace()) {
-                    let mut close_idx = after_tag;
-                    while close_idx < len && bytes[close_idx] != b'>' {
-                        close_idx += 1;
-                    }
-                    if close_idx < len {
-                        return Some(close_idx + 1);
-                    }
-                }
-            }
+        if let Some(close_pos) = match_closing_tag_at(bytes, idx, len, tag) {
+            return Some(close_pos);
         }
 
         idx += 1;
@@ -378,11 +409,17 @@ pub fn eq_ascii_insensitive(a: &[u8], b: &[u8]) -> bool {
 /// contains more than two dashes before the `>` (e.g. `<!-- foo --->` or
 /// `<!-- foo ---->`).  When it encounters such a comment it creates an empty
 /// comment node and silently discards every byte that follows, so all document
-/// content after the comment is lost.
+/// content after the comment is lost. It also mishandles the opposite,
+/// too-few-dashes shape: `<!-->` and `<!--->`, HTML5's "abrupt-closing-of-
+/// empty-comment" quirk, where the closing `-->` shares its dashes with the
+/// opening `<!--`. With no unshared `-->` left in the remaining input, `tl`
+/// treats the comment as unterminated and drops everything after it, exactly
+/// like the excess-dash case.
 ///
-/// This function rewrites those bogus closings: every `--[-]+>` sequence that
-/// terminates an HTML comment is normalised to `-->`.  Regular `-->` closings
-/// are left unchanged.
+/// This function rewrites both bogus shapes: every `--[-]+>` sequence that
+/// terminates an HTML comment is normalised to `-->`, and every abrupt
+/// `<!-->`/`<!--->` open+close is normalised to the well-formed empty comment
+/// `<!---->`.  Regular `-->` closings are left unchanged.
 ///
 /// # Algorithm
 ///
@@ -393,12 +430,14 @@ pub fn eq_ascii_insensitive(a: &[u8], b: &[u8]) -> bool {
 /// - Any other character after `--` resets back into the comment body.
 ///
 /// If the actual number of leading dashes before `>` is more than two the
-/// closing sequence is replaced with `-->`.
+/// closing sequence is replaced with `-->`. If `>` (or `->`) appears
+/// immediately after the opening `<!--`, with no other content consumed, the
+/// whole `<!-->`/`<!--->` run is replaced with `<!---->`.
 pub fn normalize_bogus_comment_endings(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
     let len = bytes.len();
 
-    if len < 7 || !bytes.windows(4).any(|w| w == b"<!--") {
+    if len < 5 || !bytes.windows(4).any(|w| w == b"<!--") {
         return Cow::Borrowed(input);
     }
 
@@ -413,6 +452,28 @@ pub fn normalize_bogus_comment_endings(input: &str) -> Cow<'_, str> {
         }
 
         idx += 4;
+
+        // ~keep `<!-->` (zero shared dashes) and `<!--->` (one shared dash) never
+        // ~keep accumulate `consecutive_dashes >= 2` below, so the general scan can
+        // ~keep never see them as closed -- it would run to EOF looking for an
+        // ~keep unshared `-->` and swallow the rest of the document. Caught here,
+        // ~keep before that scan starts.
+        if bytes.get(idx) == Some(&b'>') {
+            let out = output.get_or_insert_with(|| String::with_capacity(len));
+            out.push_str(&input[last..idx - 4]);
+            out.push_str("<!---->");
+            idx += 1;
+            last = idx;
+            continue;
+        }
+        if bytes.get(idx) == Some(&b'-') && bytes.get(idx + 1) == Some(&b'>') {
+            let out = output.get_or_insert_with(|| String::with_capacity(len));
+            out.push_str(&input[last..idx - 4]);
+            out.push_str("<!---->");
+            idx += 2;
+            last = idx;
+            continue;
+        }
 
         let mut consecutive_dashes: usize = 0;
 
@@ -480,7 +541,11 @@ pub fn normalize_split_closing_tags(input: &str) -> Cow<'_, str> {
     let mut output: Option<String> = None;
 
     while idx + 2 < len {
-        if bytes[idx] != b'<' || bytes[idx + 1] != b'/' {
+        let Some(offset) = memchr::memchr(b'<', &bytes[idx..]) else {
+            break;
+        };
+        idx += offset;
+        if bytes.get(idx + 1) != Some(&b'/') {
             idx += 1;
             continue;
         }
@@ -534,14 +599,192 @@ pub fn normalize_split_closing_tags(input: &str) -> Cow<'_, str> {
     }
 }
 
+/// Collapse an empty HTML comment `<!---->` at `idx` to `<!-- -->` (a single interior space).
+/// Returns `Some(new_pos)` when found, `None` otherwise.
+///
+/// Extracted from `preprocess_html`'s main scan loop — identical prefix match and rewrite,
+/// unchanged.
+fn collapse_empty_comment(
+    input: &str,
+    bytes: &[u8],
+    idx: usize,
+    last: usize,
+    output: &mut Option<String>,
+) -> Option<usize> {
+    const EMPTY_COMMENT: &[u8] = b"<!---->";
+    if !bytes[idx..].starts_with(EMPTY_COMMENT) {
+        return None;
+    }
+    let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
+    out.push_str(&input[last..idx]);
+    out.push_str("<!-- -->");
+    Some(idx + EMPTY_COMMENT.len())
+}
+
+/// Normalize an XML-style self-closing void element (`<br/>`, `<hr/>`, `<img/>`) at `idx` to its
+/// HTML5 form (`<br>`, `<hr>`, `<img>`). Returns `Some(new_pos)` when matched, `None` otherwise.
+///
+/// Extracted from `preprocess_html`'s main scan loop — identical pattern table and rewrite,
+/// unchanged.
+fn normalize_self_closing_void(
+    input: &str,
+    bytes: &[u8],
+    idx: usize,
+    last: usize,
+    output: &mut Option<String>,
+) -> Option<usize> {
+    const SELF_CLOSING: [(&[u8], &str); 3] = [(b"<br/>", "<br>"), (b"<hr/>", "<hr>"), (b"<img/>", "<img>")];
+    for (pattern, replacement) in &SELF_CLOSING {
+        if bytes[idx..].starts_with(pattern) {
+            let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
+            out.push_str(&input[last..idx]);
+            out.push_str(replacement);
+            return Some(idx + pattern.len());
+        }
+    }
+    None
+}
+
+/// Lowercase the tag name of an HTML5 void element written in upper or mixed case.
+///
+/// The bundled astral-tl parser compares a tag's raw source bytes against an all-lowercase
+/// void-element table, so `<META>` misses it and is pushed onto the open-element stack as a
+/// *container*. The parent's close tag then cannot pop it and every following sibling is
+/// absorbed as its child: for `<head><META ...></head><body>` that leaves `<body>` a
+/// grandchild of `<head>`, out of reach of `converter::metadata`'s direct-child rescue, and
+/// the whole document converts to an empty string (issue #467). Tier-1 lowercases tag names
+/// before lookup and was never affected, so this also closes a tier divergence.
+///
+/// Only the name is rewritten -- attribute names and values are left byte for byte alone.
+/// Non-void elements need no rewrite: the parser compares open and close tags against each
+/// other, so `<DIV>...</DIV>` already matches.
+///
+/// Returns `Some(new_pos)` when a name was rewritten, `None` otherwise.
+fn normalize_void_tag_case(
+    input: &str,
+    bytes: &[u8],
+    idx: usize,
+    last: usize,
+    output: &mut Option<String>,
+) -> Option<usize> {
+    let name_start = idx + 1;
+    if !bytes.get(name_start)?.is_ascii_alphabetic() {
+        return None;
+    }
+    let name_end = crate::converter::main_helpers::scan_tag_name_end(bytes, name_start);
+    let name = &bytes[name_start..name_end];
+    // ~keep Uppercase check first: it is a byte scan, while the void-element test allocates.
+    if !name.iter().any(u8::is_ascii_uppercase) || !crate::converter::main_helpers::is_html5_void_element(name) {
+        return None;
+    }
+    let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
+    out.push_str(&input[last..idx]);
+    out.push('<');
+    out.push_str(&input[name_start..name_end].to_ascii_lowercase());
+    Some(name_end)
+}
+
+/// Strip a raw-text `<script>` or `<style>` element in `preprocess_html`'s pass, replacing its
+/// content with an empty element (`<tag ...></tag>`) rather than removing it outright. A
+/// `<script type="application/ld+json">` open tag is left alone (its JSON-LD body must survive
+/// for metadata extraction), matching neither `TAGS` entry in that case — mirrored by the
+/// `continue` below, which moves on to the next `TAGS` entry instead of stopping the scan.
+///
+/// Returns `Some(new_pos)` when a tag was stripped, `None` when `idx` does not start such a tag.
+///
+/// Extracted from `preprocess_html`'s main scan loop — identical tag matching and JSON-LD
+/// exemption, unchanged.
+fn strip_raw_text_tag_reopen(
+    input: &str,
+    bytes: &[u8],
+    idx: usize,
+    last: usize,
+    output: &mut Option<String>,
+) -> Option<usize> {
+    const TAGS: [&[u8]; 2] = [b"script", b"style"];
+
+    for tag in TAGS {
+        if matches_tag_start(bytes, idx + 1, tag) {
+            if let Some(open_end) = find_tag_end(bytes, idx + 1 + tag.len()) {
+                if tag == b"script" && is_json_ld_script_open_tag(&input[idx..open_end]) {
+                    continue;
+                }
+                let remove_end = find_closing_tag(bytes, open_end, tag).unwrap_or(open_end);
+                let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
+                out.push_str(&input[last..idx]);
+                out.push_str(&input[idx..open_end]);
+                out.push_str("</");
+                if let Ok(tag_str) = str::from_utf8(tag) {
+                    out.push_str(tag_str);
+                }
+                out.push('>');
+
+                return Some(remove_end);
+            }
+        }
+    }
+
+    None
+}
+
+/// Strip a `<!doctype ...>` declaration at `idx`. Returns `Some(new_pos)` when found and
+/// terminated, `None` otherwise.
+///
+/// Extracted from `preprocess_html`'s main scan loop — identical whitespace-skip and
+/// case-insensitive `doctype` match, unchanged.
+fn strip_doctype(
+    input: &str,
+    bytes: &[u8],
+    idx: usize,
+    len: usize,
+    last: usize,
+    output: &mut Option<String>,
+) -> Option<usize> {
+    const DOCTYPE: &[u8] = b"doctype";
+
+    if idx + 2 >= len || bytes[idx + 1] != b'!' {
+        return None;
+    }
+    let mut cursor = idx + 2;
+    while cursor < len && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+
+    if cursor + DOCTYPE.len() > len || !bytes[cursor..cursor + DOCTYPE.len()].eq_ignore_ascii_case(DOCTYPE) {
+        return None;
+    }
+
+    let end = find_tag_end(bytes, cursor + DOCTYPE.len())?;
+    let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
+    out.push_str(&input[last..idx]);
+    Some(end)
+}
+
+/// Whether `<` at `idx` opens something that looks like real markup (a tag, a `<!...>`
+/// declaration/comment, or a `<?...?>` processing instruction) rather than a bare `<` that must
+/// be entity-escaped so a later HTML parse does not swallow following content as a bogus tag.
+///
+/// Extracted from `preprocess_html`'s main scan loop — identical byte-class checks, unchanged.
+fn looks_like_tag_start(bytes: &[u8], idx: usize, len: usize) -> bool {
+    if idx + 1 >= len {
+        return false;
+    }
+    match bytes[idx + 1] {
+        b'!' => {
+            idx + 2 < len
+                && (bytes[idx + 2] == b'-'
+                    || bytes[idx + 2].is_ascii_alphabetic()
+                    || bytes[idx + 2].is_ascii_uppercase())
+        }
+        b'/' => idx + 2 < len && (bytes[idx + 2].is_ascii_alphabetic() || bytes[idx + 2].is_ascii_uppercase()),
+        b'?' => true,
+        c if c.is_ascii_alphabetic() || c.is_ascii_uppercase() => true,
+        _ => false,
+    }
+}
+
 /// Preprocess HTML to normalize tags and fix common issues.
 pub fn preprocess_html(input: &str) -> Cow<'_, str> {
-    const SELF_CLOSING: [(&[u8], &str); 3] = [(b"<br/>", "<br>"), (b"<hr/>", "<hr>"), (b"<img/>", "<img>")];
-    const TAGS: [&[u8]; 2] = [b"script", b"style"];
-    const SVG: &[u8] = b"svg";
-    const DOCTYPE: &[u8] = b"doctype";
-    const EMPTY_COMMENT: &[u8] = b"<!---->";
-
     let bytes = input.as_bytes();
     let len = bytes.len();
     if len == 0 {
@@ -555,120 +798,44 @@ pub fn preprocess_html(input: &str) -> Cow<'_, str> {
 
     while idx < len {
         if bytes[idx] == b'<' {
-            if bytes[idx..].starts_with(EMPTY_COMMENT) {
-                let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
-                out.push_str(&input[last..idx]);
-                out.push_str("<!-- -->");
-                idx += EMPTY_COMMENT.len();
-                last = idx;
+            if let Some(new_pos) = collapse_empty_comment(input, bytes, idx, last, &mut output) {
+                last = new_pos;
+                idx = new_pos;
                 continue;
             }
 
-            let mut replaced = false;
-            for (pattern, replacement) in &SELF_CLOSING {
-                if bytes[idx..].starts_with(pattern) {
-                    let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
-                    out.push_str(&input[last..idx]);
-                    out.push_str(replacement);
-                    idx += pattern.len();
-                    last = idx;
-                    replaced = true;
-                    break;
-                }
-            }
-            if replaced {
+            if let Some(new_pos) = normalize_self_closing_void(input, bytes, idx, last, &mut output) {
+                last = new_pos;
+                idx = new_pos;
                 continue;
             }
 
-            if matches_tag_start(bytes, idx + 1, SVG) {
-                if let Some(open_end) = find_tag_end(bytes, idx + 1 + SVG.len()) {
-                    svg_depth += 1;
-                    idx = open_end;
-                    continue;
-                }
-            } else if matches_end_tag_start(bytes, idx + 1, SVG) {
-                if let Some(close_end) = find_tag_end(bytes, idx + 2 + SVG.len()) {
-                    if svg_depth > 0 {
-                        svg_depth = svg_depth.saturating_sub(1);
-                    }
-                    idx = close_end;
-                    continue;
-                }
+            if let Some(new_idx) = track_svg_tag(bytes, idx, &mut svg_depth) {
+                idx = new_idx;
+                continue;
             }
 
             if svg_depth == 0 {
-                let mut handled = false;
-                for tag in TAGS {
-                    if matches_tag_start(bytes, idx + 1, tag) {
-                        if let Some(open_end) = find_tag_end(bytes, idx + 1 + tag.len()) {
-                            if tag == b"script" && is_json_ld_script_open_tag(&input[idx..open_end]) {
-                                continue;
-                            }
-                            let remove_end = find_closing_tag(bytes, open_end, tag).unwrap_or(open_end);
-                            let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
-                            out.push_str(&input[last..idx]);
-                            out.push_str(&input[idx..open_end]);
-                            out.push_str("</");
-                            if let Ok(tag_str) = str::from_utf8(tag) {
-                                out.push_str(tag_str);
-                            }
-                            out.push('>');
-
-                            last = remove_end;
-                            idx = remove_end;
-                            handled = true;
-                        }
-                    }
-
-                    if handled {
-                        break;
-                    }
-                }
-
-                if handled {
+                if let Some(new_pos) = normalize_void_tag_case(input, bytes, idx, last, &mut output) {
+                    last = new_pos;
+                    idx = new_pos;
                     continue;
                 }
 
-                if idx + 2 < len && bytes[idx + 1] == b'!' {
-                    let mut cursor = idx + 2;
-                    while cursor < len && bytes[cursor].is_ascii_whitespace() {
-                        cursor += 1;
-                    }
+                if let Some(new_pos) = strip_raw_text_tag_reopen(input, bytes, idx, last, &mut output) {
+                    last = new_pos;
+                    idx = new_pos;
+                    continue;
+                }
 
-                    if cursor + DOCTYPE.len() <= len
-                        && bytes[cursor..cursor + DOCTYPE.len()].eq_ignore_ascii_case(DOCTYPE)
-                    {
-                        if let Some(end) = find_tag_end(bytes, cursor + DOCTYPE.len()) {
-                            let out = output.get_or_insert_with(|| String::with_capacity(input.len()));
-                            out.push_str(&input[last..idx]);
-                            last = end;
-                            idx = end;
-                            continue;
-                        }
-                    }
+                if let Some(new_pos) = strip_doctype(input, bytes, idx, len, last, &mut output) {
+                    last = new_pos;
+                    idx = new_pos;
+                    continue;
                 }
             }
 
-            let is_valid_tag = if idx + 1 < len {
-                match bytes[idx + 1] {
-                    b'!' => {
-                        idx + 2 < len
-                            && (bytes[idx + 2] == b'-'
-                                || bytes[idx + 2].is_ascii_alphabetic()
-                                || bytes[idx + 2].is_ascii_uppercase())
-                    }
-                    b'/' => {
-                        idx + 2 < len && (bytes[idx + 2].is_ascii_alphabetic() || bytes[idx + 2].is_ascii_uppercase())
-                    }
-                    b'?' => true,
-                    c if c.is_ascii_alphabetic() || c.is_ascii_uppercase() => true,
-                    _ => false,
-                }
-            } else {
-                false
-            };
-
-            if !is_valid_tag {
+            if !looks_like_tag_start(bytes, idx, len) {
                 let out = output.get_or_insert_with(|| String::with_capacity(input.len() + 4));
                 out.push_str(&input[last..idx]);
                 out.push_str("&lt;");
@@ -689,6 +856,19 @@ pub fn preprocess_html(input: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(input)
     }
+}
+
+/// Find the end of an unquoted attribute value starting at `start`: the first ASCII whitespace
+/// or `>` byte, or `bytes.len()` if neither occurs before the end of `bytes`.
+///
+/// Extracted from `is_json_ld_script_open_tag`'s unquoted-value branch — identical scan,
+/// unchanged.
+fn scan_unquoted_attr_value_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() && bytes[end] != b'>' {
+        end += 1;
+    }
+    end
 }
 
 /// Check if a script tag is a JSON-LD script.
@@ -737,11 +917,7 @@ pub fn is_json_ld_script_open_tag(tag: &str) -> bool {
                 }
                 _ => {
                     let start = i;
-                    let mut end = start;
-                    while end < bytes.len() && !bytes[end].is_ascii_whitespace() && bytes[end] != b'>' {
-                        end += 1;
-                    }
-                    (start, end)
+                    (start, scan_unquoted_attr_value_end(bytes, start))
                 }
             };
 
@@ -791,27 +967,15 @@ pub fn matches_tag_start(bytes: &[u8], mut start: usize, tag: &[u8]) -> bool {
 
 /// Find the end of an HTML tag (the position of '>').
 pub fn find_tag_end(bytes: &[u8], mut idx: usize) -> Option<usize> {
-    let len = bytes.len();
-    let mut in_quote: Option<u8> = None;
-
-    while idx < len {
-        match bytes[idx] {
-            b'"' | b'\'' => {
-                if let Some(current) = in_quote {
-                    if current == bytes[idx] {
-                        in_quote = None;
-                    }
-                } else {
-                    in_quote = Some(bytes[idx]);
-                }
-            }
-            b'>' if in_quote.is_none() => return Some(idx + 1),
-            _ => {}
-        }
+    loop {
+        idx += memchr::memchr3(b'"', b'\'', b'>', bytes.get(idx..)?)?;
+        let delimiter = bytes[idx];
         idx += 1;
+        if delimiter == b'>' {
+            return Some(idx);
+        }
+        idx += memchr::memchr(delimiter, &bytes[idx..])? + 1;
     }
-
-    None
 }
 
 /// Find the closing tag for a given tag name.
@@ -853,6 +1017,223 @@ pub fn matches_end_tag_start(bytes: &[u8], start: usize, tag: &[u8]) -> bool {
     matches_tag_start(bytes, start + 1, tag)
 }
 
+/// Outcome of scanning one `<...>` tag starting at `tag_start` (the index of `<`), for
+/// `normalize_unclosed_list_items`.
+enum ListTagScan {
+    /// A named tag was fully parsed. `name_start..name_end` bounds the tag name (captured
+    /// before any attributes); `idx` is the position just past its `>`, or `bytes.len()` if the
+    /// tag is unterminated after the name.
+    Tag {
+        is_close: bool,
+        name_start: usize,
+        name_end: usize,
+        idx: usize,
+    },
+    /// The tag had no name (e.g. `<>` or `</>`); `idx` is where scanning should resume.
+    Empty { idx: usize },
+    /// The input ended before the tag could be parsed; scanning must stop entirely.
+    Truncated,
+}
+
+/// Advance `*idx`/`*in_comment` past a `<!--`/`-->` boundary, or past the current byte if
+/// already inside a comment. Returns `true` when the caller's scan loop should `continue`
+/// immediately (the position was consumed as comment text or a comment boundary), `false` when
+/// `bytes[*idx]` is unrelated to comment tracking and `*idx` is unchanged.
+///
+/// Extracted from `normalize_unclosed_list_items`'s main scan loop — identical comment
+/// state-machine, unchanged.
+fn advance_past_comment(bytes: &[u8], idx: &mut usize, len: usize, in_comment: &mut bool) -> bool {
+    let b = bytes[*idx];
+
+    if *in_comment {
+        if b == b'-' && *idx + 2 < len && bytes[*idx + 1] == b'-' && bytes[*idx + 2] == b'>' {
+            *in_comment = false;
+            *idx += 3;
+        } else {
+            *idx += 1;
+        }
+        return true;
+    }
+
+    if b == b'<' && *idx + 3 < len && bytes[*idx + 1] == b'!' && bytes[*idx + 2] == b'-' && bytes[*idx + 3] == b'-' {
+        *in_comment = true;
+        *idx += 4;
+        return true;
+    }
+
+    false
+}
+
+/// Scan one tag for `normalize_unclosed_list_items`, starting at `tag_start` (the index of `<`).
+///
+/// Extracted from `normalize_unclosed_list_items`'s main scan loop — identical open/close-slash,
+/// whitespace-skip, name-scan, and quote-aware attribute scan, unchanged.
+fn scan_list_tag(bytes: &[u8], tag_start: usize, len: usize) -> ListTagScan {
+    let mut idx = tag_start + 1;
+    if idx >= len {
+        return ListTagScan::Truncated;
+    }
+
+    let is_close = bytes[idx] == b'/';
+    if is_close {
+        idx += 1;
+        if idx >= len {
+            return ListTagScan::Truncated;
+        }
+    }
+
+    while idx < len && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+
+    let name_start = idx;
+    while idx < len {
+        let ch = bytes[idx];
+        if ch == b'>' || ch == b'/' || ch.is_ascii_whitespace() {
+            break;
+        }
+        idx += 1;
+    }
+    let name_end = idx;
+    if name_end == name_start {
+        return ListTagScan::Empty { idx };
+    }
+
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    while idx < len {
+        match bytes[idx] {
+            b'\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                idx += 1;
+            }
+            b'"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                idx += 1;
+            }
+            b'>' if !in_single_quote && !in_double_quote => {
+                idx += 1;
+                break;
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+
+    ListTagScan::Tag {
+        is_close,
+        name_start,
+        name_end,
+        idx,
+    }
+}
+
+/// Whether `name_bytes` names an HTML element whose body is raw/verbatim text — `<pre>`,
+/// `<code>`, `<script>`, or `<style>` — inside which list-item auto-closing must not run.
+///
+/// Extracted from `normalize_unclosed_list_items`'s main scan loop — identical tag-name checks,
+/// unchanged.
+fn is_verbatim_tag_name(name_bytes: &[u8]) -> bool {
+    name_bytes.eq_ignore_ascii_case(b"pre")
+        || name_bytes.eq_ignore_ascii_case(b"code")
+        || name_bytes.eq_ignore_ascii_case(b"script")
+        || name_bytes.eq_ignore_ascii_case(b"style")
+}
+
+/// The closing tag text for an auto-closed list-item element name (`"li"`, `"dt"`, or `"dd"`).
+///
+/// Extracted from `normalize_unclosed_list_items` — identical lookup, unchanged.
+fn list_item_close_tag(item: &'static str) -> &'static str {
+    match item {
+        "li" => "</li>",
+        "dt" => "</dt>",
+        "dd" => "</dd>",
+        _ => unreachable!(),
+    }
+}
+
+/// Append `&input[*last_flush..pos]` followed by `close_tag` to the lazily-allocated `*output`,
+/// then advance `*last_flush` to `pos`.
+///
+/// Extracted from `normalize_unclosed_list_items`'s local `emit_close_before!` macro as a plain
+/// function — identical operations and order, unchanged.
+fn emit_close_before(
+    input: &str,
+    len: usize,
+    last_flush: &mut usize,
+    output: &mut Option<String>,
+    pos: usize,
+    close_tag: &str,
+) {
+    let out = output.get_or_insert_with(|| String::with_capacity(len + 64));
+    out.push_str(&input[*last_flush..pos]);
+    out.push_str(close_tag);
+    *last_flush = pos;
+}
+
+/// Update the open-list-item state machine for one non-verbatim tag and emit an auto-close for
+/// a still-open `<li>`/`<dt>`/`<dd>` where HTML allows omitting the end tag.
+///
+/// Extracted from `normalize_unclosed_list_items`'s main scan loop — identical container/
+/// list-item bookkeeping and close-tag emission, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn apply_list_item_tag(
+    input: &str,
+    len: usize,
+    tag_start: usize,
+    is_close: bool,
+    name_bytes: &[u8],
+    open_item: &mut Option<&'static str>,
+    list_stack: &mut Vec<Option<&'static str>>,
+    last_flush: &mut usize,
+    output: &mut Option<String>,
+) {
+    let is_list_container = name_bytes.eq_ignore_ascii_case(b"ul")
+        || name_bytes.eq_ignore_ascii_case(b"ol")
+        || name_bytes.eq_ignore_ascii_case(b"dl");
+
+    let is_li = name_bytes.eq_ignore_ascii_case(b"li");
+    let is_def_term = name_bytes.eq_ignore_ascii_case(b"dt");
+    let is_def_desc = name_bytes.eq_ignore_ascii_case(b"dd");
+    let is_list_item = is_li || is_def_term || is_def_desc;
+
+    if is_close {
+        if is_list_container {
+            if let Some(item) = open_item.take() {
+                emit_close_before(input, len, last_flush, output, tag_start, list_item_close_tag(item));
+            }
+            *open_item = list_stack.pop().unwrap_or(None);
+        } else if is_list_item {
+            *open_item = None;
+        }
+        return;
+    }
+
+    if is_list_container {
+        list_stack.push(open_item.take());
+    } else if is_list_item {
+        let item_name: &'static str = if is_li {
+            "li"
+        } else if is_def_term {
+            "dt"
+        } else {
+            "dd"
+        };
+
+        if let Some(prev_item) = open_item.replace(item_name) {
+            emit_close_before(
+                input,
+                len,
+                last_flush,
+                output,
+                tag_start,
+                list_item_close_tag(prev_item),
+            );
+        }
+    }
+}
+
 /// Close implicitly-terminated list-item elements that `tl` would otherwise
 /// absorb as deep children, causing stack overflows on large documents.
 ///
@@ -879,193 +1260,93 @@ pub fn matches_end_tag_start(bytes: &[u8], start: usize, tag: &[u8]) -> bool {
 /// Only the three list-item element types are handled here; `<p>` and other
 /// auto-closing block elements are intentionally left to the existing
 /// `has_inline_block_misnest` → `repair_with_html5ever` path.
+/// Whether `bytes` holds any tag that could open or close a list item, which is the only
+/// reason to run the rewrite scan at all.
+///
+/// Extracted from `normalize_unclosed_list_items`' early-exit guard — identical window scan,
+/// unchanged.
+fn contains_list_item_tag(bytes: &[u8], len: usize) -> bool {
+    len >= 4
+        && bytes
+            .windows(3)
+            .any(|w| w.eq_ignore_ascii_case(b"<li") || w.eq_ignore_ascii_case(b"<dt") || w.eq_ignore_ascii_case(b"<dd"))
+}
+
+/// Track `<pre>`/`<code>` nesting depth, whose contents are verbatim and must never be rewritten.
+///
+/// Extracted from `normalize_unclosed_list_items`' scan loop — identical saturating arithmetic,
+/// unchanged.
+const fn update_verbatim_depth(depth: &mut usize, is_close: bool) {
+    *depth = if is_close { depth.saturating_sub(1) } else { *depth + 1 };
+}
+
 pub fn normalize_unclosed_list_items(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
     let len = bytes.len();
-    if len < 4
-        || (!bytes.windows(3).any(|w| {
-            w.eq_ignore_ascii_case(b"<li") || w.eq_ignore_ascii_case(b"<dt") || w.eq_ignore_ascii_case(b"<dd")
-        }))
-    {
+    if !contains_list_item_tag(bytes, len) {
         return Cow::Borrowed(input);
     }
 
     let mut open_item: Option<&'static str> = None;
     let mut list_stack: Vec<Option<&'static str>> = Vec::new();
-
     let mut in_pre_or_code: usize = 0;
     let mut in_comment = false;
-
     let mut idx = 0usize;
     let mut last_flush = 0usize;
     let mut output: Option<String> = None;
 
-    macro_rules! emit_close_before {
-        ($pos:expr, $close_tag:expr) => {{
-            let out = output.get_or_insert_with(|| String::with_capacity(len + 64));
-            out.push_str(&input[last_flush..$pos]);
-            out.push_str($close_tag);
-            last_flush = $pos;
-        }};
-    }
-
     while idx < len {
-        let b = bytes[idx];
-
-        if in_comment {
-            if b == b'-' && idx + 2 < len && bytes[idx + 1] == b'-' && bytes[idx + 2] == b'>' {
-                in_comment = false;
-                idx += 3;
-            } else {
-                idx += 1;
-            }
+        if advance_past_comment(bytes, &mut idx, len, &mut in_comment) {
             continue;
         }
 
-        if b == b'<' && idx + 3 < len && bytes[idx + 1] == b'!' && bytes[idx + 2] == b'-' && bytes[idx + 3] == b'-' {
-            in_comment = true;
-            idx += 4;
-            continue;
-        }
-
-        if b != b'<' {
+        if bytes[idx] != b'<' {
             idx += 1;
             continue;
         }
 
         let tag_start = idx;
-        idx += 1;
-        if idx >= len {
-            break;
-        }
-
-        let is_close = bytes[idx] == b'/';
-        if is_close {
-            idx += 1;
-            if idx >= len {
-                break;
+        let (is_close, name_start, name_end) = match scan_list_tag(bytes, tag_start, len) {
+            ListTagScan::Truncated => break,
+            ListTagScan::Empty { idx: new_idx } => {
+                idx = new_idx;
+                continue;
             }
-        }
-
-        while idx < len && bytes[idx].is_ascii_whitespace() {
-            idx += 1;
-        }
-
-        let name_start = idx;
-        while idx < len {
-            let ch = bytes[idx];
-            if ch == b'>' || ch == b'/' || ch.is_ascii_whitespace() {
-                break;
+            ListTagScan::Tag {
+                is_close,
+                name_start,
+                name_end,
+                idx: new_idx,
+            } => {
+                idx = new_idx;
+                (is_close, name_start, name_end)
             }
-            idx += 1;
-        }
-        let name_bytes = &bytes[name_start..idx];
-        if name_bytes.is_empty() {
+        };
+        let name_bytes = &bytes[name_start..name_end];
+
+        if is_verbatim_tag_name(name_bytes) {
+            update_verbatim_depth(&mut in_pre_or_code, is_close);
             continue;
         }
-
-        {
-            let mut in_single_quote = false;
-            let mut in_double_quote = false;
-            while idx < len {
-                match bytes[idx] {
-                    b'\'' if !in_double_quote => {
-                        in_single_quote = !in_single_quote;
-                        idx += 1;
-                    }
-                    b'"' if !in_single_quote => {
-                        in_double_quote = !in_double_quote;
-                        idx += 1;
-                    }
-                    b'>' if !in_single_quote && !in_double_quote => {
-                        idx += 1;
-                        break;
-                    }
-                    _ => {
-                        idx += 1;
-                    }
-                }
-            }
-        }
-
-        let tag_is_verbatim = name_bytes.eq_ignore_ascii_case(b"pre")
-            || name_bytes.eq_ignore_ascii_case(b"code")
-            || name_bytes.eq_ignore_ascii_case(b"script")
-            || name_bytes.eq_ignore_ascii_case(b"style");
-
-        if tag_is_verbatim {
-            if is_close {
-                in_pre_or_code = in_pre_or_code.saturating_sub(1);
-            } else {
-                in_pre_or_code += 1;
-            }
-            continue;
-        }
-
         if in_pre_or_code > 0 {
             continue;
         }
 
-        let is_list_container = name_bytes.eq_ignore_ascii_case(b"ul")
-            || name_bytes.eq_ignore_ascii_case(b"ol")
-            || name_bytes.eq_ignore_ascii_case(b"dl");
-
-        let is_li = name_bytes.eq_ignore_ascii_case(b"li");
-        let is_def_term = name_bytes.eq_ignore_ascii_case(b"dt");
-        let is_def_desc = name_bytes.eq_ignore_ascii_case(b"dd");
-        let is_list_item = is_li || is_def_term || is_def_desc;
-
-        if is_close {
-            if is_list_container {
-                if let Some(item) = open_item.take() {
-                    let close_tag = match item {
-                        "li" => "</li>",
-                        "dt" => "</dt>",
-                        "dd" => "</dd>",
-                        _ => unreachable!(),
-                    };
-                    emit_close_before!(tag_start, close_tag);
-                }
-                open_item = list_stack.pop().unwrap_or(None);
-            } else if is_list_item {
-                open_item = None;
-            }
-        } else {
-            if is_list_container {
-                list_stack.push(open_item.take());
-            } else if is_list_item {
-                let item_name: &'static str = if is_li {
-                    "li"
-                } else if is_def_term {
-                    "dt"
-                } else {
-                    "dd"
-                };
-
-                if let Some(prev_item) = open_item.replace(item_name) {
-                    let close_tag = match prev_item {
-                        "li" => "</li>",
-                        "dt" => "</dt>",
-                        "dd" => "</dd>",
-                        _ => unreachable!(),
-                    };
-                    emit_close_before!(tag_start, close_tag);
-                }
-            }
-        }
+        apply_list_item_tag(
+            input,
+            len,
+            tag_start,
+            is_close,
+            name_bytes,
+            &mut open_item,
+            &mut list_stack,
+            &mut last_flush,
+            &mut output,
+        );
     }
 
     if let Some(item) = open_item.take() {
-        let close_tag = match item {
-            "li" => "</li>",
-            "dt" => "</dt>",
-            "dd" => "</dd>",
-            _ => unreachable!(),
-        };
-        let out = output.get_or_insert_with(|| String::with_capacity(len + 16));
-        out.push_str(&input[last_flush..]);
-        out.push_str(close_tag);
-        last_flush = len;
+        emit_close_before(input, len, &mut last_flush, &mut output, len, list_item_close_tag(item));
     }
 
     match output {
@@ -1114,12 +1395,211 @@ pub fn sanitize_markdown_url(url: &str) -> Cow<'_, str> {
 }
 
 /// Strip elements that are never rendered from HTML: those carrying the `hidden`
-/// attribute, and those hidden via an inline `style="display:none"` or
-/// `style="visibility:hidden"` declaration.
+/// attribute, and those hidden via an inline `style="display:none"`,
+/// `style="visibility:hidden"` or `style="font-size:0"` declaration.
+///
+/// `font-size: 0` is the one conditional case — it is also a spacing hack whose children
+/// restore a readable size — so its subtree is kept when a descendant re-declares a non-zero
+/// `font-size` or contains an image, whose intrinsic size is independent of font size (issues #468, #476).
 ///
 /// Scans for opening tags matching either condition, finds their matching
 /// closing tag, and removes the entire element (tag + content, so nested
 /// content never leaks out). Self-closing tags are also removed.
+/// Find `needle` in `haystack` at or after `from`, returning its start offset.
+fn find_subslice(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if from >= haystack.len() {
+        return None;
+    }
+    memchr::memmem::find(&haystack[from..], needle).map(|off| from + off)
+}
+
+/// If `<` at `idx` (with `next`/`rest` already read) opens a real HTML comment (`<!--`) or a
+/// CDATA section (`<![CDATA[`), return the index just past its terminator (or `len` if
+/// unterminated). Returns `None` for anything else, in which case `idx` is unaffected.
+///
+/// Extracted from `strip_bogus_comments`'s main scan loop — identical terminator lookups,
+/// unchanged.
+fn skip_real_comment_or_cdata(bytes: &[u8], idx: usize, len: usize, next: u8, rest: &[u8]) -> Option<usize> {
+    // ~keep Step over a real comment as one unit. Its interior is not markup, and a
+    // ~keep downlevel conditional comment (`<!--[if gte mso 9]> … <![endif]-->`, which
+    // ~keep Microsoft Word emits by the dozen) contains a `<![endif]` that looks exactly
+    // ~keep like a bogus comment. Stripping that would delete the `-->` closing the real
+    // ~keep comment, leaving it unterminated and swallowing the rest of the document.
+    if next == b'!' && rest.starts_with(b"--") {
+        return Some(find_subslice(bytes, idx + 4, b"-->").map_or(len, |end| end + 3));
+    }
+    // ~keep Likewise CDATA: its interior is character data, not markup.
+    if next == b'!' && rest.starts_with(b"[CDATA[") {
+        return Some(find_subslice(bytes, idx + 9, b"]]>").map_or(len, |end| end + 3));
+    }
+    None
+}
+
+/// Whether `<` at `idx` (real comments/CDATA already ruled out by `skip_real_comment_or_cdata`)
+/// starts a "bogus comment" per the HTML5 tokenizer.
+///
+/// Extracted from `strip_bogus_comments`'s main scan loop — identical classification, unchanged.
+fn is_bogus_comment_marker(bytes: &[u8], idx: usize, len: usize, next: u8, rest: &[u8]) -> bool {
+    if next == b'?' {
+        return true;
+    }
+    if next == b'!' {
+        // ~keep Real comments and CDATA already returned above. `<!DOCTYPE` is a doctype,
+        // ~keep handled elsewhere; anything else after `<!` is a bogus comment.
+        return !(rest.len() >= 7 && rest[..7].eq_ignore_ascii_case(b"DOCTYPE"));
+    }
+    if next == b'/' {
+        // ~keep `</` followed by a letter is a real end tag; anything else -- including
+        // ~keep end-of-input -- is a bogus comment.
+        return idx + 2 >= len || !bytes[idx + 2].is_ascii_alphabetic();
+    }
+    false
+}
+
+fn has_bogus_comment_candidate(bytes: &[u8]) -> bool {
+    // ~keep Markers inside quotes, comments, or CDATA may produce false positives here;
+    // ~keep the full scanner resolves those. Reject only inputs containing no removal marker.
+    memchr::memchr3_iter(b'?', b'!', b'/', bytes).any(|idx| {
+        if idx == 0 || bytes[idx - 1] != b'<' {
+            return false;
+        }
+        let next = bytes[idx];
+        let rest = &bytes[idx + 1..];
+        if next == b'!' && (rest.starts_with(b"--") || rest.starts_with(b"[CDATA[")) {
+            return false;
+        }
+        is_bogus_comment_marker(bytes, idx - 1, bytes.len(), next, rest)
+    })
+}
+
+/// Remove HTML5 *bogus comments* so they do not leak into the output as text.
+///
+/// The tokenizer enters the bogus-comment state from three places, and in all of them the
+/// run through the next `>` becomes a comment token, which renders as nothing:
+///
+/// - `<?` — a "processing instruction" is not a thing in HTML; `<?php … ?>` is a comment.
+/// - `<!` not beginning `--`, `DOCTYPE`, or `[CDATA[`.
+/// - `</` followed by anything that is not an ASCII letter, e.g. `</3>` or `</ >`.
+///
+/// Real comments already convert to nothing, so leaving these as text was inconsistent as
+/// well as wrong: `<?php echo 1; ?>` emitted `?php echo 1; ?>`, and `<!bogus>` emitted a
+/// stray `>`.
+///
+/// `<![CDATA[` is deliberately NOT treated as a bogus comment here. It only is one outside
+/// foreign content; inside `<svg>` or `<math>` it is real CDATA, and this pass has no
+/// element context to tell them apart. Getting that wrong would corrupt SVG, so the narrower
+/// behaviour is kept (see `tools/benchmark-harness/fixtures/synthetic/cdata_in_svg.html`).
+///
+/// Real tags are skipped with the quote-aware [`find_tag_end`] rather than scanned through,
+/// so a `<?` or `<!` inside an attribute value cannot be mistaken for a bogus comment.
+pub fn strip_bogus_comments(input: &str) -> Cow<'_, str> {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    // ~keep The shortest bogus comment is two bytes (`<?`, `</`, `<!` at end of input), so
+    // ~keep the cheap bail must not be wider than that.
+    if len < 2 || !has_bogus_comment_candidate(bytes) {
+        return Cow::Borrowed(input);
+    }
+
+    let mut idx = 0;
+    let mut last = 0;
+    let mut output: Option<String> = None;
+
+    while let Some(offset) = memchr::memchr(b'<', &bytes[idx..]) {
+        idx += offset;
+        if idx + 1 >= len {
+            break;
+        }
+
+        let next = bytes[idx + 1];
+        let rest = if idx + 2 <= len {
+            &bytes[idx + 2..]
+        } else {
+            &bytes[len..]
+        };
+
+        if let Some(new_idx) = skip_real_comment_or_cdata(bytes, idx, len, next, rest) {
+            idx = new_idx;
+            continue;
+        }
+
+        if !is_bogus_comment_marker(bytes, idx, len, next, rest) {
+            // ~keep Skip a real tag wholesale so a `<?`/`<!` sitting inside a quoted
+            // ~keep attribute value is never seen as a bogus comment of its own.
+            if next.is_ascii_alphabetic() {
+                if let Some(tag_end) = find_tag_end(bytes, idx + 1) {
+                    idx = tag_end;
+                    continue;
+                }
+            }
+            idx += 1;
+            continue;
+        }
+
+        // ~keep The bogus-comment state ends at the first `>` regardless of quoting, or at
+        // ~keep end-of-input if there is none -- unlike a tag, it has no attribute grammar.
+        let end = memchr::memchr(b'>', &bytes[idx + 1..]).map_or(len, |off| idx + 1 + off + 1);
+        let out = output.get_or_insert_with(|| String::with_capacity(len));
+        out.push_str(&input[last..idx]);
+        last = end;
+        idx = end;
+    }
+
+    match output {
+        Some(mut out) => {
+            out.push_str(&input[last..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(input),
+    }
+}
+
+/// Compute the end index of the hidden element starting at `idx` whose opening tag spans
+/// `idx..tag_end` — either just past the opening tag itself (self-closing) or past its matching
+/// closing tag.
+///
+/// Extracted from `strip_hidden_elements`'s main scan loop — identical tag-name scan and
+/// self-closing/closing-tag dispatch, unchanged.
+fn hidden_element_remove_end(bytes: &[u8], idx: usize, tag_end: usize, len: usize) -> usize {
+    let name_start = idx + 1;
+    let mut name_end = name_start;
+    while name_end < len && !bytes[name_end].is_ascii_whitespace() && bytes[name_end] != b'>' && bytes[name_end] != b'/'
+    {
+        name_end += 1;
+    }
+    let tag_name = &bytes[name_start..name_end];
+
+    if is_self_closing_tag(&bytes[idx..tag_end], tag_name) {
+        tag_end
+    } else {
+        find_closing_tag_bytes_nested(bytes, tag_end, tag_name).unwrap_or(tag_end)
+    }
+}
+
+/// Where the removal of the element whose open tag spans `idx..tag_end` ends, or `None` when
+/// the element must be kept.
+///
+/// The `hidden` attribute and a definitive `display`/`visibility` declaration remove the
+/// subtree outright. `font-size: 0` must preserve images and descendants that restore a readable size.
+fn hidden_element_removal_end(input: &str, bytes: &[u8], idx: usize, tag_end: usize, len: usize) -> Option<usize> {
+    let tag_slice = &input[idx..tag_end];
+    if tag_has_hidden_attribute(tag_slice) {
+        return Some(hidden_element_remove_end(bytes, idx, tag_end, len));
+    }
+    match hidden_style_reason(tag_slice)? {
+        HiddenStyleReason::Definitive => Some(hidden_element_remove_end(bytes, idx, tag_end, len)),
+        HiddenStyleReason::FontSizeZero => {
+            if matches_tag_start(bytes, idx + 1, b"img") {
+                return None;
+            }
+            let remove_end = hidden_element_remove_end(bytes, idx, tag_end, len);
+            // ~keep Scan past the element's own open tag so its `font-size: 0` is not re-read.
+            let subtree = input.get(tag_end..remove_end).unwrap_or("");
+            (!region_restores_visible_content(subtree)).then_some(remove_end)
+        }
+    }
+}
+
 pub fn strip_hidden_elements(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
     let len = bytes.len();
@@ -1128,32 +1608,36 @@ pub fn strip_hidden_elements(input: &str) -> Cow<'_, str> {
         return Cow::Borrowed(input);
     }
 
+    // ~keep Every removal requires a `hidden` or `style` attribute; without either
+    // ~keep initial ASCII letter, even malformed or quoted tag-like text cannot match.
+    if memchr::memchr2(b'h', b'H', bytes).is_none() && memchr::memchr2(b's', b'S', bytes).is_none() {
+        return Cow::Borrowed(input);
+    }
+
+    // ~keep DoS guard: a run of unterminated `<` (no `>` anywhere in the rest of the
+    // ~keep document) makes `find_tag_end` scan to EOF on every single one, turning this
+    // ~keep loop quadratic. Once no `>` remains past `idx`, `find_tag_end` is guaranteed
+    // ~keep to fail regardless of quoting, so `last_gt` lets every remaining iteration
+    // ~keep skip the call in O(1) instead of re-scanning to the end each time.
+    let last_gt = bytes.iter().rposition(|&b| b == b'>');
+
     let mut idx = 0;
     let mut last = 0;
     let mut output: Option<String> = None;
 
     while idx < len {
-        if bytes[idx] == b'<' && idx + 1 < len && bytes[idx + 1] != b'/' && bytes[idx + 1] != b'!' {
+        let Some(offset) = memchr::memchr(b'<', &bytes[idx..]) else {
+            break;
+        };
+        idx += offset;
+        // ~keep A `<` not immediately followed by an ASCII letter can never start a real
+        // ~keep HTML tag name (HTML5 tokenizer "tag open state"), so it is never worth a
+        // ~keep `find_tag_end` scan. Without this, a run like `<<<<<` treats every `<` as a
+        // ~keep candidate tag start, and each failing scan re-walks the same suffix.
+        let starts_tag_name = idx + 1 < len && bytes[idx + 1].is_ascii_alphabetic();
+        if starts_tag_name && last_gt.is_some_and(|gt| gt > idx) {
             if let Some(tag_end) = find_tag_end(bytes, idx + 1) {
-                let tag_slice = &input[idx..tag_end];
-                if tag_has_hidden_attribute(tag_slice) || tag_has_hidden_style(tag_slice) {
-                    let name_start = idx + 1;
-                    let mut name_end = name_start;
-                    while name_end < len
-                        && !bytes[name_end].is_ascii_whitespace()
-                        && bytes[name_end] != b'>'
-                        && bytes[name_end] != b'/'
-                    {
-                        name_end += 1;
-                    }
-                    let tag_name = &bytes[name_start..name_end];
-
-                    let remove_end = if is_self_closing_tag(&bytes[idx..tag_end], tag_name) {
-                        tag_end
-                    } else {
-                        find_closing_tag_bytes_nested(bytes, tag_end, tag_name).unwrap_or(tag_end)
-                    };
-
+                if let Some(remove_end) = hidden_element_removal_end(input, bytes, idx, tag_end, len) {
                     let out = output.get_or_insert_with(|| String::with_capacity(len));
                     out.push_str(&input[last..idx]);
                     last = remove_end;
@@ -1173,6 +1657,34 @@ pub fn strip_hidden_elements(input: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(input)
     }
+}
+
+/// Consume an optional `=value` following an attribute name, starting at `i` (already past the
+/// name and any whitespace). Returns the index just past the value (quoted or bare), or `i`
+/// unchanged if there is no `=`.
+///
+/// Extracted from `tag_has_hidden_attribute` — identical quote-aware value scan, unchanged.
+fn skip_attribute_value(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    if i >= len || bytes[i] != b'=' {
+        return i;
+    }
+    i += 1;
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < len && (bytes[i] == b'"' || bytes[i] == b'\'') {
+        let quote = bytes[i];
+        i += 1;
+        while i < len && bytes[i] != quote {
+            i += 1;
+        }
+        i += 1;
+    } else {
+        while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+            i += 1;
+        }
+    }
+    i
 }
 
 /// Check if an opening tag string contains the `hidden` attribute.
@@ -1213,24 +1725,7 @@ pub fn tag_has_hidden_attribute(tag: &str) -> bool {
         while i < len && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if i < len && bytes[i] == b'=' {
-            i += 1;
-            while i < len && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i < len && (bytes[i] == b'"' || bytes[i] == b'\'') {
-                let quote = bytes[i];
-                i += 1;
-                while i < len && bytes[i] != quote {
-                    i += 1;
-                }
-                i += 1;
-            } else {
-                while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
-                    i += 1;
-                }
-            }
-        }
+        i = skip_attribute_value(bytes, i, len);
 
         if name.eq_ignore_ascii_case(b"hidden") {
             return true;
@@ -1262,54 +1757,157 @@ fn strip_css_comments(declaration: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Check if an opening tag's inline `style` attribute hides the element via
-/// `display: none` or `visibility: hidden`.
+/// Why an element's inline `style` marks it as never rendered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HiddenStyleReason {
+    /// `display: none` or `visibility: hidden` — neither the element nor its subtree renders,
+    /// whatever a descendant declares.
+    Definitive,
+    /// `font-size: 0` — the element's own text is invisible, but the same declaration is also
+    /// the classic inline-block/email spacing hack, where a descendant sets its own non-zero
+    /// `font-size` and *does* render. Callers must check the subtree before removing it.
+    FontSizeZero,
+}
+
+/// Last-declaration-wins scan of an inline `style` value for the three properties that decide
+/// whether an element renders.
 ///
-/// This is a targeted declaration scan, not a full CSS parser: it extracts the raw
-/// `style` attribute value, splits it on `;`, and inspects each `property: value`
-/// pair. Untrusted input is handled defensively — extra whitespace around `:` and
-/// `;`, mixed casing, and a trailing `!important` (with or without a preceding
-/// space) are all tolerated.
-///
-/// ~keep `pub(crate)`: also called from `tier1::scanner` (see
-/// ~keep `tag_has_hidden_attribute` above).
-pub fn tag_has_hidden_style(tag: &str) -> bool {
-    let Some(style_value) = extract_attribute_value(tag, "style") else {
-        return false;
-    };
+/// Returns `(display_hides, visibility_hides, font_size_zero)`, where the third element is
+/// `None` when `font-size` is not declared at all, and `Some(is_zero)` when it is.
+fn scan_visibility_declarations(style_value: &str) -> (bool, bool, Option<bool>) {
     // ~keep CSS cascade: within one declaration block the LAST declaration for a property
     // ~keep wins, so `display:none; display:block` is VISIBLE. Matching with `.any()`
     // ~keep stripped it.
     let mut display_hides = false;
     let mut visibility_hides = false;
+    let mut font_size_zero = None;
     for declaration in style_value.split(';') {
         let cleaned = strip_css_comments(declaration);
         let Some((property, value)) = cleaned.split_once(':') else {
             continue;
         };
         let property = property.trim();
+        // ~keep `!important` (any casing, with or without a preceding space) is a CSS
+        // ~keep priority flag, not part of the value — drop everything from `!` onward.
         let value = value.split('!').next().unwrap_or("").trim();
         if property.eq_ignore_ascii_case("display") {
             display_hides = value.eq_ignore_ascii_case("none");
         } else if property.eq_ignore_ascii_case("visibility") {
             visibility_hides = value.eq_ignore_ascii_case("hidden");
+        } else if property.eq_ignore_ascii_case("font-size") {
+            font_size_zero = Some(css_length_is_zero(value));
         }
     }
-    display_hides || visibility_hides
+    (display_hides, visibility_hides, font_size_zero)
 }
 
-/// Check whether a single CSS declaration (`property: value`) hides its element.
-fn declaration_hides_element(declaration: &str) -> bool {
-    let Some((property, value)) = declaration.split_once(':') else {
+/// Whether a CSS length value is an exact zero: `0`, `0px`, `0.0em`, `.0%` and friends, in any
+/// casing. A unit is optional (CSS permits a bare `0`) but must be a real length or percentage
+/// unit when present, so a function call or keyword never reads as zero.
+fn css_length_is_zero(value: &str) -> bool {
+    const ZERO_UNITS: [&str; 16] = [
+        "px", "pt", "pc", "em", "rem", "ex", "ch", "vw", "vh", "vmin", "vmax", "cm", "mm", "in", "q", "%",
+    ];
+    let digits_end = value
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(digits_end);
+    if number.is_empty() || number == "." || number.matches('.').count() > 1 {
+        return false;
+    }
+    if number.bytes().any(|b| b != b'0' && b != b'.') {
+        return false;
+    }
+    let unit = unit.trim();
+    unit.is_empty() || ZERO_UNITS.iter().any(|candidate| unit.eq_ignore_ascii_case(candidate))
+}
+
+/// Classify how an opening tag's inline `style` attribute hides the element, if at all.
+///
+/// This is a targeted declaration scan, not a full CSS parser: it extracts the raw `style`
+/// attribute value, splits it on `;`, and inspects each `property: value` pair. Untrusted
+/// input is handled defensively — extra whitespace around `:` and `;`, mixed casing, and a
+/// trailing `!important` (with or without a preceding space) are all tolerated.
+pub fn hidden_style_reason(tag: &str) -> Option<HiddenStyleReason> {
+    let style_value = extract_attribute_value(tag, "style")?;
+    let (display_hides, visibility_hides, font_size_zero) = scan_visibility_declarations(style_value);
+    if display_hides || visibility_hides {
+        return Some(HiddenStyleReason::Definitive);
+    }
+    if font_size_zero == Some(true) {
+        return Some(HiddenStyleReason::FontSizeZero);
+    }
+    None
+}
+
+/// Whether an opening tag's inline `style` declares a non-zero `font-size`, which makes the
+/// element render even inside a `font-size: 0` ancestor.
+fn tag_sets_non_zero_font_size(tag: &str) -> bool {
+    let Some(style_value) = extract_attribute_value(tag, "style") else {
         return false;
     };
-    let property = property.trim();
-    // ~keep `!important` (any casing, with or without a preceding space) is a CSS
-    // ~keep priority flag, not part of the value — drop everything from `!` onward.
-    let value = value.split('!').next().unwrap_or("").trim();
+    scan_visibility_declarations(style_value).2 == Some(false)
+}
 
-    (property.eq_ignore_ascii_case("display") && value.eq_ignore_ascii_case("none"))
-        || (property.eq_ignore_ascii_case("visibility") && value.eq_ignore_ascii_case("hidden"))
+/// Whether `region` contains an image or re-declares a non-zero `font-size`.
+///
+/// `font-size: 0` on a wrapper is a well-known inline-block/email spacing hack: the wrapper
+/// kills the whitespace between children while each child restores a readable size. Removing
+/// such a subtree would delete genuinely visible text, so the removal is skipped when a
+/// descendant opts back in. This is a one-level-of-inheritance heuristic, not a cascade — a
+/// size restored from a stylesheet is out of reach of a byte-level pass.
+fn region_restores_visible_content(region: &str) -> bool {
+    let bytes = region.as_bytes();
+    let len = bytes.len();
+    let mut idx = 0;
+    while idx < len {
+        if let Some(end) = skip_opaque_region(bytes, idx) {
+            idx = end;
+            continue;
+        }
+        if bytes[idx] == b'<' && idx + 1 < len && bytes[idx + 1].is_ascii_alphabetic() {
+            if let Some(tag_end) = find_tag_end(bytes, idx + 1) {
+                let tag = &region[idx..tag_end];
+                if tag_has_hidden_attribute(tag) || hidden_style_reason(tag) == Some(HiddenStyleReason::Definitive) {
+                    idx = hidden_element_remove_end(bytes, idx, tag_end, len);
+                    continue;
+                }
+                if tag_sets_non_zero_font_size(tag) || matches_tag_start(bytes, idx + 1, b"img") {
+                    return true;
+                }
+                idx = tag_end;
+                continue;
+            }
+        }
+        idx += 1;
+    }
+    false
+}
+
+/// Check if an opening tag's inline `style` attribute hides the element.
+///
+/// ~keep `pub`: also called from `tier1::scanner` (see `tag_has_hidden_attribute` above).
+/// ~keep Tier-1 bails on any hit, including the `font-size: 0` case whose subtree Tier-2 may
+/// ~keep still keep — a conservative bail that falls through to Tier-2 rather than diverging.
+pub fn tag_has_hidden_style(tag: &str) -> bool {
+    hidden_style_reason(tag).is_some()
+}
+
+/// If `i` (already past an attribute name and whitespace) points at `=`, scan its value with
+/// `scan_attribute_value` and return `(Some(value), next_i)`; otherwise return `(None, i)`
+/// unchanged.
+///
+/// Extracted from `extract_attribute_value` — identical `=value` handling, unchanged.
+fn scan_optional_attribute_value<'a>(bytes: &[u8], tag: &'a str, mut i: usize, len: usize) -> (Option<&'a str>, usize) {
+    if i >= len || bytes[i] != b'=' {
+        return (None, i);
+    }
+    i += 1;
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let (val, next) = scan_attribute_value(bytes, tag, i);
+    (Some(val), next)
 }
 
 /// Extract the value of a named attribute from a raw opening-tag string.
@@ -1344,16 +1942,8 @@ fn extract_attribute_value<'a>(tag: &'a str, attr_name: &str) -> Option<&'a str>
             i += 1;
         }
 
-        let mut value: Option<&str> = None;
-        if i < len && bytes[i] == b'=' {
-            i += 1;
-            while i < len && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            let (val, next) = scan_attribute_value(bytes, tag, i);
-            value = Some(val);
-            i = next;
-        }
+        let (value, next_i) = scan_optional_attribute_value(bytes, tag, i, len);
+        i = next_i;
 
         if name.eq_ignore_ascii_case(attr_name) {
             return value;
@@ -1389,10 +1979,92 @@ fn scan_attribute_value<'a>(bytes: &[u8], tag: &'a str, start: usize) -> (&'a st
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::{
-        find_closing_tag_bytes, find_closing_tag_bytes_nested, normalize_bogus_comment_endings,
-        normalize_split_closing_tags, normalize_unclosed_list_items, sanitize_markdown_url, strip_hidden_elements,
+        find_closing_tag_bytes, find_closing_tag_bytes_nested, find_tag_end, normalize_bogus_comment_endings,
+        normalize_split_closing_tags, normalize_unclosed_list_items, sanitize_markdown_url, strip_bogus_comments,
+        strip_hidden_elements,
     };
+
+    #[test]
+    fn should_find_tag_end_outside_quotes_from_the_requested_byte() {
+        let cases: &[(&[u8], usize, Option<usize>)] = &[
+            (b"", 0, None),
+            (b">", 0, Some(1)),
+            (b">", 1, None),
+            (b">", usize::MAX, None),
+            (b"a>b", 0, Some(2)),
+            (b"'>' >", 0, Some(5)),
+            (b"\"'>'\">", 0, Some(6)),
+            (b"'\" >' >", 0, Some(7)),
+            (b"\"unterminated >", 0, None),
+            (b"\"abc\">", 1, None),
+            (b"\\\">", 0, None),
+            (b"\xff'>\0'\xfe>", 0, Some(7)),
+        ];
+        for &(input, start, expected) in cases {
+            assert_eq!(find_tag_end(input, start), expected, "input: {input:?}, start: {start}");
+        }
+    }
+
+    #[test]
+    fn should_borrow_html_without_bogus_comments() {
+        for input in [
+            "",
+            "<",
+            "é日 text<",
+            "<p title='a<?b>c'>é日</p><",
+            "<!--[if gte mso 9]><?ignored?><![endif]--><p>kept</p>",
+            "<![CDATA[<?not markup>]]><p>kept</p>",
+            "<!DOCTYPE html><p>kept</p>",
+            "<!-- unterminated <?ignored>",
+            "<![CDATA[unterminated <?ignored>",
+        ] {
+            let actual = strip_bogus_comments(input);
+            assert_eq!(actual.as_ref(), input, "input: {input}");
+            assert!(matches!(actual, Cow::Borrowed(_)), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn should_remove_bogus_comments_at_utf8_and_markup_boundaries() {
+        for (input, expected) in [
+            ("é<?a><!b></3>日<", "é日<"),
+            ("<p title='a<?b>c'>é</p><?drop>日", "<p title='a<?b>c'>é</p>日"),
+            ("<!-- <?kept> --><?drop>日", "<!-- <?kept> -->日"),
+            ("<![CDATA[<?kept>]]><?drop>日", "<![CDATA[<?kept>]]>日"),
+            ("é<?'quoted>日", "é日"),
+            ("é<?", "é"),
+            ("é<!", "é"),
+            ("é</", "é"),
+        ] {
+            let actual = strip_bogus_comments(input);
+            assert_eq!(actual.as_ref(), expected, "input: {input}");
+            assert!(matches!(actual, Cow::Owned(_)), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn should_distinguish_bogus_markers_from_recognized_prefixes() {
+        for (input, expected) in [
+            ("é /!? 日", "é /!? 日"),
+            ("<!DOC>é", "é"),
+            ("<!DOCTYPE", "<!DOCTYPE"),
+            ("<!dOcTyPe html><p>é</p>", "<!dOcTyPe html><p>é</p>"),
+            ("<![cdata[x]]>é", "é"),
+            ("<![CDATA[<?x>]]>é", "<![CDATA[<?x>]]>é"),
+            ("<!--<?x>-->é", "<!--<?x>-->é"),
+            ("</é>日", "日"),
+            ("</a>", "</a>"),
+            ("</A>", "</A>"),
+            ("<p title='<!bad><?bad></3>'>é</p>", "<p title='<!bad><?bad></3>'>é</p>"),
+        ] {
+            let actual = strip_bogus_comments(input);
+            assert_eq!(actual.as_ref(), expected, "input: {input}");
+            assert_eq!(matches!(actual, Cow::Borrowed(_)), input == expected, "input: {input}");
+        }
+    }
 
     #[test]
     fn normalize_bogus_comment_endings_leaves_well_formed_comment_unchanged() {
@@ -1430,6 +2102,19 @@ mod tests {
     }
 
     #[test]
+    fn normalize_bogus_comment_endings_rewrites_abrupt_closing_of_empty_comment() {
+        // ~keep `<!-->` and `<!--->` are HTML5's "abrupt-closing-of-empty-comment"
+        // ~keep quirk: legal, empty comments whose open and close share dashes.
+        let input = "<p>Before</p><!--><p>After</p>";
+        let result = normalize_bogus_comment_endings(input);
+        assert_eq!(result.as_ref(), "<p>Before</p><!----><p>After</p>");
+
+        let input = "<p>Before</p><!---><p>After</p>";
+        let result = normalize_bogus_comment_endings(input);
+        assert_eq!(result.as_ref(), "<p>Before</p><!----><p>After</p>");
+    }
+
+    #[test]
     fn normalize_bogus_comment_endings_handles_no_comments() {
         let input = "<p>Just a paragraph</p>";
         let result = normalize_bogus_comment_endings(input);
@@ -1440,6 +2125,77 @@ mod tests {
     fn normalize_bogus_comment_endings_empty_input() {
         let result = normalize_bogus_comment_endings("");
         assert_eq!(result.as_ref(), "");
+    }
+
+    #[test]
+    fn should_preserve_hidden_style_markers_without_false_negative_skips() {
+        let cases = [
+            ("<ul><li>a<li>b<li>c</ul>\n", "<ul><li>a<li>b<li>c</ul>\n", false),
+            ("é<div>visible</div>", "é<div>visible</div>", false),
+            ("<b HIDDEN>x</b>", "", true),
+            ("<b STYLE='DISPLAY:NONE'>x</b>", "", true),
+            ("<b style='display:none'>x</b>", "", true),
+            ("<b title='HIDDEN STYLE'>x</b>", "<b title='HIDDEN STYLE'>x</b>", false),
+        ];
+        for (input, expected, owned) in cases {
+            let actual = strip_hidden_elements(input);
+            assert_eq!(actual, expected, "input: {input:?}");
+            assert_eq!(matches!(actual, Cow::Owned(_)), owned, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn should_preserve_hidden_element_scan_boundaries_and_borrowing() {
+        let cases = [
+            ("é text<", "é text<", false),
+            ("<span hidden", "<span hidden", false),
+            ("<<span hidden>x</span>終", "<終", true),
+            ("< span hidden>x</ span>", "< span hidden>x</ span>", false),
+            (
+                "<div title='<span hidden>x</span>'>ok</div>",
+                "<div title=''>ok</div>",
+                true,
+            ),
+            ("<i hidden>x</i><b hidden>y</b>z", "z", true),
+            (
+                "<div data-hidden='true'>x</div>",
+                "<div data-hidden='true'>x</div>",
+                false,
+            ),
+            (
+                "<div style='font-size:0'><b style='font-size:12px'>x</b></div>",
+                "<div style='font-size:0'><b style='font-size:12px'>x</b></div>",
+                false,
+            ),
+        ];
+        for (input, expected, owned) in cases {
+            let actual = strip_hidden_elements(input);
+            assert_eq!(actual, expected, "input: {input:?}");
+            assert_eq!(matches!(actual, Cow::Owned(_)), owned, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn should_preserve_split_closing_tag_boundaries_and_borrowing() {
+        let cases = [
+            ("é\ntext</", "é\ntext</", false),
+            ("é\ntext<", "é\ntext<", false),
+            ("\n<", "\n<", false),
+            ("\n</</a\n>", "\n</</a>", true),
+            ("\n</a!></b\r\n >", "\n</a!></b>", true),
+            ("é</custom-42\n>終</B\n>", "é</custom-42>終</B>", true),
+            ("\n</a ", "\n</a ", false),
+            ("</a\r>", "</a\r>", false),
+            ("\n</a\r>", "\n</a>", true),
+            ("\n</ a\n>", "\n</ a\n>", false),
+            ("<!-- </a\n> -->", "<!-- </a> -->", true),
+            ("<x a='</b\n>'>", "<x a='</b>'>", true),
+        ];
+        for (input, expected, owned) in cases {
+            let actual = normalize_split_closing_tags(input);
+            assert_eq!(actual, expected, "input: {input:?}");
+            assert_eq!(matches!(actual, Cow::Owned(_)), owned, "input: {input:?}");
+        }
     }
 
     #[test]

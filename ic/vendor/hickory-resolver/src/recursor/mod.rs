@@ -16,7 +16,7 @@ use std::{
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{Arc, atomic::AtomicU8},
+    sync::Arc,
     time::Instant,
 };
 
@@ -61,7 +61,7 @@ mod error;
 pub use error::{AuthorityData, RecursorError};
 
 mod handle;
-use handle::RecursorDnsHandle;
+use handle::{RecursorDnsHandle, RequestLimits};
 
 #[cfg(test)]
 mod tests;
@@ -359,7 +359,7 @@ impl<P: ConnectionProvider> Recursor<P> {
                         request_time,
                         query_has_dnssec_ok,
                         0,
-                        Arc::new(AtomicU8::new(0)),
+                        &RequestLimits::new(),
                     )
                     .await
             }
@@ -634,6 +634,10 @@ pub struct RecursorOptions {
     /// See [DnsRequestOptions::edns_payload_len][crate::proto::op::DnsRequestOptions::edns_payload_len].
     #[cfg_attr(feature = "serde", serde(default = "default_edns_payload_len"))]
     pub edns_payload_len: u16,
+
+    /// Configure QNAME minimization.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub qname_minimization: QNameMinimization,
 }
 
 impl Default for RecursorOptions {
@@ -652,6 +656,7 @@ impl Default for RecursorOptions {
             case_randomization: false,
             opportunistic_encryption: OpportunisticEncryption::default(),
             edns_payload_len: default_edns_payload_len(),
+            qname_minimization: QNameMinimization::default(),
         }
     }
 }
@@ -783,6 +788,18 @@ pub enum DnssecPolicyConfig {
         /// set to control the size of the DNSSEC validation cache.  Set to none to use the default
         validation_cache_size: Option<usize>,
     },
+}
+
+/// Configuration for QNAME minimization (RFC 9156).
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum QNameMinimization {
+    /// Enforce RFC 8020: short-circuit on NXDOMAIN.
+    #[default]
+    Strict,
+
+    /// Relax RFC 8020: continue on NXDOMAIN.
+    Relaxed,
 }
 
 /// Bailiwick/sub zone checking.

@@ -12,6 +12,13 @@ rust-version.workspace = true
 description = "High-performance HTML to Markdown converter using the astral-tl parser. Part of the Xberg ecosystem."
 keywords = ["html", "markdown", "converter", "astral-tl", "doc-processing"]
 categories = ["parsing", "text-processing", "web-programming"]
+# ~keep These two tests `include_str!` the CommonMark spec fixture from
+# ~keep `packages/python/tests/`, which is outside this package root and so is not
+# ~keep carried by `cargo package`. Shipping them would publish a crate whose
+# ~keep `cargo test` cannot compile. They are excluded rather than having the
+# ~keep fixture moved in, because that fixture is CC-BY-SA and vendoring it into
+# ~keep the published artifact is a licensing decision, not a packaging one.
+exclude = ["tests/commonmark_compliance_test.rs", "tests/commonmark_spec_fixpoint.rs"]
 
 [package.metadata.cargo-machete]
 ignored = ["once_cell", "ahash"]
@@ -38,22 +45,22 @@ bitflags = "2"
 html-escape = "0.2.15"
 html5ever.workspace = true
 image = { version = "0.25", default-features = false, features = [
-  "gif",
-  "jpeg",
-  "png",
-  "bmp",
-  "webp",
+    "gif",
+    "jpeg",
+    "png",
+    "bmp",
+    "webp",
 ], optional = true }
 memchr = "2"
 once_cell.workspace = true
 phf = { version = "0.14", features = ["macros"] }
 regex.workspace = true
-rmcp = { version = "3.1.4", features = [
-  "server",
-  "macros",
-  "transport-io",
-  "transport-streamable-http-server",
-  "server-side-http",
+rmcp = { version = "3.4.1", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+    "server-side-http",
 ], optional = true }
 schemars = { version = "1.2.2", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
@@ -64,10 +71,17 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"], opt
 tower = { version = "0.5", default-features = false, features = ["limit", "timeout"], optional = true }
 tower-http = { version = "0.7", default-features = false, features = ["limit"], optional = true }
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
+comrak = { version = "0.55.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml.workspace = true
+
+[[example]]
+name = "test_deser"
+required-features = ["serde"]
 
 [lints]
 workspace = true

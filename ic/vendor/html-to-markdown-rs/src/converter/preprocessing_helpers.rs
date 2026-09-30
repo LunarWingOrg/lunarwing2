@@ -3,8 +3,8 @@
 //! This module contains helper functions for preprocessing HTML before conversion,
 //! including validation and normalization checks.
 
-use crate::converter::dom_context::DomContext;
-use crate::converter::main_helpers::is_inline_element;
+use crate::converter::dom_context::{DomContext, TagInfo};
+use crate::converter::main_helpers::{is_ascii_whitespace_only, is_inline_element};
 use crate::converter::utility::attributes::{attribute_matches_any, element_has_navigation_hint};
 use crate::options::ConversionOptions;
 
@@ -21,23 +21,72 @@ pub fn inline_ancestor_allows_block(tag_name: &str) -> bool {
 /// ~keep instead, since each scan only ever needs the *nearest* qualifying ancestor.
 #[derive(Clone, Copy)]
 struct MisnestState {
+    /// True if a strict ancestor is an anchor.
+    inside_anchor: bool,
     /// True if this node or any strict ancestor is `<pre>`/`<code>`.
     inside_preformatted: bool,
     /// True if any strict ancestor is an inline element that disallows block children.
     blocked_by_inline_ancestor: bool,
     /// Result of a `has_p_ancestor` scan started at this node (used by its children).
     p_ancestor_state: bool,
+    /// True if a strict ancestor is `<li>`/`<dt>`/`<dd>` with no intervening
+    /// `<ul>`/`<ol>`/`<dl>` (i.e. we are still "inside" that same list item).
+    list_item_ancestor_state: bool,
+    /// True if a strict ancestor is `<td>`/`<th>` with no intervening
+    /// `<table>`/`<thead>`/`<tbody>`/`<tfoot>`/`<tr>` (i.e. we are still "inside"
+    /// that same cell's content, not a fresh row).
+    cell_ancestor_state: bool,
 }
 
 impl MisnestState {
     const ROOT: Self = Self {
+        inside_anchor: false,
         inside_preformatted: false,
         blocked_by_inline_ancestor: false,
         p_ancestor_state: false,
+        list_item_ancestor_state: false,
+        cell_ancestor_state: false,
     };
 }
 
-/// Detect block elements that were incorrectly nested under inline ancestors.
+/// True when `info`, reached with inherited `state`, is one of the misnestings this pass repairs.
+///
+/// ~keep Each disjunct is an independent, side-effect-free shape check, so collecting them here
+/// ~keep preserves the original sequence of early returns exactly -- same order, same
+/// ~keep short-circuiting, same answer -- while keeping the walk itself under the complexity limit
+/// ~keep (issue #465).
+fn node_is_misnested(info: &TagInfo, state: MisnestState, self_inside_preformatted: bool) -> bool {
+    // An anchor nested inside another anchor, outside preformatted content.
+    (info.name == "a" && state.inside_anchor && !state.inside_preformatted)
+        // ~keep Table elements under <p>: tl misparsed an unclosed <p> in <td>.
+        || (matches!(info.name.as_str(), "td" | "tr" | "th") && state.p_ancestor_state)
+        || (info.is_block && !self_inside_preformatted && state.blocked_by_inline_ancestor)
+        // ~keep <li>/<dt>/<dd> nested under another one without an intervening list
+        // ~keep container: tl absorbed the next item because a <p>/<div> inside the
+        // ~keep previous one was left unclosed.
+        || (matches!(info.name.as_str(), "li" | "dt" | "dd") && state.list_item_ancestor_state)
+        // ~keep <tr> nested directly inside a <td>/<th>: not reachable per HTML5 tree
+        // ~keep construction, and silently dropped by the table renderer (issue #486).
+        || (info.name == "tr" && state.cell_ancestor_state)
+}
+
+/// Inherited state to hand to every child of `info`.
+fn child_misnest_state(info: &TagInfo, state: MisnestState, self_inside_preformatted: bool) -> MisnestState {
+    MisnestState {
+        inside_anchor: state.inside_anchor || info.name == "a",
+        inside_preformatted: self_inside_preformatted,
+        blocked_by_inline_ancestor: state.blocked_by_inline_ancestor
+            || (is_inline_element(&info.name) && !inline_ancestor_allows_block(&info.name)),
+        p_ancestor_state: p_ancestor_state_for(&info.name, state.p_ancestor_state),
+        list_item_ancestor_state: list_item_ancestor_state_for(&info.name, state.list_item_ancestor_state),
+        cell_ancestor_state: cell_ancestor_state_for(&info.name, state.cell_ancestor_state),
+    }
+}
+
+/// Detect malformed nesting that requires HTML5 tree repair.
+///
+/// Nested anchors must be closed by the HTML5 adoption agency algorithm so their
+/// destinations remain separate Markdown links (issue #479).
 ///
 /// Excludes elements inside `<pre>` or `<code>` blocks, as they have special
 /// whitespace preservation rules and should not be repaired.
@@ -46,6 +95,35 @@ impl MisnestState {
 /// a structural impossibility in valid HTML that signals the `tl` parser absorbed
 /// a table into a paragraph because of an unclosed `<p>` (common in Word/Outlook
 /// HTML such as `<p class='MsoNormal'>` cells). Issue #336.
+///
+/// Also detects a `<li>`/`<dt>`/`<dd>` nested under another `<li>`/`<dt>`/`<dd>`
+/// with no intervening `<ul>`/`<ol>`/`<dl>`. `<li>content<div><li>more` is a
+/// structural impossibility in valid HTML: the HTML5 spec implies a closing
+/// `</li>` when a new `<li>` starts, regardless of what block elements (`<p>`,
+/// `<div>`, …) are still open inside it. `tl` does not apply that rule, so an
+/// unclosed `<p>`/`<div>` inside a list item causes it to nest the next `<li>`
+/// as a child instead of treating it as a sibling.
+///
+/// Also detects a `<tr>` nested directly inside a `<td>`/`<th>` — a structural
+/// impossibility in valid HTML (a `<tr>` is only ever a child of `<table>`,
+/// `<thead>`, `<tbody>`, or `<tfoot>`). HTML5's "in cell" insertion mode closes the
+/// open cell (and its row) before starting the new row as a sibling of the one that
+/// held the cell; `tl` instead nests it literally, and the table renderer only walks
+/// a cell's own row/table ancestry, so the nested row's content is never reached and
+/// is silently dropped. Issue #486.
+///
+/// Also detects a `<table>` with a direct child that HTML5's "in table" insertion
+/// mode would foster-parent (non-whitespace text) or restructure (any element
+/// outside the small set valid directly under `<table>`, e.g. a stray `<td>` or
+/// `<a>` with no `<tr>`). `tl` has no foster-parenting or table auto-fixup: it
+/// leaves such content exactly where it was written, as a direct child of the
+/// `<table>` node, and the table handler (`converter::block::table::builder`)
+/// only recognises `caption`/`thead`/`tbody`/`tfoot`/`tr`/`colgroup`/`col` there —
+/// silently dropping raw text and routing anything else through a no-op handler.
+///
+/// Also detects a `<tr>`/`<row>` or table section (`<thead>`/`<tbody>`/`<tfoot>`) with a
+/// misplaced element child (e.g. a `<p>` stranded inside a `<tr>` by a dropped `</table>`
+/// close tag). See [`is_row_context_with_misplaced_element`]. Issue #489.
 ///
 /// ~keep Walks the tree top-down exactly once, carrying inherited ancestor state
 /// ~keep (see [`MisnestState`]) instead of re-walking every node's ancestor chain.
@@ -69,28 +147,117 @@ pub fn has_inline_block_misnest(dom_ctx: &DomContext, parser: &tl::Parser) -> bo
             continue;
         };
 
-        // ~keep Table elements under <p>: tl misparsed an unclosed <p> in <td>.
-        if matches!(info.name.as_str(), "td" | "tr" | "th") && state.p_ancestor_state {
-            return true;
-        }
-
         let self_inside_preformatted = state.inside_preformatted || matches!(info.name.as_str(), "pre" | "code");
-        if info.is_block && !self_inside_preformatted && state.blocked_by_inline_ancestor {
+        if node_is_misnested(info, state, self_inside_preformatted) {
             return true;
         }
 
         if let Some(children) = dom_ctx.children_of(node_id) {
-            let child_state = MisnestState {
-                inside_preformatted: self_inside_preformatted,
-                blocked_by_inline_ancestor: state.blocked_by_inline_ancestor
-                    || (is_inline_element(&info.name) && !inline_ancestor_allows_block(&info.name)),
-                p_ancestor_state: p_ancestor_state_for(&info.name, state.p_ancestor_state),
-            };
+            // ~keep <table> with a direct child that a spec-compliant parser would
+            // ~keep foster-parent or restructure (see the doc comment above).
+            if info.name == "table"
+                && children
+                    .iter()
+                    .any(|child| is_foster_parenting_candidate(*child, parser, dom_ctx))
+            {
+                return true;
+            }
+
+            // ~keep A <tr>/<row> or table section (<thead>/<tbody>/<tfoot>) holding a
+            // ~keep misplaced element child: `tl`'s `read_end` (astral-tl
+            // ~keep parser/base.rs:240-256) silently discards an unmatched close tag
+            // ~keep instead of erroring, so `</table>` inside a still-open `<tr>` is
+            // ~keep dropped and a following sibling element (e.g. a footer `<p>`)
+            // ~keep attaches as a child of that `<tr>` instead of becoming `<table>`'s
+            // ~keep sibling. `collect_table_cells` only walks `td`/`th`/`cell`
+            // ~keep children, so the misattached element -- and everything after it --
+            // ~keep is silently dropped (issue #489). Deliberately element-only:
+            // ~keep `is_foster_parenting_candidate`'s text arm decodes entities and
+            // ~keep treats `&nbsp;` as non-whitespace, so widening this to text would
+            // ~keep route every Outlook/newsletter `<tr>&nbsp;</tr>` through a full
+            // ~keep html5ever re-parse for no benefit. `<tr>stray text</tr>` losing its
+            // ~keep text stays a separate, documented defect (see the CONTROL test in
+            // ~keep `issue_489_regressions.rs`).
+            if is_row_context_with_misplaced_element(info, children, parser, dom_ctx) {
+                return true;
+            }
+
+            let child_state = child_misnest_state(info, state, self_inside_preformatted);
             stack.extend(children.iter().map(|child| (*child, child_state)));
         }
     }
 
     false
+}
+
+/// True if `child`, as a direct child of a `<table>` element, is content that a
+/// spec-compliant HTML5 parser would foster-parent (non-whitespace text) or
+/// restructure (an element outside the small set valid directly under `<table>`)
+/// rather than leave in place.
+///
+/// A comment is neither: HTML5's "in table" insertion mode inserts a comment token
+/// as a child of the current node (the table itself), so it is not lost and needs
+/// no repair.
+fn is_foster_parenting_candidate(child: tl::NodeHandle, parser: &tl::Parser, dom_ctx: &DomContext) -> bool {
+    match child.get(parser) {
+        Some(tl::Node::Raw(bytes)) => {
+            let raw = bytes.as_utf8_str();
+            let decoded = crate::text::decode_html_entities_cow(raw.as_ref());
+            !is_ascii_whitespace_only(&decoded)
+        }
+        Some(tl::Node::Tag(_)) => dom_ctx
+            .tag_name_for(child, parser)
+            .is_some_and(|name| !is_table_structural_child(name.as_ref())),
+        _ => false,
+    }
+}
+
+/// Tag names valid as a direct child of `<table>` per the HTML5 "in table" insertion
+/// mode: `caption`, `colgroup`, `col`, `thead`/`tbody`/`tfoot`, `tr`, plus
+/// `style`/`script`/`template`, which are left wherever they are written. `row` is
+/// this codebase's normalized alias for `tr` from non-HTML input sources (see
+/// `converter::block::table::scanner`).
+fn is_table_structural_child(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "caption" | "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr" | "row" | "style" | "script" | "template"
+    )
+}
+
+/// True when `info` is a `<tr>`/`<row>` or table section (`<thead>`/`<tbody>`/`<tfoot>`) with an
+/// element child outside the set valid in that context (see [`is_row_structural_child`] and
+/// [`is_section_structural_child`]). Element children only -- see the call site's doc comment for
+/// why text is deliberately excluded.
+fn is_row_context_with_misplaced_element(
+    info: &TagInfo,
+    children: &[tl::NodeHandle],
+    parser: &tl::Parser,
+    dom_ctx: &DomContext,
+) -> bool {
+    let valid: fn(&str) -> bool = match info.name.as_str() {
+        "tr" | "row" => is_row_structural_child,
+        "thead" | "tbody" | "tfoot" => is_section_structural_child,
+        _ => return false,
+    };
+    children.iter().any(|child| {
+        matches!(child.get(parser), Some(tl::Node::Tag(_)))
+            && dom_ctx
+                .tag_name_for(*child, parser)
+                .is_some_and(|name| !valid(name.as_ref()))
+    })
+}
+
+/// Tag names valid as a direct child of `<tr>`/`<row>`: `td`/`th`/`cell` (this codebase's
+/// normalized cell aliases, see `converter::block::table::scanner`), plus `script`/`style`/
+/// `template`, which are left wherever they are written.
+fn is_row_structural_child(tag_name: &str) -> bool {
+    matches!(tag_name, "td" | "th" | "cell" | "script" | "style" | "template")
+}
+
+/// Tag names valid as a direct child of `<thead>`/`<tbody>`/`<tfoot>`: `tr`/`row`, plus
+/// `script`/`style`/`template`, which are left wherever they are written.
+fn is_section_structural_child(tag_name: &str) -> bool {
+    matches!(tag_name, "tr" | "row" | "script" | "style" | "template")
 }
 
 /// Compute the `has_p_ancestor` scan result to hand down to a node's children,
@@ -103,6 +270,41 @@ fn p_ancestor_state_for(tag_name: &str, inherited: bool) -> bool {
     if tag_name == "p" {
         true
     } else if matches!(tag_name, "table" | "body" | "html") {
+        false
+    } else {
+        inherited
+    }
+}
+
+/// Compute the `list_item_ancestor_state` scan result to hand down to a node's
+/// children, given the node's own tag name and the state its own parent handed down.
+///
+/// A `<li>`/`<dt>`/`<dd>` ancestor found before crossing a `<ul>`/`<ol>`/`<dl>`
+/// (a new list context) counts; crossing into a new list container, or the
+/// `table`/`body`/`html` boundary, resets the search — a `<li>` nested inside a
+/// genuinely new list (or a new formatting context such as a table cell) is not
+/// misnesting.
+fn list_item_ancestor_state_for(tag_name: &str, inherited: bool) -> bool {
+    if matches!(tag_name, "li" | "dt" | "dd") {
+        true
+    } else if matches!(tag_name, "ul" | "ol" | "dl" | "table" | "body" | "html") {
+        false
+    } else {
+        inherited
+    }
+}
+
+/// Compute the `cell_ancestor_state` scan result to hand down to a node's children,
+/// given the node's own tag name and the state its own parent handed down.
+///
+/// A `<td>`/`<th>` ancestor found before crossing a `<table>`/`<thead>`/`<tbody>`/
+/// `<tfoot>`/`<tr>` boundary counts; crossing any of those boundaries resets the
+/// search, since a `<tr>` there is legitimately positioned relative to a new row or
+/// table context.
+fn cell_ancestor_state_for(tag_name: &str, inherited: bool) -> bool {
+    if matches!(tag_name, "td" | "th") {
+        true
+    } else if matches!(tag_name, "table" | "thead" | "tbody" | "tfoot" | "tr") {
         false
     } else {
         inherited

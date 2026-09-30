@@ -129,6 +129,7 @@ impl From<bool> for Dst {
 /// since there is no time zone identifier, the offset instead is repeated as
 /// an additional assertion that a fixed offset datetime was intended.
 #[derive(Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Offset {
     inner: JOffset,
 }
@@ -1062,7 +1063,7 @@ impl Offset {
         // environments with `alloc`, this will always succeed because the
         // heap is used as a fallback. But in core-only environments, the
         // abbreviation capacity is specifically set to `9` in jiff-core to
-        // acommodate this use case. Thus, this can never fail.
+        // accommodate this use case. Thus, this can never fail.
         jcore::tz::Abbreviation::new(dst.as_str())
             .expect("`Abbreviation` capacity is big enough")
     }

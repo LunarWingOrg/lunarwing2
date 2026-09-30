@@ -1987,9 +1987,9 @@ dependencies = [
 
 [[package]]
 name = "pageant"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f3a5ae18f65a85c67a77d18d42d3606c07948e3c17c1e5f74852b26589e88a5"
+checksum = "3adadc44070da6f464b0918655a12f5792c156e088d8c4082d13e27d94c3e791"
 dependencies = [
  "base16ct",
  "byteorder",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.62.6"
+version = "0.62.7"
 dependencies = [
  "aes",
  "anyhow",
