@@ -21,7 +21,7 @@ use subtle::ConstantTimeEq;
 use crate::audio::{AudioFormat, decode_audio, encode_wav};
 use crate::config::{Config, normalize_stt_language};
 use crate::engine::{EngineError, SpeechSegment, TranscriptSegment, VoiceEngine};
-use crate::inference::{InferenceRuntime, InferenceStatus, VoiceComponent};
+use crate::inference::{InferenceStatus, VoiceComponent};
 
 type DirectRateLimiter = governor::RateLimiter<
     governor::state::NotKeyed,
@@ -882,5 +882,4 @@ mod tests {
             .unwrap();
         assert_eq!(ready.status(), StatusCode::OK);
     }
-
 }

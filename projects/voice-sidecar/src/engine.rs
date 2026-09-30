@@ -3,6 +3,7 @@ use std::collections::HashMap;
 #[cfg(feature = "onnx")]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(feature = "onnx")]
 use std::sync::Arc;
 #[cfg(feature = "onnx")]
 use std::sync::Mutex;

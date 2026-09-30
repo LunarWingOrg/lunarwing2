@@ -83,13 +83,24 @@ impl InferenceStatus {
 }
 
 /// Abandonment and failure bookkeeping for one component.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ComponentSlots {
     /// Admission slot; one admitted call per component at a time.
     admission: Arc<Semaphore>,
     abandoned_total: AtomicU64,
     abandoned_in_flight: AtomicUsize,
     failed: AtomicBool,
+}
+
+impl Default for ComponentSlots {
+    fn default() -> Self {
+        Self {
+            admission: Arc::new(Semaphore::new(1)),
+            abandoned_total: AtomicU64::new(0),
+            abandoned_in_flight: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
 }
 
 impl ComponentSlots {

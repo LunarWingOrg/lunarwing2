@@ -185,7 +185,10 @@ async fn timeout_fences_repeated_tts_preserves_shared_capacity_and_recovers() {
             synthesis_request(&fixture.state).await.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        assert_eq!(probe(&fixture.state, "/ready").await.status(), StatusCode::OK);
+        assert_eq!(
+            probe(&fixture.state, "/ready").await.status(),
+            StatusCode::OK
+        );
         fixture.other_components(StatusCode::OK).await;
         let response = request.await.unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -216,7 +219,10 @@ async fn timeout_fences_repeated_tts_preserves_shared_capacity_and_recovers() {
         assert_eq!(body["inference"]["tts"]["active"], true);
         let metrics = response_json(probe(&fixture.state, "/metrics").await).await;
         assert_eq!(metrics["inference"]["tts"]["abandoned_total"], cycle);
-        assert_eq!(probe(&fixture.state, "/health").await.status(), StatusCode::OK);
+        assert_eq!(
+            probe(&fixture.state, "/health").await.status(),
+            StatusCode::OK
+        );
         fixture
             .completion
             .send(if cycle == 2 {
@@ -228,7 +234,10 @@ async fn timeout_fences_repeated_tts_preserves_shared_capacity_and_recovers() {
         fixture.wait_settled().await;
         // Once the underlying call returns — success or error — the
         // component is re-admitted and shared capacity is restored.
-        assert_eq!(probe(&fixture.state, "/ready").await.status(), StatusCode::OK);
+        assert_eq!(
+            probe(&fixture.state, "/ready").await.status(),
+            StatusCode::OK
+        );
     }
     fixture.completion.send(Completion::Success).unwrap();
     assert_eq!(
@@ -262,7 +271,10 @@ async fn cancelled_request_with_one_permit_is_bounded_and_recovers_after_drain()
     fixture.completion.send(Completion::Success).unwrap();
     fixture.wait_settled().await;
     fixture.other_components(StatusCode::OK).await;
-    assert_eq!(probe(&fixture.state, "/ready").await.status(), StatusCode::OK);
+    assert_eq!(
+        probe(&fixture.state, "/ready").await.status(),
+        StatusCode::OK
+    );
 }
 
 /// Regression test for the MR !1263 review finding: a panic while the model
@@ -300,7 +312,10 @@ async fn panic_with_model_lock_held_settles_accounting_but_requires_restart() {
         }
         let ready = probe(&fixture.state, "/ready").await;
         assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response_json(ready).await["inference"]["tts"]["failed"], true);
+        assert_eq!(
+            response_json(ready).await["inference"]["tts"]["failed"],
+            true
+        );
         fixture.other_components(StatusCode::OK).await;
         assert!(
             fixture.started.try_recv().is_err(),
