@@ -1001,17 +1001,6 @@ SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and t
                                # missions (paused while off, resumed on re-enable)
 ORCHESTRATOR_SELF_MODIFY=false # Compiled orchestrator v0, no stored prompt overlays or model control-doc writes
 
-**Prompt-overlay audit and operator lifecycle (WI#268).** The full contract —
-overlay storage identity and bridge path, the three gated writers, consumption
-semantics, the existing-thread retention caveat, safe enable/disable, and a
-read-only tenant inspection runbook — is published in
-`docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
-`ORCHESTRATOR_SELF_MODIFY` unset or any value other than `true`/`1` makes
-stored overlays inert regardless of database contents; `SKILL_SELF_IMPROVEMENT`
-(the new-tenant provisioning default) is a separate flag and never authorizes
-prompt alteration; disabling the gate does not rewrite System messages already
-persisted in existing threads.
-
 # ThreadConfig env overrides (read at thread spawn):
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/LLM
                                         # calls awaited in a ResolveFutures round; on
@@ -1022,6 +1011,17 @@ ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Model failure recovery attempts per st
 ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4 # Total recovery attempts per thread lifetime.
                                         # Default: 4; clamped to 16
 ```
+
+**Prompt-overlay audit and operator lifecycle (WI#268).** The full contract —
+overlay storage identity and bridge path, the three gated writers, consumption
+semantics, the existing-thread retention caveat, safe enable/disable, and a
+read-only tenant inspection runbook — is published in
+`docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
+`ORCHESTRATOR_SELF_MODIFY` unset or any value other than `true`/`1` makes
+stored overlays inert regardless of database contents; `SKILL_SELF_IMPROVEMENT`
+(the new-tenant provisioning default) is a separate flag and never authorizes
+prompt alteration; disabling the gate does not rewrite System messages already
+persisted in existing threads.
 
 **Pending-gate expiry (host daemon knob, WI#111).** How long a pending
 approval/auth gate waits before the background sweep expires it and resumes
