@@ -1539,6 +1539,77 @@ openrc_service_state() {
   fi
 }
 
+# Print the PID of the tenant's *daemon process* — the process that actually
+# loaded the tenant env file — for read-only diagnostics such as
+# /proc/<pid>/environ inspection (WI#268 overlay audits).
+#
+# On systemd this is the unit's MainPID, read through the tenant user manager
+# (never the system bus). On OpenRC the daemon runs under supervise-daemon,
+# whose pidfile holds the SUPERVISOR's PID (supervise-daemon(8): "-p pidfile
+# Sets a path for the supervisor's pid file. Note that this is not the pid file
+# of the process that is being supervised"). The tenant env file is applied
+# even later, by lunarwing-openrc-env-exec.sh in the child. So the daemon PID
+# comes from OpenRC's own per-service value record —
+# $(rc_svcdir)/options/<svc>/child_pid, written by supervise-daemon itself
+# (default rc_svcdir /run/openrc, overridable via RC_SVCDIR) — never from the
+# supervisor pidfile.
+#
+# PID records are validated BEFORE any cleanup: only surrounding whitespace is
+# stripped, so a record like "1234-not-a-number" is rejected instead of being
+# silently collapsed into the unrelated PID 1234 (WI#268 review). A resolved
+# PID is additionally checked for tenant association — owned by the tenant
+# user and carrying the tenant's home path in its command line — so a
+# stale-but-reused PID cannot pass an audit as this tenant's daemon
+# (WI#268 review). /proc/<pid> existence alone is never sufficient.
+#
+# Prints the numeric PID and returns 0, or prints nothing and returns 1 when
+# the PID cannot be resolved (unit not running/unknown state, missing or
+# malformed record, or a PID that is not alive / not the tenant's daemon). A
+# failed probe must be treated as *uninspected*, not as evidence of anything.
+#
+# Usage: tenant_daemon_pid <name>
+tenant_daemon_pid() {
+  local name="$1" svc pid
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  svc="lunarwing-${name}"
+
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    local record="${RC_SVCDIR:-/run/openrc}/options/${svc}/child_pid"
+    [[ -r "$record" ]] || return 1
+    pid="$(cat -- "$record" 2>/dev/null)" || return 1
+    _daemon_pid_valid "$pid" || return 1
+  else
+    pid="$(_systemctl_user "$name" show "${svc}.service" -p MainPID --value 2>/dev/null || true)"
+    _daemon_pid_valid "${pid:-}" || return 1
+  fi
+
+  _daemon_pid_belongs_to_tenant "$pid" "$name" || return 1
+  printf '%s\n' "$pid"
+}
+
+# Validate a raw PID record: only surrounding whitespace (including the
+# trailing newline OpenRC never writes but callers may add) may be removed.
+# Any embedded non-digit — including digits mixed with non-digits — makes the
+# record malformed and the probe fails (prints nothing, returns 1).
+_daemon_pid_valid() {
+  local raw="${1#"${1%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  [[ "$raw" =~ ^[1-9][0-9]*$ ]]
+}
+
+_daemon_pid_belongs_to_tenant() {
+  local pid="$1" name="$2" uid cmdline
+  [[ -d "/proc/$pid" ]] || return 1
+  uid="$(id -u "$name" 2>/dev/null)" || return 1
+  [[ "$(stat -c %u "/proc/$pid" 2>/dev/null || echo -1)" == "$uid" ]] || return 1
+  cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" || return 1
+  [[ "$cmdline" == *"/lunarwing"* ]] || return 1
+  [[ "$cmdline" == *"$(tenant_home "$name")"* ]] || return 1
+  return 0
+}
+
 status_tenant() {
   local name="$1"
   name="$(sanitize_name "$name")"
