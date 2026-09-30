@@ -77,6 +77,14 @@ impl PendingGate {
             thread_id: self.thread_id,
         }
     }
+
+    /// Legacy gates or disappeared tools may have no redacted snapshot. Withhold
+    /// those parameters from every display surface; execution keeps the original.
+    pub fn safe_display_parameters(&self) -> &serde_json::Value {
+        self.display_parameters
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null)
+    }
 }
 
 /// Read-only view of a pending gate for API responses.
@@ -99,10 +107,8 @@ impl From<&PendingGate> for PendingGateView {
             gate_name: gate.gate_name.clone(),
             tool_name: gate.action_name.clone(),
             description: gate.description.clone(),
-            parameters: serde_json::to_string_pretty(
-                gate.display_parameters.as_ref().unwrap_or(&gate.parameters),
-            )
-            .unwrap_or_default(),
+            parameters: serde_json::to_string_pretty(gate.safe_display_parameters())
+                .unwrap_or_default(),
             resume_kind: gate.resume_kind.clone(),
         }
     }
@@ -160,5 +166,22 @@ mod tests {
         let view = PendingGateView::from(&gate);
         assert_eq!(view.tool_name, "shell");
         assert_eq!(view.gate_name, "approval");
+    }
+
+    #[test]
+    fn legacy_gate_view_withholds_raw_parameters_without_a_redacted_snapshot() {
+        let mut gate = sample_gate(300);
+        gate.parameters = serde_json::json!({"token":"must-not-leak"});
+        let serialized = serde_json::to_string(&gate).unwrap();
+        assert!(!serialized.contains("display_parameters"));
+        let restored: PendingGate = serde_json::from_str(&serialized).unwrap();
+        let view = PendingGateView::from(&restored);
+        assert_eq!(view.parameters, "null");
+        assert!(
+            !serde_json::to_string(&view)
+                .unwrap()
+                .contains("must-not-leak")
+        );
+        assert_eq!(restored.parameters["token"], "must-not-leak");
     }
 }

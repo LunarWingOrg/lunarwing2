@@ -1728,11 +1728,6 @@ impl Tool for WasmToolWrapper {
         true
     }
 
-    fn estimated_duration(&self, _params: &serde_json::Value) -> Option<Duration> {
-        // Use the timeout as a conservative estimate
-        Some(self.prepared.limits.timeout)
-    }
-
     fn webhook_capability(&self) -> Option<crate::tools::wasm::WebhookCapability> {
         self.capabilities.webhook.clone()
     }

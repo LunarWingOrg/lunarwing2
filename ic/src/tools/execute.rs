@@ -1,8 +1,8 @@
 //! Shared tool execution pipeline.
 //!
 //! Provides a single implementation of the validate → timeout → execute → serialize
-//! pipeline used by all agentic loop consumers (chat, job, container) and the
-//! scheduler's subtask execution.
+//! pipeline used by chat, container and scheduler subtask execution. Local jobs
+//! and routines retain their own preflight/audit paths, sharing the timed call.
 
 use crate::context::JobContext;
 use crate::error::Error;
@@ -12,9 +12,7 @@ use crate::tools::{ToolRegistry, prepare_tool_params, redact_params};
 
 /// Execute a tool with safety checks: lookup → validate → timeout → execute → serialize.
 ///
-/// This is the single canonical implementation of tool execution. All consumers
-/// (chat dispatcher, job worker, container runtime, scheduler subtasks) use this
-/// function instead of maintaining their own copies.
+/// Chat, engine-v2, container runtime and scheduler subtasks use this pipeline.
 pub async fn execute_tool_with_safety(
     tools: &ToolRegistry,
     safety: &SafetyLayer,
@@ -62,9 +60,8 @@ pub async fn execute_tool_with_safety(
 
     // Execute with per-tool timeout
     let timeout = tool.execution_timeout();
-    let start = std::time::Instant::now();
-    let result = tokio::time::timeout(timeout, tool.execute(normalized_params, job_ctx)).await;
-    let elapsed = start.elapsed();
+    let (result, elapsed) =
+        execute_timed_tool(tools, tool.as_ref(), normalized_params, job_ctx, timeout).await;
 
     match &result {
         Ok(Ok(output)) => {
@@ -113,6 +110,31 @@ pub async fn execute_tool_with_safety(
         }
         .into()
     })
+}
+
+/// The execution-only boundary shared with job/routine pipelines. Call AFTER
+/// their existing approval, hook, validation and allowlist checks. Neither a
+/// preflight wait nor a dropped/failed/timed-out future trains the learner.
+pub(crate) async fn execute_timed_tool(
+    tools: &ToolRegistry,
+    tool: &dyn crate::tools::Tool,
+    params: serde_json::Value,
+    job_ctx: &JobContext,
+    timeout: std::time::Duration,
+) -> (
+    Result<Result<crate::tools::ToolOutput, crate::tools::ToolError>, tokio::time::error::Elapsed>,
+    std::time::Duration,
+) {
+    let observation = tools.estimates().begin(&job_ctx.user_id, tool, &params);
+    let start = tokio::time::Instant::now();
+    let result = tokio::time::timeout(timeout, tool.execute(params, job_ctx)).await;
+    let elapsed = start.elapsed();
+    if let (Some(observation), Ok(Ok(output))) = (observation, &result) {
+        tools
+            .estimates()
+            .complete(observation, elapsed, output.cost);
+    }
+    (result, elapsed)
 }
 
 /// Process a tool result into a `ChatMessage::tool_result` with safety sanitization.
@@ -511,5 +533,233 @@ mod tests {
         );
         assert_eq!(message.role, crate::llm::Role::Tool);
         assert_eq!(message.name.as_deref(), Some("gitlab"));
+    }
+}
+
+#[cfg(test)]
+mod estimation_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rust_decimal::Decimal;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput};
+
+    struct TimedTool;
+
+    #[async_trait::async_trait]
+    impl Tool for TimedTool {
+        fn name(&self) -> &str {
+            "timed-tool"
+        }
+        fn description(&self) -> &str {
+            "Timing fixture"
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn estimated_duration(&self, _: &Value) -> Option<Duration> {
+            Some(Duration::from_secs(1))
+        }
+        fn estimated_cost(&self, _: &Value) -> Option<Decimal> {
+            Some(Decimal::ONE)
+        }
+        fn execution_timeout(&self) -> Duration {
+            Duration::from_secs(10)
+        }
+        fn requires_approval(&self, _: &Value) -> ApprovalRequirement {
+            ApprovalRequirement::Always
+        }
+        async fn execute(&self, params: Value, _: &JobContext) -> Result<ToolOutput, ToolError> {
+            let seconds = params["seconds"].as_u64().unwrap_or(2);
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            if params["fail"] == true {
+                return Err(ToolError::ExecutionFailed("fixture failure".into()));
+            }
+            // Deliberately report zero to prove the pipeline measures wall time.
+            let mut output = ToolOutput::success(json!({"ok": true}), Duration::ZERO);
+            if params["charged"] == true {
+                output.cost = Some(Decimal::from(2));
+            }
+            Ok(output)
+        }
+    }
+
+    fn safety() -> SafetyLayer {
+        SafetyLayer::new(&crate::config::SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        })
+    }
+
+    async fn setup() -> (Arc<ToolRegistry>, Arc<dyn Tool>, JobContext) {
+        let tools = Arc::new(
+            ToolRegistry::new()
+                .with_estimation_mode(crate::estimation::ToolEstimationMode::Display),
+        );
+        let tool: Arc<dyn Tool> = Arc::new(TimedTool);
+        tools.register(tool.clone()).await;
+        (
+            tools,
+            tool,
+            JobContext::with_user("alice", "test", "EMA integration"),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_calls_calibrate_runtime_and_freeze_a_user_scoped_approval_hint() {
+        let (tools, tool, ctx) = setup().await;
+        let safety = safety();
+        let params = json!({"credential": "must-not-appear"});
+        for n in 0..5 {
+            assert!(
+                tools
+                    .estimates()
+                    .estimate("alice", tool.as_ref(), &params)
+                    .is_none(),
+                "premature at {n}"
+            );
+            let output =
+                execute_tool_with_safety(&tools, &safety, tool.name(), params.clone(), &ctx)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&output).unwrap(),
+                json!({"ok": true})
+            );
+        }
+        let estimate = tools
+            .estimates()
+            .estimate("alice", tool.as_ref(), &params)
+            .unwrap();
+        assert_eq!(estimate.samples, 5);
+        assert_eq!(estimate.duration, Duration::from_secs(2)); // baseline was 1 s
+        assert_eq!(estimate.cost, None); // unknown is not free
+        let hint = tools
+            .approval_description("alice", "timed_tool", &params, "Approve?")
+            .await;
+        assert!(hint.contains("~2.00s"));
+        assert!(hint.contains("5 completed calls"));
+        assert!(!hint.contains("must-not-appear"));
+        assert_eq!(
+            tools
+                .approval_description("bob", "timed-tool", &params, "Approve?")
+                .await,
+            "Approve?"
+        );
+        assert!(
+            ToolRegistry::new()
+                .estimates()
+                .estimate("alice", tool.as_ref(), &params)
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_timed_out_and_canceled_calls_do_not_train_success_runtime() {
+        let (tools, tool, ctx) = setup().await;
+        let safety = safety();
+        for params in [json!({"fail": true}), json!({"seconds": 60})] {
+            for _ in 0..5 {
+                assert!(
+                    execute_tool_with_safety(&tools, &safety, tool.name(), params.clone(), &ctx)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        for _ in 0..5 {
+            let execution = execute_tool_with_safety(&tools, &safety, tool.name(), json!({}), &ctx);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), execution)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            tools
+                .estimates()
+                .estimate("alice", tool.as_ref(), &json!({}))
+                .is_none()
+        );
+        for _ in 0..5 {
+            execute_tool_with_safety(&tools, &safety, tool.name(), json!({}), &ctx)
+                .await
+                .unwrap();
+        }
+        let estimate = tools
+            .estimates()
+            .estimate("alice", tool.as_ref(), &json!({}))
+            .unwrap();
+        assert_eq!(estimate.samples, 5);
+        assert_eq!(estimate.duration, Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parallel_calls_record_once_and_only_real_charges_train_cost() {
+        let (tools, tool, ctx) = setup().await;
+        let safety = Arc::new(safety());
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let tools = tools.clone();
+            let safety = safety.clone();
+            let ctx = ctx.clone();
+            calls.spawn(async move {
+                execute_tool_with_safety(
+                    &tools,
+                    &safety,
+                    "timed-tool",
+                    json!({"charged": true}),
+                    &ctx,
+                )
+                .await
+            });
+        }
+        while let Some(call) = calls.join_next().await {
+            call.unwrap().unwrap();
+        }
+        let estimate = tools
+            .estimates()
+            .estimate("alice", tool.as_ref(), &json!({}))
+            .unwrap();
+        assert_eq!(estimate.samples, 10);
+        assert_eq!(estimate.duration, Duration::from_secs(2));
+        assert_eq!(estimate.cost, Some(Decimal::from(2)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observation_only_and_disabled_modes_preserve_output_and_approval_text() {
+        use crate::estimation::ToolEstimationMode;
+        for mode in [ToolEstimationMode::Observe, ToolEstimationMode::Disabled] {
+            let tools = ToolRegistry::new().with_estimation_mode(mode);
+            tools.register(Arc::new(TimedTool)).await;
+            let safety = safety();
+            let ctx = JobContext::with_user("alice", "test", "mode");
+            for _ in 0..5 {
+                let output =
+                    execute_tool_with_safety(&tools, &safety, "timed-tool", json!({}), &ctx)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&output).unwrap(),
+                    json!({"ok": true})
+                );
+            }
+            assert_eq!(
+                tools
+                    .approval_description("alice", "timed-tool", &json!({}), "Approve?")
+                    .await,
+                "Approve?"
+            );
+            assert_eq!(
+                tools
+                    .estimates()
+                    .estimate("alice", &TimedTool, &json!({}))
+                    .is_some(),
+                mode == ToolEstimationMode::Observe
+            );
+        }
     }
 }

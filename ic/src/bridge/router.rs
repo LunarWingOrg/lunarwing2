@@ -1,6 +1,8 @@
 //! Engine v2 router — handles user messages via the engine when enabled.
 
 pub(crate) mod auth;
+#[cfg(test)]
+mod estimation_tests;
 mod outcome;
 use outcome::await_thread_outcome;
 
@@ -197,10 +199,7 @@ fn local_skill_to_v2(s: &crate::skills::LoadedSkill) -> lunarwing_skills::Loaded
 }
 
 fn gate_display_parameters(pending: &PendingGate) -> serde_json::Value {
-    pending
-        .display_parameters
-        .clone()
-        .unwrap_or_else(|| pending.parameters.clone())
+    pending.safe_display_parameters().clone()
 }
 
 fn resumed_action_result_message(
@@ -243,8 +242,23 @@ async fn insert_and_notify_pending_gate(
     channels: &std::sync::Arc<crate::channels::ChannelManager>,
     state: &EngineState,
     message: &IncomingMessage,
-    pending: PendingGate,
+    mut pending: PendingGate,
 ) -> Result<Option<String>, Error> {
+    if matches!(
+        &pending.resume_kind,
+        lunarwing_engine::ResumeKind::Approval { .. }
+    ) {
+        pending.description = state
+            .effect_adapter
+            .tools()
+            .approval_description(
+                &pending.user_id,
+                &pending.action_name,
+                &pending.parameters,
+                &pending.description,
+            )
+            .await;
+    }
     let display_parameters = gate_display_parameters(&pending);
 
     if let Err(error) = state.pending_gates.insert(pending.clone()).await {
