@@ -82,7 +82,10 @@
 17. [ ] update all docs in docs/architecture
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/270
-20. [ ] fix issues in CI/CD (if any) - See Pipeline number 4774 for latest master pipeline run and see if anything is not GREEN
+20. [x] fix issues in CI/CD (if any) - See Pipeline number 4774 for latest master pipeline run and see if anything is not GREEN
+    - DONE 2026-10-01 (`aj/kimi-20-20261001-1100`, item 20): audited pipeline #4774 (master @ `1894b8cfdf`, confirmed still the current master head via `git ls-remote`). Overall status `success`: all 35/35 jobs green across all 8 stages (validate/check/test/security/containers), zero bridges/downstream pipelines, no job failure_reasons/erased/retries, and every allow_failure job (worker candidates/scans, rust-msrv-check) actually passed. Trace sweep of all 35 jobs: the only `FAIL` marker anywhere is an expected-failure fixture in `python-unit` — `test_upgrade_fails_verification_without_gateway_allocation` asserts post-upgrade verification *reports* a FAIL row; the test itself passes. No pipeline schedules exist to go stale. Completed 100% as an audit: no CI/CD issues found, so no CI config/code changes were required.
+    - Non-green pipelines at audit time are not CI/CD defects: #4797/#4798 on WIP branch `mcp-image-forwarding` (MR !1298, target master) fail `rust-check-postgres`/`rust-check-libsql`/`rust-clippy-all`/`rust-test-lib` on that branch's own new code (E0308 `i64` vs `u64` at `ic/src/tools/mcp/client.rs:2018`) — CI correctly gating a broken WIP MR. Remaining non-green pipelines are auto-canceled superseded pushes or an MR pipeline (#4804, item 18) still running.
+    - Verified locally on this branch: `.gitlab/scripts/validate_config.py` (8 CI YAML files + helper refs), `.gitlab/tests` suite (36 tests, OK), `.gitlab/scripts/shell-syntax.sh` (235 scripts + 3 hooks) all pass. Docs/goals-only change: no cargo work needed.
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/280
 23. [x] (S) new reconcile routine method improvement for MR review process
