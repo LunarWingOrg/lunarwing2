@@ -60,7 +60,16 @@
 
 ## Phase 5 - Miscellaneous (for goals referencing work items, read comments on work items as well)
 
-12. [ ] take a look at any documentation that should be updated and update necessary documentation
+12. [x] take a look at any documentation that should be updated and update necessary documentation
+    - DONE 2026-10-01 (`aj/kimi-12-20261001-0453`, item 12): swept the tree for docs that drifted from v2.1.4.0-cycle code changes not already covered by each goal's own doc updates (goals 5/6/7/8/9/10 and item 2 updated their docs in-branch). Seven files updated, each verified against source:
+    - `docs/ops/MULTITENANCY-PRODUCTION.md` — command reference synced with the current mt-admin surface: added `build-opencode2-worker`, `configure-opencode2`, `rotate-pg-password`, `psql`, `daemon-pid`; fixed the stale workers list (now includes `opencode2`).
+    - `docs/guides/MT-ADMIN-QUICKSTART.md` — added the v2.1.4.0 (WI#268) read-only diagnostics verbs `psql`/`daemon-pid` to §8 with the uninspected-on-failure rule and a link to the WI#268 audit runbook; revalidation stamp extended to 2026-10-01 (v2.1.4.0). Verified wording against `tenant_psql`/`tenant_daemon_pid` in `ic/scripts/mt-admin-lib/11-postgres.sh` and the mt-admin usage block (read-only is operator discipline, not enforced).
+    - `docs/ops/TENANT-CONFIGURATION.md` — documented `LUNARWING_TOOL_ESTIMATES` (WI#191: observation-only default, `=1` opt-in hints, `=0` disable, read-once at startup, no persistence) with a link to `ic/src/estimation/README.md`.
+    - `docs/guides/TESTING_GUIDE.md` — 2026-10-01 repass added four v2.1.4.0 manual tiers: tenant system-prompt editor (WI#220), tool runtime-estimate hints (WI#191), `routine_history` over Engine V2 missions (WI#265), mt-admin read-only diagnostics (WI#268).
+    - `docs/releases/README.md` — indexed the shipped RELEASE-v2.1.3.0.md (Ō-Yoroi, 2026-09-29), which was missing from the release table.
+    - `docs/README.md` — indexed the new `guides/TENANT-SYSTEM-PROMPTS.md` (WI#220) in the guides table; latest-release pointer corrected to v2.1.3.0; index update note appended.
+    - `docs/guides/CONTRIBUTOR-ONBOARDING.md` — freeze status updated: v2.1.3.0 shipped 2026-09-29, all LunarWing crates bumped to 2.1.4 (item #1 done, verified against `ic/Cargo.toml`/`Cargo.lock`), kimi worker 2.1.1 pin re-verified.
+    - Checked and intentionally left alone: ENGINE-V2.md (goals 5/7/8 already updated it), GATEWAY_VOICE_API.md + voice-sidecar README (goal 6), TENANT-SYSTEM-PROMPTS.md (goal 9), estimation/tools READMEs (goal 10), WORKER-CONTAINERS.md (item 2), job-state machine (only documented in point-in-time proposals), pairing allowlist semantics (sbpatch1 fix matches documented "approved pairing codes" behavior), port tables (v17 current), versioned v2.1.4.0_* evidence docs (archived at release time per history convention). Markdown link targets in all edited files verified resolvable. Docs-only change: no cargo check needed.
 13. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
 14. [ ] review all currently open work items - create audit document for 2.1.4.0 in docs/ops - there are similar docs in docs/ops for 2.1.3.0 and earlier releases so you can use those as references
 15. [x] (S) (COMEBACKTOTHISLATER) UPDATE RELEASE-v2.1.2.0.md WITH CHANGES MADE SINCE FIRST DRAFT WAS CREATED

@@ -2,7 +2,7 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0).**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), and 2026-10-01 (v2.1.4.0).**
 Referenced ops runbook,
 `ic/scripts/release-test.sh`, and the channel/worker/multi-tenant tiers were
 re-checked against the current tree. Added the v2.1.2.0 durable cross-channel
@@ -12,7 +12,11 @@ handoff (bounded ~3s wait for the worker's terminal `task_result`). The
 `proxy-enforced` mode (default `none` everywhere) and added the OpenCode 2
 worker lane to the workers checklist (mt-admin `--with-opencode2`). The
 2026-09-27 repass added the v2.1.3.0 WI#223 per-tenant sandbox-image tier
-below (rendered env defaults + tenant rootless store + recovery verb).
+below (rendered env defaults + tenant rootless store + recovery verb). The
+2026-10-01 repass added v2.1.4.0 tiers below: the tenant system-prompt
+editor (WI#220), opt-in tool runtime-estimate hints (WI#191),
+`routine_history` over Engine V2 missions (WI#265), and the mt-admin
+read-only diagnostics verbs (WI#268).
 
 Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
@@ -50,6 +54,10 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] **XMPP attachments** — exercise the configured upload path and verify size/auth limits.
 - [ ] **Durable cross-channel attachments** (v2.1.2.0) — send a file on one channel, then verify it is retrievable from another via the `attachment_store` tool (list/read under `attachments/<channel>/…` in workspace memory).
 - [ ] **Per-tenant sandbox image** (v2.1.3.0, WI#223) — for a fresh mt-admin tenant, confirm `SANDBOX_IMAGE=lunarwing-sandbox:latest` and `SANDBOX_AUTO_PULL=false` in the rendered env, the image exists in the tenant's rootless store, and a sandboxed shell execution succeeds; recover a missing image with `build-sandbox-image <tenant>` and re-verify.
+- [ ] **Tenant system-prompt editor** (v2.1.4.0, WI#220) — in the gateway, open Settings → System Prompt, edit the primary-scope source, save, and confirm the workspace preview; create a missing identity file; verify a failed save preserves the draft and that scope isolation holds across tenants. Engine V2 activation requires `restart-tenant` plus a new conversation (see `TENANT-SYSTEM-PROMPTS.md`).
+- [ ] **Tool runtime-estimate hints** (v2.1.4.0, WI#191) — with `LUNARWING_TOOL_ESTIMATES=1`, after five completed calls of one tool by one user, confirm an advisory "typical runtime" line appears on the next approval; with `=0`, confirm no recording and no hints; confirm the default (unset) observation-only behavior shows no hints.
+- [ ] **routine_history over Engine V2 missions** (v2.1.4.0, WI#265) — fire an Engine V2 learning mission, then verify `routine_history <mission-name>` resolves the mission and renders recent fires; a not-found error must name both registries and point at `routine_list`/`mission_list`.
+- [ ] **mt-admin read-only diagnostics** (v2.1.4.0, WI#268) — `mt-admin psql <tenant>` runs psql inside the tenant's own PostgreSQL container (operator discipline: SELECTs and fingerprints only — it does not itself enforce read-only, and DB rows can be secret-bearing); `mt-admin daemon-pid <tenant>` prints the validated daemon PID and exits non-zero (treated as uninspected) when the unit is down.
 - [ ] **WeeChat WSS** — connect relay and adapter, exchange messages, then reconnect after a service restart.
 - [ ] **DarkIRC** — verify the tenant adapter, contact-key boundary, delivery, and health reporting.
 - [ ] **WASM channels** — install, configure, activate, poll, and remove a disposable extension.

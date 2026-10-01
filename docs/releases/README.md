@@ -6,6 +6,7 @@ typographical corrections that don't change meaning).
 
 | Release | Codename | Date | Notes |
 |---------|----------|------|-------|
+| [v2.1.3.0](RELEASE-v2.1.3.0.md) | Ō-Yoroi (大鎧) | 2026-09-29 | Secrets hardening, sealed engine output, relay-password rotation, operator ergonomics |
 | [v2.1.2.0](RELEASE-v2.1.2.0.md) | Yoroi (鎧) | 2026-09-25 | Generic Podman-first agent-shell sandbox, worker-contract hardening, health system parity, confabulation hardening |
 | [v2.1.1.0](RELEASE-v2.1.1.0.md) | Zanshin (残心) | 2026-09-13 | Memory authenticity + index self-heal, priority-control race fix, coordination-knowledge sharing, Pebble restart parity, Parakeet STT | 
 | [v2.1.0.0](RELEASE-v2.1.0.0.md) | Ma-ai (間合い) | 2026-09-07 | Mid-turn interrupt/steer, LunarVoice lifecycle, gateway presentation, memory recall, supply-chain hardening |
