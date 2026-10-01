@@ -677,6 +677,30 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrent_add_allow_from_preserves_all_grants() {
+        // Regression for the wipe under concurrency: eight approvers taking
+        // the file lock in turn must never observe a truncated allowlist.
+        let (store, _dir) = test_store();
+        let senders: Vec<String> = (0..8).map(|i| format!("user-{i}")).collect();
+
+        std::thread::scope(|s| {
+            for sender in &senders {
+                let store = store.clone();
+                let sender = sender.clone();
+                s.spawn(move || {
+                    store.add_allow_from("xmpp", &sender).unwrap();
+                });
+            }
+        });
+
+        let mut allow = store.read_allow_from("xmpp").unwrap();
+        allow.sort();
+        let mut expected = senders;
+        expected.sort();
+        assert_eq!(allow, expected, "every concurrent grant must survive");
+    }
+
+    #[test]
     fn test_weechat_pairing_request_approval_flow() {
         let (store, _) = test_store();
         assert!(!store.is_sender_allowed("weechat", "alice", None).unwrap());
