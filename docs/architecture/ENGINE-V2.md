@@ -895,6 +895,23 @@ Approval and auth prompts are statuses; gate pauses, auth pauses, and stopped
 turns return an empty no-reply sentinel so the outer handler does not send or
 persist a duplicate terminal response.
 
+### Workspace Prompt Editing and Lifetime (WI#220)
+
+The bridge reads `agent.workspace().system_prompt()` once during thread-manager
+initialization and supplies it through `set_identity_preamble()`. This uses
+direct-context composition with UTC daily dates. The executor assembles its
+complete prompt only when the thread has no System message; existing persisted
+threads retain that message on reuse.
+
+The gateway's **Settings → System Prompt** editor writes primary-scope workspace
+documents. Its authenticated `/api/prompts/preview` endpoint independently
+composes current saved workspace content with optional group/timezone inputs.
+It is not a live engine snapshot and excludes separately assembled engine
+templates, tool documentation, skills, channel constraints and runtime overlays.
+For edited workspace instructions to reach Engine V2, restart the tenant via
+mt-admin and start a new conversation. See
+[Tenant System Prompts](../guides/TENANT-SYSTEM-PROMPTS.md).
+
 ### Attachment Input
 
 Engine V2 parses submissions and resolves pending authentication against the

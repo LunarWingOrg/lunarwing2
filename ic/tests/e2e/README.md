@@ -39,6 +39,17 @@ HEADED=1 pytest tests/e2e/scenarios/test_connection.py -v
 
 ## Architecture
 
+The prompt-editor browser regressions serve the committed static UI through
+Playwright routing and need no daemon build or LLM. Run them from `ic/` after
+the Python/Chromium setup above:
+
+```bash
+pytest -c tests/e2e/pyproject.toml tests/e2e/scenarios/test_prompt_editor.py -q
+```
+
+Their backend counterpart is the real authenticated router/database suite
+`channels::web::tests::multi_tenant::prompt_handlers` in the Rust library tests.
+
 Tests start two subprocesses:
 1. **Mock LLM** (`mock_llm.py`) -- fake OpenAI-compat server with canned responses
 2. **LunarWing** -- the real binary with gateway enabled, pointing to the mock LLM
@@ -55,6 +66,7 @@ Then Playwright drives a headless Chromium browser against the gateway, making D
 | `test_tool_approval.py` | Tool approval overlay (approve, deny, always, params toggle) |
 | `test_sse_reconnect.py` | SSE reconnection handling |
 | `test_html_injection.py` | HTML injection security |
+| `test_prompt_editor.py` | Prompt drafts/save/reload, safe text rendering, error recovery, preview races and auth-session isolation (routed API) |
 | `test_extensions.py` | Extensions tab: install, remove, configure, OAuth, auth card, activate |
 
 ## Adding new scenarios

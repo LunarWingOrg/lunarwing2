@@ -6,6 +6,7 @@ pub mod coord;
 pub mod jobs;
 pub mod memory;
 pub mod missions;
+pub mod prompts;
 pub mod routines;
 pub mod skills;
 

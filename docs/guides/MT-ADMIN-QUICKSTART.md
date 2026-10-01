@@ -21,6 +21,11 @@ unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
 advisory `proxy`. See
 [`../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
 
+For per-tenant instructions and identity editing, use the gateway's
+**Settings → System Prompt** panel. See [Tenant System Prompts](TENANT-SYSTEM-PROMPTS.md)
+for source files, preview semantics, and the Engine V2 restart/new-conversation
+activation procedure.
+
 ## 1. Install Host Prerequisites
 
 Required for the core MT flow:

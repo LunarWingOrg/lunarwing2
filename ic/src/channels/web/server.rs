@@ -472,6 +472,7 @@ pub(super) async fn start_server_with_mascot(
         .route("/api/memory/read", get(memory_read_handler))
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
+        .merge(crate::channels::web::handlers::prompts::routes())
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
         .route("/api/jobs/summary", get(jobs_summary_handler))
@@ -618,6 +619,7 @@ pub(super) async fn start_server_with_mascot(
         .route("/", get(move || index_handler(mascot_enabled)))
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
+        .route("/prompts.js", get(prompts_js_handler))
         .route("/theme-init.js", get(theme_init_handler))
         .route("/favicon.ico", get(favicon_handler))
         .route("/favicon.svg", get(favicon_svg_handler))
@@ -795,6 +797,16 @@ async fn js_handler() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         include_str!("static/app.js"),
+    )
+}
+
+async fn prompts_js_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("static/prompts.js"),
     )
 }
 

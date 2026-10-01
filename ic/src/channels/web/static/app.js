@@ -173,6 +173,7 @@ const LIVE_WORK_MAX_CHARS = 12000;
 // --- Auth ---
 
 function authenticate() {
+  PromptEditor.reset();
   token = document.getElementById('token-input').value.trim();
   _authExpired = false; // allow a future expiry to trigger the auth screen again
   if (!token) {
@@ -279,6 +280,7 @@ let _authExpired = false;
 function handleAuthExpiry() {
   if (_authExpired) return;
   _authExpired = true;
+  PromptEditor.reset();
   sessionStorage.removeItem('lunarwing_token');
   token = '';
   _pendingGateRequestSequence++;
@@ -6358,6 +6360,7 @@ function settingsBack() {
 function loadSettingsSubtab(subtab) {
   if (subtab === 'inference') loadInferenceSettings();
   else if (subtab === 'agent') loadAgentSettings();
+  else if (subtab === 'prompts') PromptEditor.load();
   else if (subtab === 'channels') { loadChannelsStatus(); startPairingPoll(); }
   else if (subtab === 'networking') loadNetworkingSettings();
   else if (subtab === 'extensions') { loadExtensions(); startPairingPoll(); }
