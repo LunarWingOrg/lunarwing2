@@ -33,7 +33,7 @@ use crate::types::mission::{
 };
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::thread::{MissionContext, ThreadConfig, ThreadId, ThreadType};
+use crate::types::thread::{MissionContext, Thread, ThreadConfig, ThreadId, ThreadType};
 
 type MissionExecutionLock = Mutex<()>;
 type MissionLockRegistry = Mutex<HashMap<MissionId, Weak<MissionExecutionLock>>>;
@@ -1218,6 +1218,12 @@ impl MissionManager {
     /// Get a mission by ID.
     pub async fn get_mission(&self, id: MissionId) -> Result<Option<Mission>, EngineError> {
         self.store.load_mission(id).await
+    }
+
+    /// Load a thread by ID. Read access for history surfaces (WI#269's
+    /// `mission_history` tool) that render a mission's `thread_history` fires.
+    pub async fn load_thread(&self, id: ThreadId) -> Result<Option<Thread>, EngineError> {
+        self.store.load_thread(id).await
     }
 
     /// Find a mission by name for a given user within a project.
@@ -3361,7 +3367,7 @@ mod tests {
     use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
     use crate::types::project::{Project, ProjectId};
     use crate::types::step::{ActionResult, LlmResponse, Step, TokenUsage};
-    use crate::types::thread::{Thread, ThreadId, ThreadState};
+    use crate::types::thread::ThreadState;
 
     // ── TestStore — in-memory Store that persists missions ───
 
