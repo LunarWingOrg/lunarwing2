@@ -743,6 +743,15 @@ source and stamped for v2.1.4.0:
     design document with landed pinning tests. Existing per-channel pairing
     JSON files keep working; the secrets-store migration remains future work
     tracked in the WI.
+15. **Outbound delivery semantics (WI#270).** No configuration change. The
+    `message` tool ack text changed from `Sent message to …` to `Queued
+    message to …` — success means acceptance for delivery, and tenant
+    mission specs/prompts must keep recording acceptance, never "delivered"
+    (discipline documented in
+    [OUTBOUND-DELIVERY-SEMANTICS.md](docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md)).
+    XMPP enqueue while disconnected now fails the tool call instead of
+    silently queueing into a memory-only queue; shutdown drains acked
+    stanzas within a bounded 2s window.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -766,10 +775,16 @@ source and stamped for v2.1.4.0:
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) still
   fire for Research child threads — only Mission threads are filtered
   (carried).
+- Outbound channel queues remain memory-only: a hard process exit can still
+  lose queued messages, and post-enqueue send failures remain warn-and-drop
+  with no end-to-end delivery receipts. The durable outbound spool +
+  mission-run ledger stays tracked as WI#270's long-term fix #4 (platform
+  halves in #277/#276) (carried).
 - CI-only confirmations that need GitLab/registry visibility remain, as
   with every release: the corrected-head full remote pipeline for item 1,
-  the trivy scan of the published worker candidate, and the opencode2
-  whole-image reproducibility digest gate.
+  the trivy scan of the published worker candidate, the opencode2
+  whole-image reproducibility digest gate, and the first remote run of the
+  unvendored cargo-deny wrapper (item 20).
 - Live-tenant acceptance steps that remain operator-side: dwarfstar
   mission-day-rollover inspection (WI#243), engine mission-history
   fallback on a live tenant (WI#265 — covered by e2e traces), and
@@ -837,6 +852,14 @@ source and stamped for v2.1.4.0:
 - The cycle's open work items were reconciled in
   `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` with tree-verified
   dispositions for all 23 open items; WI#200 closed on the landed stopgap.
+- Outbound message delivery is honest about its contract: the `message`
+  tool ack reports queue acceptance, the XMPP channel refuses enqueue while
+  disconnected, and shutdown drains acked stanzas within a bounded 2s
+  window (WI#270 — the three ranked platform fixes landed; the durable
+  spool remains tracked as fix #4).
+- The CI cargo-deny yanked gate is restored: it runs unvendored from the
+  repo root and hard-fails on any `index-failure`, with the validator rule
+  and 6-case regression suite pinning the contract (item 20).
 
 ---
 
