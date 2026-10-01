@@ -2,7 +2,7 @@
 
 ## Codename: UNKNOWN (draft)
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repass 2026-10-01)
+**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repasses 2026-10-01)
 
 ## Overview
 
@@ -28,13 +28,18 @@ now pinned 0.10.2 with a refreshed `PEBBLE_LOCK_SHA256`), and the Pebble
 lock guard gained multi-version record keying and no-op-override rejection.
 CI recovered from pipeline #4679's Cavepony release-metadata drift and
 orphan-mission boundary violation; integration-target MRs now run the full
-validation matrix.
+validation matrix. A later look at the green pipeline 4811 found the
+cargo-deny yanked-crate gate silently degrading to warnings under vendored
+source replacement; the job now runs unvendored from the repo root and
+hard-fails on any index-failure diagnostic (item 20).
 
 Engine reliability dominates the feature work: mission execution recovers
 from transient provider failures after partial text instead of aborting the
 thread (WI#244), global mission listings no longer drop missions whose
 project record is missing so every active mission keeps its daily rollover
-(WI#243), `routine_history` resolves Engine V2 mission names (WI#265), and
+(WI#243), `routine_history` resolves Engine V2 mission names (WI#265), a
+dedicated `mission_history` tool joins the bridge `mission_*` family with
+`routine_history` honestly blocked in v2 threads (WI#269), and
 the voice sidecar bounds abandoned inference admission so a timed-out or
 cancelled call cannot pin the model mutex or starve other components
 (WI#264). Shared tool execution learns bounded per-user EMA runtime
@@ -51,12 +56,16 @@ existing allowlist. New tenants now render `ORCHESTRATOR_SELF_MODIFY=true`
 opt-out preserved across re-renders. The WI#184 secrets-store pairing
 redesign advanced to design revision 3 (both !1294 review P2s answered) with
 the review-required legacy-matching and concurrency regressions landed ahead
-of the substrate change.
+of the substrate change. Outbound delivery is now honest about its contract
+(WI#270): the `message` tool ack reads `Queued …` instead of implying
+delivery, the XMPP channel refuses enqueue while no session is bound, and
+shutdown gives the outbound queue a bounded drain window.
 
 The full docs set was repassed for the cycle: all 32 active guides under
 `docs/guides/` and all 10 active architecture docs re-verified against source
-and stamped, and the cycle's open work items were reconciled in a tracker
-audit (23 open items, dispositions verified against the tree).
+and stamped, the cycle's open work items were reconciled in a tracker
+audit (23 open items, dispositions verified against the tree), and codename
+candidates were shortlisted for the human pick.
 
 The release identifier is `2.1.4.0`; LunarWing-owned Rust crates and channel
 packages use `2.1.4`. Rust 2024 and MSRV `1.96.1` are unchanged. There are
@@ -95,6 +104,16 @@ previous compatibility baseline.
   byte-indexing a `String` — so multilingual assistant text cannot panic the
   path. Not-found errors name both registries and point at
   `routine_list`/`mission_list`; limit clamped 1..=50
+- **Dedicated `mission_history` tool (WI#269).** Engine V2 missions gain a
+  first-class history tool in the bridge `mission_*` family, rendering
+  newest-first fires from `mission.thread_history` in the same shape as
+  `routine_history` (character-safe summaries, limit clamped 1..=50,
+  default 10) through a new `MissionManager::load_thread` read accessor.
+  Name lookup is project-scoped own+shared like `mission_list`; the UUID
+  path re-checks project and ownership after the store load and returns
+  `access denied` otherwise. `routine_history` is now blocked in v2 threads
+  with an honest "use mission_history" error instead of a wrong-registry
+  fallthrough
 - **Bounded inference admission in the voice sidecar (WI#264).** STT/TTS/VAD
   each admit one call before taking shared capacity; blocking workers retain
   both permits until settlement, so repeated TTS retries cannot queue behind
@@ -155,6 +174,15 @@ previous compatibility baseline.
   validation now also covers integration-target MRs, with
   `LUNARWING_CI_FULL_VALIDATION=1` opt-in for scratch branches. Evidence:
   [v2.1.4.0_GOAL1_CI_RECOVERY.md](docs/ops/v2.1.4.0_GOAL1_CI_RECOVERY.md)
+- **cargo-deny yanked-crate gate restored (item 20).** The green
+  `cargo-deny` CI job was green dishonestly: run from inside `ic/`,
+  vendored source replacement hid the registry index, so `yanked = "deny"`
+  degraded to one `warning[index-failure]` per crate (738 in pipeline 4811)
+  while the job still exited 0 — and the diagnostics flooded the trace past
+  the 4 MB log cap, truncating the verdict away. A repo-root wrapper now
+  runs cargo-deny with explicit manifest/config paths, keeps the trace
+  compact, and hard-fails on any index-failure so the yanked check can
+  never be silently skipped again
 - **Pairing allowlist preservation (sbpatch1).** Approving a new sender
   previously opened the allowlist store with `truncate(true)` before
   deserialization, silently erasing every previously approved sender when
@@ -162,6 +190,16 @@ previous compatibility baseline.
   and rewrites through the same locked handle (set_len + seek + write +
   sync), so concurrent approvers cannot bypass the lock and shorter
   payloads cannot leave trailing bytes
+- **Outbound message delivery honesty (WI#270).** The `message` tool's
+  success ack was an enqueue ack dressed as a delivery receipt — the
+  contract gap behind a scheduled mission recording "Delivered via XMPP" in
+  memory for a stanza silently lost in a rebuild window. The ack now reads
+  `Queued message to <channel>:<target>` with a tool-description warning
+  that success means acceptance for delivery; the XMPP channel refuses
+  enqueue while no session is bound; and `shutdown()` gives the client task
+  a bounded 2s drain window, WARNing with the pending depth when the queue
+  cannot drain. Documented in
+  [OUTBOUND-DELIVERY-SEMANTICS.md](docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md)
 - **Orchestrator self-modification for new tenants (WI#282).** add-tenant
   now renders `ORCHESTRATOR_SELF_MODIFY=true` so new tenants adopt stored
   orchestrator and prompt-overlay updates; an explicit operator opt-out is
