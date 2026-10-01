@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-28)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-28, again 2026-10-01 for v2.1.4.0)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -142,4 +142,11 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > gateway`). No self-heal pipeline script changed in the 2.1.3.0 cycle; the
 > release's tenant-env work (WI#239) lives in mt-admin env generation, not the
 > host health pipeline.
+>
+> **Update (2026-10-01, v2.1.4.0):** the `ORDER` list is unchanged in the
+> 2.1.4.0 cycle (`bash tests/run-all.sh --list` still registers the same 19
+> suites, verified live). No self-heal pipeline script changed this cycle;
+> the release's feature work (WI#191 tool-estimate hints, WI#220 prompt
+> editor, WI#265 `routine_history`) lives in the agent/gateway, not the host
+> health pipeline.
 

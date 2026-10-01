@@ -1,6 +1,6 @@
 # XMPP File Transfer Support
 
-**Revalidated against source 2026-09-28 (v2.1.3.0).** Every limit in the
+**Revalidated against source 2026-10-01 (v2.1.4.0).** Every limit in the
 table below, the MIME allowlist, the WIT interface (`ic/wit/channel.wit`,
 `store-attachment-data`), the bridge body limit (`MAX_SEND_BODY_BYTES` 70 MiB,
 send route only), and the LunarVision enrichment bounds were re-checked
@@ -8,7 +8,11 @@ against the current tree and still hold. The 2.1.2.0 release only bumped the
 xmpp-bridge and xmpp channel crate/registry versions (0.1.14); no transfer
 limits or protocol behavior changed. The 2.1.3.0 release bumped the
 xmpp-bridge crate to 2.1.3 and the xmpp channel crate/registry version to
-0.1.15; no transfer limits or protocol behavior changed.
+0.1.15; no transfer limits or protocol behavior changed. The 2.1.4.0 release
+bumped the xmpp-bridge crate to 2.1.4 and the xmpp channel registry version
+to 0.1.16 (crate now at workspace version 2.1.4; external-crate
+semver-compatible updates in the lockfiles only); no transfer limits or
+protocol behavior changed.
 
 ## Overview
 

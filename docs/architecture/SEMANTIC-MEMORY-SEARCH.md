@@ -2,13 +2,18 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
-**Revalidated against source 2026-09-28 (v2.1.3.0).** Pipeline structure,
+**Revalidated against source 2026-10-01 (v2.1.4.0).** Pipeline structure,
 limits, tools, schema/migrations (V27 remains the latest migration), and env
-vars were re-checked; no changes were needed for 2.1.3.0. The additive
+vars were re-checked; no search/indexing changes were made in the 2.1.4.0
+cycle. The additive
 knowledge refresh cadence (item 6/WI#121) is now documented in Step 6, the
 WI#132 memory-index outbox (`indexed_at`, V27, repair sweep) is documented in
 Step 1, and the mission-subtree index exclusion (WI#135/WI#136) is documented
-in Step 1.
+in Step 1. The 2.1.4.0 cycle added operator-facing system-prompt editing
+(WI#220, gateway Settings → System Prompt) which flows through the same
+`Workspace::write()` ingestion, write guard, and indexing path described
+below — no pipeline change; see `ic/src/workspace/README.md` (Operator
+Prompt Editing) and `docs/guides/TENANT-SYSTEM-PROMPTS.md`.
 
 The system lives in `ic/src/workspace/`. General memory is exposed through
 `memory_search`, `memory_write`, `memory_read`, and `memory_tree` in
