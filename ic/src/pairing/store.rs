@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -476,16 +476,20 @@ impl PairingStore {
         })?;
         fs::create_dir_all(parent)?;
 
-        let file = fs::OpenOptions::new()
+        // Keep the existing allowlist intact until it has been read under the
+        // lock. Opening with truncate here silently removed every previously
+        // approved sender before deserialization.
+        let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&path)?;
 
         file.lock()?;
 
-        let content = fs::read_to_string(&path).unwrap_or_default();
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
         let mut store: AllowFromStoreFile =
             serde_json::from_str(&content).unwrap_or(AllowFromStoreFile {
                 version: 1,
@@ -504,7 +508,13 @@ impl PairingStore {
 
         store.allow_from.push(entry);
         let json = serde_json::to_string_pretty(&store)?;
-        fs::write(&path, json)?;
+        // Rewrite through the same locked handle so concurrent approvers
+        // cannot bypass the lock and shorter payloads cannot leave trailing
+        // bytes behind.
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
 
         file.unlock()?;
         Ok(())
@@ -629,6 +639,41 @@ mod tests {
 
         let allow = store.read_allow_from("xmpp").unwrap();
         assert_eq!(allow, vec!["user456"]);
+    }
+
+    #[test]
+    fn test_approving_second_sender_preserves_first_allow_from_entry() {
+        let (store, _) = test_store();
+        let first = store.upsert_request("xmpp", "user-a", None).unwrap();
+        let second = store.upsert_request("xmpp", "user-b", None).unwrap();
+
+        store.approve("xmpp", &first.code).unwrap().unwrap();
+        store.approve("xmpp", &second.code).unwrap().unwrap();
+
+        assert_eq!(
+            store.read_allow_from("xmpp").unwrap(),
+            vec!["user-a", "user-b"]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_allow_from_entry_does_not_rewrite_file() {
+        let (store, dir) = test_store();
+        store.add_allow_from("xmpp", "user-a").unwrap();
+        let path = allow_from_path(dir.path(), "xmpp").unwrap();
+        let before_content = fs::read(&path).unwrap();
+        let before_modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Cross filesystems with coarse timestamp resolution while still
+        // asserting the duplicate path performs no write at all.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        store.add_allow_from("xmpp", "USER-A").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), before_content);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            before_modified
+        );
     }
 
     #[test]
