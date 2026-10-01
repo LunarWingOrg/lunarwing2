@@ -29,7 +29,7 @@
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1261
+4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1276
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1256
 6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1263
     - DONE 2026-09-30 (`cmc/g6/v2.1.4.0`, WI#264): added a shared inference runner in `projects/voice-sidecar/src/inference.rs`. STT/TTS/VAD each admit one call before taking shared capacity; blocking workers retain both permits until settlement, so repeated TTS retries cannot queue behind the model mutex or consume remaining STT/VAD capacity. Caller cancellation/timeout and worker settlement share a phase lock; `/ready` and `/metrics` report per-component activity, current/cumulative abandonment, and permanent failure.
@@ -74,5 +74,6 @@
 26. [x] (S) (HUMAN) start thinking about scope of 2.1.6.0 next real feature set
 27. [x] (S) (HUMAN) Findings from sb and kumo
 28. [ ] Repo housecleaning - get rid of old stuff in docs/ops and move it to history
+29. [ ] repass of item 2. upgrade opencode2 to new version 2.0.21
 
 ---
