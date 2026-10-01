@@ -284,6 +284,77 @@ else
   fail "classifier: unrelated error matched"
 fi
 
+# ── 10-11. WI#271: success paths report tenant-store image drift ─────────────
+# The podman probe proves the runtime answers, not that the store holds the
+# tenant's images; repair must surface a missing worker image instead of
+# concluding "probe OK" (barracuda inttest, 2026-09-28).
+WI271_REGISTRY="$fixture/ports.json"
+cat >"$WI271_REGISTRY" <<'JSON'
+{"version":17,"tenants":{"acorn":{"enable_voice":false,"vision":{"mode":"external"},"workers":{"pebble":true}}}}
+JSON
+# shellcheck disable=SC2034  # read by the tenant_* registry accessors
+PORTS_REGISTRY="$WI271_REGISTRY"
+WARN_LOG="$fixture/warn.log"
+
+# 10. Healthy probe, image missing from the store: no-op repair still warns.
+_ctr_behave() {
+  case "${1:-}" in
+    image) return 1 ;;   # tenant store lacks the pebble worker image
+  esac
+  return 0               # podman ps succeeds
+}
+: >"$ORDER"
+if repair_tenant_podman_userns acorn >"$WARN_LOG" 2>&1; then
+  pass "image drift: healthy-probe repair still succeeds"
+else
+  fail "image drift: healthy-probe repair failed"
+fi
+if [[ ! -s "$ORDER" ]]; then
+  pass "image drift: healthy probe remains a no-op (no stop/migrate/start)"
+else
+  fail "image drift: unexpected actions: $(tr '\n' ' ' <"$ORDER")"
+fi
+if grep -q "tenant store is missing image(s)" "$WARN_LOG" \
+    && grep -q "lunarwing-worker-pebble:latest" "$WARN_LOG"; then
+  pass "image drift: healthy-probe success names the missing worker image"
+else
+  fail "image drift: missing-image warning absent: $(cat "$WARN_LOG")"
+fi
+
+# 11. Full repair path: store drift is reported after "repair complete".
+_ctr_behave() {
+  case "${1:-}" in
+    ps)
+      if pop_ps_fail; then
+        printf 'Error: cannot re-exec process to join the existing user namespace\n' >&2
+        return 1
+      fi
+      return 0
+      ;;
+    system)
+      note_step MIGRATE
+      return 0
+      ;;
+    image) return 1 ;;
+  esac
+  return 0
+}
+set_ps_fails 1
+: >"$ORDER"
+if repair_tenant_podman_userns acorn >"$WARN_LOG" 2>&1; then
+  pass "image drift: full repair completes despite missing worker image"
+else
+  fail "image drift: full repair aborted"
+fi
+assert_eq "image drift: repair sequence unchanged" \
+  "$(printf 'STOP_INIT\nCLEAN_PAUSE\nMIGRATE\nSTOP\nSTART')" "$(cat "$ORDER")"
+if grep -q "rootless podman userns repair complete for acorn (probe OK)" "$WARN_LOG" \
+    && grep -q "lunarwing-worker-pebble:latest" "$WARN_LOG"; then
+  pass "image drift: post-repair success reports the missing image"
+else
+  fail "image drift: post-repair warning absent: $(cat "$WARN_LOG")"
+fi
+
 echo
 bash "$SCRIPT_DIR/tests/test-mt-admin-podman-repair-quiescence.sh" || fail "repair/quiescence integration"
 if [[ "$failures" -eq 0 ]]; then

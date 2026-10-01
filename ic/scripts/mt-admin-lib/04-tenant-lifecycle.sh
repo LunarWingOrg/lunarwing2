@@ -1309,6 +1309,21 @@ repair_tenant_podman_userns() {
   with_tenant_lifecycle_lock "$name" _repair_tenant_podman_userns_locked "$name"
 }
 
+# WI#271: a green podman probe proves the runtime answers, not that the store
+# holds the tenant's images — the start-tenant distribution gate warns and
+# silently skips, so repair used to conclude "complete (probe OK)" with the
+# worker image missing. Report store drift on every repair success path;
+# advisory only, never fails the repair.
+_repair_report_store_images() {  # <tenant>
+  local name="$1" missing_images image hint
+  missing_images="$(_tenant_store_missing_images "$name")" && return 0
+  say "WARNING: podman answers for $name, but the tenant store is missing image(s):" >&2
+  while IFS=$'\t' read -r image hint; do
+    [[ -n "$image" ]] || continue
+    say "  - $image (recover: '$hint', then 'start-tenant $name' re-distributes)" >&2
+  done <<<"$missing_images"
+}
+
 _repair_tenant_podman_userns_locked() {
   local name="$1"
   local probe rc=0
@@ -1317,6 +1332,7 @@ _repair_tenant_podman_userns_locked() {
   probe="$(_ctr "$name" ps 2>&1)" || rc=$?
   if (( rc == 0 )); then
     say "rootless podman probe OK for $name; userns pairing is healthy, nothing to repair"
+    _repair_report_store_images "$name"
     return 0
   fi
   say "rootless podman probe failed for $name (rc=$rc):"
@@ -1331,6 +1347,7 @@ _repair_tenant_podman_userns_locked() {
     probe="$(_ctr "$name" ps 2>&1)" || rc=$?
     if (( rc == 0 )); then
       say "podman OK for $name after stale pause.pid cleanup"
+      _repair_report_store_images "$name"
       return 0
     fi
     die "podman for '$name' fails with an error that is not the userns-join signature; inspect the output above before repairing manually"
@@ -1364,6 +1381,7 @@ _repair_tenant_podman_userns_locked() {
     die "rootless podman userns repair did not recover tenant '$name'; rebooting the tenant host (or the tenant user manager) is the remaining remedy"
   fi
   say "rootless podman userns repair complete for $name (probe OK)"
+  _repair_report_store_images "$name"
 }
 
 darkirc_managed_state_exists() {
@@ -1738,6 +1756,24 @@ status_tenant() {
   else
     say "LunarVoice: not created (enabled=$(tenant_voice_enabled "$name" && echo true || echo false))"
   fi
+
+  # WI#271: the container lines above cannot see store drift — a worker keeps
+  # running from its materialized container while its image is gone from (or
+  # stale in) the store, and every restart/recreate path then fails. Surface
+  # per-image presence and admin-store drift for the images this tenant needs.
+  say ""
+  if [[ "$MT_ROOTLESS" == "true" ]]; then
+    say "Store images (tenant store vs admin store):"
+  else
+    say "Store images (shared store):"
+  fi
+  local _si_image _si_hint _si_seen=false
+  while IFS=$'\t' read -r _si_image _si_hint; do
+    [[ -n "$_si_image" ]] || continue
+    _si_seen=true
+    say "  $_si_image: $(_tenant_image_state "$name" "$_si_image")"
+  done < <(_tenant_store_expected_images "$name")
+  [[ "$_si_seen" == "true" ]] || say "  (no worker or sidecar images expected for this tenant)"
 
   ensure_init_system
   say ""
