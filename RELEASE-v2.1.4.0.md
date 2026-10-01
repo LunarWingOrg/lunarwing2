@@ -2,7 +2,7 @@
 
 ## Codename: UNKNOWN (draft)
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repass 2026-10-01)
+**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, second repass 2026-10-01)
 
 ## Overview
 
@@ -864,9 +864,14 @@ source and stamped for v2.1.4.0:
 ---
 
 *Draft status: codename, release date, and pipeline numbers for final CI
-confirmation will be filled in before the release is cut. This is the first
-repass (item 27, 2026-10-01): it folds in the work merged after the first
-draft — WI#184 design revision 3 with its landed regressions (item 11), the
-open work items audit (item 14), and the guides/architecture docs repasses
-(items 16/17). Open goal items at repass time (18–20, 22, 24, 25, 28, 29)
-may add sections; this draft covers the merged state as of 2026-10-01.*
+confirmation will be filled in before the release is cut. This is the second
+repass (item 21, 2026-10-01): it folds in the work merged after the first
+repass — the WI#270 outbound-delivery honesty fixes (item 19: queued-not-
+delivered ack, XMPP disconnected-enqueue refusal, bounded shutdown drain,
+and the OUTBOUND-DELIVERY-SEMANTICS architecture doc), the CI cargo-deny
+yanked-gate restoration (item 20), and the codename shortlist (item 25,
+[v2.1.4.0_CODENAME_IDEAS.md](docs/ops/v2.1.4.0_CODENAME_IDEAS.md) — codename
+stays UNKNOWN pending human selection). The first repass (item 27) folded in
+items 11/14/16/17. Open goal items at this repass (15, 18, 22, 23, 24, 26,
+28, 29) may add sections; this draft covers the merged state as of
+2026-10-01.*
