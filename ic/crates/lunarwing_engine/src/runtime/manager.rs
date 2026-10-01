@@ -1357,6 +1357,7 @@ mod tests {
                 output: serde_json::json!({}),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })
         }
 
@@ -1385,6 +1386,7 @@ mod tests {
                 output: serde_json::json!({}),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })
         }
 

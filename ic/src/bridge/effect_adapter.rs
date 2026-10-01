@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use base64::Engine;
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -668,6 +669,7 @@ impl EffectBridgeAdapter {
                 output,
                 is_error: false,
                 duration: std::time::Duration::ZERO,
+                transient_images: Vec::new(),
             }),
             Err(e) => Ok(ActionResult {
                 call_id: String::new(),
@@ -675,6 +677,7 @@ impl EffectBridgeAdapter {
                 output: serde_json::json!({"error": e.to_string()}),
                 is_error: true,
                 duration: std::time::Duration::ZERO,
+                transient_images: Vec::new(),
             }),
         })
     }
@@ -960,7 +963,7 @@ impl EffectBridgeAdapter {
             job_ctx.metadata["notify_user"] = serde_json::json!(context.user_id);
         }
 
-        let result = crate::tools::execute::execute_tool_with_safety(
+        let result = crate::tools::execute::execute_tool_with_safety_rich(
             &self.tools,
             &self.safety,
             lookup_name,
@@ -973,9 +976,26 @@ impl EffectBridgeAdapter {
 
         match result {
             Ok(output) => {
-                let sanitized = self.safety.sanitize_tool_output(lookup_name, &output);
+                let sanitized = self
+                    .safety
+                    .sanitize_tool_output(lookup_name, &output.content);
                 // Parsing the original JSON would bypass truncation and redaction. Parsing
                 // sanitized but non-neutralized JSON would preserve role-token openers.
+                // MCP images arrive base64-encoded; the engine carries decoded bytes.
+                // Undecodable payloads are dropped rather than failing the action.
+                let transient_images = output
+                    .images
+                    .iter()
+                    .filter_map(|image| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(image.data.as_bytes())
+                            .ok()
+                            .map(|data| lunarwing_engine::TransientContentPart::Image {
+                                mime_type: image.mime_type.clone(),
+                                data,
+                            })
+                    })
+                    .collect::<Vec<_>>();
                 drop(output);
                 let neutralized = neutralize_role_token_openers(&sanitized.content);
                 let output_value = serde_json::from_str::<serde_json::Value>(&neutralized)
@@ -1053,6 +1073,7 @@ impl EffectBridgeAdapter {
                                 output: enriched,
                                 is_error: false,
                                 duration,
+                                transient_images: Vec::new(),
                             });
                         }
                         ToolReadiness::Ready => {
@@ -1070,6 +1091,7 @@ impl EffectBridgeAdapter {
                     output: output_value,
                     is_error: false,
                     duration,
+                    transient_images,
                 })
             }
             Err(e) => {
@@ -1106,6 +1128,7 @@ impl EffectBridgeAdapter {
                     output: serde_json::json!({"error": wrapped_error}),
                     is_error: true,
                     duration,
+                    transient_images: Vec::new(),
                 })
             }
         }
@@ -3645,6 +3668,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 output: serde_json::json!({}),
                 is_error: false,
                 duration: std::time::Duration::from_millis(1),
+                transient_images: Vec::new(),
             })
         }
 

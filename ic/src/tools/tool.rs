@@ -207,6 +207,16 @@ pub enum ToolError {
     Sandbox(String),
 }
 
+/// A single image attached to a tool result, excluded from the sanitized
+/// text pipeline and delivered to vision-capable providers separately.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolImage {
+    /// MIME type (e.g. `image/png`).
+    pub mime_type: String,
+    /// Base64-encoded image bytes.
+    pub data: String,
+}
+
 /// Output from a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
@@ -219,6 +229,11 @@ pub struct ToolOutput {
     /// Raw output before sanitization (for debugging).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// Images forwarded to vision-capable providers outside the sanitized
+    /// text pipeline. Never embedded in `result`, so they cannot leak into
+    /// sanitized tool-output text or persisted transcripts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ToolImage>,
 }
 
 impl ToolOutput {
@@ -229,6 +244,7 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            images: Vec::new(),
         }
     }
 
@@ -239,6 +255,7 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            images: Vec::new(),
         }
     }
 
@@ -251,6 +268,12 @@ impl ToolOutput {
     /// Set the raw output.
     pub fn with_raw(mut self, raw: impl Into<String>) -> Self {
         self.raw = Some(raw.into());
+        self
+    }
+
+    /// Attach images for vision-capable provider delivery.
+    pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
+        self.images = images;
         self
     }
 }

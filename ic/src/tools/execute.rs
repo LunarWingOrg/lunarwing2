@@ -13,6 +13,8 @@ use crate::tools::{ToolRegistry, prepare_tool_params, redact_params};
 /// Execute a tool with safety checks: lookup → validate → timeout → execute → serialize.
 ///
 /// Chat, engine-v2, container runtime and scheduler subtasks use this pipeline.
+/// Image parts attached by multimodal tools are dropped here; use
+/// [`execute_tool_with_safety_rich`] to receive them.
 pub async fn execute_tool_with_safety(
     tools: &ToolRegistry,
     safety: &SafetyLayer,
@@ -20,6 +22,32 @@ pub async fn execute_tool_with_safety(
     params: serde_json::Value,
     job_ctx: &JobContext,
 ) -> Result<String, Error> {
+    execute_tool_with_safety_rich(tools, safety, tool_name, params, job_ctx)
+        .await
+        .map(|rich| rich.content)
+}
+
+/// Tool output with the sanitized text channel plus any typed image parts.
+///
+/// `content` matches what [`execute_tool_with_safety`] returns; `images`
+/// travel outside the text pipeline so sanitization/truncation never sees
+/// them and they cannot leak into persisted tool-output text.
+#[derive(Debug, Clone)]
+pub struct RichToolOutput {
+    pub content: String,
+    pub images: Vec<crate::tools::ToolImage>,
+}
+
+/// Rich variant of [`execute_tool_with_safety`] that also returns typed
+/// image parts attached by multimodal tools (e.g. MCP servers returning
+/// `image` content blocks).
+pub async fn execute_tool_with_safety_rich(
+    tools: &ToolRegistry,
+    safety: &SafetyLayer,
+    tool_name: &str,
+    params: serde_json::Value,
+    job_ctx: &JobContext,
+) -> Result<RichToolOutput, Error> {
     if tool_name.is_empty() {
         return Err(crate::error::ToolError::NotFound {
             name: tool_name.to_string(),
@@ -46,7 +74,7 @@ pub async fn execute_tool_with_safety(
             .join("; ");
         return Err(crate::error::ToolError::InvalidParameters {
             name: tool_name.to_string(),
-            reason: format!("Invalid tool parameters: {}", details),
+            reason: format!("Invalid parameters: {}", details),
         }
         .into());
     }
@@ -86,14 +114,13 @@ pub async fn execute_tool_with_safety(
         Err(_) => {
             tracing::debug!(
                 tool = %tool_name,
-                elapsed_ms = elapsed.as_millis() as u64,
                 timeout_secs = timeout.as_secs(),
                 "Tool call timed out"
             );
         }
     }
 
-    let result = result
+    let output = result
         .map_err(|_| crate::error::ToolError::Timeout {
             name: tool_name.to_string(),
             timeout,
@@ -103,12 +130,15 @@ pub async fn execute_tool_with_safety(
             reason: e.to_string(),
         })?;
 
-    serde_json::to_string_pretty(&result.result).map_err(|e| {
+    let content = serde_json::to_string_pretty(&output.result).map_err(|e| {
         crate::error::ToolError::ExecutionFailed {
             name: tool_name.to_string(),
             reason: format!("Failed to serialize result: {}", e),
         }
-        .into()
+    })?;
+    Ok(RichToolOutput {
+        content,
+        images: output.images,
     })
 }
 

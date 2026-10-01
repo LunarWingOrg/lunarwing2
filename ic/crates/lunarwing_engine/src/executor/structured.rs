@@ -91,6 +91,7 @@ pub async fn execute_action_calls(
                     output: serde_json::json!({"error": &error}),
                     is_error: true,
                     duration: std::time::Duration::ZERO,
+                    transient_images: Vec::new(),
                 },
                 event: EventKind::ActionFailed {
                     step_id: context.step_id,
@@ -121,6 +122,7 @@ pub async fn execute_action_calls(
                     }),
                     is_error: true,
                     duration: std::time::Duration::ZERO,
+                    transient_images: Vec::new(),
                 };
                 let event = EventKind::ActionFailed {
                     step_id: context.step_id,
@@ -167,6 +169,7 @@ pub async fn execute_action_calls(
                         }),
                         is_error: true,
                         duration: std::time::Duration::ZERO,
+                        transient_images: Vec::new(),
                     };
                     let event = EventKind::ActionFailed {
                         step_id: context.step_id,
@@ -440,6 +443,7 @@ fn classify_exec_result(
                 }),
                 is_error: true,
                 duration: std::time::Duration::ZERO,
+                transient_images: Vec::new(),
             };
             let event = EventKind::ApprovalRequested {
                 action_name,
@@ -465,6 +469,7 @@ fn classify_exec_result(
                 output: serde_json::json!({"error": e.to_string()}),
                 is_error: true,
                 duration: std::time::Duration::ZERO,
+                transient_images: Vec::new(),
             };
             let event = EventKind::ActionFailed {
                 step_id: context.step_id,
@@ -552,6 +557,7 @@ mod tests {
                     output: serde_json::json!({"result": "ok"}),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 })
             } else {
                 results.remove(0)
@@ -723,6 +729,7 @@ mod tests {
                 output: serde_json::json!({"results": []}),
                 is_error: false,
                 duration: Duration::from_millis(42),
+                transient_images: Vec::new(),
             })],
         ));
         let leases = Arc::new(LeaseManager::new());
@@ -872,6 +879,7 @@ mod tests {
                     output: serde_json::json!("a_result"),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
                 Ok(ActionResult {
                     call_id: String::new(),
@@ -879,6 +887,7 @@ mod tests {
                     output: serde_json::json!("b_result"),
                     is_error: false,
                     duration: Duration::from_millis(2),
+                    transient_images: Vec::new(),
                 }),
             ],
         ));
@@ -1116,6 +1125,7 @@ mod tests {
                     output: serde_json::json!("second ran"),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
             ],
         ));
@@ -1198,6 +1208,7 @@ mod tests {
                     output: serde_json::json!("second call ran"),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
             ],
         ));
@@ -1364,6 +1375,7 @@ mod tests {
                 output: serde_json::json!("hello"),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })],
         ));
         let leases = Arc::new(LeaseManager::new());
@@ -1410,6 +1422,7 @@ mod tests {
                 output: serde_json::json!({}),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })],
         ));
         let leases = Arc::new(LeaseManager::new());

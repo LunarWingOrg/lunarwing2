@@ -1604,6 +1604,7 @@ fn thread_from_archive(summary: &ThreadArchiveSummary) -> Option<Thread> {
         step_count: summary.step_count,
         total_tokens_used: summary.total_tokens,
         total_cost_usd: 0.0,
+        transient_action_images: Vec::new(),
     })
 }
 

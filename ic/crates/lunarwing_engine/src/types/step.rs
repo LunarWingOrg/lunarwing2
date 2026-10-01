@@ -260,6 +260,11 @@ pub struct ActionResult {
     /// How long the action took.
     #[serde(with = "duration_millis")]
     pub duration: Duration,
+    /// Images attached by multimodal tools. Runtime-only: never serialized
+    /// into sealed step records or checkpoints; the executor stashes them on
+    /// the thread for provider delivery instead.
+    #[serde(skip)]
+    pub transient_images: Vec<crate::types::message::TransientContentPart>,
 }
 
 /// Token usage for a single LLM call.

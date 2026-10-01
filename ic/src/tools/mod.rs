@@ -36,6 +36,6 @@ pub(crate) use coercion::prepare_tool_params;
 pub use rate_limiter::RateLimiter;
 pub use registry::ToolRegistry;
 pub use tool::{
-    ApprovalContext, ApprovalRequirement, RiskLevel, Tool, ToolDomain, ToolError, ToolOutput,
-    ToolRateLimitConfig, redact_params, validate_tool_schema,
+    ApprovalContext, ApprovalRequirement, RiskLevel, Tool, ToolDomain, ToolError, ToolImage,
+    ToolOutput, ToolRateLimitConfig, redact_params, validate_tool_schema,
 };

@@ -416,7 +416,9 @@ pub struct ListToolsResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<ContentBlock>,
-    #[serde(default)]
+    /// Canonical MCP spelling is `isError`; accept the legacy snake_case
+    /// alias so a standard client/server failure is never read as success.
+    #[serde(default, rename = "isError", alias = "is_error")]
     pub is_error: bool,
 }
 
@@ -427,7 +429,13 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]
-    Image { data: String, mime_type: String },
+    Image {
+        data: String,
+        /// Canonical MCP spelling is `mimeType`; accept the legacy
+        /// snake_case alias for older servers.
+        #[serde(rename = "mimeType", alias = "mime_type")]
+        mime_type: String,
+    },
     #[serde(rename = "resource")]
     Resource {
         uri: String,
@@ -749,7 +757,7 @@ mod tests {
         let json = serde_json::to_value(&image_block).expect("serialize");
         assert_eq!(json["type"], "image");
         assert_eq!(json["data"], "abc");
-        assert_eq!(json["mime_type"], "image/jpeg");
+        assert_eq!(json["mimeType"], "image/jpeg");
 
         let resource_block = ContentBlock::Resource {
             uri: "file:///x".to_string(),

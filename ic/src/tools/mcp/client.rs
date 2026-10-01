@@ -17,8 +17,8 @@ use crate::tools::mcp::auth::refresh_access_token;
 use crate::tools::mcp::config::McpServerConfig;
 use crate::tools::mcp::http_transport::HttpMcpTransport;
 use crate::tools::mcp::protocol::{
-    CallToolResult, InitializeResult, ListToolsResult, McpRequest, McpResponse, McpTool,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    CallToolResult, ContentBlock, InitializeResult, ListToolsResult, McpRequest, McpResponse,
+    McpTool, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::mcp::transport::McpTransport;
@@ -817,6 +817,67 @@ struct McpToolWrapper {
     client: Arc<McpClient>,
 }
 
+/// Maximum number of image parts forwarded from one MCP tool result.
+const MAX_RESULT_IMAGES: usize = 4;
+/// Maximum base64 characters forwarded per image (~2 MiB decoded).
+const MAX_RESULT_IMAGE_CHARS: usize = 2_800_000;
+/// Maximum total base64 characters forwarded per tool result.
+const MAX_RESULT_IMAGE_TOTAL_CHARS: usize = 8_400_000;
+/// MIME types providers reliably accept as image content parts.
+const RESULT_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Split an MCP tool result into sanitized-bound text and typed image parts.
+///
+/// Text blocks are joined exactly as before. Image blocks within the count,
+/// per-image, and total size bounds become [`ToolImage`]s for
+/// vision-capable providers; anything beyond the bounds is dropped and
+/// reported in the text so the model is never silently misled about missing
+/// image content.
+fn split_result_content(result: &CallToolResult) -> (String, Vec<crate::tools::ToolImage>) {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    let mut dropped = 0usize;
+    let mut total_chars = 0usize;
+
+    for block in &result.content {
+        match block {
+            ContentBlock::Text { text: part } => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(part);
+            }
+            ContentBlock::Image { data, mime_type } => {
+                let size = data.len() + mime_type.len();
+                if images.len() >= MAX_RESULT_IMAGES
+                    || data.len() > MAX_RESULT_IMAGE_CHARS
+                    || total_chars + size > MAX_RESULT_IMAGE_TOTAL_CHARS
+                    || !RESULT_IMAGE_MIME_TYPES.contains(&mime_type.as_str())
+                {
+                    dropped += 1;
+                    continue;
+                }
+                total_chars += size;
+                images.push(crate::tools::ToolImage {
+                    mime_type: mime_type.clone(),
+                    data: data.clone(),
+                });
+            }
+            ContentBlock::Resource { .. } => {}
+        }
+    }
+
+    if dropped > 0 {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "[{dropped} image result(s) omitted: unsupported type or size]"
+        ));
+    }
+    (text, images)
+}
+
 #[async_trait]
 impl Tool for McpToolWrapper {
     fn name(&self) -> &str {
@@ -851,16 +912,11 @@ impl Tool for McpToolWrapper {
         let params = strip_top_level_nulls(params);
 
         let result = self.client.call_tool(&self.tool.name, params).await?;
-        let content: String = result
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (content, images) = split_result_content(&result);
         if result.is_error {
             return Err(ToolError::ExecutionFailed(content));
         }
-        Ok(ToolOutput::text(content, start.elapsed()))
+        Ok(ToolOutput::text(content, start.elapsed()).with_images(images))
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -1954,6 +2010,209 @@ mod tests {
             .expect_err("another user must not invoke an owner's MCP client");
 
         assert!(matches!(error, ToolError::NotAuthorized(_)));
+    }
+
+    fn mcp_response(id: i64, result: serde_json::Value) -> McpResponse {
+        McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn image_wrapper(responses: Vec<McpResponse>) -> McpToolWrapper {
+        let transport = Arc::new(MockTransport::new(false, responses));
+        let client = Arc::new(McpClient::new_with_transport(
+            "img-server",
+            transport,
+            None,
+            None,
+            "alice",
+            None,
+        ));
+        McpToolWrapper {
+            tool: make_test_mcp_tool(false),
+            prefixed_name: "img-server_do_thing".to_string(),
+            client,
+        }
+    }
+
+    fn handshake_then(call_result: serde_json::Value) -> Vec<McpResponse> {
+        vec![
+            mcp_response(
+                1,
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "img", "version": "1.0"}
+                }),
+            ),
+            mcp_response(2, serde_json::json!({})),
+            mcp_response(3, call_result),
+        ]
+    }
+
+    fn image_block(data: &str, mime_field: &str, mime: &str) -> serde_json::Value {
+        serde_json::json!({"type": "image", "data": data, (mime_field): mime})
+    }
+
+    #[tokio::test]
+    async fn wrapper_forwards_standard_mcp_images_outside_the_text_channel() {
+        let call = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "captured"},
+                image_block("AQID", "mimeType", "image/png")
+            ],
+            "isError": false
+        });
+        let wrapper = image_wrapper(handshake_then(call));
+        let context = JobContext::with_user("alice", "test", "test");
+
+        let output = wrapper
+            .execute(serde_json::json!({}), &context)
+            .await
+            .expect("image result should succeed");
+
+        assert_eq!(output.result, serde_json::json!("captured"));
+        assert_eq!(
+            output.images,
+            vec![crate::tools::ToolImage {
+                mime_type: "image/png".to_string(),
+                data: "AQID".to_string(),
+            }]
+        );
+        assert!(!output.result.as_str().unwrap().contains("omitted"));
+    }
+
+    #[tokio::test]
+    async fn wrapper_accepts_legacy_snake_case_image_fields() {
+        let call = serde_json::json!({
+            "content": [image_block("AQID", "mime_type", "image/jpeg")],
+            "is_error": false
+        });
+        let wrapper = image_wrapper(handshake_then(call));
+        let context = JobContext::with_user("alice", "test", "test");
+
+        let output = wrapper
+            .execute(serde_json::json!({}), &context)
+            .await
+            .expect("legacy field spelling should deserialize");
+
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].mime_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn wrapper_caps_image_count_and_reports_drops() {
+        let images: Vec<_> = (0..6)
+            .map(|i| image_block(&format!("A{i}"), "mimeType", "image/png"))
+            .collect();
+        let call = serde_json::json!({"content": images, "isError": false});
+        let wrapper = image_wrapper(handshake_then(call));
+        let context = JobContext::with_user("alice", "test", "test");
+
+        let output = wrapper
+            .execute(serde_json::json!({}), &context)
+            .await
+            .expect("capped result should still succeed");
+
+        assert_eq!(output.images.len(), MAX_RESULT_IMAGES);
+        assert_eq!(
+            output.images.last().unwrap().data,
+            format!("A{}", MAX_RESULT_IMAGES - 1)
+        );
+        assert_eq!(
+            output.result,
+            serde_json::json!("[2 image result(s) omitted: unsupported type or size]")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapper_drops_oversized_and_unsupported_images() {
+        let oversized = "A".repeat(MAX_RESULT_IMAGE_CHARS + 1);
+        let call = serde_json::json!({
+            "content": [
+                image_block(&oversized, "mimeType", "image/png"),
+                image_block("AAAA", "mimeType", "image/bmp")
+            ],
+            "isError": false
+        });
+        let wrapper = image_wrapper(handshake_then(call));
+        let context = JobContext::with_user("alice", "test", "test");
+
+        let output = wrapper
+            .execute(serde_json::json!({}), &context)
+            .await
+            .expect("dropped images should not fail the call");
+
+        assert!(output.images.is_empty());
+        assert_eq!(
+            output.result,
+            serde_json::json!("[2 image result(s) omitted: unsupported type or size]")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapper_error_results_never_forward_images() {
+        let call = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "boom"},
+                image_block("AQID", "mimeType", "image/png")
+            ],
+            "isError": true
+        });
+        let wrapper = image_wrapper(handshake_then(call));
+        let context = JobContext::with_user("alice", "test", "test");
+
+        let error = wrapper
+            .execute(serde_json::json!({}), &context)
+            .await
+            .expect_err("standard MCP error results must surface as failures");
+
+        assert!(matches!(error, ToolError::ExecutionFailed(message) if message.contains("boom")));
+    }
+
+    #[test]
+    fn split_result_content_enforces_total_budget_and_ignores_resources() {
+        let per_image = MAX_RESULT_IMAGE_CHARS / 3;
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "frame".to_string(),
+            },
+            ContentBlock::Image {
+                data: "B".repeat(per_image),
+                mime_type: "image/png".to_string(),
+            },
+            ContentBlock::Image {
+                data: "C".repeat(per_image),
+                mime_type: "image/png".to_string(),
+            },
+            ContentBlock::Image {
+                data: "D".repeat(per_image),
+                mime_type: "image/png".to_string(),
+            },
+            ContentBlock::Image {
+                data: "E".repeat(per_image),
+                mime_type: "image/png".to_string(),
+            },
+            ContentBlock::Resource {
+                uri: "file:///x".to_string(),
+                mime_type: None,
+                text: None,
+            },
+        ];
+        let result = CallToolResult {
+            content: blocks,
+            is_error: false,
+        };
+
+        let (text, images) = split_result_content(&result);
+
+        // Third image would exceed the total budget and is dropped with a note.
+        assert_eq!(images.len(), 2);
+        assert!(text.starts_with("frame\n"));
+        assert!(text.contains("omitted"));
     }
 
     // Regression test: empty/whitespace-only tokens must not produce a

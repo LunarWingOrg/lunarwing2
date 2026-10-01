@@ -7465,6 +7465,7 @@ pub(crate) mod tests {
             output: serde_json::json!({"success": false, "exit_code": 1}),
             is_error: false,
             duration: std::time::Duration::ZERO,
+            transient_images: Vec::new(),
         };
         assert!(!action_allows_always_persistence("ssh", &result));
 
@@ -7483,6 +7484,7 @@ pub(crate) mod tests {
             output: serde_json::json!({"error": "connection refused"}),
             is_error: true,
             duration: std::time::Duration::ZERO,
+            transient_images: Vec::new(),
         };
         assert!(!action_allows_always_persistence("ssh", &result));
     }
@@ -7498,6 +7500,7 @@ pub(crate) mod tests {
             output: serde_json::json!({"error": "404 Issue Not Found"}),
             is_error: true,
             duration: std::time::Duration::ZERO,
+            transient_images: Vec::new(),
         };
         assert!(action_allows_always_persistence("gitlab", &result));
 
@@ -8063,6 +8066,7 @@ pub(crate) mod tests {
             output: serde_json::json!("approved output"),
             is_error: false,
             duration: std::time::Duration::from_millis(8),
+            transient_images: Vec::new(),
         };
 
         let event = resolved_action_event(&pending, step_id, &result);

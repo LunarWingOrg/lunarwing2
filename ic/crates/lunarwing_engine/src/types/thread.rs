@@ -343,9 +343,89 @@ pub struct Thread {
     pub total_tokens_used: u64,
     /// Cumulative USD cost across all steps.
     pub total_cost_usd: f64,
+    /// Images from recent multimodal action results, keyed by call ID.
+    /// Runtime-only (never serialized): attached to matching ActionResult
+    /// messages on subsequent provider requests until evicted. Restart or
+    /// recovery simply drops them, degrading to text-only results.
+    #[serde(skip)]
+    pub transient_action_images: Vec<TransientActionImages>,
 }
 
+/// Bounded image set stashed for one action result.
+#[derive(Debug, Clone)]
+pub struct TransientActionImages {
+    pub call_id: String,
+    pub parts: Vec<crate::types::message::TransientContentPart>,
+}
+
+/// Maximum number of image-bearing action results retained per thread.
+const MAX_TRANSIENT_ACTION_IMAGE_ENTRIES: usize = 3;
+/// Maximum total decoded image bytes retained across stashed entries.
+const MAX_TRANSIENT_ACTION_IMAGE_TOTAL_BYTES: usize = 8_400_000;
+
 impl Thread {
+    /// Stash images for an action result, evicting oldest entries to hold
+    /// the entry-count and total-size bounds. Empty call IDs and empty
+    /// image sets are ignored.
+    pub fn stash_transient_action_images(
+        &mut self,
+        call_id: &str,
+        parts: Vec<crate::types::message::TransientContentPart>,
+    ) {
+        if call_id.is_empty() || parts.is_empty() {
+            return;
+        }
+        self.transient_action_images
+            .retain(|entry| entry.call_id != call_id);
+        self.transient_action_images.push(TransientActionImages {
+            call_id: call_id.to_string(),
+            parts,
+        });
+        let mut total: usize = self
+            .transient_action_images
+            .iter()
+            .map(|entry| {
+                entry
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        crate::types::message::TransientContentPart::Image { mime_type, data } => {
+                            mime_type.len() + data.len()
+                        }
+                    })
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        while self.transient_action_images.len() > MAX_TRANSIENT_ACTION_IMAGE_ENTRIES
+            || total > MAX_TRANSIENT_ACTION_IMAGE_TOTAL_BYTES
+        {
+            let Some(evicted) = self.transient_action_images.first() else {
+                break;
+            };
+            let evicted_size: usize = evicted
+                .parts
+                .iter()
+                .map(|part| match part {
+                    crate::types::message::TransientContentPart::Image { mime_type, data } => {
+                        mime_type.len() + data.len()
+                    }
+                })
+                .sum::<usize>();
+            total -= evicted_size;
+            self.transient_action_images.remove(0);
+        }
+    }
+
+    /// Images stashed for one call ID, if any remain.
+    pub fn transient_images_for_call(
+        &self,
+        call_id: &str,
+    ) -> Option<&[crate::types::message::TransientContentPart]> {
+        self.transient_action_images
+            .iter()
+            .find(|entry| entry.call_id == call_id)
+            .map(|entry| entry.parts.as_slice())
+    }
     /// Create a new thread in the `Created` state.
     pub fn new(
         goal: impl Into<String>,
@@ -376,6 +456,7 @@ impl Thread {
             step_count: 0,
             total_tokens_used: 0,
             total_cost_usd: 0.0,
+            transient_action_images: Vec::new(),
         }
     }
 

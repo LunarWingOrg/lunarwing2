@@ -1916,6 +1916,7 @@ async fn resolve_tool_completion(
                 output: serde_json::json!({"error": e.to_string()}),
                 is_error: true,
                 duration: Duration::ZERO,
+                transient_images: Vec::new(),
             });
             ToolFutureResolution::Monty(ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
@@ -1938,6 +1939,7 @@ async fn resolve_tool_completion(
                 output: serde_json::json!({"error": &error}),
                 is_error: true,
                 duration: Duration::ZERO,
+                transient_images: Vec::new(),
             });
             ToolFutureResolution::Monty(ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
@@ -2369,6 +2371,7 @@ mod tests {
                     output: serde_json::json!({"result": "ok"}),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 })
             } else {
                 results.remove(0)
@@ -3491,6 +3494,7 @@ FINAL("must not reach")
                     output: serde_json::json!("sibling complete"),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
             ],
         ));
@@ -3528,6 +3532,7 @@ FINAL("should not reach")
                 output: serde_json::json!("hello world"),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })],
         ));
 
@@ -3569,6 +3574,7 @@ FINAL(str(result))
                     output: serde_json::json!(10),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
                 Ok(ActionResult {
                     call_id: String::new(),
@@ -3576,6 +3582,7 @@ FINAL(str(result))
                     output: serde_json::json!(32),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
             ],
         ));
@@ -3621,6 +3628,7 @@ FINAL(str(a + b))
                     output: serde_json::json!("search results"),
                     is_error: false,
                     duration: Duration::from_millis(50),
+                    transient_images: Vec::new(),
                 }),
                 Ok(ActionResult {
                     call_id: String::new(),
@@ -3628,6 +3636,7 @@ FINAL(str(a + b))
                     output: serde_json::json!("page content"),
                     is_error: false,
                     duration: Duration::from_millis(100),
+                    transient_images: Vec::new(),
                 }),
                 Ok(ActionResult {
                     call_id: String::new(),
@@ -3635,6 +3644,7 @@ FINAL(str(a + b))
                     output: serde_json::json!("memories"),
                     is_error: false,
                     duration: Duration::from_millis(25),
+                    transient_images: Vec::new(),
                 }),
             ],
         ));
@@ -3672,6 +3682,7 @@ FINAL(str(s) + "|" + str(h) + "|" + str(m))
                     output: serde_json::json!("intermediate"),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
                 Ok(ActionResult {
                     call_id: String::new(),
@@ -3679,6 +3690,7 @@ FINAL(str(s) + "|" + str(h) + "|" + str(m))
                     output: serde_json::json!("final"),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
             ],
         ));
@@ -3709,6 +3721,7 @@ FINAL(str(b))
                     output: serde_json::json!("ok"),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
                 Err(EngineError::Effect {
                     reason: "tool exploded".into(),
@@ -3827,6 +3840,7 @@ FINAL(str(len(results)))
                 output: serde_json::json!("gathered"),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })],
         ));
 

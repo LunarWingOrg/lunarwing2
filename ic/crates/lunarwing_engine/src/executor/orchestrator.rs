@@ -730,10 +730,11 @@ async fn handle_llm_complete(
 ) -> LlmHostCallOutcome {
     let explicit_messages = args.first().map(monty_to_json).filter(|v| !v.is_null());
     let explicit_config = args.get(2).map(monty_to_json).filter(|v| !v.is_null());
-    let messages = explicit_messages
+    let mut messages = explicit_messages
         .as_ref()
         .and_then(|value| json_to_thread_messages_with_transient(value, Some(thread)))
         .unwrap_or_else(|| thread.messages.clone());
+    attach_transient_action_images(&mut messages, thread);
 
     let active_leases = leases.active_for_thread(thread.id).await;
     let actions = effects
@@ -1294,6 +1295,9 @@ async fn handle_execute_action(
                 "is_error": r.is_error,
                 "duration_ms": r.duration.as_millis(),
             });
+            if !r.is_error {
+                thread.stash_transient_action_images(&call_id, r.transient_images);
+            }
             Ok(ExtFunctionResult::Return(json_to_monty(&result)))
         }
         Err(EngineError::GatePaused {
@@ -1637,6 +1641,8 @@ async fn handle_execute_actions_parallel(
     let mut slot_results: Vec<Option<serde_json::Value>> = vec![None; parsed.len()];
     let mut slot_events: Vec<Option<EventKind>> = vec![None; parsed.len()];
     let mut slot_outputs: Vec<Option<serde_json::Value>> = vec![None; parsed.len()];
+    let mut slot_images: Vec<Option<Vec<crate::types::message::TransientContentPart>>> =
+        vec![None; parsed.len()];
 
     // Separate runnable from errors
     let mut runnable: Vec<(usize, crate::types::capability::CapabilityLease)> = Vec::new();
@@ -1687,7 +1693,7 @@ async fn handle_execute_actions_parallel(
             ps,
         )
         .await;
-        let (result_json, event, output) = match execution {
+        let (result_json, event, output, transient_images) = match execution {
             Ok(result) => result,
             Err(EngineError::ExecutionStopped) => {
                 let _ = leases.refund_use(lease.id).await;
@@ -1701,6 +1707,7 @@ async fn handle_execute_actions_parallel(
         slot_results[idx] = Some(result_json);
         slot_events[idx] = Some(event);
         slot_outputs[idx] = Some(output);
+        slot_images[idx] = Some(transient_images);
     } else if runnable.len() > 1 {
         // Multiple calls: execute in parallel via JoinSet
         let mut join_set = tokio::task::JoinSet::new();
@@ -1755,13 +1762,14 @@ async fn handle_execute_actions_parallel(
                         pending_lease_uses.swap_remove(position);
                     }
                     match result {
-                        Ok((result_json, event, output)) => {
+                        Ok((result_json, event, output, transient_images)) => {
                             if interrupted_result_needs_refund(&result_json) {
                                 let _ = leases.refund_use(lease_id).await;
                             }
                             slot_results[idx] = Some(result_json);
                             slot_events[idx] = Some(event);
                             slot_outputs[idx] = Some(output);
+                            slot_images[idx] = Some(transient_images);
                         }
                         Err(EngineError::ExecutionStopped) => {
                             if !execution_stopped {
@@ -1804,6 +1812,19 @@ async fn handle_execute_actions_parallel(
             }
             thread.events.push(ev);
         }
+        if let Some(transient_images) = slot_images[idx].take().filter(|_images| {
+            // Gate interruptions and error slots never deliver provider images.
+            !result_json
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && !result_json
+                    .get("gate_paused")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+        }) {
+            thread.stash_transient_action_images(&parsed[idx].call_id, transient_images);
+        }
 
         results_json.push(result_json.clone());
     }
@@ -1814,8 +1835,9 @@ async fn handle_execute_actions_parallel(
     )))
 }
 
-/// Execute a single action and return (result_json, event, output) for the
-/// batch handler to record. Shared by both single-call and parallel paths.
+/// Execute a single action and return (result_json, event, output, images)
+/// for the batch handler to record. Shared by both single-call and parallel
+/// paths. The images element carries multimodal parts for provider delivery.
 async fn execute_single_action(
     effects: &Arc<dyn EffectExecutor>,
     name: &str,
@@ -1824,7 +1846,15 @@ async fn execute_single_action(
     lease: &crate::types::capability::CapabilityLease,
     exec_ctx: &ThreadExecutionContext,
     params_summary: Option<String>,
-) -> Result<(serde_json::Value, EventKind, serde_json::Value), EngineError> {
+) -> Result<
+    (
+        serde_json::Value,
+        EventKind,
+        serde_json::Value,
+        Vec<crate::types::message::TransientContentPart>,
+    ),
+    EngineError,
+> {
     match effects.execute_action(name, params, lease, exec_ctx).await {
         Ok(r) => {
             let event = EventKind::ActionExecuted {
@@ -1835,13 +1865,18 @@ async fn execute_single_action(
                 params_summary: params_summary.clone(),
                 result_preview: crate::types::event::preview_from_output(&r.output),
             };
+            let transient_images = if r.is_error {
+                Vec::new()
+            } else {
+                r.transient_images
+            };
             let result_json = serde_json::json!({
                 "action_name": r.action_name,
                 "output": r.output,
                 "is_error": r.is_error,
                 "duration_ms": r.duration.as_millis(),
             });
-            Ok((result_json, event, r.output))
+            Ok((result_json, event, r.output, transient_images))
         }
         Err(EngineError::GatePaused {
             gate_name,
@@ -1873,7 +1908,7 @@ async fn execute_single_action(
                 "resume_kind": serde_json::to_value(&*resume_kind).unwrap_or_default(),
                 "resume_output": resume_output,
             });
-            Ok((result_json, event, output))
+            Ok((result_json, event, output, Vec::new()))
         }
         Err(EngineError::ExecutionStopped) => Err(EngineError::ExecutionStopped),
         Err(e) => {
@@ -1889,7 +1924,7 @@ async fn execute_single_action(
                 "output": &output,
                 "is_error": true,
             });
-            Ok((result_json, event, output))
+            Ok((result_json, event, output, Vec::new()))
         }
     }
 }
@@ -2624,6 +2659,32 @@ fn json_to_thread_messages_with_transient(
     }
 
     Some(messages)
+}
+
+/// Attach stashed multimodal action images to their matching ActionResult
+/// messages before a provider request.
+///
+/// Images are runtime-only: they ride the request in
+/// `transient_content_parts` (never serialized) and remain available for
+/// later requests until the stash evicts them, mirroring how inbound user
+/// attachment images stay visible for the turn.
+pub(super) fn attach_transient_action_images(messages: &mut [ThreadMessage], thread: &Thread) {
+    if thread.transient_action_images.is_empty() {
+        return;
+    }
+    for message in messages.iter_mut() {
+        if message.role != crate::types::message::MessageRole::ActionResult {
+            continue;
+        }
+        let Some(call_id) = message.action_call_id.as_deref() else {
+            continue;
+        };
+        if message.transient_content_parts.is_empty()
+            && let Some(parts) = thread.transient_images_for_call(call_id)
+        {
+            message.transient_content_parts = parts.to_vec();
+        }
+    }
 }
 
 fn json_to_action_calls(value: &serde_json::Value) -> Option<Vec<ActionCall>> {
@@ -4296,6 +4357,7 @@ mod tests {
                 output: serde_json::json!({"ok": true}),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })
         }
 
@@ -4323,6 +4385,7 @@ mod tests {
                 output: serde_json::json!({"ok": true}),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })
         }
 
@@ -4350,6 +4413,7 @@ mod tests {
                 output: serde_json::json!({"ok": true}),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })
         }
 
@@ -4377,6 +4441,7 @@ mod tests {
                 output: serde_json::json!({}),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })
         }
 

@@ -143,6 +143,28 @@ consumers) still returns full structs; only the agent-facing `tool_list`
 output is bounded. The same pagination contract is the model for fixing
 `mission_list` and `list_issues`, which share the truncation family.
 
+### MCP tool result images (multimodal forwarding)
+
+MCP servers may return `image` content blocks alongside text. The client
+accepts both the canonical `isError`/`mimeType` spellings and legacy
+snake_case, and forwards images to vision-capable providers as a typed
+side channel — never embedded in the sanitized tool-output text, so
+truncation/redaction and persisted transcripts are unaffected.
+
+Bounds per tool result: at most 4 images, `image/png`/`jpeg`/`webp`/`gif`
+only, ~2 MiB per image and ~6 MiB total (base64). Anything beyond the
+bounds is dropped and reported in the text as
+`[N image result(s) omitted: unsupported type or size]`, so the model is
+never silently misled. Error results never forward images.
+
+In Engine V2 the executor stashes images for the action's `call_id`
+(runtime-only; newest 3 calls / ~8 MiB, never serialized) and attaches
+them to the matching `ActionResult` message on subsequent provider
+requests — the same transient, non-persisted mechanism inbound user
+attachment images use. A thread restart or recovery drops them,
+degrading to text-only results. The v1 chat loop and job-worker MCP
+placement do not yet forward images (dropped with the same omission note).
+
 ### What Goes in Tools (capabilities.json)
 
 - API endpoints the tool needs (HTTP allowlist)

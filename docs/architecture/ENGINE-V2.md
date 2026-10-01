@@ -961,6 +961,21 @@ so a file sent on one channel stays retrievable from all other channels and
 the WebUI. Stored documents go through the normal workspace write path
 (prompt-injection scan, search indexing).
 
+#### Action-result images
+
+Multimodal tool output (MCP servers returning `image` content blocks) uses
+the same transient delivery. The host effect adapter decodes bounded,
+allow-listed images out of the tool result and returns them on
+`ActionResult::transient_images` — a serde-skipped field, so sealed step
+records and checkpoints never contain image bytes. The executor stashes
+them on the thread keyed by the action's `call_id` (newest three calls,
+~8 MiB total, runtime-only) and attaches them to the matching
+`ActionResult` message for each provider request until evicted. The
+orchestrator never sees image data; Python working transcripts and
+sanitized tool-output text are unchanged. Restart or recovery drops the
+stash, degrading to text-only results. Error results and gate pauses never
+carry images.
+
 Attachment count, MIME, per-file, and aggregate limits remain owned by the
 ingress channel/host implementations. Attachments on approval, interrupt, and
 credential replies stay on those control paths and are not added to model

@@ -817,6 +817,7 @@ mod tests {
                     output: serde_json::json!({"result": "ok"}),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 })
             } else {
                 results.remove(0)
@@ -832,6 +833,202 @@ mod tests {
     }
 
     // ── Helpers ─────────────────────────────────────────────
+
+    fn test_image_part(marker: &str) -> crate::types::message::TransientContentPart {
+        crate::types::message::TransientContentPart::Image {
+            mime_type: "image/png".to_string(),
+            data: marker.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn transient_action_image_stash_enforces_entry_and_size_bounds() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+
+        // Empty call IDs and empty image sets are ignored entirely.
+        thread.stash_transient_action_images("", vec![test_image_part("a")]);
+        thread.stash_transient_action_images("call-0", Vec::new());
+        assert!(thread.transient_action_images.is_empty());
+
+        for index in 0..4 {
+            thread.stash_transient_action_images(
+                &format!("call-{index}"),
+                vec![test_image_part(&format!("img-{index}"))],
+            );
+        }
+        // Entry cap keeps the newest three call IDs.
+        let stored: Vec<&str> = thread
+            .transient_action_images
+            .iter()
+            .map(|entry| entry.call_id.as_str())
+            .collect();
+        assert_eq!(stored, vec!["call-1", "call-2", "call-3"]);
+        assert!(thread.transient_images_for_call("call-0").is_none());
+        assert_eq!(thread.transient_images_for_call("call-3").unwrap().len(), 1);
+
+        // Restashing a call ID moves it to the back without duplicating.
+        thread.stash_transient_action_images("call-1", vec![test_image_part("img-1b")]);
+        let stored: Vec<&str> = thread
+            .transient_action_images
+            .iter()
+            .map(|entry| entry.call_id.as_str())
+            .collect();
+        assert_eq!(stored, vec!["call-2", "call-3", "call-1"]);
+
+        // A single just-under-cap entry evicts everything older and stays.
+        let huge = vec![b'H'; 8_399_000];
+        thread.stash_transient_action_images(
+            "call-huge",
+            vec![crate::types::message::TransientContentPart::Image {
+                mime_type: "image/png".to_string(),
+                data: huge,
+            }],
+        );
+        assert_eq!(thread.transient_action_images.len(), 1);
+        assert_eq!(thread.transient_action_images[0].call_id, "call-huge");
+    }
+
+    #[test]
+    fn transient_action_images_never_serialize_with_the_thread() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.stash_transient_action_images("call-9", vec![test_image_part("secret")]);
+
+        let json = serde_json::to_string(&thread).expect("thread serializes");
+        assert!(!json.contains("secret"));
+        let restored: Thread = serde_json::from_str(&json).expect("thread deserializes");
+        assert!(restored.transient_action_images.is_empty());
+    }
+
+    #[test]
+    fn attach_transient_action_images_matches_only_action_results_with_call_ids() {
+        use crate::executor::orchestrator::attach_transient_action_images as attach;
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.stash_transient_action_images("call-1", vec![test_image_part("one")]);
+
+        let mut messages = vec![
+            ThreadMessage::user("hello"),
+            ThreadMessage::action_result("call-1", "screenshot", "captured"),
+            ThreadMessage::action_result("call-2", "other", "no images"),
+            ThreadMessage::action_result("", "missing-id", "no id"),
+        ];
+        attach(&mut messages, &thread);
+
+        assert!(messages[0].transient_content_parts.is_empty());
+        assert_eq!(messages[1].transient_content_parts.len(), 1);
+        assert!(messages[2].transient_content_parts.is_empty());
+        assert!(messages[3].transient_content_parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn action_result_images_reach_the_next_model_request() {
+        // One screenshot-producing call, then a FINAL turn: the second LLM
+        // request must carry the image as a transient content part attached
+        // to the ActionResult message for that call.
+        let llm = Arc::new(StreamingMockLlm::new(vec![
+            vec![
+                Ok(LlmStreamChunk::TextDelta(
+                    "```repl\nawait test_tool()\n```".to_string(),
+                )),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".into(),
+                }),
+            ],
+            vec![
+                Ok(LlmStreamChunk::TextDelta(
+                    "```repl\nFINAL('saw the image')\n```".to_string(),
+                )),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".into(),
+                }),
+            ],
+        ]));
+        let effects = Arc::new(ImageMockEffects);
+        let (mut exec, _signal_tx) = make_loop_with_effects(llm.clone(), effects).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "saw the image"
+        ));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2, "action turn + final turn");
+        let action_messages: Vec<_> = requests[1]
+            .iter()
+            .filter(|message| message.role == MessageRole::ActionResult)
+            .collect();
+        assert_eq!(action_messages.len(), 1);
+        assert_eq!(
+            action_messages[0].action_call_id.as_deref(),
+            Some("call-img-1")
+        );
+        assert_eq!(action_messages[0].transient_content_parts.len(), 1);
+        assert!(matches!(
+            &action_messages[0].transient_content_parts[0],
+            crate::types::message::TransientContentPart::Image { data, .. }
+                if data == b"png-bytes"
+        ));
+        // The stash keeps the images available for later requests too.
+        assert_eq!(
+            exec.thread
+                .transient_images_for_call("call-img-1")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    struct ImageMockEffects;
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for ImageMockEffects {
+        async fn execute_action(
+            &self,
+            _action_name: &str,
+            _parameters: serde_json::Value,
+            _lease: &CapabilityLease,
+            _context: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            Ok(ActionResult {
+                call_id: "call-img-1".to_string(),
+                action_name: "screenshot".to_string(),
+                output: serde_json::json!({"frame": 1}),
+                is_error: false,
+                duration: Duration::from_millis(2),
+                transient_images: vec![crate::types::message::TransientContentPart::Image {
+                    mime_type: "image/png".to_string(),
+                    data: b"png-bytes".to_vec(),
+                }],
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action()])
+        }
+    }
 
     fn text_response(text: &str) -> LlmOutput {
         LlmOutput {
@@ -901,6 +1098,29 @@ mod tests {
 
         let (tx, rx) = crate::runtime::messaging::signal_channel(16);
 
+        let exec = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, "test-user".into());
+        (exec, tx)
+    }
+
+    async fn make_loop_with_effects(
+        llm: Arc<dyn LlmBackend>,
+        effects: Arc<dyn EffectExecutor>,
+    ) -> (ExecutionLoop, crate::runtime::messaging::SignalSender) {
+        let thread = Thread::new(
+            "test goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let tid = thread.id;
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        leases
+            .grant(tid, "test_cap", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let (tx, rx) = crate::runtime::messaging::signal_channel(16);
         let exec = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, "test-user".into());
         (exec, tx)
     }
@@ -1312,6 +1532,7 @@ mod tests {
             output: serde_json::json!({"ok": true}),
             is_error: false,
             duration: Duration::from_millis(1),
+            transient_images: Vec::new(),
         };
         let (mut execution, _signal_tx) =
             make_loop_with_llm(llm.clone(), vec![Ok(effect)], ThreadConfig::default()).await;
@@ -1364,6 +1585,7 @@ mod tests {
             output: serde_json::json!({"ok": true}),
             is_error: false,
             duration: Duration::from_millis(1),
+            transient_images: Vec::new(),
         };
         let (mut execution, _signal_tx) =
             make_loop_with_llm(llm.clone(), vec![Ok(effect)], ThreadConfig::default()).await;
@@ -1611,6 +1833,7 @@ mod tests {
                 output: serde_json::json!({"data": "result"}),
                 is_error: false,
                 duration: Duration::from_millis(5),
+                transient_images: Vec::new(),
             })],
             ThreadConfig::default(),
         )
@@ -1643,6 +1866,7 @@ mod tests {
                     output: serde_json::json!({"i": i}),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 })
             })
             .collect();
@@ -1959,6 +2183,7 @@ mod tests {
                     output: serde_json::json!({"error": "failed"}),
                     is_error: true,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 })
             })
             .collect();
@@ -1997,6 +2222,7 @@ mod tests {
                     output: serde_json::json!({"error": "failed"}),
                     is_error: true,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 })
             })
             .collect();
@@ -2025,6 +2251,7 @@ mod tests {
                     output: serde_json::json!({}),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 })
             })
             .collect();
@@ -2379,6 +2606,7 @@ mod tests {
                 output: serde_json::json!({"data": "hello from tool"}),
                 is_error: false,
                 duration: Duration::from_millis(5),
+                transient_images: Vec::new(),
             })],
             ThreadConfig::default(),
         )
@@ -2503,6 +2731,7 @@ mod tests {
                     output: serde_json::json!({"i": 0}),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
                 Ok(ActionResult {
                     call_id: "code_call_2".into(),
@@ -2510,6 +2739,7 @@ mod tests {
                     output: serde_json::json!({"i": 1}),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
                 Ok(ActionResult {
                     call_id: "code_call_3".into(),
@@ -2517,6 +2747,7 @@ mod tests {
                     output: serde_json::json!({"i": 2}),
                     is_error: false,
                     duration: Duration::from_millis(1),
+                    transient_images: Vec::new(),
                 }),
             ],
             ThreadConfig::default(),
@@ -2667,6 +2898,7 @@ mod tests {
                 output: serde_json::json!({"data": "result"}),
                 is_error: false,
                 duration: Duration::from_millis(5),
+                transient_images: Vec::new(),
             })],
             ThreadConfig::default(),
         )
@@ -2711,6 +2943,7 @@ mod tests {
                 output: serde_json::json!({"data": "result"}),
                 is_error: false,
                 duration: Duration::from_millis(1),
+                transient_images: Vec::new(),
             })],
             ThreadConfig::default(),
         )
@@ -2854,6 +3087,7 @@ mod tests {
                 output: serde_json::json!({"status": "ok"}),
                 is_error: false,
                 duration: Duration::from_millis(3),
+                transient_images: Vec::new(),
             })],
             ThreadConfig::default(),
         )
