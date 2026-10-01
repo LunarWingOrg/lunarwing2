@@ -59,7 +59,7 @@
 
 12. [ ] take a look at any documentation that should be updated and update necessary documentation
 13. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
-14. [ ] review all currently open work items - create audit document for 2.1.3.0
+14. [ ] review all currently open work items - create audit document for 2.1.4.0 in docs/ops - there are similar docs in docs/ops for 2.1.3.0 and earlier releases so you can use those as references
 15. [x] (S) (COMEBACKTOTHISLATER) UPDATE RELEASE-v2.1.2.0.md WITH CHANGES MADE SINCE FIRST DRAFT WAS CREATED
 16. [ ] update all docs in docs/guides
 17. [ ] update all docs in docs/architecture
