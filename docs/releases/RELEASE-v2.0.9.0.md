@@ -189,7 +189,7 @@ but unifying it is still a possible follow-up.
 
 Evidence and detailed threat analysis:
 
-- [`docs/ops/v2.0.9.0_GOAL1_TOOL_RESULT_INTEGRITY.md`](docs/ops/v2.0.9.0_GOAL1_TOOL_RESULT_INTEGRITY.md)
+- [`docs/ops/history/v2.0.9.0_GOAL1_TOOL_RESULT_INTEGRITY.md`](docs/ops/history/v2.0.9.0_GOAL1_TOOL_RESULT_INTEGRITY.md)
 - [`docs/ops/ROLE_TOKEN_SMUGGLE.md`](docs/ops/ROLE_TOKEN_SMUGGLE.md)
 
 ### Self-Repair and Tool Schema Reliability
@@ -243,8 +243,8 @@ native knowledge store.
 
 Evidence:
 
-- [`docs/ops/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md`](docs/ops/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md)
-- [`docs/ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](docs/ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md)
+- [`docs/ops/history/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md`](docs/ops/history/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md)
+- [`docs/ops/history/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](docs/ops/history/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md)
 
 ### Multi-Tenant Port-Collision Diagnostics
 
@@ -453,7 +453,7 @@ and deployed workspace guidance changed:
 System prompt and workspace documents were also preserved byte-for-byte during a
 live `upgrade-tenant` test on systemd; the test tenant was removed afterward.
 See
-[`docs/ops/v2.0.9.0_GOAL16_SYSTEM_PROMPT_UPGRADE_SYSTEMD.md`](docs/ops/v2.0.9.0_GOAL16_SYSTEM_PROMPT_UPGRADE_SYSTEMD.md).
+[`docs/ops/history/v2.0.9.0_GOAL16_SYSTEM_PROMPT_UPGRADE_SYSTEMD.md`](docs/ops/history/v2.0.9.0_GOAL16_SYSTEM_PROMPT_UPGRADE_SYSTEMD.md).
 
 ### Skill Attenuation Visibility
 
@@ -489,10 +489,10 @@ attenuating `memory_write`. LunarWing now logs this per-turn tool attenuation at
   [`docs/guides/TENANT_KNOWLEDGE_SEED.md`](docs/guides/TENANT_KNOWLEDGE_SEED.md),
   walks through seeding a new tenant from the synced lw2studymcp base and the
   correct re-arm path.
-- New `docs/ops/v2.0.9.0_OPEN_WORK_ITEMS_STATUS.md` tracks each open GitLab
+- New `docs/ops/history/v2.0.9.0_OPEN_WORK_ITEMS_STATUS.md` tracks each open GitLab
   work item's addressed/unaddressed state, and the OpenRC and systemd stress
-  plans plus dated findings live under `docs/ops/v2.0.9.0_GOAL25_*` and
-  `docs/ops/v2.0.9.0_GOAL26_*`.
+  plans plus dated findings live under `docs/ops/history/v2.0.9.0_GOAL25_*` and
+  `docs/ops/history/v2.0.9.0_GOAL26_*`.
 - The CI architecture-boundary check passes again: the LLM module now imports
   the role-token neutralizer from the `lunarwing_safety` workspace crate
   directly rather than through the `crate::safety` re-export shim.

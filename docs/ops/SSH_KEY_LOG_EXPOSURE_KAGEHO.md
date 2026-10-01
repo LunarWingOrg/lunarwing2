@@ -156,5 +156,5 @@ fences that surface:
 - Log-leak fix: `09b0f507` ("fix(ssh): keep key upload secrets out of tracing spans and logs")
 - Router fence: `8c323c43` ("fix(ssh): require bearer auth on SSH API and default webhook bind to loopback")
 - CI allowlist: `d89ceff8`
-- Finding source: `docs/ops/v2.0.9.0_GOAL25_STRESS_TEST_FINDINGS_SYSTEMD.md` (F2)
+- Finding source: `docs/ops/history/v2.0.9.0_GOAL25_STRESS_TEST_FINDINGS_SYSTEMD.md` (F2)
 - Repo invariant: `secrecy` types for sensitive values; never log or expose secrets
