@@ -94,9 +94,9 @@
     - `XMPP_FILE_TRANSFERS.md` — registry 0.1.16 / bridge crate 2.1.4 confirmed; only lockfile bumps this cycle, no transfer-limit or protocol change.
     - `ATOMICBOOL_DEEPER_PROPAGATION.md` — symbol anchors re-verified (`HARD_KILL_GRACE_SECS`=30 at `agent_loop.rs:52`; per-message suppression flag at `:1330`); defer decision stands, decision log appended.
     - `SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md` — `bash tests/run-all.sh --list` run live: 19 suites, unchanged; no pipeline script changed this cycle.
-    - `SELF_HEAL_DEPLOYMENT_WIRING.md` / `SSH_AGENT_HARNESS.md` / `SSH_DELIVERY_MECHANISMS.md` — stamps updated; wiring/role mappings unchanged, `ensure_health_pipeline` still in `mt-admin-lib/12-health-pipeline.sh`, no `ic/src/bridge/ssh*.rs` change this cycle (WI#265 touched `router.rs` only), opencode2 2.0.20 pin move does not affect the SSH mount contract.
+    - `SELF_HEAL_DEPLOYMENT_WIRING.md` / `SSH_AGENT_HARNESS.md` / `SSH_DELIVERY_MECHANISMS.md` — stamps updated; wiring/role mappings unchanged, `ensure_health_pipeline` still in `mt-admin-lib/12-health-pipeline.sh`, no `ic/src/bridge/ssh*.rs` change this cycle (WI#265 touched `router.rs` only), opencode2 2.0.20 pin move does not affect the SSH mount contract
     - All relative links in all 10 files verified resolvable. Docs-only change: no cargo check needed
-18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269
+18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269 - last attempt was rejected: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1302 - see comments of closed MR for details and re-attempt, using the last closed MR here as a reference
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/270
 20. [ ] fix issues in CI/CD (if any) - See Pipeline number 4774 for latest master pipeline run and see if anything is not GREEN
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
