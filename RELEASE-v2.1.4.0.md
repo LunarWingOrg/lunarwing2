@@ -49,7 +49,7 @@ estimates surfaced as frozen advisory hints on approvals and pending gates
 The operator surface gained per-tenant system-prompt editing in Settings with
 Engine V2 initialization snapshots (WI#220), read-only tenant database and
 daemon-PID diagnostics verbs in mt-admin (`psql`, `daemon-pid`) with a
-WI#268 prompt-overlay audit runbook, an opencode2 worker bump to v2.0.20, and
+WI#268 prompt-overlay audit runbook, an opencode2 worker bump to v2.0.21, and
 a pairing allowlist fix so approving a new sender no longer erases the
 existing allowlist. New tenants now render `ORCHESTRATOR_SELF_MODIFY=true`
 (stored orchestrator and prompt-overlay updates, WI#282), with the operator
@@ -208,12 +208,13 @@ previous compatibility baseline.
   now renders `ORCHESTRATOR_SELF_MODIFY=true` so new tenants adopt stored
   orchestrator and prompt-overlay updates; an explicit operator opt-out is
   preserved across re-renders. Existing tenants are untouched
-- **External worker: opencode2 v2.0.20 (item 2).** The opencode2 lane
-  advances v2.0.18 → v2.0.20 at reviewed full commit
-  `84c9be93a56304a108f1a22df0c5d62c26d5b6ca` (tag SHA verified live).
-  Dockerfile pins, CI source_ref/build args, and the reproducible-build
-  fixture moved together; the `bytecode: true`/`splitting: true` patch
-  contract and bridge surface verified unchanged (diff is additive). kimi
+- **External worker: opencode2 v2.0.21 (items 2/29).** The opencode2 lane
+  advances v2.0.18 → v2.0.21 at reviewed full commit
+  `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (lightweight tag `v2.0.21`;
+  tag SHA verified live). Dockerfile pins, CI source_ref/build args, and
+  the reproducible-build fixture moved together; the
+  `bytecode: true`/`splitting: true` patch contract and bridge surface
+  verified unchanged at both pins this cycle (each diff is additive). kimi
   stays at 2.1.1, opencode v1 at `v1.18.25`, pebble at `2d0f3786…`
 - **Documentation parity (item 12).** Seven docs re-verified against the
   tree for changes not covered by each goal's own updates: the mt-admin
@@ -263,7 +264,7 @@ previous compatibility baseline.
 | Tool registry patches | cavepony-tool 0.4.4 (release-metadata alignment; the `version-policy` gate requires all five version fields to advance together), gitlab 0.1.7, gotify 0.1.1, llm-context 0.1.2, multica-bridge 0.1.3, ssh 0.1.2, vision-analyze 0.1.4, voice-transcribe 0.1.2, web-search 0.2.3 |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.16 (no change from v2.1.3.0) |
 | External crate updates | 121 semver-compatible updates across the ic workspace and satellite lockfile roots (notably hyper 1.11.1, reqwest 0.13.5, tokio-rustls 0.26.6, quinn 0.11.12, clap 4.6.7, thiserror 2.0.21, rkyv stack replaced by string_cache/web_atoms/zlib-rs in affected satellites); `ic/vendor/` regenerated |
-| Worker image tool pins | kimi-code `2.1.1` (no change); opencode2 `v2.0.20` at `84c9be93a56304a108f1a22df0c5d62c26d5b6ca` (was v2.0.18); opencode `v1.18.25` (no change); pebble `2d0f3786…` with the reviewed upstream lock re-pinned for the chacha20 retirement (refreshed `PEBBLE_LOCK_SHA256`) |
+| Worker image tool pins | kimi-code `2.1.1` (no change); opencode2 `v2.0.21` at `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (was v2.0.18, via v2.0.20); opencode `v1.18.25` (no change); pebble `2d0f3786…` with the reviewed upstream lock re-pinned for the chacha20 retirement (refreshed `PEBBLE_LOCK_SHA256`) |
 | Engine provider recovery | Bounded per-turn recovery after partial text for transient/unavailable provider failures; retry caps and rate-limit exclusions unchanged; failed drafts never enter history or tool execution |
 | Mission global listings | Missions whose project record is missing/unparseable remain globally enumerable; only Active ones reach the active-only listing |
 | `routine_history` / `mission_history` | `routine_history` falls back to Engine V2 mission-name lookup when the v1 routines registry misses, with character-based summary truncation; in v2 threads it is blocked with an honest pointer to the new `mission_history` tool (project-scoped own+shared, ownership re-checked on the UUID path) |
@@ -610,21 +611,29 @@ tracked manifest/lock audit confirmed no project-owned package remains at
 workspace and the repo-root satellite lockfile roots; `ic/vendor/` was
 regenerated. Channel behavior is unchanged — the bumps are rebuild-only.
 
-### External Workers: opencode2 v2.0.20 (item 2)
+### External Workers: opencode2 v2.0.21 (items 2/29)
 
-The opencode2 lane advances v2.0.18 → v2.0.20 at reviewed full commit
-`84c9be93a56304a108f1a22df0c5d62c26d5b6ca` (tag SHA verified live against
-the anomalyco/opencode remote). Dockerfile pins, CI source_ref/build args,
-and the reproducible-build test fixture moved in step. Verified: the
-upstream `build.ts` at the new SHA still has exactly one `bytecode: true` /
-`splitting: true` (patch contract holds); the bridge surface is unchanged
-(`OpenCode.make`, `session.create` with `permissions`,
-`session.permission.reply`, `session.interrupt`, `event.subscribe`, all
-matched event names); the diff is additive — new `credential.list/create`
-endpoints are unused. Host-side reproducible-build preparation 3/3 OK.
-Whole-image reproducibility must still pass the CI candidate-vs-clean
-rebuild digest gate before promotion (CI-only, as with prior bumps). kimi
-remains at 2.1.1, opencode v1 at `v1.18.25`, and pebble at `2d0f3786…`.
+The opencode2 lane moved twice this cycle, landing at v2.0.21. Item 2
+advanced v2.0.18 → v2.0.20 at `84c9be93a56304a108f1a22df0c5d62c26d5b6ca`;
+item 29 then advanced v2.0.20 → v2.0.21 at reviewed full commit
+`8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (lightweight tag `v2.0.21`;
+both tag SHAs verified live against the anomalyco/opencode remote).
+Dockerfile pins, CI source_ref/build args, and the reproducible-build test
+fixture moved in step at each bump. Verified at the final pin: the upstream
+`build.ts` still has exactly one `bytecode: true` / `splitting: true`
+(patch contract holds); the bridge surface is unchanged on every endpoint
+the worker uses (`OpenCode.make`, `session.create` with `permissions`,
+`session.prompt`, `session.message.list`, `session.permission.reply`,
+`session.interrupt`, `event.subscribe`, all eight matched event names) —
+the v2.0.20 → v2.0.21 surface diff is additive only (an optional `message`
+param on the unused `session.form.cancel` endpoint and an
+`x-opencode-session-id` header; the `permission.reply` path is
+byte-identical), as was the v2.0.18 → v2.0.20 diff (unused
+`credential.list/create` endpoints). Host-side reproducible-build
+preparation 3/3 OK. Whole-image reproducibility must still pass the CI
+candidate-vs-clean rebuild digest gate before promotion (CI-only, as with
+prior bumps). kimi remains at 2.1.1, opencode v1 at `v1.18.25`, and pebble
+at `2d0f3786…`.
 
 ### Documentation Parity (item 12)
 
@@ -755,8 +764,8 @@ as alternates. The codename above remains UNKNOWN until a human picks.
 4. **Vendor snapshot.** `ic/vendor/` was regenerated for the 121 external
    crate updates; if you maintain a local vendor override, refresh it with
    `ic/scripts/refresh-vendor.sh` before building.
-5. **opencode2 rebuild.** Rebuild the opencode2 worker image at `v2.0.20`
-   (`84c9be93a…`); pull worker images by the digest recorded in
+5. **opencode2 rebuild.** Rebuild the opencode2 worker image at `v2.0.21`
+   (`8a8bd622…`); pull worker images by the digest recorded in
    `worker-image-evidence.json`. Promotion still requires the CI
    candidate-vs-clean rebuild digest gate.
 6. **Pebble worker.** The reviewed upstream lock re-pins chacha20 to 0.10.2
@@ -823,7 +832,7 @@ as alternates. The codename above remains UNKNOWN until a human picks.
   (carried).
 - Kawarimi remains PostgreSQL-only (carried).
 - OpenCode v1.18.29+ remains deliberately un-adopted for the opencode lane
-  pending upstream proof (carried; the opencode2 lane is on v2.0.20).
+  pending upstream proof (carried; the opencode2 lane is on v2.0.21).
 - Historical WI#159 behavior remains: terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) still
   fire for Research child threads — only Mission threads are filtered
@@ -896,8 +905,9 @@ as alternates. The codename above remains UNKNOWN until a human picks.
   multi-version keying and no-op-override rejection.
 - Integration-target MRs now run the full validation matrix; CI recovered
   from #4679 without bypassing any gate.
-- opencode2 worker at v2.0.20 (reviewed commit, verified patch contract and
-  bridge surface); kimi 2.1.1, opencode v1, and pebble pins unchanged.
+- opencode2 worker at v2.0.21 (reviewed commit, verified patch contract and
+  bridge surface at both of the cycle's pins); kimi 2.1.1, opencode v1, and
+  pebble pins unchanged.
 - Documentation parity for the cycle: seven docs synced, four manual test
   tiers added, releases/docs indexes updated.
 - All 32 active guides and all 10 active architecture docs repassed for
