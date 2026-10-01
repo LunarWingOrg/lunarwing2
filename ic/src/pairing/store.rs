@@ -677,6 +677,108 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_username_entry_matches_by_username() {
+        // Legacy compatibility contract (WI #184 design): an allowFrom entry
+        // written as `@Alice` must keep authorizing a sender whose id is a
+        // platform id and whose username is `alice`. Username matching is
+        // case-insensitive and tolerates the `@` prefix on the stored entry.
+        // These regressions pin today's file-store semantics so the
+        // secrets-store migration preserves them (P2 finding on !1294).
+        let (store, dir) = test_store();
+        let path = allow_from_path(dir.path(), "xmpp").unwrap();
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&AllowFromStoreFile {
+                version: 1,
+                allow_from: vec!["@Alice".to_string()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .is_sender_allowed("xmpp", "platform-id", Some("alice"))
+                .unwrap()
+        );
+        assert!(
+            store
+                .is_sender_allowed("xmpp", "platform-id", Some("Alice"))
+                .unwrap()
+        );
+        // The id itself never matches a username-only entry, and an unrelated
+        // username must not be authorized by it.
+        assert!(
+            !store
+                .is_sender_allowed("xmpp", "platform-id", None)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_sender_allowed("xmpp", "platform-id", Some("bob"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_legacy_trimmed_id_entry_matches_exact_id() {
+        // Legacy entries may carry surrounding whitespace; the id comparison
+        // is exact on trimmed strings, never case-folded.
+        let (store, dir) = test_store();
+        let path = allow_from_path(dir.path(), "weechat").unwrap();
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&AllowFromStoreFile {
+                version: 1,
+                allow_from: vec!["  nick:libera:alice  ".to_string()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .is_sender_allowed("weechat", "nick:libera:alice", None)
+                .unwrap()
+        );
+        // Case differences and separator variants stay distinct principals.
+        assert!(
+            !store
+                .is_sender_allowed("weechat", "nick:libera:alice_bob", None)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_sender_allowed("weechat", "nick:libera:alice-bob", None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_concurrent_add_allow_from_preserves_all_grants() {
+        // Regression for the wipe under concurrency: eight approvers taking
+        // the file lock in turn must never observe a truncated allowlist.
+        let (store, _dir) = test_store();
+        let senders: Vec<String> = (0..8).map(|i| format!("user-{i}")).collect();
+
+        std::thread::scope(|s| {
+            for sender in &senders {
+                let store = store.clone();
+                let sender = sender.clone();
+                s.spawn(move || {
+                    store.add_allow_from("xmpp", &sender).unwrap();
+                });
+            }
+        });
+
+        let mut allow = store.read_allow_from("xmpp").unwrap();
+        allow.sort();
+        let mut expected = senders;
+        expected.sort();
+        assert_eq!(allow, expected, "every concurrent grant must survive");
+    }
+
+    #[test]
     fn test_weechat_pairing_request_approval_flow() {
         let (store, _) = test_store();
         assert!(!store.is_sender_allowed("weechat", "alice", None).unwrap());

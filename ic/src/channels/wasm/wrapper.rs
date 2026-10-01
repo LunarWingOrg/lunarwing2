@@ -5300,6 +5300,74 @@ mod tests {
     }
 
     #[test]
+    fn test_pairing_host_functions_preserve_legacy_matching() {
+        // WI #184 (!1294 review): the wasm `pairing-is-allowed` host function
+        // is the path weechat and other wasm channels use for DM gating. A
+        // secrets-store pairing backend replacing the file store behind this
+        // trait must preserve its observable semantics: exact trimmed id
+        // match, plus case-insensitive username/`@username` matching. This
+        // regression exercises the host fn directly against a legacy-shaped
+        // allowFrom file.
+        use super::ChannelStoreData;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let allow_path = dir.path().join("weechat-allowFrom.json");
+        // Legacy-shaped allowFrom file: a username entry with an `@` prefix
+        // and an exact principal entry, exactly as tenants' files look today.
+        std::fs::write(
+            &allow_path,
+            r#"{"version":1,"allowFrom":["@Alice","nick:libera:carol"]}"#,
+        )
+        .unwrap();
+
+        let mut store = ChannelStoreData::new(
+            1024 * 1024,
+            "weechat",
+            ChannelCapabilities::default(),
+            HashMap::new(),
+            Vec::new(),
+            Arc::new(PairingStore::with_base_dir(dir.path().to_path_buf())),
+        );
+
+        use super::lunarwing::agent::channel_host::Host as _;
+
+        // Legacy username entry authorizes the platform-id sender whose
+        // username is `alice`, case-insensitively; never by id alone.
+        assert!(
+            store
+                .pairing_is_allowed("weechat".into(), "platform-id".into(), Some("alice".into()))
+                .unwrap()
+        );
+        assert!(
+            store
+                .pairing_is_allowed("weechat".into(), "platform-id".into(), Some("Alice".into()))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .pairing_is_allowed("weechat".into(), "platform-id".into(), None)
+                .unwrap()
+        );
+        // Exact trimmed-id match for a migrated principal entry.
+        assert!(
+            store
+                .pairing_is_allowed("weechat".into(), "nick:libera:carol".into(), None)
+                .unwrap()
+        );
+        // Separator and case variants remain distinct principals.
+        assert!(
+            !store
+                .pairing_is_allowed("weechat".into(), "nick:libera:carol-bob".into(), None)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .pairing_is_allowed("weechat".into(), "NICK:LIBERA:CAROL".into(), None)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn test_redact_credentials_replaces_values() {
         use super::ChannelStoreData;
 
