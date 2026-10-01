@@ -32,7 +32,7 @@
 4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1276
 5. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1256
     - DONE 2026-10-01 (`rarity/kimi-5-20261001-0302`, item 5, WI#265): re-applied the rejected !1256 with all three review findings fixed. `routine_history` now resolves Engine V2 mission names — `ic/src/bridge/router.rs` adds read-only `get_engine_mission_history_by_name` (default-project own+shared lookup, then a global ownership-filtered scan) rendering recent fires from `mission.thread_history`; `ic/src/tools/builtin/routine.rs` falls back to it when the v1 routines lookup misses, with not-found errors naming both registries and pointing at `routine_list`/`mission_list`; limit clamped 1..=50; schema canary synced.
-    - Review fixes vs !1256: (1) run summaries truncate by characters (`truncate_summary_chars`), never byte-index `String::truncate(200)` — the byte form panicked on multilingual assistant text; regression covers CJK, 199-ASCII+`é` boundary, and 4-byte emoji. (2) All changed files pass `cargo fmt --all -- --check` (edition 2024). (3) The fallback test takes the shared `ENGINE_STATE_TEST_LOCK` via `engine_state_test_lock()` and resets state explicitly instead of assuming an uninitialized process-global engine, so it cannot race the router's engine-state tests.
+    - Review fixes vs !1256: (1) run summaries truncate by characters (`truncate_summary_chars`), never byte-index `String::truncate(200)` — the byte form panicked on multilingual assistant text; regression covers CJK, 199-ASCII+`é` boundary, and 4-byte emoji. (2) All changed files pass `cargo fmt --all -- --check` (edition 2024). (3) The fallback test takes the shared `ENGINE_STATE_TEST_LOCK` via `engine_state_test_lock()` and resets state explicitly instead of assuming an uninitialized process-global engine, so it cannot race the router's engine-state tests
     - Verified: `cargo check --lib --tests`, `cargo clippy --lib --tests -- -D warnings`, `cargo fmt --all -- --check` clean; 90 router tests, 26 routine tool tests, 250 bridge tests, 1167 tools tests, and e2e `routine_history` + `skill_install_routine_webhook_sim` trace tests pass. Docs updated in `docs/architecture/ENGINE-V2.md` (Learning Missions section)
 6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1263
     - DONE 2026-09-30 (`cmc/g6/v2.1.4.0`, WI#264): added a shared inference runner in `projects/voice-sidecar/src/inference.rs`. STT/TTS/VAD each admit one call before taking shared capacity; blocking workers retain both permits until settlement, so repeated TTS retries cannot queue behind the model mutex or consume remaining STT/VAD capacity. Caller cancellation/timeout and worker settlement share a phase lock; `/ready` and `/metrics` report per-component activity, current/cumulative abandonment, and permanent failure.
@@ -72,16 +72,16 @@
     - Checked and intentionally left alone: ENGINE-V2.md (goals 5/7/8 already updated it), GATEWAY_VOICE_API.md + voice-sidecar README (goal 6), TENANT-SYSTEM-PROMPTS.md (goal 9), estimation/tools READMEs (goal 10), WORKER-CONTAINERS.md (item 2), job-state machine (only documented in point-in-time proposals), pairing allowlist semantics (sbpatch1 fix matches documented "approved pairing codes" behavior), port tables (v17 current), versioned v2.1.4.0_* evidence docs (archived at release time per history convention). Markdown link targets in all edited files verified resolvable. Docs-only change: no cargo check needed
 13. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
 14. [ ] review all currently open work items - create audit document for 2.1.4.0 in docs/ops - there are similar docs in docs/ops for 2.1.3.0 and earlier releases so you can use those as references
-15. [x] (S) (COMEBACKTOTHISLATER) UPDATE RELEASE-v2.1.2.0.md WITH CHANGES MADE SINCE FIRST DRAFT WAS CREATED
+15. [x] (S) (COMEBACKTOTHISLATER) UPDATE RELEASE-v2.1.4.0.md WITH CHANGES MADE SINCE FIRST DRAFT WAS CREATED
 16. [ ] update all docs in docs/guides
 17. [ ] update all docs in docs/architecture
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/270
 20. [ ] fix issues in CI/CD (if any) - See Pipeline #4760 for latest master pipeline run and see if anything is not GREEN
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
-22. [x] (S) (H) Consider web gateway additional functionality (seperate from goal 38)
+22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/280
 23. [x] (S) new reconcile routine method improvement for MR review process
-24. [x] (S) record deferred items somewhere in one place
+24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/271
 25. [ ] come up with ideas for names for 2.1.4.0 - write in a document in docs/ops
 26. [x] (S) (HUMAN) start thinking about scope of 2.1.6.0 next real feature set
 27. [x] (S) (HUMAN) Findings from sb and kumo
