@@ -28,7 +28,10 @@ now pinned 0.10.2 with a refreshed `PEBBLE_LOCK_SHA256`), and the Pebble
 lock guard gained multi-version record keying and no-op-override rejection.
 CI recovered from pipeline #4679's Cavepony release-metadata drift and
 orphan-mission boundary violation; integration-target MRs now run the full
-validation matrix.
+validation matrix. A follow-up CI audit then found the cargo-deny job green
+dishonestly — vendored source replacement had silently degraded the
+`yanked = "deny"` policy to per-crate warnings — and restored the gate so
+it fails loudly instead (item 20).
 
 Engine reliability dominates the feature work: mission execution recovers
 from transient provider failures after partial text instead of aborting the
@@ -46,9 +49,13 @@ Engine V2 initialization snapshots (WI#220), read-only tenant database and
 daemon-PID diagnostics verbs in mt-admin (`psql`, `daemon-pid`) with a
 WI#268 prompt-overlay audit runbook, an opencode2 worker bump to v2.0.20, and
 a pairing allowlist fix so approving a new sender no longer erases the
-existing allowlist. New tenants now render `ORCHESTRATOR_SELF_MODIFY=true`
-(stored orchestrator and prompt-overlay updates, WI#282), with the operator
-opt-out preserved across re-renders. The WI#184 secrets-store pairing
+existing allowlist. Outbound message delivery is also now honest about its
+contract (WI#270): the `message` tool ack reports queue acceptance rather
+than "delivered", the XMPP channel refuses to queue while disconnected, and
+shutdown gives already-acked stanzas a bounded drain window. New tenants now
+render `ORCHESTRATOR_SELF_MODIFY=true` (stored orchestrator and
+prompt-overlay updates, WI#282), with the operator opt-out preserved across
+re-renders. The WI#184 secrets-store pairing
 redesign advanced to design revision 3 (both !1294 review P2s answered) with
 the review-required legacy-matching and concurrency regressions landed ahead
 of the substrate change.
@@ -207,6 +214,29 @@ previous compatibility baseline.
   darkirc 0.1.10, weechat 0.2.11, xmpp 0.1.16; WASM channel crates at
   workspace `2.1.4`) and confirming V27 remains the latest migration with
   the migration chain's `ironclaw-agent-v1` alias removed
+- **Honest outbound delivery semantics (WI#270).** The `message` tool's
+  success ack was an enqueue ack dressed as a delivery receipt — the gap
+  behind scheduled mission PR Digest #59 recording "Delivered via XMPP" in
+  memory while the queued stanza was silently lost in a rebuild window. The
+  ack now reads `Queued message to <channel>:<target>` with a tool-description
+  warning that success means acceptance for delivery; the XMPP channel
+  refuses proactive enqueue while no session is bound; and `shutdown()`
+  gives the client task a bounded 2s window to drain acked stanzas, WARNing
+  with the pending depth when it cannot. Five new XMPP channel regressions;
+  semantics and mission-spec discipline documented in
+  [OUTBOUND-DELIVERY-SEMANTICS.md](docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md)
+- **CI cargo-deny yanked gate restored (item 20).** The `cargo-deny` CI job
+  was green dishonestly: running from inside `ic/` source-replaces crates.io
+  with `ic/vendor/`, so the `yanked = "deny"` policy silently degraded to
+  one `warning[index-failure]` per crate (738 in pipeline #4811) while the
+  job exited 0 — and the flood pushed the trace past GitLab's 4 MB log cap,
+  truncating the verdict away. The new
+  `.gitlab/scripts/cargo-deny-check.sh` wrapper runs from the repo root with
+  explicit `--manifest-path`/`--config`, keeps the trace compact, and
+  hard-fails on any `index-failure` so the yanked check can never be
+  silently skipped again; the `refresh-vendor.sh` post-vendor advisory gate
+  routes through the same wrapper, and a validator rule plus a 6-case
+  regression suite pin the contract
 
 ## Compatibility
 
