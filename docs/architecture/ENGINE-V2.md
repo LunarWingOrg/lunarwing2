@@ -624,9 +624,12 @@ the model at `mission_history` (WI#269).
 
 Engine-v2 threads get their history surface from the `mission_history` tool
 (WI#269), registered in the `missions` capability alongside `mission_list`
-and `mission_update`. It resolves a mission by name (or UUID) scoped like
-`mission_list` — the calling project's own missions plus shared-owned
-missions — and renders the newest fires from the mission's `thread_history`
+and `mission_update`. It resolves a mission by name or UUID — both paths
+scoped like `mission_list`: the name path resolves through the calling
+project's own + shared missions, and the UUID path re-checks project and
+ownership (own or shared-owner) after the store load, returning
+`access denied` for any other project's or user's mission UUID — and renders
+the newest fires from the mission's `thread_history`
 (default 10, clamp 1-50) in the `routine_history` result shape: per-run
 status, `started_at`/`completed_at`, `duration_secs`, a char-safe
 200-character result summary from the last assistant message, and

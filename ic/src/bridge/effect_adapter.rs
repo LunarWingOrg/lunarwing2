@@ -453,7 +453,10 @@ impl EffectBridgeAdapter {
 
     /// Resolve a mission for `mission_history`: accepts `name` or `id` (also
     /// via positional `_args`), scoped like `mission_list` (own + shared
-    /// missions in the caller's project).
+    /// missions in the caller's project). The UUID path re-checks project and
+    /// ownership after the raw store load — `resolve_mission_id` accepts any
+    /// well-formed UUID, so without this check a thread in project A could
+    /// read project B's mission history (!1302 review P2).
     async fn resolve_mission_for_history(
         params: &serde_json::Value,
         context: &ThreadExecutionContext,
@@ -472,11 +475,18 @@ impl EffectBridgeAdapter {
         }
 
         let id = Self::resolve_mission_id(params, context, mgr).await?;
-        mgr.get_mission(id)
-            .await?
-            .ok_or_else(|| EngineError::Store {
-                reason: format!("mission {id} not found"),
-            })
+        let mission = mgr.get_mission(id).await?.ok_or_else(|| EngineError::Store {
+            reason: format!("mission {id} not found"),
+        })?;
+        let visible = mission.project_id == context.project_id
+            && (mission.is_owned_by(&context.user_id) || mission.owner_id().is_shared());
+        if !visible {
+            return Err(EngineError::AccessDenied {
+                user_id: context.user_id.clone(),
+                entity: format!("mission {id}"),
+            });
+        }
+        Ok(mission)
     }
 
     /// Render one mission fire as a `routine_history`-shaped run entry.
@@ -4136,6 +4146,111 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 .get("runs")
                 .and_then(|v| v.as_array())
                 .is_some_and(|runs| runs.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_history_uuid_path_enforces_project_and_ownership_scoping() {
+        // !1302 review P2: resolve_mission_id accepts any well-formed UUID, so
+        // the raw store load must re-check project + ownership afterwards.
+        // Without it, a v2 thread in project A could read project B's mission
+        // history just by knowing its UUID.
+        let (adapter, mgr, store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+        let ctx = mission_create_ctx();
+
+        let other_project = lunarwing_engine::ProjectId::new();
+        let cross_project = lunarwing_engine::Mission::new(
+            other_project,
+            "other-user",
+            "foreign-mission",
+            "g",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        let cross_project_id = cross_project.id;
+        store.save_mission(&cross_project).await.expect("save mission");
+
+        let same_project_other_user = lunarwing_engine::Mission::new(
+            ctx.project_id,
+            "other-user",
+            "neighbors-mission",
+            "g",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        let same_project_id = same_project_other_user.id;
+        store
+            .save_mission(&same_project_other_user)
+            .await
+            .expect("save mission");
+
+        let shared_same_project = lunarwing_engine::Mission::new(
+            ctx.project_id,
+            lunarwing_engine::types::shared_owner_id(),
+            "shared-mission",
+            "g",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        let shared_id = shared_same_project.id;
+        store
+            .save_mission(&shared_same_project)
+            .await
+            .expect("save mission");
+
+        // Project B's UUID from project A's context must be rejected.
+        let foreign = adapter
+            .handle_mission_call(
+                "mission_history",
+                &serde_json::json!({"id": cross_project_id.to_string()}),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(foreign.is_error, "cross-project UUID must be denied");
+        assert!(
+            foreign
+                .output
+                .get("error")
+                .and_then(|v| v.as_str())
+                .is_some_and(|e| e.contains("access denied")),
+            "error should be access denied: {:?}",
+            foreign.output
+        );
+
+        // Same project but owned by another user must also be rejected.
+        let neighbor = adapter
+            .handle_mission_call(
+                "mission_history",
+                &serde_json::json!({"id": same_project_id.to_string()}),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(
+            neighbor.is_error,
+            "same-project other-user UUID must be denied: {:?}",
+            neighbor.output
+        );
+
+        // A shared mission in the caller's project stays readable.
+        let shared = adapter
+            .handle_mission_call(
+                "mission_history",
+                &serde_json::json!({"id": shared_id.to_string()}),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(
+            !shared.is_error,
+            "shared same-project UUID must be readable: {:?}",
+            shared.output
+        );
+        assert_eq!(
+            shared.output.get("name").and_then(|v| v.as_str()),
+            Some("shared-mission")
         );
     }
 
