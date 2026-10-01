@@ -278,9 +278,9 @@ After provisioning and the first `start-tenant`:
   production multi-tenant deployment runbook
 - [`../ops/TENANT-CONFIGURATION.md`](../ops/TENANT-CONFIGURATION.md) — tenant
   env file layout and configuration reference
-- [`../ops/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md`](../ops/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md) —
+- [`../ops/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md`](../ops/history/v2.0.9.0_GOAL3_KNOWLEDGE_SEED.md) —
   mechanism design record + Gentoo/OpenRC live verification
-- [`../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md) —
+- [`../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](../ops/history/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md) —
   systemd live verification (including the upgraded-tenant negative case)
 - [`../ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](../ops/history/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md) —
   refresh architecture, safety invariants, and hosted-delta follow-up

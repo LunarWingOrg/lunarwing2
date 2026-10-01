@@ -115,7 +115,15 @@ _ensure_tenant_image() {
   else
     say "distributing image $image into ${name}'s rootless store (save|load — minutes for large images) ..."
   fi
-  if "$CONTAINER_RT" save "$image" | _ctr "$name" load >/dev/null 2>&1; then
+  # Capture each half's stderr separately so the failure class (missing
+  # admin-side image, store corruption, EPIPE from a load side that died
+  # early, ...) reaches the operator instead of collapsing into one generic
+  # warning (WI#271).
+  local save_err load_err
+  save_err="$(mktemp)" || return 1
+  load_err="$(mktemp)" || { rm -f "$save_err"; return 1; }
+  if "$CONTAINER_RT" save "$image" 2>"$save_err" | _ctr "$name" load >/dev/null 2>"$load_err"; then
+    rm -f "$save_err" "$load_err"
     # Drop the previous (now-untagged) image if the load re-pointed the tag, so
     # repeated worker-image updates don't accumulate GBs of stale layers in the
     # tenant's rootless store.
@@ -123,7 +131,22 @@ _ensure_tenant_image() {
     say "image $image available in ${name}'s store"
     return 0
   fi
-  say "WARNING: failed to load $image into ${name}'s store"
+  local save_msg load_msg detail=""
+  save_msg="$(head -n 3 "$save_err" | tr '\n' ' ')"
+  save_msg="${save_msg% }"
+  load_msg="$(head -n 3 "$load_err" | tr '\n' ' ')"
+  load_msg="${load_msg% }"
+  rm -f "$save_err" "$load_err"
+  [[ -n "$save_msg" ]] && detail="save: $save_msg"
+  if [[ -n "$load_msg" ]]; then
+    [[ -n "$detail" ]] && detail+="; "
+    detail+="load: $load_msg"
+  fi
+  if [[ -n "$detail" ]]; then
+    say "WARNING: failed to load $image into ${name}'s store ($detail)"
+  else
+    say "WARNING: failed to load $image into ${name}'s store"
+  fi
   return 1
 }
 

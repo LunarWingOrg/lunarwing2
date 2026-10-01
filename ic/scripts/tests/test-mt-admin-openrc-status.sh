@@ -89,5 +89,24 @@ assert_contains "healthy custom WeeChat status is started" "$tenant_status" \
 assert_not_contains "healthy custom WeeChat status is never unknown" "$tenant_status" \
   "lunarwing-weechat-alice: unknown"
 
+# WI#271: per-tenant worker-image presence lines in status output.
+tenant_worker_enabled() { [[ "$2" == pebble ]]; }
+_ctr() {
+  shift   # drop the tenant name
+  if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
+    # Only the pebble image is present in this tenant's store.
+    if [[ "${3:-}" == "lunarwing-worker-pebble:latest" ]]; then return 0; fi
+    return 1
+  fi
+  return 1
+}
+tenant_status="$(status_tenant alice)"
+assert_contains "status lists worker images" "$tenant_status" \
+  "Worker images:"
+assert_contains "selected and present worker image reports present" "$tenant_status" \
+  "lunarwing-worker-pebble:latest: present"
+assert_contains "unselected worker image is not a false missing" "$tenant_status" \
+  "lunarwing-worker-opencode:latest: not selected for tenant"
+
 (( failures == 0 )) || exit 1
 printf 'ALL TESTS PASSED\n'

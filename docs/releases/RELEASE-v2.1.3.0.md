@@ -528,7 +528,7 @@ broken intra-repo links were repaired. The architecture docs were repassed
 for the sealed-step-record change (`ENGINE-V2.md` documents the
 `StepRecord` role and the sealing boundary). The Hermes Kawarimi adapter
 was audited for v2.1.3.0 breakage — none found
-(`docs/ops/v2.1.3.0_HERMES_KAWARIMI_ADAPTER_AUDIT.md`). The ops index,
+(`docs/ops/history/v2.1.3.0_HERMES_KAWARIMI_ADAPTER_AUDIT.md`). The ops index,
 releases index, contributor-onboarding freeze status, and worker-container
 pins were refreshed for the cycle
 

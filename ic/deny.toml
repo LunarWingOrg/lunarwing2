@@ -3,7 +3,7 @@ unmaintained = "workspace"
 yanked = "deny"
 ignore = [
     # Accepted advisories — each entry re-verified against upstream 2026-09-26
-    # for v2.1.3.0. See docs/ops/v2.1.3.0_CARGO_DENY_AUDIT.md for the full
+    # for v2.1.3.0. See docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md for the full
     # audit trail. Remove an entry only when its clearing upgrade has landed
     # in Cargo.lock AND the corresponding lockfile root has been re-checked
     # with `--config` overrides so the advisory surfaces as a hard error if

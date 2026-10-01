@@ -134,6 +134,76 @@ else
   bad "rootful admin-absent must fail" "rc=$RETURNED_RC"
 fi
 
+# ── WI#271: a failed distribution quotes the failing side's stderr ──────────
+# The generic "failed to load" warning must name the failing half of the
+# save|load pipeline and include its first stderr lines — a missing admin-side
+# image, store corruption, and EPIPE from a load-side early death are
+# different incidents and must not collapse into one bare warning.
+run_case_dist_fail() {  # <save_stderr> <load_stderr>
+  ADMIN_ID="new-id" TENANT_ID="old-id"
+  # shellcheck disable=SC2034  # read by _ensure_tenant_image from the sourced lib
+  MT_ROOTLESS=true
+  # shellcheck disable=SC2034  # read by _ensure_tenant_image from the sourced lib
+  CONTAINER_RT="podman"
+  SAVE_ERR_TEXT="$1" LOAD_ERR_TEXT="$2"
+  SAY_LOG="$(mktemp)"
+
+  podman() {
+    case "${1:-}" in
+      save)
+        if [[ -n "$SAVE_ERR_TEXT" ]]; then
+          printf '%s\n' "$SAVE_ERR_TEXT" >&2
+          return 1
+        fi
+        return 0
+        ;;
+    esac
+    [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]] || return 0
+    [[ -n "$ADMIN_ID" ]] || return 1
+    printf '%s' "$ADMIN_ID"
+  }
+  # The tenant-store probe and the load half go through _ctr <name> <verb...>.
+  _ctr() {
+    shift
+    case "${1:-}" in
+      load)
+        if [[ -n "$LOAD_ERR_TEXT" ]]; then
+          printf '%s\n' "$LOAD_ERR_TEXT" >&2
+          return 1
+        fi
+        return 0
+        ;;
+    esac
+    [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]] || return 0
+    [[ -n "$TENANT_ID" ]] || return 1
+    printf '%s' "$TENANT_ID"
+  }
+  say() { printf '%s\n' "$*" >>"$SAY_LOG"; }
+
+  set +e
+  _ensure_tenant_image tenant-a "lunarwing-worker-pebble:latest"
+  local rc=$?
+  set -e
+  RETURNED_RC="$rc"
+}
+
+run_case_dist_fail "Error: admin store corrupted while reading image" ""
+if [[ "$RETURNED_RC" == "1" ]] \
+    && grep -q "WARNING: failed to load lunarwing-worker-pebble:latest into tenant-a's store (save: Error: admin store corrupted while reading image)" "$SAY_LOG"; then
+  ok "save-side failure quotes the admin store's stderr (WI#271)"
+else
+  bad "save-side failure must quote save stderr" "rc=$RETURNED_RC out=$(cat "$SAY_LOG")"
+fi
+
+run_case_dist_fail "" "Error: payload does not match its manifest digest"
+if [[ "$RETURNED_RC" == "1" ]] \
+    && grep -q "WARNING: failed to load lunarwing-worker-pebble:latest into tenant-a's store (load: Error: payload does not match its manifest digest)" "$SAY_LOG"; then
+  ok "load-side failure quotes the tenant store's stderr (WI#271)"
+else
+  bad "load-side failure must quote load stderr" "rc=$RETURNED_RC out=$(cat "$SAY_LOG")"
+fi
+rm -f "$SAY_LOG"
+
 echo ""
 if [[ "$fail" -eq 0 ]]; then
   echo "RESULT: all _ensure_tenant_image tests passed ($pass)"
