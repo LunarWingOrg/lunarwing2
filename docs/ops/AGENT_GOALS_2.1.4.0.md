@@ -105,7 +105,11 @@
 24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/271
 25. [ ] come up with ideas for names for 2.1.4.0 - write in a document in docs/ops
 26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/277
-27. [ ] repass of item 13 to update draft of release notes
+27. [x] repass of item 13 to update draft of release notes
+    - DONE 2026-10-01 (`rarity/kimi-27-20261001-1300`, item 27): first repass of `RELEASE-v2.1.4.0.md` (613 → 753 lines) folding in everything merged between the item-13 draft commit (`1af182b81`) and HEAD: item 11 (WI#184 pairing design revision 3 + the landed legacy-matching/concurrent-grant/wasm host-path regressions — with an explicit "design-only, no runtime change" upgrade note), item 14 (`docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md`, 23 items, dispositions at `03f5650fe`), and items 16/17 (all 32 active guides + all 10 active architecture docs repassed).
+    - Added: three Highlights entries, three Changes sections (WI#184 revision 3; open work items audit; guides/architecture repass), a WI#184 Compatibility row, upgrade note 14, and four "Resolved or Source-Fixed" bullets. Corrected two stale first-draft claims: the WI#200 stopgap line (tracker item was closed 2026-10-01 on the landed !1283 fix) and the overview's "four deferred defects" parenthetical (previously listed six WI numbers including in-cycle WI#243 and WI#191; now four closed v2.1.3.0 deferrals — WI#265/#264/#244/#220 — with WI#184 noted as remaining at revision 3). Footer updated: open items at repass time are 18–20, 22, 24, 25, 28, 29.
+    - Verified: all 8 relative md links in the draft resolve live; guide/architecture counts (32/10) re-counted with find; multica 0.1.13 / multica-bridge 0.1.3 re-read from `ic/registry/`; `ironclaw-agent-v1` alias-removal claim re-verified in `ic/src/orchestrator/external_worker.rs:137`; #200 closure cross-checked against the item-14 audit doc. Docs-only change: no cargo check needed.
+
 28. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
 29. [ ] repass of item 2. upgrade opencode2 to new version 2.0.21
 
