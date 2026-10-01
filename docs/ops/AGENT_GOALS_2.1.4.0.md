@@ -103,7 +103,8 @@
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/280
 23. [x] (S) new reconcile routine method improvement for MR review process
 24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/271
-25. [ ] come up with ideas for names for 2.1.4.0 - write in a document in docs/ops
+25. [x] come up with ideas for names for 2.1.4.0 - write in a document in docs/ops
+    - DONE 2026-10-01 (`rarity/kimi-25-20261001-1200`, item 25): created [v2.1.4.0_CODENAME_IDEAS.md](v2.1.4.0_CODENAME_IDEAS.md) with ten candidates grounded in the cycle's actual work (crate security re-audit, pipeline recovery, engine mid-stream recovery/rollover fixes, five re-attempted MRs). No previous codename repeated; all prior shortlist names checked against docs/ops/history. Top pick: **Kabuto (兜)** — completes the `Yoroi` (2.1.2.0) → `Ō-Yoroi` (2.1.3.0) armor lineage; alternates Kiwame (極め, appraisal verdict) and Shūfuku (修復, repair). Codename remains UNKNOWN in RELEASE-v2.1.4.0.md until a human picks. Docs-only change: no cargo check needed
 26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/277
 27. [x] repass of item 13 to update draft of release notes
     - DONE 2026-10-01 (`rarity/kimi-27-20261001-1300`, item 27): first repass of `RELEASE-v2.1.4.0.md` (613 → 753 lines) folding in everything merged between the item-13 draft commit (`1af182b81`) and HEAD: item 11 (WI#184 pairing design revision 3 + the landed legacy-matching/concurrent-grant/wasm host-path regressions — with an explicit "design-only, no runtime change" upgrade note), item 14 (`docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md`, 23 items, dispositions at `03f5650fe`), and items 16/17 (all 32 active guides + all 10 active architecture docs repassed).
