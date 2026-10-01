@@ -230,6 +230,7 @@ previous compatibility baseline.
 | mt-admin verbs | New: `psql <tenant>`, `daemon-pid <tenant>` (read-only diagnostics); all existing verbs unchanged |
 | New tenant env defaults | `ORCHESTRATOR_SELF_MODIFY=true` rendered at add-tenant (WI#282); explicit operator values preserved on re-render; existing tenants untouched |
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
+| Pairing store (WI#184) | Design revision 3 only — no substrate change this release; landed tests pin current legacy matching and concurrent-grant semantics ahead of the secrets-store migration |
 | CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only |
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
 
@@ -509,6 +510,90 @@ by each goal's own doc updates: `docs/ops/MULTITENANCY-PRODUCTION.md`
 intentionally left alone: ENGINE-V2.md, GATEWAY_VOICE_API.md + voice-sidecar
 README, TENANT-SYSTEM-PROMPTS.md, estimation/tools READMEs,
 WORKER-CONTAINERS.md (each already updated in-branch by its goal).
+
+### Pairing Secrets-Store Design Revision 3 (item 11, WI#184)
+
+The rejected !1294 attempt is superseded by design revision 3 at
+[PAIRING_SECRETS_STORE_DM_AUTH.md](docs/proposals/PAIRING_SECRETS_STORE_DM_AUTH.md),
+which answers both P2 findings from the review:
+
+- **Legacy matching contract.** The rejected revision promised byte-exact
+  digest lookup for every query while also claiming byte-verbatim legacy
+  migration preserves today's matching — contradictory (a legacy `@Alice`
+  entry would never be found by an id- or username-derived lookup).
+  Revision 3 defines two explicit source-tagged matchers: a strict
+  byte-exact canonical-principal lookup (equivalent to today's id
+  comparison) and a legacy matcher applying today's exact comparison
+  function **only** to `kind:"legacy"` grants — no cross-kind broadening in
+  either direction.
+- **Name privacy.** Unkeyed SHA-256 names are replaced with
+  `hex(hmac_sha256(name_key, "lunarwing-pairing-name-v1"|channel|0x00|principal))[0..10]`
+  where `name_key` is an HKDF-SHA256 master-key subkey domain-separated
+  from the per-secret encryption subkey — database-read-only dictionary
+  attacks against candidate IRC principals/JIDs no longer terminate without
+  the master key. Key lifecycle equals master-key lifecycle (no independent
+  rotation exists today; the re-key contract is stated).
+- **Hot path (nonblocking fix).** The "decrypt-per-grant enumeration is
+  operator-only" claim is withdrawn — Signal reads allowFrom per message,
+  weechat per DM, web per activation render. Revision 3 specifies a bounded
+  decoded-grant cache per channel: 15 s TTL, synchronous invalidation on
+  daemon-side approve, revoke-latency-bounded-by-TTL documented for
+  operators, 1024-grant bound with uncached fallback.
+
+The regressions the review required are landed executable tests ahead of
+the substrate change, so the current semantics cannot silently drift before
+the migration lands: `test_legacy_username_entry_matches_by_username`,
+`test_legacy_trimmed_id_entry_matches_exact_id`, and
+`test_concurrent_add_allow_from_preserves_all_grants` (8 concurrent
+approvers) in `ic/src/pairing/store.rs`, plus
+`test_pairing_host_functions_preserve_legacy_matching` exercising the
+`ChannelStoreData` `Host::pairing_is_allowed` path in
+`ic/src/channels/wasm/wrapper.rs` against a legacy-shaped allowFrom file.
+Verified: 27/27 pairing tests and 77/77 wasm wrapper tests pass; lib
+Clippy with `--all-features --tests -D warnings` and rustfmt clean. This is
+design-only — the secrets-store substrate implementation remains future
+work as the WI intends.
+
+### Open Work Items Audit (item 14)
+
+All 23 open tracker items were fetched live from the GitLab API and
+reconciled in [v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md](docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md)
+following the v2.1.3.0 audit format. Key findings, each verified against
+the tree at `03f5650fe` rather than taken from tracker bodies:
+
+- 5 items carry the 2.1.4.0 label genuinely open (#281 engine preamble
+  `mission_*` advertisement, #280 daily-log injection-scanner
+  false-positives, #270 PR Digest false "delivered" memory record, #269
+  missing `mission_history` tool, #271 inttest/infra investigation);
+  #184 records the !1294 rejection with both P2 design findings quoted.
+- 15 items are deferred to 2.1.5.0+ by label, several carrying
+  source-verified root-cause maps.
+- #198/#199 are empty-bodied but have closeable evidence in this cycle's
+  audit docs.
+- Tracker churn since the 2026-09-27 audit: 24 items created-and-closed,
+  #220/#200 closed, open set grew 13 → 23.
+
+### Guides and Architecture Docs Repass (items 16/17)
+
+All 32 active guides under `docs/guides/` (excluding `history/`) and all 10
+active docs under `docs/architecture/` were re-verified against current
+source and stamped for v2.1.4.0:
+
+- Guides: substantive corrections beyond stamps — the gotify-wasm README's
+  deprecated-path mention now resolves to `ic/scripts/setup-instance.sh`;
+  the multica/darkirc/weechat stamps record the 2.1.4.0 version moves
+  (registry multica 0.1.13 / multica-bridge 0.1.3, darkirc 0.1.10, weechat
+  0.2.11; WASM channel crates now at workspace `2.1.4`); distro package
+  lists note the WI#268 `psql`/`daemon-pid` verbs add no host packages;
+  GATEWAY_VOICE_API.md cites the speed-scaled pre-flight.
+- Architecture: ENGINE-V2.md header revalidated for the cycle's engine work
+  (WI#243/#244/#265/#268/#282); SEMANTIC-MEMORY-SEARCH.md confirms V27
+  remains latest; IRC-SENDER-IDENTITY/WEECHAT docs re-verify principal
+  formats in `ic/channels-src/{darkirc,weechat}/src/lib.rs`; XMPP transfer
+  docs note registry 0.1.16 / bridge crate 2.1.4 with no protocol change;
+  SELF_HEAL_COVERAGE_AUDIT re-listed live at 19 suites unchanged.
+- Link checks: every relative link and cited `ic/`/`projects/` path in the
+  active guides and architecture docs resolves.
 
 ## Upgrade Notes
 
