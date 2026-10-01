@@ -640,11 +640,13 @@ build-all                        Build registered tenants sequentially
 
 build-pebble-worker              Build the Pebble image
 build-opencode-worker            Build the OpenCode image
+build-opencode2-worker           Build the OpenCode 2 image
 build-kimi-worker                Build the Kimi Code image
   --no-cache                     Force a clean image rebuild
 
 configure-pebble <name>          Set Pebble API key/model
 configure-opencode <name>        Set OpenCode model/base URL
+configure-opencode2 <name>       Set OpenCode 2 model/base URL
 configure-kimi <name>            Set Kimi model/base URL/API key file
 
 start-tenant <name>              Start core and selected optional services
@@ -654,9 +656,14 @@ start-worker <name> <worker>     Start one selected worker
 stop-worker <name> <worker>      Gracefully stop one worker
 restart-worker <name> <worker>   Restart one worker
 kill-worker <name> <worker>      Emergency zero-grace worker stop
-                                 workers: pebble, opencode, kimi
+                                 workers: pebble, opencode, kimi, opencode2
 render-units <name>              Re-render units without restarting
 patch-env <name>                 Add missing current environment values
+rotate-pg-password <name>        Rotate the tenant PostgreSQL password
+psql <name> [args...]            Read-only psql inside the tenant PG container
+daemon-pid <name>                Print the tenant daemon PID (validated as
+                                 tenant-owned; exits non-zero when
+                                 unresolvable — treat as uninspected)
 
 backup-tenant <name>             Create a custom-format PostgreSQL dump
 restore-tenant <name> <file>     Destructive restore; requires --yes

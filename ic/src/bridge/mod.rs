@@ -21,7 +21,9 @@ pub use effect_adapter::EffectBridgeAdapter;
 pub use router::{
     // DTO types
     EngineMissionDetail,
+    EngineMissionHistory,
     EngineMissionInfo,
+    EngineMissionRun,
     EngineProjectInfo,
     EngineStepInfo,
     EngineThreadDetail,
@@ -39,6 +41,7 @@ pub use router::{
     fire_engine_mission,
     fire_engine_webhook_mission,
     get_engine_mission,
+    get_engine_mission_history_by_name,
     get_engine_pending_auth,
     get_engine_pending_gate,
     get_engine_project,

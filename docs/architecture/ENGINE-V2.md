@@ -604,6 +604,15 @@ pattern is exactly a known system event type (`thread_start`,
 Mission listings surface `last_fired_at` / `never_fired` so an "Active" status
 cannot be mistaken for a dispatching one (registry honesty).
 
+The v1 `routine_history` tool resolves mission names too (WI#265): when the
+v1 routines registry misses a name, the tool queries the bridge's
+`get_engine_mission_history_by_name`, which searches the default project's
+missions (own + shared) and then falls back to a global ownership-filtered
+scan, rendering recent fires from the mission's `thread_history` with
+char-safe (never byte-index) summary truncation. A name found in neither
+registry errors with a message naming both registries and pointing at
+`routine_list` / `mission_list`.
+
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
 loaded checkpoint **before** the `Running` transition and the first model
@@ -1051,6 +1060,24 @@ default **1800s (30 minutes)**. Values outside the inclusive range **30s to
 2592000s (30 days)** fall back to the default. The lower bound prevents windows
 shorter than the 60-second gate sweep can observe; the upper bound prevents
 unsigned-to-signed wraparound and Chrono duration overflow (WI#115).
+
+**Prompt-overlay audit and operator lifecycle (WI#268).** The full contract —
+overlay storage identity and bridge path, the three gated writers, consumption
+semantics, the existing-thread retention caveat, safe enable/disable, and a
+read-only tenant inspection runbook (`mt-admin daemon-pid` / `mt-admin psql`)
+— is published in
+`docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
+`ORCHESTRATOR_SELF_MODIFY` unset or any value other than `true`/`1` makes
+stored overlays inert regardless of database contents; `SKILL_SELF_IMPROVEMENT`
+(the new-tenant provisioning default) is a separate flag and never authorizes
+prompt alteration; disabling the gate does not rewrite System messages already
+persisted in existing threads; and a failed audit probe (unresolvable daemon
+PID, unreadable `/proc/<pid>/environ`, errored DB query) is always classified
+**uninspected** — never as evidence of gate-off or absence. On OpenRC the
+daemon's live environment is probed via OpenRC's `child_pid` record — never
+the supervise-daemon pidfile, which holds the supervisor's PID — and the
+record is validated as-written with tenant-association checks on the resolved
+process.
 
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time. `supervised_timeout_secs` (the fixed 300s fail-closed approval auto-deny) has no env override.
 

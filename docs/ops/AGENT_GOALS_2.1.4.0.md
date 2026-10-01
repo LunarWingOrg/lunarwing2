@@ -29,8 +29,11 @@
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1261
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1256
+4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/268 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1276
+5. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/265 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1256
+    - DONE 2026-10-01 (`rarity/kimi-5-20261001-0302`, item 5, WI#265): re-applied the rejected !1256 with all three review findings fixed. `routine_history` now resolves Engine V2 mission names — `ic/src/bridge/router.rs` adds read-only `get_engine_mission_history_by_name` (default-project own+shared lookup, then a global ownership-filtered scan) rendering recent fires from `mission.thread_history`; `ic/src/tools/builtin/routine.rs` falls back to it when the v1 routines lookup misses, with not-found errors naming both registries and pointing at `routine_list`/`mission_list`; limit clamped 1..=50; schema canary synced.
+    - Review fixes vs !1256: (1) run summaries truncate by characters (`truncate_summary_chars`), never byte-index `String::truncate(200)` — the byte form panicked on multilingual assistant text; regression covers CJK, 199-ASCII+`é` boundary, and 4-byte emoji. (2) All changed files pass `cargo fmt --all -- --check` (edition 2024). (3) The fallback test takes the shared `ENGINE_STATE_TEST_LOCK` via `engine_state_test_lock()` and resets state explicitly instead of assuming an uninitialized process-global engine, so it cannot race the router's engine-state tests.
+    - Verified: `cargo check --lib --tests`, `cargo clippy --lib --tests -- -D warnings`, `cargo fmt --all -- --check` clean; 90 router tests, 26 routine tool tests, 250 bridge tests, 1167 tools tests, and e2e `routine_history` + `skill_install_routine_webhook_sim` trace tests pass. Docs updated in `docs/architecture/ENGINE-V2.md` (Learning Missions section)
 6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/264 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1263
     - DONE 2026-09-30 (`cmc/g6/v2.1.4.0`, WI#264): added a shared inference runner in `projects/voice-sidecar/src/inference.rs`. STT/TTS/VAD each admit one call before taking shared capacity; blocking workers retain both permits until settlement, so repeated TTS retries cannot queue behind the model mutex or consume remaining STT/VAD capacity. Caller cancellation/timeout and worker settlement share a phase lock; `/ready` and `/metrics` report per-component activity, current/cumulative abandonment, and permanent failure.
     - Addressed both !1263 findings: `WouldBlock` remains transient Busy, while poisoned model locks and panics return explicit `component_failed`/503 and keep readiness degraded until restart. The regression holds the actual production runner's component mutex during panic, both with a waiting caller and after cancellation. [Recovery documentation](../../projects/voice-sidecar/README.md#inference-timeout-admission-and-recovery-wi264) uses the verified `restart-tenant` verb and states its whole-tenant impact. A never-returning native call still retains one permit and requires operator restart; with only one shared permit, other components also fail fast.
@@ -51,21 +54,30 @@
     - REVIEW FOLLOW-UP (!1273): added local `#[cfg(test)]` to `prompt_handlers` so the file-local panic-policy scanner recognizes its helper assertions as test code. Reproduced the 7 CI violations at `54e741bc7`; the corrected snapshot passes the exact MR-base CI wrapper and all 13 scanner self-tests. The adjacent Goal 10 entry is independently completed in !1272; integration must retain both checked items and their separate DONE trails.
 10. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191
     - DONE 2026-09-30 (`cmc/g10/v2.1.4.0`, initial tool/approval slice): wired bounded, per-user EMA learning into shared tool execution, local jobs and routines; added frozen advisory runtime hints to both v1 approval paths and v2 pending gates. Cold-start in-memory learning is documented; display is opt-in with `LUNARWING_TOOL_ESTIMATES=1`, and `=0` disables recording/new hints. Legacy v1/v2 recovery no longer falls back to raw parameters when a redacted snapshot is missing.
-    - Verified locally: 114 targeted tests plus the overhead benchmark; PostgreSQL test-target and libSQL library compile checks; all-feature library/test Clippy with zero warnings; formatting and architecture-boundary checks. Twelve-thread helper p95 was 0.260 ms. [Evidence, rollout limits and remaining plan slices](v2.1.4.0_GOAL10_EMA_VALIDATION.md). Pipeline #4712 passed 25/26 jobs; its required panic-policy failure is addressed below. Live-tenant/browser rollout remains unverified; LLM and whole-job/mission estimates are later slices of the broader plan.
+    - Verified locally: 114 targeted tests plus the overhead benchmark; PostgreSQL test-target and libSQL library compile checks; all-feature library/test Clippy with zero warnings; formatting and architecture-boundary checks. Twelve-thread helper p95 was 0.260 ms. [Evidence, rollout limits and remaining plan slices](v2.1.4.0_GOAL10_EMA_VALIDATION.md). Pipeline #4712 passed 25/26 jobs; its required panic-policy failure is addressed below. Live-tenant/browser rollout remains unverified; LLM and whole-job/mission estimates are later slices of the broader plan
     - REVIEW FOLLOW-UP (!1272): added local `#[cfg(test)]` to four test helpers so the per-file panic-policy scanner recognizes their assertions. Reproduced all 17 CI findings at `e1ce94ea4`; the corrected sources pass the MR-base wrapper and all 13 scanner self-tests. The adjacent Goal 9 entry is independently completed in !1273; integration must retain both checked items and their separate DONE trails.
-11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/184
+11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/184 - last attempt was rejected on MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1284 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed
 
 ## Phase 5 - Miscellaneous (for goals referencing work items, read comments on work items as well)
 
-12. [ ] take a look at any documentation that should be updated and update necessary documentation
+12. [x] take a look at any documentation that should be updated and update necessary documentation
+    - DONE 2026-10-01 (`aj/kimi-12-20261001-0453`, item 12): swept the tree for docs that drifted from v2.1.4.0-cycle code changes not already covered by each goal's own doc updates (goals 5/6/7/8/9/10 and item 2 updated their docs in-branch). Seven files updated, each verified against source:
+    - `docs/ops/MULTITENANCY-PRODUCTION.md` — command reference synced with the current mt-admin surface: added `build-opencode2-worker`, `configure-opencode2`, `rotate-pg-password`, `psql`, `daemon-pid`; fixed the stale workers list (now includes `opencode2`).
+    - `docs/guides/MT-ADMIN-QUICKSTART.md` — added the v2.1.4.0 (WI#268) read-only diagnostics verbs `psql`/`daemon-pid` to §8 with the uninspected-on-failure rule and a link to the WI#268 audit runbook; revalidation stamp extended to 2026-10-01 (v2.1.4.0). Verified wording against `tenant_psql`/`tenant_daemon_pid` in `ic/scripts/mt-admin-lib/11-postgres.sh` and the mt-admin usage block (read-only is operator discipline, not enforced).
+    - `docs/ops/TENANT-CONFIGURATION.md` — documented `LUNARWING_TOOL_ESTIMATES` (WI#191: observation-only default, `=1` opt-in hints, `=0` disable, read-once at startup, no persistence) with a link to `ic/src/estimation/README.md`.
+    - `docs/guides/TESTING_GUIDE.md` — 2026-10-01 repass added four v2.1.4.0 manual tiers: tenant system-prompt editor (WI#220), tool runtime-estimate hints (WI#191), `routine_history` over Engine V2 missions (WI#265), mt-admin read-only diagnostics (WI#268).
+    - `docs/releases/README.md` — indexed the shipped RELEASE-v2.1.3.0.md (Ō-Yoroi, 2026-09-29), which was missing from the release table.
+    - `docs/README.md` — indexed the new `guides/TENANT-SYSTEM-PROMPTS.md` (WI#220) in the guides table; latest-release pointer corrected to v2.1.3.0; index update note appended.
+    - `docs/guides/CONTRIBUTOR-ONBOARDING.md` — freeze status updated: v2.1.3.0 shipped 2026-09-29, all LunarWing crates bumped to 2.1.4 (item #1 done, verified against `ic/Cargo.toml`/`Cargo.lock`), kimi worker 2.1.1 pin re-verified.
+    - Checked and intentionally left alone: ENGINE-V2.md (goals 5/7/8 already updated it), GATEWAY_VOICE_API.md + voice-sidecar README (goal 6), TENANT-SYSTEM-PROMPTS.md (goal 9), estimation/tools READMEs (goal 10), WORKER-CONTAINERS.md (item 2), job-state machine (only documented in point-in-time proposals), pairing allowlist semantics (sbpatch1 fix matches documented "approved pairing codes" behavior), port tables (v17 current), versioned v2.1.4.0_* evidence docs (archived at release time per history convention). Markdown link targets in all edited files verified resolvable. Docs-only change: no cargo check needed.
 13. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
-14. [ ] review all currently open work items - create audit document for 2.1.3.0
+14. [ ] review all currently open work items - create audit document for 2.1.4.0 in docs/ops - there are similar docs in docs/ops for 2.1.3.0 and earlier releases so you can use those as references
 15. [x] (S) (COMEBACKTOTHISLATER) UPDATE RELEASE-v2.1.2.0.md WITH CHANGES MADE SINCE FIRST DRAFT WAS CREATED
 16. [ ] update all docs in docs/guides
 17. [ ] update all docs in docs/architecture
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/270
-20. [ ] fix issues in CI/CD (if any)
+20. [ ] fix issues in CI/CD (if any) - I
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
 22. [x] (S) (H) Consider web gateway additional functionality (seperate from goal 38)
 23. [x] (S) new reconcile routine method improvement for MR review process
@@ -73,6 +85,7 @@
 25. [ ] come up with ideas for names for 2.1.4.0 - write in a document in docs/ops
 26. [x] (S) (HUMAN) start thinking about scope of 2.1.6.0 next real feature set
 27. [x] (S) (HUMAN) Findings from sb and kumo
-28. [ ] Repo housecleaning - get rid of old stuff in docs/ops and move it to history
+28. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
+29. [ ] repass of item 2. upgrade opencode2 to new version 2.0.21
 
 ---
