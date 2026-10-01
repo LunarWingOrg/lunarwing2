@@ -65,6 +65,26 @@ Job images are declared through the `CI_LINT_IMAGE`, `CI_RUST_IMAGE`, and
 `CI_GITLEAKS_IMAGE` variables in `defaults.yml`; `ci-config` expands those
 variables before checking pins, so overrides must stay digest-pinned too.
 
+### Rustup component downloads and runner DNS
+
+The pinned Rust image uses Rustup's **minimal** profile. Its `rustfmt` and
+`cargo-clippy` commands are Rustup proxies, which exist even when those components
+are absent. `bootstrap-rust.sh` calls `ensure-rust-components.sh` to execute each
+component's `--version` through the pinned toolchain, install missing components,
+and verify them before any Cargo job enters `ic/`. Otherwise the components in
+`ic/rust-toolchain.toml` trigger an implicit download during the Cargo command.
+
+Component installation gets three attempts with 5s/10s backoff for temporary
+network failures; an unusable component still fails the job. This does not retry
+compilation or make any required check optional. Preinstalled components need no
+download. Runners need working DNS and HTTPS access to `static.rust-lang.org` for
+missing components and explicit WASM target installs.
+
+Pipeline #4708's required `rust-check-libsql` job #86164 failed on the `laptop`
+runner while resolving that host, before any compilation. A persistent failure
+needs runner DNS/egress repair and a retry of the failed check **and** its skipped
+`rust-test-libsql` dependent; a green retry of the check alone is insufficient.
+
 ## Docker Hub pull rate limits
 
 Symptom — a job fails before any test runs, with a log like:

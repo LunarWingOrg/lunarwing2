@@ -1846,7 +1846,15 @@ impl Agent {
                     tool_name: tc.name.clone(),
                     parameters: tc.arguments.clone(),
                     display_parameters: redact_params(&tc.arguments, tool.sensitive_params()),
-                    description: tool.description().to_string(),
+                    description: self
+                        .tools()
+                        .approval_description(
+                            &message.user_id,
+                            &tc.name,
+                            &tc.arguments,
+                            tool.description(),
+                        )
+                        .await,
                     tool_call_id: tc.id.clone(),
                     context_messages: context_messages.clone(),
                     deferred_tool_calls: deferred_tool_calls[approval_idx + 1..].to_vec(),

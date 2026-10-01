@@ -24,11 +24,16 @@ The Dockerfile pins upstream Pebble to a reviewed commit and supplies a
 reviewed `PEBBLE_LOCK_SHA256` default for `upstream/Cargo.lock`. Plain Docker
 builds, both Compose services, mt-admin's Docker/Podman builders, and CI use
 that same default without an extra argument. The build rejects a digest
-mismatch and compares complete parsed package records against the pinned
-upstream lock; only `rustls` and `rustls-webpki` may differ. Package additions,
-removals, or source/checksum/dependency edits outside that allowlist fail even
-when a caller supplies a matching digest override. Update the reviewed digest
-together with any intentional lock change; CI checks they match.
+mismatch and compares complete parsed package records — keyed by
+`(name, version, source)` so multi-version crates are fully covered — against
+the pinned upstream lock; only `rustls`, `rustls-webpki`, and `chacha20`
+may differ (the first two for RUSTSEC-2026-0285, the last to retire upstream's
+yanked 0.10.1 pin).
+Package additions, removals, or source/checksum/dependency edits outside that
+allowlist fail even when a caller supplies a matching digest override, and a
+no-op override fails too, so the input is retired once upstream ships its own
+fix. Update the reviewed digest together with any intentional lock change; CI
+checks they match.
 
 Fast regression checks (no image build):
 

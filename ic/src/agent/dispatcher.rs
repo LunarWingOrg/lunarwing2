@@ -3,6 +3,9 @@
 //! Extracted from `agent_loop.rs` to keep the core agentic tool execution
 //! loop (LLM call -> tool calls -> repeat) in its own focused module.
 
+#[cfg(test)]
+mod estimation_tests;
+
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -1078,7 +1081,16 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 tool_name: tc.name.clone(),
                 parameters: tc.arguments.clone(),
                 display_parameters: display_params,
-                description: tool.description().to_string(),
+                description: self
+                    .agent
+                    .tools()
+                    .approval_description(
+                        &self.job_ctx.user_id,
+                        &tc.name,
+                        &tc.arguments,
+                        tool.description(),
+                    )
+                    .await,
                 tool_call_id: tc.id.clone(),
                 context_messages: reason_ctx.messages.clone(),
                 deferred_tool_calls: tool_calls[approval_idx + 1..].to_vec(),
@@ -1423,19 +1435,26 @@ mod tests {
 
     /// Build a minimal `Agent` for unit testing (no DB, no workspace, no extensions).
     fn make_test_agent() -> Agent {
+        make_test_agent_with_runtime(Arc::new(ToolRegistry::new()), Arc::new(StaticLlmProvider))
+    }
+
+    pub(super) fn make_test_agent_with_runtime(
+        tools: Arc<ToolRegistry>,
+        llm: Arc<dyn LlmProvider>,
+    ) -> Agent {
         let deps = AgentDeps {
             owner_id: "default".to_string(),
             vision_service_url: None,
             store: None,
             container_job_manager: None,
             external_worker_manager: None,
-            llm: Arc::new(StaticLlmProvider),
+            llm,
             cheap_llm: None,
             safety: Arc::new(SafetyLayer::new(&SafetyConfig {
                 max_output_length: 100_000,
                 injection_check_enabled: true,
             })),
-            tools: Arc::new(ToolRegistry::new()),
+            tools,
             workspace: None,
             extension_manager: None,
             skill_registry: None,

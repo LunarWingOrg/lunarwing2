@@ -7,16 +7,60 @@
 
 mod cost;
 mod learner;
+mod runtime;
 mod time;
 mod value;
 
 pub use cost::CostEstimator;
 pub use learner::{EstimationLearner, LearningModel};
+pub use runtime::{ToolEstimates, ToolEstimationMode};
 pub use time::TimeEstimator;
 pub use value::ValueEstimator;
 
 use rust_decimal::Decimal;
 use std::time::Duration;
+
+/// A completed execution paired with its *unadjusted* baselines and the
+/// duration prediction captured before execution. Unknown cost stays unknown.
+#[derive(Debug, Clone, Copy)]
+pub struct Actuals {
+    pub baseline_cost: Option<Decimal>,
+    pub actual_cost: Option<Decimal>,
+    pub baseline_time: Option<Duration>,
+    pub predicted_time: Option<Duration>,
+    pub actual_time: Duration,
+}
+
+/// Advisory single-operation estimate. Confidence is a heuristic, not a
+/// probability or a deadline. Cost has its own minimum valid sample count.
+#[derive(Debug, Clone)]
+pub struct RuntimeEstimate {
+    pub duration: Duration,
+    pub confidence: f64,
+    pub samples: u64,
+    pub cost: Option<Decimal>,
+}
+
+impl RuntimeEstimate {
+    /// Safe to append to an existing redacted approval description. Contains
+    /// only aggregate numbers, never tool arguments, names or user identity.
+    pub fn approval_hint(&self) -> String {
+        let confidence = if self.confidence < 0.5 {
+            "low"
+        } else {
+            "moderate"
+        };
+        let runtime = if self.duration < Duration::from_millis(10) {
+            "<0.01s".to_owned()
+        } else {
+            format!("~{:.2}s", self.duration.as_secs_f64())
+        };
+        format!(
+            "Typical tool runtime: {runtime} (EMA, {} completed calls, {confidence} confidence). Excludes approval wait; not a deadline.",
+            self.samples,
+        )
+    }
+}
 
 /// Combined estimation for a job.
 #[derive(Debug, Clone)]
@@ -98,7 +142,27 @@ impl Estimator {
         }
     }
 
-    /// Record actual results for learning.
+    /// Estimate a single operation from real observations, without the legacy
+    /// job facade's synthetic prices, tool defaults or value/earnings fields.
+    pub fn estimate_operation(
+        &self,
+        category: &str,
+        baseline_time: Option<Duration>,
+        baseline_cost: Option<Decimal>,
+    ) -> Option<RuntimeEstimate> {
+        let duration = self.learner.estimate_duration(category, baseline_time)?;
+        let model = self.learner.get_model(category)?;
+        Some(RuntimeEstimate {
+            duration,
+            confidence: self.learner.confidence(category),
+            samples: model.time_sample_count,
+            cost: baseline_cost.and_then(|cost| self.learner.adjust_cost(category, cost)),
+        })
+    }
+
+    /// Legacy job calibration API. Estimates here must be the unadjusted
+    /// baselines; use `record_operation_actuals` for optional cost and a frozen
+    /// prediction captured before execution.
     pub fn record_actuals(
         &mut self,
         category: &str,
@@ -114,6 +178,12 @@ impl Estimator {
             estimated_time,
             actual_time,
         );
+    }
+
+    /// Record actual results for learning. Call only for executed, completed
+    /// operations, not gate denials, preflight failures or truncated timeouts.
+    pub fn record_operation_actuals(&mut self, category: &str, actuals: Actuals) {
+        self.learner.record_actuals(category, actuals);
     }
 
     /// Get the cost estimator.

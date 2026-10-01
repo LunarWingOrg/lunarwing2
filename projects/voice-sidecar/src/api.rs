@@ -21,6 +21,7 @@ use subtle::ConstantTimeEq;
 use crate::audio::{AudioFormat, decode_audio, encode_wav};
 use crate::config::{Config, normalize_stt_language};
 use crate::engine::{EngineError, SpeechSegment, TranscriptSegment, VoiceEngine};
+use crate::inference::InferenceStatus;
 
 type DirectRateLimiter = governor::RateLimiter<
     governor::state::NotKeyed,
@@ -133,6 +134,13 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ReadyResponse {
+    #[serde(flatten)]
+    readiness: crate::engine::EngineReadiness,
+    inference: InferenceStatus,
+}
+
+#[derive(Debug, Serialize)]
 struct MetricsResponse {
     total_requests: u64,
     transcription_requests: u64,
@@ -141,6 +149,7 @@ struct MetricsResponse {
     cache_hits: u64,
     rate_limited: u64,
     errors: u64,
+    inference: InferenceStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +170,8 @@ enum ApiError {
     InvalidRequest(String),
     #[error("voice component unavailable")]
     Unavailable,
+    #[error("voice component failed; sidecar restart required")]
+    ComponentFailed,
     #[error("voice processing failed")]
     Processing,
     #[error("voice processing timed out")]
@@ -176,6 +187,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::BAD_REQUEST, "bad_request")
             }
             Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            Self::ComponentFailed => (StatusCode::SERVICE_UNAVAILABLE, "component_failed"),
             Self::Processing => (StatusCode::UNPROCESSABLE_ENTITY, "processing_failed"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
         };
@@ -337,13 +349,21 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let readiness = state.engine.readiness();
+    let mut readiness = state.engine.readiness();
+    let inference = state.engine.inference_status();
+    readiness.ready &= !inference.is_degraded();
     let status = if readiness.ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(readiness))
+    (
+        status,
+        Json(ReadyResponse {
+            readiness,
+            inference,
+        }),
+    )
 }
 
 async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
@@ -355,6 +375,7 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
         cache_hits: state.metrics.cache_hits.load(Ordering::Relaxed),
         rate_limited: state.metrics.rate_limited.load(Ordering::Relaxed),
         errors: state.metrics.errors.load(Ordering::Relaxed),
+        inference: state.engine.inference_status(),
     })
 }
 
@@ -422,6 +443,7 @@ async fn decode_request_audio(
 
 fn map_engine_error(error: EngineError) -> ApiError {
     match error {
+        EngineError::State => ApiError::ComponentFailed,
         EngineError::ModelUnavailable(_) | EngineError::Busy => ApiError::Unavailable,
         EngineError::ModelMismatch | EngineError::LanguageMismatch | EngineError::UnknownVoice => {
             ApiError::InvalidRequest(error.to_string())
@@ -499,6 +521,8 @@ mod tests {
     use super::*;
     use crate::audio::{AudioData, encode_wav};
     use crate::engine::{EngineReadiness, SynthesizedAudio, Transcription};
+
+    mod inference;
 
     struct MockEngine;
 

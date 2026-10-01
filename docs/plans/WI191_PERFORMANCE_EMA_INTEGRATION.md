@@ -1,6 +1,20 @@
 # WI #191 — Performance-first EMA estimation integration plan
 
-Status: **proposal / implementation plan, not implemented**. Reviewed against
+Status: **tool/approval slice implemented on `cmc/g10/v2.1.4.0`; later slices remain planned**.
+Implementation contract: [`ic/src/estimation/README.md`](../../ic/src/estimation/README.md).
+The initial integration covers slices 0/1 and the approval-description portion
+of slice 3: per-user registry-owned learning, all three tool execution paths,
+five-sample warmup, and frozen v1/v2 approval hints. Recording defaults to
+observation-only; `LUNARWING_TOOL_ESTIMATES=1` enables hints and `=0` disables
+the cache. It uses existing description
+fields rather than adding estimate DTOs across channel protocols. LLM timing,
+whole-job/mission-run estimates, gate-wait analytics, held-out workload
+evaluation and durable caches remain follow-ups; tool calls within those
+jobs are covered by this slice. Costs are only learned when actually reported,
+and are not displayed. See the
+[goal-10 evidence record](../ops/v2.1.4.0_GOAL10_EMA_VALIDATION.md) for checks run.
+
+Original plan reviewed against
 `wire-in-ema` at `05ddcc5cd` (2026-09-26). Tracker:
 [work item #191](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191).
 The work item says implementation starts **after the 2.1.3.0 release**; verify
@@ -159,8 +173,10 @@ blindly promote the unknown-tool 5-second fallback to a trusted forecast.
 Before activating live observations, bound positive ratios and durations,
 guard `NaN`/infinity, zero and negative costs, `Duration::from_secs_f64`
 overflow, `Decimal` conversion failures, and `sample_count` overflow. Never
-silently return factor 1.0 on an ordinary fractional cost factor as
-`learner.rs:103` currently can. Make alpha/min_samples invariants explicit;
+silently return factor 1.0 on a failed cost-factor conversion. Ordinary
+fractional factors (for example 1.13) are representable; the earlier draft's
+implication that they routinely fail conversion was incorrect and is covered
+by a regression test. Make alpha/min_samples invariants explicit;
 retain defaults until offline calibration demonstrates better settings.
 Avoid a global lock across tool/LLM awaits: capture prediction with a brief
 read, record with a brief write. Bound category count and evict cold keys;

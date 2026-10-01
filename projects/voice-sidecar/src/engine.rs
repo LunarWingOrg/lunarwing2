@@ -15,6 +15,9 @@ use crate::audio::TARGET_SAMPLE_RATE;
 use crate::config::Config;
 #[cfg(feature = "onnx")]
 use crate::config::normalize_stt_language;
+use crate::inference::InferenceStatus;
+#[cfg(feature = "onnx")]
+use crate::inference::{InferenceRuntime, VoiceComponent};
 
 #[cfg(feature = "onnx")]
 const STT_CHUNK_SECS: usize = 30;
@@ -67,7 +70,7 @@ pub enum EngineError {
     UnknownVoice,
     #[error("voice inference failed")]
     Inference,
-    #[error("voice engine state is unavailable")]
+    #[error("voice engine state failed; sidecar restart required")]
     State,
     #[error("voice inference capacity is busy")]
     Busy,
@@ -98,6 +101,10 @@ pub trait VoiceEngine: Send + Sync {
 
     async fn detect(&self, audio: AudioData) -> Result<Vec<SpeechSegment>, EngineError>;
 
+    fn inference_status(&self) -> InferenceStatus {
+        InferenceStatus::default()
+    }
+
     fn readiness(&self) -> EngineReadiness;
 }
 
@@ -116,7 +123,7 @@ pub struct SherpaVoiceEngine {
     language: String,
     voice_ids: HashMap<String, i32>,
     default_voice: String,
-    inference_limit: Arc<tokio::sync::Semaphore>,
+    inference: InferenceRuntime,
 }
 
 #[cfg(feature = "onnx")]
@@ -178,7 +185,7 @@ impl SherpaVoiceEngine {
             language: config.stt_language.clone(),
             voice_ids: config.tts_voice_ids.clone(),
             default_voice: config.tts_default_voice.clone(),
-            inference_limit: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_inference)),
+            inference: InferenceRuntime::new(config.max_concurrent_inference),
         })
     }
 }
@@ -264,17 +271,11 @@ impl VoiceEngine for SherpaVoiceEngine {
             return Err(EngineError::LanguageMismatch);
         }
         let fallback_language = self.language.clone();
-        let permit = self
-            .inference_limit
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| EngineError::Busy)?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            transcribe_chunks(&stt, &audio, &fallback_language)
-        })
-        .await
-        .map_err(|_| EngineError::Inference)?
+        self.inference
+            .run(VoiceComponent::Stt, stt, move |stt| {
+                transcribe_chunks(stt, &audio, &fallback_language)
+            })
+            .await
     }
 
     async fn synthesize(
@@ -299,24 +300,17 @@ impl VoiceEngine for SherpaVoiceEngine {
             .or_else(|| voice.parse::<i32>().ok())
             .ok_or(EngineError::UnknownVoice)?;
         let text = text.to_string();
-        let permit = self
-            .inference_limit
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| EngineError::Busy)?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut tts = tts.lock().map_err(|_| EngineError::State)?;
-            let audio = tts
-                .create(&text, speaker_id, speed.clamp(0.5, 2.0))
-                .map_err(|_| EngineError::Inference)?;
-            Ok(SynthesizedAudio {
-                samples: audio.samples,
-                sample_rate: audio.sample_rate,
+        self.inference
+            .run(VoiceComponent::Tts, tts, move |tts| {
+                let audio = tts
+                    .create(&text, speaker_id, speed.clamp(0.5, 2.0))
+                    .map_err(|_| EngineError::Inference)?;
+                Ok(SynthesizedAudio {
+                    samples: audio.samples,
+                    sample_rate: audio.sample_rate,
+                })
             })
-        })
-        .await
-        .map_err(|_| EngineError::Inference)?
+            .await
     }
 
     async fn detect(&self, audio: AudioData) -> Result<Vec<SpeechSegment>, EngineError> {
@@ -324,17 +318,15 @@ impl VoiceEngine for SherpaVoiceEngine {
             .vad
             .clone()
             .ok_or(EngineError::ModelUnavailable("VAD"))?;
-        let permit = self
-            .inference_limit
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| EngineError::Busy)?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            detect_segments(&vad, &audio)
-        })
-        .await
-        .map_err(|_| EngineError::Inference)?
+        self.inference
+            .run(VoiceComponent::Vad, vad, move |vad| {
+                detect_segments(vad, &audio)
+            })
+            .await
+    }
+
+    fn inference_status(&self) -> InferenceStatus {
+        self.inference.status()
     }
 
     fn readiness(&self) -> EngineReadiness {
@@ -360,18 +352,17 @@ impl VoiceEngine for SherpaVoiceEngine {
 
 #[cfg(feature = "onnx")]
 fn transcribe_chunks(
-    stt: &Mutex<SttRecognizer>,
+    recognizer: &mut SttRecognizer,
     audio: &AudioData,
     fallback_language: &str,
 ) -> Result<Transcription, EngineError> {
-    let mut recognizer = stt.lock().map_err(|_| EngineError::State)?;
     let chunk_samples = TARGET_SAMPLE_RATE as usize * STT_CHUNK_SECS;
     let mut segments = Vec::new();
     let mut language = fallback_language.to_string();
     for (index, chunk) in audio.samples.chunks(chunk_samples).enumerate() {
         // Whisper reports the detected language per chunk; parakeet-tdt
         // returns text only, so the configured language is kept.
-        let text = match &mut *recognizer {
+        let text = match recognizer {
             SttRecognizer::Whisper(whisper) => {
                 let result = whisper.transcribe(audio.sample_rate, chunk);
                 if !result.lang.is_empty() {
@@ -410,10 +401,9 @@ fn transcribe_chunks(
 
 #[cfg(feature = "onnx")]
 fn detect_segments(
-    vad: &Mutex<sherpa_rs::silero_vad::SileroVad>,
+    vad: &mut sherpa_rs::silero_vad::SileroVad,
     audio: &AudioData,
 ) -> Result<Vec<SpeechSegment>, EngineError> {
-    let mut vad = vad.lock().map_err(|_| EngineError::State)?;
     vad.clear();
     for window in audio.samples.chunks(512) {
         let mut samples = window.to_vec();

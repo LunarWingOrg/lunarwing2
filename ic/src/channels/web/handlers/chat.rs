@@ -366,12 +366,7 @@ pub async fn chat_history_handler(
             let pending_approval = thread
                 .pending_approval
                 .as_ref()
-                .map(|pa| PendingApprovalInfo {
-                    request_id: pa.request_id.to_string(),
-                    tool_name: pa.tool_name.clone(),
-                    description: pa.description.clone(),
-                    parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
-                });
+                .map(PendingApprovalInfo::from);
 
             return Ok(Json(HistoryResponse {
                 thread_id,
