@@ -708,7 +708,11 @@ mod tests {
         );
         // The id itself never matches a username-only entry, and an unrelated
         // username must not be authorized by it.
-        assert!(!store.is_sender_allowed("xmpp", "platform-id", None).unwrap());
+        assert!(
+            !store
+                .is_sender_allowed("xmpp", "platform-id", None)
+                .unwrap()
+        );
         assert!(
             !store
                 .is_sender_allowed("xmpp", "platform-id", Some("bob"))
