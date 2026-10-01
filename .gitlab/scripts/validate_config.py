@@ -380,6 +380,44 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
             errors.append(f"{job_name} must report junit artifact {report}")
 
 
+def validate_cargo_deny_gate(merged: dict, errors: list[str]) -> None:
+    """The cargo-deny job must run unvendored so yanked = "deny" is enforced.
+
+    cargo-deny resolves the crates.io index only when it is not run from
+    inside ic/, whose .cargo/config.toml source-replaces crates.io with
+    vendor/. From ic/ every crate degrades to warning[index-failure] and the
+    check silently passes (pipeline 4811 also lost its verdict to the 4 MB
+    trace cap those diagnostics caused). Require the wrapper script, and
+    forbid the vendored-context invocations inside it.
+    """
+    job = merged.get("cargo-deny", {})
+    script = job.get("script", []) if isinstance(job, dict) else []
+    commands = script if isinstance(script, list) else [str(script)]
+    if not any(
+        isinstance(command, str) and "cargo-deny-check.sh" in command
+        for command in commands
+    ):
+        errors.append(
+            "cargo-deny must invoke .gitlab/scripts/cargo-deny-check.sh "
+            "(unvendored context) instead of cargo-ci.sh deny check"
+        )
+
+    wrapper = ROOT / ".gitlab" / "scripts" / "cargo-deny-check.sh"
+    try:
+        text = wrapper.read_text(encoding="utf-8")
+    except OSError as error:
+        errors.append(f"cannot read cargo-deny wrapper: {error}")
+        return
+    required_fragments = (
+        "--manifest-path",
+        "--hide-inclusion-graph",
+        'grep -q "index-failure"',
+    )
+    for fragment in required_fragments:
+        if fragment not in text:
+            errors.append(f"cargo-deny-check.sh lost its {fragment} guard")
+
+
 def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
     """Catch release metadata drift before the expensive WASM/host test job."""
     expected = merged.get("cavepony-wasm", {}).get("variables", {}).get("CAVEPONY_EXPECTED_VERSION")
@@ -843,6 +881,7 @@ def main() -> int:
     validate_worker_publication(merged_config, errors)
     validate_test_shapes(merged_config, errors)
     validate_cavepony_version(merged_config, errors)
+    validate_cargo_deny_gate(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
     validate_worker_versions(errors)
     validate_deliverables_manifest(merged_config, errors)

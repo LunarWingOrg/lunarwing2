@@ -252,6 +252,15 @@ candidate job — the scan can only succeed after a candidate publishes
   emits `junit-shell.xml`; the worker scan emits a GitLab
   `container_scanning` report alongside its blocking CRITICAL gate.
 - cargo-deny and redacted current-tree Gitleaks scans.
+- cargo-deny runs unvendored: `.gitlab/scripts/cargo-deny-check.sh` executes
+  from the repo root with an explicit `--manifest-path ic/Cargo.toml` so
+  ic/'s vendored source replacement cannot hide the crates.io index. Run from
+  inside ic/, the `yanked = "deny"` policy silently degraded to per-crate
+  `warning[index-failure]` while the job still passed, and those diagnostics
+  also pushed pipeline 4811's trace past GitLab's 4 MB log cap, hiding the
+  verdict. The wrapper hides inclusion graphs and fails the job on any
+  `index-failure` diagnostic, so the gate can never be silently skipped;
+  `validate_config.py` rejects a cargo-deny job that bypasses it.
 - Rust concurrency is host-managed: memory-constrained runners restrict eligible
   jobs and concurrent compiles; larger hosts can accept parallel work.
 - CI parallelism is intentional: `-j2` (libSQL `-j1`) caps peak memory within

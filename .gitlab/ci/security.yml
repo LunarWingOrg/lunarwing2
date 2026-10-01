@@ -7,7 +7,7 @@ cargo-deny:
     - cargo-metadata
   script:
     - bash .gitlab/scripts/install-cargo-deny.sh
-    - PATH="$CI_PROJECT_DIR/.ci-bin:$PATH" bash .gitlab/scripts/cargo-ci.sh deny check
+    - bash .gitlab/scripts/cargo-deny-check.sh
 
 # cargo-deny filters crates that are pinned in Cargo.lock but never resolved
 # into the built graph, so advisories against such pins stay invisible. This
