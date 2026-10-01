@@ -1012,7 +1012,10 @@ mod tests {
             .execute(serde_json::json!({"content": "hello"}), &ctx)
             .await
             .expect("message tool should use xmpp metadata routing");
-        assert_eq!(result.result.as_str(), Some("Queued message to xmpp:424242"));
+        assert_eq!(
+            result.result.as_str(),
+            Some("Queued message to xmpp:424242")
+        );
 
         assert!(gateway_captures.lock().await.is_empty());
         let xmpp = xmpp_captures.lock().await.clone();
