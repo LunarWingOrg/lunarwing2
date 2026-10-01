@@ -177,6 +177,26 @@ b20="$(sb)"; report "$b20" '{components:[{component:"gateway",status:"healthy",m
 oB20="$(run_dry "$b20" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1)"
 assert_contains "$oB20" "nothing to do" "B20: absent diagnostic components create no targets"
 
+# B21 — worker_images (WI#271): per-tenant store drift escalates with tenant
+# attribution through the monitor-only diagnostic path; store contents are
+# operator-remediated via mt-admin, never by restarting a service.
+b21="$(sb)"; report "$b21" '{components:[{component:"worker_images",status:"critical",metrics:{instances:[
+  {tenant:"barracuda",status:"critical"},
+  {tenant:"acme",status:"healthy"}]}}]}'
+oB21="$(run_dry "$b21" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB21" "ESCALATING: worker_images@barracuda (monitor_only" "B21: store drift escalates with tenant attribution"
+assert_absent   "$oB21" "restart"                                        "B21: store drift never restarts anything"
+assert_absent   "$oB21" "no service mapping for component 'worker_images'" "B21: no service-mapping warning for worker_images"
+
+# B21b — a healthy worker_images instance clears synthetic diagnostic state
+# (report-as-truth recovery, mirroring B19).
+b21b="$(sb)"; report "$b21b" '{components:[{component:"worker_images",status:"healthy",metrics:{instances:[
+  {tenant:"barracuda",status:"healthy"}]}}]}'
+seed_state "$b21b" '{"worker_images@barracuda":{retries:1,consecutive_unhealthy:2}}'
+oB21b="$(run_raw "$b21b" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_VERIFY_HEALTH=false -- --report "$b21b/report.json" --backoff 0)"
+assert_contains "$oB21b" "RECOVERED: cleared state for worker_images@barracuda" "B21b: healthy instance clears store-drift state"
+assert_eq "$(state_of "$b21b")" '{}' "B21b: recovered store-drift state cleared"
+
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},

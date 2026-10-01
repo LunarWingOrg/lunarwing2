@@ -160,6 +160,27 @@
 #HEALTH_LUNARVOICE_FETCH_METRICS=true
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Component: worker_images (per-tenant container image store drift, WI#271)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# `auto` audits every registry tenant's rootless store for the images it is
+# expected to hold (local vision sidecar, enabled voice sidecar, selected
+# external workers) and compares IDs against the admin store. `false` disables.
+# A MISSING image is critical (restart/recreate would fail); STALE (store ID
+# differs from the admin store's) is degraded. No expected images, no registry,
+# or no podman reports healthy/disabled; with `true`, missing podman/sudo is a
+# critical monitoring gap instead.
+#HEALTH_WORKER_IMAGES_ENABLED=auto
+
+# Per-probe timeout (seconds) for each `podman image inspect`.
+#HEALTH_WORKER_IMAGES_TIMEOUT=5
+
+# Fleet sweep deadline for tenant targets (same partial-results contract as the
+# other fleet checks): late tenants are marked unprobed and the component
+# degrades rather than silently skipping coverage. 0 disables the deadline.
+#HEALTH_WORKER_IMAGES_SWEEP_DEADLINE_SECS=22
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Component: netbird (host tunnel peer readiness)
 # ═════════════════════════════════════════════════════════════════════════════
 

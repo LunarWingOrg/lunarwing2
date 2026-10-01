@@ -464,6 +464,7 @@ declare -A MONITOR_ONLY=()
 MONITOR_ONLY[lunarvoice]=1
 MONITOR_ONLY[runtime]=1
 MONITOR_ONLY[knowledge]=1
+MONITOR_ONLY[worker_images]=1
 if [[ "$NETBIRD_REMEDIATE" != true ]]; then
     MONITOR_ONLY[netbird]=1
 fi
@@ -474,10 +475,13 @@ fi
 # tenant attribution (synthetic "<comp>@<tenant>" identities built in main),
 # never a SERVICE_MAP restart. Without this registration, standard MT
 # configuration (SELF_HEAL_REMEDY_LOGICAL=false) silently skipped their
-# critical results because there was no service to map.
+# critical results because there was no service to map. worker_images (WI#271)
+# is the same shape: per-tenant store drift is operator-remediated via
+# mt-admin, never by restarting a service.
 declare -A DIAGNOSTIC_COMPONENTS=(
     [runtime]=1
     [knowledge]=1
+    [worker_images]=1
 )
 
 # Service identities that inherit monitor-only treatment regardless of which
@@ -1040,8 +1044,9 @@ main() {
         done
     done < <(jq -r '.components[] | "\(.component)\t\(.status)"' "$report" 2>/dev/null || true)
 
-    # 1b) Monitor-only diagnostic components (runtime, knowledge — MR !1041
-    # review finding 2): per-instance failures become synthetic monitor-only
+    # 1b) Monitor-only diagnostic components (runtime, knowledge,
+    # worker_images — MR !1041 review finding 2, WI#271): per-instance failures
+    # become synthetic monitor-only
     # targets ("<comp>@<tenant>", or bare "<comp>" for unattributed/legacy
     # single-node results) so they grace-track and escalate with tenant
     # attribution even when MT logical remediation is disabled. Healthy
@@ -1050,7 +1055,7 @@ main() {
     # not page per tenant).
     local diag_comp inst_tenant inst_status diag_id diag_cstatus
     local -a diag_bad=()
-    for diag_comp in runtime knowledge; do
+    for diag_comp in runtime knowledge worker_images; do
         diag_bad=()
         while IFS=$'\t' read -r inst_tenant inst_status; do
             [[ -n "$inst_tenant" ]] || continue

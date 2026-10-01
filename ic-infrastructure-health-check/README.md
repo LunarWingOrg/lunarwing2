@@ -26,6 +26,7 @@ cron-wrapper.sh
   │     ├── health-netbird.sh          (opt-in host tunnel readiness)
   │     ├── health-runtime.sh          (tenant gateway/bridge runtime diagnostics)
   │     ├── health-knowledge.sh         (knowledge sync/sweep progress monitoring)
+  │     ├── health-worker-images.sh    (per-tenant container image store drift, WI#271)
   │     └── health-{systemd,openrc,launchd}.sh  (service manager — one, auto-detected)
   │
   └── lunarwing-self-heal.sh           (reads report → restarts → verifies → escalates)
@@ -123,6 +124,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | runtime | health-runtime.sh | Per-tenant gateway `/api/gateway/status` + `/api/chat/pending-gates` and bridge `/v1/status` (ports-registry discovery, bearer tokens from tenant env files) | `gateway_reachable`, `gateway_uptime_secs`, `gateway_connections`, `channels_unhealthy` (unhealthy channels degrade the tenant), `pending_gates` (metric only — approval/auth waits are not stalled execution; an unobservable pending-gates endpoint degrades as an observability gap), `bridge_running`, `bridge_queued_messages`, `bridge_outbound_last_hour`, `bridge_omemo_enabled`, `bridge_prekeys_available` |
 | knowledge | health-knowledge.sh | Per-tenant `knowledge_sync_state.json` + `knowledge_sweep_state.json` **and the tenant's actual feature enablement** (`KNOWLEDGE_SYNC_ENABLED` default false, `KNOWLEDGE_SWEEP_ENABLED` default true, plus cadences, from the tenant env file) | `sync_enabled`, `sweep_enabled`, `sync_cadence_hours`, `sweep_cadence_hours`, `sync_consecutive_failures`, `sync_last_error_class`, `sync_deferred_notes`, `sync_last_success_age_seconds`, `sweep_last_run_age_seconds`; monitor-only — disabled features ignore their (possibly stale) state; enabled-but-never-observed degrades only past the startup grace period; overdue derives from the configured cadence |
 | systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant) | `metrics.units` / `.services` / `.agents` |
+| worker_images | health-worker-images.sh | Per-tenant rootless container stores: presence of each expected image (local vision sidecar, enabled voice sidecar, selected workers) and ID drift vs the admin store (WI#271) | per-tenant per-image `state` (`current`/`stale`/`missing`/`present-no-admin-copy`), `tenant_id`/`admin_id`; monitor-only diagnostic (escalates as `worker_images@<tenant>`; remediation is via mt-admin, never a restart) |
 
 A check that cannot reach its target generally reports `critical`; several
 checks can instead be **disabled** so they report `healthy` with
@@ -217,6 +219,9 @@ workloads.
 | `HEALTH_OPENRC_SWEEP_DEADLINE_SECS` | health-openrc.sh | `22` | Fleet sweep deadline; past it, remaining services are emitted as unprobed/skipped and the component degrades for lost coverage (0 disables) |
 | `HEALTH_LUNARVISION_SWEEP_DEADLINE_SECS` | health-lunarvision.sh | `22` | Fleet sweep deadline for tenant targets (same partial-results contract) |
 | `HEALTH_LUNARVOICE_SWEEP_DEADLINE_SECS` | health-lunarvoice.sh | `22` | Fleet sweep deadline for tenant targets (same partial-results contract) |
+| `HEALTH_WORKER_IMAGES_ENABLED` | health-worker-images.sh | `auto` | Audits every registry tenant's rootless store for its expected images (local vision sidecar, enabled voice sidecar, selected workers) vs the admin store; `false` disables; with `true`, missing podman/sudo is a critical monitoring gap |
+| `HEALTH_WORKER_IMAGES_TIMEOUT` | health-worker-images.sh | `5` | Per-probe timeout (s) for each `podman image inspect` |
+| `HEALTH_WORKER_IMAGES_SWEEP_DEADLINE_SECS` | health-worker-images.sh | `22` | Fleet sweep deadline for tenant targets (same partial-results contract) |
 | `HEALTH_CHECK_TIMEOUT_SECS` | infrastructure-health-check.sh | `30` | Per-component outer timeout; a component killed after emitting valid JSON keeps its partial report |
 | `LUNARWING_HEALTH_PATH` | cron-wrapper.sh | _(unset)_ | Appended to the safe PATH (which includes `/usr/local/sbin:/usr/sbin` for admin tools) |
 | `HEALTH_OPENRC_CRON_DIRS` | health-openrc.sh | `/etc/cron.hourly /etc/periodic/hourly` | Cron hook dirs scanned for the watchdog hook (scheduler blind-spot check) |
@@ -386,6 +391,7 @@ wedge it.
 | netbird | `netbird` (monitor-only unless explicitly delegated) | health-netbird.sh |
 | runtime | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `runtime@<tenant>`; escalates with tenant attribution, never restarts | health-runtime.sh |
 | knowledge | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `knowledge@<tenant>`; escalates with tenant attribution, never restarts | health-knowledge.sh |
+| worker_images | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `worker_images@<tenant>`; store drift is operator-remediated via mt-admin (`build-*-worker` / `build-vision-sidecar` / `install-voice`, then `start-tenant`), never by a restart | health-worker-images.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
 `runtime`/`knowledge` failures become synthetic monitor-only targets: a failing
@@ -554,12 +560,13 @@ bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios
 bash tests/test-lunarvision-init-templates.sh # systemd/OpenRC template contracts
 bash tests/test-health-netbird.sh           # opt-in readiness probe scenarios
 bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness scenarios
+bash tests/test-health-worker-images.sh     # tenant image-store drift scenarios (WI#271)
 ```
 
 | Suite | Script | What it does |
 |-------|--------|--------------|
 | `regression` | `test-self-heal.sh` | Original regression checks (jq precedence, backoff, grace, flapping, …). |
-| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (152 assertions). |
+| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (179 assertions). |
 | `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system. |
 | `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units, cron-scheduler blind-spot check). |
 | `systemd` | `test-health-systemd.sh` | Exercises tenant user-bus discovery, failure bias, and container health including LunarVision. |
@@ -574,6 +581,7 @@ bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness sce
 | `runtime` | `test-health-runtime.sh` | Exercises `health-runtime.sh` (mock curl: discovery, reachability, backlog thresholds, channel health, pending-gates observability, budget-bounded sweeps). |
 | `knowledge` | `test-health-knowledge.sh` | Exercises `health-knowledge.sh` (enablement-aware sync/sweep classification, grace window, cadence-derived overdue budgets). |
 | `gateway` | `test-health-gateway.sh` | Exercises `health-gateway.sh` (absent legacy dir stays healthy; stale locks and oversized sessions still degrade). |
+| `worker-images` | `test-health-worker-images.sh` | Exercises `health-worker-images.sh` (mock podman/sudo stores: current/stale/missing/tenant-only images, enablement-driven expectations, registry validation, podman-absent behavior). |
 | `watchdog-openrc` | `test-watchdog-openrc.sh` | Exercises the OpenRC service-level watchdog (start/verify, deep-check guards, bounded rc-service probes, lock contention) against a mock rc-service. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
 
