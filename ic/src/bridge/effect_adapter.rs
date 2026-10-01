@@ -475,9 +475,12 @@ impl EffectBridgeAdapter {
         }
 
         let id = Self::resolve_mission_id(params, context, mgr).await?;
-        let mission = mgr.get_mission(id).await?.ok_or_else(|| EngineError::Store {
-            reason: format!("mission {id} not found"),
-        })?;
+        let mission = mgr
+            .get_mission(id)
+            .await?
+            .ok_or_else(|| EngineError::Store {
+                reason: format!("mission {id} not found"),
+            })?;
         let visible = mission.project_id == context.project_id
             && (mission.is_owned_by(&context.user_id) || mission.owner_id().is_shared());
         if !visible {
@@ -4168,7 +4171,10 @@ FINAL(echoed + "|" + http_result["error"])"#,
             lunarwing_engine::MissionCadence::Manual,
         );
         let cross_project_id = cross_project.id;
-        store.save_mission(&cross_project).await.expect("save mission");
+        store
+            .save_mission(&cross_project)
+            .await
+            .expect("save mission");
 
         let same_project_other_user = lunarwing_engine::Mission::new(
             ctx.project_id,
