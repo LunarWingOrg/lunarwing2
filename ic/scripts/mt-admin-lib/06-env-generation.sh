@@ -1019,10 +1019,14 @@ write_tenant_lunarwing_env() {
   # tenants. An existing ENGINE_V2 / ENGINE_V2_CHANNELS value is preserved
   # across upgrade/rebuild/re-render — never clobber an operator's setting;
   # only a first write (or an absent key) falls back to the defaults.
-  local engine_v2 engine_v2_channels
+  local engine_v2 engine_v2_channels orchestrator_self_modify
   engine_v2="$(_env_existing "$path" ENGINE_V2)"; engine_v2="${engine_v2:-true}"
   engine_v2_channels="$(_env_existing "$path" ENGINE_V2_CHANNELS)"
   engine_v2_channels="${engine_v2_channels:-xmpp,weechat,darkirc}"
+  # WI#282: new tenants opt into stored orchestrator and prompt-overlay updates.
+  # Preserve an explicit operator opt-out across add-tenant re-renders.
+  orchestrator_self_modify="$(_env_existing "$path" ORCHESTRATOR_SELF_MODIFY)"
+  orchestrator_self_modify="${orchestrator_self_modify:-true}"
 
   # Sandbox egress (WI#154): multi-tenant hosts run worker WSS ports, tenant
   # PostgreSQL, and health endpoints on host loopback, and the proxy egress
@@ -1209,6 +1213,9 @@ WS_ADAPTER_URL=http://127.0.0.1:${weechat_adapter_port}
 # durable opt-out.
 ENGINE_V2=$engine_v2
 ENGINE_V2_CHANNELS=$engine_v2_channels
+# Runtime orchestrator and prompt-overlay updates (WI#282): enabled for new
+# tenants; set false to retain the compiled orchestrator and ignore overlays.
+ORCHESTRATOR_SELF_MODIFY=$orchestrator_self_modify
 # Engine V2 model recovery + async tool budget (WI#239). Attempts are the
 # per-turn model-retry ceiling; the async timeout wraps a single in-flight
 # tool call so a stuck tool cannot pin a turn forever. Preserved on re-render.

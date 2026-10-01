@@ -1038,7 +1038,9 @@ ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and the
                                # self-improvement/skill-extraction/skill-maintenance
                                # missions (paused while off, resumed on re-enable)
-ORCHESTRATOR_SELF_MODIFY=false # Compiled orchestrator v0, no stored prompt overlays or model control-doc writes
+ORCHESTRATOR_SELF_MODIFY=false # Runtime default: compiled orchestrator v0, no
+                               # stored prompt overlays or model control-doc writes.
+                               # Multi-tenant provisioning writes true for new tenants.
 
 # ThreadConfig env overrides (read at thread spawn):
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/LLM
@@ -1068,11 +1070,12 @@ read-only tenant inspection runbook (`mt-admin daemon-pid` / `mt-admin psql`)
 — is published in
 `docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
 `ORCHESTRATOR_SELF_MODIFY` unset or any value other than `true`/`1` makes
-stored overlays inert regardless of database contents; `SKILL_SELF_IMPROVEMENT`
-(the new-tenant provisioning default) is a separate flag and never authorizes
-prompt alteration; disabling the gate does not rewrite System messages already
-persisted in existing threads; and a failed audit probe (unresolvable daemon
-PID, unreadable `/proc/<pid>/environ`, errored DB query) is always classified
+stored overlays inert regardless of database contents; multi-tenant provisioning
+writes `ORCHESTRATOR_SELF_MODIFY=true` for new tenants while preserving an
+explicit operator opt-out on re-render. `SKILL_SELF_IMPROVEMENT` is a separate
+flag and never authorizes prompt alteration; disabling the gate does not
+rewrite System messages already persisted in existing threads; and a failed
+audit probe (unresolvable daemon PID, unreadable `/proc/<pid>/environ`, errored DB query) is always classified
 **uninspected** — never as evidence of gate-off or absence. On OpenRC the
 daemon's live environment is probed via OpenRC's `child_pid` record — never
 the supervise-daemon pidfile, which holds the supervisor's PID — and the
