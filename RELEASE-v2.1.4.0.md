@@ -261,8 +261,10 @@ previous compatibility baseline.
 | mt-admin verbs | New: `psql <tenant>`, `daemon-pid <tenant>` (read-only diagnostics); all existing verbs unchanged |
 | New tenant env defaults | `ORCHESTRATOR_SELF_MODIFY=true` rendered at add-tenant (WI#282); explicit operator values preserved on re-render; existing tenants untouched |
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
+| Outbound message delivery | `message` tool ack reports queue acceptance (`Queued message to <channel>:<target>`), never delivery; XMPP refuses proactive enqueue while disconnected; bounded 2s shutdown drain for already-acked stanzas (WI#270) |
 | Pairing store (WI#184) | Design revision 3 only — no substrate change this release; landed tests pin current legacy matching and concurrent-grant semantics ahead of the secrets-store migration |
 | CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only |
+| CI cargo-deny gate | Runs unvendored from the repo root via `.gitlab/scripts/cargo-deny-check.sh` (explicit `--manifest-path`/`--config`); hard-fails on any `index-failure` so the `yanked = "deny"` policy cannot be silently skipped |
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
 
 ## Changes
@@ -476,6 +478,37 @@ gate:
 Locked builds, the fuel budget, required artifacts, and the unchanged
 boundary ratchet are all retained. Evidence:
 [v2.1.4.0_GOAL1_CI_RECOVERY.md](docs/ops/v2.1.4.0_GOAL1_CI_RECOVERY.md).
+
+### CI cargo-deny Yanked-Gate Honesty (item 20)
+
+Pipeline #4811 was green (35/35 jobs), but the `cargo-deny` job was green
+dishonestly. The job ran from inside `ic/`, where
+`ic/.cargo/config.toml` source-replaces crates.io with `ic/vendor/` — so
+cargo-deny could not query the registry index and downgraded every crate's
+yanked check to `warning[index-failure]` (738 in #4811) while still exiting
+0. The diagnostic flood also pushed the job trace past GitLab's 4 MB log
+cap, truncating the verdict away entirely. The intended gate is restored
+without weakening the vendored-build design (runner egress already permits
+the crates.io index):
+
+- New `.gitlab/scripts/cargo-deny-check.sh` runs cargo-deny from the repo
+  root with explicit `--manifest-path ic/Cargo.toml` + `--config
+  ic/deny.toml`, hides inclusion graphs to keep the trace compact, and
+  hard-fails if any `index-failure` diagnostic still appears — the yanked
+  check can never be silently skipped again.
+- `.gitlab/ci/security.yml` uses the wrapper; the `refresh-vendor.sh`
+  post-vendor advisory gate routes through the same wrapper instead of the
+  old in-`ic/` invocation.
+- `.gitlab/scripts/validate_config.py` gained `validate_cargo_deny_gate`
+  (rejects a job bypassing the wrapper or a wrapper losing its guards) with
+  a 6-case regression suite (`.gitlab/tests/test_cargo_deny_gate.py`); the
+  unvendored gate and the pipeline-4811 incident are documented in
+  `.gitlab/README.md`.
+
+Verified locally: full `ci-config` gate green, the wrapper run reports 0
+index-failures, and the old failure mode was reproduced with a cold
+`CARGO_HOME` from `ic/` before the fix. This is CI-only — no runtime or
+operator-facing change.
 
 ### Pairing Allowlist Preservation (sbpatch1)
 
