@@ -212,6 +212,11 @@ post-deployment worker/export/restart evidence.
    error, the `failed to reexec: Permission denied` variant, and the
    system-migrate wrapper; any other podman failure gets only the cheap
    pause.pid cleanup and then fails loudly without stopping the tenant.
+   Since WI#271, every success path (probe-gated no-op, pause.pid-only
+   recovery, and the full cycle) also audits the tenant store for expected
+   worker/sidecar images and WARNs with the recovery verbs — a green probe no
+   longer concludes the repair while the store is missing an image (the
+   distribution gate in `start-tenant` warns and silently skips).
 2. **Shared pause.pid hygiene** (`clean_stale_pause_pid`,
    `ic/scripts/mt-admin-lib/05-tenant-build.sh`): extracted from
    `ensure_rootless_prereqs` so provisioning and the repair verb use the same
@@ -248,7 +253,8 @@ post-deployment worker/export/restart evidence.
 - `ic/scripts/tests/test-mt-admin-fix-podman-userns.sh`: probe-gated no-op,
   init-stop→cleanup→migrate→verified-stop→start ordering, stale/dead/foreign/keep pause.pid
   branches, non-join failures never stop the tenant, failing migrate
-  tolerated, classifier signatures.
+  tolerated, classifier signatures, and (WI#271) tenant-store image-drift
+  reporting on both the healthy-probe and full-repair success paths.
 - `ic/scripts/tests/test-mt-admin-podman-repair-quiescence.sh` (also invoked by
   the repair test): real repair/stop/quiescence composition with a runtime that
   cannot answer until migration, on both init paths. Covers service-stop

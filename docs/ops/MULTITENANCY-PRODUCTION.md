@@ -156,6 +156,18 @@ sudo ic/scripts/lunarwing-mt-admin.sh status ruffles
 sudo ic/scripts/lunarwing-mt-admin.sh tokens
 ```
 
+`status` also prints a **Store images** section (WI#271): each image the tenant
+is expected to hold (local vision sidecar, enabled voice sidecar, selected
+workers) classified as `current` / `STALE` / `MISSING` against the admin store
+that feeds distribution. A worker container can keep running from its
+materialized image while the store drifts, so green containers do not imply a
+healthy store. `STALE`/`MISSING` entries self-heal on the next `start-tenant`,
+which re-distributes from the admin store; a failed distribution prints the
+captured `save|load` diagnostics, and a refreshed image force-recreates the
+worker container (the recreation contract carries the tenant store's image ID).
+The host health pipeline reports the same drift as the monitor-only
+`worker_images` component.
+
 ### Step 6: Access gateways
 
 Gateways bind to `127.0.0.1` by default. From the same machine, open a browser to `http://127.0.0.1:<gateway-port>` and paste the token from step 5.
