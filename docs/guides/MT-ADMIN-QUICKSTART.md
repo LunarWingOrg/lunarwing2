@@ -4,7 +4,7 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0).**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), and 2026-10-01 (v2.1.4.0).**
 Every referenced mt-admin
 subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 `patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,
@@ -13,7 +13,9 @@ subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 v2.1.2.0 `fix-podman-userns` repair command below. The 2026-09-19 repass added
 the `opencode2` worker to the single-worker restart example. The 2026-09-27
 repass added the v2.1.3.0 (WI#223) `build-sandbox-image` command and the
-new-tenant `SANDBOX_IMAGE`/`SANDBOX_AUTO_PULL=false` defaults. **Migration note
+new-tenant `SANDBOX_IMAGE`/`SANDBOX_AUTO_PULL=false` defaults. The 2026-10-01
+repass added the v2.1.4.0 (WI#268) read-only diagnostics verbs `psql` and
+`daemon-pid` (see §8). **Migration note
 (WI#154/155):** `SANDBOX_NETWORK` defaults to `none` everywhere. Existing
 explicit `proxy` settings are preserved (mt-admin renders `none` only when
 unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
@@ -224,6 +226,15 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles opencode
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles kimi
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles opencode2
 ```
+
+For init-agnostic diagnostics, prefer the read-only inspection verbs over raw `psql`/`ps`/`pgrep` against tenant state (WI#268):
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh psql ruffles -c 'SELECT ...'
+sudo ic/scripts/lunarwing-mt-admin.sh daemon-pid ruffles
+```
+
+`psql` runs inside the tenant's own PostgreSQL container and is for SELECTs and fingerprints only — database rows can be secret-bearing. `daemon-pid` prints the PID of the process that actually loaded the tenant env, validated as tenant-owned (on OpenRC it reads OpenRC's `child_pid` record, never the supervise-daemon pidfile); a non-zero exit means the PID could not be resolved and must be treated as *uninspected*, never as evidence. The full operator runbook, including the Engine V2 prompt-overlay audit procedure that motivated these verbs, is [`../ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`](../ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md).
 
 ## 9. Backup, Restore, Upgrade, and Remove
 
