@@ -62,7 +62,7 @@ run_check() { PATH="$ROOT/bin:$PATH" bash "$CHECK" 2>/dev/null; }
 
 set_images() { # <store> <vision-id|-> <voice-id|-> <pebble-id|->
   local store="$1"
-  rm -rf "$MOCK_STORE_ROOT/$store"; mkdir -p "$MOCK_STORE_ROOT/$store"
+  rm -rf "${MOCK_STORE_ROOT:?}/$store"; mkdir -p "$MOCK_STORE_ROOT/$store"
   [[ "$2" == - ]] || printf 'sha256:%s' "$2" >"$MOCK_STORE_ROOT/$store/lunarwing_vision-service_latest"
   [[ "$3" == - ]] || printf 'sha256:%s' "$3" >"$MOCK_STORE_ROOT/$store/lunarwing_voice-service_latest"
   [[ "$4" == - ]] || printf 'sha256:%s' "$4" >"$MOCK_STORE_ROOT/$store/lunarwing-worker-pebble_latest"
