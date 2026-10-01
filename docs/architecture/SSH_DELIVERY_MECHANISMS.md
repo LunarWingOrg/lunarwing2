@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-09-28 (v2.1.3.0; item-40 socket-directory mount).
+**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-09-28 (v2.1.3.0; item-40 socket-directory mount), and again 2026-10-01 (v2.1.4.0 — no SSH harness/tool change this cycle; opencode2 worker image only moved pins 2.0.18 → 2.0.20, which does not affect the mount or socket contract).
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
