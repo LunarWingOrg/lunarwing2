@@ -5836,17 +5836,36 @@ async fn migrate_legacy_user_ids(store: &Arc<dyn lunarwing_engine::Store>, owner
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Test twin of the removed production fallback (30-minute default).
     const DEFAULT_PENDING_GATE_EXPIRY: chrono::Duration = chrono::Duration::minutes(30);
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::sync::{Mutex as TokioMutex, Notify, RwLock as TokioRwLock};
+    use tokio::sync::{
+        Mutex as TokioMutex, MutexGuard as TokioMutexGuard, Notify, RwLock as TokioRwLock,
+    };
 
     pub(super) static ENGINE_STATE_TEST_LOCK: LazyLock<TokioMutex<()>> =
         LazyLock::new(|| TokioMutex::new(()));
+
+    /// Acquire the shared global engine-state test lock.
+    ///
+    /// Cross-module tests (e.g. the `routine_history` fallback in
+    /// `tools::builtin::routine`) mutate the process-global `ENGINE_STATE`;
+    /// they must serialize against the router's engine-state tests through
+    /// this same lock (WI#265 review).
+    pub(crate) async fn engine_state_test_lock() -> TokioMutexGuard<'static, ()> {
+        ENGINE_STATE_TEST_LOCK.lock().await
+    }
+
+    /// Clear the process-global engine state; caller must hold the lock from
+    /// [`engine_state_test_lock`].
+    pub(crate) async fn reset_engine_state_for_tests() {
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+    }
 
     #[test]
     fn channel_constraints_compose_without_empty_sections() {
