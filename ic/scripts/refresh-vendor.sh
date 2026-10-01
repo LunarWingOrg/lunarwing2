@@ -146,12 +146,9 @@ if strays:
 print("refresh-vendor: vendor set matches synced Cargo.lock files")
 PYEOF
 
-# Prefer the repo-pinned cargo-deny binary; fall back to the cargo subcommand.
-DENY=(cargo deny)
-if [[ -x ../.ci-bin/cargo-deny ]]; then
-  DENY=(../.ci-bin/cargo-deny)
-fi
-
-echo "refresh-vendor: ${DENY[*]} check advisories" >&2
-"${DENY[@]}" check advisories
+# The unvendored cargo-deny wrapper (../.gitlab/scripts/cargo-deny-check.sh)
+# enforces yanked = "deny" against the real crates.io index; running the check
+# from inside ic/ would source-replace the registry away and silently skip it.
+echo "refresh-vendor: cargo-deny advisories gate (unvendored context)" >&2
+bash ../.gitlab/scripts/cargo-deny-check.sh
 echo "refresh-vendor: OK - review the $VENDOR_DIR/ diff, then commit" >&2
