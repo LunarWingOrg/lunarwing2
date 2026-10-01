@@ -77,7 +77,7 @@
 17. [ ] update all docs in docs/architecture
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/270
-20. [ ] fix issues in CI/CD (if any) - See Pipeline #4760 for latest master pipeline run and see if anything is not GREEN
+20. [ ] fix issues in CI/CD (if any) - See Pipeline number 4774 for latest master pipeline run and see if anything is not GREEN
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/280
 23. [x] (S) new reconcile routine method improvement for MR review process
