@@ -13,6 +13,7 @@ every **active** file is listed below. Archived material lives under
 * Updated on September 12th, 2026 for the v2.1.1.0 pre-release pass: indexed all releases through v2.1.0.0, added the missing guides (voice API, coordination knowledge, mascot, contribution policies) and the self-heal coverage audit to the index, removed a duplicated bugs paragraph and a stray duplicate archive line.*
 * Updated on September 14th, 2026 for the v2.1.2.0 pre-release pass: release index now points at v2.1.1.0 as latest.*
 * Updated on September 27th, 2026 for the v2.1.3.0 pre-release pass: release index now points at v2.1.2.0 as latest; new v2.1.3.0 ops docs (cargo-deny audit, half-broken tenant troubleshooting) indexed.*
+* Updated on October 1st, 2026 for the v2.1.4.0 pre-release pass: indexed the new tenant system-prompts guide (WI#220); release index now points at v2.1.3.0 as latest.*
 
 ## Companion applications
 
@@ -50,6 +51,7 @@ How-to guides, build instructions, and setup walkthroughs.
 |------|-------------|
 | [`CONTRIBUTOR-ONBOARDING.md`](guides/CONTRIBUTOR-ONBOARDING.md) | Contributor onboarding: shortest path from clone to merged MR, current freeze status, contribution tiers, review expectations, AI-policy compliance |
 | [`MT-ADMIN-QUICKSTART.md`](guides/MT-ADMIN-QUICKSTART.md) | Init-agnostic multi-tenant provisioning and lifecycle quickstart |
+| [`TENANT-SYSTEM-PROMPTS.md`](guides/TENANT-SYSTEM-PROMPTS.md) | Per-tenant system prompt management: gateway Settings panel, `/api/prompts` routes, Engine V2 initialization snapshot and restart activation (WI#220) |
 | [`CREATE_TENANT_NEW_SCRIPT.md`](guides/CREATE_TENANT_NEW_SCRIPT.md) | Full-featured tenant convenience wrapper |
 | [`TENANT_KNOWLEDGE_SEED.md`](guides/TENANT_KNOWLEDGE_SEED.md) | Seeding a new tenant's knowledge store with the full lw2studymcp study-notes base (`--with-study-mcp` one-shot import) |
 | [`MIGRATE_IRONCLAW_TO_LUNARWING.md`](guides/MIGRATE_IRONCLAW_TO_LUNARWING.md) | Rehearsed single-instance PostgreSQL migration from IronClaw |
@@ -357,7 +359,7 @@ Dated implementation plans and design specs produced by the superpowers agentic 
 
 ### 📦 [`releases/`](releases/)
 
-Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v2.1.2.0, latest: RELEASE-v2.1.2.0.md).
+Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v2.1.3.0, latest: RELEASE-v2.1.3.0.md).
 
 ---
 
