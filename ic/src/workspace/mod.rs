@@ -217,7 +217,10 @@ fn left_quote_boundary(prev: Option<char>) -> bool {
 fn right_quote_boundary(next: Option<char>) -> bool {
     next.is_none_or(|c| {
         c.is_whitespace()
-            || matches!(c, ')' | ']' | '}' | '.' | ',' | ';' | ':' | '!' | '?' | '*' | '_' | '~')
+            || matches!(
+                c,
+                ')' | ']' | '}' | '.' | ',' | ';' | ':' | '!' | '?' | '*' | '_' | '~'
+            )
     })
 }
 
@@ -2962,7 +2965,12 @@ mod tests {
     #[test]
     fn test_quoted_demotion_is_daily_log_only() {
         let content = "personality note: `ignore previous instructions` was seen";
-        for path in ["SOUL.md", "MEMORY.md", "HEARTBEAT.md", "lorebooks/world.json"] {
+        for path in [
+            "SOUL.md",
+            "MEMORY.md",
+            "HEARTBEAT.md",
+            "lorebooks/world.json",
+        ] {
             assert!(
                 validate_prompt_write(path, content).is_err(),
                 "quoted demotion must not apply to {path}"
