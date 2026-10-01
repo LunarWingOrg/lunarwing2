@@ -642,6 +642,10 @@ source and stamped for v2.1.4.0:
     [v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md](docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md).
 13. The bundled-skills catalog is unchanged from v2.1.3.0 (exactly seven
     product skills); no skill migration is needed.
+14. **Pairing (WI#184).** No runtime change this release — revision 3 is a
+    design document with landed pinning tests. Existing per-channel pairing
+    JSON files keep working; the secrets-store migration remains future work
+    tracked in the WI.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -673,13 +677,17 @@ source and stamped for v2.1.4.0:
   mission-day-rollover inspection (WI#243), engine mission-history
   fallback on a live tenant (WI#265 — covered by e2e traces), and
   browser/live-tenant rollout of the tool-estimate hints (WI#191).
-- Item 11 (WI#184 secrets-store pairing redesign) remains open for this
-  cycle at draft time; the WI#200 WeeChat pairing 30-day stopgap carries.
+- Item 11 (WI#184 secrets-store pairing redesign) landed as design revision
+  3 with the review-required regressions; the secrets-store substrate
+  implementation itself remains future work — the WI stays open for the
+  migration. The WI#200 stopgap tracker item was closed 2026-10-01 on the
+  landed allowFrom-preservation fix (!1283).
 - WI#191 later slices (LLM timing, whole-job/mission ETA, gate-wait
   analytics, durable aggregate caches) are deferred beyond this release.
-- Repo housecleaning and docs/guides + docs/architecture full repasses
-  (items 16/17/28) are tracked separately in the goals document and may
-  land after this draft is finalized.
+- Repo housecleaning (item 28) is tracked separately in the goals document
+  and may land after this draft is finalized; the docs/guides (item 16) and
+  docs/architecture (item 17) repasses landed after the first draft and are
+  covered in the sections above.
 
 ### Resolved or Source-Fixed Since v2.1.3.0
 
@@ -724,11 +732,21 @@ source and stamped for v2.1.4.0:
   bridge surface); kimi 2.1.1, opencode v1, and pebble pins unchanged.
 - Documentation parity for the cycle: seven docs synced, four manual test
   tiers added, releases/docs indexes updated.
+- All 32 active guides and all 10 active architecture docs repassed for
+  v2.1.4.0 with every cited path verified against source.
+- WI#184 pairing design advanced to revision 3 with both !1294 review P2s
+  answered; the legacy-matching, concurrent-grant, and wasm host-path
+  regressions are landed executable tests ahead of the substrate change.
+- The cycle's open work items were reconciled in
+  `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` with tree-verified
+  dispositions for all 23 open items; WI#200 closed on the landed stopgap.
 
 ---
 
-*Draft status: codename, release date, pipeline numbers for final CI
-confirmation, and the item-14 open-work-items audit cross-reference will be
-filled in before the release is cut. Open goal items at draft time (11, 14,
-16–20, 22, 24, 25, 28, 29) may add sections; this draft covers the merged
-state as of 2026-10-01.*
+*Draft status: codename, release date, and pipeline numbers for final CI
+confirmation will be filled in before the release is cut. This is the first
+repass (item 27, 2026-10-01): it folds in the work merged after the first
+draft — WI#184 design revision 3 with its landed regressions (item 11), the
+open work items audit (item 14), and the guides/architecture docs repasses
+(items 16/17). Open goal items at repass time (18–20, 22, 24, 25, 28, 29)
+may add sections; this draft covers the merged state as of 2026-10-01.*
