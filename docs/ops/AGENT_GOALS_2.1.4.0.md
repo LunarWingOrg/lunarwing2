@@ -55,7 +55,7 @@
 10. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/191
     - DONE 2026-09-30 (`cmc/g10/v2.1.4.0`, initial tool/approval slice): wired bounded, per-user EMA learning into shared tool execution, local jobs and routines; added frozen advisory runtime hints to both v1 approval paths and v2 pending gates. Cold-start in-memory learning is documented; display is opt-in with `LUNARWING_TOOL_ESTIMATES=1`, and `=0` disables recording/new hints. Legacy v1/v2 recovery no longer falls back to raw parameters when a redacted snapshot is missing.
     - Verified locally: 114 targeted tests plus the overhead benchmark; PostgreSQL test-target and libSQL library compile checks; all-feature library/test Clippy with zero warnings; formatting and architecture-boundary checks. Twelve-thread helper p95 was 0.260 ms. [Evidence, rollout limits and remaining plan slices](v2.1.4.0_GOAL10_EMA_VALIDATION.md). Pipeline #4712 passed 25/26 jobs; its required panic-policy failure is addressed below. Live-tenant/browser rollout remains unverified; LLM and whole-job/mission estimates are later slices of the broader plan
-    - REVIEW FOLLOW-UP (!1272): added local `#[cfg(test)]` to four test helpers so the per-file panic-policy scanner recognizes their assertions. Reproduced all 17 CI findings at `e1ce94ea4`; the corrected sources pass the MR-base wrapper and all 13 scanner self-tests. The adjacent Goal 9 entry is independently completed in !1273; integration must retain both checked items and their separate DONE trails.
+    - REVIEW FOLLOW-UP (!1272): added local `#[cfg(test)]` to four test helpers so the per-file panic-policy scanner recognizes their assertions. Reproduced all 17 CI findings at `e1ce94ea4`; the corrected sources pass the MR-base wrapper and all 13 scanner self-tests. The adjacent Goal 9 entry is independently completed in !1273; integration must retain both checked items and their separate DONE trails
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/184 - last attempt was rejected on MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1284 - Last attempt was rejected. See comments on previous closed MR for details on what needs to be addressed
 
 ## Phase 5 - Miscellaneous (for goals referencing work items, read comments on work items as well)
@@ -69,7 +69,7 @@
     - `docs/releases/README.md` — indexed the shipped RELEASE-v2.1.3.0.md (Ō-Yoroi, 2026-09-29), which was missing from the release table.
     - `docs/README.md` — indexed the new `guides/TENANT-SYSTEM-PROMPTS.md` (WI#220) in the guides table; latest-release pointer corrected to v2.1.3.0; index update note appended.
     - `docs/guides/CONTRIBUTOR-ONBOARDING.md` — freeze status updated: v2.1.3.0 shipped 2026-09-29, all LunarWing crates bumped to 2.1.4 (item #1 done, verified against `ic/Cargo.toml`/`Cargo.lock`), kimi worker 2.1.1 pin re-verified.
-    - Checked and intentionally left alone: ENGINE-V2.md (goals 5/7/8 already updated it), GATEWAY_VOICE_API.md + voice-sidecar README (goal 6), TENANT-SYSTEM-PROMPTS.md (goal 9), estimation/tools READMEs (goal 10), WORKER-CONTAINERS.md (item 2), job-state machine (only documented in point-in-time proposals), pairing allowlist semantics (sbpatch1 fix matches documented "approved pairing codes" behavior), port tables (v17 current), versioned v2.1.4.0_* evidence docs (archived at release time per history convention). Markdown link targets in all edited files verified resolvable. Docs-only change: no cargo check needed.
+    - Checked and intentionally left alone: ENGINE-V2.md (goals 5/7/8 already updated it), GATEWAY_VOICE_API.md + voice-sidecar README (goal 6), TENANT-SYSTEM-PROMPTS.md (goal 9), estimation/tools READMEs (goal 10), WORKER-CONTAINERS.md (item 2), job-state machine (only documented in point-in-time proposals), pairing allowlist semantics (sbpatch1 fix matches documented "approved pairing codes" behavior), port tables (v17 current), versioned v2.1.4.0_* evidence docs (archived at release time per history convention). Markdown link targets in all edited files verified resolvable. Docs-only change: no cargo check needed
 13. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
 14. [ ] review all currently open work items - create audit document for 2.1.4.0 in docs/ops - there are similar docs in docs/ops for 2.1.3.0 and earlier releases so you can use those as references
 15. [x] (S) (COMEBACKTOTHISLATER) UPDATE RELEASE-v2.1.2.0.md WITH CHANGES MADE SINCE FIRST DRAFT WAS CREATED
@@ -77,7 +77,7 @@
 17. [ ] update all docs in docs/architecture
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/269
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/270
-20. [ ] fix issues in CI/CD (if any) - I
+20. [ ] fix issues in CI/CD (if any) - See Pipeline #4760 for latest master pipeline run and see if anything is not GREEN
 21. [x] (S) (HUMAN) explore wireguard tun for tunnelling system for podman sandbox
 22. [x] (S) (H) Consider web gateway additional functionality (seperate from goal 38)
 23. [x] (S) new reconcile routine method improvement for MR review process

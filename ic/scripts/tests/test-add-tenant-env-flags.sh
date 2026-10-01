@@ -156,6 +156,8 @@ assert_eq "coordination admin token generated" \
 assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "20009"
 assert_eq "default ENGINE_V2" "$(envval ENGINE_V2)" "true"
 assert_eq "default ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
+assert_eq "default ORCHESTRATOR_SELF_MODIFY" \
+  "$(envval ORCHESTRATOR_SELF_MODIFY)" "true"
 # WI#154: MT tenants default to kernel-enforced no-egress sandbox networking.
 assert_eq "default SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "none"
 # WI#223: MT tenants pin the podman runtime, the lean locally-built sandbox
@@ -200,6 +202,7 @@ sed -i \
   -e 's/^MASCOT_ENABLED=.*/MASCOT_ENABLED=true/' \
   -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
   -e 's/^ENGINE_V2_CHANNELS=.*/ENGINE_V2_CHANNELS=xmpp/' \
+  -e 's/^ORCHESTRATOR_SELF_MODIFY=.*/ORCHESTRATOR_SELF_MODIFY=false/' \
   -e 's/^SANDBOX_NETWORK=.*/SANDBOX_NETWORK=proxy/' \
   -e 's/^SANDBOX_RUNTIME=.*/SANDBOX_RUNTIME=docker/' \
   -e 's/^SANDBOX_IMAGE=.*/SANDBOX_IMAGE=custom-sandbox:v2/' \
@@ -244,6 +247,8 @@ assert_eq "rerun preserves LW2STUDYMCP_ALLOW_WRITE" \
   "$(envval LW2STUDYMCP_ALLOW_WRITE)" "1"
 assert_eq "rerun preserves ENGINE_V2" "$(envval ENGINE_V2)" "false"
 assert_eq "rerun preserves ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp"
+assert_eq "rerun preserves ORCHESTRATOR_SELF_MODIFY" \
+  "$(envval ORCHESTRATOR_SELF_MODIFY)" "false"
 assert_eq "rerun preserves SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "proxy"
 assert_eq "rerun preserves SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "docker"
 assert_eq "rerun preserves SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "custom-sandbox:v2"
@@ -282,6 +287,7 @@ sed -i \
   -e '/^MASCOT_ENABLED=/d' \
   -e '/^ENGINE_V2=/d' \
   -e '/^ENGINE_V2_CHANNELS=/d' \
+  -e '/^ORCHESTRATOR_SELF_MODIFY=/d' \
   -e '/^SANDBOX_NETWORK=/d' \
   -e '/^SANDBOX_RUNTIME=/d' \
   -e '/^SANDBOX_IMAGE=/d' \
@@ -292,6 +298,8 @@ assert_eq "re-run adds MASCOT_ENABLED default" "$(envval MASCOT_ENABLED)" "false
 assert_eq "re-run adds ENGINE_V2 default" "$(envval ENGINE_V2)" "true"
 assert_eq "re-run adds ENGINE_V2_CHANNELS default" \
   "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
+assert_eq "re-run adds ORCHESTRATOR_SELF_MODIFY default" \
+  "$(envval ORCHESTRATOR_SELF_MODIFY)" "true"
 assert_eq "re-run adds SANDBOX_NETWORK default" "$(envval SANDBOX_NETWORK)" "none"
 assert_eq "re-run adds SANDBOX_RUNTIME default" "$(envval SANDBOX_RUNTIME)" "podman"
 assert_eq "re-run adds SANDBOX_IMAGE default" "$(envval SANDBOX_IMAGE)" "lunarwing-sandbox:latest"
