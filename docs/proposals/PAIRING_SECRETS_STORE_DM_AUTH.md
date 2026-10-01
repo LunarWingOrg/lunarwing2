@@ -348,8 +348,8 @@ Introduce a backend trait, keep the file store as an impl:
 1. **Trait extraction** — `PairingStoreBackend` with today's public surface
    (`list_pending`, `upsert_request`, `approve`, `read_allow_from`,
    `is_sender_allowed`); current struct becomes `FilePairingStore`
-   (`with_base_dir` preserved). Existing 23 unit tests keep running against
-   it unchanged.
+   (`with_base_dir` preserved). The module's existing 17 unit tests keep
+   running against it unchanged.
 2. **`SecretsPairingStore`** — `Arc<dyn SecretsStore + Send + Sync>` +
    tenant id + the key encoding above + the concurrency contract above;
    tested against `InMemorySecretsStore` for logic and real
