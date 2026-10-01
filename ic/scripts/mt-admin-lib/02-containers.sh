@@ -115,7 +115,22 @@ _ensure_tenant_image() {
   else
     say "distributing image $image into ${name}'s rootless store (save|load — minutes for large images) ..."
   fi
-  if "$CONTAINER_RT" save "$image" | _ctr "$name" load >/dev/null 2>&1; then
+  # WI#271: capture BOTH halves' stderr so the failure warning says why the
+  # distribution failed (store corruption vs missing source image vs the
+  # rootless userns/conmon class) instead of collapsing every cause into one
+  # generic line. A load-side early death EPIPEs the save side, so either
+  # half's diagnostics can be the useful one. Diagnostics are best-effort: a
+  # mktemp failure degrades to the pre-WI#271 discard behavior.
+  local dist_log="" dist_rc=0
+  dist_log="$(mktemp)" || true
+  if [[ -n "$dist_log" ]]; then
+    "$CONTAINER_RT" save "$image" 2>>"$dist_log" \
+      | _ctr "$name" load >/dev/null 2>>"$dist_log" || dist_rc=$?
+  else
+    "$CONTAINER_RT" save "$image" | _ctr "$name" load >/dev/null 2>&1 || dist_rc=$?
+  fi
+  if (( dist_rc == 0 )); then
+    [[ -z "$dist_log" ]] || rm -f "$dist_log"
     # Drop the previous (now-untagged) image if the load re-pointed the tag, so
     # repeated worker-image updates don't accumulate GBs of stale layers in the
     # tenant's rootless store.
@@ -124,7 +139,84 @@ _ensure_tenant_image() {
     return 0
   fi
   say "WARNING: failed to load $image into ${name}'s store"
+  if [[ -n "$dist_log" ]]; then
+    if [[ -s "$dist_log" ]]; then
+      say "distribution diagnostics (save|load stderr, last 5 lines):"
+      local _dist_line
+      while IFS= read -r _dist_line; do say "  $_dist_line"; done < <(tail -n 5 "$dist_log")
+    fi
+    rm -f "$dist_log"
+  fi
   return 1
+}
+
+# ── Tenant image-store introspection (WI#271) ────────────────────────────────
+# The tenant store can silently drift from the images a tenant needs: a failed
+# save|load used to be a content-free warning and nothing re-checked presence
+# afterwards, so `mt-admin status`, userns repair, and the host health fleet
+# all reported green while a worker image was missing. These helpers are the
+# shared source of truth for "which images should this tenant's store hold?"
+# and "what is actually there?".
+
+# The tenant store's current ID for an image (empty when absent/unreadable).
+_tenant_store_image_id() {  # <tenant> <image>
+  _ctr "$1" image inspect -f '{{.Id}}' "$2" 2>/dev/null || true
+}
+
+# Images a tenant's store is expected to hold, one "<image>\t<build-verb>" pair
+# per line: the vision sidecar unless the tenant uses an external instance, the
+# voice sidecar when enabled, and every selected external worker. (The managed
+# sandbox image is excluded: its runtime is chosen per tenant and may differ
+# from the worker runtime this module's _ctr targets.)
+_tenant_store_expected_images() {  # <tenant>
+  local name="$1" worker
+  tenant_vision_external "$name" \
+    || printf '%s\t%s\n' "$VISION_SIDECAR_IMAGE" "build-vision-sidecar"
+  tenant_voice_enabled "$name" \
+    && printf '%s\t%s\n' "$VOICE_SIDECAR_IMAGE" "install-voice"
+  for worker in pebble opencode opencode2 kimi; do
+    tenant_worker_enabled "$name" "$worker" \
+      && printf 'lunarwing-worker-%s:latest\tbuild-%s-worker\n' "$worker" "$worker"
+  done
+  return 0
+}
+
+# Print one "<image>\t<build-verb>" line per expected image MISSING from the
+# tenant's store. Returns 1 when any are missing.
+_tenant_store_missing_images() {  # <tenant>
+  local name="$1" image hint missing=0
+  while IFS=$'\t' read -r image hint; do
+    [[ -n "$image" ]] || continue
+    if [[ -z "$(_tenant_store_image_id "$name" "$image")" ]]; then
+      printf '%s\t%s\n' "$image" "$hint"
+      missing=1
+    fi
+  done < <(_tenant_store_expected_images "$name")
+  return "$missing"
+}
+
+# A short state string for one image in the tenant's store, for `mt-admin
+# status`. Rootless compares the tenant store ID against the admin store's
+# (the distribution source of truth); rootful only reports presence because
+# the shared store IS the admin store.
+_tenant_image_state() {  # <tenant> <image>
+  local name="$1" image="$2" admin_id="" tenant_id=""
+  admin_id="$("$CONTAINER_RT" image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)"
+  tenant_id="$(_tenant_store_image_id "$name" "$image")"
+  if [[ "$MT_ROOTLESS" != "true" ]]; then
+    [[ -n "$tenant_id" ]] && { printf 'present (%s)' "${tenant_id:0:19}"; return 0; }
+    printf 'MISSING'
+    return 0
+  fi
+  if [[ -z "$tenant_id" ]]; then
+    printf 'MISSING'
+  elif [[ -z "$admin_id" ]]; then
+    printf 'present (%s; admin store has no copy to compare)' "${tenant_id:0:19}"
+  elif [[ "$tenant_id" == "$admin_id" ]]; then
+    printf 'current (%s)' "${tenant_id:0:19}"
+  else
+    printf 'STALE (tenant %s, admin %s)' "${tenant_id:0:19}" "${admin_id:0:19}"
+  fi
 }
 
 # Install (or refresh) the babysitter helper binary from this repo to /usr/local/sbin.
