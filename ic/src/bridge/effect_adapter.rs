@@ -412,6 +412,98 @@ impl EffectBridgeAdapter {
         })
     }
 
+    /// Read a mission's run history (recent fires from `thread_history`) for
+    /// the `mission_history` tool (WI#269). Renders newest-first run entries
+    /// in the same shape as the legacy `routine_history` output so the LLM
+    /// can switch tools without relearning the schema.
+    async fn mission_history(
+        params: &serde_json::Value,
+        context: &ThreadExecutionContext,
+        mgr: &lunarwing_engine::MissionManager,
+    ) -> Result<serde_json::Value, EngineError> {
+        let mission = Self::resolve_mission_for_history(params, context, mgr).await?;
+
+        let limit = params
+            .get("limit")
+            .and_then(serde_json::Value::as_i64)
+            .map(|limit| limit.clamp(1, 50))
+            .unwrap_or(10) as usize;
+
+        let mut runs = Vec::new();
+        for tid in mission.thread_history.iter().rev() {
+            if runs.len() >= limit {
+                break;
+            }
+            if let Ok(Some(thread)) = mgr.load_thread(*tid).await {
+                runs.push(Self::mission_run_entry(&thread));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "name": mission.name,
+            "kind": "engine_mission",
+            "mission_id": mission.id.to_string(),
+            "status": format!("{:?}", mission.status),
+            "total_runs": mission.thread_history.len(),
+            "last_fired_at": mission.last_fired_at.map(|dt| dt.to_rfc3339()),
+            "never_fired": mission.last_fired_at.is_none(),
+            "runs": runs,
+        }))
+    }
+
+    /// Resolve a mission for `mission_history`: accepts `name` or `id` (also
+    /// via positional `_args`), scoped like `mission_list` (own + shared
+    /// missions in the caller's project).
+    async fn resolve_mission_for_history(
+        params: &serde_json::Value,
+        context: &ThreadExecutionContext,
+        mgr: &lunarwing_engine::MissionManager,
+    ) -> Result<lunarwing_engine::Mission, EngineError> {
+        let name = params
+            .get("name")
+            .or_else(|| params.get("_args").and_then(|a| a.get(0)))
+            .and_then(|v| v.as_str());
+        if let Some(name) = name
+            && let Some(mission) = mgr
+                .find_by_name(context.project_id, &context.user_id, name)
+                .await?
+        {
+            return Ok(mission);
+        }
+
+        let id = Self::resolve_mission_id(params, context, mgr).await?;
+        mgr.get_mission(id)
+            .await?
+            .ok_or_else(|| EngineError::Store {
+                reason: format!("mission {id} not found"),
+            })
+    }
+
+    /// Render one mission fire as a `routine_history`-shaped run entry.
+    fn mission_run_entry(thread: &lunarwing_engine::Thread) -> serde_json::Value {
+        let duration_secs = thread.completed_at.map(|completed| {
+            completed
+                .signed_duration_since(thread.created_at)
+                .num_seconds()
+        });
+        serde_json::json!({
+            "id": thread.id.to_string(),
+            "trigger_type": "mission_thread",
+            "trigger_detail": None::<String>,
+            "started_at": thread.created_at.to_rfc3339(),
+            "completed_at": thread.completed_at.map(|dt| dt.to_rfc3339()),
+            "duration_secs": duration_secs,
+            "status": format!("{:?}", thread.state),
+            "result_summary": thread
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == lunarwing_engine::MessageRole::Assistant)
+                .map(|message| message.content.chars().take(200).collect::<String>()),
+            "tokens_used": thread.total_tokens_used,
+        })
+    }
+
     /// Handle mission_* function calls. Returns None if not a mission call.
     async fn handle_mission_call(
         &self,
@@ -658,6 +750,7 @@ impl EffectBridgeAdapter {
                     Err(e) => Err(e),
                 }
             }
+            "mission_history" => Self::mission_history(params, context, mgr).await,
             _ => return None, // Not a mission/routine call
         };
 
@@ -732,6 +825,20 @@ impl EffectBridgeAdapter {
             return result.map(|mut r| {
                 r.duration = start.elapsed();
                 r
+            });
+        }
+
+        // routine_history answers against the v1 routines registry; in a v2
+        // thread the same name can shadow a live mission and return the wrong
+        // object's history, so it must error honestly toward mission_history
+        // instead of falling through to the v1 store (WI#269).
+        if is_routine_history_tool(lookup_name) {
+            return Err(EngineError::Effect {
+                reason: format!(
+                    "Tool '{}' is not available in engine v2. \
+                     Use mission_history instead (mission names come from mission_list).",
+                    action_name
+                ),
             });
         }
 
@@ -1345,7 +1452,16 @@ fn is_v1_only_tool(name: &str) -> bool {
             | "routine_resume"
             | "routine_update"
             | "routine_delete"
+            | "routine_history"
     )
+}
+
+/// v1-only tools whose v2 replacement is a mission tool. The generic
+/// "use the slash command" error would misdirect here: the honest answer is
+/// `mission_history` for history and the other `mission_*` verbs for
+/// lifecycle (WI#269).
+fn is_routine_history_tool(name: &str) -> bool {
+    matches!(name, "routine_history" | "routine-history")
 }
 
 /// Auth management tools from v1 that are now kernel-internal in v2.
