@@ -424,6 +424,20 @@ Commands:
     --skip-render                  Keep existing unit files (run render-units later;
                                    must happen before v2.0.0 for pre-1.1.9 tenants)
   rotate-pg-password <name>       Generate a new random PG password (ALTER ROLE + env update)
+  psql <name> [psql args...]      Run psql inside the tenant's own PostgreSQL
+                                  container (init/runtime-agnostic, via _ctr).
+                                  Read-only diagnostics: SELECTs and fingerprints
+                                  only — DB rows can be secret-bearing.
+  daemon-pid <name>               Print the tenant daemon's PID (the process that
+                                  loaded the tenant env). OpenRC reads OpenRC's
+                                  child_pid record — NOT the supervise-daemon
+                                  pidfile, which holds the supervisor's PID. The
+                                  record is validated as-written (mixed
+                                  digit/non-digit records are rejected) and the
+                                  process must be owned by the tenant and carry
+                                  the tenant home path in its cmdline. Exits
+                                  non-zero when unresolvable; treat that as
+                                  uninspected, never as evidence.
 
   configure-gotify <name> <url>    Set custom Gotify URL for a tenant
                                    (updates workspace config + capabilities)
@@ -1159,6 +1173,24 @@ main() {
       require_root
       [[ -n "${1:-}" ]] || die "usage: rotate-pg-password <name>"
       rotate_tenant_pg_password "$1"
+      ;;
+
+    psql)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: psql <name> [psql args...]"
+      local psql_tenant="$1"; shift
+      tenant_psql "$psql_tenant" "$@"
+      ;;
+
+    daemon-pid)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: daemon-pid <name>"
+      local daemon_pid
+      if daemon_pid="$(tenant_daemon_pid "$1")"; then
+        say "$daemon_pid"
+      else
+        die "could not resolve the daemon PID for tenant '$1' (unit not running, PID record missing/malformed, or process not associated with the tenant); treat as uninspected"
+      fi
       ;;
 
     list-tenants|list)
