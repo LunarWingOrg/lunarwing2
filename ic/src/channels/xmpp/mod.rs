@@ -2,9 +2,15 @@
 //!
 //! Connects to an XMPP server via tokio-xmpp, listens for incoming messages,
 //! and routes replies back over the same XMPP channel.
+//!
+//! Outbound messages accepted via the `queue_outbound*` path are persisted to
+//! a durable on-disk spool before the enqueue ack and replayed on every
+//! (re)bind, so restarts no longer silently lose acked messages (WI#277; see
+//! the `spool` module).
 
 mod config;
 pub mod omemo;
+mod spool;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -48,6 +54,7 @@ use crate::config::XmppConfig;
 use crate::error::ChannelError;
 use crate::pairing::PairingStore;
 use omemo::{OmemoManager, RemoteDeviceBundle};
+use spool::{OutboundSpool, SpooledMessage};
 
 use config::{bare_jid, is_jid_allowed, thread_id_from_jid};
 
@@ -73,6 +80,10 @@ const INBOUND_ATTACHMENT_QUEUE_CAPACITY: usize = 16;
 /// buffer flush: shutdown must not hang, but acked messages deserve a chance.
 const OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const OUTBOUND_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Directory name (under `omemo_store_dir`) of the durable outbound spool
+/// (WI#277). Deriving it from the existing per-instance data directory keeps
+/// bridge and native deployments working with no new config surface.
+const OUTBOUND_SPOOL_DIR_NAME: &str = "spool";
 
 #[derive(Debug, Clone, Default)]
 struct EncryptedRoomState {
@@ -124,6 +135,10 @@ struct OutboundMessage {
     preferred_device_id: Option<u32>,
     /// Files to upload (XEP-0363) and deliver as OOB URLs after the text body.
     attachments: Vec<OutboundAttachment>,
+    /// Durable spool record key (WI#277). `Some` for messages accepted through
+    /// `queue_outbound*` (persisted before the ack); `None` for internal
+    /// protocol sends (e.g. pairing prompts) that are not spooled.
+    spool_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -206,9 +221,10 @@ pub struct XmppChannel {
     /// Sender half for outbound stanzas.
     outbound_tx: mpsc::Sender<OutboundMessage>,
     /// Outbound stanzas accepted into the queue but not yet processed by the
-    /// client task (WI#270). Depth signal for the shutdown drain: anything
-    /// still pending when the process exits is lost, because the queue is
-    /// memory-only.
+    /// client task (WI#270). Depth signal for the shutdown drain. Every
+    /// message counted here also carries a durable spool record (WI#277), so
+    /// an undrained queue at exit delays delivery until the next bind instead
+    /// of losing it.
     outbound_pending: Arc<std::sync::atomic::AtomicUsize>,
     outbound_rate_limiter: Arc<tokio::sync::Mutex<OutboundRateLimiter>>,
     /// Receiver half taken by `start()` on the first call.
@@ -220,6 +236,9 @@ pub struct XmppChannel {
     /// Health must reflect bridge connection failures instead of reporting
     /// unconditional success while retries spam the log.
     connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Durable outbound spool (WI#277). Every `queue_outbound*` message is
+    /// persisted here before its ack and replayed on every (re)bind.
+    spool: OutboundSpool,
 }
 
 impl XmppChannel {
@@ -241,6 +260,17 @@ impl XmppChannel {
             config.max_messages_per_hour,
         )));
 
+        // WI#277: the spool lives under the OMEMO store directory, which
+        // already owns this deployment's per-instance persistence contract.
+        // If the directory is unusable the channel must fail loudly here —
+        // acking messages it cannot persist would reopen the WI#270 silent
+        // restart-loss window.
+        let spool = OutboundSpool::new(config.omemo_store_dir.join(OUTBOUND_SPOOL_DIR_NAME))
+            .map_err(|e| ChannelError::StartupFailed {
+                name: "xmpp".into(),
+                reason: format!("outbound spool init failed: {e}"),
+            })?;
+
         Ok(Self {
             config,
             reply_targets: Arc::new(RwLock::new(LruCache::new(cap))),
@@ -253,6 +283,7 @@ impl XmppChannel {
             outbound_rx: Arc::new(tokio::sync::Mutex::new(Some(outbound_rx))),
             http_upload_service: Arc::new(RwLock::new(None)),
             connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            spool,
         })
     }
 
@@ -323,25 +354,43 @@ impl XmppChannel {
             });
         }
 
+        let mut message = OutboundMessage {
+            to: target_jid,
+            body,
+            groupchat,
+            preferred_device_id,
+            attachments,
+            spool_key: None,
+        };
+
+        // WI#277: persist BEFORE the mpsc handoff — once `send` succeeds the
+        // caller is acked, so the record must already be durable. If the
+        // spool write fails, refuse the ack (same honesty rule as the
+        // connected gate above) rather than queue a message we could lose.
+        let spool_key = self.spool.persist(&message).map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                "XMPP outbound spool write failed; message not queued"
+            );
+            ChannelError::SendFailed {
+                name: "xmpp".into(),
+                reason: format!("outbound spool write failed; message not queued: {e}"),
+            }
+        })?;
+        message.spool_key = Some(spool_key.clone());
+
         // Reserve the pending slot BEFORE enqueue: the client task may
         // receive and finish this message before `send` returns, and its
         // decrement must never race ahead of the matching increment
         // (a send-then-increment order could transiently wrap the counter).
         self.outbound_pending
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if let Err(_dropped) = self
-            .outbound_tx
-            .send(OutboundMessage {
-                to: target_jid,
-                body,
-                groupchat,
-                preferred_device_id,
-                attachments,
-            })
-            .await
-        {
+        if let Err(_dropped) = self.outbound_tx.send(message).await {
             self.outbound_pending
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            // The caller was never acked, so the record must not be
+            // resurrected by a spool replay after a restart.
+            self.spool.discard(&spool_key);
             return Err(ChannelError::SendFailed {
                 name: "xmpp".into(),
                 reason: "outbound channel closed (client task exited)".into(),
@@ -462,9 +511,9 @@ impl Drop for XmppConnectionGuard {
 }
 
 /// Decrements the outbound pending counter when the client task finishes
-/// with a queued message (WI#270). The shutdown drain waits on that counter:
-/// anything still pending at process exit is lost, because the queue is
-/// memory-only.
+/// with a queued message (WI#270). The shutdown drain waits on that counter;
+/// anything still pending at process exit keeps its durable spool record
+/// (WI#277) and is replayed on the next bind.
 struct OutboundPendingSlot(Arc<std::sync::atomic::AtomicUsize>);
 
 impl Drop for OutboundPendingSlot {
@@ -894,6 +943,9 @@ async fn handle_pairing_request(
                 groupchat: false,
                 preferred_device_id: None,
                 attachments: Vec::new(),
+                // Pairing prompts are ephemeral protocol traffic, not acked
+                // caller sends — deliberately not spooled (WI#277).
+                spool_key: None,
             })
             .map_err(|e| ChannelError::SendFailed {
                 name: "xmpp".into(),
@@ -944,6 +996,7 @@ impl Channel for XmppChannel {
         let outbound_pending = Arc::clone(&self.outbound_pending);
         let http_upload_service = Arc::clone(&self.http_upload_service);
         let connected = Arc::clone(&self.connected);
+        let spool = self.spool.clone();
         let pairing_store = PairingStore::new();
         let (inbound_attachment_tx, inbound_attachment_rx) =
             mpsc::channel(INBOUND_ATTACHMENT_QUEUE_CAPACITY);
@@ -1011,6 +1064,25 @@ impl Channel for XmppChannel {
                                     omemo.record_error(err.to_string()).await;
                                     tracing::warn!("XMPP OMEMO publish failed: {err}");
                                 }
+                                // WI#277: replay anything a previous process
+                                // (or a pre-reconnect queue) acked but never
+                                // sent. Runs after room joins and the OMEMO
+                                // publish so encrypted sends see fresh state.
+                                drain_outbound_spool(
+                                    &mut client,
+                                    &spool,
+                                    &tx,
+                                    &config,
+                                    &reply_targets,
+                                    &omemo,
+                                    &muc_participants,
+                                    &encrypted_room_states,
+                                    &pairing_store,
+                                    &outbound_tx,
+                                    &http_upload_service,
+                                    &outbound_pending,
+                                )
+                                .await;
                             }
                             Some(tokio_xmpp::Event::Stanza(stanza)) => {
                                 if let Err(e) = process_stanza(
@@ -1061,125 +1133,44 @@ impl Channel for XmppChannel {
                                 // delivery goes: the shutdown drain only waits
                                 // for messages the client task still owns.
                                 let pending_slot = OutboundPendingSlot(Arc::clone(&outbound_pending));
-                                match msg.to.parse::<xmpp_parsers::jid::Jid>() {
-                                Ok(to_jid) => {
-                                    // Upload any attachments via XEP-0363, then assemble
-                                    // the bodies to send: the text first (if present),
-                                    // followed by one out-of-band URL per uploaded file.
-                                    let mut sends: Vec<(String, bool)> = Vec::new();
-                                    if msg.attachments.is_empty() || !msg.body.is_empty() {
-                                        sends.push((msg.body.clone(), false));
-                                    }
-                                    for attachment in &msg.attachments {
-                                        match upload_file_via_http_slot(
-                                            &mut client,
-                                            &config,
-                                            &http_upload_service,
-                                            attachment,
-                                            &tx,
-                                            &reply_targets,
-                                            &omemo,
-                                            &muc_participants,
-                                            &encrypted_room_states,
-                                            &pairing_store,
-                                            &outbound_tx,
-                                        )
-                                        .await
-                                        {
-                                            Ok(get_url) => sends.push((get_url, true)),
-                                            Err(err) => {
-                                                tracing::warn!(
-                                                    file = %attachment.filename,
-                                                    error = %err,
-                                                    "XMPP XEP-0363 upload failed; skipping attachment"
-                                                );
-                                            }
+                                // WI#277: claim the spool record before
+                                // sending. If a spool replay (or an earlier
+                                // attempt) already owns the record, this
+                                // in-memory copy is the duplicate and must
+                                // not send. Unspooled internal messages
+                                // (pairing prompts) have no record to claim.
+                                let claimed = match msg.spool_key.as_deref() {
+                                    Some(key) => match spool.claim(key) {
+                                        Ok(Some(claimed)) => Some(claimed),
+                                        Ok(None) => {
+                                            tracing::debug!(key, "XMPP outbound message already handled via spool; skipping duplicate");
+                                            None
                                         }
-                                    }
-
-                                    for (body, is_file_url) in sends {
-                                        let mut stanza = if msg.groupchat {
-                                            if room_requires_encryption(&config, bare_jid(&msg.to)) {
-                                                match build_outbound_groupchat_stanza(
-                                                    &mut client,
-                                                    to_jid.clone(),
-                                                    body.clone(),
-                                                    &tx,
-                                                    &config,
-                                                    &reply_targets,
-                                                    &omemo,
-                                                    &muc_participants,
-                                                    &encrypted_room_states,
-                                                    &pairing_store,
-                                                    &outbound_tx,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(Some(stanza)) => stanza,
-                                                    Ok(None) => continue,
-                                                    Err(err) => {
-                                                        omemo.record_error(err.to_string()).await;
-                                                        tracing::warn!("XMPP encrypted room send preparation failed: {err}");
-                                                        continue;
-                                                    }
-                                                }
-                                            } else {
-                                                xmpp_parsers::message::Message::groupchat(to_jid.clone())
-                                                    .with_body(xmpp_parsers::message::Lang::from(""), body.clone())
-                                            }
-                                        } else {
-                                            match build_outbound_dm_stanza(
-                                                &mut client,
-                                                to_jid.clone(),
-                                                body.clone(),
-                                                msg.preferred_device_id,
-                                                &tx,
-                                                &config,
-                                                &reply_targets,
-                                                &omemo,
-                                                &muc_participants,
-                                                &encrypted_room_states,
-                                                &pairing_store,
-                                                &outbound_tx,
-                                            )
-                                            .await
-                                            {
-                                                Ok(Some(stanza)) => stanza,
-                                                Ok(None) => continue,
-                                                Err(err) => {
-                                                    omemo.record_error(err.to_string()).await;
-                                                    tracing::warn!("XMPP OMEMO send preparation failed: {err}");
-                                                    continue;
-                                                }
-                                            }
-                                        };
-
-                                        // For file URLs sent in cleartext, attach an
-                                        // XEP-0066 OOB payload so clients render the file
-                                        // inline. Skip for OMEMO-encrypted stanzas: the URL
-                                        // lives in the encrypted body and a cleartext OOB
-                                        // child would leak it to the server.
-                                        if is_file_url && !stanza_is_encrypted(&stanza) {
-                                            stanza.payloads.push(
-                                                Oob {
-                                                    url: body.clone(),
-                                                    desc: None,
-                                                }
-                                                .into(),
-                                            );
+                                        Err(err) => {
+                                            tracing::warn!(key, error = %err, "XMPP spool claim failed; message remains spooled for replay");
+                                            None
                                         }
-
-                                        if let Err(e) = client
-                                            .send_stanza(tokio_xmpp::Stanza::Message(stanza))
-                                            .await
-                                        {
-                                            tracing::warn!("XMPP send error: {e:?}");
-                                        }
+                                    },
+                                    None => None,
+                                };
+                                if msg.spool_key.is_none() || claimed.is_some() {
+                                    let disposition = process_outbound_message(
+                                        &mut client,
+                                        &msg,
+                                        &tx,
+                                        &config,
+                                        &reply_targets,
+                                        &omemo,
+                                        &muc_participants,
+                                        &encrypted_room_states,
+                                        &pairing_store,
+                                        &outbound_tx,
+                                        &http_upload_service,
+                                    )
+                                    .await;
+                                    if let Some(claimed) = claimed {
+                                        resolve_spool_outcome(&spool, &claimed, disposition);
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("XMPP outbound: invalid JID '{}': {e}", msg.to);
-                                }
                                 }
                                 drop(pending_slot);
                             }
@@ -1381,11 +1372,11 @@ impl Channel for XmppChannel {
         // Coalesced flushes are owned by the agent-level shared buffer,
         // which the agent run loop flushes before channel shutdown.
         //
-        // WI#270: the outbound mpsc is memory-only and is NOT flushed by the
-        // agent, so give the still-running client task a bounded window to
-        // drain any stanzas already acked to callers. If the queue does not
-        // empty in time, say so loudly — those messages are lost when the
-        // process exits (durable spooling is tracked separately).
+        // WI#270: give the still-running client task a bounded window to
+        // drain stanzas already acked to callers. Anything still pending
+        // when the window ends is NOT lost — every acked message carries a
+        // durable spool record (WI#277) that the next process replays on
+        // bind — so the warn below is a delivery-delay notice, not data loss.
         let pending_now = self
             .outbound_pending
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1405,7 +1396,7 @@ impl Channel for XmppChannel {
             if remaining > 0 {
                 tracing::warn!(
                     pending = remaining,
-                    "XMPP shutdown: outbound queue did not drain; pending messages will be lost"
+                    "XMPP shutdown: outbound queue did not drain; pending messages remain in the durable spool and will be sent on the next bind"
                 );
             } else {
                 tracing::debug!("XMPP shutdown: outbound queue drained");
@@ -1433,6 +1424,277 @@ impl Channel for XmppChannel {
             ctx.insert("sender".to_string(), from.to_string());
         }
         ctx
+    }
+}
+
+/// Delivery outcome for one outbound message (WI#277). The client task maps
+/// this onto the message's spool record: `Delivered` clears it, `Retry`
+/// reschedules it with exponential backoff, `Undeliverable` parks it as
+/// `.failed.json` for operator inspection.
+#[derive(Debug)]
+enum OutboundDisposition {
+    Delivered,
+    Retry(String),
+    Undeliverable(String),
+}
+
+/// Build and send every stanza for one outbound message: the text body first
+/// (if present), then one out-of-band URL per uploaded attachment (XEP-0363).
+///
+/// Per-part warn logging matches the pre-WI#277 behavior; what changed is the
+/// aggregate return: any part that used to be silently warn-and-dropped now
+/// makes the whole message `Retry` (re-sent from the spool on the next bind),
+/// so multi-part messages are at-least-once at whole-message granularity —
+/// a retried message can re-send parts that already went out.
+#[allow(clippy::too_many_arguments)]
+async fn process_outbound_message(
+    client: &mut tokio_xmpp::Client,
+    msg: &OutboundMessage,
+    tx: &tokio::sync::mpsc::Sender<IncomingMessage>,
+    config: &XmppConfig,
+    reply_targets: &Arc<RwLock<LruCache<Uuid, String>>>,
+    omemo: &Arc<OmemoManager>,
+    muc_participants: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    encrypted_room_states: &Arc<RwLock<HashMap<String, EncryptedRoomState>>>,
+    pairing_store: &PairingStore,
+    outbound_tx: &mpsc::Sender<OutboundMessage>,
+    http_upload_service: &Arc<RwLock<Option<String>>>,
+) -> OutboundDisposition {
+    let to_jid = match msg.to.parse::<xmpp_parsers::jid::Jid>() {
+        Ok(to_jid) => to_jid,
+        Err(e) => {
+            tracing::warn!("XMPP outbound: invalid JID '{}': {e}", msg.to);
+            // Re-parsing can never succeed: park instead of retrying.
+            return OutboundDisposition::Undeliverable(format!("invalid JID '{}': {e}", msg.to));
+        }
+    };
+
+    let mut transient_errors: Vec<String> = Vec::new();
+    let mut any_sent = false;
+    let mut any_skipped = false;
+
+    // Upload any attachments via XEP-0363, then assemble the bodies to send:
+    // the text first (if present), followed by one out-of-band URL per file.
+    let mut sends: Vec<(String, bool)> = Vec::new();
+    if msg.attachments.is_empty() || !msg.body.is_empty() {
+        sends.push((msg.body.clone(), false));
+    }
+    for attachment in &msg.attachments {
+        match upload_file_via_http_slot(
+            client,
+            config,
+            http_upload_service,
+            attachment,
+            tx,
+            reply_targets,
+            omemo,
+            muc_participants,
+            encrypted_room_states,
+            pairing_store,
+            outbound_tx,
+        )
+        .await
+        {
+            Ok(get_url) => sends.push((get_url, true)),
+            Err(err) => {
+                tracing::warn!(
+                    file = %attachment.filename,
+                    error = %err,
+                    "XMPP XEP-0363 upload failed; skipping attachment"
+                );
+                transient_errors.push(format!(
+                    "attachment {} upload failed: {err}",
+                    attachment.filename
+                ));
+            }
+        }
+    }
+
+    for (body, is_file_url) in sends {
+        let mut stanza = if msg.groupchat {
+            if room_requires_encryption(config, bare_jid(&msg.to)) {
+                match build_outbound_groupchat_stanza(
+                    client,
+                    to_jid.clone(),
+                    body.clone(),
+                    tx,
+                    config,
+                    reply_targets,
+                    omemo,
+                    muc_participants,
+                    encrypted_room_states,
+                    pairing_store,
+                    outbound_tx,
+                )
+                .await
+                {
+                    Ok(Some(stanza)) => stanza,
+                    Ok(None) => {
+                        any_skipped = true;
+                        continue;
+                    }
+                    Err(err) => {
+                        omemo.record_error(err.to_string()).await;
+                        tracing::warn!("XMPP encrypted room send preparation failed: {err}");
+                        transient_errors
+                            .push(format!("encrypted room send preparation failed: {err}"));
+                        continue;
+                    }
+                }
+            } else {
+                xmpp_parsers::message::Message::groupchat(to_jid.clone())
+                    .with_body(xmpp_parsers::message::Lang::from(""), body.clone())
+            }
+        } else {
+            match build_outbound_dm_stanza(
+                client,
+                to_jid.clone(),
+                body.clone(),
+                msg.preferred_device_id,
+                tx,
+                config,
+                reply_targets,
+                omemo,
+                muc_participants,
+                encrypted_room_states,
+                pairing_store,
+                outbound_tx,
+            )
+            .await
+            {
+                Ok(Some(stanza)) => stanza,
+                Ok(None) => {
+                    any_skipped = true;
+                    continue;
+                }
+                Err(err) => {
+                    omemo.record_error(err.to_string()).await;
+                    tracing::warn!("XMPP OMEMO send preparation failed: {err}");
+                    transient_errors.push(format!("OMEMO send preparation failed: {err}"));
+                    continue;
+                }
+            }
+        };
+
+        // For file URLs sent in cleartext, attach an XEP-0066 OOB payload so
+        // clients render the file inline. Skip for OMEMO-encrypted stanzas:
+        // the URL lives in the encrypted body and a cleartext OOB child would
+        // leak it to the server.
+        if is_file_url && !stanza_is_encrypted(&stanza) {
+            stanza.payloads.push(
+                Oob {
+                    url: body.clone(),
+                    desc: None,
+                }
+                .into(),
+            );
+        }
+
+        match client
+            .send_stanza(tokio_xmpp::Stanza::Message(stanza))
+            .await
+        {
+            Ok(_) => any_sent = true,
+            Err(e) => {
+                tracing::warn!("XMPP send error: {e:?}");
+                transient_errors.push(format!("send failed: {e}"));
+            }
+        }
+    }
+
+    if !transient_errors.is_empty() {
+        return OutboundDisposition::Retry(transient_errors.join("; "));
+    }
+    if !any_sent && any_skipped {
+        return OutboundDisposition::Undeliverable(
+            "no deliverable stanza produced for message".to_string(),
+        );
+    }
+    OutboundDisposition::Delivered
+}
+
+/// Apply the send outcome to a claimed spool record (WI#277). Bookkeeping
+/// failures leave the record on disk (claimed or pending), so the message is
+/// retried on the next bind rather than lost — log and move on.
+fn resolve_spool_outcome(
+    spool: &OutboundSpool,
+    claimed: &SpooledMessage,
+    disposition: OutboundDisposition,
+) {
+    let result = match &disposition {
+        OutboundDisposition::Delivered => spool.complete(&claimed.key),
+        OutboundDisposition::Retry(error) => spool.fail_transient(claimed, error),
+        OutboundDisposition::Undeliverable(error) => spool.fail_permanent(claimed, error),
+    };
+    if let Err(err) = result {
+        tracing::warn!(key = %claimed.key, error = %err, "XMPP spool bookkeeping failed");
+    }
+}
+
+/// WI#277: after every (re)bind, replay persisted outbound messages that the
+/// previous process (or the pre-reconnect queue) acked but never sent. Runs
+/// after room joins and the OMEMO publish so encrypted sends see fresh state.
+/// Replayed sends bypass the hourly rate limiter: they were already accepted
+/// and counted when the original caller was acked.
+#[allow(clippy::too_many_arguments)]
+async fn drain_outbound_spool(
+    client: &mut tokio_xmpp::Client,
+    spool: &OutboundSpool,
+    tx: &tokio::sync::mpsc::Sender<IncomingMessage>,
+    config: &XmppConfig,
+    reply_targets: &Arc<RwLock<LruCache<Uuid, String>>>,
+    omemo: &Arc<OmemoManager>,
+    muc_participants: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    encrypted_room_states: &Arc<RwLock<HashMap<String, EncryptedRoomState>>>,
+    pairing_store: &PairingStore,
+    outbound_tx: &mpsc::Sender<OutboundMessage>,
+    http_upload_service: &Arc<RwLock<Option<String>>>,
+    outbound_pending: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let keys = match spool.list_pending() {
+        Ok(keys) => keys,
+        Err(err) => {
+            tracing::warn!(error = %err, "XMPP outbound spool scan failed");
+            return;
+        }
+    };
+    if keys.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = keys.len(),
+        "XMPP outbound spool: replaying persisted messages"
+    );
+    for key in keys {
+        let claimed = match spool.claim(&key) {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(key, error = %err, "XMPP spool claim during replay failed");
+                continue;
+            }
+        };
+        // Count replayed sends as pending so the graceful-shutdown drain
+        // (WI#270) waits for them too.
+        outbound_pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let pending_slot = OutboundPendingSlot(Arc::clone(outbound_pending));
+        let msg = claimed.message();
+        let disposition = process_outbound_message(
+            client,
+            &msg,
+            tx,
+            config,
+            reply_targets,
+            omemo,
+            muc_participants,
+            encrypted_room_states,
+            pairing_store,
+            outbound_tx,
+            http_upload_service,
+        )
+        .await;
+        drop(pending_slot);
+        resolve_spool_outcome(spool, &claimed, disposition);
     }
 }
 
@@ -4657,6 +4919,177 @@ mod tests {
         assert!(
             started.elapsed() < OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT,
             "drain must finish once the queue is consumed"
+        );
+    }
+
+    /// WI#277: every acked outbound message is persisted to the durable
+    /// spool BEFORE the enqueue returns, and the queued copy carries the
+    /// spool key so the client task can resolve the record after sending.
+    #[tokio::test]
+    async fn queue_outbound_persists_to_spool_before_ack() {
+        let channel = XmppChannel::new(test_config())
+            .await
+            .expect("channel initializes");
+        simulate_bound_session(&channel);
+
+        channel
+            .queue_outbound(
+                "alice@example.com".to_string(),
+                "durable".to_string(),
+                false,
+                None,
+            )
+            .await
+            .expect("enqueue succeeds with a bound session");
+
+        let spool_dir = channel.config.omemo_store_dir.join("spool");
+        let entries: Vec<_> = fs::read_dir(&spool_dir)
+            .expect("spool dir exists")
+            .collect::<Result<_, _>>()
+            .expect("spool dir readable");
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one spool record before any send happens"
+        );
+
+        let outbound = recv_outbound(&channel).await;
+        assert_eq!(outbound.body, "durable");
+        let key = outbound
+            .spool_key
+            .as_deref()
+            .expect("spooled message carries its record key");
+        let record = fs::read_to_string(spool_dir.join(format!("{key}.json")))
+            .expect("spool record readable");
+        assert!(record.contains("durable"));
+        assert!(record.contains("alice@example.com"));
+    }
+
+    /// WI#277 restart window: a message acked by one channel instance is
+    /// replayed from the spool by the NEXT instance sharing the same data
+    /// directory — the daemon/bridge restart case from WI#270 PR Digest #59.
+    #[tokio::test]
+    async fn spooled_message_survives_channel_restart() {
+        let config = test_config();
+        let spool_dir = config.omemo_store_dir.join("spool");
+        {
+            let first = XmppChannel::new(config.clone())
+                .await
+                .expect("first channel initializes");
+            simulate_bound_session(&first);
+            first
+                .queue_outbound(
+                    "alice@example.com".to_string(),
+                    "before restart".to_string(),
+                    false,
+                    None,
+                )
+                .await
+                .expect("first enqueue succeeds");
+            first
+                .queue_outbound(
+                    "room@conference.example.com".to_string(),
+                    "also before restart".to_string(),
+                    true,
+                    None,
+                )
+                .await
+                .expect("second enqueue succeeds");
+            // The process "exits" here without start(): the memory-only
+            // queue dies with the instance.
+        }
+
+        let second = XmppChannel::new(config)
+            .await
+            .expect("second channel initializes");
+        let keys = second.spool.list_pending().expect("list pending");
+        assert_eq!(
+            keys.len(),
+            2,
+            "both acked messages survive the restart in the spool"
+        );
+
+        // Replay: claim, send, complete — oldest first.
+        let first_claim = second
+            .spool
+            .claim(&keys[0])
+            .expect("claim first")
+            .expect("first record present");
+        let msg = first_claim.message();
+        assert_eq!(msg.body, "before restart");
+        assert!(!msg.groupchat);
+        second
+            .spool
+            .complete(&first_claim.key)
+            .expect("complete first");
+        let second_claim = second
+            .spool
+            .claim(&keys[1])
+            .expect("claim second")
+            .expect("second record present");
+        assert_eq!(second_claim.message().body, "also before restart");
+        assert!(second_claim.message().groupchat);
+        second
+            .spool
+            .complete(&second_claim.key)
+            .expect("complete second");
+        assert_eq!(second.spool.pending_count(), 0);
+        assert!(
+            fs::read_dir(&spool_dir)
+                .expect("spool dir readable")
+                .next()
+                .is_none(),
+            "spool dir must be empty once every record is sent"
+        );
+    }
+
+    /// WI#277: when the client task is gone, the enqueue fails AND the
+    /// just-persisted spool record is discarded — the caller was never
+    /// acked, so a replay must not resurrect the message after a restart.
+    #[tokio::test]
+    async fn failed_enqueue_discards_spool_record() {
+        let channel = XmppChannel::new(test_config())
+            .await
+            .expect("channel initializes");
+        simulate_bound_session(&channel);
+        // Simulate a dead client task: take and drop the receiver.
+        let rx = channel.outbound_rx.lock().await.take();
+        drop(rx);
+
+        let err = channel
+            .queue_outbound(
+                "alice@example.com".to_string(),
+                "lost task".to_string(),
+                false,
+                None,
+            )
+            .await
+            .expect_err("enqueue must fail when the client task is gone");
+        assert!(
+            err.to_string().contains("outbound channel closed"),
+            "got: {err}"
+        );
+        assert_eq!(
+            channel.spool.pending_count(),
+            0,
+            "no ack was issued, so nothing may remain spooled"
+        );
+    }
+
+    /// WI#277: a channel that cannot persist outbound messages must fail to
+    /// start rather than ack sends it might lose across a restart.
+    #[tokio::test]
+    async fn channel_startup_fails_when_spool_dir_unusable() {
+        let config = test_config();
+        // A regular file where the spool directory must be created.
+        fs::write(config.omemo_store_dir.join("spool"), b"occupied").expect("write blocker file");
+        let err = match XmppChannel::new(config).await {
+            Ok(_) => panic!("startup must fail when the spool directory cannot be created"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("spool"),
+            "error must name the spool, got: {err}"
         );
     }
 
