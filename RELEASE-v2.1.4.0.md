@@ -2,7 +2,7 @@
 
 ## Codename: UNKNOWN (draft)
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01)
+**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repass 2026-10-01)
 
 ## Overview
 
@@ -47,7 +47,15 @@ WI#268 prompt-overlay audit runbook, an opencode2 worker bump to v2.0.20, and
 a pairing allowlist fix so approving a new sender no longer erases the
 existing allowlist. New tenants now render `ORCHESTRATOR_SELF_MODIFY=true`
 (stored orchestrator and prompt-overlay updates, WI#282), with the operator
-opt-out preserved across re-renders.
+opt-out preserved across re-renders. The WI#184 secrets-store pairing
+redesign advanced to design revision 3 (both !1294 review P2s answered) with
+the review-required legacy-matching and concurrency regressions landed ahead
+of the substrate change.
+
+The full docs set was repassed for the cycle: all 32 active guides under
+`docs/guides/` and all 10 active architecture docs re-verified against source
+and stamped, and the cycle's open work items were reconciled in a tracker
+audit (23 open items, dispositions verified against the tree).
 
 The release identifier is `2.1.4.0`; LunarWing-owned Rust crates and channel
 packages use `2.1.4`. Rust 2024 and MSRV `1.96.1` are unchanged. There are
@@ -170,6 +178,34 @@ previous compatibility baseline.
   (WI#268 diagnostics tier), TENANT-CONFIGURATION
   (`LUNARWING_TOOL_ESTIMATES`), TESTING_GUIDE (four v2.1.4.0 manual tiers),
   releases/docs indexes, and contributor onboarding freeze status
+- **Pairing secrets-store design revision 3 (item 11, WI#184).** Both P2
+  findings from the rejected !1294 review are answered in
+  [PAIRING_SECRETS_STORE_DM_AUTH.md](docs/proposals/PAIRING_SECRETS_STORE_DM_AUTH.md):
+  a source-tagged matching contract (strict byte-exact canonical-principal
+  lookup, plus a legacy matcher applying today's exact comparison only to
+  `kind:"legacy"` grants — no cross-kind broadening) and keyed
+  HMAC-SHA256 grant names domain-separated from the per-secret encryption
+  subkey, so database-read-only dictionary attacks against candidate IRC
+  principals/JIDs no longer terminate without the master key. The
+  review-required regressions are landed executable tests ahead of the
+  substrate change: legacy `@nick`/username and trimmed-exact-id matching
+  (`ic/src/pairing/store.rs`), concurrent-grant preservation (8 concurrent
+  approvers), and the wasm `pairing_is_allowed` host-path regression
+  (`ic/src/channels/wasm/wrapper.rs`)
+- **Open work items audit (item 14).** All 23 open tracker items reconciled
+  against the tree in
+  [v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md](docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md):
+  5 genuinely-open 2.1.4.0 items (#281, #280, #270, #269, #271), #184 with
+  the !1294 rejection recorded, 15 deferred by label, and closeable evidence
+  identified for #198/#199. Every code-facing disposition verified against
+  source at `03f5650fe`, not taken from tracker bodies
+- **Guides and architecture docs repass (items 16/17).** All 32 active
+  guides under `docs/guides/` and all 10 active docs under
+  `docs/architecture/` re-verified against current source and stamped for
+  v2.1.4.0, recording the cycle's version moves (registry multica 0.1.13,
+  darkirc 0.1.10, weechat 0.2.11, xmpp 0.1.16; WASM channel crates at
+  workspace `2.1.4`) and confirming V27 remains the latest migration with
+  the migration chain's `ironclaw-agent-v1` alias removed
 
 ## Compatibility
 
