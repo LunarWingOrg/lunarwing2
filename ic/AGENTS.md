@@ -4,18 +4,14 @@
 
 - `AGENTS.md` is the quick-start contract for coding agents. It is not the full architecture spec.
 - Read the relevant subsystem spec before changing a complex area. When a repo spec exists, treat it as authoritative.
-Start with these deeper docs as needed:
-- `src/agent/CLAUDE.md`
-- `src/channels/web/CLAUDE.md`
+Start with these deeper docs as needed (they can be outdated — verify anything you read against the tree):
 - `src/db/CLAUDE.md`
-- `src/llm/CLAUDE.md`
 - `src/setup/README.md`
 - `src/tools/README.md`
 - `src/workspace/README.md`
 - `src/NETWORK_SECURITY.md`
-- `tests/e2e/CLAUDE.md`
-- `crates/lunarwing_engine/CLAUDE.md`
-- In this repo, `ic/` contains the core daemon; however, the product name is LunarWing.
+No specs exist yet for the agent, web-gateway, llm, e2e, or engine subsystems — read the code instead.
+- This directory contains the core daemon; however, the product name is LunarWing.
 
 ## Architecture Mental Model
 
@@ -45,9 +41,8 @@ Start with these deeper docs as needed:
 - Webhook ingress for tools: `src/webhooks/`
 - Observability: `src/observability/`
 - Extension registry catalog: `src/registry/`
-- OpenClaw port staging work: `ic/openclaw-ports/`. For OpenClaw port tasks, keep edits inside `ic/openclaw-ports/` unless the user explicitly approves touching core LunarWing files.
-- Using /tmp as a place to store logs or other small files is totally acceptabl
-e. However, in general, storing massive files (over 1GB) to /tmp should not happen. You shouldn't be building entire rust binaries to /tmp - it's really stupid.
+- OpenClaw port staging work: `openclaw-ports/`. For OpenClaw port tasks, keep edits inside `openclaw-ports/` unless the user explicitly approves touching core LunarWing files.
+- Using /tmp as a place to store logs or other small files is totally acceptable. However, in general, storing massive files (over 1GB) to /tmp should not happen. You shouldn't be building entire rust binaries to /tmp - it's really stupid.
 
 ## Ownership and Composition Rules
 
@@ -71,8 +66,8 @@ e. However, in general, storing massive files (over 1GB) to /tmp should not happ
 
 ## Dependency Vendoring
 
-- crates-io is source-replaced by the committed directory `vendor/` (see `.cargo/config.toml`): every cargo command under `ic/` resolves exclusively from `vendor/`, so check/test/build/clippy need no crates.io access.
-- After any dependency add/update, run `scripts/refresh-vendor.sh` (`cargo vendor` over the ic workspace + satellite lockfile roots under `ic/`, asserts the vendored set still matches the committed Cargo.lock pins without re-resolving, then `cargo deny check advisories`), review the `vendor/` diff, and commit it with the manifest/lockfile change.
+- crates-io is source-replaced by the committed directory `vendor/` (see `.cargo/config.toml`): every cargo command in this directory resolves exclusively from `vendor/`, so check/test/build/clippy need no crates.io access.
+- After any dependency add/update, run `scripts/refresh-vendor.sh` (`cargo vendor` over the ic workspace + satellite lockfile roots in this directory, asserts the vendored set still matches the committed Cargo.lock pins without re-resolving, then `cargo deny check advisories`), review the `vendor/` diff, and commit it with the manifest/lockfile change.
 - Never hand-edit or delete entries under `vendor/`. `vendor/libsignal-protocol{,-sys}` are pre-vendored **path** dependencies (`Cargo.toml`) — always vendor with `--no-delete` so they survive.
 
 ## Database, Setup, and Config Rules
@@ -103,14 +98,14 @@ e. However, in general, storing massive files (over 1GB) to /tmp should not happ
 ## Local XMPP and Service Operations
 
 - Treat systemd unit environment values as secret-bearing. Do not paste passwords, bearer tokens, or webhook secrets into user-facing output; summarize or redact them.
-- **Both systemd and OpenRC must be supported.** systemd is the primary target and can be fully verified on the dev VM. OpenRC code must still be correct and maintained — the dev VM cannot run OpenRC tests, but OpenRC-specific logic should be kept in the same service-management abstraction rather than duplicated.
+- **Both systemd and OpenRC must be supported.** launchd is a distant third. systemd is the primary target and can be fully verified on the dev VM. OpenRC code must still be correct and maintained — the dev VM cannot run OpenRC tests, but OpenRC-specific logic should be kept in the same service-management abstraction rather than duplicated.
 - `xmpp-bridge.service` is coupled to `lunarwing.service` with `PartOf=lunarwing.service`, so LunarWing restarts can also restart the bridge. Do not assume the bridge caused a LunarWing stop just because both units restarted together.
-- For install-style harness tests on Linux, prefer the rendered service units over leaving `scripts/lunarwing-xmpp-test-env.sh up` attached to a transient shell. The durable path is `render-systemd` plus `systemctl --user` on systemd hosts; OpenRC validation should use `lunarwing service install` or the committed OpenRC templates.
+- For install-style harness tests, prefer the rendered service units over leaving `scripts/lunarwing-xmpp-test-env.sh up` attached to a transient shell. The durable path is `render-systemd` plus `systemctl --user` on systemd hosts; `render-launchd` plus `launchctl` on macOS; OpenRC validation should use `lunarwing service install` or the committed OpenRC templates.
 - The harness and service path intentionally seed `ALLOW_PRIVATE_IPS=1`, `DATABASE_SSLMODE=disable`, and `PGSSLMODE=disable` for private-network Postgres/TensorZero test setups. Preserve those defaults unless the task explicitly changes the network or SSL assumptions.
 - Use `scripts/xmpp-rate-limit.sh` for live XMPP outbound rate-limit changes. It requires `XMPP_BRIDGE_TOKEN`; `status`, `set <n>`, `off`, and `reset` are the main commands.
 - Use `scripts/xmpp-configure.sh` for bridge room/configuration checks and configure calls when working with the existing XMPP bridge API.
-- The local service watchdog assets are `scripts/lunarwing-watchdog.sh`, `scripts/lunarwing-watchdog-openrc.sh`, `scripts/install-lunarwing-watchdog.sh`, `systemd/lunarwing-watchdog.service`, `systemd/lunarwing-watchdog.timer`, `systemd/lunarwing-watchdog.confd`, and `systemd/lunarwing-watchdog.cron.hourly`. The installer auto-detects `systemd` vs `OpenRC`; on OpenRC it also auto-selects the scheduler. `auto` prefers an existing `cronie`/`crond`/`dcron` hourly setup and only falls back to a managed `fcron` entry when that avoids interfering.
-- The healthpoint metrics exporter assets are `../ic-infrastructure-health-check/health-metrics-exporter.sh` (Prometheus textfile export from `cron-wrapper.sh`), the optional loopback listener crate `crates/lunarwing_health_metrics`, its installer `scripts/install-health-metrics-listener.sh` + units `systemd/lunarwing-health-metrics.*`, and the ports-registry v16 `health_metrics` slot (`scripts/migrate-ports-v16.sh`). Design: `../docs/proposals/HEALTHPOINT_METRICS_EXPORTER.md`.
+- The local service watchdog assets are `scripts/lunarwing-watchdog.sh` (systemd), `scripts/lunarwing-watchdog-openrc.sh` (OpenRC), `scripts/lunarwing-watchdog-launchd.sh` (macOS), `scripts/install-lunarwing-watchdog.sh`, `systemd/lunarwing-watchdog.service`, `systemd/lunarwing-watchdog.timer`, `systemd/lunarwing-watchdog.confd`, `systemd/lunarwing-watchdog.cron.hourly`, and `systemd/com.lunarwing.watchdog.plist` (launchd). The installer auto-detects `systemd` vs `OpenRC` vs `launchd`; on OpenRC it also auto-selects the scheduler. `auto` prefers an existing `cronie`/`crond`/`dcron` hourly setup and only falls back to a managed `fcron` entry when that avoids interfering.
+- The healthpoint metrics exporter assets are `../ic-infrastructure-health-check/health-metrics-exporter.sh` (Prometheus textfile export from `../ic-infrastructure-health-check/cron-wrapper.sh`), the optional loopback listener crate `crates/lunarwing_health_metrics`, its installer `scripts/install-health-metrics-listener.sh` + units `systemd/lunarwing-health-metrics.*`, and the ports-registry v16 `health_metrics` slot (`scripts/migrate-ports-v16.sh`). Design: `../docs/proposals/HEALTHPOINT_METRICS_EXPORTER.md`.
 - Prefer read-only diagnostics first for **single-node / harness** service issues: `systemctl --user status` (or the matching OpenRC path), `journalctl --user`, and bridge status endpoints. For **multi-tenant** hosts always use `scripts/lunarwing-mt-admin.sh status|…` — never bare system-bus `systemctl` against tenant units (see Multi-Tenant Ops below). Only restart services after identifying unit state or when the user explicitly asks.
 - If harness `verify` only fails the TensorZero proxy check, inspect the upstream `TENSORZERO_URL` before treating the local service install as broken. The local proxy can be bound and healthy while the upstream `/openai/v1/models` probe still returns `500`.
 
@@ -121,7 +116,7 @@ This is **not** a lowest-common-denominator product. Multi-tenant LunarWing runs
 ### Forbidden
 
 - Bare `systemctl is-active` / `systemctl status` / `systemctl restart` against **tenant** units from wrappers, verify helpers, or one-off scripts (system bus only — false-fails healthy tenants).
-- Bare `rc-service` probes that reimplement what `lunarwing-mt-admin.sh` already does.
+- Bare `rc-service` probes that reimplement what `scripts/lunarwing-mt-admin.sh` already does.
 - Assuming tenant units live on the **system** bus. They do not. On systemd they are **`systemctl --user`** under the tenant (`XDG_RUNTIME_DIR=/run/user/<uid>`, linger). On Gentoo they are OpenRC services.
 - Hardcoding single-node host ports for multi-tenant health probes — especially LunarVision **`http://127.0.0.1:8088`**. On MT hosts each tenant publishes OCR health on registry **`vision_health`** (e.g. lunarium → `20006`), not 8088.
 - Setting `HEALTH_LUNARVISION_URL=http://127.0.0.1:8088` in `/etc/lunarwing/health.env` on multi-tenant fleets (forces false-critical overall health while tenant sidecars are fine).
@@ -131,9 +126,9 @@ This is **not** a lowest-common-denominator product. Multi-tenant LunarWing runs
 
 - Tenant lifecycle / status / operator health → **`scripts/lunarwing-mt-admin.sh`** (`status <tenant>`, start/stop/build, doctor, health pipeline install). Override path with `LUNARWING_MT_ADMIN` if needed. Since v2.0.8.0 the script is a thin composition root that sources `scripts/mt-admin-lib/NN-*.sh` (numbered topical modules: common, detect, containers, ports-registry, tenant-lifecycle, tenant-build, env-generation, units-systemd, units-openrc, worker-config, owner-scope, postgres, health-pipeline, cgroups-openrc, knowledge-sync); edit the owning module, keep the CLI surface and entrypoint stable, and keep `scripts/check-mt-admin.sh` (shellcheck over root + modules) green.
 - Host-global pipeline lives under `../ic-infrastructure-health-check/` (installed to `/usr/local/lib/lunarwing-health/` via mt-admin). It must stay **init-agnostic** and **ports-registry-aware**.
-- `health-lunarvision.sh`: leave **`HEALTH_LUNARVISION_URL` unset** on MT hosts so it auto-discovers every tenant's `vision_health` (legacy `reserved_6`, then `vision_service`) from `SELF_HEAL_TENANTS_FILE` / `/etc/lunarwing/ports.json`. Explicit URL is only for intentional single-target override; empty registry falls back to the dedicated single-node operational listener on `8089`.
+- `../ic-infrastructure-health-check/health-lunarvision.sh`: leave **`HEALTH_LUNARVISION_URL` unset** on MT hosts so it auto-discovers every tenant's `vision_health` (legacy `reserved_6`, then `vision_service`) from `SELF_HEAL_TENANTS_FILE` / `/etc/lunarwing/ports.json`. Explicit URL is only for intentional single-target override; empty registry falls back to the dedicated single-node operational listener on `8089`.
 - LunarVision tenant lifecycle belongs in mt-admin: publish distinct API/health ports, recreate containers when env/image/port contracts change, require `/health` before reporting success, use systemd user Quadlet (or its managed older-Podman fallback), and pair the OpenRC health unit with a `-sup` crash supervisor.
-- Wrappers (`lunarwing_mt_onboard*`) are **thin drivers** of mt-admin — no parallel init or port logic.
+- Wrappers (`../lunarwing_mt_onboard*`) are **thin drivers** of mt-admin — no parallel init or port logic.
 - Parse both init status shapes when reading mt-admin output (`….service: active` and OpenRC `…: started`), or use exit codes / structured contracts.
 - **Both systemd and OpenRC are first-class.** Never treat Gentoo/OpenRC as an edge case.
 
