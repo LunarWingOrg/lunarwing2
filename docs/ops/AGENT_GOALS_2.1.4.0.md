@@ -89,7 +89,7 @@
 24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/271
 25. [ ] come up with ideas for names for 2.1.4.0 - write in a document in docs/ops
 26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/277
-27. [x] (S) (HUMAN) Findings from sb and kumo
+27. [ ] repass of item 13 to update draft of release notes
 28. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
 29. [ ] repass of item 2. upgrade opencode2 to new version 2.0.21
 
