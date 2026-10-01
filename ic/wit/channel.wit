@@ -389,7 +389,8 @@ interface channel {
     /// - response: The agent's response
     ///
     /// Returns:
-    /// - Ok: Response delivered successfully
+    /// - Ok: Response accepted for delivery (queued by the channel); this is
+    ///   not a delivery receipt (WI#270)
     /// - Err(string): Delivery failure message
     on-respond: func(response: agent-response) -> result<_, string>;
 
@@ -412,7 +413,8 @@ interface channel {
     /// - response: The message content and attachments to send
     ///
     /// Returns:
-    /// - Ok: Message delivered successfully
+    /// - Ok: Message accepted for delivery (queued by the channel); this is
+    ///   not a delivery receipt (WI#270)
     /// - Err(string): Delivery failure message
     on-broadcast: func(user-id: string, response: agent-response) -> result<_, string>;
 
