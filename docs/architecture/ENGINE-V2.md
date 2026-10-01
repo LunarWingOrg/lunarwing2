@@ -2,7 +2,7 @@
 
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
-**Revalidated against source 2026-09-28 (v2.1.3.0).** Module map, gate types,
+**Revalidated against source 2026-10-01 (v2.1.4.0).** Module map, gate types,
 mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
 re-checked against the current tree, including the landed WI#227 sealed step
 records; updates for 2.1.1.0 include the
@@ -19,7 +19,14 @@ Updates for 2.1.3.0 include the WI#227 sealed step records (interpreter step
 output carries the `SealedStepRecord` role through the inference transcript
 only; `Thread::add_message` reroutes it out of the user-visible transcript,
 the trace analyzer keeps `code_error` detection over sealed records, and all
-wire surfaces use `MessageRole::wire_name()`).
+wire surfaces use `MessageRole::wire_name()`). Updates for 2.1.4.0 include
+the WI#243 recurrence fix (store-level global mission listings enumerate the
+missions map directly so missions with a missing/unparseable `project.json`
+stay bootstrapped, dispatched, and rollover-swept), the WI#244 bounded
+mid-stream recovery (documented under Failure Recovery), the WI#265
+`routine_history` Engine V2 mission-name fallback, the WI#268 prompt-overlay
+audit cross-link, and the WI#282 new-tenant
+`ORCHESTRATOR_SELF_MODIFY=true` default.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
