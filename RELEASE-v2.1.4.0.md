@@ -468,6 +468,39 @@ tenants are not rewritten merely by upgrading. The WI#268 audit runbook
 complements this with the inspection procedure for tenants that keep the
 gate off.
 
+### Outbound Message Delivery Honesty (WI#270)
+
+The `message` tool's success ack was an enqueue ack dressed as a delivery
+receipt: channels accept messages into in-memory outbound queues, and the
+XMPP queue is dropped on restart. That contract gap is what let scheduled
+mission PR Digest #59 record "Delivered via XMPP … Goal achieved" in memory
+while the queued stanza was silently lost in a rebuild window. Three
+hardening changes landed, following the fix ranking accepted on the work
+item:
+
+- The tool ack is now honest — `Queued message to <channel>:<target>` —
+  and the tool description warns that success means acceptance for
+  delivery, never "delivered".
+- The XMPP channel refuses proactive enqueue while no session is bound
+  (`XMPP is not connected (no bound session); message not queued`) instead
+  of accepting into a doomed queue, so the failure surfaces to the caller.
+- `shutdown()` gives the client task a bounded 2s window to drain already
+  acked stanzas (pending-counter driven, mirroring the coalesce flush) and
+  WARNs with the pending depth when it cannot, instead of dropping
+  silently.
+
+The WIT channel interface text is intentionally unchanged — its `Ok`
+semantics are spelled out in the tool description and the new architecture
+doc instead of a comment-only WIT edit that would force a package version
+bump and registry-wide churn. Hard-exit loss remains
+inherently possible with a memory-only queue; the durable outbound spool +
+mission-run ledger stays tracked as the long-term fix (WI#270 fix #4,
+platform halves in #277/#276). New architecture doc:
+`docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md` also records the
+mission-spec discipline (daily log → send → memory records acceptance;
+update the run baseline each time). The PR Digest mission spec itself is
+tenant workspace data, outside this repo.
+
 ### Version Bumps and Supply Chain (item 1)
 
 All eleven LunarWing-owned release packages moved `2.1.3` → `2.1.4`: the
