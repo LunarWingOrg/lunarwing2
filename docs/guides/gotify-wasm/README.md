@@ -70,7 +70,7 @@ If `config/gotify.json` is absent or unparseable, the tool falls back to the com
 
 ### Provisioning Support
 
-For a single-instance deployment, use the registry/setup flow above and write the reviewed workspace JSON and capability host allowlist explicitly. The old `scripts/setup-instance.sh` path is deprecated in favor of `lunarwing onboard --quick` and the current extension lifecycle.
+For a single-instance deployment, use the registry/setup flow above and write the reviewed workspace JSON and capability host allowlist explicitly. The old `ic/scripts/setup-instance.sh` path is deprecated in favor of `lunarwing onboard --quick` and the current extension lifecycle.
 
 For a multi-tenant deployment, MT admin can configure Gotify during provisioning:
 ```bash
