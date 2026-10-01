@@ -73,7 +73,7 @@
 25. [ ] come up with ideas for names for 2.1.4.0 - write in a document in docs/ops
 26. [x] (S) (HUMAN) start thinking about scope of 2.1.6.0 next real feature set
 27. [x] (S) (HUMAN) Findings from sb and kumo
-28. [ ] Repo housecleaning - get rid of old stuff in docs/ops and move it to history
+28. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
 29. [ ] repass of item 2. upgrade opencode2 to new version 2.0.21
 
 ---
