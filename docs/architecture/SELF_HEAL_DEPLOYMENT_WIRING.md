@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-09-28, v2.1.3.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics)
+**Date:** 2026-06-13 (revalidated 2026-09-28, v2.1.3.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics; revalidated 2026-10-01, v2.1.4.0 — pipeline wiring, scheduling ownership, and role mappings unchanged this cycle)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 

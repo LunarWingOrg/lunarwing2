@@ -2,7 +2,7 @@
 
 A WASM tool for LunarWing that sends push notifications to a self-hosted Gotify server.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0).** Registry manifest,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0) and 2026-10-01 (v2.1.4.0).** Registry manifest,
 capability sidecar, compiled-in defaults (`https://gotify.darkc.sobe.world`,
 title `LunarWing`), and the `configure-gotify`/`--gotify-url`/`--gotify-title`
 mt-admin paths were re-checked against the current tree; no changes were needed.
@@ -70,7 +70,7 @@ If `config/gotify.json` is absent or unparseable, the tool falls back to the com
 
 ### Provisioning Support
 
-For a single-instance deployment, use the registry/setup flow above and write the reviewed workspace JSON and capability host allowlist explicitly. The old `scripts/setup-instance.sh` path is deprecated in favor of `lunarwing onboard --quick` and the current extension lifecycle.
+For a single-instance deployment, use the registry/setup flow above and write the reviewed workspace JSON and capability host allowlist explicitly. The old `ic/scripts/setup-instance.sh` path is deprecated in favor of `lunarwing onboard --quick` and the current extension lifecycle.
 
 For a multi-tenant deployment, MT admin can configure Gotify during provisioning:
 ```bash

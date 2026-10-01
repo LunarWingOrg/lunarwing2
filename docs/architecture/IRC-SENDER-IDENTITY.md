@@ -1,6 +1,6 @@
 # IRC Sender Identity
 
-**Revalidated against source 2026-09-28 (v2.1.3.0).** Principal formats
+**Revalidated against source 2026-10-01 (v2.1.4.0).** Principal formats
 (`darkirc:nick:<case-folded-nick>`, `account:<network>:…` /
 `nick:<network>:…`, `weechat:dm:v2:<principal>`,
 `weechat:group:<network>:<target>`), the owner-actor settings, and the
@@ -10,6 +10,9 @@ still hold. The 2.1.2.0 release only bumped the channel crate/registry
 versions (darkirc 0.1.8, weechat 0.2.9); no principal-format or pairing
 logic changed. The 2.1.3.0 release again only bumped the channel
 crate/registry versions (darkirc 0.1.9, weechat 0.2.10); no
+principal-format or pairing logic changed. The 2.1.4.0 release again only
+bumped the channel crate/registry versions (darkirc 0.1.10, weechat
+0.2.11; channel crates now at workspace version 2.1.4); no
 principal-format or pairing logic changed.
 
 LunarWing treats IRC sender identity as a routing and continuity hint, not as
