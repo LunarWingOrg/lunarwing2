@@ -569,7 +569,7 @@ async fn assert_strict_stream_failure(script: Vec<SseFrame>) {
     let env = EngineV2EnvGuard::enable(Some("gateway"));
     lunarwing::bridge::reset_engine_state().await;
 
-    let fixture = TensorZeroFixture::start(vec![script]).await;
+    let fixture = TensorZeroFixture::start(vec![script.clone(), script]).await;
     let rig = TestRigBuilder::new()
         .with_channel_name("gateway")
         .with_llm(fixture.provider())
@@ -603,12 +603,18 @@ async fn assert_strict_stream_failure(script: Vec<SseFrame>) {
     );
     assert_eq!(
         captured_stream_chunks(&rig),
-        vec!["```repl\nFINAL('partial".to_string()]
+        vec!["```repl\nFINAL('partial".to_string(); 2]
     );
-    assert_eq!(fixture.request_count(), 1);
+    // Both the original stream and its bounded recovery fail before Done.
+    assert_eq!(fixture.request_count(), 2);
     let requests = fixture.captured_requests();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_stream_request(&requests[0]);
+    assert_stream_request(&requests[1]);
+    let recovery_messages = requests[1]["messages"].to_string();
+    assert!(recovery_messages.contains("provider temporarily failed"));
+    assert!(!recovery_messages.contains("FINAL('partial"));
+    assert!(!recovery_messages.contains("TensorZero provider failed mid-stream"));
     assert_eq!(
         rig.llm_call_count(),
         0,
@@ -640,4 +646,123 @@ async fn midstream_json_error_does_not_commit_a_partial_response() {
 #[tokio::test]
 async fn premature_eof_before_terminal_event_does_not_synthesize_done() {
     assert_strict_stream_failure(premature_eof_script()).await;
+}
+
+#[tokio::test]
+async fn midstream_transport_failures_recover_with_one_fresh_request() {
+    // Cover both a provider error frame and an HTTP body interrupted mid-stream.
+    for script in [midstream_error_script(), premature_eof_script()] {
+        assert_midstream_recovery(script).await;
+    }
+}
+
+async fn assert_midstream_recovery(script: Vec<SseFrame>) {
+    let _lock = ENGINE_V2_ENV_LOCK.lock().await;
+    let env = EngineV2EnvGuard::enable(Some("gateway"));
+    lunarwing::bridge::reset_engine_state().await;
+
+    let fixture =
+        TensorZeroFixture::start(vec![script, terminal_script("decode-recovered", 12, 6)]).await;
+    let rig = TestRigBuilder::new()
+        .with_channel_name("gateway")
+        .with_llm(fixture.provider())
+        .build()
+        .await;
+    let thread_id = Uuid::new_v4();
+    register_gateway_thread(&rig, thread_id).await;
+    rig.send_incoming(gateway_message(thread_id, "fail mid-stream then recover"))
+        .await;
+
+    let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].content, "decode-recovered");
+    // Deltas remain provisional live work; recovery does not emit a stream reset.
+    assert_eq!(
+        captured_stream_chunks(&rig),
+        vec![
+            "```repl\nFINAL('partial",
+            "```repl\nFINAL('decode-recovered')\n```"
+        ]
+    );
+    assert_eq!(fixture.request_count(), 2);
+    let requests = fixture.captured_requests();
+    assert_eq!(requests.len(), 2);
+    assert_stream_request(&requests[0]);
+    assert_stream_request(&requests[1]);
+    let recovery_messages = requests[1]["messages"].to_string();
+    assert!(recovery_messages.contains("provider temporarily failed"));
+    assert!(!recovery_messages.contains("TensorZero provider failed mid-stream"));
+    assert!(!recovery_messages.contains("FINAL('partial"));
+    assert_eq!(
+        assistant_messages(&rig, thread_id).await,
+        vec!["decode-recovered"]
+    );
+    // Only the successful terminal usage is recorded.
+    assert_eq!(rig.llm_call_count(), 1);
+    assert_eq!(rig.total_input_tokens(), 12);
+    assert_eq!(rig.total_output_tokens(), 6);
+
+    rig.shutdown_and_wait().await;
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn aborted_tool_draft_is_not_executed_during_recovery() {
+    let _lock = ENGINE_V2_ENV_LOCK.lock().await;
+    let env = EngineV2EnvGuard::enable(Some("gateway"));
+    lunarwing::bridge::reset_engine_state().await;
+
+    let fixture = TensorZeroFixture::start(vec![
+        vec![
+            text_delta("aborted tool draft", None),
+            tool_delta(
+                Some("aborted-call"),
+                Some(TOOL_NAME),
+                Some("{\"value\":\"aborted\"}"),
+                None,
+            ),
+            SseFrame::Abort,
+        ],
+        fragmented_tool_script(),
+        terminal_script("tool-recovered", 13, 4),
+    ])
+    .await;
+    let executions = Arc::new(AtomicUsize::new(0));
+    let rig = TestRigBuilder::new()
+        .with_channel_name("gateway")
+        .with_llm(fixture.provider())
+        .with_extra_tools(vec![Arc::new(EchoTool {
+            executions: executions.clone(),
+        })])
+        .build()
+        .await;
+    let thread_id = Uuid::new_v4();
+    register_gateway_thread(&rig, thread_id).await;
+    rig.send_incoming(gateway_message(thread_id, "recover the interrupted echo"))
+        .await;
+
+    let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].content, "tool-recovered");
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.request_count(), 3);
+    let requests = fixture.captured_requests();
+    let recovery_messages = requests[1]["messages"].to_string();
+    assert!(recovery_messages.contains("provider temporarily failed"));
+    assert!(!recovery_messages.contains("aborted-call"));
+    assert!(!recovery_messages.contains("aborted tool draft"));
+    let results = rig.tool_results();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1.contains("fragmented"));
+    assert!(!results[0].1.contains("aborted"));
+    assert_eq!(rig.llm_call_count(), 2);
+    assert_eq!(rig.total_input_tokens(), 24);
+    assert_eq!(rig.total_output_tokens(), 9);
+    assert_eq!(
+        assistant_messages(&rig, thread_id).await,
+        vec!["tool-recovered"]
+    );
+
+    rig.shutdown_and_wait().await;
+    env.cleanup().await;
 }

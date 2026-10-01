@@ -359,10 +359,23 @@ breaking in the host LLM stack. When those paths return a final provider error,
 the bridge maps it to `ModelFailureKind`. The Python orchestrator receives only
 that safe class and fixed recovery text, never provider-supplied diagnostics.
 
-- Recoverable model failures get one extra model request. Context-overflow
+- By default, recoverable model failures get one extra model request. Context-overflow
   recovery first replaces protocol history with a bounded plain-text view of
   the original goal and recent context. A second failure becomes a typed
   `ThreadFailureKind::Model` outcome with actionable user text.
+- Mid-stream transport failures (`transient`, `unavailable`) remain recoverable
+  after partial text has been streamed (WI#244). The failed response never
+  reaches assistant-history or action commitment, so retrying cannot execute
+  its partial code or tool calls. Failed streams do not synthesize `Done` or
+  commit usage. The existing per-step and lifetime recovery limits still apply,
+  as do the per-kind caps (at most two transient retries, one unavailable retry).
+  Rate limits remain provider-owned; the engine does not add a retry loop for
+  them.
+- Streamed deltas are provisional **Live work** in the web UI. Deltas from the
+  failed and recovered attempts can accumulate there until terminal/final
+  reconciliation; only the successful final answer is committed as a response.
+  Model recovery does not emit a `stream_gap` or reset event. `stream_gap` is
+  the separate subscriber-lag recovery path.
 - Authentication and rejected-request failures skip model retry because an
   unchanged request cannot repair credentials or compatibility. Their terminal
   text names the operator action required.
