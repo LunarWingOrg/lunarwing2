@@ -204,6 +204,18 @@ previous compatibility baseline.
   a bounded 2s drain window, WARNing with the pending depth when the queue
   cannot drain. Documented in
   [OUTBOUND-DELIVERY-SEMANTICS.md](docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md)
+- **Durable XMPP outbound spool (WI#277).** The channel half of WI#270's
+  long-term fix #4: every `queue_outbound*` message is persisted to
+  `<omemo_store_dir>/spool/` (atomic tmp-write + fsync + rename, dir 0700 /
+  files 0600) *before* the mpsc handoff is acked — a spool write failure
+  refuses the ack instead of queueing a losable message. The client task
+  claims records by atomic rename, deletes them on success, and replays all
+  pending records on every `Event::Online` bind, so a restart/crash between
+  ack and send no longer loses the message. Post-enqueue failures retry
+  with exponential backoff (30s base, 1h cap) and park as
+  `<key>.failed.json` after 24 attempts. Live-verified on test tenant
+  derpy: 19/19 messages delivered exactly once, including a spooled record
+  surviving `systemctl stop` and replaying on the next boot
 - **Orchestrator self-modification for new tenants (WI#282).** add-tenant
   now renders `ORCHESTRATOR_SELF_MODIFY=true` so new tenants adopt stored
   orchestrator and prompt-overlay updates; an explicit operator opt-out is
@@ -274,6 +286,7 @@ previous compatibility baseline.
 | mt-admin verbs | New: `psql <tenant>`, `daemon-pid <tenant>` (read-only diagnostics); all existing verbs unchanged |
 | New tenant env defaults | `ORCHESTRATOR_SELF_MODIFY=true` rendered at add-tenant (WI#282); explicit operator values preserved on re-render; existing tenants untouched |
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
+| XMPP outbound delivery | `message` tool ack reports `Queued …` (acceptance, not delivery); enqueue refused while no session is bound; bounded 2s shutdown drain; durable spool persists every outbound message before ack with replay on bind, backoff retry, and `.failed.json` parking after 24 attempts — at-least-once semantics (post-send crash can duplicate at whole-message granularity) |
 | Pairing store (WI#184) | Design revision 3 only — no substrate change this release; landed tests pin current legacy matching and concurrent-grant semantics ahead of the secrets-store migration |
 | CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only; the cargo-deny job runs unvendored from the repo root via `.gitlab/scripts/cargo-deny-check.sh` and fails on any `index-failure` diagnostic |
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
@@ -589,14 +602,52 @@ item:
 The WIT channel interface text is intentionally unchanged — its `Ok`
 semantics are spelled out in the tool description and the new architecture
 doc instead of a comment-only WIT edit that would force a package version
-bump and registry-wide churn. Hard-exit loss remains
-inherently possible with a memory-only queue; the durable outbound spool +
-mission-run ledger stays tracked as the long-term fix (WI#270 fix #4,
-platform halves in #277/#276). New architecture doc:
+bump and registry-wide churn. The XMPP half of the long-term durable-spool
+fix then landed as WI#277 (next section), closing the restart-loss window
+for the XMPP lane; the mission-run ledger half remains tracked as WI#276.
+New architecture doc:
 `docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md` also records the
 mission-spec discipline (daily log → send → memory records acceptance;
 update the run baseline each time). The PR Digest mission spec itself is
 tenant workspace data, outside this repo.
+
+### Durable XMPP Outbound Spool (WI#277)
+
+The remaining channel-platform half of WI#270's fix #4: the XMPP outbound
+queue was memory-only, so a restart/crash/rebuild between the acked
+enqueue and the wire send silently lost the message — the exact PR Digest
+#59 incident class. The channel now runs a durable spool
+(`ic/src/channels/xmpp/spool.rs`):
+
+- Every `queue_outbound*` message is persisted to
+  `<omemo_store_dir>/spool/<millis>-<seq>-<uuid>.json` (atomic tmp-write +
+  fsync + rename, dir 0700 / files 0600) *before* the mpsc handoff is
+  acked — a spool write failure refuses the ack instead of queueing a
+  losable message, and a dead client task discards the record (no ack, no
+  replay).
+- The client task claims a record by atomic rename before sending (a spool
+  replay and a late in-memory copy can never both send) and deletes it on
+  success; every `Event::Online` bind replays all pending records after
+  room joins and OMEMO publish.
+- Post-enqueue failures (send_stanza, OMEMO/room prep, XEP-0363 upload)
+  are no longer bare warn-and-drop: the record retries with exponential
+  backoff (30 s base, 1 h cap), and after 24 attempts parks as
+  `<key>.failed.json` with the last error; invalid JIDs park immediately
+  as permanent. Item 19's gate/drain semantics are preserved — the
+  undrained-shutdown WARN now says messages remain spooled, not lost.
+- Internal protocol sends (pairing prompts) are deliberately unspooled,
+  and the rate limiter is not re-applied to replays (already counted at
+  the original ack).
+
+Semantics are at-least-once: a crash between wire-send and record-clear
+replays, so a duplicate is possible at whole-message granularity. Verified
+with 93 `channels::xmpp` lib tests (12 new spool unit + 4 new
+channel-level, including a restart-window replay across two channel
+instances sharing a data dir) and live on test tenant derpy: 19/19 test
+messages delivered exactly once, including a spooled (acked-but-unsent)
+record that survived `systemctl stop` and replayed on the next boot's
+Online drain. End-to-end delivery receipts (XEP-0198) and the WI#276
+engine-side mission-run ledger remain open.
 
 ### Version Bumps and Supply Chain (item 1)
 
@@ -814,6 +865,13 @@ as alternates. The codename above remains UNKNOWN until a human picks.
     `mission_history` (mission names come from `mission_list`);
     `routine_history` now returns an honest pointer error there instead of
     a wrong-registry fallthrough. No configuration change.
+17. **XMPP outbound spool (WI#277).** No configuration change; the spool
+    lives under the tenant's existing `omemo_store_dir` (`spool/`
+    subdirectory). Delivery is at-least-once — a crash between wire-send
+    and record-clear can replay a duplicate — and a message that
+    exhausts its 24 retry attempts parks as `<key>.failed.json` with the
+    last error for operator inspection/replay. The spool is XMPP-local;
+    other channels keep memory-only queues.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -831,6 +889,13 @@ as alternates. The codename above remains UNKNOWN until a human picks.
   enable only for intentionally trusted private-network deployments
   (carried).
 - Kawarimi remains PostgreSQL-only (carried).
+- Outbound delivery beyond XMPP still runs memory-only queues: the WI#277
+  durable spool is XMPP-channel-local, so restart-loss of acked messages
+  remains possible on other channels. On XMPP the spool is at-least-once —
+  a crash between wire-send and record-clear can replay a duplicate
+  (whole-message granularity) — and there are no end-to-end delivery
+  receipts (XEP-0198 remains open). The engine-side mission-run ledger
+  half of WI#270's fix #4 remains tracked as WI#276.
 - OpenCode v1.18.29+ remains deliberately un-adopted for the opencode lane
   pending upstream proof (carried; the opencode2 lane is on v2.0.21).
 - Historical WI#159 behavior remains: terminal triggers
@@ -877,6 +942,11 @@ as alternates. The codename above remains UNKNOWN until a human picks.
   residue (WI#270 platform hardening landed; the durable spool half of its
   long-term fix #4 then landed as WI#277 below, with the mission-run ledger
   half still tracked as WI#276).
+- XMPP outbound messages survive restarts: a durable spool persists every
+  message before the ack, replays pending records on every Online bind,
+  retries post-enqueue failures with bounded backoff, and parks exhausted
+  records as `.failed.json` — verified live on derpy with 19/19 deliveries,
+  including a restart-window replay (WI#277 source-fixed).
 - The voice sidecar bounds abandoned inference admission with per-component
   readiness and explicit permanent-failure semantics; supported recovery
   via `restart-tenant` (WI#264 source-fixed; the v2.1.3.0 known issue is
