@@ -4,6 +4,7 @@ pub mod api;
 pub mod audio;
 pub mod config;
 pub mod engine;
+pub mod inference;
 
 pub use api::{AppState, api_router, health_router};
 pub use config::Config;

@@ -26,9 +26,4 @@ if [[ "$rust_version" != rustc\ 1.96.1\ * ]]; then
     exit 1
 fi
 
-if ! command -v rustfmt >/dev/null 2>&1; then
-    rustup component add --toolchain 1.96.1 rustfmt
-fi
-if ! command -v cargo-clippy >/dev/null 2>&1; then
-    rustup component add --toolchain 1.96.1 clippy
-fi
+bash "$(dirname "${BASH_SOURCE[0]}")/ensure-rust-components.sh" 1.96.1
