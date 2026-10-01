@@ -92,6 +92,7 @@ pub struct WriteResult {
     pub actual_layer: String,
 }
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -101,7 +102,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::error::WorkspaceError;
-use crate::safety::{Sanitizer, Severity};
+use crate::safety::{InjectionWarning, Sanitizer, Severity};
 
 /// Files injected into the system prompt. Writes to these are scanned for
 /// prompt injection patterns and rejected if high-severity matches are found.
@@ -147,6 +148,21 @@ fn is_lorebook_json_file(path: &str) -> bool {
 /// Shared sanitizer instance — avoids rebuilding Aho-Corasick + regexes on every write.
 static SANITIZER: std::sync::LazyLock<Sanitizer> = std::sync::LazyLock::new(Sanitizer::new);
 
+/// Build the rejection error for prompt-visible content, logging the decision.
+fn injection_rejected_error(path: &str, rejecting: &[&InjectionWarning]) -> WorkspaceError {
+    let descriptions: Vec<&str> = rejecting.iter().map(|w| w.description.as_str()).collect();
+    tracing::warn!(
+        target: "lunarwing::safety",
+        file = %path,
+        "workspace prompt content rejected: prompt injection detected ({})",
+        descriptions.join("; "),
+    );
+    WorkspaceError::InjectionRejected {
+        path: path.to_string(),
+        reason: descriptions.join("; "),
+    }
+}
+
 /// Scan content for prompt injection. Returns `Err` if high-severity patterns
 /// are detected, otherwise logs warnings and returns `Ok(())`.
 pub(crate) fn reject_if_injected(path: &str, content: &str) -> Result<(), WorkspaceError> {
@@ -160,23 +176,10 @@ fn reject_if_injected_at(
 ) -> Result<(), WorkspaceError> {
     let sanitizer = &*SANITIZER;
     let warnings = sanitizer.detect(content);
-    let dominated = warnings.iter().any(|w| w.severity >= minimum);
-    if dominated {
-        let descriptions: Vec<&str> = warnings
-            .iter()
-            .filter(|w| w.severity >= minimum)
-            .map(|w| w.description.as_str())
-            .collect();
-        tracing::warn!(
-            target: "lunarwing::safety",
-            file = %path,
-            "workspace prompt content rejected: prompt injection detected ({})",
-            descriptions.join("; "),
-        );
-        return Err(WorkspaceError::InjectionRejected {
-            path: path.to_string(),
-            reason: descriptions.join("; "),
-        });
+    let rejecting: Vec<&InjectionWarning> =
+        warnings.iter().filter(|w| w.severity >= minimum).collect();
+    if !rejecting.is_empty() {
+        return Err(injection_rejected_error(path, &rejecting));
     }
     for w in &warnings {
         tracing::warn!(
@@ -186,6 +189,136 @@ fn reject_if_injected_at(
         );
     }
     Ok(())
+}
+
+/// Maximum length in bytes of an inline quoted span eligible for
+/// describing-context demotion (WI#280). Longer spans are bulk content, not
+/// a quoted phrase, and are scanned strictly so a pasted payload cannot hide
+/// inside one oversized "quote".
+const MAX_QUOTED_SPAN_BYTES: usize = 200;
+
+/// Patterns that operate below the linguistic layer: chat-template special
+/// tokens and null bytes are not neutralized by surrounding quotes, so they
+/// keep their severity even inside a quoted span.
+fn is_tokenizer_level_pattern(pattern: &str) -> bool {
+    matches!(pattern, "<|" | "|>" | "[INST]" | "[/INST]" | "null_byte")
+}
+
+/// True when `prev` allows a quote to open: start of content, whitespace, or
+/// opening/markdown punctuation.
+fn left_quote_boundary(prev: Option<char>) -> bool {
+    prev.is_none_or(|c| {
+        c.is_whitespace() || matches!(c, '(' | '[' | '{' | '>' | '*' | '_' | '~' | '-' | '–' | '—')
+    })
+}
+
+/// True when `next` allows a quote to close: end of content, whitespace, or
+/// closing/sentence punctuation.
+fn right_quote_boundary(next: Option<char>) -> bool {
+    next.is_none_or(|c| {
+        c.is_whitespace()
+            || matches!(c, ')' | ']' | '}' | '.' | ',' | ';' | ':' | '!' | '?' | '*' | '_' | '~')
+    })
+}
+
+/// Returns the closing delimiter when `ch` opens a demotable quoted span.
+/// Straight/curly single quotes additionally require a following alphanumeric
+/// so prose apostrophes ("don't") and plural possessives ("dogs'") never open
+/// a span.
+fn quote_opener(ch: char, prev: Option<char>, next: Option<char>) -> Option<char> {
+    match ch {
+        '`' => Some('`'),
+        '"' | '“' if left_quote_boundary(prev) => Some(if ch == '“' { '”' } else { '"' }),
+        '\'' | '‘' if left_quote_boundary(prev) && next.is_some_and(|c| c.is_alphanumeric()) => {
+            Some(if ch == '‘' { '’' } else { '\'' })
+        }
+        _ => None,
+    }
+}
+
+/// Whether a delimiter match terminates an open span. Quote closers require a
+/// right boundary; backtick code spans close anywhere.
+fn quote_closes(closer: char, next: Option<char>) -> bool {
+    match closer {
+        '`' => true,
+        _ => right_quote_boundary(next),
+    }
+}
+
+/// Byte ranges of short, single-line, inline quoted spans (`code`, "double",
+/// 'single', “curly”, ‘curly’). Spans never exceed [`MAX_QUOTED_SPAN_BYTES`]
+/// and never cross newlines; unterminated spans are dropped.
+fn quoted_spans(content: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut open: Option<(char, usize)> = None;
+    let mut prev: Option<char> = None;
+    let mut iter = content.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        match open {
+            Some((closer, start)) => {
+                if ch == closer && quote_closes(closer, iter.peek().map(|&(_, c)| c)) {
+                    spans.push(start..idx);
+                    open = None;
+                } else if ch == '\n' || idx - start > MAX_QUOTED_SPAN_BYTES {
+                    open = None;
+                }
+            }
+            None => {
+                open = quote_opener(ch, prev, iter.peek().map(|&(_, c)| c))
+                    .map(|closer| (closer, idx + ch.len_utf8()));
+            }
+        }
+        prev = Some(ch);
+    }
+    spans
+}
+
+/// Daily-log injection scan (WI#280). Daily logs accumulate agent-authored
+/// incident and test notes, so a match fully enclosed in a short inline
+/// quoted span is describing context (e.g. logging that the scanner rejected
+/// `ignore previous instructions`) and demotes to warn-only. Unquoted
+/// matches and tokenizer-level patterns reject exactly as in
+/// [`reject_if_injected`].
+fn reject_daily_log_if_injected(path: &str, content: &str) -> Result<(), WorkspaceError> {
+    let sanitizer = &*SANITIZER;
+    let warnings = sanitizer.detect(content);
+    let needs_spans = warnings.iter().any(|w| w.severity >= Severity::High);
+    let spans = if needs_spans {
+        quoted_spans(content)
+    } else {
+        Vec::new()
+    };
+    let mut rejecting: Vec<&InjectionWarning> = Vec::new();
+    for w in &warnings {
+        if w.severity < Severity::High {
+            tracing::warn!(
+                target: "lunarwing::safety",
+                file = %path, severity = ?w.severity, pattern = %w.pattern,
+                "workspace prompt content warning: {}", w.description,
+            );
+            continue;
+        }
+        let quoted = !is_tokenizer_level_pattern(&w.pattern)
+            && spans
+                .iter()
+                .any(|s| s.start <= w.location.start && w.location.end <= s.end);
+        if quoted {
+            tracing::warn!(
+                target: "lunarwing::safety",
+                file = %path, severity = ?w.severity, pattern = %w.pattern,
+                "daily-log injection pattern inside quoted span (describing context); \
+                 warn-only: {}",
+                w.description,
+            );
+        } else {
+            rejecting.push(w);
+        }
+    }
+    if rejecting.is_empty() {
+        Ok(())
+    } else {
+        Err(injection_rejected_error(path, &rejecting))
+    }
 }
 
 fn canonical_prompt_scan_text(content: &str) -> String {
@@ -254,7 +387,8 @@ pub(crate) fn reject_lorebook_if_injected(path: &str, content: &str) -> Result<(
 }
 
 /// Validate one prompt-visible write: lorebook JSON receives raw and
-/// decoded-field scans; other system-prompt files keep the raw scan.
+/// decoded-field scans; daily logs demote quoted describing-context matches
+/// (WI#280); other system-prompt files keep the strict raw scan.
 fn validate_prompt_write(path: &str, content: &str) -> Result<(), WorkspaceError> {
     if !is_system_prompt_file(path) || content.is_empty() {
         return Ok(());
@@ -276,6 +410,8 @@ fn validate_prompt_write(path: &str, content: &str) -> Result<(), WorkspaceError
         if !decoded.is_empty() {
             reject_lorebook_if_injected(path, &decoded)?;
         }
+    } else if is_daily_log_file(path) {
+        reject_daily_log_if_injected(path, content)?;
     } else {
         reject_if_injected(path, content)?;
     }
