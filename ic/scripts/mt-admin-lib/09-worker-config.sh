@@ -20,6 +20,25 @@
 # body was rewritten.
 
 
+# WI#271: fold the tenant store's current image ID into a worker's recreation
+# contract so a refreshed image bounces the running container instead of
+# letting it pin an arbitrarily old image while the store holds the current
+# tag (the vision/voice sidecar launch contracts always carried the image ID;
+# worker contracts did not). An empty ID leaves the contract unchanged, which
+# degrades to the pre-WI#271 static behavior when the image cannot be
+# inspected.
+_worker_recreate_contract() {  # <image-id> [base-contract]
+  local id="$1" base="${2:-}"
+  if [[ -z "$id" ]]; then
+    printf '%s' "$base"
+  elif [[ -n "$base" ]]; then
+    printf '%s;image=%s' "$base" "$id"
+  else
+    printf 'image=%s' "$id"
+  fi
+}
+
+
 # Render a dedicated OpenRC unit for a tenant's supported external worker,
 # modeled on the lunarwing-pg-<t> unit. Health-aware status() checks the worker's
 # /health endpoint (curl is present in both worker images) so the host self-heal
@@ -1157,6 +1176,12 @@ start_tenant_opencode() {
       ;;
   esac
 
+  # WI#271: image drift is a recreation trigger on every path below.
+  local worker_image_id worker_image_contract
+  worker_image_id="$(_tenant_store_image_id "$name" lunarwing-worker-opencode:latest)"
+  worker_image_contract="$(_worker_recreate_contract "$worker_image_id")"
+  opencode_launch_contract="$(_worker_recreate_contract "$worker_image_id" "$opencode_launch_contract")"
+
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
@@ -1165,14 +1190,14 @@ start_tenant_opencode() {
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode-${name}.container"
     render_worker_quadlet "$name" opencode 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
-    if _container_config_changed "$name" "lunarwing-opencode-${name}" "$quadlet_file"; then
+    if _container_config_changed "$name" "lunarwing-opencode-${name}" "$quadlet_file" "$worker_image_contract"; then
       _recreate_quadlet_container "$name" "$opencode_service" "lunarwing-opencode-${name}"
     fi
     # A bad pre-upgrade image can exhaust StartLimitBurst. Loading a fixed image
     # does not clear that systemd lockout, so reset it before the explicit retry.
     _systemctl_user "$name" reset-failed "$opencode_service" >/dev/null 2>&1 || true
     if _systemctl_user "$name" start "$opencode_service" >/dev/null 2>&1; then
-      _store_container_hash "$name" "lunarwing-opencode-${name}" "$quadlet_file"
+      _store_container_hash "$name" "lunarwing-opencode-${name}" "$quadlet_file" "$worker_image_contract"
       say "opencode worker ready via quadlet ($opencode_service, WSS port $wss_port)"
     else
       say "WARNING: $opencode_service failed to start" >&2
@@ -1367,6 +1392,12 @@ start_tenant_opencode2() {
       ;;
   esac
 
+  # WI#271: image drift is a recreation trigger on every path below.
+  local worker_image_id worker_image_contract
+  worker_image_id="$(_tenant_store_image_id "$name" lunarwing-worker-opencode2:latest)"
+  worker_image_contract="$(_worker_recreate_contract "$worker_image_id")"
+  launch_contract="$(_worker_recreate_contract "$worker_image_id" "$launch_contract")"
+
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
@@ -1375,12 +1406,12 @@ start_tenant_opencode2() {
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode2-${name}.container"
     render_worker_quadlet "$name" opencode2 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
-    if _container_config_changed "$name" "lunarwing-opencode2-${name}" "$quadlet_file"; then
+    if _container_config_changed "$name" "lunarwing-opencode2-${name}" "$quadlet_file" "$worker_image_contract"; then
       _recreate_quadlet_container "$name" "$service" "lunarwing-opencode2-${name}"
     fi
     _systemctl_user "$name" reset-failed "$service" >/dev/null 2>&1 || true
     if _systemctl_user "$name" start "$service" >/dev/null 2>&1; then
-      _store_container_hash "$name" "lunarwing-opencode2-${name}" "$quadlet_file"
+      _store_container_hash "$name" "lunarwing-opencode2-${name}" "$quadlet_file" "$worker_image_contract"
       say "opencode2 worker ready via quadlet ($service, WSS port $wss_port)"
     else
       say "WARNING: $service failed to start" >&2
@@ -1652,6 +1683,12 @@ start_tenant_kimi() {
       ;;
   esac
 
+  # WI#271: image drift is a recreation trigger on every path below.
+  local worker_image_id worker_image_contract
+  worker_image_id="$(_tenant_store_image_id "$name" lunarwing-worker-kimi:latest)"
+  worker_image_contract="$(_worker_recreate_contract "$worker_image_id")"
+  kimi_launch_contract="$(_worker_recreate_contract "$worker_image_id" "$kimi_launch_contract")"
+
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
@@ -1660,12 +1697,12 @@ start_tenant_kimi() {
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-kimi-${name}.container"
     render_worker_quadlet "$name" kimi 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
-    if _container_config_changed "$name" "lunarwing-kimi-${name}" "$quadlet_file"; then
+    if _container_config_changed "$name" "lunarwing-kimi-${name}" "$quadlet_file" "$worker_image_contract"; then
       _recreate_quadlet_container "$name" "$kimi_service" "lunarwing-kimi-${name}"
     fi
     _systemctl_user "$name" reset-failed "$kimi_service" >/dev/null 2>&1 || true
     if _systemctl_user "$name" start "$kimi_service" >/dev/null 2>&1; then
-      _store_container_hash "$name" "lunarwing-kimi-${name}" "$quadlet_file"
+      _store_container_hash "$name" "lunarwing-kimi-${name}" "$quadlet_file" "$worker_image_contract"
       say "kimi worker ready via quadlet ($kimi_service, WSS port $wss_port)"
     else
       say "WARNING: $kimi_service failed to start" >&2
@@ -1805,6 +1842,12 @@ start_tenant_pebble() {
     return 0
   fi
 
+  # WI#271: image drift is a recreation trigger on every path below.
+  local worker_image_id worker_image_contract pebble_launch_contract
+  worker_image_id="$(_tenant_store_image_id "$name" lunarwing-worker-pebble:latest)"
+  worker_image_contract="$(_worker_recreate_contract "$worker_image_id")"
+  pebble_launch_contract="$(_worker_recreate_contract "$worker_image_id" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT")"
+
   # systemd + rootless podman: Quadlet .container owns the lifecycle (the unit's
   # [Container] spec creates+runs it), so skip the imperative `_ctr run` below.
   ensure_init_system
@@ -1815,12 +1858,12 @@ start_tenant_pebble() {
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-pebble-${name}.container"
     render_worker_quadlet "$name" pebble 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
-    if _container_config_changed "$name" "lunarwing-pebble-${name}" "$quadlet_file"; then
+    if _container_config_changed "$name" "lunarwing-pebble-${name}" "$quadlet_file" "$worker_image_contract"; then
       _recreate_quadlet_container "$name" "$pebble_service" "lunarwing-pebble-${name}"
     fi
     _systemctl_user "$name" reset-failed "$pebble_service" >/dev/null 2>&1 || true
     if _systemctl_user "$name" start "$pebble_service" >/dev/null 2>&1; then
-      _store_container_hash "$name" "lunarwing-pebble-${name}" "$quadlet_file"
+      _store_container_hash "$name" "lunarwing-pebble-${name}" "$quadlet_file" "$worker_image_contract"
       say "pebble worker ready via quadlet ($pebble_service, WSS port $wss_port)"
     else
       say "WARNING: $pebble_service failed to start" >&2
@@ -1838,19 +1881,19 @@ start_tenant_pebble() {
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
-    if _container_config_changed "$name" "$container_name" "$env_file_for_hash" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT"; then
+    if _container_config_changed "$name" "$container_name" "$env_file_for_hash" "$pebble_launch_contract"; then
       say "config changed for $container_name; force-recreating"
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
     elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "pebble worker already running ($container_name, WSS port $wss_port)"
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT"
+      _store_container_hash "$name" "$container_name" "$env_file_for_hash" "$pebble_launch_contract"
       _register_worker_unit "$name" pebble
       return 0
     else
       say "starting existing pebble worker container $container_name"
       _ctr "$name" start "$container_name" >/dev/null
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT"
+      _store_container_hash "$name" "$container_name" "$env_file_for_hash" "$pebble_launch_contract"
       _register_worker_unit "$name" pebble
       say "pebble worker ready ($container_name, WSS port $wss_port)"
       return 0
@@ -1916,7 +1959,7 @@ start_tenant_pebble() {
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
       lunarwing-worker-pebble:latest >/dev/null
-    _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT"
+    _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" "$pebble_launch_contract"
   fi
 
   _register_worker_unit "$name" pebble
