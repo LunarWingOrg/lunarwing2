@@ -787,6 +787,20 @@ as alternates. The codename above remains UNKNOWN until a human picks.
     design document with landed pinning tests. Existing per-channel pairing
     JSON files keep working; the secrets-store migration remains future work
     tracked in the WI.
+15. **Outbound delivery semantics (WI#270).** The `message` tool ack now
+    reports `Queued message to <channel>:<target>`; success means the
+    channel accepted the message for delivery, never that it arrived.
+    Mission specs and operators must record acceptance, not "delivered" —
+    see
+    [OUTBOUND-DELIVERY-SEMANTICS.md](docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md).
+    The XMPP channel refuses proactive enqueue while disconnected, and
+    shutdown drains the outbound queue within a bounded 2s window; a hard
+    process exit can still lose the memory-only queue (durable spool is
+    tracked as WI#270 fix #4).
+16. **Mission history (WI#269).** In Engine V2 threads, use
+    `mission_history` (mission names come from `mission_list`);
+    `routine_history` now returns an honest pointer error there instead of
+    a wrong-registry fallthrough. No configuration change.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -841,6 +855,14 @@ as alternates. The codename above remains UNKNOWN until a human picks.
 - `routine_history` resolves Engine V2 mission names with character-safe
   summaries and registry-pointing errors (WI#265 source-fixed; the
   v2.1.3.0 known issue is closed).
+- Engine V2 missions have a first-class `mission_history` history tool with
+  project/ownership-scoped resolution, and `routine_history` is honestly
+  blocked in v2 threads with a pointer to it (WI#269 source-fixed).
+- Outbound delivery no longer over-reports: the `message` tool ack says
+  `Queued …`, the XMPP channel refuses enqueue without a bound session, and
+  shutdown drains the outbound queue in a bounded window with a WARN on
+  residue (WI#270 platform hardening landed; the durable spool + mission-run
+  ledger remains tracked as its long-term fix #4).
 - The voice sidecar bounds abandoned inference admission with per-component
   readiness and explicit permanent-failure semantics; supported recovery
   via `restart-tenant` (WI#264 source-fixed; the v2.1.3.0 known issue is
@@ -881,13 +903,24 @@ as alternates. The codename above remains UNKNOWN until a human picks.
 - The cycle's open work items were reconciled in
   `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` with tree-verified
   dispositions for all 23 open items; WI#200 closed on the landed stopgap.
+- The cargo-deny yanked-crate CI gate is honest again: it runs unvendored
+  from the repo root and hard-fails on any `index-failure` diagnostic,
+  closing the silent-skip hole found in pipeline 4811 (item 20).
+- Ten codename candidates are shortlisted for the human pick in
+  `docs/ops/v2.1.4.0_CODENAME_IDEAS.md` (top pick Kabuto; the draft header
+  stays UNKNOWN until then).
 
 ---
 
 *Draft status: codename, release date, and pipeline numbers for final CI
-confirmation will be filled in before the release is cut. This is the first
-repass (item 27, 2026-10-01): it folds in the work merged after the first
-draft — WI#184 design revision 3 with its landed regressions (item 11), the
-open work items audit (item 14), and the guides/architecture docs repasses
-(items 16/17). Open goal items at repass time (18–20, 22, 24, 25, 28, 29)
-may add sections; this draft covers the merged state as of 2026-10-01.*
+confirmation will be filled in before the release is cut. The first repass
+(item 27, 2026-10-01) folded in the work merged after the first draft —
+WI#184 design revision 3 with its landed regressions (item 11), the open
+work items audit (item 14), and the guides/architecture docs repasses
+(items 16/17). This second repass (item 21, 2026-10-01) folds in everything
+merged since: the `mission_history` tool and `routine_history` v2 block
+(item 18, WI#269), outbound delivery honesty (item 19, WI#270 — its Changes
+section landed with the fix itself), the cargo-deny yanked-gate repair
+(item 20), and the codename candidates shortlist (item 25). Open goal items
+at repass time (15, 22–24, 26, 28, 29) may add sections; this draft covers
+the merged state as of 2026-10-01.*
