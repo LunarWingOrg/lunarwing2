@@ -3106,6 +3106,8 @@ FINAL(echoed + "|" + http_result["error"])"#,
         assert!(is_v1_only_tool("routine_pause"));
         assert!(is_v1_only_tool("routine_resume"));
         assert!(is_v1_only_tool("routine_update"));
+        assert!(is_v1_only_tool("routine_history"));
+        assert!(!is_v1_only_tool("mission_history"));
     }
 
     #[test]
@@ -3113,6 +3115,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
         assert!(!is_v1_only_tool("mission_create"));
         assert!(!is_v1_only_tool("mission_list"));
         assert!(!is_v1_only_tool("mission_fire"));
+        assert!(!is_v1_only_tool("mission_history"));
         assert!(!is_v1_only_tool("http"));
         assert!(!is_v1_only_tool("web_search"));
     }
@@ -3773,6 +3776,17 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     fn adapter_with_mission_manager() -> (EffectBridgeAdapter, Arc<MissionManager>) {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        (adapter, mgr)
+    }
+
+    /// Like [`adapter_with_mission_manager`] but hands back the backing store
+    /// so tests can seed missions and threads directly (WI#269 history tests).
+    fn adapter_with_mission_manager_parts() -> (
+        EffectBridgeAdapter,
+        Arc<MissionManager>,
+        Arc<dyn lunarwing_engine::Store>,
+    ) {
         let store: Arc<dyn lunarwing_engine::Store> =
             Arc::new(crate::bridge::store_adapter::HybridStore::new(None));
         let thread_manager = Arc::new(ThreadManager::new(
@@ -3783,8 +3797,8 @@ FINAL(echoed + "|" + http_result["error"])"#,
             Arc::new(LeaseManager::new()),
             Arc::new(PolicyEngine::new()),
         ));
-        let mgr = Arc::new(MissionManager::new(store, thread_manager));
-        (make_adapter(), mgr)
+        let mgr = Arc::new(MissionManager::new(store.clone(), thread_manager));
+        (make_adapter(), mgr, store)
     }
 
     fn mission_create_ctx() -> lunarwing_engine::ThreadExecutionContext {
@@ -3955,5 +3969,204 @@ FINAL(echoed + "|" + http_result["error"])"#,
         );
         let mission = mgr.get_mission(mid).await.expect("load").expect("exists");
         assert!(mission.current_focus.is_none());
+    }
+
+    #[tokio::test]
+    async fn mission_history_returns_recent_fires_from_thread_history() {
+        let (adapter, mgr, store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+
+        let ctx = mission_create_ctx();
+        let mut mission = lunarwing_engine::Mission::new(
+            ctx.project_id,
+            &ctx.user_id,
+            "self-improvement",
+            "improve",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        // Two completed fires, oldest first in thread_history.
+        let mut fired_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        for (goal, summary) in [
+            ("run 1", "first run summary"),
+            ("run 2", "second run summary"),
+        ] {
+            let mut thread = lunarwing_engine::Thread::new(
+                goal,
+                lunarwing_engine::ThreadType::Mission,
+                ctx.project_id,
+                &ctx.user_id,
+                lunarwing_engine::ThreadConfig::default(),
+            );
+            thread.created_at = fired_at;
+            thread.completed_at = Some(fired_at + chrono::Duration::minutes(5));
+            thread.state = lunarwing_engine::ThreadState::Completed;
+            thread.total_tokens_used = 120;
+            thread
+                .messages
+                .push(lunarwing_engine::ThreadMessage::assistant(summary));
+            store.save_thread(&thread).await.expect("save thread");
+            mission.thread_history.push(thread.id);
+            fired_at += chrono::Duration::hours(1);
+        }
+        mission.last_fired_at = Some(fired_at);
+        store.save_mission(&mission).await.expect("save mission");
+
+        let result = adapter
+            .handle_mission_call(
+                "mission_history",
+                &serde_json::json!({"name": "self-improvement"}),
+                &ctx,
+            )
+            .await
+            .expect("mission_history must be handled")
+            .expect("no transport error");
+        assert!(
+            !result.is_error,
+            "history should succeed: {:?}",
+            result.output
+        );
+        assert_eq!(
+            result.output.get("kind").and_then(|v| v.as_str()),
+            Some("engine_mission")
+        );
+        assert_eq!(
+            result.output.get("total_runs").and_then(|v| v.as_i64()),
+            Some(2)
+        );
+        let runs = result
+            .output
+            .get("runs")
+            .and_then(|v| v.as_array())
+            .expect("runs array");
+        assert_eq!(runs.len(), 2);
+        // Newest first.
+        assert_eq!(
+            runs[0].get("result_summary").and_then(|v| v.as_str()),
+            Some("second run summary")
+        );
+        assert_eq!(
+            runs[0].get("duration_secs").and_then(|v| v.as_i64()),
+            Some(300)
+        );
+        assert_eq!(
+            runs[0].get("trigger_type").and_then(|v| v.as_str()),
+            Some("mission_thread")
+        );
+
+        // limit=1 keeps only the newest fire.
+        let limited = adapter
+            .handle_mission_call(
+                "mission_history",
+                &serde_json::json!({"name": "self-improvement", "limit": 1}),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        let runs = limited
+            .output
+            .get("runs")
+            .and_then(|v| v.as_array())
+            .expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].get("result_summary").and_then(|v| v.as_str()),
+            Some("second run summary")
+        );
+
+        // A misspelled name errors honestly instead of returning empty history.
+        let missing = adapter
+            .handle_mission_call(
+                "mission_history",
+                &serde_json::json!({"name": "does-not-exist"}),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(missing.is_error, "unknown name must error");
+        assert!(
+            missing
+                .output
+                .get("error")
+                .and_then(|v| v.as_str())
+                .is_some_and(|e| e.contains("not found")),
+            "error should say not found: {:?}",
+            missing.output
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_history_never_fired_mission_reports_empty_history() {
+        let (adapter, mgr, store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+
+        let ctx = mission_create_ctx();
+        let mission = lunarwing_engine::Mission::new(
+            ctx.project_id,
+            &ctx.user_id,
+            "conversation-insights",
+            "learn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        let mission_id = mission.id;
+        store.save_mission(&mission).await.expect("save mission");
+
+        let result = adapter
+            .handle_mission_call(
+                "mission_history",
+                &serde_json::json!({"id": mission_id.to_string()}),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(
+            result.output.get("total_runs").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            result.output.get("never_fired").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            result
+                .output
+                .get("runs")
+                .and_then(|v| v.as_array())
+                .is_some_and(|runs| runs.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn routine_history_is_blocked_in_v2_threads_with_mission_history_pointer() {
+        // WI#269 shadowing regression: even with a v1 routine and a v2 mission
+        // sharing a name, a v2 thread must get the honest error instead of
+        // the wrong registry's history.
+        let adapter = make_adapter();
+        let err = adapter
+            .execute_resolved_pending_action(
+                "routine_history",
+                serde_json::json!({"name": "self-improvement"}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_rh_1")),
+                true,
+            )
+            .await
+            .expect_err("routine_history must be rejected in v2 threads");
+        match err {
+            EngineError::Effect { reason } => {
+                assert!(
+                    reason.contains("mission_history"),
+                    "error must point at mission_history: {reason}"
+                );
+                assert!(
+                    reason.contains("not available in engine v2"),
+                    "error must name the v2 unavailability: {reason}"
+                );
+            }
+            other => panic!("expected Effect error, got {other:?}"),
+        }
     }
 }
