@@ -1656,6 +1656,20 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                 requires_approval: false,
             },
             lunarwing_engine::ActionDef {
+                name: "mission_history".into(),
+                description: "View the execution history of a mission or routine: recent fires with status, duration, and result summaries. Resolves Engine V2 mission names (as shown by mission_list).".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Name of the mission/routine (from mission_list); alternatively pass its UUID via 'id'"},
+                        "id": {"type": "string", "description": "Mission/routine UUID (alternative to 'name')"},
+                        "limit": {"type": "integer", "description": "Max runs to return (default: 10, max: 50)"}
+                    }
+                }),
+                effects: vec![],
+                requires_approval: false,
+            },
+            lunarwing_engine::ActionDef {
                 name: "mission_delete".into(),
                 description: "Delete a mission or routine. Conversation insights retain a disabled tombstone (explicit resume re-enables); optionally purge their generated memory.".into(),
                 parameters_schema: serde_json::json!({
