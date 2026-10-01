@@ -9,9 +9,10 @@
 LunarWing v2.1.4.0 is a recovery, dependency-audit, and engine-reliability
 release — the cycle that repaired a red integration pipeline, put every
 tracked lockfile and worker image through a full crate-security re-audit,
-closed four deferred engine/worker defects from v2.1.3.0's known-issues list
-(WI#265, WI#264, WI#244, WI#243, WI#220, WI#191 first slice), and landed the
-per-tenant system-prompt editor the previous release had deferred.
+closed four of the defects v2.1.3.0 deferred to this release (WI#265,
+WI#264, WI#244, WI#220 — WI#184 remains at design revision 3), fixed the
+global mission-listing defect found in-cycle (WI#243), and landed the
+first slice of WI#191's EMA estimation wiring.
 
 The cycle opened with the version sweep: all LunarWing-owned release packages
 moved from `2.1.3` to `2.1.4` (daemon, five workspace crates, XMPP bridge,
