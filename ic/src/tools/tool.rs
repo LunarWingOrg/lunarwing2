@@ -327,11 +327,19 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolOutput, ToolError>;
 
     /// Estimate the cost of running this tool with the given parameters.
+    /// This cheap, side-effect-free hint may be called before validation or
+    /// approval. It must handle arbitrary/invalid parameters without panicking
+    /// or performing I/O, returning None when it cannot estimate them.
     fn estimated_cost(&self, _params: &serde_json::Value) -> Option<Decimal> {
         None
     }
 
-    /// Estimate how long this tool will take with the given parameters.
+    /// Estimate typical execution time with the given parameters, before any
+    /// learned adjustment. Return None when unknown; a timeout is a safety
+    /// ceiling, not a runtime estimate. Runtime calibration learns from elapsed
+    /// time even when no baseline is declared.
+    /// Like `estimated_cost`, this must be cheap, side-effect-free and safe on
+    /// arbitrary/invalid parameters, including before approval/validation.
     fn estimated_duration(&self, _params: &serde_json::Value) -> Option<Duration> {
         None
     }

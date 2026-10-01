@@ -24,6 +24,20 @@ See `tools-src/` for examples.
 
 ## Tool Architecture Principles
 
+### Advisory runtime estimates (WI191)
+
+Tool execution in chat, Engine V2, local jobs, routines, containers and scheduler
+subtasks records completed-call elapsed time in the owning registry's bounded,
+per-user EMA cache. Recording defaults to observation-only; opt in to approval
+hints with `LUNARWING_TOOL_ESTIMATES=1`. After five valid samples an approval
+description may include a typical runtime and confidence label. This is execution time, not approval
+wait or a deadline. Failed/timed-out/canceled calls do not train the cache.
+`Tool::estimated_duration` must describe a typical unadjusted runtime, **not** a
+timeout; return `None` when unknown. Costs remain unknown unless reported by
+the tool. Restart resets learned statistics; `LUNARWING_TOOL_ESTIMATES=0`
+disables new recording/display. Details and staged scope:
+[runtime estimation](../estimation/README.md).
+
 **CRITICAL: Keep tool-specific logic out of the main agent codebase.**
 
 The main agent provides generic infrastructure; tools are self-contained units that declare their requirements through capabilities files.

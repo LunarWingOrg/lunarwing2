@@ -1997,7 +1997,9 @@ async fn execute_lightweight_with_tools(
 
             // Execute tools sequentially
             for tc in response.tool_calls {
-                let result = execute_routine_tool(ctx, &job_ctx, &allowed_tools, &tc).await;
+                let result =
+                    execute_routine_tool(&ctx.tools, &ctx.safety, &job_ctx, &allowed_tools, &tc)
+                        .await;
 
                 // Sanitize and wrap result (including errors)
                 let result_content = match result {
@@ -2060,7 +2062,8 @@ fn snapshot_messages_for_tool_iteration(messages: &[ChatMessage]) -> Vec<ChatMes
 
 /// Execute a single tool for a lightweight routine.
 async fn execute_routine_tool(
-    ctx: &EngineContext,
+    tools: &ToolRegistry,
+    safety: &SafetyLayer,
     job_ctx: &JobContext,
     allowed_tools: &std::collections::HashSet<String>,
     tc: &ToolCall,
@@ -2071,18 +2074,14 @@ async fn execute_routine_tool(
     }
 
     // Check if tool exists
-    let tool = ctx
-        .tools
+    let tool = tools
         .get(&tc.name)
         .await
         .ok_or_else(|| format!("Tool '{}' not found", tc.name))?;
     let normalized_params = prepare_tool_params(tool.as_ref(), &tc.arguments);
 
     // Validate tool parameters
-    let validation = ctx
-        .safety
-        .validator()
-        .validate_tool_params(&normalized_params);
+    let validation = safety.validator().validate_tool_params(&normalized_params);
     if !validation.is_valid {
         let details = validation
             .errors
@@ -2095,12 +2094,14 @@ async fn execute_routine_tool(
 
     // Execute with per-tool timeout
     let timeout = tool.execution_timeout();
-    let start = std::time::Instant::now();
-    let result = tokio::time::timeout(timeout, async {
-        tool.execute(normalized_params.clone(), job_ctx).await
-    })
+    let (result, elapsed) = crate::tools::execute::execute_timed_tool(
+        tools,
+        tool.as_ref(),
+        normalized_params,
+        job_ctx,
+        timeout,
+    )
     .await;
-    let elapsed = start.elapsed();
 
     // Log tool execution result (single consolidated log)
     match &result {
@@ -2369,6 +2370,76 @@ mod tests {
     use crate::llm::FinishReason;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
+
+    struct TimedRoutineTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for TimedRoutineTool {
+        fn name(&self) -> &str {
+            "timed_routine"
+        }
+        fn description(&self) -> &str {
+            "Routine timing fixture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _: &crate::context::JobContext,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(crate::tools::ToolOutput::success(
+                serde_json::json!({"ok":true}),
+                Duration::ZERO,
+            ))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn routine_estimation_respects_allowlist_and_records_once() {
+        use std::sync::Arc;
+        let tools = crate::tools::ToolRegistry::new()
+            .with_estimation_mode(crate::estimation::ToolEstimationMode::Observe);
+        tools.register(Arc::new(TimedRoutineTool)).await;
+        let safety = crate::safety::SafetyLayer::new(&crate::config::SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        });
+        let ctx = crate::context::JobContext::with_user("alice", "test", "routine");
+        let call = crate::llm::ToolCall {
+            id: "call-1".into(),
+            name: "timed_routine".into(),
+            arguments: serde_json::json!({}),
+            reasoning: None,
+        };
+        for _ in 0..5 {
+            assert!(
+                super::execute_routine_tool(&tools, &safety, &ctx, &Default::default(), &call)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            tools
+                .estimates()
+                .estimate("alice", &TimedRoutineTool, &call.arguments)
+                .is_none()
+        );
+        let allowed = [call.name.clone()].into_iter().collect();
+        for _ in 0..5 {
+            super::execute_routine_tool(&tools, &safety, &ctx, &allowed, &call)
+                .await
+                .unwrap();
+        }
+        let estimate = tools
+            .estimates()
+            .estimate("alice", &TimedRoutineTool, &call.arguments)
+            .unwrap();
+        assert_eq!(estimate.samples, 5);
+        assert_eq!(estimate.duration, Duration::from_secs(2));
+    }
 
     #[test]
     fn test_notification_gating() {

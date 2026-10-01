@@ -626,12 +626,14 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // Execute with per-tool timeout and timing
         let tool_timeout = tool.execution_timeout();
-        let start = std::time::Instant::now();
-        let result = tokio::time::timeout(tool_timeout, async {
-            tool.execute(effective_params.clone(), &job_ctx).await
-        })
+        let (result, elapsed) = crate::tools::execute::execute_timed_tool(
+            &deps.tools,
+            tool.as_ref(),
+            effective_params,
+            &job_ctx,
+            tool_timeout,
+        )
         .await;
-        let elapsed = start.elapsed();
 
         match &result {
             Ok(Ok(output)) => {
@@ -1600,7 +1602,8 @@ mod tests {
 
     /// Build a Worker wired to a ToolRegistry containing the given tools.
     async fn make_worker(tools: Vec<Arc<dyn Tool>>) -> Worker {
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::new()
+            .with_estimation_mode(crate::estimation::ToolEstimationMode::Observe);
         for t in tools {
             registry.register(t).await;
         }
@@ -1662,6 +1665,36 @@ mod tests {
 
     // Completion detection tests live in src/util.rs (the canonical location).
     // See: test_completion_signals, test_completion_negative, etc.
+
+    #[tokio::test(start_paused = true)]
+    async fn job_execution_trains_registry_estimates_once_per_completion() {
+        let tool: Arc<dyn Tool> = Arc::new(SlowTool {
+            tool_name: "calibrated_job_tool".into(),
+            delay: Duration::from_secs(2),
+        });
+        let worker = make_worker(vec![tool.clone()]).await;
+        let params = serde_json::json!({});
+        let ctx = worker
+            .deps
+            .context_manager
+            .get_context(worker.job_id)
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            Worker::execute_tool_inner(&worker.deps, worker.job_id, tool.name(), &params)
+                .await
+                .unwrap();
+        }
+        let estimate = worker
+            .deps
+            .tools
+            .estimates()
+            .estimate(&ctx.user_id, tool.as_ref(), &params)
+            .unwrap();
+        assert_eq!(estimate.samples, 5);
+        assert_eq!(estimate.duration, Duration::from_secs(2));
+        assert_eq!(estimate.cost, None);
+    }
 
     #[tokio::test]
     async fn test_parallel_speedup() {

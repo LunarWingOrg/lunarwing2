@@ -98,6 +98,8 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    /// Bounded, in-memory timing calibration, isolated by user and tool name.
+    estimates: crate::estimation::ToolEstimates,
     /// Tracks which names were registered via the built-in startup path.
     builtin_names: RwLock<std::collections::HashSet<String>>,
     /// Shared credential registry populated by WASM tools, consumed by HTTP tool.
@@ -128,6 +130,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
+            estimates: crate::estimation::ToolEstimates::default(),
             builtin_names: RwLock::new(std::collections::HashSet::new()),
             credential_registry: None,
             secrets_store: None,
@@ -160,6 +163,37 @@ impl ToolRegistry {
     /// Get the shared rate limiter for checking built-in tool limits.
     pub fn rate_limiter(&self) -> &RateLimiter {
         &self.rate_limiter
+    }
+
+    pub fn estimates(&self) -> &crate::estimation::ToolEstimates {
+        &self.estimates
+    }
+
+    /// Override the process setting when composing a registry (including tests).
+    pub fn with_estimation_mode(mut self, mode: crate::estimation::ToolEstimationMode) -> Self {
+        self.estimates = crate::estimation::ToolEstimates::new(mode);
+        self
+    }
+
+    /// Freeze a learned runtime hint into the existing approval description so
+    /// live delivery, history and persisted-gate recovery show the same text.
+    pub async fn approval_description(
+        &self,
+        user_id: &str,
+        tool_name: &str,
+        params: &serde_json::Value,
+        description: &str,
+    ) -> String {
+        if !self.estimates.display_enabled() {
+            return description.to_owned();
+        }
+        if let Some((_, tool)) = self.get_resolved_for_user(tool_name, user_id).await {
+            let params = crate::tools::prepare_tool_params(tool.as_ref(), params);
+            if let Some(estimate) = self.estimates.estimate(user_id, tool.as_ref(), &params) {
+                return format!("{description}\n\n{}", estimate.approval_hint());
+            }
+        }
+        description.to_owned()
     }
 
     /// Register a tool. Rejects dynamic tools that try to shadow a protected built-in name.

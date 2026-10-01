@@ -111,6 +111,20 @@ pub struct PendingApprovalInfo {
     pub parameters: String,
 }
 
+impl From<&crate::agent::session::PendingApproval> for PendingApprovalInfo {
+    fn from(pending: &crate::agent::session::PendingApproval) -> Self {
+        Self {
+            request_id: pending.request_id.to_string(),
+            tool_name: pending.tool_name.clone(),
+            description: pending.description.clone(),
+            // Same snapshot as live delivery, including for legacy approvals
+            // with no display parameters: never fall back to raw credentials.
+            parameters: serde_json::to_string_pretty(&pending.display_parameters)
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// Durable, user-scoped recovery snapshot for SSE/WebSocket clients.
 #[derive(Debug, Serialize)]
 pub struct PendingGatesResponse {
@@ -1624,6 +1638,35 @@ pub struct HealthResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn approval_recovery_preserves_frozen_hint_and_never_exposes_raw_parameters() {
+        let description = "Approve?\n\nTypical tool runtime: ~2.00s (EMA, 5 completed calls, low confidence). Excludes approval wait; not a deadline.";
+        for display in [
+            serde_json::Value::Null,
+            serde_json::json!({"token":"[REDACTED]"}),
+        ] {
+            let pending: crate::agent::session::PendingApproval =
+                serde_json::from_value(serde_json::json!({
+                    "request_id": uuid::Uuid::new_v4(), "tool_name": "tool",
+                    "description": description, "parameters": {"token": "must-not-leak"},
+                    "display_parameters": display, "tool_call_id": "call-1", "context_messages": [],
+                }))
+                .unwrap();
+            let view = super::PendingApprovalInfo::from(&pending);
+            assert_eq!(view.description, description);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&view.parameters).unwrap(),
+                display
+            );
+            assert!(
+                !serde_json::to_string(&view)
+                    .unwrap()
+                    .contains("must-not-leak")
+            );
+            assert_eq!(pending.parameters["token"], "must-not-leak");
+        }
+    }
+
     use super::*;
 
     // ---- WsClientMessage deserialization tests ----
