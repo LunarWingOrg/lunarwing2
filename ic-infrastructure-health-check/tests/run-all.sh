@@ -35,8 +35,9 @@ declare -A SUITES=(
     [runtime]="test-health-runtime.sh"
     [knowledge]="test-health-knowledge.sh"
     [gateway]="test-health-gateway.sh"
+    [worker-images]="test-health-worker-images.sh"
 )
-ORDER=(regression matrix chaos openrc systemd lunarvision init-templates lunarvoice voice-init-templates netbird llm-streams metrics-exporter metrics-unit watchdog watchdog-openrc cron-wrapper runtime knowledge gateway)
+ORDER=(regression matrix chaos openrc systemd lunarvision init-templates lunarvoice voice-init-templates netbird llm-streams metrics-exporter metrics-unit watchdog watchdog-openrc cron-wrapper runtime knowledge gateway worker-images)
 
 # --list: print available suites and exit (for CI introspection). Derived from
 # ORDER so it can never drift out of sync with the registered suites.

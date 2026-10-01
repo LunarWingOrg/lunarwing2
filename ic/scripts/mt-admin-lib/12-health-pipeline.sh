@@ -187,6 +187,12 @@ SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 # none are enabled, so provisioned-but-disabled sidecars never false-page.
 # HEALTH_LUNARVOICE_URL=
 
+# Worker image stores (WI#271): health-worker-images.sh audits every registry
+# tenant's rootless store for its expected images (local vision sidecar,
+# enabled voice sidecar, selected workers) against the admin store. MISSING is
+# critical, STALE degraded; monitor-only (operator remediates via mt-admin).
+# HEALTH_WORKER_IMAGES_ENABLED=auto
+
 # NetBird is operator-owned and disabled by default. To monitor readiness, set
 # HEALTH_NETBIRD_ENABLED=true. Automatic daemon restart also requires explicit
 # SELF_HEAL_NETBIRD_REMEDIATE=true; otherwise failures only escalate.
