@@ -618,7 +618,26 @@ missions (own + shared) and then falls back to a global ownership-filtered
 scan, rendering recent fires from the mission's `thread_history` with
 char-safe (never byte-index) summary truncation. A name found in neither
 registry errors with a message naming both registries and pointing at
-`routine_list` / `mission_list`.
+`routine_list` / `mission_list`. That fallback serves v1 threads only — in
+engine-v2 threads the bridge now blocks `routine_history` outright and points
+the model at `mission_history` (WI#269).
+
+Engine-v2 threads get their history surface from the `mission_history` tool
+(WI#269), registered in the `missions` capability alongside `mission_list`
+and `mission_update`. It resolves a mission by name or UUID — both paths
+scoped like `mission_list`: the name path resolves through the calling
+project's own + shared missions, and the UUID path re-checks project and
+ownership (own or shared-owner) after the store load, returning
+`access denied` for any other project's or user's mission UUID — and renders
+the newest fires from the mission's `thread_history`
+(default 10, clamp 1-50) in the `routine_history` result shape: per-run
+status, `started_at`/`completed_at`, `duration_secs`, a char-safe
+200-character result summary from the last assistant message, and
+`tokens_used`, plus `total_runs`, `last_fired_at`, and `never_fired` at the
+top level. `routine_history` itself is now in the bridge's v1-only tool
+list, so a v2 thread that asks for a name which shadows both registries
+gets an honest "use mission_history" error instead of silently returning
+the v1 object's history for a same-named routine.
 
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
