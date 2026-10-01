@@ -1274,6 +1274,19 @@ _podman_userns_join_failure() {  # <probe-output>
     || grep -q "Try running .*podman system migrate" <<<"$out"
 }
 
+# The tenant worker lanes and their image refs ("<lane> <ref>" per line), in
+# status-display order. Mirrors the refs 09-worker-config.sh's
+# start_tenant_<lane> functions pass to _ensure_tenant_image. Whether a lane is
+# actually expected for a given tenant is the caller's job
+# (tenant_worker_enabled — add-tenant --with-<lane>).
+_worker_image_refs() {
+  printf '%s %s\n' \
+    pebble lunarwing-worker-pebble:latest \
+    opencode lunarwing-worker-opencode:latest \
+    opencode2 lunarwing-worker-opencode2:latest \
+    kimi lunarwing-worker-kimi:latest
+}
+
 # Repair a tenant's broken rootless-podman user-namespace pairing (WI#142).
 #
 # Symptom: every `podman` invocation as the tenant — including the agent's
@@ -1363,7 +1376,25 @@ _repair_tenant_podman_userns_locked() {
     printf '%s\n' "$probe" >&2
     die "rootless podman userns repair did not recover tenant '$name'; rebooting the tenant host (or the tenant user manager) is the remaining remedy"
   fi
-  say "rootless podman userns repair complete for $name (probe OK)"
+
+  # The runtime probe does not prove the tenant store still holds the images
+  # its selected workers need: a failed save|load during start_tenant (or a
+  # store-level problem) leaves already-materialized containers running while
+  # the image itself is absent, so the next recreate would strand the worker
+  # (WI#271). The userns repair itself succeeded, so warn — do not fail.
+  local lane img missing_images=""
+  while read -r lane img; do
+    tenant_worker_enabled "$name" "$lane" || continue
+    _ctr "$name" image inspect "$img" &>/dev/null && continue
+    missing_images+="${missing_images:+ }$img"
+  done < <(_worker_image_refs)
+  if [[ -n "$missing_images" ]]; then
+    say "WARNING: worker image(s) missing from ${name}'s rootless store after repair: $missing_images" >&2
+    say "  running containers are unaffected, but the next recreate needs the image; re-distribute with 'start-tenant $name' (build the image first if the admin store also lacks it)" >&2
+    say "rootless podman userns repair complete for $name (probe OK; worker image(s) missing)"
+  else
+    say "rootless podman userns repair complete for $name (probe OK)"
+  fi
 }
 
 darkirc_managed_state_exists() {
@@ -1708,6 +1739,21 @@ status_tenant() {
   else
     say "Kimi worker: not created"
   fi
+
+  # Image presence in the tenant's own store (WI#271): a running/stopped
+  # container says nothing about whether the image survived — it only matters
+  # at (re)creation time, which is exactly when its absence strands a worker.
+  say "Worker images:"
+  local img_lane img_ref
+  while read -r img_lane img_ref; do
+    if ! tenant_worker_enabled "$name" "$img_lane"; then
+      say "  $img_ref: not selected for tenant"
+    elif _ctr "$name" image inspect "$img_ref" &>/dev/null; then
+      say "  $img_ref: present"
+    else
+      say "  $img_ref: missing"
+    fi
+  done < <(_worker_image_refs)
 
   local vision_container="lunarwing-vision-$name"
   if tenant_vision_external "$name"; then

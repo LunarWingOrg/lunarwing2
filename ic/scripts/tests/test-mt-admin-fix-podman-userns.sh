@@ -13,6 +13,9 @@ set -euo pipefail
 #    and fail loudly instead
 #  - a failing `podman system migrate` warns but the repair still completes
 #    when the final probe recovers
+#  - the post-repair verify also checks selected worker images are present in
+#    the tenant store: a missing image warns (degraded-but-repaired, WI#271)
+#    but does not fail the repair
 #
 # Stubbing notes: podman calls run inside `$( ... )` subshells, so every piece
 # of stub state that must survive them lives in files, not shell variables.
@@ -261,7 +264,86 @@ else
   fail "failing migrate: tenant not started"
 fi
 
-# ── 9. The classifier matches all known signatures ───────────────────────────
+# ── 9. Probe OK but selected worker image missing: warn, still succeed ───────
+# (WI#271: degraded-but-repaired — the userns pairing recovered, so repair
+# succeeds, but the missing image must be named loudly or the next container
+# recreate strands the worker.)
+
+tenant_worker_enabled() { [[ "$2" == pebble ]]; }
+_ctr_behave() {
+  case "${1:-}" in
+    ps)
+      if pop_ps_fail; then
+        printf 'Error: cannot re-exec process to join the existing user namespace\n' >&2
+        return 1
+      fi
+      return 0
+      ;;
+    system)
+      note_step MIGRATE
+      return 0
+      ;;
+    image)
+      return 1  # every image inspect fails: absent from the tenant store
+      ;;
+  esac
+  return 0
+}
+set_ps_fails 1
+: >"$ORDER"
+repair_rc=0
+repair_out="$(repair_tenant_podman_userns acorn 2>&1)" || repair_rc=$?
+if [[ "$repair_rc" == "0" ]]; then
+  pass "missing worker image: repair still succeeds (degraded-but-repaired)"
+else
+  fail "missing worker image: repair aborted (rc=$repair_rc)"
+fi
+if [[ "$repair_out" == *"WARNING: worker image(s) missing from acorn's rootless store after repair: lunarwing-worker-pebble:latest"* ]]; then
+  pass "missing worker image: warning names the absent image"
+else
+  fail "missing worker image: no warning emitted: $repair_out"
+fi
+if [[ "$repair_out" == *"repair complete for acorn (probe OK; worker image(s) missing)"* ]]; then
+  pass "missing worker image: completion line notes the degraded state"
+else
+  fail "missing worker image: completion line lacks degraded note"
+fi
+
+# ── 10. Probe OK and selected worker images present: plain completion ────────
+
+_ctr_behave() {
+  case "${1:-}" in
+    ps)
+      if pop_ps_fail; then
+        printf 'Error: cannot re-exec process to join the existing user namespace\n' >&2
+        return 1
+      fi
+      return 0
+      ;;
+    system)
+      note_step MIGRATE
+      return 0
+      ;;
+  esac
+  return 0  # image inspect succeeds: present in the tenant store
+}
+set_ps_fails 1
+: >"$ORDER"
+repair_rc=0
+repair_out="$(repair_tenant_podman_userns acorn 2>&1)" || repair_rc=$?
+if [[ "$repair_rc" == "0" ]]; then
+  pass "images present: repair succeeds"
+else
+  fail "images present: repair aborted (rc=$repair_rc)"
+fi
+if [[ "$repair_out" == *"repair complete for acorn (probe OK)"* ]] \
+    && [[ "$repair_out" != *"worker image(s) missing"* ]]; then
+  pass "images present: plain completion line, no image warning"
+else
+  fail "images present: unexpected output: $repair_out"
+fi
+
+# ── 11. The classifier matches all known signatures ──────────────────────────
 
 if _podman_userns_join_failure "Error: cannot re-exec process to join the existing user namespace"; then
   pass "classifier: bare join error matches"
