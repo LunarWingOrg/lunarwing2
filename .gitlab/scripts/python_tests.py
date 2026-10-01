@@ -75,13 +75,23 @@ def main() -> int:
             records,
         )
 
+    computer = ROOT / "projects" / "computer-use"
+    with import_from(computer), import_from(computer / "tests"):
+        computer_ok, computer_total, computer_skipped = run_suite(
+            "Wayland computer-use connector",
+            ["test_computer", "test_portal"],
+            records,
+        )
+
     junit.write(REPORT_PATH, records)
     total += adapter_total
+    total += computer_total
     skipped += adapter_skipped
+    skipped += computer_skipped
     if skipped:
         print(f"ERROR: {skipped} Python test(s) skipped; CI prerequisites are incomplete", file=sys.stderr)
         return 1
-    if not ok or not adapter_ok:
+    if not ok or not adapter_ok or not computer_ok:
         return 1
 
     print(f"Python test suites passed: {total} tests, no skips.")

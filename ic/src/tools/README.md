@@ -2,6 +2,16 @@
 
 ## Adding a New Tool
 
+### Existing Wayland desktop control
+
+The optional [computer-use connector](../../../projects/computer-use/README.md)
+exposes an existing GNU/Linux Wayland desktop through stdio MCP, locally or
+over SSH. It uses RemoteDesktop/ScreenCast portals, PipeWire screenshots and
+LunarVision-backed text observations. Run it as the desktop user, independently
+of the daemon. The linked guide covers installation, portal support, input
+tools and live acceptance. MCP image blocks are parsed but are not yet
+forwarded to the model; LunarWing uses the connector's `desktop_observe` tool.
+
 ### Built-in Tools (Rust)
 
 1. Create `src/tools/builtin/my_tool.rs`

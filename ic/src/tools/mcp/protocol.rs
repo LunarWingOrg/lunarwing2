@@ -416,7 +416,7 @@ pub struct ListToolsResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<ContentBlock>,
-    #[serde(default)]
+    #[serde(default, rename = "isError", alias = "is_error")]
     pub is_error: bool,
 }
 
@@ -427,7 +427,11 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]
-    Image { data: String, mime_type: String },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType", alias = "mime_type")]
+        mime_type: String,
+    },
     #[serde(rename = "resource")]
     Resource {
         uri: String,
@@ -749,7 +753,7 @@ mod tests {
         let json = serde_json::to_value(&image_block).expect("serialize");
         assert_eq!(json["type"], "image");
         assert_eq!(json["data"], "abc");
-        assert_eq!(json["mime_type"], "image/jpeg");
+        assert_eq!(json["mimeType"], "image/jpeg");
 
         let resource_block = ContentBlock::Resource {
             uri: "file:///x".to_string(),
@@ -786,6 +790,31 @@ mod tests {
         }))
         .expect("deserialize");
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn mcp_desktop_results_accept_standard_and_legacy_field_names() {
+        for (error_key, mime_key) in [("isError", "mimeType"), ("is_error", "mime_type")] {
+            let result: CallToolResult = serde_json::from_value(serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "Desktop session ended"},
+                    {"type": "image", "data": "AQID", (mime_key): "image/png"}
+                ],
+                (error_key): true
+            }))
+            .expect("MCP tool result");
+            assert!(
+                result.is_error,
+                "desktop failures must not become successful actions"
+            );
+            assert!(
+                matches!(&result.content[1], ContentBlock::Image { mime_type, .. } if mime_type == "image/png")
+            );
+            let wire = serde_json::to_value(result).expect("serialize result");
+            assert_eq!(wire["isError"], true);
+            assert_eq!(wire["content"][1]["mimeType"], "image/png");
+            assert!(wire.get("is_error").is_none());
+        }
     }
 
     #[test]
