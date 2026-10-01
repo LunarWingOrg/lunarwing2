@@ -49,7 +49,9 @@ estimates surfaced as frozen advisory hints on approvals and pending gates
 The operator surface gained per-tenant system-prompt editing in Settings with
 Engine V2 initialization snapshots (WI#220), read-only tenant database and
 daemon-PID diagnostics verbs in mt-admin (`psql`, `daemon-pid`) with a
-WI#268 prompt-overlay audit runbook, an opencode2 worker bump to v2.0.21, and
+WI#268 prompt-overlay audit runbook, worker-image store-failure surfacing
+with quoted stderr and per-lane image presence in `mt-admin status`
+(WI#271), an opencode2 worker bump to v2.0.21, and
 a pairing allowlist fix so approving a new sender no longer erases the
 existing allowlist. New tenants now render `ORCHESTRATOR_SELF_MODIFY=true`
 (stored orchestrator and prompt-overlay updates, WI#282), with the operator
@@ -156,6 +158,15 @@ previous compatibility baseline.
   diff and without enabling self-modification; a failed environment
   capture reports `uninspected (live gate)` with a non-zero exit rather than
   certifying "gate off"
+- **mt-admin worker-image store surfacing (WI#271).** The
+  `podman save | podman load` image distribution now captures both halves'
+  stderr and quotes the first lines in the WARNING, so store corruption vs
+  a missing admin-side image vs conmon-rot no longer collapse into one
+  generic line. The userns-repair post-verify checks worker-image presence
+  per selected lane and reports a degraded `repair complete … (probe OK;
+  worker image(s) missing)` instead of a clean bill, and
+  `mt-admin status <tenant>` gained a read-only `Worker images:` block
+  reporting `present`/`missing`/`not selected for tenant` per lane
 - **Crate security audit and supply chain (item 3).** All 27 tracked
   lockfile roots re-scanned against a fresh RustSec db (2026-09-30) with an
   empty ignore list and `unmaintained = "all"`; the resolved worker-image
@@ -283,7 +294,7 @@ previous compatibility baseline.
 | Voice sidecar admission | One in-flight call per component (STT/TTS/VAD) before shared capacity; blocked workers hold both permits until settlement; poisoned lock/panic = `component_failed`/503 until restart |
 | Tool runtime hints | `LUNARWING_TOOL_ESTIMATES` read once at startup: unset/`observe` = record only, `1` = record + hints, `0` = off; restart resets learned models; no migration or new wire fields |
 | Tenant system prompts | Settings editor writes primary-scope prompts consumed as Engine V2 initialization snapshots (activate via `restart-tenant` + new conversation); existing threads keep their System message |
-| mt-admin verbs | New: `psql <tenant>`, `daemon-pid <tenant>` (read-only diagnostics); all existing verbs unchanged |
+| mt-admin verbs | New: `psql <tenant>`, `daemon-pid <tenant>` (read-only diagnostics); `status <tenant>` reports per-lane worker-image presence (WI#271); all existing verbs unchanged |
 | New tenant env defaults | `ORCHESTRATOR_SELF_MODIFY=true` rendered at add-tenant (WI#282); explicit operator values preserved on re-render; existing tenants untouched |
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
 | XMPP outbound delivery | `message` tool ack reports `Queued …` (acceptance, not delivery); enqueue refused while no session is bound; bounded 2s shutdown drain; durable spool persists every outbound message before ack with replay on bind, backoff retry, and `.failed.json` parking after 24 attempts — at-least-once semantics (post-send crash can duplicate at whole-message granularity) |
@@ -473,6 +484,35 @@ values are reduced to presence/absence before printing. A regression pins
 that `prompt_additions` writes nothing while the self-modify gate is off.
 The !1276 review's daemon-PID findings (as-written validation, tenant
 association, fixture cleanup) are addressed in the same pass.
+
+### mt-admin Worker-Image Store Surfacing (WI#271)
+
+Tenant worker-image failures no longer hide behind generic lines:
+
+- `_ensure_tenant_image` now captures both halves' stderr from the
+  `podman save | podman load` distribution into mktemp files and quotes
+  the first lines in the WARNING — store corruption vs a missing
+  admin-side image vs the conmon-rot class no longer collapse into one
+  generic line; the temp files are cleaned on the success, failure, and
+  mktemp-failure paths.
+- The `repair_tenant_podman_userns` post-verify checks worker-image
+  presence per selected lane via the tenant-context container wrapper
+  (new shared `_worker_image_refs` helper mirroring the four worker refs,
+  using the same gate `start_tenant` uses), so repair no longer concludes
+  "complete (probe OK)" with the pebble image absent — it warns with
+  remediation and reports `repair complete … (probe OK; worker image(s)
+  missing)`, the file's existing degraded-but-repaired idiom.
+- `mt-admin status <tenant>` gained a `Worker images:` block reporting
+  `present`/`missing` per selected lane and `not selected for tenant`
+  for the rest — read-only, init-agnostic, with no false "missing" for
+  unselected lanes.
+
+Verified with the mt-admin regression suites (tenant-image 10/10 with the
+new stderr-quoting cases, fix-podman-userns cases 9–10, openrc-status
+`Worker images:` assertions) plus repo-wide shell syntax/shellcheck. The
+rig-side smoke PARTIAL flag stays rig-owned (out of tree), and image-ID as
+a container-recreation trigger remains a deliberate-decision item per the
+WI.
 
 ### Crate Security Audit and Supply Chain (item 3)
 
@@ -800,6 +840,23 @@ history. The top pick is **Kabuto (兜)** — completing the `Yoroi` (2.1.2.0)
 → `Ō-Yoroi` (2.1.3.0) armor lineage — with Kiwame (極め) and Shūfuku (修復)
 as alternates. The codename above remains UNKNOWN until a human picks.
 
+### Repo Housecleaning and Agent-Doc Drift (items 28, #285)
+
+Fourteen stale versioned docs moved from `docs/ops/` to
+`docs/ops/history/` via `git mv` (rename tracking preserved) — the eleven
+`v2.0.9.0_*` goal-evidence docs plus three `v2.1.3.0_*` audit/status docs —
+matching the convention prior releases already used, and the placeholder
+`docs/ov/` directory was removed. Every inbound reference was repaired in
+the same pass (guides, prior release notes, the v2.1.4.0 audit doc, the
+moved docs' self-references, and a `ic/deny.toml` comment), and a
+repo-wide grep confirms zero stale `docs/ops/v2.0.9.0_` /
+`docs/ops/v2.1.3.0_` paths remain. The root and `ic/` `AGENTS.md` files
+also took a drift pass (#285): the deeper-docs lists now name only the
+five specs that exist in the tree, every relative path resolves from its
+file's own directory, and the watchdog asset lists include the launchd
+assets with consistent init-system guidance (systemd + OpenRC first,
+launchd a distant third).
+
 ## Upgrade Notes
 
 1. Back up PostgreSQL, tenant environment files, `/etc/lunarwing/ports.json`,
@@ -917,10 +974,6 @@ as alternates. The codename above remains UNKNOWN until a human picks.
   landed allowFrom-preservation fix (!1283).
 - WI#191 later slices (LLM timing, whole-job/mission ETA, gate-wait
   analytics, durable aggregate caches) are deferred beyond this release.
-- Repo housecleaning (item 28) is tracked separately in the goals document
-  and may land after this draft is finalized; the docs/guides (item 16) and
-  docs/architecture (item 17) repasses landed after the first draft and are
-  covered in the sections above.
 
 ### Resolved or Source-Fixed Since v2.1.3.0
 
@@ -961,6 +1014,9 @@ as alternates. The codename above remains UNKNOWN until a human picks.
 - mt-admin `psql`/`daemon-pid` read-only diagnostics plus the WI#268
   prompt-overlay audit runbook with uninspected-on-failure semantics and
   as-written PID validation.
+- mt-admin surfaces tenant worker-image store failures with quoted stderr,
+  verifies per-lane image presence after userns repair, and reports a
+  `Worker images:` block in `status` (WI#271 source-fixed).
 - Approving a pairing sender no longer truncates the existing allowlist;
   rewrites are locked, seek-corrected, and synced.
 - New tenants default to `ORCHESTRATOR_SELF_MODIFY=true` with the operator
@@ -994,6 +1050,10 @@ as alternates. The codename above remains UNKNOWN until a human picks.
 - Ten codename candidates are shortlisted for the human pick in
   `docs/ops/v2.1.4.0_CODENAME_IDEAS.md` (top pick Kabuto; the draft header
   stays UNKNOWN until then).
+- Repo housecleaning archived fourteen stale versioned ops docs to
+  `docs/ops/history/` with every inbound link repaired and removed the
+  placeholder `docs/ov/`; the root and `ic/` `AGENTS.md` files took a
+  drift pass so their spec lists and relative paths match the tree (#285).
 
 ---
 
