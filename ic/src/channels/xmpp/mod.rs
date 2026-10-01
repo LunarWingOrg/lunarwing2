@@ -68,6 +68,11 @@ const MAX_CONCURRENT_OOB_DOWNLOADS: usize = 4;
 /// Pending inbound messages awaiting attachment extraction. One FIFO worker
 /// preserves message order while bounding memory and task creation.
 const INBOUND_ATTACHMENT_QUEUE_CAPACITY: usize = 16;
+/// Bounded wait for the still-running client task to drain the memory-only
+/// outbound queue during graceful shutdown (WI#270). Mirrors the coalesce
+/// buffer flush: shutdown must not hang, but acked messages deserve a chance.
+const OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const OUTBOUND_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Default)]
 struct EncryptedRoomState {
@@ -200,6 +205,11 @@ pub struct XmppChannel {
     encrypted_room_states: Arc<RwLock<HashMap<String, EncryptedRoomState>>>,
     /// Sender half for outbound stanzas.
     outbound_tx: mpsc::Sender<OutboundMessage>,
+    /// Outbound stanzas accepted into the queue but not yet processed by the
+    /// client task (WI#270). Depth signal for the shutdown drain: anything
+    /// still pending when the process exits is lost, because the queue is
+    /// memory-only.
+    outbound_pending: Arc<std::sync::atomic::AtomicUsize>,
     outbound_rate_limiter: Arc<tokio::sync::Mutex<OutboundRateLimiter>>,
     /// Receiver half taken by `start()` on the first call.
     outbound_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<OutboundMessage>>>>,
@@ -238,6 +248,7 @@ impl XmppChannel {
             muc_participants: Arc::new(RwLock::new(HashMap::new())),
             encrypted_room_states: Arc::new(RwLock::new(HashMap::new())),
             outbound_tx,
+            outbound_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             outbound_rate_limiter,
             outbound_rx: Arc::new(tokio::sync::Mutex::new(Some(outbound_rx))),
             http_upload_service: Arc::new(RwLock::new(None)),
@@ -278,6 +289,24 @@ impl XmppChannel {
             "XMPP queuing outbound message"
         );
 
+        // WI#270: the outbound queue is memory-only, so anything accepted
+        // while no session is bound is a stanza that can only be lost (or
+        // delayed until reconnect drains it). Callers (the message tool ack)
+        // treat acceptance as success, so refuse enqueue instead of accepting
+        // into a doomed queue; replies race reconnect windows far less often
+        // than proactive sends.
+        if !self.connected.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::warn!(
+                to = %target_jid,
+                groupchat,
+                "XMPP outbound message refused: no bound session (disconnected or reconnecting)"
+            );
+            return Err(ChannelError::SendFailed {
+                name: "xmpp".into(),
+                reason: "XMPP is not connected (no bound session); message not queued".into(),
+            });
+        }
+
         if let Err(active_limit) = self.outbound_rate_limiter.lock().await.try_acquire() {
             tracing::warn!(
                 to = %target_jid,
@@ -294,7 +323,14 @@ impl XmppChannel {
             });
         }
 
-        self.outbound_tx
+        // Reserve the pending slot BEFORE enqueue: the client task may
+        // receive and finish this message before `send` returns, and its
+        // decrement must never race ahead of the matching increment
+        // (a send-then-increment order could transiently wrap the counter).
+        self.outbound_pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Err(_dropped) = self
+            .outbound_tx
             .send(OutboundMessage {
                 to: target_jid,
                 body,
@@ -303,10 +339,15 @@ impl XmppChannel {
                 attachments,
             })
             .await
-            .map_err(|_| ChannelError::SendFailed {
+        {
+            self.outbound_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return Err(ChannelError::SendFailed {
                 name: "xmpp".into(),
                 reason: "outbound channel closed (client task exited)".into(),
-            })
+            });
+        }
+        Ok(())
     }
 
     /// Send a proactive message with file attachments to a target JID.
@@ -417,6 +458,18 @@ struct XmppConnectionGuard(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for XmppConnectionGuard {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Decrements the outbound pending counter when the client task finishes
+/// with a queued message (WI#270). The shutdown drain waits on that counter:
+/// anything still pending at process exit is lost, because the queue is
+/// memory-only.
+struct OutboundPendingSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for OutboundPendingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -888,6 +941,7 @@ impl Channel for XmppChannel {
         let muc_participants = Arc::clone(&self.muc_participants);
         let encrypted_room_states = Arc::clone(&self.encrypted_room_states);
         let outbound_tx = self.outbound_tx.clone();
+        let outbound_pending = Arc::clone(&self.outbound_pending);
         let http_upload_service = Arc::clone(&self.http_upload_service);
         let connected = Arc::clone(&self.connected);
         let pairing_store = PairingStore::new();
@@ -1002,7 +1056,12 @@ impl Channel for XmppChannel {
 
                     outbound = outbound_rx.recv() => {
                         match outbound {
-                            Some(msg) => match msg.to.parse::<xmpp_parsers::jid::Jid>() {
+                            Some(msg) => {
+                                // Mark this queue slot processed no matter how
+                                // delivery goes: the shutdown drain only waits
+                                // for messages the client task still owns.
+                                let pending_slot = OutboundPendingSlot(Arc::clone(&outbound_pending));
+                                match msg.to.parse::<xmpp_parsers::jid::Jid>() {
                                 Ok(to_jid) => {
                                     // Upload any attachments via XEP-0363, then assemble
                                     // the bodies to send: the text first (if present),
@@ -1121,7 +1180,9 @@ impl Channel for XmppChannel {
                                 Err(e) => {
                                     tracing::warn!("XMPP outbound: invalid JID '{}': {e}", msg.to);
                                 }
-                            },
+                                }
+                                drop(pending_slot);
+                            }
                             None => {
                                 tracing::debug!("XMPP outbound channel closed, stopping task");
                                 break;
@@ -1319,6 +1380,37 @@ impl Channel for XmppChannel {
     async fn shutdown(&self) -> Result<(), ChannelError> {
         // Coalesced flushes are owned by the agent-level shared buffer,
         // which the agent run loop flushes before channel shutdown.
+        //
+        // WI#270: the outbound mpsc is memory-only and is NOT flushed by the
+        // agent, so give the still-running client task a bounded window to
+        // drain any stanzas already acked to callers. If the queue does not
+        // empty in time, say so loudly — those messages are lost when the
+        // process exits (durable spooling is tracked separately).
+        let pending_now = self
+            .outbound_pending
+            .load(std::sync::atomic::Ordering::Acquire);
+        if pending_now > 0 {
+            let deadline = Instant::now() + OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT;
+            while Instant::now() < deadline
+                && self
+                    .outbound_pending
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    > 0
+            {
+                tokio::time::sleep(OUTBOUND_DRAIN_POLL_INTERVAL).await;
+            }
+            let remaining = self
+                .outbound_pending
+                .load(std::sync::atomic::Ordering::Acquire);
+            if remaining > 0 {
+                tracing::warn!(
+                    pending = remaining,
+                    "XMPP shutdown: outbound queue did not drain; pending messages will be lost"
+                );
+            } else {
+                tracing::debug!("XMPP shutdown: outbound queue drained");
+            }
+        }
         self.connected
             .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -4380,6 +4472,194 @@ mod tests {
         (dir, store)
     }
 
+    fn simulate_bound_session(channel: &XmppChannel) {
+        channel
+            .connected
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn clear_bound_session(channel: &XmppChannel) {
+        channel
+            .connected
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// WI#270: proactive enqueue must be refused while no session is bound,
+    /// instead of accepting into the memory-only outbound queue where a
+    /// restart would silently drop the "acked" stanza.
+    #[tokio::test]
+    async fn queue_outbound_refused_without_bound_session() {
+        let channel = XmppChannel::new(test_config())
+            .await
+            .expect("channel initializes");
+
+        let err = channel
+            .queue_outbound(
+                "alice@example.com".to_string(),
+                "proactive".to_string(),
+                false,
+                None,
+            )
+            .await
+            .expect_err("enqueue without a bound session must fail");
+
+        match err {
+            ChannelError::SendFailed { name, reason } => {
+                assert_eq!(name, "xmpp");
+                assert!(reason.contains("not connected"), "got: {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let mut guard = channel.outbound_rx.lock().await;
+        let rx = guard.as_mut().expect("receiver available");
+        assert!(rx.try_recv().is_err(), "refused message must not be queued");
+
+        // Once a session is bound, enqueue succeeds again.
+        drop(guard);
+        simulate_bound_session(&channel);
+        channel
+            .queue_outbound(
+                "alice@example.com".to_string(),
+                "proactive".to_string(),
+                false,
+                None,
+            )
+            .await
+            .expect("enqueue succeeds with a bound session");
+        let outbound = recv_outbound(&channel).await;
+        assert_eq!(outbound.body, "proactive");
+    }
+
+    /// WI#270: after a disconnect, a shutdown must not re-enable enqueue —
+    /// the gate tracks the live connection flag, not channel lifetime.
+    #[tokio::test]
+    async fn broadcast_refused_after_shutdown_disconnect() {
+        let channel = XmppChannel::new(test_config())
+            .await
+            .expect("channel initializes");
+        simulate_bound_session(&channel);
+        clear_bound_session(&channel);
+
+        let err = channel
+            .broadcast(
+                "alice@example.com",
+                OutgoingResponse::text("post-disconnect"),
+            )
+            .await
+            .expect_err("broadcast after disconnect must fail");
+        assert!(err.to_string().contains("not connected"), "got: {err}");
+    }
+
+    #[test]
+    fn outbound_pending_slot_decrements_counter_on_drop() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        {
+            let _slot = OutboundPendingSlot(Arc::clone(&counter));
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "slot must not decrement while the message is owned"
+            );
+        }
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "slot must decrement when the client task is done with the message"
+        );
+    }
+
+    /// WI#270: shutdown with an unowned queued message (client task never
+    /// consumed it) must warn instead of silently dropping, and must not
+    /// hang past the bounded drain window.
+    #[tokio::test]
+    async fn shutdown_reports_undrained_outbound_queue() {
+        let channel = XmppChannel::new(test_config())
+            .await
+            .expect("channel initializes");
+        simulate_bound_session(&channel);
+
+        channel
+            .queue_outbound(
+                "alice@example.com".to_string(),
+                "never processed".to_string(),
+                false,
+                None,
+            )
+            .await
+            .expect("enqueue succeeds with a bound session");
+        assert_eq!(
+            channel
+                .outbound_pending
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        // No client task is running (start() was never called), so the
+        // message cannot be drained: shutdown must complete within the
+        // bounded window while the message stays pending.
+        let started = Instant::now();
+        channel.shutdown().await.expect("shutdown succeeds");
+        assert!(
+            started.elapsed() >= OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT,
+            "shutdown must wait the full drain window before giving up"
+        );
+        assert_eq!(
+            channel
+                .outbound_pending
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "undrained message must still be counted"
+        );
+
+        // A drained queue must not stall shutdown.
+        channel
+            .outbound_pending
+            .store(0, std::sync::atomic::Ordering::Release);
+        let started = Instant::now();
+        channel.shutdown().await.expect("second shutdown succeeds");
+        assert!(
+            started.elapsed() < OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT,
+            "empty queue must not wait the drain window"
+        );
+    }
+
+    /// WI#270: shutdown must return as soon as the client task finishes
+    /// processing the queued message, not wait out the full window.
+    #[tokio::test]
+    async fn shutdown_drain_waits_for_client_task_to_consume() {
+        let channel = XmppChannel::new(test_config())
+            .await
+            .expect("channel initializes");
+        simulate_bound_session(&channel);
+
+        channel
+            .queue_outbound(
+                "alice@example.com".to_string(),
+                "drain me".to_string(),
+                false,
+                None,
+            )
+            .await
+            .expect("enqueue succeeds with a bound session");
+
+        // Simulate the client task taking ownership of the queued message
+        // shortly after shutdown begins: the drain loop must observe the
+        // counter drop and finish early.
+        let pending = Arc::clone(&channel.outbound_pending);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            pending.store(0, std::sync::atomic::Ordering::Release);
+        });
+
+        let started = Instant::now();
+        channel.shutdown().await.expect("shutdown succeeds");
+        assert!(
+            started.elapsed() < OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT,
+            "drain must finish once the queue is consumed"
+        );
+    }
+
     #[tokio::test]
     async fn health_check_reflects_connection_state() {
         // Goal-26 stress finding F3: native XMPP health was unconditional
@@ -4421,6 +4701,7 @@ mod tests {
         let channel = XmppChannel::new(test_config())
             .await
             .expect("channel initializes");
+        simulate_bound_session(&channel);
         let msg = IncomingMessage::new("xmpp", "room@conference.example.com", "hi").with_metadata(
             serde_json::json!({
                 "chat_type": "group",
@@ -4447,6 +4728,7 @@ mod tests {
         let channel = XmppChannel::new(test_config())
             .await
             .expect("channel initializes");
+        simulate_bound_session(&channel);
         let msg = IncomingMessage::new("xmpp", "alice@example.com", "hi").with_metadata(
             serde_json::json!({
                 "chat_type": "private",
@@ -4473,6 +4755,7 @@ mod tests {
         let channel = XmppChannel::new(test_config())
             .await
             .expect("channel initializes");
+        simulate_bound_session(&channel);
         channel
             .muc_participants
             .write()
@@ -4497,6 +4780,7 @@ mod tests {
         let channel = XmppChannel::new(test_config())
             .await
             .expect("channel initializes");
+        simulate_bound_session(&channel);
 
         let metadata = serde_json::json!({ "xmpp_target": "alice@example.com" });
         channel
@@ -4548,6 +4832,7 @@ mod tests {
         let mut config = test_config();
         config.max_messages_per_hour = 1;
         let channel = XmppChannel::new(config).await.expect("channel initializes");
+        simulate_bound_session(&channel);
 
         channel
             .queue_outbound(
@@ -4593,6 +4878,7 @@ mod tests {
         let mut config = test_config();
         config.max_messages_per_hour = 1;
         let channel = XmppChannel::new(config).await.expect("channel initializes");
+        simulate_bound_session(&channel);
 
         channel
             .queue_outbound(

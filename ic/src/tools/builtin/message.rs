@@ -200,7 +200,9 @@ impl Tool for MessageTool {
          - Signal: target accepts E.164 (+1234567890) or group ID \
          - XMPP: target accepts username or chat ID \
          - XMPP: target accepts bare JID (user@domain.tld) \
-         - WeeChat: target must be a full buffer name (irc.<network>.<nick-or-channel>)"
+         - WeeChat: target must be a full buffer name (irc.<network>.<nick-or-channel>) \
+         A successful result means the channel ACCEPTED the message for delivery (queued), \
+         not that it was delivered. Never record 'delivered' in memory based on this tool alone"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -361,13 +363,18 @@ impl Tool for MessageTool {
             {
                 Ok(()) => {
                     tracing::info!(
-                        message_sent = true,
+                        message_accepted = true,
                         channel = %channel,
                         target = %target,
                         attachments = attachment_count,
-                        "Message sent via message tool"
+                        "Message accepted for delivery via message tool"
                     );
-                    let msg = format!("Sent message to {}:{}", channel, target);
+                    // The channel contract is enqueue-acceptance, not delivery
+                    // (WI#270): channels may buffer outbound messages in memory,
+                    // so claiming "sent"/"delivered" here is what let a mission
+                    // log a false "Delivered via XMPP" record when a restart
+                    // ate the queue. Report acceptance honestly.
+                    let msg = format!("Queued message to {}:{}", channel, target);
                     Ok(ToolOutput::text(msg, start.elapsed()))
                 }
                 Err(e) => {
@@ -413,14 +420,14 @@ impl Tool for MessageTool {
                 Err(ToolError::ExecutionFailed(err_msg))
             } else {
                 tracing::info!(
-                    message_sent = true,
+                    message_accepted = true,
                     channels = ?succeeded,
                     target = %target,
                     attachments = attachment_count,
-                    "Message broadcast via message tool"
+                    "Message accepted for delivery via message tool"
                 );
                 let msg = format!(
-                    "Broadcast message to {} (target: {})",
+                    "Queued message to {} (target: {})",
                     succeeded.join(", "),
                     target
                 );
@@ -894,7 +901,7 @@ mod tests {
 
         assert_eq!(
             result.result.as_str(),
-            Some("Sent message to xmpp:owner-scope")
+            Some("Queued message to xmpp:owner-scope")
         );
         assert!(gateway_captures.lock().await.is_empty());
         let xmpp = xmpp_captures.lock().await.clone();
@@ -925,7 +932,7 @@ mod tests {
 
         assert_eq!(
             result.result.as_str(),
-            Some("Sent message to xmpp:interactive-chat-user")
+            Some("Queued message to xmpp:interactive-chat-user")
         );
         assert!(gateway_captures.lock().await.is_empty());
         let xmpp = xmpp_captures.lock().await.clone();
@@ -1005,7 +1012,10 @@ mod tests {
             .execute(serde_json::json!({"content": "hello"}), &ctx)
             .await
             .expect("message tool should use xmpp metadata routing");
-        assert_eq!(result.result.as_str(), Some("Sent message to xmpp:424242"));
+        assert_eq!(
+            result.result.as_str(),
+            Some("Queued message to xmpp:424242")
+        );
 
         assert!(gateway_captures.lock().await.is_empty());
         let xmpp = xmpp_captures.lock().await.clone();
@@ -1036,7 +1046,7 @@ mod tests {
             result
                 .result
                 .as_str()
-                .is_some_and(|message| message.contains("Broadcast message to"))
+                .is_some_and(|message| message.contains("Queued message to"))
         );
 
         let gateway = gateway_captures.lock().await.clone();

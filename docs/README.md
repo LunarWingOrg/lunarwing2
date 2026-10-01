@@ -32,6 +32,7 @@ System design and technical architecture documents (the authoritative specs).
 |------|-------------|
 | [`ENGINE-V2.md`](architecture/ENGINE-V2.md) | V2 engine: threads, capabilities, CodeAct, gates, learning missions (linked from `CLAUDE.md`) |
 | [`IRC-SENDER-IDENTITY.md`](architecture/IRC-SENDER-IDENTITY.md) | Versioned DarkIRC and WeeChat sender principals, DM scope, pairing compatibility, owner routing, and migration behavior |
+| [`OUTBOUND-DELIVERY-SEMANTICS.md`](architecture/OUTBOUND-DELIVERY-SEMANTICS.md) | What a successful `message`-tool send means (acceptance, not delivery), XMPP enqueue gate/shutdown drain, and mission-spec delivery-receipt discipline (WI#270) |
 | [`SSH_AGENT_HARNESS.md`](architecture/SSH_AGENT_HARNESS.md) | SSH agent harness: per-tenant in-process ssh-agent, encrypted key store, worker socket injection, host-key model |
 | [`SSH_DELIVERY_MECHANISMS.md`](architecture/SSH_DELIVERY_MECHANISMS.md) | The three ways the agent runs SSH: worker mode, the `ssh`/`ssh_git` built-in tools, and the WASM `ssh` tool — when-to-use, security, enablement |
 | [`SEMANTIC-MEMORY-SEARCH.md`](architecture/SEMANTIC-MEMORY-SEARCH.md) | Hybrid FTS + vector memory search, RRF fusion, embeddings (linked from `CLAUDE.md`) |
