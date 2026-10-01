@@ -85,6 +85,7 @@ fi
 # Leg 2: imperative path (systemd without Quadlet support) — an existing,
 # running container whose config is unchanged must hash-check against the
 # image-augmented contract and re-store it.
+# shellcheck disable=SC2034  # read by the sourced start path
 INIT_SYSTEM="systemd"
 podman_supports_quadlet() { return 1; }
 CHANGED_RC=1   # unchanged: exercise the already-running store path
