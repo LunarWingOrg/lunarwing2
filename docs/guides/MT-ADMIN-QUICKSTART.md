@@ -167,7 +167,7 @@ On rootless-podman hosts, a tenant can start failing with `cannot re-exec proces
 sudo ic/scripts/lunarwing-mt-admin.sh fix-podman-userns ruffles
 ```
 
-The command probes first and is a no-op on a healthy pairing; on the join signature it stops the tenant, cleans stale `pause.pid` state, runs `podman system migrate` as the tenant user, and restarts with health-gated sidecar recreation.
+The command probes first and is a no-op on a healthy pairing; on the join signature it stops the tenant, cleans stale `pause.pid` state, runs `podman system migrate` as the tenant user, and restarts with health-gated sidecar recreation. Since WI#271 every success path also audits the tenant's image store: a green probe no longer masks store drift, and any expected-but-missing worker/sidecar image is WARNed with its recovery verb (`build-pebble-worker`/`build-opencode-worker`/`build-opencode2-worker`/`build-kimi-worker`, `build-vision-sidecar`, `install-voice`; the following `start-tenant` re-distributes). `status <tenant>` shows the same audit as its **Store images** section.
 
 If a component fails, keep using MT admin to inspect the tenant and then read the init-appropriate logs. Do not bypass a failed `start-tenant` by manually starting a partial OpenRC or systemd graph; either fix/disable the failing optional component through supported configuration or rerender/reconcile the tenant.
 

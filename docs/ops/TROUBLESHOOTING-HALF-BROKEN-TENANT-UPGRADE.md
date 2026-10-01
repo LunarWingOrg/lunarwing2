@@ -59,6 +59,16 @@ as a signal to re-verify the image stores, not just the env value.
 
 ### Diagnosis
 
+For worker/sidecar images (everything except the per-tenant-runtime sandbox
+image), two surfaces added in WI#271 answer "did the stores drift?" without
+manual probing: `mt-admin status <tenant>` prints a **Store images** section
+classifying each expected image as `current` / `STALE` / `MISSING` against the
+admin store, and the host health pipeline's monitor-only `worker_images`
+component pages on missing images. Since WI#271 a failed distribution also
+prints the captured `save|load` stderr, so the WARNING says why the copy
+failed. The manual probes below remain the reference for the sandbox image and
+for verifying what the tooling reports.
+
 Check the selected sandbox runtime's admin store and, for Podman, the tenant's
 rootless store. `SANDBOX_RUNTIME=docker` prefers Docker; `auto`/`podman` prefers
 Podman if installed (with CLI fallback as in `sandbox_container_runtime`). The
