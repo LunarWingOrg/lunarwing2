@@ -604,6 +604,15 @@ pattern is exactly a known system event type (`thread_start`,
 Mission listings surface `last_fired_at` / `never_fired` so an "Active" status
 cannot be mistaken for a dispatching one (registry honesty).
 
+The v1 `routine_history` tool resolves mission names too (WI#265): when the
+v1 routines registry misses a name, the tool queries the bridge's
+`get_engine_mission_history_by_name`, which searches the default project's
+missions (own + shared) and then falls back to a global ownership-filtered
+scan, rendering recent fires from the mission's `thread_history` with
+char-safe (never byte-index) summary truncation. A name found in neither
+registry errors with a message naming both registries and pointing at
+`routine_list` / `mission_list`.
+
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
 loaded checkpoint **before** the `Running` transition and the first model

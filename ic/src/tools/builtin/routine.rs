@@ -1535,6 +1535,114 @@ impl RoutineHistoryTool {
     }
 }
 
+/// Recent runs for a v1 routine, rendered as JSON.
+async fn v1_routine_runs(
+    store: &Arc<dyn Database>,
+    ctx: &JobContext,
+    name: &str,
+    limit: i64,
+) -> Result<Option<serde_json::Value>, ToolError> {
+    let routine = store
+        .get_routine_by_name(&ctx.user_id, name)
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("DB error: {e}")))?;
+
+    let Some(routine) = routine else {
+        return Ok(None);
+    };
+
+    let runs = store
+        .list_routine_runs(routine.id, limit)
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("failed to list runs: {e}")))?;
+
+    let run_list: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|r| {
+            let duration_secs = r
+                .completed_at
+                .map(|c| c.signed_duration_since(r.started_at).num_seconds());
+            serde_json::json!({
+                "id": r.id.to_string(),
+                "trigger_type": r.trigger_type,
+                "trigger_detail": r.trigger_detail,
+                "started_at": r.started_at.to_rfc3339(),
+                "completed_at": r.completed_at.map(|t| t.to_rfc3339()),
+                "duration_secs": duration_secs,
+                "status": r.status.to_string(),
+                "result_summary": r.result_summary,
+                "tokens_used": r.tokens_used,
+            })
+        })
+        .collect();
+
+    Ok(Some(serde_json::json!({
+        "routine": name,
+        "total_runs": routine.run_count,
+        "runs": run_list,
+    })))
+}
+
+/// Engine V2 mission history fallback (WI#265): names that miss the v1
+/// routines registry may name a live mission, whose fires are rendered from
+/// the mission's `thread_history`.
+async fn engine_mission_runs(
+    ctx: &JobContext,
+    name: &str,
+    limit: usize,
+) -> Result<Option<serde_json::Value>, ToolError> {
+    let history = crate::bridge::get_engine_mission_history_by_name(name, &ctx.user_id, limit)
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("engine mission lookup failed: {e}")))?;
+
+    Ok(history.map(|history| render_engine_mission_history(name, &history)))
+}
+
+/// Render resolved mission history in the `routine_history` result shape.
+fn render_engine_mission_history(
+    name: &str,
+    history: &crate::bridge::EngineMissionHistory,
+) -> serde_json::Value {
+    let runs: Vec<serde_json::Value> = history
+        .runs
+        .iter()
+        .map(|run| {
+            serde_json::json!({
+                "id": run.thread_id,
+                "trigger_type": "mission_thread",
+                "trigger_detail": None::<String>,
+                "started_at": run.started_at,
+                "completed_at": run.completed_at,
+                "duration_secs": run.duration_secs,
+                "status": run.status,
+                "result_summary": run.result_summary,
+                "tokens_used": run.tokens_used,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "routine": name,
+        "kind": "engine_mission",
+        "mission_id": history.info.id,
+        "cadence": history.cadence,
+        "status": history.info.status,
+        "total_runs": history.info.thread_count,
+        "last_fired_at": history.info.last_fired_at,
+        "never_fired": history.info.never_fired,
+        "runs": runs,
+    })
+}
+
+/// Not-found error naming both registries a `routine_history` name can live
+/// in (WI#265): the v1 routines table and Engine V2 missions.
+fn routine_not_found_error(name: &str) -> ToolError {
+    ToolError::ExecutionFailed(format!(
+        "routine '{}' not found in routines or engine missions — try routine_list or mission_list",
+        name
+    ))
+}
+
 #[async_trait]
 impl Tool for RoutineHistoryTool {
     fn name(&self) -> &str {
@@ -1542,7 +1650,8 @@ impl Tool for RoutineHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "View the execution history of a routine. Shows recent runs with status, duration, and results."
+        "View the execution history of a routine. Shows recent runs with status, duration, and results. \
+         Resolves both v1 routines and Engine V2 mission names (as shown by mission_list)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1551,7 +1660,7 @@ impl Tool for RoutineHistoryTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Name of the routine"
+                    "description": "Name of the routine or engine mission"
                 },
                 "limit": {
                     "type": "integer",
@@ -1576,46 +1685,14 @@ impl Tool for RoutineHistoryTool {
             .get("limit")
             .and_then(|v| v.as_i64())
             .unwrap_or(10)
-            .min(50);
+            .clamp(1, 50);
 
-        let routine = self
-            .store
-            .get_routine_by_name(&ctx.user_id, name)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("DB error: {e}")))?
-            .ok_or_else(|| ToolError::ExecutionFailed(format!("routine '{}' not found", name)))?;
-
-        let runs = self
-            .store
-            .list_routine_runs(routine.id, limit)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to list runs: {e}")))?;
-
-        let run_list: Vec<serde_json::Value> = runs
-            .iter()
-            .map(|r| {
-                let duration_secs = r
-                    .completed_at
-                    .map(|c| c.signed_duration_since(r.started_at).num_seconds());
-                serde_json::json!({
-                    "id": r.id.to_string(),
-                    "trigger_type": r.trigger_type,
-                    "trigger_detail": r.trigger_detail,
-                    "started_at": r.started_at.to_rfc3339(),
-                    "completed_at": r.completed_at.map(|t| t.to_rfc3339()),
-                    "duration_secs": duration_secs,
-                    "status": r.status.to_string(),
-                    "result_summary": r.result_summary,
-                    "tokens_used": r.tokens_used,
-                })
-            })
-            .collect();
-
-        let result = serde_json::json!({
-            "routine": name,
-            "total_runs": routine.run_count,
-            "runs": run_list,
-        });
+        let result = match v1_routine_runs(&self.store, ctx, name, limit).await? {
+            Some(result) => result,
+            None => engine_mission_runs(ctx, name, limit as usize)
+                .await?
+                .ok_or_else(|| routine_not_found_error(name))?,
+        };
 
         Ok(ToolOutput::success(result, start.elapsed()))
     }
@@ -1624,7 +1701,6 @@ impl Tool for RoutineHistoryTool {
         false
     }
 }
-
 // ==================== event_emit ====================
 
 pub struct EventEmitTool {
@@ -2460,5 +2536,104 @@ mod tests {
                 && description == "Run it"
                 && max_iterations == 10
         ));
+    }
+
+    // ── routine_history engine mission fallback (WI#265) ────────
+
+    #[test]
+    fn routine_history_not_found_error_names_both_registries() {
+        // Pure error-contract check (WI#265): a name that misses the v1
+        // routines registry must produce an error naming both registries and
+        // pointing at the discovery tools, instead of the old bare
+        // "routine '<name>' not found".
+        let error = routine_not_found_error("conversation-insights");
+        let message = error.to_string();
+        assert!(
+            message.contains("not found in routines or engine missions"),
+            "error should name both registries: {message}"
+        );
+        assert!(
+            message.contains("routine_list") && message.contains("mission_list"),
+            "error should point at discovery tools: {message}"
+        );
+        assert!(
+            message.contains("conversation-insights"),
+            "error should echo the unresolved name: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn routine_history_falls_back_to_engine_missions() {
+        // Serialized against every other global ENGINE_STATE test (WI#265
+        // review: the fallback must not race parallel engine-state tests).
+        let guard = crate::bridge::router::tests::engine_state_test_lock().await;
+        let ctx = crate::context::JobContext::with_user(
+            "alice",
+            "history probe",
+            "routine_history fallback probe",
+        );
+
+        // Uninitialized engine: neither registry can resolve the name, so the
+        // fallback yields None rather than an error or a panic.
+        crate::bridge::router::tests::reset_engine_state_for_tests().await;
+        let unresolved = engine_mission_runs(&ctx, "conversation-insights", 10)
+            .await
+            .expect("uninitialized engine must resolve to None, not error");
+        assert!(
+            unresolved.is_none(),
+            "no engine state means no mission history"
+        );
+
+        // Rendered history for a resolved mission keeps the routine_history
+        // result shape (verified separately against a fabricated history).
+        drop(guard);
+    }
+
+    #[test]
+    fn routine_history_renders_engine_mission_runs() {
+        let history = crate::bridge::EngineMissionHistory {
+            info: crate::bridge::EngineMissionInfo {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                name: "conversation-insights".to_string(),
+                goal: "digest conversations".to_string(),
+                status: "Active".to_string(),
+                cadence_type: "cron".to_string(),
+                thread_count: 1,
+                current_focus: None,
+                threads_today: 1,
+                max_threads_per_day: 30,
+                budget_exhausted: false,
+                last_fired_at: Some("2026-09-30T00:00:00Z".to_string()),
+                never_fired: false,
+                created_at: "2026-09-01T00:00:00Z".to_string(),
+                updated_at: "2026-09-30T00:00:00Z".to_string(),
+            },
+            cadence: serde_json::json!({"Cron": {"expression": "0 0 9 * * *"}}),
+            runs: vec![crate::bridge::EngineMissionRun {
+                thread_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                status: "Done".to_string(),
+                started_at: "2026-09-30T00:00:00Z".to_string(),
+                completed_at: Some("2026-09-30T00:01:00Z".to_string()),
+                duration_secs: Some(60),
+                result_summary: Some("insights written".to_string()),
+                tokens_used: 1234,
+                step_count: 2,
+            }],
+        };
+
+        let rendered = render_engine_mission_history("conversation-insights", &history);
+
+        assert_eq!(rendered["routine"], "conversation-insights");
+        assert_eq!(rendered["kind"], "engine_mission");
+        assert_eq!(
+            rendered["mission_id"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(rendered["total_runs"], 1);
+        let run = &rendered["runs"][0];
+        assert_eq!(run["trigger_type"], "mission_thread");
+        assert_eq!(run["id"], "22222222-2222-2222-2222-222222222222");
+        assert_eq!(run["duration_secs"], 60);
+        assert_eq!(run["result_summary"], "insights written");
     }
 }

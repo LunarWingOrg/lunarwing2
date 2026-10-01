@@ -734,7 +734,7 @@ mod tests {
                 serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Routine name" },
+                        "name": { "type": "string", "description": "Name of the routine or engine mission" },
                         "limit": { "type": "integer", "description": "Max runs", "default": 10 }
                     },
                     "required": ["name"]

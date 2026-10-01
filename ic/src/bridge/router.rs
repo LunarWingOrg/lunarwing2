@@ -4292,6 +4292,32 @@ pub struct EngineMissionDetail {
     pub threads: Vec<EngineThreadInfo>,
 }
 
+/// One mission fire rendered for the legacy `routine_history` tool (WI#265).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineMissionRun {
+    pub thread_id: String,
+    pub status: String,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    pub tokens_used: u64,
+    pub step_count: usize,
+}
+
+/// Mission history resolved by name, for the legacy `routine_history` tool
+/// fallback (WI#265).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineMissionHistory {
+    #[serde(flatten)]
+    pub info: EngineMissionInfo,
+    pub cadence: serde_json::Value,
+    pub runs: Vec<EngineMissionRun>,
+}
+
 // ── Engine query functions ───────────────────────────────────
 
 fn cadence_type_label(cadence: &lunarwing_engine::types::mission::MissionCadence) -> &'static str {
@@ -4663,6 +4689,118 @@ pub async fn get_engine_mission(
         next_fire_at: m.next_fire_at.map(|dt| dt.to_rfc3339()),
         threads,
     }))
+}
+
+/// Resolve a mission by name and render its run history for the legacy
+/// `routine_history` tool (WI#265).
+///
+/// Engine V2 missions live in a different registry from v1 routines, so a name
+/// that misses the v1 `routines` table can still name a live mission. The
+/// default project is searched first (the common case); a global scan over all
+/// projects, filtered to missions the user owns or that are shared, covers
+/// per-user default projects. Recent fires are the newest `thread_history`
+/// entries whose threads still load.
+pub async fn get_engine_mission_history_by_name(
+    name: &str,
+    user_id: &str,
+    limit: usize,
+) -> Result<Option<EngineMissionHistory>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(None);
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(None);
+    };
+
+    let mission = resolve_mission_by_name(state, name, user_id).await?;
+    let Some(mission) = mission else {
+        return Ok(None);
+    };
+
+    let mut threads = Vec::new();
+    for tid in mission.thread_history.iter().rev() {
+        if threads.len() >= limit {
+            break;
+        }
+        if let Ok(Some(thread)) = state.store.load_thread(*tid).await {
+            threads.push(thread);
+        }
+    }
+
+    Ok(Some(EngineMissionHistory {
+        info: mission_to_info(&mission),
+        cadence: public_cadence_json(&mission.cadence),
+        runs: threads.iter().map(mission_thread_run).collect(),
+    }))
+}
+
+/// Find a mission by name visible to `user_id`, or `None` when no mission
+/// carries that name.
+async fn resolve_mission_by_name(
+    state: &EngineState,
+    name: &str,
+    user_id: &str,
+) -> Result<Option<lunarwing_engine::Mission>, Error> {
+    let missions = state
+        .store
+        .list_missions_with_shared(state.default_project_id, user_id)
+        .await
+        .map_err(|e| engine_err("list missions", e))?;
+    if let Some(mission) = missions.into_iter().find(|mission| mission.name == name) {
+        return Ok(Some(mission));
+    }
+
+    // The default project may belong to another user in multi-tenant hosts;
+    // fall back to a global scan filtered to visible missions.
+    let candidates = state
+        .store
+        .list_all_missions_global()
+        .await
+        .map_err(|e| engine_err("list missions", e))?;
+    Ok(candidates
+        .into_iter()
+        .find(|mission| mission.name == name && mission_visible_to(mission, user_id)))
+}
+
+/// Ownership check shared with `get_engine_mission`: a mission is visible to
+/// its owner and to everyone when shared-owned.
+fn mission_visible_to(mission: &lunarwing_engine::Mission, user_id: &str) -> bool {
+    mission.user_id == user_id || is_shared_owner(&mission.user_id)
+}
+
+/// Render one mission fire as a `routine_history`-shaped run entry.
+fn mission_thread_run(thread: &lunarwing_engine::Thread) -> EngineMissionRun {
+    let duration_secs = thread.completed_at.map(|completed| {
+        completed
+            .signed_duration_since(thread.created_at)
+            .num_seconds()
+    });
+    EngineMissionRun {
+        thread_id: thread.id.to_string(),
+        status: format!("{:?}", thread.state),
+        started_at: thread.created_at.to_rfc3339(),
+        completed_at: thread.completed_at.map(|dt| dt.to_rfc3339()),
+        duration_secs,
+        result_summary: thread
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == lunarwing_engine::MessageRole::Assistant)
+            .map(|message| truncate_summary_chars(&message.content, SUMMARY_CHAR_LIMIT)),
+        tokens_used: thread.total_tokens_used,
+        step_count: thread.step_count,
+    }
+}
+
+/// Character budget for mission run summaries in `routine_history` output.
+const SUMMARY_CHAR_LIMIT: usize = 200;
+
+/// Truncate to at most `limit` characters without ever splitting a UTF-8
+/// code point. A byte-index `String::truncate` would panic on multilingual
+/// assistant text whose limit-th byte lands mid-code-point (WI#265 review).
+fn truncate_summary_chars(summary: &str, limit: usize) -> String {
+    summary.chars().take(limit).collect()
 }
 
 /// Manually fire a mission (spawn a new thread).
@@ -5698,17 +5836,36 @@ async fn migrate_legacy_user_ids(store: &Arc<dyn lunarwing_engine::Store>, owner
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Test twin of the removed production fallback (30-minute default).
     const DEFAULT_PENDING_GATE_EXPIRY: chrono::Duration = chrono::Duration::minutes(30);
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::sync::{Mutex as TokioMutex, Notify, RwLock as TokioRwLock};
+    use tokio::sync::{
+        Mutex as TokioMutex, MutexGuard as TokioMutexGuard, Notify, RwLock as TokioRwLock,
+    };
 
     pub(super) static ENGINE_STATE_TEST_LOCK: LazyLock<TokioMutex<()>> =
         LazyLock::new(|| TokioMutex::new(()));
+
+    /// Acquire the shared global engine-state test lock.
+    ///
+    /// Cross-module tests (e.g. the `routine_history` fallback in
+    /// `tools::builtin::routine`) mutate the process-global `ENGINE_STATE`;
+    /// they must serialize against the router's engine-state tests through
+    /// this same lock (WI#265 review).
+    pub(crate) async fn engine_state_test_lock() -> TokioMutexGuard<'static, ()> {
+        ENGINE_STATE_TEST_LOCK.lock().await
+    }
+
+    /// Clear the process-global engine state; caller must hold the lock from
+    /// [`engine_state_test_lock`].
+    pub(crate) async fn reset_engine_state_for_tests() {
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+    }
 
     #[test]
     fn channel_constraints_compose_without_empty_sections() {
@@ -5832,6 +5989,7 @@ mod tests {
         conversations: TokioRwLock<Vec<lunarwing_engine::ConversationSurface>>,
         threads: TokioRwLock<HashMap<lunarwing_engine::ThreadId, lunarwing_engine::Thread>>,
         docs: TokioRwLock<HashMap<lunarwing_engine::DocId, lunarwing_engine::MemoryDoc>>,
+        missions: TokioRwLock<HashMap<lunarwing_engine::MissionId, lunarwing_engine::Mission>>,
         block_next_thread_load: AtomicBool,
         thread_load_started: Notify,
         continue_thread_load: Notify,
@@ -5844,6 +6002,7 @@ mod tests {
                 conversations: TokioRwLock::new(Vec::new()),
                 threads: TokioRwLock::new(HashMap::new()),
                 docs: TokioRwLock::new(HashMap::new()),
+                missions: TokioRwLock::new(HashMap::new()),
                 block_next_thread_load: AtomicBool::new(false),
                 thread_load_started: Notify::new(),
                 continue_thread_load: Notify::new(),
@@ -6048,22 +6207,46 @@ mod tests {
         }
         async fn save_mission(
             &self,
-            _: &lunarwing_engine::Mission,
+            mission: &lunarwing_engine::Mission,
         ) -> Result<(), lunarwing_engine::EngineError> {
+            self.missions
+                .write()
+                .await
+                .insert(mission.id, mission.clone());
             Ok(())
         }
         async fn load_mission(
             &self,
-            _: lunarwing_engine::MissionId,
+            id: lunarwing_engine::MissionId,
         ) -> Result<Option<lunarwing_engine::Mission>, lunarwing_engine::EngineError> {
-            Ok(None)
+            Ok(self.missions.read().await.get(&id).cloned())
         }
         async fn list_missions(
             &self,
-            _: lunarwing_engine::ProjectId,
-            _user_id: &str,
+            project_id: lunarwing_engine::ProjectId,
+            user_id: &str,
         ) -> Result<Vec<lunarwing_engine::Mission>, lunarwing_engine::EngineError> {
-            Ok(vec![])
+            Ok(self
+                .missions
+                .read()
+                .await
+                .values()
+                .filter(|mission| mission.project_id == project_id && mission.user_id == user_id)
+                .cloned()
+                .collect())
+        }
+        async fn list_all_missions(
+            &self,
+            project_id: lunarwing_engine::ProjectId,
+        ) -> Result<Vec<lunarwing_engine::Mission>, lunarwing_engine::EngineError> {
+            Ok(self
+                .missions
+                .read()
+                .await
+                .values()
+                .filter(|mission| mission.project_id == project_id)
+                .cloned()
+                .collect())
         }
         async fn update_mission_status(
             &self,
@@ -6500,6 +6683,160 @@ mod tests {
             gate.resume_kind,
             lunarwing_engine::ResumeKind::Authentication { .. }
         ));
+    }
+
+    // ── mission history by name (WI#265) ────────────────────────
+
+    /// Seed a mission with recorded fires and persist its threads.
+    ///
+    /// `assistant_text` becomes the final assistant message of every run, so
+    /// tests can exercise summary rendering (including multilingual text that
+    /// would panic a byte-index truncate).
+    async fn seed_mission_with_runs(
+        store: &TestStore,
+        project_id: lunarwing_engine::ProjectId,
+        user_id: &str,
+        name: &str,
+        assistant_text: &str,
+    ) -> lunarwing_engine::MissionId {
+        let mut mission = lunarwing_engine::Mission::new(
+            project_id,
+            user_id,
+            name,
+            "test goal",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        for index in 0..2 {
+            let mut thread = lunarwing_engine::Thread::new(
+                format!("{name} run {index}"),
+                lunarwing_engine::ThreadType::Mission,
+                project_id,
+                user_id,
+                lunarwing_engine::ThreadConfig::default(),
+            );
+            thread.add_message(lunarwing_engine::ThreadMessage::assistant(format!(
+                "{assistant_text} {index}"
+            )));
+            store.save_thread(&thread).await.unwrap();
+            mission.record_thread(thread.id);
+        }
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+        id
+    }
+
+    /// Install a fresh engine state (or clear it) under the global test lock.
+    async fn install_test_engine_state(state: Option<EngineState>) {
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+        *lock.write().await = state;
+    }
+
+    #[tokio::test]
+    async fn mission_history_by_name_renders_recent_fires() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let project = lunarwing_engine::ProjectId::new();
+        seed_mission_with_runs(
+            &store,
+            project,
+            "alice",
+            "conversation-insights",
+            "run done",
+        )
+        .await;
+
+        let mut state = make_expected_test_state(store.clone());
+        state.default_project_id = project;
+        install_test_engine_state(Some(state)).await;
+
+        let history = get_engine_mission_history_by_name("conversation-insights", "alice", 10)
+            .await
+            .expect("query must not error")
+            .expect("mission must resolve by name");
+
+        assert_eq!(history.info.name, "conversation-insights");
+        assert_eq!(history.info.thread_count, 2);
+        assert_eq!(history.runs.len(), 2);
+        assert!(history.runs.iter().all(|run| {
+            run.result_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("run"))
+        }));
+
+        install_test_engine_state(None).await;
+    }
+
+    #[tokio::test]
+    async fn mission_history_by_name_finds_foreign_project_mission_for_owner() {
+        // Multi-tenant fallback: the mission lives outside the default
+        // project, so only the global scan finds it.
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let tenant_project = lunarwing_engine::ProjectId::new();
+        seed_mission_with_runs(
+            &store,
+            tenant_project,
+            "bob",
+            "self-improvement",
+            "improved",
+        )
+        .await;
+
+        let state = make_expected_test_state(store.clone());
+        install_test_engine_state(Some(state)).await;
+
+        let found = get_engine_mission_history_by_name("self-improvement", "bob", 10)
+            .await
+            .expect("query must not error")
+            .expect("owner must see their own mission via the global scan");
+        assert_eq!(found.info.thread_count, 2);
+
+        let other_user = get_engine_mission_history_by_name("self-improvement", "mallory", 10)
+            .await
+            .expect("query must not error");
+        assert!(
+            other_user.is_none(),
+            "a non-owner must not see another user's mission"
+        );
+
+        install_test_engine_state(None).await;
+    }
+
+    #[tokio::test]
+    async fn mission_history_by_name_returns_none_when_engine_uninitialized() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        install_test_engine_state(None).await;
+
+        let history = get_engine_mission_history_by_name("anything", "alice", 10)
+            .await
+            .expect("query must not error");
+        assert!(history.is_none());
+    }
+
+    #[test]
+    fn mission_run_summary_truncation_is_char_safe_for_multilingual_text() {
+        // WI#265 review: byte-index `String::truncate(200)` panics when the
+        // 200th byte lands inside a multi-byte code point. Both shapes below
+        // crossed that boundary; summaries must instead cut on chars.
+        let wide = "界".repeat(300);
+        let summary = truncate_summary_chars(&wide, SUMMARY_CHAR_LIMIT);
+        assert_eq!(summary.chars().count(), SUMMARY_CHAR_LIMIT);
+        assert!(summary.chars().all(|c| c == '界'));
+
+        // 199 ASCII characters followed by a two-byte 'é': byte 200 is the
+        // first half of the code point in the naive scheme.
+        let boundary = format!("{}é", "a".repeat(199));
+        let summary = truncate_summary_chars(&boundary, SUMMARY_CHAR_LIMIT);
+        assert_eq!(summary.chars().count(), SUMMARY_CHAR_LIMIT);
+        assert_eq!(summary.chars().last(), Some('é'));
+
+        // Emoji (4-byte code points) and short strings pass through intact.
+        let emoji = "💡".repeat(300);
+        let summary = truncate_summary_chars(&emoji, SUMMARY_CHAR_LIMIT);
+        assert_eq!(summary.chars().count(), SUMMARY_CHAR_LIMIT);
+        assert!(summary.chars().all(|c| c == '💡'));
+        assert_eq!(truncate_summary_chars("short", SUMMARY_CHAR_LIMIT), "short");
     }
 
     #[tokio::test]
