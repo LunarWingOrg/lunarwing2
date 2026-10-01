@@ -476,16 +476,26 @@ impl PairingStore {
         })?;
         fs::create_dir_all(parent)?;
 
-        let file = fs::OpenOptions::new()
+        // Open without truncating: the existing content must survive until
+        // the new (merged) list is written back through this same fd.
+        let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&path)?;
 
         file.lock()?;
 
-        let content = fs::read_to_string(&path).unwrap_or_default();
+        // Read through the locked fd so concurrent writers merge instead of
+        // clobbering each other.
+        let mut content = String::new();
+        file.seek(SeekFrom::Start(0))?;
+        {
+            use std::io::Read;
+            file.read_to_string(&mut content)?;
+        }
+
         let mut store: AllowFromStoreFile =
             serde_json::from_str(&content).unwrap_or(AllowFromStoreFile {
                 version: 1,
@@ -504,7 +514,11 @@ impl PairingStore {
 
         store.allow_from.push(entry);
         let json = serde_json::to_string_pretty(&store)?;
-        fs::write(&path, json)?;
+
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
 
         file.unlock()?;
         Ok(())
@@ -734,5 +748,48 @@ mod tests {
         store.upsert_request("xmpp", "u1", None).unwrap();
         store.list_pending("").unwrap_err();
         store.upsert_request("", "u1", None).unwrap_err();
+    }
+
+    #[test]
+    fn test_approve_preserves_existing_allow_from_entries() {
+        // Regression for the allowFrom wipe: add_allow_from used to open the
+        // file with truncate(true) before reading its content through a
+        // second fd, so every approval destroyed all prior grants.
+        let (store, _) = test_store();
+        let r1 = store.upsert_request("xmpp", "alice", None).unwrap();
+        store.approve("xmpp", &r1.code).unwrap();
+        let r2 = store.upsert_request("xmpp", "bob", None).unwrap();
+        store.approve("xmpp", &r2.code).unwrap();
+
+        let allow = store.read_allow_from("xmpp").unwrap();
+        assert_eq!(allow.len(), 2, "second approve must not wipe first grant");
+        assert!(allow.contains(&"alice".to_string()));
+        assert!(allow.contains(&"bob".to_string()));
+        assert!(store.is_sender_allowed("xmpp", "alice", None).unwrap());
+        assert!(store.is_sender_allowed("xmpp", "bob", None).unwrap());
+    }
+
+    #[test]
+    fn test_approve_preserves_preexisting_file_entries() {
+        // A pre-populated allowFrom file (e.g. seeded by an operator) must
+        // survive an approval: the store reads the existing content before
+        // writing the merged list back.
+        use std::io::Write;
+        let (store, dir) = test_store();
+        let path = dir.path().join("xmpp-allowFrom.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({"version": 1, "allowFrom": ["carol"]})
+        )
+        .unwrap();
+
+        let r = store.upsert_request("xmpp", "dave", None).unwrap();
+        store.approve("xmpp", &r.code).unwrap();
+
+        let allow = store.read_allow_from("xmpp").unwrap();
+        assert!(allow.contains(&"carol".to_string()));
+        assert!(allow.contains(&"dave".to_string()));
     }
 }
