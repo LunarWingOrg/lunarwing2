@@ -1228,10 +1228,16 @@ codename candidates shortlist (item 25), the durable XMPP outbound spool
 (item 28, #285), and the opencode2 v2.0.21 bump (item 29). This third
 repass (item 40, 2026-10-02) folds in the rest: the audit doc's own repass
 (item 15), the daily-log injection-scan quoted demotion (item 22, WI#280),
-and the pipeline-4867 all-green verification (item 23). Note that goals
-items 20 and 29 were later re-opened with new scopes (a pipeline-4890
-check and WI#286, respectively) — references to items 20/29 in this draft
+and the pipeline-4867 all-green verification (item 23). Goals items 20 and
+29 were later re-opened with new scopes (a master-pipeline re-check and
+WI#286, respectively) — earlier references to items 20/29 in this draft
 describe the completed cargo-deny and opencode2 work done under those
-numbers. Open goal items at repass time are 20 (pipeline 4890 re-check),
-29 (WI#286), 30 (WI#281), and 39 (item-14 repass); this draft covers the
-merged state as of 2026-10-02.*
+numbers. This fourth repass (item 42, 2026-10-02) folds in both re-opened
+scopes: the curated-memory write contract — `append_memory` injection
+scan, the 256 KiB `memory_write` payload cap, and prompt-file shadow
+backups (item 29, WI#286, merged via !1341/!1344) — and item 20's
+re-check, with master pipeline 4907 on the WI#286 merge (`75c4bd50`)
+verified 35/35 green including the honest unvendored cargo-deny wrapper.
+Open goal items at repass time are 30 (WI#281), 31 (WI#292), 32 (WI#288),
+and 39 (item-14 repass); this draft covers the merged state as of
+2026-10-02.*
