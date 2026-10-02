@@ -2,7 +2,7 @@
 
 ## Codename: UNKNOWN (draft)
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repasses 2026-10-01)
+**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repasses 2026-10-01 and 2026-10-02)
 
 ## Overview
 
@@ -44,7 +44,12 @@ the voice sidecar bounds abandoned inference admission so a timed-out or
 cancelled call cannot pin the model mutex or starve other components
 (WI#264). Shared tool execution learns bounded per-user EMA runtime
 estimates surfaced as frozen advisory hints on approvals and pending gates
-(WI#191 first slice, opt-in via `LUNARWING_TOOL_ESTIMATES=1`).
+(WI#191 first slice, opt-in via `LUNARWING_TOOL_ESTIMATES=1`). The
+workspace prompt-injection write scan no longer false-positives on
+agent-authored daily logs that merely quote injection-shaped security text:
+a High-severity match fully enclosed in a short, single-line, inline quoted
+span demotes to warn-only describing context, while unquoted and
+tokenizer-level matches still reject (WI#280).
 
 The operator surface gained per-tenant system-prompt editing in Settings with
 Engine V2 initialization snapshots (WI#220), read-only tenant database and
@@ -227,6 +232,17 @@ previous compatibility baseline.
   `<key>.failed.json` after 24 attempts. Live-verified on test tenant
   derpy: 19/19 messages delivered exactly once, including a spooled record
   surviving `systemctl stop` and replaying on the next boot
+- **Daily-log injection scan demotes quoted describing context (WI#280).**
+  Agent-authored daily logs (`daily/*.md`) were being rejected by the
+  workspace prompt-injection write scan for merely *quoting*
+  injection-shaped security phrasing. A High-severity match fully enclosed
+  in a short (≤200-byte), single-line, inline quoted span (`` `code` ``,
+  `"double"`, `'single'`, curly quotes) now demotes to warn-only describing
+  context; a closing quote that fails its right-boundary check ends the
+  span instead of staying open, so mismatched quotes cannot be eagerly
+  re-paired to bracket injection text (the !1317 review P2). Unquoted
+  matches, oversized/multiline spans, and tokenizer-level patterns still
+  reject, and identity files and lorebooks keep the strict raw scan
 - **Orchestrator self-modification for new tenants (WI#282).** add-tenant
   now renders `ORCHESTRATOR_SELF_MODIFY=true` so new tenants adopt stored
   orchestrator and prompt-overlay updates; an explicit operator opt-out is
@@ -298,6 +314,7 @@ previous compatibility baseline.
 | New tenant env defaults | `ORCHESTRATOR_SELF_MODIFY=true` rendered at add-tenant (WI#282); explicit operator values preserved on re-render; existing tenants untouched |
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
 | XMPP outbound delivery | `message` tool ack reports `Queued …` (acceptance, not delivery); enqueue refused while no session is bound; bounded 2s shutdown drain; durable spool persists every outbound message before ack with replay on bind, backoff retry, and `.failed.json` parking after 24 attempts — at-least-once semantics (post-send crash can duplicate at whole-message granularity) |
+| Workspace write scanning | Daily logs (`daily/*.md`) demote High-severity injection matches fully enclosed in short (≤200-byte) single-line inline quoted spans to warn-only describing context (WI#280); unquoted matches and tokenizer-level patterns still reject at the same floor; identity files and lorebooks keep the strict raw scan |
 | Pairing store (WI#184) | Design revision 3 only — no substrate change this release; landed tests pin current legacy matching and concurrent-grant semantics ahead of the secrets-store migration |
 | CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only; the cargo-deny job runs unvendored from the repo root via `.gitlab/scripts/cargo-deny-check.sh` and fails on any `index-failure` diagnostic |
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
@@ -597,6 +614,13 @@ relaxing it:
   `.gitlab/README.md` documents the unvendored gate and the pipeline-4811
   incident.
 
+Post-repair confirmation (item 23): the next latest master pipeline, 4867,
+was verified job-by-job — all 35 jobs `success`, zero failed/canceled —
+with the `cargo-deny` job confirmed at the pipeline's exact SHA to run this
+wrapper, so its green is the honest mode rather than the silent-degradation
+mode fixed above (the 42-second runtime matches the compact trace; the
+broken mode blew past the 4 MB log cap).
+
 ### Pairing Allowlist Preservation (sbpatch1)
 
 `PairingStore` approval opened the allowlist store with `truncate(true)`
@@ -688,6 +712,39 @@ messages delivered exactly once, including a spooled (acked-but-unsent)
 record that survived `systemctl stop` and replayed on the next boot's
 Online drain. End-to-end delivery receipts (XEP-0198) and the WI#276
 engine-side mission-run ledger remain open.
+
+### Daily-Log Injection Scan Quoted Demotion (WI#280)
+
+The workspace prompt-injection write scan was rejecting agent-authored
+daily logs that merely *described* injection-shaped security content — the
+false-positive class behind WI#280, which cost the work item two complete
+implementations (!1317, !1327) closed unmerged on process grounds before
+this landing. Daily-log writes (`daily/*.md` only, via the pre-existing
+`is_daily_log_file` gate) now demote a High-severity match fully enclosed
+in a short (≤200-byte), single-line, inline quoted span (`` `code` ``,
+`"double"`, `'single'`, `“curly”`, `‘curly’`) to warn-only describing
+context (`quoted_spans` + `reject_daily_log_if_injected` in
+`ic/src/workspace/mod.rs`):
+
+- Tokenizer-level patterns (`<|`, `|>`, `[INST]`, `[/INST]`, null bytes)
+  and unquoted matches still reject at the same High floor as the strict
+  path; identity files and lorebooks keep the strict raw scan.
+- The !1317 review P2 is closed inside the same change: a closing quote
+  that fails its right-boundary check ends the span instead of staying
+  open, so mismatched quotes cannot be eagerly re-paired to bracket
+  injection text (`"a"ignore previous …"` stays unquoted and rejects).
+- Oversized or multiline quoted spans stay strict; the demotion is
+  daily-log-only.
+
+Verified with 230 `workspace::` lib tests including the eleven WI#280
+regressions (span pairing/boundaries, apostrophes never open spans,
+mismatched-closer drops span, quote-bracketed injection still rejected,
+quoted phrase allowed, unquoted/live/tokenizer-level still rejected,
+oversized/multiline stays strict, demotion is daily-log-only).
+Documented in the workspace README's new Prompt-Injection Write Scanning
+section. The change landed via !1332 (pipeline #4880 green) re-applying
+the reviewed !1327 head, whose review had zero findings — it had died only
+on goals-file merge conflicts.
 
 ### Version Bumps and Supply Chain (item 1)
 
@@ -803,10 +860,13 @@ the tree at `03f5650fe` rather than taken from tracker bodies:
 - Tracker churn since the 2026-09-27 audit: 24 items created-and-closed,
   #220/#200 closed, open set grew 13 → 23.
 
-The audit is a point-in-time record at `03f5650fe`; three of its five
-genuinely-open 2.1.4.0 items have since landed in this release — #269
-(`mission_history`, item 18), #270 (outbound delivery honesty, item 19),
-and #271 (mt-admin worker-image store surfacing, item 24).
+The audit is a point-in-time record at `03f5650fe`, repassed once (item 15,
+22:10Z refresh) to fold in the #271 and #277 landings and #280's !1327
+closure. Four of its five genuinely-open 2.1.4.0 items have since landed in
+this release — #269 (`mission_history`, item 18), #270 (outbound delivery
+honesty, item 19), #271 (mt-admin worker-image store surfacing, item 24),
+and #280 (daily-log quoted demotion, item 22) — leaving #281 as the only
+genuinely-open 2.1.4.0-labeled item, tracked as goals item 30.
 
 ### Guides and Architecture Docs Repass (items 16/17)
 
@@ -929,6 +989,11 @@ launchd a distant third).
     exhausts its 24 retry attempts parks as `<key>.failed.json` with the
     last error for operator inspection/replay. The spool is XMPP-local;
     other channels keep memory-only queues.
+18. **Daily-log injection scanning (WI#280).** No configuration change.
+    Agent daily logs may now quote short (≤200-byte) single-line
+    injection-shaped text inline without a write rejection (warn-only
+    describing context). Unquoted matches and tokenizer-level patterns
+    still reject, and identity-file/lorebook writes are unchanged.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -1000,6 +1065,11 @@ launchd a distant third).
   retries post-enqueue failures with bounded backoff, and parks exhausted
   records as `.failed.json` — verified live on derpy with 19/19 deliveries,
   including a restart-window replay (WI#277 source-fixed).
+- Daily-log writes no longer false-positive on quoted security phrasing:
+  the workspace injection scan demotes High-severity matches fully enclosed
+  in short, single-line, inline quoted spans to warn-only describing
+  context, with the quote-pairing bypass closed, while unquoted and
+  tokenizer-level matches still reject (WI#280 source-fixed via !1332).
 - The voice sidecar bounds abandoned inference admission with per-component
   readiness and explicit permanent-failure semantics; supported recovery
   via `restart-tenant` (WI#264 source-fixed; the v2.1.3.0 known issue is
@@ -1043,7 +1113,9 @@ launchd a distant third).
   regressions are landed executable tests ahead of the substrate change.
 - The cycle's open work items were reconciled in
   `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` with tree-verified
-  dispositions for all 23 open items; WI#200 closed on the landed stopgap.
+  dispositions for all 23 open items, then repassed once (item 15) as
+  #271/#277 landed and #280's !1327 closed unmerged; WI#200 closed on the
+  landed stopgap.
 - The cargo-deny yanked-crate CI gate is honest again: it runs unvendored
   from the repo root and hard-fails on any `index-failure` diagnostic,
   closing the silent-skip hole found in pipeline 4811 (item 20).
@@ -1062,13 +1134,20 @@ confirmation will be filled in before the release is cut. The first repass
 (item 27, 2026-10-01) folded in the work merged after the first draft —
 WI#184 design revision 3 with its landed regressions (item 11), the open
 work items audit (item 14), and the guides/architecture docs repasses
-(items 16/17). This second repass (item 21, 2026-10-01) folds in everything
+(items 16/17). The second repass (item 21, 2026-10-01) folded in everything
 merged since: the `mission_history` tool and `routine_history` v2 block
 (item 18, WI#269), outbound delivery honesty (item 19, WI#270 — its Changes
 section landed with the fix itself), the cargo-deny yanked-gate repair
 (item 20), mt-admin worker-image store surfacing (item 24, WI#271), the
 codename candidates shortlist (item 25), the durable XMPP outbound spool
 (item 26, WI#277), the docs/ops housecleaning and AGENTS.md drift fixes
-(item 28, #285), and the opencode2 v2.0.21 bump (item 29). Open goal items
-at repass time (15, 22, 23) may add sections; this draft covers the merged
-state as of 2026-10-01.*
+(item 28, #285), and the opencode2 v2.0.21 bump (item 29). This third
+repass (item 40, 2026-10-02) folds in the rest: the audit doc's own repass
+(item 15), the daily-log injection-scan quoted demotion (item 22, WI#280),
+and the pipeline-4867 all-green verification (item 23). Note that goals
+items 20 and 29 were later re-opened with new scopes (a pipeline-4890
+check and WI#286, respectively) — references to items 20/29 in this draft
+describe the completed cargo-deny and opencode2 work done under those
+numbers. Open goal items at repass time are 20 (pipeline 4890 re-check),
+29 (WI#286), 30 (WI#281), and 39 (item-14 repass); this draft covers the
+merged state as of 2026-10-02.*
