@@ -2,10 +2,24 @@
 
 This vendored copy of rig-core carries a **local LunarWing patch** on top of
 pristine crates.io `rig-core 0.40.0`. `cargo vendor` regenerates this directory
-from the registry tarball and **silently drops the patch**;
-`ic/scripts/refresh-vendor.sh` contains a tripwire that fails the refresh if
-the patch marker is gone. If that tripwire fires, re-apply the patch below
-(see git history for the exact diff) and re-run the refresh.
+from the registry tarball on every run and **silently drops the patch**, so
+`ic/scripts/refresh-vendor.sh` handles it explicitly:
+
+- **Before vendoring** it fails fast unless the patch marker is present and
+  this directory is committed clean (the post-vendor restore resets it from
+  git, so uncommitted changes here would be lost).
+- **After vendoring** it restores the committed patched tree — patched
+  sources, this file, and `.cargo-checksum.json` — from git
+  (`git checkout HEAD -- vendor/rig-core`), making a same-version refresh
+  fully self-healing.
+- If the refresh **bumped rig-core to a new version**, the restore is refused
+  and the script exits nonzero: re-apply the patch onto the new sources (file
+  list below; see git history for the exact diff), regenerate the per-file
+  SHA-256 entries in `.cargo-checksum.json`, commit, then re-run the refresh.
+
+Editing any file under `vendor/rig-core/` (including this one) without
+regenerating its entry in `.cargo-checksum.json` breaks cargo's
+directory-source verification on the next build.
 
 ## WI#292 — finish_reason pass-through
 

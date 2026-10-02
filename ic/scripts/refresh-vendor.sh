@@ -16,8 +16,11 @@
 #     path dependencies, and without --no-delete it would delete them.
 #   - vendor/rig-core carries a LOCAL PATCH (WI#292 finish_reason
 #     pass-through, see vendor/rig-core/LUNARWING-PATCH.md). cargo vendor
-#     regenerates it from crates.io, which would silently drop the patch; the
-#     post-vendor patch check below fails loudly if that happens.
+#     regenerates it from crates.io on every run, wiping the patch, so this
+#     script verifies the patch before vendoring and restores the committed
+#     patched tree from git afterwards. The one case that still fails loudly
+#     is a rig-core version bump: re-apply the patch onto the new sources and
+#     commit it first (LUNARWING-PATCH.md describes the flow).
 #   - The post-vendor set check compares vendor/ against the committed
 #     Cargo.lock files (the approved pins). It must only report drift, never
 #     re-resolve versions: any stray means the lockfiles drifted, so fix the
@@ -61,18 +64,52 @@ for manifest in "${SYNC_MANIFESTS[@]}"; do
   lockfiles+=("$lock")
 done
 
+# --- WI#292 rig-core patch guard (pre-vendor) ---
+# vendor/rig-core carries a LOCAL PATCH (finish_reason pass-through) that
+# cargo vendor silently overwrites with pristine crates.io sources on every
+# run. The post-vendor step below restores the committed patched tree from
+# git, so the patch must be committed and the directory clean before we start.
+RIGCORE_DIR="$VENDOR_DIR/rig-core"
+RIGCORE_MARKER_FILE="$RIGCORE_DIR/src/providers/internal/openai_chat_completions_compatible.rs"
+RIGCORE_MARKER="LUNARWING_WI292_FINISH_REASON_PATCH"
+
+rigcore_dirty="$(git status --porcelain -- "$RIGCORE_DIR")"
+if [[ -n "$rigcore_dirty" ]]; then
+  echo "refresh-vendor: ERROR $RIGCORE_DIR has uncommitted changes." >&2
+  echo "  The post-vendor step restores the committed patch from git, which would" >&2
+  echo "  overwrite them. Commit or stash the rig-core patch first, then re-run." >&2
+  exit 1
+fi
+if ! grep -q "$RIGCORE_MARKER" "$RIGCORE_MARKER_FILE" 2>/dev/null; then
+  echo "refresh-vendor: ERROR rig-core local patch (WI#292 finish_reason pass-through) is missing." >&2
+  echo "  Re-apply it and commit (see vendor/rig-core/LUNARWING-PATCH.md and git history), then re-run." >&2
+  exit 1
+fi
+rigcore_committed_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$RIGCORE_DIR/Cargo.toml" | head -n1)"
+
 echo "refresh-vendor: cargo vendor --locked --no-delete $VENDOR_DIR ${sync_args[*]} $*" >&2
 cargo vendor --locked --no-delete "$VENDOR_DIR" "${sync_args[@]}" "$@"
 
-# WI#292 tripwire: vendor/rig-core carries a local patch (finish_reason
-# pass-through) that cargo vendor silently overwrites with pristine crates.io
-# sources. Fail loudly instead of losing the patch in a "refresh".
-if ! grep -q "LUNARWING_WI292_FINISH_REASON_PATCH" \
-  "$VENDOR_DIR/rig-core/src/providers/internal/openai_chat_completions_compatible.rs" 2>/dev/null; then
-  echo "refresh-vendor: ERROR rig-core local patch (WI#292 finish_reason pass-through) is gone after the vendor run." >&2
-  echo "  Re-apply it (see vendor/rig-core/LUNARWING-PATCH.md and git history), refresh .cargo-checksum.json, then re-run." >&2
+# --- WI#292 rig-core patch restore (post-vendor) ---
+# cargo vendor just rewrote rig-core from the registry. If the version moved,
+# the committed patch belongs to the old sources — refuse to restore it and
+# fail loudly so the patch is re-applied onto the NEW version by hand.
+rigcore_vendored_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$RIGCORE_DIR/Cargo.toml" | head -n1)"
+if [[ "$rigcore_vendored_version" != "$rigcore_committed_version" ]]; then
+  echo "refresh-vendor: ERROR rig-core was re-vendored at a NEW version ($rigcore_committed_version -> $rigcore_vendored_version)." >&2
+  echo "  The WI#292 patch does not auto-apply across versions: re-apply it onto the new" >&2
+  echo "  sources, regenerate rig-core's .cargo-checksum.json, commit, then re-run this script." >&2
+  echo "  (See vendor/rig-core/LUNARWING-PATCH.md and git history for the patch diff.)" >&2
   exit 1
 fi
+# Same version: the committed tree (patched sources + matching
+# .cargo-checksum.json) is the correct end state; restore it from git.
+git checkout HEAD -- "$RIGCORE_DIR"
+if ! grep -q "$RIGCORE_MARKER" "$RIGCORE_MARKER_FILE" 2>/dev/null; then
+  echo "refresh-vendor: ERROR rig-core patch restore from git failed (marker still missing after restore)." >&2
+  exit 1
+fi
+echo "refresh-vendor: restored rig-core WI#292 patch from git (cargo vendor had overwritten it with pristine $rigcore_vendored_version sources)" >&2
 
 # The directory source requires `.cargo-checksum.json` in every vendor/*
 # subdir, including the hand-vendored libsignal path deps that cargo vendor

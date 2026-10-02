@@ -68,7 +68,7 @@ No specs exist yet for the agent, web-gateway, llm, e2e, or engine subsystems �
 
 - crates-io is source-replaced by the committed directory `vendor/` (see `.cargo/config.toml`): every cargo command in this directory resolves exclusively from `vendor/`, so check/test/build/clippy need no crates.io access.
 - After any dependency add/update, run `scripts/refresh-vendor.sh` (`cargo vendor` over the ic workspace + satellite lockfile roots in this directory, asserts the vendored set still matches the committed Cargo.lock pins without re-resolving, then `cargo deny check advisories`), review the `vendor/` diff, and commit it with the manifest/lockfile change.
-- Never hand-edit or delete entries under `vendor/`. `vendor/libsignal-protocol{,-sys}` are pre-vendored **path** dependencies (`Cargo.toml`) — always vendor with `--no-delete` so they survive.
+- Never hand-edit or delete entries under `vendor/`. `vendor/libsignal-protocol{,-sys}` are pre-vendored **path** dependencies (`Cargo.toml`) — always vendor with `--no-delete` so they survive. The one sanctioned exception is the WI#292 `vendor/rig-core/` patch (`vendor/rig-core/LUNARWING-PATCH.md`); `scripts/refresh-vendor.sh` restores it from git after each vendor run — commit rig-core patch changes before refreshing.
 
 ## Database, Setup, and Config Rules
 
