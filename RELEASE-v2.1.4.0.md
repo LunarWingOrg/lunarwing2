@@ -49,7 +49,13 @@ workspace prompt-injection write scan no longer false-positives on
 agent-authored daily logs that merely quote injection-shaped security text:
 a High-severity match fully enclosed in a short, single-line, inline quoted
 span demotes to warn-only describing context, while unquoted and
-tokenizer-level matches still reject (WI#280).
+tokenizer-level matches still reject (WI#280). The curated-memory write
+contract closed its remaining gaps in the same pass: the `append_memory`
+lane behind `memory_write(target: "memory", append: true)` no longer
+bypasses the injection scan, every `memory_write` lane rejects payloads
+over 256 KiB, and full-replace writes of prompt-visible files keep a
+rolling shadow backup so an accidental clobber of curated memory is
+recoverable in-place (WI#286).
 
 The operator surface gained per-tenant system-prompt editing in Settings with
 Engine V2 initialization snapshots (WI#220), read-only tenant database and
@@ -243,6 +249,19 @@ previous compatibility baseline.
   re-paired to bracket injection text (the !1317 review P2). Unquoted
   matches, oversized/multiline spans, and tokenizer-level patterns still
   reject, and identity files and lorebooks keep the strict raw scan
+- **Curated-memory write contract hardened (WI#286).** The default
+  `memory_write(target: "memory", append: true)` lane did zero
+  prompt-injection validation — the WI#132 hardening scanned every sibling
+  lane but skipped this one — so a `<|im_start|>` payload could reach a v1
+  session prompt undefused. `append_memory` now scans the entry and the
+  combined candidate pre-commit, mirroring `append()`. Every
+  `memory_write` lane also rejects payloads over 256 KiB (the incident's
+  ~48 KB context dump clobbered a curated `MEMORY.md`), matching the web
+  prompt editor's whole-file cap. And a full-replace `write()` of a
+  prompt-visible file with non-empty differing prior content now persists
+  the previous version to a rolling single-slot `backups/<path>.bak`
+  shadow copy first — exact-path readable, never search-indexed, and
+  backup failures never block the write
 - **Orchestrator self-modification for new tenants (WI#282).** add-tenant
   now renders `ORCHESTRATOR_SELF_MODIFY=true` so new tenants adopt stored
   orchestrator and prompt-overlay updates; an explicit operator opt-out is
@@ -745,6 +764,50 @@ Documented in the workspace README's new Prompt-Injection Write Scanning
 section. The change landed via !1332 (pipeline #4880 green) re-applying
 the reviewed !1327 head, whose review had zero findings — it had died only
 on goals-file merge conflicts.
+
+### Curated-Memory Write Contract (WI#286)
+
+WI#286's "fixed" was data recovery only; the substrate gaps behind the
+incident (a session's ~48 KB context dump clobbering a curated `MEMORY.md`)
+are now closed (goals item 29's re-opened scope, landed via !1341/!1344):
+
+- **The `append_memory` scan bypass is closed (the MED-HIGH finding).**
+  The default `memory_write(target: "memory", append: true)` lane did zero
+  validation — the WI#132 hardening commit scanned every sibling lane but
+  skipped this one. `append_memory()` in `ic/src/workspace/mod.rs` now
+  scans the entry and the combined candidate before commit, mirroring
+  `append()` (pre-commit, so no compensation path is needed). A
+  `<|im_start|>` payload through this lane into a v1 session no longer
+  reaches the prompt undefused.
+- **`memory_write` payload cap.** The tool accepted unbounded content;
+  every lane now rejects payloads over 256 KiB
+  (`MAX_MEMORY_WRITE_BYTES` in `ic/src/tools/builtin/memory.rs`),
+  matching the web prompt editor's whole-file cap.
+- **Shadow backup for prompt-file full replaces.** `Workspace::write()`
+  on a prompt-visible file with non-empty differing prior content now
+  persists the previous version to a rolling single-slot
+  `backups/<path>.bak` doc before replacing it — the clobber class is
+  recoverable in-place via exact-path `read()` instead of manual
+  re-curation. Backups carry an empty chunk projection (never
+  search-indexed), are not rescanned (so poisoned content can still be
+  replaced), and backup failures log-and-continue rather than blocking
+  the write.
+
+The stale `memory.rs` comment claiming `append_memory` scanning was handled
+by `write()`/`append()` was corrected, and the spec is updated in the
+workspace README (scan lane, shadow-backup section, cap note). Deliberately
+out of scope: the broader #280/#286 detector redesign (line-start role
+labels plus a "resembles the live system prompt" provenance heuristic) is
+deferred as needing runtime verification.
+
+Verified: 6 new workspace integration tests (injection entry rejected
+pre-commit with no doc created, append over poisoned existing content
+rejected without touching it, benign appends land with the `\n\n`
+separator, backup created/rolling/scoped-to-prompt-files, backup
+unindexed) plus a tool-level cap test (oversized rejected on all lanes,
+at-limit passes the gate) — `workspace::` suite 236/236 and
+`tools::builtin::memory` 24/24 pass, with clippy `-D warnings`, rustfmt,
+and the panic-policy scanner clean.
 
 ### Version Bumps and Supply Chain (item 1)
 
