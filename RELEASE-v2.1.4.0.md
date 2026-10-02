@@ -2,7 +2,7 @@
 
 ## Codename: UNKNOWN (draft)
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repasses 2026-10-01)
+**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repasses 2026-10-01 and 2026-10-02)
 
 ## Overview
 
@@ -1134,13 +1134,20 @@ confirmation will be filled in before the release is cut. The first repass
 (item 27, 2026-10-01) folded in the work merged after the first draft —
 WI#184 design revision 3 with its landed regressions (item 11), the open
 work items audit (item 14), and the guides/architecture docs repasses
-(items 16/17). This second repass (item 21, 2026-10-01) folds in everything
+(items 16/17). The second repass (item 21, 2026-10-01) folded in everything
 merged since: the `mission_history` tool and `routine_history` v2 block
 (item 18, WI#269), outbound delivery honesty (item 19, WI#270 — its Changes
 section landed with the fix itself), the cargo-deny yanked-gate repair
 (item 20), mt-admin worker-image store surfacing (item 24, WI#271), the
 codename candidates shortlist (item 25), the durable XMPP outbound spool
 (item 26, WI#277), the docs/ops housecleaning and AGENTS.md drift fixes
-(item 28, #285), and the opencode2 v2.0.21 bump (item 29). Open goal items
-at repass time (15, 22, 23) may add sections; this draft covers the merged
-state as of 2026-10-01.*
+(item 28, #285), and the opencode2 v2.0.21 bump (item 29). This third
+repass (item 40, 2026-10-02) folds in the rest: the audit doc's own repass
+(item 15), the daily-log injection-scan quoted demotion (item 22, WI#280),
+and the pipeline-4867 all-green verification (item 23). Note that goals
+items 20 and 29 were later re-opened with new scopes (a pipeline-4890
+check and WI#286, respectively) — references to items 20/29 in this draft
+describe the completed cargo-deny and opencode2 work done under those
+numbers. Open goal items at repass time are 20 (pipeline 4890 re-check),
+29 (WI#286), 30 (WI#281), and 39 (item-14 repass); this draft covers the
+merged state as of 2026-10-02.*
