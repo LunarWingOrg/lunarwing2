@@ -149,8 +149,24 @@ fn is_lorebook_json_file(path: &str) -> bool {
 static SANITIZER: std::sync::LazyLock<Sanitizer> = std::sync::LazyLock::new(Sanitizer::new);
 
 /// Build the rejection error for prompt-visible content, logging the decision.
-fn injection_rejected_error(path: &str, rejecting: &[&InjectionWarning]) -> WorkspaceError {
-    let descriptions: Vec<&str> = rejecting.iter().map(|w| w.description.as_str()).collect();
+/// Each rejecting match carries its 1-based line number so an operator (or the
+/// agent) can find and repair the offending content quickly (WI#288).
+fn injection_rejected_error(
+    path: &str,
+    content: &str,
+    rejecting: &[&InjectionWarning],
+) -> WorkspaceError {
+    let descriptions: Vec<String> = rejecting
+        .iter()
+        .map(|w| match content.get(..w.location.start) {
+            Some(prefix) => format!(
+                "{} (line {})",
+                w.description,
+                prefix.matches('\n').count() + 1
+            ),
+            None => w.description.clone(),
+        })
+        .collect();
     tracing::warn!(
         target: "lunarwing::safety",
         file = %path,
@@ -179,7 +195,7 @@ fn reject_if_injected_at(
     let rejecting: Vec<&InjectionWarning> =
         warnings.iter().filter(|w| w.severity >= minimum).collect();
     if !rejecting.is_empty() {
-        return Err(injection_rejected_error(path, &rejecting));
+        return Err(injection_rejected_error(path, content, &rejecting));
     }
     for w in &warnings {
         tracing::warn!(
@@ -326,7 +342,7 @@ fn reject_daily_log_if_injected(path: &str, content: &str) -> Result<(), Workspa
     if rejecting.is_empty() {
         Ok(())
     } else {
-        Err(injection_rejected_error(path, &rejecting))
+        Err(injection_rejected_error(path, content, &rejecting))
     }
 }
 
@@ -1175,6 +1191,89 @@ impl Workspace {
         }
     }
 
+    /// Move a poisoned daily log aside to `daily/<date>.poisoned-<n>.md` and
+    /// clear the day file so appends resume on a fresh log (WI#288).
+    ///
+    /// The quarantine copy is written directly through the storage layer,
+    /// bypassing the write-time injection scan on purpose, and carries an
+    /// empty chunk projection: retrievable by exact-path `read()`, visible in
+    /// `list()`, never search-indexed. It is also never injected into the
+    /// system prompt — daily-log injection reads only the exact
+    /// `daily/YYYY-MM-DD.md` path. Returns the quarantine path.
+    async fn quarantine_daily_log(
+        &self,
+        path: &str,
+        doc: &MemoryDocument,
+    ) -> Result<String, WorkspaceError> {
+        let stem = path.strip_suffix(".md").unwrap_or(path);
+        let mut n = 1u32;
+        let quarantine_path = loop {
+            let candidate = format!("{stem}.poisoned-{n}.md");
+            match self
+                .storage
+                .get_document_by_path(&self.user_id, self.agent_id, &candidate)
+                .await
+            {
+                Ok(_) => n += 1,
+                Err(WorkspaceError::DocumentNotFound { .. }) => break candidate,
+                Err(e) => return Err(e),
+            }
+        };
+        let quarantine_doc = self
+            .storage
+            .get_or_create_document_by_path(&self.user_id, self.agent_id, &quarantine_path)
+            .await?;
+        self.storage
+            .update_document_and_replace_chunks(quarantine_doc.id, &doc.content, &[])
+            .await?;
+        self.storage
+            .update_document_and_replace_chunks(doc.id, "", &[])
+            .await?;
+        tracing::warn!(
+            target: "lunarwing::safety",
+            file = %path,
+            quarantine = %quarantine_path,
+            "daily log quarantined: pre-existing unquoted injection content moved aside; \
+             day file cleared so appends resume on a fresh log"
+        );
+        Ok(quarantine_path)
+    }
+
+    /// Quarantine a poisoned daily log and annotate the scan rejection so the
+    /// caller learns the poison was moved aside and a retry starts a fresh
+    /// log. A failed quarantine only logs — the original rejection stands and
+    /// the day file stays frozen (WI#288).
+    async fn quarantine_daily_log_on_reject(
+        &self,
+        path: &str,
+        doc: &MemoryDocument,
+        scan_err: WorkspaceError,
+    ) -> WorkspaceError {
+        match self.quarantine_daily_log(path, doc).await {
+            Ok(quarantine_path) => match scan_err {
+                WorkspaceError::InjectionRejected { path, reason } => {
+                    WorkspaceError::InjectionRejected {
+                        path,
+                        reason: format!(
+                            "{reason}; pre-existing poison quarantined to '{quarantine_path}'; \
+                             retry the append to start a fresh daily log"
+                        ),
+                    }
+                }
+                other => other,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    target: "lunarwing::safety",
+                    file = %path,
+                    error = %e,
+                    "daily-log quarantine failed; the day file remains frozen"
+                );
+                scan_err
+            }
+        }
+    }
+
     /// Append content to a file.
     ///
     /// Creates the file if it doesn't exist.
@@ -1203,7 +1302,23 @@ impl Workspace {
                 .await?;
             if prompt_visible {
                 let candidate = appended_content(&doc.content, content, "\n");
-                validate_prompt_write(&path, &candidate)?;
+                if let Err(scan_err) = validate_prompt_write(&path, &candidate) {
+                    // WI#288: a daily log already holding unquoted poison
+                    // re-fails this combined-candidate scan on every append,
+                    // freezing the day's log. The new entry itself passed the
+                    // entry scan above, so when the pre-existing content alone
+                    // trips the gate, quarantine it aside and clear the day
+                    // file — the next append starts a fresh log.
+                    if is_daily_log_file(&path)
+                        && reject_daily_log_if_injected(&path, &doc.content).is_err()
+                    {
+                        return Err(
+                            self.quarantine_daily_log_on_reject(&path, &doc, scan_err)
+                                .await,
+                        );
+                    }
+                    return Err(scan_err);
+                }
             }
             (doc.id, doc.content)
         };
