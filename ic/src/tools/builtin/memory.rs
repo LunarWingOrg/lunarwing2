@@ -303,6 +303,12 @@ fn map_write_err(e: crate::error::WorkspaceError) -> ToolError {
     }
 }
 
+/// Maximum size of one `memory_write` payload (256 KiB), matching the web
+/// prompt editor's whole-file cap (`MAX_SOURCE_BYTES`). The tool previously
+/// accepted unbounded content: a single ~48 KB context dump clobbered the
+/// curated MEMORY.md (WI#286). Every write lane shares this bound.
+const MAX_MEMORY_WRITE_BYTES: usize = 256 * 1024;
+
 /// Tool for searching workspace memory.
 ///
 /// Performs hybrid search (FTS + semantic) across all memory documents.
@@ -470,6 +476,15 @@ impl Tool for MemoryWriteTool {
 
         let content = require_str(&params, "content")?;
 
+        if content.len() > MAX_MEMORY_WRITE_BYTES {
+            return Err(ToolError::InvalidParameters(format!(
+                "content is {} bytes, exceeding the {} KiB memory_write limit; \
+                 split the payload into smaller writes or trim it",
+                content.len(),
+                MAX_MEMORY_WRITE_BYTES / 1024,
+            )));
+        }
+
         let target = params
             .get("target")
             .and_then(|v| v.as_str())
@@ -561,7 +576,7 @@ impl Tool for MemoryWriteTool {
         } else {
             // No layer specified — use default workspace methods.
             // Prompt injection scanning for system-prompt files is handled by
-            // Workspace::write() / Workspace::append().
+            // Workspace::write() / Workspace::append() / Workspace::append_memory().
             match target {
                 "memory" => {
                     if append {
@@ -1370,6 +1385,48 @@ mod tests {
                     );
                 }
                 other => panic!("expected NotAuthorized, got: {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_memory_write_rejects_oversized_content() {
+            let workspace = make_test_workspace();
+            let tool = MemoryWriteTool::from_workspace(workspace);
+            let ctx = JobContext::default();
+
+            // WI#286: memory_write accepted unbounded payloads (a ~48 KB
+            // context dump clobbered MEMORY.md). The cap fires before any
+            // workspace access, on every lane.
+            let oversized = "x".repeat(MAX_MEMORY_WRITE_BYTES + 1);
+            for target in ["memory", "daily_log", "notes/big.md"] {
+                let params = serde_json::json!({
+                    "content": oversized,
+                    "target": target,
+                });
+                let result = tool.execute(params, &ctx).await;
+                match result {
+                    Err(ToolError::InvalidParameters(msg)) => {
+                        assert!(
+                            msg.contains("256 KiB"),
+                            "unexpected message for target {target}: {msg}"
+                        );
+                    }
+                    other => {
+                        panic!("expected InvalidParameters for target {target}, got: {other:?}")
+                    }
+                }
+            }
+
+            let at_limit = "x".repeat(MAX_MEMORY_WRITE_BYTES);
+            let params = serde_json::json!({
+                "content": at_limit,
+                "target": "notes/big.md",
+            });
+            // At-limit content passes the size gate; it then fails on the
+            // dead test pool, proving the gate itself did not reject it.
+            let result = tool.execute(params, &ctx).await;
+            if let Err(ToolError::InvalidParameters(msg)) = result {
+                panic!("at-limit content must not hit the size gate: {msg}");
             }
         }
     }
