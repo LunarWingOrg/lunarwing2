@@ -1,6 +1,6 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.1.4.0
 
-## Codename: Kabuto
+## Codename: Kabuto (兜) — The Helmet
 
 **Open TODOs (v2.1.4.0) — To be done before release**
 
@@ -188,7 +188,10 @@
     - WI#286 folded in across the draft: overview sentence (workspace security paragraph), Highlights entry, new Changes section "Curated-Memory Write Contract (WI#286)" (append_memory scan bypass closed, 256 KiB `memory_write` cap, prompt-file shadow backups; deferred #280/#286 detector redesign noted), a Compatibility "Workspace memory writes" row, upgrade note 19 (chunking guidance + `backups/<path>.bak` restore path), a carried-limitation bullet (detector redesign deferred; WI#288 unquoted-poison daily-log append freeze tracked as goals item 32), and a Resolved bullet. All code claims verified against the tree pre-write: `append_memory` dual pre-commit scan (`ic/src/workspace/mod.rs:1706`), `MAX_MEMORY_WRITE_BYTES = 256 * 1024` (`ic/src/tools/builtin/memory.rs:310`), `shadow_backup_prompt_file` with empty chunk projection / log-and-continue (`ic/src/workspace/mod.rs:1157`), README scan-lane + shadow-backup sections
     - Item 20 re-check recorded in the footer: master pipeline 4907 on the WI#286 merge (`75c4bd50`) verified 35/35 success via commit statuses, including the honest unvendored `cargo-deny` wrapper (the item-20 repair). Footer rewritten for the fourth repass: the items-20/29 re-open note now records both scopes as landed and covered; open items at repass time are 30 (WI#281), 31 (WI#292), 32 (WI#288), 39 (item-14 repass)
     - Verified: all 10 unique relative md links in the draft resolve live; `git diff --check` clean; no stale "pipeline-4890"/"may land" phrasing remains. Docs-only change: no cargo check needed
-43. [ ] repass of item 13 again - codename is in https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/293 - include the haikus througout the release notes periodically where appropriate
+43. [x] repass of item 13 again - codename is in https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/293 - include the haikus througout the release notes periodically where appropriate
+    - DONE 2026-10-02 (`cmc/g43/v2.1.4.0`): fifth release-draft repass against branch base `130edb89f` and the delta since item 42 (`96e4ec14c`). Set Kabuto (兜, the helmet) in the release header and checklist; reproduced all three WI#293 haikus at the opener, compatibility transition, and closing, with lineage and release-art links. Codename selection is confirmed; release date and Christopher's tag-time sign-off remain pending.
+    - Folded in WI#292 real finish metadata (including the engine-recovery and outbound-web limits), WI#288 quarantine/retry and line-number detail, the Wasmtime/WASI 36.0.17 security update after pipeline 4922, WI#294 same-version rig-core patch restoration, and item 39's historical audit snapshot. Updated highlights, compatibility, changes, upgrade notes, limitations, resolved items, and draft footer. WI#281's live closing discussion confirms existing foreground effect bindings; recorded its closure without inventing a runtime or tool-discovery fix. Goal 44 retains the separate tracker-audit repass.
+    - Verified current source, manifests/locks, vendor patch documentation, and WI#293 body/comments; all local Markdown links resolve, the three haikus match the source text, stale codename/runtime/poison-freeze assertions are removed, and `git diff --check` passes. Docs-only; no builds or runtime tests run, and earlier validation counts remain attributed to their original goals rather than claimed as new runs.
 44. [ ] repass of item 14 again
 45. [x] (S) Reserved
 
