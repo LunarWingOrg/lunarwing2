@@ -49,7 +49,13 @@ workspace prompt-injection write scan no longer false-positives on
 agent-authored daily logs that merely quote injection-shaped security text:
 a High-severity match fully enclosed in a short, single-line, inline quoted
 span demotes to warn-only describing context, while unquoted and
-tokenizer-level matches still reject (WI#280).
+tokenizer-level matches still reject (WI#280). The curated-memory write
+contract closed its remaining gaps in the same pass: the `append_memory`
+lane behind `memory_write(target: "memory", append: true)` no longer
+bypasses the injection scan, every `memory_write` lane rejects payloads
+over 256 KiB, and full-replace writes of prompt-visible files keep a
+rolling shadow backup so an accidental clobber of curated memory is
+recoverable in-place (WI#286).
 
 The operator surface gained per-tenant system-prompt editing in Settings with
 Engine V2 initialization snapshots (WI#220), read-only tenant database and
@@ -243,6 +249,19 @@ previous compatibility baseline.
   re-paired to bracket injection text (the !1317 review P2). Unquoted
   matches, oversized/multiline spans, and tokenizer-level patterns still
   reject, and identity files and lorebooks keep the strict raw scan
+- **Curated-memory write contract hardened (WI#286).** The default
+  `memory_write(target: "memory", append: true)` lane did zero
+  prompt-injection validation — the WI#132 hardening scanned every sibling
+  lane but skipped this one — so a `<|im_start|>` payload could reach a v1
+  session prompt undefused. `append_memory` now scans the entry and the
+  combined candidate pre-commit, mirroring `append()`. Every
+  `memory_write` lane also rejects payloads over 256 KiB (the incident's
+  ~48 KB context dump clobbered a curated `MEMORY.md`), matching the web
+  prompt editor's whole-file cap. And a full-replace `write()` of a
+  prompt-visible file with non-empty differing prior content now persists
+  the previous version to a rolling single-slot `backups/<path>.bak`
+  shadow copy first — exact-path readable, never search-indexed, and
+  backup failures never block the write
 - **Orchestrator self-modification for new tenants (WI#282).** add-tenant
   now renders `ORCHESTRATOR_SELF_MODIFY=true` so new tenants adopt stored
   orchestrator and prompt-overlay updates; an explicit operator opt-out is
@@ -315,6 +334,7 @@ previous compatibility baseline.
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
 | XMPP outbound delivery | `message` tool ack reports `Queued …` (acceptance, not delivery); enqueue refused while no session is bound; bounded 2s shutdown drain; durable spool persists every outbound message before ack with replay on bind, backoff retry, and `.failed.json` parking after 24 attempts — at-least-once semantics (post-send crash can duplicate at whole-message granularity) |
 | Workspace write scanning | Daily logs (`daily/*.md`) demote High-severity injection matches fully enclosed in short (≤200-byte) single-line inline quoted spans to warn-only describing context (WI#280); unquoted matches and tokenizer-level patterns still reject at the same floor; identity files and lorebooks keep the strict raw scan |
+| Workspace memory writes | The `append_memory` lane (`memory_write(target: "memory", append: true)`) is prompt-injection scanned pre-commit like every sibling lane (WI#286); all `memory_write` lanes reject payloads over 256 KiB; full-replace writes of prompt-visible files persist the prior content to a rolling `backups/<path>.bak` shadow copy (exact-path readable, never search-indexed) before replacing it |
 | Pairing store (WI#184) | Design revision 3 only — no substrate change this release; landed tests pin current legacy matching and concurrent-grant semantics ahead of the secrets-store migration |
 | CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only; the cargo-deny job runs unvendored from the repo root via `.gitlab/scripts/cargo-deny-check.sh` and fails on any `index-failure` diagnostic |
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
@@ -746,6 +766,50 @@ section. The change landed via !1332 (pipeline #4880 green) re-applying
 the reviewed !1327 head, whose review had zero findings — it had died only
 on goals-file merge conflicts.
 
+### Curated-Memory Write Contract (WI#286)
+
+WI#286's "fixed" was data recovery only; the substrate gaps behind the
+incident (a session's ~48 KB context dump clobbering a curated `MEMORY.md`)
+are now closed (goals item 29's re-opened scope, landed via !1341/!1344):
+
+- **The `append_memory` scan bypass is closed (the MED-HIGH finding).**
+  The default `memory_write(target: "memory", append: true)` lane did zero
+  validation — the WI#132 hardening commit scanned every sibling lane but
+  skipped this one. `append_memory()` in `ic/src/workspace/mod.rs` now
+  scans the entry and the combined candidate before commit, mirroring
+  `append()` (pre-commit, so no compensation path is needed). A
+  `<|im_start|>` payload through this lane into a v1 session no longer
+  reaches the prompt undefused.
+- **`memory_write` payload cap.** The tool accepted unbounded content;
+  every lane now rejects payloads over 256 KiB
+  (`MAX_MEMORY_WRITE_BYTES` in `ic/src/tools/builtin/memory.rs`),
+  matching the web prompt editor's whole-file cap.
+- **Shadow backup for prompt-file full replaces.** `Workspace::write()`
+  on a prompt-visible file with non-empty differing prior content now
+  persists the previous version to a rolling single-slot
+  `backups/<path>.bak` doc before replacing it — the clobber class is
+  recoverable in-place via exact-path `read()` instead of manual
+  re-curation. Backups carry an empty chunk projection (never
+  search-indexed), are not rescanned (so poisoned content can still be
+  replaced), and backup failures log-and-continue rather than blocking
+  the write.
+
+The stale `memory.rs` comment claiming `append_memory` scanning was handled
+by `write()`/`append()` was corrected, and the spec is updated in the
+workspace README (scan lane, shadow-backup section, cap note). Deliberately
+out of scope: the broader #280/#286 detector redesign (line-start role
+labels plus a "resembles the live system prompt" provenance heuristic) is
+deferred as needing runtime verification.
+
+Verified: 6 new workspace integration tests (injection entry rejected
+pre-commit with no doc created, append over poisoned existing content
+rejected without touching it, benign appends land with the `\n\n`
+separator, backup created/rolling/scoped-to-prompt-files, backup
+unindexed) plus a tool-level cap test (oversized rejected on all lanes,
+at-limit passes the gate) — `workspace::` suite 236/236 and
+`tools::builtin::memory` 24/24 pass, with clippy `-D warnings`, rustfmt,
+and the panic-policy scanner clean.
+
 ### Version Bumps and Supply Chain (item 1)
 
 All eleven LunarWing-owned release packages moved `2.1.3` → `2.1.4`: the
@@ -994,6 +1058,13 @@ launchd a distant third).
     injection-shaped text inline without a write rejection (warn-only
     describing context). Unquoted matches and tokenizer-level patterns
     still reject, and identity-file/lorebook writes are unchanged.
+19. **Curated-memory writes (WI#286).** No configuration change.
+    `memory_write` payloads over 256 KiB are now rejected on every lane —
+    agents that previously dumped large context blobs into curated memory
+    must chunk instead. Full replaces of prompt-visible files keep the
+    prior content at `backups/<path>.bak` in the same workspace scope;
+    restore by reading that exact path. Backups are single-slot (each
+    replace rolls the previous one away) and never search-indexed.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -1039,6 +1110,13 @@ launchd a distant third).
   landed allowFrom-preservation fix (!1283).
 - WI#191 later slices (LLM timing, whole-job/mission ETA, gate-wait
   analytics, durable aggregate caches) are deferred beyond this release.
+- The broader daily-log detector redesign (line-start role labels plus a
+  "resembles the live system prompt" provenance heuristic) was
+  deliberately deferred out of WI#280/WI#286 as needing runtime
+  verification. A daily log containing an *unquoted* High-severity match
+  still blocks all further appends to that day's file with no tool-level
+  self-heal (operator/disk repair required) — tracked as WI#288
+  (goals item 32).
 
 ### Resolved or Source-Fixed Since v2.1.3.0
 
@@ -1070,6 +1148,12 @@ launchd a distant third).
   in short, single-line, inline quoted spans to warn-only describing
   context, with the quote-pairing bypass closed, while unquoted and
   tokenizer-level matches still reject (WI#280 source-fixed via !1332).
+- Curated memory can no longer be clobbered or poisoned through the gaps
+  in the write contract: the `append_memory` lane is scanned pre-commit
+  like every sibling lane, `memory_write` payloads are capped at 256 KiB,
+  and full replaces of prompt-visible files keep a rolling
+  `backups/<path>.bak` shadow copy recoverable by exact-path read
+  (WI#286 source-fixed via !1341/!1344).
 - The voice sidecar bounds abandoned inference admission with per-component
   readiness and explicit permanent-failure semantics; supported recovery
   via `restart-tenant` (WI#264 source-fixed; the v2.1.3.0 known issue is
@@ -1144,10 +1228,16 @@ codename candidates shortlist (item 25), the durable XMPP outbound spool
 (item 28, #285), and the opencode2 v2.0.21 bump (item 29). This third
 repass (item 40, 2026-10-02) folds in the rest: the audit doc's own repass
 (item 15), the daily-log injection-scan quoted demotion (item 22, WI#280),
-and the pipeline-4867 all-green verification (item 23). Note that goals
-items 20 and 29 were later re-opened with new scopes (a pipeline-4890
-check and WI#286, respectively) — references to items 20/29 in this draft
+and the pipeline-4867 all-green verification (item 23). Goals items 20 and
+29 were later re-opened with new scopes (a master-pipeline re-check and
+WI#286, respectively) — earlier references to items 20/29 in this draft
 describe the completed cargo-deny and opencode2 work done under those
-numbers. Open goal items at repass time are 20 (pipeline 4890 re-check),
-29 (WI#286), 30 (WI#281), and 39 (item-14 repass); this draft covers the
-merged state as of 2026-10-02.*
+numbers. This fourth repass (item 42, 2026-10-02) folds in both re-opened
+scopes: the curated-memory write contract — `append_memory` injection
+scan, the 256 KiB `memory_write` payload cap, and prompt-file shadow
+backups (item 29, WI#286, merged via !1341/!1344) — and item 20's
+re-check, with master pipeline 4907 on the WI#286 merge (`75c4bd50`)
+verified 35/35 green including the honest unvendored cargo-deny wrapper.
+Open goal items at repass time are 30 (WI#281), 31 (WI#292), 32 (WI#288),
+and 39 (item-14 repass); this draft covers the merged state as of
+2026-10-02.*
