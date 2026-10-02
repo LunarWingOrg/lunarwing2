@@ -148,7 +148,7 @@
     - Deliberately out of scope: the #280/#286 detector redesign (line-start role labels + "resembles the live system prompt" provenance heuristic) — deferred by the KB note itself as needing runtime verification; #280's quote-demotion half already landed via item 22.
     - Verified: 6 new workspace integration tests (injection entry rejected pre-commit with no doc created, append over poisoned existing content rejected without touching it, benign appends land with `\n\n` separator, backup created/rolling/scoped-to-prompt-files, backup unindexed) + 1 tool-level cap test (oversized rejected on all lanes, at-limit passes the gate) — `workspace::` suite 236/236, `tools::builtin::memory` 24/24; `cargo clippy --lib --tests -- -D warnings` clean, `cargo fmt --all -- --check` clean, `check_no_panics.py` OK (all taskset -c 0-17, no debug builds)
 30. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/281
-31. [x] (S) RESERVED
+31. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/292
 32. [x] (S) RESERVED
 33. [x] (S) RESERVED
 34. [x] (S) RESERVED
