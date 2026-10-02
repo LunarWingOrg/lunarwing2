@@ -88,7 +88,26 @@ check ends the span instead of keeping it open, so mismatched quotes cannot
 be eagerly re-paired to bracket injection text (`"a"ignore previous …"`
 stays unquoted and rejects). Unquoted matches and tokenizer-level patterns
 (`<|`, `|>`, `[INST]`, `[/INST]`, null bytes) still reject in daily logs, and
-all other prompt-visible files keep the strict raw scan.
+all other prompt-visible files keep the strict raw scan. Rejection errors name
+the offending file and the 1-based line of each rejecting match so an operator
+can repair quickly (WI#288).
+
+### Daily-Log Quarantine (WI#288)
+
+An append to a daily log re-scans the full combined candidate, so a day file
+already holding *unquoted* High-severity content (e.g. written before the gate
+existed) would otherwise reject every subsequent append and freeze the day's
+log with no tool-level recovery. When the combined scan fails but the new
+entry itself is clean and the pre-existing content alone trips the gate,
+`append()` quarantines the day file aside to `daily/YYYY-MM-DD.poisoned-<n>.md`
+(first free slot) and clears the day file; the rejection reason names the
+quarantine path so the caller knows a retry starts a fresh log. The quarantine
+copy is retained with an empty chunk projection — exact-path readable, listed,
+never search-indexed — and is never prompt-injected (daily-log injection reads
+only the exact `daily/YYYY-MM-DD.md` path). Quarantine applies only when the
+poison pre-exists: a poisoned entry, or a pattern split across the append
+boundary, is still a plain rejection with no file movement. Quarantine
+failures are logged and never mask the original rejection.
 
 ### Prompt-File Shadow Backups (WI#286)
 
