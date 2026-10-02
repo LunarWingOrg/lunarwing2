@@ -1,8 +1,17 @@
 # Release Notes for LunarWing v2.1.4.0
 
-## Codename: UNKNOWN (draft)
+## Codename: Kabuto (兜) — The Helmet
 
 **Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repasses 2026-10-01 and 2026-10-02)
+
+> Beneath the helmet,<br>
+> the head that planned every plate —<br>
+> armor remembers. 兜
+
+After Yoroi laced the plates and Ō-Yoroi closed the box, **Kabuto crowns
+the suit**: the helmet protects the mind behind the armor. Christopher
+selected the name on 2026-10-02 in
+[WI#293](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/293).
 
 ## Overview
 
@@ -57,6 +66,14 @@ over 256 KiB, and full-replace writes of prompt-visible files keep a
 rolling shadow backup so an accidental clobber of curated memory is
 recoverable in-place (WI#286).
 
+Late-cycle hardening carries the provider's real finish reason through
+blocking and streaming responses instead of inventing a successful stop
+(WI#292), and quarantines pre-existing poisoned daily logs so a retry can
+resume the day's entries (WI#288). Wasmtime/WASI advances to 36.0.17 for
+three new RustSec advisories; vendor refresh now restores the committed
+rig-core finish-reason patch automatically for same-version refreshes
+(WI#294).
+
 The operator surface gained per-tenant system-prompt editing in Settings with
 Engine V2 initialization snapshots (WI#220), read-only tenant database and
 daemon-PID diagnostics verbs in mt-admin (`psql`, `daemon-pid`) with a
@@ -80,8 +97,9 @@ restart or crash between ack and send no longer silently loses the message
 The full docs set was repassed for the cycle: all 32 active guides under
 `docs/guides/` and all 10 active architecture docs re-verified against source
 and stamped, the cycle's open work items were reconciled in a tracker
-audit (23 open items, dispositions verified against the tree), codename
-candidates were shortlisted for the human pick, and stale versioned ops docs
+audit (initially 23 open items; the latest recorded audit covers 25 at
+18:10 UTC on October 2), Kabuto was selected from the codename shortlist,
+and stale versioned ops docs
 were archived to `docs/ops/history/` with every inbound link repaired.
 
 The release identifier is `2.1.4.0`; LunarWing-owned Rust crates and channel
@@ -94,6 +112,23 @@ previous compatibility baseline.
 
 ## Highlights
 
+- **Provider finish reasons preserved (WI#292).** Blocking responses and
+  the deployed OpenAI-compatible streaming path now carry the actual
+  stop/length/content-filter/tool-use metadata. Missing reasons remain
+  `Unknown`; the deployed proxy no longer fabricates `stop`. The lightweight
+  routine consumer can classify truncation correctly; an Engine V2
+  finish-reason-driven recovery ladder remains follow-up work.
+- **Daily-log quarantine and retry (WI#288).** A clean append encountering
+  pre-existing poisoned daily content preserves it at
+  `daily/YYYY-MM-DD.poisoned-<n>.md`, clears the day file, and rejects with
+  a retry hint. The next clean append can succeed; rejection details now
+  include offending line numbers. New poison and split-boundary patterns
+  still reject without quarantining the file.
+- **Wasmtime security and repeatable vendor refresh (item 20, WI#294).**
+  Wasmtime/WASI 36.0.17 clears RUSTSEC-2026-0321/0322/0323 without new
+  advisory ignores. Same-version vendor refreshes restore the committed
+  rig-core patch and checksums; uncommitted patch edits or a rig-core
+  version change require explicit maintainer action.
 - **Recoverable mid-stream provider failures (WI#244).** Mission executor
   turns that lose the provider after partial text now attempt bounded
   recovery for transient/unavailable failures instead of aborting the whole
@@ -294,13 +329,16 @@ previous compatibility baseline.
   (`ic/src/pairing/store.rs`), concurrent-grant preservation (8 concurrent
   approvers), and the wasm `pairing_is_allowed` host-path regression
   (`ic/src/channels/wasm/wrapper.rs`)
-- **Open work items audit (item 14).** All 23 open tracker items reconciled
+- **Open work items audit (items 14/15/39).** Initially 23 open tracker items reconciled
   against the tree in
   [v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md](docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md):
-  5 genuinely-open 2.1.4.0 items (#281, #280, #270, #269, #271), #184 with
+  The initial snapshot recorded 5 genuinely-open 2.1.4.0 items
+  (#281, #280, #270, #269, #271), #184 with
   the !1294 rejection recorded, 15 deferred by label, and closeable evidence
   identified for #198/#199. Every code-facing disposition verified against
-  source at `03f5650fe`, not taken from tracker bodies
+  source at `03f5650fe`, not taken from tracker bodies. The item-39 repass
+  records 25 open items at `150e05ca9`; subsequent landings and WI#281's
+  source-based closure are distinguished below from those historical counts
 - **Guides and architecture docs repass (items 16/17).** All 32 active
   guides under `docs/guides/` and all 10 active docs under
   `docs/architecture/` re-verified against current source and stamped for
@@ -308,6 +346,10 @@ previous compatibility baseline.
   darkirc 0.1.10, weechat 0.2.11, xmpp 0.1.16; WASM channel crates at
   workspace `2.1.4`) and confirming V27 remains the latest migration with
   the migration chain's `ironclaw-agent-v1` alias removed
+
+> Fire bent the steel,<br>
+> thread drew the plates tight together —<br>
+> now the helm takes form. 兜
 
 ## Compatibility
 
@@ -320,10 +362,13 @@ previous compatibility baseline.
 | Multi-tenant port registry | v17 (no change) |
 | Channel registry patches | darkirc 0.1.10, multica 0.1.13, weechat 0.2.11, xmpp 0.1.16 (behavior unchanged; rebuild required) |
 | Tool registry patches | cavepony-tool 0.4.4 (release-metadata alignment; the `version-policy` gate requires all five version fields to advance together), gitlab 0.1.7, gotify 0.1.1, llm-context 0.1.2, multica-bridge 0.1.3, ssh 0.1.2, vision-analyze 0.1.4, voice-transcribe 0.1.2, web-search 0.2.3 |
-| WASM runtime | Wasmtime / wasmtime-wasi 36.0.16 (no change from v2.1.3.0) |
+| WASM runtime | Wasmtime / wasmtime-wasi 36.0.17 (security update from 36.0.16 for RUSTSEC-2026-0321/0322/0323); workspace and XMPP bridge lockfiles plus vendor tree updated |
 | External crate updates | 121 semver-compatible updates across the ic workspace and satellite lockfile roots (notably hyper 1.11.1, reqwest 0.13.5, tokio-rustls 0.26.6, quinn 0.11.12, clap 4.6.7, thiserror 2.0.21, rkyv stack replaced by string_cache/web_atoms/zlib-rs in affected satellites); `ic/vendor/` regenerated |
 | Worker image tool pins | kimi-code `2.1.1` (no change); opencode2 `v2.0.21` at `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (was v2.0.18, via v2.0.20); opencode `v1.18.25` (no change); pebble `2d0f3786…` with the reviewed upstream lock re-pinned for the chacha20 retirement (refreshed `PEBBLE_LOCK_SHA256`) |
 | Engine provider recovery | Bounded per-turn recovery after partial text for transient/unavailable provider failures; retry caps and rate-limit exclusions unchanged; failed drafts never enter history or tool execution |
+| Provider finish metadata | Real blocking/compatible-stream finish reasons propagated; missing reasons remain Unknown; deployed lunarwing-proxy.py omits absent upstream reasons instead of defaulting to stop (WI#292) |
+| Daily-log recovery | Clean appends encountering pre-existing poison quarantine the old content and reject with a retry hint; retry starts a fresh day file, with file/line rejection detail (WI#288) |
+| Vendor maintenance | Commit rig-core patch edits and checksums before refresh; same-version refresh restores the committed patch, while a rig-core version change requires manual patch porting (WI#294) |
 | Mission global listings | Missions whose project record is missing/unparseable remain globally enumerable; only Active ones reach the active-only listing |
 | `routine_history` / `mission_history` | `routine_history` falls back to Engine V2 mission-name lookup when the v1 routines registry misses, with character-based summary truncation; in v2 threads it is blocked with an honest pointer to the new `mission_history` tool (project-scoped own+shared, ownership re-checked on the UUID path) |
 | Voice sidecar admission | One in-flight call per component (STT/TTS/VAD) before shared capacity; blocked workers hold both permits until settlement; poisoned lock/panic = `component_failed`/503 until restart |
@@ -340,6 +385,80 @@ previous compatibility baseline.
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
 
 ## Changes
+
+### Real Provider Finish Reasons (WI#292)
+
+The adapter previously inferred `Stop` or `ToolUse` from response content,
+discarding the provider's terminal metadata. Blocking extraction now reads
+`choices[0].finish_reason` or Anthropic-shaped `stop_reason`, using the
+shared canonical mapping. Tool calls in blocking content still take
+precedence over mislabeled wire metadata; absent or unrecognized metadata
+becomes `Unknown` rather than a fabricated successful stop.
+
+For streaming, the local rig-core 0.40.0 patch carries stop, length, and
+content-filter reasons through aggregation into the final response and
+exposes them through `GetTokenUsage::finish_reason()`. With no reported
+reason, the adapter falls back to tool use only when tool calls actually
+streamed, otherwise to unknown. The deployed
+`tensorzero-proxy-configurations/lunarwing-proxy.py` likewise omits an
+absent upstream reason rather than substituting `stop`.
+
+This lets the lightweight routine engine distinguish `Length` as
+`TruncatedResponse` instead of misclassifying it as `EmptyResponse`.
+Engine V2 receives the metadata through the bridge, but does **not** yet
+use it to choose a length-retry versus stop-terminal recovery path. The
+outbound web OpenAI-compatible surface still maps Unknown to `stop`;
+deprecated/experimental proxies were not changed. Historical goal-31
+validation records 64 rig-adapter, 612 LLM, and 13 bridge-adapter tests,
+including scripted blocking and TensorZero SSE regressions.
+
+### Daily-Log Quarantine and Rejection Detail (WI#288)
+
+When the combined append candidate fails its injection scan, but the new
+entry is clean and the existing daily log itself trips the gate,
+`Workspace::append()` copies the existing content to the first free
+`daily/YYYY-MM-DD.poisoned-<n>.md` slot and clears the original day file.
+The discovering append still returns an error naming the quarantine path
+and asking the caller to retry; the clean entry is written only on retry.
+
+Quarantine copies remain listed and exact-path readable, with no search
+chunks and no automatic daily-log prompt injection. A poisoned new entry
+or a pattern formed only across the append boundary is rejected without
+moving the file. Failed quarantine retains the original rejection, so
+operator repair can still be necessary. Both strict and daily-log rejection
+details now include the 1-based offending line. The broader detector
+redesign and an operator-approved repair/overwrite tool remain outside
+this change. Goal-32 evidence records 241 workspace and 24 memory-tool
+tests, including quarantine → rejection → successful retry, slot
+preservation, boundary-split rejection, and line-number coverage.
+
+### Wasmtime Security Update and Vendor Patch Preservation (item 20, WI#294)
+
+Master pipeline 4922 superseded the earlier green pipeline-4907 snapshot:
+its cargo-deny job failed on three newly published advisories against
+wasmtime-wasi 36.0.16. The fix advances the Wasmtime family to 36.0.17
+(and matching Cranelift family to 0.123.17) in the workspace and XMPP
+bridge locks and regenerates the vendor tree:
+
+- RUSTSEC-2026-0321: preview-0 `poll_oneoff` bypassing fuel consumption.
+- RUSTSEC-2026-0322: excessive host memory when guests lack stdio.
+- RUSTSEC-2026-0323: `fd_readdir` exposing uninitialized padding to guests.
+
+No advisory ignore was added. The exact unvendored CI wrapper and both
+workspace/bridge compile checks passed locally in the recorded item-20
+validation; final remote release-head validation remains required.
+
+That refresh also exposed WI#294: `cargo vendor` overwrites the local
+WI#292 rig-core patch even on no-op refreshes, making the original
+post-vendor tripwire fail every time. `ic/scripts/refresh-vendor.sh` now
+checks for a clean committed patch and its marker **before** vendoring,
+then restores the committed patched tree and matching checksums from Git
+when the version is unchanged. A rig-core version change fails explicitly
+so a maintainer can port the patch onto the new sources, regenerate
+checksums, commit, and retry. See
+[LUNARWING-PATCH.md](ic/vendor/rig-core/LUNARWING-PATCH.md).
+Goal-41 evidence records a successful full no-op refresh, clean vendor
+diff, advisory gate, compile check, and dirty-patch rejection.
 
 ### Mid-Stream Provider Failure Recovery (WI#244)
 
@@ -929,8 +1048,24 @@ The audit is a point-in-time record at `03f5650fe`, repassed once (item 15,
 closure. Four of its five genuinely-open 2.1.4.0 items have since landed in
 this release — #269 (`mission_history`, item 18), #270 (outbound delivery
 honesty, item 19), #271 (mt-admin worker-image store surfacing, item 24),
-and #280 (daily-log quoted demotion, item 22) — leaving #281 as the only
-genuinely-open 2.1.4.0-labeled item, tracked as goals item 30.
+and #280 (daily-log quoted demotion, item 22) — leaving #281 open at that
+snapshot, tracked as goals item 30.
+
+The item-39 repass records 25 open items at `150e05ca9` (2026-10-02,
+18:10 UTC), including the WI#286 landing, newly filed #288–#293, and
+Christopher's Kabuto selection. That audit predates the later WI#292,
+WI#288, Wasmtime, and WI#294 changes described above; its counts are
+historical, not a fresh open-issue total. Goal 44 owns the next audit repass.
+
+**WI#281 was closed on 2026-10-02 after source review, not a new binding
+implementation.** The closing discussion confirms mission functions are
+foreground-leased Engine V2 effect-capability actions, bound in the CodeAct
+sandbox and dispatched through the bridge before tool execution.
+`tool_info` and the ordinary tool list enumerate a different registry;
+their "not registered" result is a discovery false negative, not proof
+that `mission_create(...)` is unavailable. Worker job contexts do not gain
+mission effects from this clarification. The tool-discovery discrepancy
+remains; this release does not claim a new `tool_info` fix.
 
 ### Guides and Architecture Docs Repass (items 16/17)
 
@@ -954,15 +1089,21 @@ source and stamped for v2.1.4.0:
 - Link checks: every relative link and cited `ic/`/`projects/` path in the
   active guides and architecture docs resolves.
 
-### Codename Candidates (item 25)
+### Kabuto: The Helmet (item 25, WI#293)
 
 Ten release-codename candidates grounded in the cycle's actual work are
 shortlisted in
 [v2.1.4.0_CODENAME_IDEAS.md](docs/ops/v2.1.4.0_CODENAME_IDEAS.md), with no
 previous codename repeated and every prior shortlist checked against the
-history. The top pick is **Kabuto (兜)** — completing the `Yoroi` (2.1.2.0)
-→ `Ō-Yoroi` (2.1.3.0) armor lineage — with Kiwame (極め) and Shūfuku (修復)
-as alternates. The codename above remains UNKNOWN until a human picks.
+history. Christopher selected **Kabuto (兜, the helmet)** on 2026-10-02,
+continuing `Yoroi` (2.1.2.0) → `Ō-Yoroi` (2.1.3.0): the helmet crowns
+the armor. The longer lineage runs Tatara → Kiyome → Togishi → Sashiko →
+Odoshi → Yoroi → Ō-Yoroi → Kabuto. The three haikus interspersed in these
+notes are reproduced from [WI#293](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/293).
+The selected [release artwork](https://blog.lunarwing.org/assets/Kabuto.png)
+depicts a cyberpunk kabuto bearing LunarWing's crescent-in-hexagon sigil.
+Kabuto is reserved for this release; final tag-time confirmation remains
+Christopher's sign-off.
 
 ### Repo Housecleaning and Agent-Doc Drift (items 28, #285)
 
@@ -994,8 +1135,12 @@ launchd a distant third).
    unchanged, but the channels must be rebuilt/reinstalled. All nine tool
    registry versions advanced; rebuild/reinstall them together.
 4. **Vendor snapshot.** `ic/vendor/` was regenerated for the 121 external
-   crate updates; if you maintain a local vendor override, refresh it with
-   `ic/scripts/refresh-vendor.sh` before building.
+   crate updates and the later Wasmtime 36.0.17 security fix. Deploy a
+   rebuilt daemon/bridge to pick up that runtime fix. Use
+   `ic/scripts/refresh-vendor.sh` for dependency refreshes: rig-core carries
+   a committed local patch, so commit its edits and regenerated checksums
+   first; same-version refreshes restore it, while version bumps require
+   porting the patch. Do not replace it with pristine registry sources.
 5. **opencode2 rebuild.** Rebuild the opencode2 worker image at `v2.0.21`
    (`8a8bd622…`); pull worker images by the digest recorded in
    `worker-image-evidence.json`. Promotion still requires the CI
@@ -1064,7 +1209,17 @@ launchd a distant third).
     must chunk instead. Full replaces of prompt-visible files keep the
     prior content at `backups/<path>.bak` in the same workspace scope;
     restore by reading that exact path. Backups are single-slot (each
-    replace rolls the previous one away) and never search-indexed.
+     replace rolls the previous one away) and never search-indexed.
+20. **Daily-log recovery (WI#288).** If an append error says existing
+    poison was quarantined, retry the clean entry to start the fresh day
+    file; the rejected entry was not written automatically. Inspect the
+    named `.poisoned-<n>.md` path to recover prior content. File/line detail
+    helps manual repair when quarantine fails. No configuration change.
+21. **Finish metadata (WI#292).** Deploy the updated daemon and deployed
+    `lunarwing-proxy.py` together for end-to-end preservation. Consumers
+    must tolerate Unknown when a provider omits the reason; it no longer
+    implies successful completion. This does not enable a new Engine V2
+    recovery ladder or change the outbound web compatibility mapping.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -1113,13 +1268,30 @@ launchd a distant third).
 - The broader daily-log detector redesign (line-start role labels plus a
   "resembles the live system prompt" provenance heuristic) was
   deliberately deferred out of WI#280/WI#286 as needing runtime
-  verification. A daily log containing an *unquoted* High-severity match
-  still blocks all further appends to that day's file with no tool-level
-  self-heal (operator/disk repair required) — tracked as WI#288
-  (goals item 32).
+  verification. WI#288 now quarantines pre-existing daily-log poison and
+  permits a clean retry; quarantine failures can still require operator
+  repair. The discovering append is rejected, and no operator-gated
+  repair/overwrite verb was added.
+- WI#292 propagates finish metadata but does not implement a finish-driven
+  Engine V2 recovery ladder. Unknown still maps to `stop` on the outbound
+  web OpenAI-compatible surface; deprecated/experimental proxies retain
+  their prior behavior.
+- WI#281's source review confirmed mission effects already callable in
+  foreground Engine V2 threads; `tool_info` still cannot discover those
+  effect actions. Tracker closure is not a claim that discovery was fixed.
 
 ### Resolved or Source-Fixed Since v2.1.3.0
 
+- Real provider finish reasons survive blocking and compatible-stream
+  adaptation and the deployed proxy; absent metadata remains Unknown
+  (WI#292), with engine recovery-policy work explicitly deferred.
+- Pre-existing daily-log poison is preserved in quarantine and a clean
+  retry can resume the day; scan errors name offending lines (WI#288
+  source-fixed, tracker still open at this repass).
+- Wasmtime/WASI 36.0.17 clears RUSTSEC-2026-0321/0322/0323; same-version
+  vendor refresh preserves the committed rig-core patch (WI#294).
+- WI#281 closed after confirming existing Engine V2 effect bindings;
+  no runtime binding or tool-discovery fix is claimed.
 - Bounded recovery for transient/unavailable provider failures after
   partial text; failed drafts never enter history or tool execution
   (WI#244 source-fixed; the v2.1.3.0 known issue is closed).
@@ -1148,8 +1320,8 @@ launchd a distant third).
   in short, single-line, inline quoted spans to warn-only describing
   context, with the quote-pairing bypass closed, while unquoted and
   tokenizer-level matches still reject (WI#280 source-fixed via !1332).
-- Curated memory can no longer be clobbered or poisoned through the gaps
-  in the write contract: the `append_memory` lane is scanned pre-commit
+- Curated-memory write hardening closes the append scan bypass and adds
+  recovery for accidental full replaces: the `append_memory` lane is scanned pre-commit
   like every sibling lane, `memory_write` payloads are capped at 256 KiB,
   and full replaces of prompt-visible files keep a rolling
   `backups/<path>.bak` shadow copy recoverable by exact-path read
@@ -1197,15 +1369,14 @@ launchd a distant third).
   regressions are landed executable tests ahead of the substrate change.
 - The cycle's open work items were reconciled in
   `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` with tree-verified
-  dispositions for all 23 open items, then repassed once (item 15) as
-  #271/#277 landed and #280's !1327 closed unmerged; WI#200 closed on the
-  landed stopgap.
+  dispositions for the original 23 open items, then repassed in items 15
+  and 39 (25 open at the latter's source snapshot). Subsequent changes and
+  WI#281's closure are recorded above; WI#200 closed on the landed stopgap.
 - The cargo-deny yanked-crate CI gate is honest again: it runs unvendored
   from the repo root and hard-fails on any `index-failure` diagnostic,
   closing the silent-skip hole found in pipeline 4811 (item 20).
-- Ten codename candidates are shortlisted for the human pick in
-  `docs/ops/v2.1.4.0_CODENAME_IDEAS.md` (top pick Kabuto; the draft header
-  stays UNKNOWN until then).
+- Christopher selected **Kabuto (兜)** from the ten-name shortlist
+  (WI#293); its three haikus accompany this draft.
 - Repo housecleaning archived fourteen stale versioned ops docs to
   `docs/ops/history/` with every inbound link repaired and removed the
   placeholder `docs/ov/`; the root and `ic/` `AGENTS.md` files took a
@@ -1213,7 +1384,7 @@ launchd a distant third).
 
 ---
 
-*Draft status: codename, release date, and pipeline numbers for final CI
+*Draft status: release date and pipeline numbers for final CI
 confirmation will be filled in before the release is cut. The first repass
 (item 27, 2026-10-01) folded in the work merged after the first draft —
 WI#184 design revision 3 with its landed regressions (item 11), the open
@@ -1238,6 +1409,19 @@ scan, the 256 KiB `memory_write` payload cap, and prompt-file shadow
 backups (item 29, WI#286, merged via !1341/!1344) — and item 20's
 re-check, with master pipeline 4907 on the WI#286 merge (`75c4bd50`)
 verified 35/35 green including the honest unvendored cargo-deny wrapper.
-Open goal items at repass time are 30 (WI#281), 31 (WI#292), 32 (WI#288),
-and 39 (item-14 repass); this draft covers the merged state as of
-2026-10-02.*
+Those pipeline results are historical: the subsequent pipeline-4922
+advisory failure required the Wasmtime 36.0.17 update. This fifth repass
+(item 43, 2026-10-02) is checked against branch base `130edb89f` and folds
+in WI#292 finish metadata, WI#288 quarantine, the item-39 audit, the later
+item-20 Wasmtime security fix, and WI#294 vendor-refresh preservation.
+It also records WI#281's source-based closure and Christopher's Kabuto
+selection with all three WI#293 haikus. Goal 44 (another tracker audit)
+remains open; final release-head CI, release date, and Christopher's
+tag-time sign-off remain pending. This is still a release draft, not a
+release or deployment acceptance claim.*
+
+> What the helmet guards<br>
+> was never the metal's strength:<br>
+> the one who keeps watch.
+
+兜
