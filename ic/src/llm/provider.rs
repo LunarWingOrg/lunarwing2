@@ -300,14 +300,20 @@ impl FinishReason {
         }
     }
 
-    /// Parse terminal metadata emitted by an LLM stream.
+    /// Parse terminal metadata emitted by an LLM stream or a provider's raw
+    /// blocking response into the canonical set.
+    ///
+    /// Besides the OpenAI spellings this accepts Anthropic's `stop_reason`
+    /// vocabulary (`end_turn`, `stop_sequence`, `max_tokens`, `tool_use`) and
+    /// the deprecated OpenAI functions-era `function_call`, so raw-response
+    /// extraction (WI#292) and stream metadata share one mapping.
     pub(crate) fn from_stream_reason(reason: &str) -> Self {
         match reason {
-            "stop" => Self::Stop,
-            "length" => Self::Length,
+            "stop" | "end_turn" | "stop_sequence" => Self::Stop,
+            "length" | "max_tokens" => Self::Length,
             // "tool_calls" is the canonical spelling; "tool_use" is the legacy
             // alias previously emitted by the orchestrator worker proxy.
-            "tool_calls" | "tool_use" => Self::ToolUse,
+            "tool_calls" | "tool_use" | "function_call" => Self::ToolUse,
             "content_filter" => Self::ContentFilter,
             _ => Self::Unknown,
         }

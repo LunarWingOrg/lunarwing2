@@ -387,10 +387,40 @@ fn convert_tool_choice(choice: Option<&str>) -> Option<RigToolChoice> {
     }
 }
 
+/// Extract the provider-reported finish reason from a raw provider response.
+///
+/// OpenAI-compatible providers carry it at `choices[0].finish_reason`;
+/// Anthropic-shaped raw responses carry a top-level `stop_reason`. Both are
+/// mapped through [`FinishReason::from_stream_reason`]. Returns `None` when
+/// the provider reported nothing — callers must surface
+/// [`FinishReason::Unknown`] rather than guessing from content shape (WI#292).
+fn extract_finish_reason<T: Serialize>(raw: &T) -> Option<FinishReason> {
+    let value = serde_json::to_value(raw).ok()?;
+    if let Some(reason) = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(FinishReason::from_stream_reason(reason));
+    }
+    value
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(FinishReason::from_stream_reason)
+}
+
 /// Extract text and tool calls from a rig-core completion response.
+///
+/// `raw_finish` is the provider-reported finish reason from
+/// [`extract_finish_reason`]. Tool calls present in the content are ground
+/// truth and always yield [`FinishReason::ToolUse`]; otherwise the provider's
+/// value is carried verbatim, or [`FinishReason::Unknown`] when the provider
+/// said nothing (WI#292 — finish is no longer synthesized from content shape).
 fn extract_response(
     choice: &OneOrMany<AssistantContent>,
     _usage: &RigUsage,
+    raw_finish: Option<FinishReason>,
 ) -> (Option<String>, Vec<IronToolCall>, FinishReason) {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<IronToolCall> = Vec::new();
@@ -424,7 +454,7 @@ fn extract_response(
     let finish = if !tool_calls.is_empty() {
         FinishReason::ToolUse
     } else {
-        FinishReason::Stop
+        raw_finish.unwrap_or(FinishReason::Unknown)
     };
 
     (text, tool_calls, finish)
@@ -613,10 +643,20 @@ where
             cache_read_input_tokens: saturate_u32(raw_usage.cached_input_tokens),
             cache_creation_input_tokens: saturate_u32(raw_usage.cache_creation_input_tokens),
         });
-        let finish_reason = if self.saw_tool { "tool_calls" } else { "stop" };
+        // WI#292: carry the provider-reported finish reason when one exists.
+        // When the provider stayed silent, streamed tool calls are
+        // content-shape ground truth, but a tool-less silent stream is
+        // honestly "unknown" — never a fabricated "stop".
+        let finish_reason = raw.finish_reason().map(str::to_owned).unwrap_or_else(|| {
+            if self.saw_tool {
+                "tool_calls".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
         LlmStreamChunk::Done {
             usage,
-            finish_reason: finish_reason.to_string(),
+            finish_reason,
         }
     }
 }
@@ -725,7 +765,11 @@ where
                     reason: e.to_string(),
                 })?;
 
-        let (text, _tool_calls, finish) = extract_response(&response.choice, &response.usage);
+        let (text, _tool_calls, finish) = extract_response(
+            &response.choice,
+            &response.usage,
+            extract_finish_reason(&response.raw_response),
+        );
 
         let resp = CompletionResponse {
             content: text.unwrap_or_default(),
@@ -777,7 +821,11 @@ where
                     reason: e.to_string(),
                 })?;
 
-        let (text, mut tool_calls, finish) = extract_response(&response.choice, &response.usage);
+        let (text, mut tool_calls, finish) = extract_response(
+            &response.choice,
+            &response.usage,
+            extract_finish_reason(&response.raw_response),
+        );
 
         // Normalize tool call names: some proxies prepend "proxy_" prefixes.
         for tc in &mut tool_calls {
@@ -919,15 +967,26 @@ mod tests {
 
     type ScriptedStreamItem = Result<RawStreamingChoice<TestStreamingResponse>, CompletionError>;
 
+    type BlockingFixture = rig_core::completion::CompletionResponse<JsonValue>;
+
     #[derive(Clone)]
     struct ScriptedCompletionModel {
         stream_items: Arc<Mutex<Option<Vec<ScriptedStreamItem>>>>,
+        blocking_response: Arc<Mutex<Option<BlockingFixture>>>,
     }
 
     impl ScriptedCompletionModel {
         fn new(items: Vec<ScriptedStreamItem>) -> Self {
             Self {
                 stream_items: Arc::new(Mutex::new(Some(items))),
+                blocking_response: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn with_blocking_response(response: BlockingFixture) -> Self {
+            Self {
+                stream_items: Arc::new(Mutex::new(None)),
+                blocking_response: Arc::new(Mutex::new(Some(response))),
             }
         }
     }
@@ -946,9 +1005,17 @@ mod tests {
             _request: RigRequest,
         ) -> Result<rig_core::completion::CompletionResponse<Self::Response>, CompletionError>
         {
-            Err(CompletionError::ProviderError(
-                "blocking completion is not configured".to_string(),
-            ))
+            let response = self
+                .blocking_response
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            match response {
+                Some(response) => Ok(response),
+                None => Err(CompletionError::ProviderError(
+                    "blocking completion is not configured".to_string(),
+                )),
+            }
         }
 
         fn stream(
@@ -1106,7 +1173,40 @@ mod tests {
                     cache_creation_input_tokens: 0,
                 }),
                 finish_reason,
-            })) if finish_reason == "stop"
+            })) if finish_reason == "unknown"
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_stream_without_provider_reason_and_tools_reports_tool_calls() {
+        // WI#292 fallback: the provider said nothing, but streamed tool calls
+        // are content-shape ground truth.
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::ToolCall(
+                RawStreamingToolCall::new(
+                    "call_1".into(),
+                    "search".into(),
+                    serde_json::json!({"q": "rust"}),
+                )
+                .with_internal_call_id("internal_1".into()),
+            )),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(8, 4, 0),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            chunks.last(),
+            Some(Ok(LlmStreamChunk::Done { finish_reason, .. }))
+                if finish_reason == "tool_calls"
         ));
     }
 
@@ -1612,6 +1712,80 @@ mod tests {
         ));
     }
 
+    // -- WI#292: the real finish_reason must survive the vendored rig stream --
+
+    /// SSE fixture: one text chunk, then a terminal chunk carrying the given
+    /// (or no) finish reason plus usage.
+    async fn finish_reason_stream_chunks(
+        terminal_finish_reason: Option<&str>,
+    ) -> Vec<Result<LlmStreamChunk, LlmError>> {
+        let terminal = match terminal_finish_reason {
+            Some(reason) => serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{"index": 0, "finish_reason": reason, "delta": {}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            }),
+            None => serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{"index": 0, "delta": {}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            }),
+        };
+        let fixture = TensorZeroSseFixture::start(vec![
+            serde_json::json!({
+                "id": "inference-1",
+                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": null,
+                    "delta": {"role": "assistant", "content": "hel"}
+                }],
+                "usage": null
+            })
+            .to_string(),
+            terminal.to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+
+        fixture
+            .provider()
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("TensorZero stream should open")
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    #[tokio::test]
+    async fn tensorzero_stream_carries_length_finish_reason() {
+        let chunks = finish_reason_stream_chunks(Some("length")).await;
+        assert!(matches!(
+            chunks.last(),
+            Some(Ok(LlmStreamChunk::Done { finish_reason, .. })) if finish_reason == "length"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tensorzero_stream_carries_content_filter_finish_reason() {
+        let chunks = finish_reason_stream_chunks(Some("content_filter")).await;
+        assert!(matches!(
+            chunks.last(),
+            Some(Ok(LlmStreamChunk::Done { finish_reason, .. })) if finish_reason == "content_filter"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tensorzero_stream_without_finish_reason_reports_unknown() {
+        let chunks = finish_reason_stream_chunks(None).await;
+        assert!(matches!(
+            chunks.last(),
+            Some(Ok(LlmStreamChunk::Done { finish_reason, .. })) if finish_reason == "unknown"
+        ));
+    }
+
     #[test]
     fn test_round_f32_to_f64_no_precision_artifacts() {
         // Direct f32->f64 cast produces 0.699999988079071 instead of 0.7
@@ -1796,7 +1970,7 @@ mod tests {
     fn test_extract_response_text_only() {
         let content = OneOrMany::one(AssistantContent::text("Hello world"));
         let usage = RigUsage::new();
-        let (text, calls, finish) = extract_response(&content, &usage);
+        let (text, calls, finish) = extract_response(&content, &usage, Some(FinishReason::Stop));
         assert_eq!(text, Some("Hello world".to_string()));
         assert!(calls.is_empty());
         assert_eq!(finish, FinishReason::Stop);
@@ -1807,11 +1981,205 @@ mod tests {
         let tc = AssistantContent::tool_call("call_1", "search", serde_json::json!({"q": "test"}));
         let content = OneOrMany::one(tc);
         let usage = RigUsage::new();
-        let (text, calls, finish) = extract_response(&content, &usage);
+        let (text, calls, finish) = extract_response(&content, &usage, None);
         assert!(text.is_none());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "search");
         assert_eq!(finish, FinishReason::ToolUse);
+    }
+
+    // -- WI#292: finish_reason is carried, not synthesized --
+
+    #[test]
+    fn test_extract_response_carries_provider_finish_reason() {
+        let content = OneOrMany::one(AssistantContent::text("truncated..."));
+        let usage = RigUsage::new();
+        for (raw, expected) in [
+            (FinishReason::Stop, FinishReason::Stop),
+            (FinishReason::Length, FinishReason::Length),
+            (FinishReason::ContentFilter, FinishReason::ContentFilter),
+        ] {
+            let (_, _, finish) = extract_response(&content, &usage, Some(raw));
+            assert_eq!(finish, expected, "provider-reported {raw:?} must survive");
+        }
+    }
+
+    #[test]
+    fn test_extract_response_without_provider_reason_is_unknown_not_stop() {
+        // WI#292: a silent provider must surface Unknown, not a fabricated Stop.
+        let content = OneOrMany::one(AssistantContent::text("hi"));
+        let usage = RigUsage::new();
+        let (_, _, finish) = extract_response(&content, &usage, None);
+        assert_eq!(finish, FinishReason::Unknown);
+    }
+
+    #[test]
+    fn test_extract_response_tool_calls_are_ground_truth_over_provider_reason() {
+        // Tool calls in the content win even if the provider mislabeled the
+        // finish reason (e.g. a proxy that defaults it to "stop").
+        let tc = AssistantContent::tool_call("call_1", "search", serde_json::json!({"q": "x"}));
+        let content = OneOrMany::one(tc);
+        let usage = RigUsage::new();
+        let (_, calls, finish) = extract_response(&content, &usage, Some(FinishReason::Stop));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(finish, FinishReason::ToolUse);
+    }
+
+    #[test]
+    fn test_extract_finish_reason_openai_shape() {
+        for (wire, expected) in [
+            ("stop", FinishReason::Stop),
+            ("length", FinishReason::Length),
+            ("content_filter", FinishReason::ContentFilter),
+            ("tool_calls", FinishReason::ToolUse),
+        ] {
+            let raw = serde_json::json!({
+                "choices": [{"index": 0, "finish_reason": wire, "message": {"role": "assistant", "content": "x"}}],
+            });
+            assert_eq!(
+                extract_finish_reason(&raw),
+                Some(expected),
+                "wire reason {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_finish_reason_missing_or_empty_is_none() {
+        // No choices at all.
+        let raw = serde_json::json!({"id": "x"});
+        assert_eq!(extract_finish_reason(&raw), None);
+        // Choice without finish_reason (proxy omitted it).
+        let raw = serde_json::json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}}]});
+        assert_eq!(extract_finish_reason(&raw), None);
+        // Empty-string finish_reason (e.g. serde-defaulted field).
+        let raw = serde_json::json!({"choices": [{"index": 0, "finish_reason": ""}]});
+        assert_eq!(extract_finish_reason(&raw), None);
+    }
+
+    #[test]
+    fn test_extract_finish_reason_anthropic_stop_reason() {
+        for (wire, expected) in [
+            ("end_turn", FinishReason::Stop),
+            ("stop_sequence", FinishReason::Stop),
+            ("max_tokens", FinishReason::Length),
+            ("tool_use", FinishReason::ToolUse),
+        ] {
+            let raw = serde_json::json!({"stop_reason": wire});
+            assert_eq!(
+                extract_finish_reason(&raw),
+                Some(expected),
+                "anthropic reason {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_finish_reason_unrecognized_is_unknown() {
+        let raw = serde_json::json!({"choices": [{"index": 0, "finish_reason": "eos_token"}]});
+        assert_eq!(extract_finish_reason(&raw), Some(FinishReason::Unknown));
+    }
+
+    // -- WI#292: blocking completions carry the provider's finish_reason --
+
+    fn blocking_response_with_wire_finish(finish: Option<&str>) -> BlockingFixture {
+        let choice_json = match finish {
+            Some(reason) => serde_json::json!({
+                "index": 0,
+                "finish_reason": reason,
+                "message": {"role": "assistant", "content": "hello"}
+            }),
+            None => serde_json::json!({
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"}
+            }),
+        };
+        rig_core::completion::CompletionResponse {
+            choice: OneOrMany::one(AssistantContent::text("hello")),
+            usage: RigUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                total_tokens: 7,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                tool_use_prompt_tokens: 0,
+                reasoning_tokens: 0,
+            },
+            raw_response: serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [choice_json],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+            }),
+            message_id: None,
+        }
+    }
+
+    async fn complete_finish_reason(finish: Option<&str>) -> FinishReason {
+        let model = ScriptedCompletionModel::with_blocking_response(
+            blocking_response_with_wire_finish(finish),
+        );
+        let adapter = RigAdapter::new(model, "test-model");
+        adapter
+            .complete(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("blocking completion should succeed")
+            .finish_reason
+    }
+
+    #[tokio::test]
+    async fn blocking_completion_carries_provider_finish_reason() {
+        assert_eq!(
+            complete_finish_reason(Some("stop")).await,
+            FinishReason::Stop
+        );
+        assert_eq!(
+            complete_finish_reason(Some("length")).await,
+            FinishReason::Length
+        );
+        assert_eq!(
+            complete_finish_reason(Some("content_filter")).await,
+            FinishReason::ContentFilter
+        );
+        assert_eq!(
+            complete_finish_reason(Some("vendor_custom")).await,
+            FinishReason::Unknown
+        );
+        // Provider stayed silent: unknown, not a fabricated stop.
+        assert_eq!(complete_finish_reason(None).await, FinishReason::Unknown);
+    }
+
+    #[tokio::test]
+    async fn blocking_tool_completion_carries_provider_finish_reason() {
+        let model = ScriptedCompletionModel::with_blocking_response(
+            blocking_response_with_wire_finish(Some("length")),
+        );
+        let adapter = RigAdapter::new(model, "test-model");
+        let out = adapter
+            .complete_with_tools(tool_stream_request())
+            .await
+            .expect("tool completion should succeed");
+        assert_eq!(out.finish_reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn blocking_tool_completion_tool_calls_win_over_wire_reason() {
+        let mut response = blocking_response_with_wire_finish(Some("stop"));
+        response.choice = OneOrMany::one(AssistantContent::tool_call(
+            "call_1",
+            "search",
+            serde_json::json!({"q": "x"}),
+        ));
+        let model = ScriptedCompletionModel::with_blocking_response(response);
+        let adapter = RigAdapter::new(model, "test-model");
+        let out = adapter
+            .complete_with_tools(tool_stream_request())
+            .await
+            .expect("tool completion should succeed");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.finish_reason, FinishReason::ToolUse);
     }
 
     #[test]
