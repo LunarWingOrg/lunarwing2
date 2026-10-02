@@ -1,9 +1,11 @@
 # Nanocode External Worker Retirement
 
 Nanocode is no longer a supported LunarWing external worker. Supported
-persistent worker containers are Pebble, OpenCode, and Kimi Code.
+persistent worker containers are Pebble, OpenCode, Opencode2, and Kimi Code
 
 ## Automatic Retirement
+
+### still shows little notice
 
 Current `lunarwing-mt-admin.sh` lifecycle operations retire legacy Nanocode
 resources as part of resuming `add-tenant`, patching environment files,
