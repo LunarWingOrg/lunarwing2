@@ -14,6 +14,10 @@
 #     (vendor/libsignal-protocol, vendor/libsignal-protocol-sys) which the ic
 #     manifest path-depends on (ic/Cargo.toml); cargo vendor never rewrites
 #     path dependencies, and without --no-delete it would delete them.
+#   - vendor/rig-core carries a LOCAL PATCH (WI#292 finish_reason
+#     pass-through, see vendor/rig-core/LUNARWING-PATCH.md). cargo vendor
+#     regenerates it from crates.io, which would silently drop the patch; the
+#     post-vendor patch check below fails loudly if that happens.
 #   - The post-vendor set check compares vendor/ against the committed
 #     Cargo.lock files (the approved pins). It must only report drift, never
 #     re-resolve versions: any stray means the lockfiles drifted, so fix the
@@ -59,6 +63,16 @@ done
 
 echo "refresh-vendor: cargo vendor --locked --no-delete $VENDOR_DIR ${sync_args[*]} $*" >&2
 cargo vendor --locked --no-delete "$VENDOR_DIR" "${sync_args[@]}" "$@"
+
+# WI#292 tripwire: vendor/rig-core carries a local patch (finish_reason
+# pass-through) that cargo vendor silently overwrites with pristine crates.io
+# sources. Fail loudly instead of losing the patch in a "refresh".
+if ! grep -q "LUNARWING_WI292_FINISH_REASON_PATCH" \
+  "$VENDOR_DIR/rig-core/src/providers/internal/openai_chat_completions_compatible.rs" 2>/dev/null; then
+  echo "refresh-vendor: ERROR rig-core local patch (WI#292 finish_reason pass-through) is gone after the vendor run." >&2
+  echo "  Re-apply it (see vendor/rig-core/LUNARWING-PATCH.md and git history), refresh .cargo-checksum.json, then re-run." >&2
+  exit 1
+fi
 
 # The directory source requires `.cargo-checksum.json` in every vendor/*
 # subdir, including the hand-vendored libsignal path deps that cargo vendor

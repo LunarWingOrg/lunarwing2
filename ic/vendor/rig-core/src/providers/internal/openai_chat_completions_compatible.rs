@@ -41,9 +41,17 @@ fn provider_response_from_compatible_sse_data(data: &str) -> Option<CompletionEr
     Some(crate::provider_response::completion_error_from_body(data))
 }
 
+/// LUNARWING_WI292_FINISH_REASON_PATCH: this enum previously collapsed every
+/// non-`ToolCalls` reason into `Other`, destroying the provider's real finish
+/// reason before consumers could see it. It now carries the canonical set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompatibleFinishReason {
     ToolCalls,
+    Stop,
+    Length,
+    ContentFilter,
+    /// Null/absent finish reason on the wire, or a vendor-specific spelling
+    /// outside the canonical set. Carries no canonical meaning.
     Other,
 }
 
@@ -162,7 +170,14 @@ pub(crate) trait CompatibleStreamProfile: WasmCompatSend {
 
     fn normalize_chunk(&self, data: &str) -> NormalizedCompatibleChunk<Self::Usage, Self::Detail>;
 
-    fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse;
+    /// Build the terminal response. `finish_reason` is the last real finish
+    /// reason seen on a choice chunk (`None` when the provider never sent
+    /// one — never synthesized). LUNARWING_WI292_FINISH_REASON_PATCH.
+    fn build_final_response(
+        &self,
+        usage: Self::Usage,
+        finish_reason: Option<CompatibleFinishReason>,
+    ) -> Self::FinalResponse;
 
     fn uses_distinct_tool_call_eviction(&self) -> bool {
         false
@@ -231,6 +246,9 @@ where
     let stream = stream! {
         let mut tool_calls: HashMap<usize, RawStreamingToolCall> = HashMap::new();
         let mut final_usage = None;
+        // Last real finish reason reported on a choice chunk; `Other` (null or
+        // vendor-specific) is not recorded. LUNARWING_WI292_FINISH_REASON_PATCH.
+        let mut finish_reason = None;
         let mut terminated_with_error = false;
 
         while let Some(event_result) = event_source.next().await {
@@ -273,6 +291,10 @@ where
                     let Some(choice) = chunk.choice else {
                         continue;
                     };
+
+                    if choice.finish_reason != CompatibleFinishReason::Other {
+                        finish_reason = Some(choice.finish_reason);
+                    }
 
                     for incoming in choice.tool_calls {
                         if let Some(existing) = tool_calls.get(&incoming.index)
@@ -387,7 +409,7 @@ where
         let final_usage = final_usage.unwrap_or_default();
         record_usage(&span, &final_usage);
         yield Ok(RawStreamingChoice::FinalResponse(
-            profile.build_final_response(final_usage),
+            profile.build_final_response(final_usage, finish_reason),
         ));
     }
     .instrument(instrument_span);

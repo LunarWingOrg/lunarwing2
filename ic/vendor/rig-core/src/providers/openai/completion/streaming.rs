@@ -85,7 +85,7 @@ struct StreamingDelta {
     reasoning_details: Vec<serde_json::Value>,
 }
 
-#[derive(Deserialize, Debug, PartialEq)]
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     ToolCalls,
@@ -100,6 +100,22 @@ pub enum FinishReason {
 struct StreamingChoice {
     delta: StreamingDelta,
     finish_reason: Option<FinishReason>,
+}
+
+/// Map a normalized compatible finish reason back onto this crate's
+/// OpenAI-protocol enum. `Other` (absent or vendor-specific) maps to `None` —
+/// no reason is recorded rather than a fabricated one.
+/// LUNARWING_WI292_FINISH_REASON_PATCH.
+pub(crate) fn finish_reason_from_compatible(
+    reason: CompatibleFinishReason,
+) -> Option<FinishReason> {
+    match reason {
+        CompatibleFinishReason::ToolCalls => Some(FinishReason::ToolCalls),
+        CompatibleFinishReason::Stop => Some(FinishReason::Stop),
+        CompatibleFinishReason::Length => Some(FinishReason::Length),
+        CompatibleFinishReason::ContentFilter => Some(FinishReason::ContentFilter),
+        CompatibleFinishReason::Other => None,
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -117,6 +133,11 @@ struct StreamingCompletionChunk<U = Usage> {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StreamingCompletionResponse<U = Usage> {
     pub usage: U,
+    /// The finish reason the provider reported on its terminal choice chunk,
+    /// verbatim. `None` when the provider never sent one — this field is never
+    /// synthesized from content shape. LUNARWING_WI292_FINISH_REASON_PATCH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<FinishReason>,
 }
 
 impl<U> GetTokenUsage for StreamingCompletionResponse<U>
@@ -125,6 +146,17 @@ where
 {
     fn token_usage(&self) -> crate::completion::Usage {
         self.usage.token_usage()
+    }
+
+    fn finish_reason(&self) -> Option<&'static str> {
+        match self.finish_reason.as_ref()? {
+            FinishReason::ToolCalls => Some("tool_calls"),
+            FinishReason::Stop => Some("stop"),
+            FinishReason::ContentFilter => Some("content_filter"),
+            FinishReason::Length => Some("length"),
+            // Vendor-specific spellings carry no canonical meaning.
+            FinishReason::Other(_) => None,
+        }
     }
 }
 
@@ -285,10 +317,17 @@ where
                 |choice| CompatibleChoiceData {
                     // `function_call` is the deprecated pre-tools finish reason
                     // some compatible providers still emit for tool calls.
+                    // LUNARWING_WI292_FINISH_REASON_PATCH: stop/length/
+                    // content_filter now survive instead of collapsing to Other.
                     finish_reason: match &choice.finish_reason {
                         Some(FinishReason::ToolCalls) => CompatibleFinishReason::ToolCalls,
                         Some(FinishReason::Other(other)) if other == "function_call" => {
                             CompatibleFinishReason::ToolCalls
+                        }
+                        Some(FinishReason::Stop) => CompatibleFinishReason::Stop,
+                        Some(FinishReason::Length) => CompatibleFinishReason::Length,
+                        Some(FinishReason::ContentFilter) => {
+                            CompatibleFinishReason::ContentFilter
                         }
                         _ => CompatibleFinishReason::Other,
                     },
@@ -307,8 +346,15 @@ where
         ))
     }
 
-    fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse {
-        StreamingCompletionResponse { usage }
+    fn build_final_response(
+        &self,
+        usage: Self::Usage,
+        finish_reason: Option<CompatibleFinishReason>,
+    ) -> Self::FinalResponse {
+        StreamingCompletionResponse {
+            usage,
+            finish_reason: finish_reason.and_then(finish_reason_from_compatible),
+        }
     }
 
     fn decorate_tool_call(

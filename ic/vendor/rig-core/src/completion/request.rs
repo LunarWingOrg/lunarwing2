@@ -506,6 +506,20 @@ pub trait GetTokenUsage {
     /// [`Usage`]'s documented sentinel for missing provider usage metrics;
     /// response types that carry no usage return [`Usage::new`].
     fn token_usage(&self) -> crate::completion::Usage;
+
+    /// Returns the canonical finish reason the provider attached to a streamed
+    /// final response (`"stop"`, `"length"`, `"tool_calls"`, `"content_filter"`),
+    /// when the provider surfaced one.
+    ///
+    /// Defaults to `None` — the provider did not say. Callers must propagate
+    /// that as "unknown" rather than synthesizing a guess from content shape.
+    ///
+    /// LUNARWING_WI292_FINISH_REASON_PATCH: default method added so response
+    /// types can carry the provider's real finish reason without breaking the
+    /// many existing `GetTokenUsage` implementors.
+    fn finish_reason(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 impl GetTokenUsage for () {
