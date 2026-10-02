@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "cranelift-bforest"
-version = "0.123.16"
+version = "0.123.17"
 authors = ["The Cranelift Project Developers"]
 build = false
 autolib = false
@@ -40,7 +40,7 @@ name = "cranelift_bforest"
 path = "src/lib.rs"
 
 [dependencies.cranelift-entity]
-version = "0.123.16"
+version = "0.123.17"
 
 [lints.clippy]
 allow_attributes_without_reason = "warn"

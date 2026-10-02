@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "wasmtime-internal-slab"
-version = "36.0.16"
+version = "36.0.17"

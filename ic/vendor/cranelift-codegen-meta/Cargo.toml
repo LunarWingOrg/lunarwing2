@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "cranelift-codegen-meta"
-version = "0.123.16"
+version = "0.123.17"
 authors = ["The Cranelift Project Developers"]
 build = false
 autolib = false
@@ -38,19 +38,19 @@ name = "cranelift_codegen_meta"
 path = "src/lib.rs"
 
 [dependencies.cranelift-assembler-x64-meta]
-version = "0.123.16"
+version = "0.123.17"
 
 [dependencies.cranelift-codegen-shared]
-version = "0.123.16"
+version = "0.123.17"
 
 [dependencies.cranelift-srcgen]
-version = "0.123.16"
+version = "0.123.17"
 
 [dependencies.heck]
 version = "0.5.0"
 
 [dependencies.pulley-interpreter]
-version = "=36.0.16"
+version = "=36.0.17"
 optional = true
 
 [lints.clippy]
