@@ -44,7 +44,12 @@ the voice sidecar bounds abandoned inference admission so a timed-out or
 cancelled call cannot pin the model mutex or starve other components
 (WI#264). Shared tool execution learns bounded per-user EMA runtime
 estimates surfaced as frozen advisory hints on approvals and pending gates
-(WI#191 first slice, opt-in via `LUNARWING_TOOL_ESTIMATES=1`).
+(WI#191 first slice, opt-in via `LUNARWING_TOOL_ESTIMATES=1`). The
+workspace prompt-injection write scan no longer false-positives on
+agent-authored daily logs that merely quote injection-shaped security text:
+a High-severity match fully enclosed in a short, single-line, inline quoted
+span demotes to warn-only describing context, while unquoted and
+tokenizer-level matches still reject (WI#280).
 
 The operator surface gained per-tenant system-prompt editing in Settings with
 Engine V2 initialization snapshots (WI#220), read-only tenant database and
@@ -227,6 +232,17 @@ previous compatibility baseline.
   `<key>.failed.json` after 24 attempts. Live-verified on test tenant
   derpy: 19/19 messages delivered exactly once, including a spooled record
   surviving `systemctl stop` and replaying on the next boot
+- **Daily-log injection scan demotes quoted describing context (WI#280).**
+  Agent-authored daily logs (`daily/*.md`) were being rejected by the
+  workspace prompt-injection write scan for merely *quoting*
+  injection-shaped security phrasing. A High-severity match fully enclosed
+  in a short (≤200-byte), single-line, inline quoted span (`` `code` ``,
+  `"double"`, `'single'`, curly quotes) now demotes to warn-only describing
+  context; a closing quote that fails its right-boundary check ends the
+  span instead of staying open, so mismatched quotes cannot be eagerly
+  re-paired to bracket injection text (the !1317 review P2). Unquoted
+  matches, oversized/multiline spans, and tokenizer-level patterns still
+  reject, and identity files and lorebooks keep the strict raw scan
 - **Orchestrator self-modification for new tenants (WI#282).** add-tenant
   now renders `ORCHESTRATOR_SELF_MODIFY=true` so new tenants adopt stored
   orchestrator and prompt-overlay updates; an explicit operator opt-out is
@@ -298,6 +314,7 @@ previous compatibility baseline.
 | New tenant env defaults | `ORCHESTRATOR_SELF_MODIFY=true` rendered at add-tenant (WI#282); explicit operator values preserved on re-render; existing tenants untouched |
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
 | XMPP outbound delivery | `message` tool ack reports `Queued …` (acceptance, not delivery); enqueue refused while no session is bound; bounded 2s shutdown drain; durable spool persists every outbound message before ack with replay on bind, backoff retry, and `.failed.json` parking after 24 attempts — at-least-once semantics (post-send crash can duplicate at whole-message granularity) |
+| Workspace write scanning | Daily logs (`daily/*.md`) demote High-severity injection matches fully enclosed in short (≤200-byte) single-line inline quoted spans to warn-only describing context (WI#280); unquoted matches and tokenizer-level patterns still reject at the same floor; identity files and lorebooks keep the strict raw scan |
 | Pairing store (WI#184) | Design revision 3 only — no substrate change this release; landed tests pin current legacy matching and concurrent-grant semantics ahead of the secrets-store migration |
 | CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only; the cargo-deny job runs unvendored from the repo root via `.gitlab/scripts/cargo-deny-check.sh` and fails on any `index-failure` diagnostic |
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
@@ -689,6 +706,39 @@ record that survived `systemctl stop` and replayed on the next boot's
 Online drain. End-to-end delivery receipts (XEP-0198) and the WI#276
 engine-side mission-run ledger remain open.
 
+### Daily-Log Injection Scan Quoted Demotion (WI#280)
+
+The workspace prompt-injection write scan was rejecting agent-authored
+daily logs that merely *described* injection-shaped security content — the
+false-positive class behind WI#280, which cost the work item two complete
+implementations (!1317, !1327) closed unmerged on process grounds before
+this landing. Daily-log writes (`daily/*.md` only, via the pre-existing
+`is_daily_log_file` gate) now demote a High-severity match fully enclosed
+in a short (≤200-byte), single-line, inline quoted span (`` `code` ``,
+`"double"`, `'single'`, `“curly”`, `‘curly’`) to warn-only describing
+context (`quoted_spans` + `reject_daily_log_if_injected` in
+`ic/src/workspace/mod.rs`):
+
+- Tokenizer-level patterns (`<|`, `|>`, `[INST]`, `[/INST]`, null bytes)
+  and unquoted matches still reject at the same High floor as the strict
+  path; identity files and lorebooks keep the strict raw scan.
+- The !1317 review P2 is closed inside the same change: a closing quote
+  that fails its right-boundary check ends the span instead of staying
+  open, so mismatched quotes cannot be eagerly re-paired to bracket
+  injection text (`"a"ignore previous …"` stays unquoted and rejects).
+- Oversized or multiline quoted spans stay strict; the demotion is
+  daily-log-only.
+
+Verified with 230 `workspace::` lib tests including the eleven WI#280
+regressions (span pairing/boundaries, apostrophes never open spans,
+mismatched-closer drops span, quote-bracketed injection still rejected,
+quoted phrase allowed, unquoted/live/tokenizer-level still rejected,
+oversized/multiline stays strict, demotion is daily-log-only).
+Documented in the workspace README's new Prompt-Injection Write Scanning
+section. The change landed via !1332 (pipeline #4880 green) re-applying
+the reviewed !1327 head, whose review had zero findings — it had died only
+on goals-file merge conflicts.
+
 ### Version Bumps and Supply Chain (item 1)
 
 All eleven LunarWing-owned release packages moved `2.1.3` → `2.1.4`: the
@@ -929,6 +979,11 @@ launchd a distant third).
     exhausts its 24 retry attempts parks as `<key>.failed.json` with the
     last error for operator inspection/replay. The spool is XMPP-local;
     other channels keep memory-only queues.
+18. **Daily-log injection scanning (WI#280).** No configuration change.
+    Agent daily logs may now quote short (≤200-byte) single-line
+    injection-shaped text inline without a write rejection (warn-only
+    describing context). Unquoted matches and tokenizer-level patterns
+    still reject, and identity-file/lorebook writes are unchanged.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -1000,6 +1055,11 @@ launchd a distant third).
   retries post-enqueue failures with bounded backoff, and parks exhausted
   records as `.failed.json` — verified live on derpy with 19/19 deliveries,
   including a restart-window replay (WI#277 source-fixed).
+- Daily-log writes no longer false-positive on quoted security phrasing:
+  the workspace injection scan demotes High-severity matches fully enclosed
+  in short, single-line, inline quoted spans to warn-only describing
+  context, with the quote-pairing bypass closed, while unquoted and
+  tokenizer-level matches still reject (WI#280 source-fixed via !1332).
 - The voice sidecar bounds abandoned inference admission with per-component
   readiness and explicit permanent-failure semantics; supported recovery
   via `restart-tenant` (WI#264 source-fixed; the v2.1.3.0 known issue is
