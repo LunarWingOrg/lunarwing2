@@ -334,6 +334,7 @@ previous compatibility baseline.
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
 | XMPP outbound delivery | `message` tool ack reports `Queued …` (acceptance, not delivery); enqueue refused while no session is bound; bounded 2s shutdown drain; durable spool persists every outbound message before ack with replay on bind, backoff retry, and `.failed.json` parking after 24 attempts — at-least-once semantics (post-send crash can duplicate at whole-message granularity) |
 | Workspace write scanning | Daily logs (`daily/*.md`) demote High-severity injection matches fully enclosed in short (≤200-byte) single-line inline quoted spans to warn-only describing context (WI#280); unquoted matches and tokenizer-level patterns still reject at the same floor; identity files and lorebooks keep the strict raw scan |
+| Workspace memory writes | The `append_memory` lane (`memory_write(target: "memory", append: true)`) is prompt-injection scanned pre-commit like every sibling lane (WI#286); all `memory_write` lanes reject payloads over 256 KiB; full-replace writes of prompt-visible files persist the prior content to a rolling `backups/<path>.bak` shadow copy (exact-path readable, never search-indexed) before replacing it |
 | Pairing store (WI#184) | Design revision 3 only — no substrate change this release; landed tests pin current legacy matching and concurrent-grant semantics ahead of the secrets-store migration |
 | CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only; the cargo-deny job runs unvendored from the repo root via `.gitlab/scripts/cargo-deny-check.sh` and fails on any `index-failure` diagnostic |
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
@@ -1057,6 +1058,13 @@ launchd a distant third).
     injection-shaped text inline without a write rejection (warn-only
     describing context). Unquoted matches and tokenizer-level patterns
     still reject, and identity-file/lorebook writes are unchanged.
+19. **Curated-memory writes (WI#286).** No configuration change.
+    `memory_write` payloads over 256 KiB are now rejected on every lane —
+    agents that previously dumped large context blobs into curated memory
+    must chunk instead. Full replaces of prompt-visible files keep the
+    prior content at `backups/<path>.bak` in the same workspace scope;
+    restore by reading that exact path. Backups are single-slot (each
+    replace rolls the previous one away) and never search-indexed.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -1102,6 +1110,13 @@ launchd a distant third).
   landed allowFrom-preservation fix (!1283).
 - WI#191 later slices (LLM timing, whole-job/mission ETA, gate-wait
   analytics, durable aggregate caches) are deferred beyond this release.
+- The broader daily-log detector redesign (line-start role labels plus a
+  "resembles the live system prompt" provenance heuristic) was
+  deliberately deferred out of WI#280/WI#286 as needing runtime
+  verification. A daily log containing an *unquoted* High-severity match
+  still blocks all further appends to that day's file with no tool-level
+  self-heal (operator/disk repair required) — tracked as WI#288
+  (goals item 32).
 
 ### Resolved or Source-Fixed Since v2.1.3.0
 
@@ -1133,6 +1148,12 @@ launchd a distant third).
   in short, single-line, inline quoted spans to warn-only describing
   context, with the quote-pairing bypass closed, while unquoted and
   tokenizer-level matches still reject (WI#280 source-fixed via !1332).
+- Curated memory can no longer be clobbered or poisoned through the gaps
+  in the write contract: the `append_memory` lane is scanned pre-commit
+  like every sibling lane, `memory_write` payloads are capped at 256 KiB,
+  and full replaces of prompt-visible files keep a rolling
+  `backups/<path>.bak` shadow copy recoverable by exact-path read
+  (WI#286 source-fixed via !1341/!1344).
 - The voice sidecar bounds abandoned inference admission with per-component
   readiness and explicit permanent-failure semantics; supported recovery
   via `restart-tenant` (WI#264 source-fixed; the v2.1.3.0 known issue is
