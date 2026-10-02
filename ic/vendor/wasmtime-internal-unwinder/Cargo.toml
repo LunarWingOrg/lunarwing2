@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "wasmtime-internal-unwinder"
-version = "36.0.16"
+version = "36.0.17"
 authors = ["The Wasmtime Project Developers"]
 build = "build.rs"
 autolib = false
@@ -49,7 +49,7 @@ default-features = false
 version = "1.0"
 
 [dependencies.cranelift-codegen]
-version = "0.123.16"
+version = "0.123.17"
 features = [
     "std",
     "unwind",

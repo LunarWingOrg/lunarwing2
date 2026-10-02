@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "wasmtime-internal-jit-icache-coherence"
-version = "36.0.16"
+version = "36.0.17"
 authors = ["The Wasmtime Project Developers"]
 build = false
 autolib = false
