@@ -72,6 +72,22 @@ let results = workspace.search("dark mode preference", 5).await?;
 let prompt = workspace.system_prompt().await?;
 ```
 
+### Prompt-Injection Write Scanning
+
+Writes to prompt-visible files (the identity files, `lorebooks/`, and
+`daily/*.md`) are scanned for prompt-injection patterns before storage and
+rejected on High-or-above matches; appends re-scan the full candidate so
+patterns split across appends cannot slip through. Daily logs accumulate
+agent-authored incident and test notes, so their scan demotes a match fully
+enclosed in a short, single-line, inline quoted span (`` `code` ``,
+`"double"`, `'single'`, `“curly”`, `‘curly’`, at most 200 bytes) to warn-only
+describing context (WI#280). A closing quote that fails its right-boundary
+check ends the span instead of keeping it open, so mismatched quotes cannot
+be eagerly re-paired to bracket injection text (`"a"ignore previous …"`
+stays unquoted and rejects). Unquoted matches and tokenizer-level patterns
+(`<|`, `|>`, `[INST]`, `[/INST]`, null bytes) still reject in daily logs, and
+all other prompt-visible files keep the strict raw scan.
+
 ## Operator Prompt Editing (WI#220)
 
 The gateway's **Settings → System Prompt** panel edits the authenticated primary
