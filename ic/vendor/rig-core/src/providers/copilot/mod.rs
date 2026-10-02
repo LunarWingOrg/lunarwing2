@@ -589,6 +589,14 @@ impl GetTokenUsage for CopilotStreamingResponse {
             Self::Responses(response) => response.token_usage(),
         }
     }
+
+    fn finish_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Chat(response) => GetTokenUsage::finish_reason(response),
+            // The Responses API stream does not carry an OpenAI finish reason.
+            Self::Responses(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1622,10 +1630,16 @@ impl CompatibleStreamProfile for CopilotChatCompatibleProfile {
                 data.usage,
                 &data.choices,
                 |choice| CompatibleChoiceData {
-                    finish_reason: if choice.finish_reason == Some(ChatFinishReason::ToolCalls) {
-                        CompatibleFinishReason::ToolCalls
-                    } else {
-                        CompatibleFinishReason::Other
+                    // LUNARWING_WI292_FINISH_REASON_PATCH: stop/length/
+                    // content_filter now survive instead of collapsing to Other.
+                    finish_reason: match &choice.finish_reason {
+                        Some(ChatFinishReason::ToolCalls) => CompatibleFinishReason::ToolCalls,
+                        Some(ChatFinishReason::Stop) => CompatibleFinishReason::Stop,
+                        Some(ChatFinishReason::Length) => CompatibleFinishReason::Length,
+                        Some(ChatFinishReason::ContentFilter) => {
+                            CompatibleFinishReason::ContentFilter
+                        }
+                        _ => CompatibleFinishReason::Other,
                     },
                     text: choice.delta.content.clone(),
                     reasoning: choice.delta.reasoning_content.clone(),
@@ -1638,9 +1652,15 @@ impl CompatibleStreamProfile for CopilotChatCompatibleProfile {
         ))
     }
 
-    fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse {
+    fn build_final_response(
+        &self,
+        usage: Self::Usage,
+        finish_reason: Option<CompatibleFinishReason>,
+    ) -> Self::FinalResponse {
         CopilotStreamingResponse::Chat(openai::completion::streaming::StreamingCompletionResponse {
             usage,
+            finish_reason: finish_reason
+                .and_then(openai::completion::streaming::finish_reason_from_compatible),
         })
     }
 

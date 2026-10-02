@@ -1268,6 +1268,12 @@ pub struct Choice {
     pub index: usize,
     pub message: Message,
     pub logprobs: Option<serde_json::Value>,
+    /// Defaulted on deserialization: some OpenAI-compatible gateways (and the
+    /// LunarWing deployment proxy) omit `finish_reason` when the upstream did
+    /// not report one. The empty string is treated as "not reported" so the
+    /// caller surfaces "unknown" instead of a fabricated value.
+    /// LUNARWING_WI292_FINISH_REASON_PATCH.
+    #[serde(default)]
     pub finish_reason: String,
 }
 
