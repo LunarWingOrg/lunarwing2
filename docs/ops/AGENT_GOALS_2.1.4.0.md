@@ -149,7 +149,7 @@
     - Verified: 6 new workspace integration tests (injection entry rejected pre-commit with no doc created, append over poisoned existing content rejected without touching it, benign appends land with `\n\n` separator, backup created/rolling/scoped-to-prompt-files, backup unindexed) + 1 tool-level cap test (oversized rejected on all lanes, at-limit passes the gate) — `workspace::` suite 236/236, `tools::builtin::memory` 24/24; `cargo clippy --lib --tests -- -D warnings` clean, `cargo fmt --all -- --check` clean, `check_no_panics.py` OK (all taskset -c 0-17, no debug builds)
 30. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/281
 31. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/292
-32. [x] (S) RESERVED
+32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/288
 33. [x] (S) RESERVED
 34. [x] (S) RESERVED
 35. [x] (S) RESERVED
@@ -161,5 +161,7 @@
     - DONE 2026-10-02 (`aj/kimi-40-20261002-0445`, item 40): third repass of `RELEASE-v2.1.4.0.md` (1074 → 1153 lines) folding in everything merged since the item-21 second repass (`3cf57d878`): item 22 (WI#280 daily-log injection-scan quoted demotion — overview sentence, Highlights entry, Compatibility row, new Changes section, upgrade note 18, resolved bullet), item 15 (audit doc's own repass recorded in the Open Work Items Audit section, now four-of-five genuinely-open items landed with only #281 left, tracked as goals item 30), and item 23 (pipeline 4867 verified 35/35 green with the honest cargo-deny wrapper confirmed at the pipeline's exact SHA — added as a post-repair confirmation paragraph in the item-20 cargo-deny Changes section)
     - Also: footer rewritten for the third repass with the open items at repass time (20 pipeline-4890 re-check, 29 WI#286, 30 WI#281, 39 item-14 repass) and an explicit note that goals items 20/29 were re-opened with new scopes — draft references to items 20/29 describe the completed cargo-deny/opencode2 work done under those numbers; release-date line now reads "repasses 2026-10-01 and 2026-10-02"
     - Verified: WI#280 wording cross-checked against `ic/src/workspace/mod.rs` (`is_daily_log_file` :138, `MAX_QUOTED_SPAN_BYTES`=200 :198, `quoted_spans` :258, `reject_daily_log_if_injected` :291) and the workspace README's Prompt-Injection Write Scanning section; all 10 unique relative md links in the draft resolve live; `git diff --check` clean; merged delta since the item-21 repass confirmed to be exactly items 15/22/23 via `git diff --stat 3cf57d878..HEAD` (audit doc + workspace mod/README + goals file only). Docs-only change: no cargo check needed
+41. [x] (S) reserved
+42. [ ] see 40th item. item 13 needs another repass since more changes were made at this point
 
 ---
