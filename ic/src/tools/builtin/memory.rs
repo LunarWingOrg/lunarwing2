@@ -1411,7 +1411,9 @@ mod tests {
                             "unexpected message for target {target}: {msg}"
                         );
                     }
-                    other => panic!("expected InvalidParameters for target {target}, got: {other:?}"),
+                    other => {
+                        panic!("expected InvalidParameters for target {target}, got: {other:?}")
+                    }
                 }
             }
 
@@ -1423,11 +1425,8 @@ mod tests {
             // At-limit content passes the size gate; it then fails on the
             // dead test pool, proving the gate itself did not reject it.
             let result = tool.execute(params, &ctx).await;
-            match result {
-                Err(ToolError::InvalidParameters(msg)) => {
-                    panic!("at-limit content must not hit the size gate: {msg}")
-                }
-                _ => {}
+            if let Err(ToolError::InvalidParameters(msg)) = result {
+                panic!("at-limit content must not hit the size gate: {msg}");
             }
         }
     }
