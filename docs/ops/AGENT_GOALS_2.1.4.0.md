@@ -181,5 +181,5 @@
     - Verified: all 10 unique relative md links in the draft resolve live; `git diff --check` clean; no stale "pipeline-4890"/"may land" phrasing remains. Docs-only change: no cargo check needed
 43. [ ] repass of item 13 again
 44. [ ] repass of item 14 again
-
+45. [x] (S) Reserved
 ---
