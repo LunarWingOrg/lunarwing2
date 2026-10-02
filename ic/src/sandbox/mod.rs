@@ -4,7 +4,8 @@
 //! - **Network proxy**: `none` (default) disables egress entirely; `proxy-enforced`
 //!   keeps `--network none` and exposes only a per-execution Unix relay to the
 //!   validating public-only proxy (WI#155); legacy `proxy` mode routes traffic
-//!   through the validating proxy advisory (env-var based)
+//!   through the validating proxy advisory (env-var based); `tunnel` joins a
+//!   NetBird/WireGuard sidecar's network namespace (WI#248)
 //! - **Credential injection**: Secrets are injected by the proxy, never exposed in containers
 //! - **Resource limits**: Memory, CPU, and timeout enforcement
 //!
@@ -100,7 +101,9 @@
 //! - **No credentials in containers**: Environment variables with secrets never enter containers
 //! - **Network isolation**: `none` removes the network entirely (kernel-enforced);
 //!   `proxy-enforced` keeps `--network none` and exposes only a Unix relay to
-//!   the validating public-only proxy; legacy `proxy` is advisory (env-var based)
+//!   the validating public-only proxy; `tunnel` joins a NetBird/WireGuard
+//!   sidecar's namespace (egress policy is the tunnel's own); legacy `proxy`
+//!   is advisory (env-var based)
 //! - **Non-root execution**: keep-id userns (rootless podman) or the daemon's
 //!   own UID/GID (rootless docker maps container root to the host user; rootful
 //!   docker maps numeric host UIDs). Writable workspaces fail closed rather
@@ -119,6 +122,7 @@ pub mod error;
 pub mod manager;
 pub mod mount_guard;
 pub mod proxy;
+pub mod tunnel_sidecar;
 
 pub use cli_runner::{
     CliRunner, ContainerRuntime, KeepIdMode, SANDBOX_CONTAINER_LABEL, inflight_sandbox_containers,
@@ -135,6 +139,10 @@ pub use manager::{ExecOutput, SandboxManager, SandboxManagerBuilder};
 pub use proxy::{
     CredentialResolver, DefaultPolicyDecider, DomainAllowlist, EnvCredentialResolver, HttpProxy,
     NetworkDecision, NetworkPolicyDecider, NetworkProxyBuilder, NetworkRequest,
+};
+pub use tunnel_sidecar::{
+    SANDBOX_TUNNEL_CONTAINER, SANDBOX_TUNNEL_CONTAINER_LABEL, TunnelProvider, TunnelSidecar,
+    TunnelSidecarConfig,
 };
 
 /// Default allowlist getter (re-export for convenience).

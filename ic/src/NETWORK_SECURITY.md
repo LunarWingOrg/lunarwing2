@@ -338,12 +338,25 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 |------|-----------|-------------|
 | `none` (default) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
 | `proxy-enforced` (WI#155) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
+| `tunnel` (WI#248) | Runs join the network namespace of a long-lived tunnel **sidecar** container (`--network container:lunarwing-sandbox-tunnel`; NetBird or kernel WireGuard inside a userns-owned netns) | **Tunnel-defined** — the tunnel's own policy decides (WireGuard `AllowedIPs`, NetBird routes/ACLs); enforced when the default route rides the tunnel, otherwise the sidecar's pasta uplink remains reachable (advisory like legacy `proxy`) |
 | `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
 **Default policy (WI#154/155, v2.1.2.0):** the in-code default and mt-admin
 both render `SANDBOX_NETWORK=none` (mt-admin preserves an operator-set `proxy`
 on re-render). `none` is the safe default everywhere. `proxy` is advisory —
 use `proxy-enforced` when sandboxed processes need allowlisted web access.
+`tunnel` (WI#248) is opt-in for sandbox→overlay connectivity (NetBird or
+kernel WireGuard). Its sidecar container (`lunarwing.sandbox-tunnel` label
+namespace, `--cap-drop=ALL --cap-add=NET_ADMIN`, `no-new-privileges`, memory
+and pids limits) is the only credential holder — NetBird secrets travel via
+a mode-0600 `--env-file`, the WireGuard config is a 0600 file mounted `:ro`,
+and neither ever reaches the podman argv (which the systemd transient unit
+persists). Sandboxed commands share only the sidecar's network namespace,
+never its filesystem or environment; every run keeps its own hardening
+flags. The health-gated start fails closed (`[sandbox:sandbox_unavailable]`)
+rather than degrading to another mode. Operator guide:
+`docs/guides/SANDBOX_TUNNEL_NETWORKING.md`.
+
 `proxy-enforced` is kernel-isolated everywhere except one per-execution Unix
 socket relay to the public-only validating proxy:
 

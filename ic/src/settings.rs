@@ -839,7 +839,8 @@ pub struct SandboxSettings {
     pub runtime: String,
 
     /// Network egress mode for sandboxed policies: "none" (default),
-    /// "proxy-enforced" (isolated allowlist web access), or "proxy"
+    /// "proxy-enforced" (isolated allowlist web access), "tunnel"
+    /// (NetBird/WireGuard sidecar namespace, WI#248), or "proxy"
     /// (legacy advisory HTTP proxy).
     #[serde(default = "default_sandbox_network")]
     pub network: String,

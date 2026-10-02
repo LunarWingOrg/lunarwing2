@@ -45,6 +45,13 @@ runtime or image is unavailable, commands error with a structured
   DNS-pinned, redirect rechecked). Requires a local Linux runtime and Python 3
   in the image; relay setup failures fail closed (`[sandbox:proxy_error]`),
   never degrade to advisory or direct egress.
+- `tunnel` (WI#248): sandbox runs join a long-lived tunnel sidecar container's
+  network namespace (`--network container:lunarwing-sandbox-tunnel`; NetBird or
+  kernel WireGuard inside a userns-owned netns). The sidecar is the only
+  credential holder; runs keep every hardening flag. Egress policy is the
+  tunnel's (`AllowedIPs` / NetBird ACLs) — enforced when the default route
+  rides the tunnel, otherwise advisory. Health-gated start fails closed
+  (`[sandbox:sandbox_unavailable]`), never degrades.
 - `proxy`: legacy allowlist HTTP proxy + credential injection. **Advisory** —
   enforced via env vars, which a process may ignore.
 

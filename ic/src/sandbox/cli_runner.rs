@@ -190,7 +190,7 @@ impl EmptyMaskDir {
 /// container CLI's mount namespace (daemon + `PrivateTmp=true` + manager-
 /// forked service would hide `/tmp`). Same policy as the proxy relay.
 #[cfg(target_os = "linux")]
-fn shared_mount_source_parent() -> PathBuf {
+pub(crate) fn shared_mount_source_parent() -> PathBuf {
     crate::sandbox::proxy::relay::relay_parent_dir().unwrap_or_else(|_| std::env::temp_dir())
 }
 
@@ -412,6 +412,19 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
                 "-e".into(),
                 "no_proxy=".into(),
             ]);
+        }
+        SandboxNetworkMode::Tunnel => {
+            // Join the tunnel sidecar's network namespace (WI#248): the
+            // long-lived `lunarwing-sandbox-tunnel` container holds the
+            // NetBird/WireGuard tunnel; every run shares its network stack
+            // while keeping all of its own hardening flags. Egress policy
+            // inside the namespace is decided by the tunnel (AllowedIPs /
+            // NetBird ACLs); no proxy env is set — this is raw transport.
+            args.push("--network".into());
+            args.push(format!(
+                "container:{}",
+                crate::sandbox::tunnel_sidecar::SANDBOX_TUNNEL_CONTAINER
+            ));
         }
     }
 
@@ -752,7 +765,13 @@ impl CliRunner {
             Some(EmptyMaskDir::create()?)
         };
 
-        if network != SandboxNetworkMode::None && proxy_port == 0 {
+        // Tunnel mode needs no host proxy (egress rides the sidecar's
+        // namespace); the proxy-backed modes refuse to run without one.
+        if matches!(
+            network,
+            SandboxNetworkMode::Proxy | SandboxNetworkMode::ProxyEnforced
+        ) && proxy_port == 0
+        {
             return Err(SandboxError::ProxyError {
                 reason: format!("{network:?} network mode requires a running proxy"),
             });
@@ -1070,7 +1089,10 @@ fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<San
 /// inspection/pull and cleanup must execute in the same manager-forked
 /// context as `run` — the hardened daemon's context breaks podman's
 /// rootless user-namespace join), returning `None` when spawn fails.
-async fn run_status_isolated(bin: &str, args: &[&str]) -> Option<std::process::ExitStatus> {
+pub(crate) async fn run_status_isolated(
+    bin: &str,
+    args: &[&str],
+) -> Option<std::process::ExitStatus> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
     let spec = spawner.prepare_service(&mut cmd);
@@ -1090,7 +1112,10 @@ async fn run_status_isolated(bin: &str, args: &[&str]) -> Option<std::process::E
 
 /// Capture a command's output through the workload spawner (same isolation
 /// rationale as [`run_status_isolated`]).
-async fn output_isolated(bin: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+pub(crate) async fn output_isolated(
+    bin: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
     let spec = spawner.prepare_service(&mut cmd);
@@ -1419,6 +1444,54 @@ mod tests {
         assert_eq!(args[idx + 1], "none");
         assert!(!args.iter().any(|a| a.starts_with("http_proxy=")));
         assert!(!args.iter().any(|a| a.starts_with("https_proxy=")));
+    }
+
+    /// WI#248: tunnel mode joins the sidecar container's network namespace
+    /// and carries none of the proxy plumbing — egress rides the tunnel.
+    #[test]
+    fn args_tunnel_mode_joins_sidecar_namespace() {
+        let args = build_run_args(&spec(
+            ContainerRuntime::Podman,
+            KeepIdMode::UidPinned,
+            SandboxPolicy::ReadOnly,
+            SandboxNetworkMode::Tunnel,
+            0, // no proxy needed in tunnel mode
+        ));
+        let idx = args.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(
+            args[idx + 1],
+            format!(
+                "container:{}",
+                crate::sandbox::tunnel_sidecar::SANDBOX_TUNNEL_CONTAINER
+            )
+        );
+        assert!(!args.iter().any(|a| a.starts_with("http_proxy=")));
+        assert!(!args.iter().any(|a| a.starts_with("https_proxy=")));
+        assert!(!args.iter().any(|a| a.contains("/run/lunarwing-proxy")));
+        assert!(!args.iter().any(|a| a.contains("lunarwing-proxy-relay")));
+        // The untrusted command is passed raw (no relay wrapper tail).
+        assert_eq!(args.last().unwrap(), "echo hi");
+        // Hardening flags stay on the joined container.
+        let joined = args.join(" ");
+        assert!(joined.contains("--cap-drop=ALL"));
+        assert!(joined.contains("--read-only"));
+        assert!(joined.contains("--userns"));
+    }
+
+    /// Docker fallback uses the same container: join form and must not gain
+    /// the proxy-mode host-gateway alias.
+    #[test]
+    fn args_tunnel_mode_docker_has_no_host_alias() {
+        let args = build_run_args(&spec(
+            ContainerRuntime::Docker,
+            KeepIdMode::Off,
+            SandboxPolicy::WorkspaceWrite,
+            SandboxNetworkMode::Tunnel,
+            0,
+        ));
+        let joined = args.join(" ");
+        assert!(joined.contains("--network container:lunarwing-sandbox-tunnel"));
+        assert!(!joined.contains("--add-host"));
     }
 
     #[test]

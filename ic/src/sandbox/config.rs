@@ -52,6 +52,19 @@ pub enum SandboxNetworkMode {
     /// egress at all, kernel-enforced; the proxy is not started.
     #[default]
     None,
+    /// Egress through a long-lived tunnel sidecar container (WI#248): a
+    /// detached container (`lunarwing.sandbox-tunnel` label namespace)
+    /// establishes a NetBird or kernel-WireGuard tunnel inside its own
+    /// (userns-owned) network namespace, and every sandbox run joins that
+    /// namespace via `--network container:lunarwing-sandbox-tunnel`. The
+    /// sidecar is the only credential holder; sandbox containers keep every
+    /// existing hardening flag. Reachability inside the namespace is decided
+    /// by the tunnel itself (WireGuard `AllowedIPs`, NetBird routes/ACLs) —
+    /// with a default-route tunnel this is enforced egress, otherwise the
+    /// sidecar's pasta uplink remains reachable (advisory, like legacy
+    /// `proxy`). Fail-closed: a sidecar that cannot start or pass its health
+    /// gate blocks execution instead of degrading to another mode.
+    Tunnel,
 }
 
 impl std::str::FromStr for SandboxNetworkMode {
@@ -62,8 +75,9 @@ impl std::str::FromStr for SandboxNetworkMode {
             "proxy" | "allowlist" => Ok(SandboxNetworkMode::Proxy),
             "proxy-enforced" | "proxy_enforced" => Ok(SandboxNetworkMode::ProxyEnforced),
             "none" | "off" => Ok(SandboxNetworkMode::None),
+            "tunnel" => Ok(SandboxNetworkMode::Tunnel),
             _ => Err(format!(
-                "invalid sandbox network mode '{s}', expected 'proxy', 'proxy-enforced', or 'none'"
+                "invalid sandbox network mode '{s}', expected 'proxy', 'proxy-enforced', 'tunnel', or 'none'"
             )),
         }
     }
@@ -101,6 +115,9 @@ pub struct SandboxConfig {
     pub runtime: SandboxRuntime,
     /// Network egress mode for sandboxed policies (default: none).
     pub network: SandboxNetworkMode,
+    /// Tunnel sidecar settings; only consulted when `network` is
+    /// [`SandboxNetworkMode::Tunnel`]. `None` otherwise (and by default).
+    pub tunnel: Option<crate::sandbox::tunnel_sidecar::TunnelSidecarConfig>,
     /// Directories the sandbox must never expose (WI#205).
     ///
     /// A mount at or inside one of these is refused; one *containing* one of
@@ -126,6 +143,7 @@ impl Default for SandboxConfig {
             proxy_port: 0,
             runtime: SandboxRuntime::Auto,
             network: SandboxNetworkMode::None,
+            tunnel: None,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
         }
     }
@@ -371,7 +389,12 @@ mod tests {
             "proxy_enforced".parse::<SandboxNetworkMode>().unwrap(),
             SandboxNetworkMode::ProxyEnforced
         );
+        assert_eq!(
+            "tunnel".parse::<SandboxNetworkMode>().unwrap(),
+            SandboxNetworkMode::Tunnel
+        );
         assert!("everything".parse::<SandboxNetworkMode>().is_err());
+        assert!("tunnel:netbird".parse::<SandboxNetworkMode>().is_err());
     }
 
     #[test]

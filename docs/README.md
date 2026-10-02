@@ -67,6 +67,7 @@ How-to guides, build instructions, and setup walkthroughs.
 | [`VISION_OCR_SIDECAR.md`](guides/VISION_OCR_SIDECAR.md) | Versioned Vision/OCR sidecar endpoints and MT port behavior |
 | [`MULTICA_DEPLOYMENT.md`](guides/MULTICA_DEPLOYMENT.md) | Multica/Lunartica WASM channel and tool deployment |
 | [`NETBIRD_TUNNEL.md`](guides/NETBIRD_TUNNEL.md) | Self-hosted NetBird Reverse Proxy tunnel setup |
+| [`SANDBOX_TUNNEL_NETWORKING.md`](guides/SANDBOX_TUNNEL_NETWORKING.md) | Sandbox egress through a NetBird/WireGuard tunnel sidecar (WI#248) |
 | [`TUNNEL_PROVIDER_MIGRATION.md`](guides/TUNNEL_PROVIDER_MIGRATION.md) | Migration from removed managed Cloudflare/ngrok/Tailscale providers |
 | [`DEBIAN_PACKAGE_LIST.md`](guides/DEBIAN_PACKAGE_LIST.md) | Debian MT host packages and Python tooling dependencies |
 | [`UBUNTU_PACKAGE_LIST.md`](guides/UBUNTU_PACKAGE_LIST.md) | Ubuntu MT host packages and Python tooling dependencies |

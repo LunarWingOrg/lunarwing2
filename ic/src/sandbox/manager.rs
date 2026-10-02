@@ -34,6 +34,7 @@ use crate::sandbox::cli_runner::{CliRunner, ExecParams};
 use crate::sandbox::config::{ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy};
 use crate::sandbox::error::{Result, SandboxError};
 use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder};
+use crate::sandbox::tunnel_sidecar::{TunnelSidecar, TunnelSidecarConfig};
 
 /// Output from sandbox execution.
 #[derive(Debug, Clone)]
@@ -82,6 +83,9 @@ pub struct SandboxManager {
     config: SandboxConfig,
     proxy: Arc<RwLock<Option<HttpProxy>>>,
     runner: Arc<RwLock<Option<Arc<CliRunner>>>>,
+    /// Tunnel sidecar handle when `network` is `Tunnel` (WI#248); stopped
+    /// on shutdown.
+    tunnel: RwLock<Option<TunnelSidecar>>,
     initialized: std::sync::atomic::AtomicBool,
 }
 
@@ -92,6 +96,7 @@ impl SandboxManager {
             config,
             proxy: Arc::new(RwLock::new(None)),
             runner: Arc::new(RwLock::new(None)),
+            tunnel: RwLock::new(None),
             initialized: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -142,11 +147,45 @@ impl SandboxManager {
 
         *self.runner.write().await = Some(runner);
 
-        // Start the network proxy for every non-isolated egress mode —
-        // advisory and enforced both need the validating proxy. Per-call
-        // policy overrides (including a FullAccess manager default with sandboxed
-        // per-call policies) use the same never-relaxed proxy ACL.
-        if self.config.network != SandboxNetworkMode::None {
+        // Tunnel sidecar (WI#248): health-gated start before any run can
+        // join its namespace. `ensure_started` fails closed — a tunnel that
+        // cannot come up makes the sandbox unavailable rather than degrading
+        // to another egress mode.
+        if self.config.network == SandboxNetworkMode::Tunnel {
+            let tunnel_cfg = self
+                .config
+                .tunnel
+                .clone()
+                .ok_or_else(|| SandboxError::Config {
+                    reason: "SANDBOX_NETWORK=tunnel requires SANDBOX_TUNNEL_* settings \
+                         (see docs/guides/SANDBOX_TUNNEL_NETWORKING.md)"
+                        .to_string(),
+                })?;
+            let sidecar = TunnelSidecar::new(
+                self.runner
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|r| r.runtime())
+                    .ok_or_else(|| SandboxError::RuntimeNotAvailable {
+                        reason: "container runtime not initialized".to_string(),
+                    })?,
+                tunnel_cfg,
+            );
+            sidecar.ensure_started().await?;
+            *self.tunnel.write().await = Some(sidecar);
+        }
+
+        // Start the network proxy for the proxy-backed egress modes —
+        // advisory and enforced both need the validating proxy. The tunnel
+        // mode needs no proxy (egress rides the sidecar's namespace), and
+        // `none` starts nothing. Per-call policy overrides (including a
+        // FullAccess manager default with sandboxed per-call policies) use
+        // the same never-relaxed proxy ACL.
+        if matches!(
+            self.config.network,
+            SandboxNetworkMode::Proxy | SandboxNetworkMode::ProxyEnforced
+        ) {
             let proxy = NetworkProxyBuilder::from_config(&self.config)
                 .build_and_start(self.config.proxy_port)
                 .await?;
@@ -170,10 +209,13 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Shutdown the sandbox (stop proxy, clean up).
+    /// Shutdown the sandbox (stop proxy and tunnel sidecar, clean up).
     pub async fn shutdown(&self) {
         if let Some(proxy) = self.proxy.write().await.take() {
             proxy.stop().await;
+        }
+        if let Some(sidecar) = self.tunnel.write().await.take() {
+            sidecar.stop().await;
         }
 
         self.initialized
@@ -560,6 +602,13 @@ impl SandboxManagerBuilder {
     /// Set the network egress mode for sandboxed policies.
     pub fn network(mut self, network: SandboxNetworkMode) -> Self {
         self.config.network = network;
+        self
+    }
+
+    /// Set the tunnel sidecar settings (only consulted when the network
+    /// mode is [`SandboxNetworkMode::Tunnel`], WI#248).
+    pub fn tunnel(mut self, tunnel: TunnelSidecarConfig) -> Self {
+        self.config.tunnel = Some(tunnel);
         self
     }
 
