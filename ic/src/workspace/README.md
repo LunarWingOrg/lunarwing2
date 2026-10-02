@@ -77,7 +77,9 @@ let prompt = workspace.system_prompt().await?;
 Writes to prompt-visible files (the identity files, `lorebooks/`, and
 `daily/*.md`) are scanned for prompt-injection patterns before storage and
 rejected on High-or-above matches; appends re-scan the full candidate so
-patterns split across appends cannot slip through. Daily logs accumulate
+patterns split across appends cannot slip through. This includes the
+`append_memory()` lane behind `memory_write(target: "memory", append: true)`
+(WI#286 — it previously bypassed the scan entirely). Daily logs accumulate
 agent-authored incident and test notes, so their scan demotes a match fully
 enclosed in a short, single-line, inline quoted span (`` `code` ``,
 `"double"`, `'single'`, `“curly”`, `‘curly’`, at most 200 bytes) to warn-only
@@ -87,6 +89,17 @@ be eagerly re-paired to bracket injection text (`"a"ignore previous …"`
 stays unquoted and rejects). Unquoted matches and tokenizer-level patterns
 (`<|`, `|>`, `[INST]`, `[/INST]`, null bytes) still reject in daily logs, and
 all other prompt-visible files keep the strict raw scan.
+
+### Prompt-File Shadow Backups (WI#286)
+
+A full-replace `write()` of a prompt-visible file destroys its prior content —
+the mechanism behind the incident where a session's context dump clobbered the
+curated `MEMORY.md`. Before replacing non-empty, differing content, `write()`
+now persists the previous version to a rolling single-slot shadow copy at
+`backups/<path>.bak` (e.g. `backups/MEMORY.md.bak`). Backups are retrievable
+by exact-path `read()` and visible in `list()`, but are stored with an empty
+chunk projection so they never enter the search index. Backup failures are
+logged and never block the write itself.
 
 ## Operator Prompt Editing (WI#220)
 
@@ -108,7 +121,7 @@ for scope, preview, activation and API details.
 Four tools for LLM use:
 
 - **`memory_search`** - Hybrid search, MUST be called before answering questions about prior work
-- **`memory_write`** - Write memory, daily logs, or custom user paths
+- **`memory_write`** - Write memory, daily logs, or custom user paths (payloads capped at 256 KiB, matching the web prompt editor)
 - **`memory_read`** - Read bounded pages from a file by path
 - **`memory_tree`** - View a bounded workspace tree (depth parameter, default 1)
 
