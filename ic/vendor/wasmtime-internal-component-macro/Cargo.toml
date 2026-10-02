@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "wasmtime-internal-component-macro"
-version = "36.0.16"
+version = "36.0.17"
 authors = ["The Wasmtime Project Developers"]
 build = "build.rs"
 autolib = false
@@ -74,11 +74,11 @@ version = "2.0.25"
 features = ["extra-traits"]
 
 [dependencies.wasmtime-component-util]
-version = "=36.0.16"
+version = "=36.0.17"
 package = "wasmtime-internal-component-util"
 
 [dependencies.wasmtime-wit-bindgen]
-version = "=36.0.16"
+version = "=36.0.17"
 package = "wasmtime-internal-wit-bindgen"
 
 [dependencies.wit-parser]
@@ -105,7 +105,7 @@ version = "2.1.0"
 version = "0.1.26"
 
 [dev-dependencies.wasmtime-wit-bindgen]
-version = "=36.0.16"
+version = "=36.0.17"
 features = ["component-model-async"]
 package = "wasmtime-internal-wit-bindgen"
 

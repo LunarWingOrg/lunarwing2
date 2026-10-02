@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "cranelift-entity"
-version = "0.123.16"
+version = "0.123.17"
 authors = ["The Cranelift Project Developers"]
 build = false
 autolib = false
@@ -46,7 +46,7 @@ name = "cranelift_entity"
 path = "src/lib.rs"
 
 [dependencies.cranelift-bitset]
-version = "0.123.16"
+version = "0.123.17"
 
 [dependencies.serde]
 version = "1.0.215"
