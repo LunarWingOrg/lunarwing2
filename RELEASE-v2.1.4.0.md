@@ -614,6 +614,13 @@ relaxing it:
   `.gitlab/README.md` documents the unvendored gate and the pipeline-4811
   incident.
 
+Post-repair confirmation (item 23): the next latest master pipeline, 4867,
+was verified job-by-job — all 35 jobs `success`, zero failed/canceled —
+with the `cargo-deny` job confirmed at the pipeline's exact SHA to run this
+wrapper, so its green is the honest mode rather than the silent-degradation
+mode fixed above (the 42-second runtime matches the compact trace; the
+broken mode blew past the 4 MB log cap).
+
 ### Pairing Allowlist Preservation (sbpatch1)
 
 `PairingStore` approval opened the allowlist store with `truncate(true)`
@@ -853,10 +860,13 @@ the tree at `03f5650fe` rather than taken from tracker bodies:
 - Tracker churn since the 2026-09-27 audit: 24 items created-and-closed,
   #220/#200 closed, open set grew 13 → 23.
 
-The audit is a point-in-time record at `03f5650fe`; three of its five
-genuinely-open 2.1.4.0 items have since landed in this release — #269
-(`mission_history`, item 18), #270 (outbound delivery honesty, item 19),
-and #271 (mt-admin worker-image store surfacing, item 24).
+The audit is a point-in-time record at `03f5650fe`, repassed once (item 15,
+22:10Z refresh) to fold in the #271 and #277 landings and #280's !1327
+closure. Four of its five genuinely-open 2.1.4.0 items have since landed in
+this release — #269 (`mission_history`, item 18), #270 (outbound delivery
+honesty, item 19), #271 (mt-admin worker-image store surfacing, item 24),
+and #280 (daily-log quoted demotion, item 22) — leaving #281 as the only
+genuinely-open 2.1.4.0-labeled item, tracked as goals item 30.
 
 ### Guides and Architecture Docs Repass (items 16/17)
 
@@ -1103,7 +1113,9 @@ launchd a distant third).
   regressions are landed executable tests ahead of the substrate change.
 - The cycle's open work items were reconciled in
   `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` with tree-verified
-  dispositions for all 23 open items; WI#200 closed on the landed stopgap.
+  dispositions for all 23 open items, then repassed once (item 15) as
+  #271/#277 landed and #280's !1327 closed unmerged; WI#200 closed on the
+  landed stopgap.
 - The cargo-deny yanked-crate CI gate is honest again: it runs unvendored
   from the repo root and hard-fails on any `index-failure` diagnostic,
   closing the silent-skip hole found in pipeline 4811 (item 20).
