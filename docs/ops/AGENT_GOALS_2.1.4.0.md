@@ -1,6 +1,6 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.1.4.0
 
-## Codename: UNKNOWN
+## Codename: Kabuto
 
 **Open TODOs (v2.1.4.0) — To be done before release**
 
@@ -179,7 +179,8 @@
     - WI#286 folded in across the draft: overview sentence (workspace security paragraph), Highlights entry, new Changes section "Curated-Memory Write Contract (WI#286)" (append_memory scan bypass closed, 256 KiB `memory_write` cap, prompt-file shadow backups; deferred #280/#286 detector redesign noted), a Compatibility "Workspace memory writes" row, upgrade note 19 (chunking guidance + `backups/<path>.bak` restore path), a carried-limitation bullet (detector redesign deferred; WI#288 unquoted-poison daily-log append freeze tracked as goals item 32), and a Resolved bullet. All code claims verified against the tree pre-write: `append_memory` dual pre-commit scan (`ic/src/workspace/mod.rs:1706`), `MAX_MEMORY_WRITE_BYTES = 256 * 1024` (`ic/src/tools/builtin/memory.rs:310`), `shadow_backup_prompt_file` with empty chunk projection / log-and-continue (`ic/src/workspace/mod.rs:1157`), README scan-lane + shadow-backup sections
     - Item 20 re-check recorded in the footer: master pipeline 4907 on the WI#286 merge (`75c4bd50`) verified 35/35 success via commit statuses, including the honest unvendored `cargo-deny` wrapper (the item-20 repair). Footer rewritten for the fourth repass: the items-20/29 re-open note now records both scopes as landed and covered; open items at repass time are 30 (WI#281), 31 (WI#292), 32 (WI#288), 39 (item-14 repass)
     - Verified: all 10 unique relative md links in the draft resolve live; `git diff --check` clean; no stale "pipeline-4890"/"may land" phrasing remains. Docs-only change: no cargo check needed
-43. [ ] repass of item 13 again
-44. [ ] repass of item 14 again
+43. [ ] repass of item 13 again - codename is in https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/293 include haikus
+44. [ ] repass of item 14 again - codename is in https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/293 include haikus
 45. [x] (S) Reserved
+
 ---
