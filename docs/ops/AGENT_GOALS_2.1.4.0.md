@@ -149,7 +149,11 @@
 36. [x] (S) RESERVED
 37. [x] (S) RESERVED
 38. [x] (S) RESERVED
-39. [ ] repass of item 14 again
+39. [x] repass of item 14 again
+    - DONE 2026-10-02 (`rarity/kimi-39-20261002-0401`, item 39): second repass of [v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md](v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md) at 04:08 UTC, source revision `6886e9046`. Open set unchanged at 22 (three closures offset by three creations), all 22 items fetched live from the GitLab API (project 35, both pages) and every code-facing disposition re-verified against the tree.
+    - Tracker churn since the item-15 repass (22:10Z): closures #280 (01:55Z — third fix attempt **merged** via !1332/`6a4ba80b`, goals item 22; verified in-tree: `quoted_spans` `ic/src/workspace/mod.rs:258`, `reject_daily_log_if_injected` `:291` wired at `:422-423`, `MAX_QUOTED_SPAN_BYTES` `:198`, regressions `:2855`), #271 (01:55Z — goals item 24's mt-admin fixes), #285 (01:01Z — AGENTS.md drift landed in the housecleaning wave); creations #288/#289/#290 (all 01:51Z, applejack, from sweetiebot's WI#280 source study, all 2.1.5.0, all anchors verified: combined-candidate rescan `mod.rs:1169/:1180` + hardcoded High floor `:168`; context-blind `detect` vs line-start-only `escape_content` `sanitizer.rs:254/:259/:271-288`; `injection_rejected_error` `:152`).
+    - Content updates folded in: #286's "we fixed it" corrected in-tracker to data recovery, sweetiebot's pass-130 root cause confirmed in this tree (`append_memory` scan bypass `mod.rs:1665-1686`, no `memory_write` cap), and goals item 29's fix bundle verified **branch-only** (`rarity/kimi-29-20261002-0300` `a4f8f2fb6`, not an ancestor of HEAD); #281 gained brightdawn's 01:35Z field report (mission binding worked 06:20Z, unbound by ~11:05Z across session respawn, missed PR Digest tick #61 plausibly downstream) — defect re-verified, preamble still advertises `mission_*` at `codeact_preamble.md:36-39`; #248 gained a full implementation on branch `sandboxtunmode` (`2ed3d0395`) ahead of its 2.1.7.0 label — verified not merged.
+    - Genuinely-open 2.1.4.0 set now 1 (#281, goals item 30 open); #286 is the other 2.1.4.0 label with its fix one merge away (goals item 29 open). All cited repo paths re-verified resolvable; `git diff --check` clean. Docs-only change: no cargo check needed
 40. [ ] repass of item 13 again to update release notes draft
 
 ---
