@@ -55,8 +55,13 @@ def clean_response(data: dict) -> dict:
     for choice in data.get("choices", []):
         clean_choice = {
             "index": choice.get("index", 0),
-            "finish_reason": choice.get("finish_reason", "stop"),
         }
+        # Pass finish_reason through verbatim. When the upstream omits it, omit
+        # it too — never fabricate "stop" (WI#292): OpenAI-compatible clients
+        # treat a missing finish_reason as "unknown", and the engine's
+        # truncation recovery depends on telling length apart from stop.
+        if choice.get("finish_reason") is not None:
+            clean_choice["finish_reason"] = choice["finish_reason"]
         msg = choice.get("message", {})
         content = msg.get("content") or ""
         # If content is empty, try reasoning fields (thinking models)
@@ -145,7 +150,7 @@ class LunarWingProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.log_message(
                     "✅ %s → %s (content: %s)",
                     data.get("model", "?"),
-                    cleaned["choices"][0]["finish_reason"] if cleaned["choices"] else "?",
+                    (cleaned["choices"][0].get("finish_reason") or "?") if cleaned["choices"] else "?",
                     (cleaned["choices"][0]["message"]["content"] or "")[:60] if cleaned["choices"] else "empty",
                 )
             except json.JSONDecodeError:
