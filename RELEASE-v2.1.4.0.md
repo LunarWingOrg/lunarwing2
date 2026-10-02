@@ -2,7 +2,7 @@
 
 ## Codename: UNKNOWN (draft)
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repass 2026-10-01)
+**Release date:** 2026-10-XX (not yet released; first draft 2026-10-01, repasses 2026-10-01)
 
 ## Overview
 
@@ -28,13 +28,18 @@ now pinned 0.10.2 with a refreshed `PEBBLE_LOCK_SHA256`), and the Pebble
 lock guard gained multi-version record keying and no-op-override rejection.
 CI recovered from pipeline #4679's Cavepony release-metadata drift and
 orphan-mission boundary violation; integration-target MRs now run the full
-validation matrix.
+validation matrix. A later look at the green pipeline 4811 found the
+cargo-deny yanked-crate gate silently degrading to warnings under vendored
+source replacement; the job now runs unvendored from the repo root and
+hard-fails on any index-failure diagnostic (item 20).
 
 Engine reliability dominates the feature work: mission execution recovers
 from transient provider failures after partial text instead of aborting the
 thread (WI#244), global mission listings no longer drop missions whose
 project record is missing so every active mission keeps its daily rollover
-(WI#243), `routine_history` resolves Engine V2 mission names (WI#265), and
+(WI#243), `routine_history` resolves Engine V2 mission names (WI#265), a
+dedicated `mission_history` tool joins the bridge `mission_*` family with
+`routine_history` honestly blocked in v2 threads (WI#269), and
 the voice sidecar bounds abandoned inference admission so a timed-out or
 cancelled call cannot pin the model mutex or starve other components
 (WI#264). Shared tool execution learns bounded per-user EMA runtime
@@ -44,19 +49,29 @@ estimates surfaced as frozen advisory hints on approvals and pending gates
 The operator surface gained per-tenant system-prompt editing in Settings with
 Engine V2 initialization snapshots (WI#220), read-only tenant database and
 daemon-PID diagnostics verbs in mt-admin (`psql`, `daemon-pid`) with a
-WI#268 prompt-overlay audit runbook, an opencode2 worker bump to v2.0.20, and
+WI#268 prompt-overlay audit runbook, worker-image store-failure surfacing
+with quoted stderr and per-lane image presence in `mt-admin status`
+(WI#271), an opencode2 worker bump to v2.0.21, and
 a pairing allowlist fix so approving a new sender no longer erases the
 existing allowlist. New tenants now render `ORCHESTRATOR_SELF_MODIFY=true`
 (stored orchestrator and prompt-overlay updates, WI#282), with the operator
 opt-out preserved across re-renders. The WI#184 secrets-store pairing
 redesign advanced to design revision 3 (both !1294 review P2s answered) with
 the review-required legacy-matching and concurrency regressions landed ahead
-of the substrate change.
+of the substrate change. Outbound delivery is now honest about its contract
+(WI#270): the `message` tool ack reads `Queued …` instead of implying
+delivery, the XMPP channel refuses enqueue while no session is bound, and
+shutdown gives the outbound queue a bounded drain window — and the XMPP lane
+now persists every outbound message to a durable spool before acking, so a
+restart or crash between ack and send no longer silently loses the message
+(WI#277).
 
 The full docs set was repassed for the cycle: all 32 active guides under
 `docs/guides/` and all 10 active architecture docs re-verified against source
-and stamped, and the cycle's open work items were reconciled in a tracker
-audit (23 open items, dispositions verified against the tree).
+and stamped, the cycle's open work items were reconciled in a tracker
+audit (23 open items, dispositions verified against the tree), codename
+candidates were shortlisted for the human pick, and stale versioned ops docs
+were archived to `docs/ops/history/` with every inbound link repaired.
 
 The release identifier is `2.1.4.0`; LunarWing-owned Rust crates and channel
 packages use `2.1.4`. Rust 2024 and MSRV `1.96.1` are unchanged. There are
@@ -95,6 +110,16 @@ previous compatibility baseline.
   byte-indexing a `String` — so multilingual assistant text cannot panic the
   path. Not-found errors name both registries and point at
   `routine_list`/`mission_list`; limit clamped 1..=50
+- **Dedicated `mission_history` tool (WI#269).** Engine V2 missions gain a
+  first-class history tool in the bridge `mission_*` family, rendering
+  newest-first fires from `mission.thread_history` in the same shape as
+  `routine_history` (character-safe summaries, limit clamped 1..=50,
+  default 10) through a new `MissionManager::load_thread` read accessor.
+  Name lookup is project-scoped own+shared like `mission_list`; the UUID
+  path re-checks project and ownership after the store load and returns
+  `access denied` otherwise. `routine_history` is now blocked in v2 threads
+  with an honest "use mission_history" error instead of a wrong-registry
+  fallthrough
 - **Bounded inference admission in the voice sidecar (WI#264).** STT/TTS/VAD
   each admit one call before taking shared capacity; blocking workers retain
   both permits until settlement, so repeated TTS retries cannot queue behind
@@ -133,6 +158,15 @@ previous compatibility baseline.
   diff and without enabling self-modification; a failed environment
   capture reports `uninspected (live gate)` with a non-zero exit rather than
   certifying "gate off"
+- **mt-admin worker-image store surfacing (WI#271).** The
+  `podman save | podman load` image distribution now captures both halves'
+  stderr and quotes the first lines in the WARNING, so store corruption vs
+  a missing admin-side image vs conmon-rot no longer collapse into one
+  generic line. The userns-repair post-verify checks worker-image presence
+  per selected lane and reports a degraded `repair complete … (probe OK;
+  worker image(s) missing)` instead of a clean bill, and
+  `mt-admin status <tenant>` gained a read-only `Worker images:` block
+  reporting `present`/`missing`/`not selected for tenant` per lane
 - **Crate security audit and supply chain (item 3).** All 27 tracked
   lockfile roots re-scanned against a fresh RustSec db (2026-09-30) with an
   empty ignore list and `unmaintained = "all"`; the resolved worker-image
@@ -155,6 +189,15 @@ previous compatibility baseline.
   validation now also covers integration-target MRs, with
   `LUNARWING_CI_FULL_VALIDATION=1` opt-in for scratch branches. Evidence:
   [v2.1.4.0_GOAL1_CI_RECOVERY.md](docs/ops/v2.1.4.0_GOAL1_CI_RECOVERY.md)
+- **cargo-deny yanked-crate gate restored (item 20).** The green
+  `cargo-deny` CI job was green dishonestly: run from inside `ic/`,
+  vendored source replacement hid the registry index, so `yanked = "deny"`
+  degraded to one `warning[index-failure]` per crate (738 in pipeline 4811)
+  while the job still exited 0 — and the diagnostics flooded the trace past
+  the 4 MB log cap, truncating the verdict away. A repo-root wrapper now
+  runs cargo-deny with explicit manifest/config paths, keeps the trace
+  compact, and hard-fails on any index-failure so the yanked check can
+  never be silently skipped again
 - **Pairing allowlist preservation (sbpatch1).** Approving a new sender
   previously opened the allowlist store with `truncate(true)` before
   deserialization, silently erasing every previously approved sender when
@@ -162,16 +205,39 @@ previous compatibility baseline.
   and rewrites through the same locked handle (set_len + seek + write +
   sync), so concurrent approvers cannot bypass the lock and shorter
   payloads cannot leave trailing bytes
+- **Outbound message delivery honesty (WI#270).** The `message` tool's
+  success ack was an enqueue ack dressed as a delivery receipt — the
+  contract gap behind a scheduled mission recording "Delivered via XMPP" in
+  memory for a stanza silently lost in a rebuild window. The ack now reads
+  `Queued message to <channel>:<target>` with a tool-description warning
+  that success means acceptance for delivery; the XMPP channel refuses
+  enqueue while no session is bound; and `shutdown()` gives the client task
+  a bounded 2s drain window, WARNing with the pending depth when the queue
+  cannot drain. Documented in
+  [OUTBOUND-DELIVERY-SEMANTICS.md](docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md)
+- **Durable XMPP outbound spool (WI#277).** The channel half of WI#270's
+  long-term fix #4: every `queue_outbound*` message is persisted to
+  `<omemo_store_dir>/spool/` (atomic tmp-write + fsync + rename, dir 0700 /
+  files 0600) *before* the mpsc handoff is acked — a spool write failure
+  refuses the ack instead of queueing a losable message. The client task
+  claims records by atomic rename, deletes them on success, and replays all
+  pending records on every `Event::Online` bind, so a restart/crash between
+  ack and send no longer loses the message. Post-enqueue failures retry
+  with exponential backoff (30s base, 1h cap) and park as
+  `<key>.failed.json` after 24 attempts. Live-verified on test tenant
+  derpy: 19/19 messages delivered exactly once, including a spooled record
+  surviving `systemctl stop` and replaying on the next boot
 - **Orchestrator self-modification for new tenants (WI#282).** add-tenant
   now renders `ORCHESTRATOR_SELF_MODIFY=true` so new tenants adopt stored
   orchestrator and prompt-overlay updates; an explicit operator opt-out is
   preserved across re-renders. Existing tenants are untouched
-- **External worker: opencode2 v2.0.20 (item 2).** The opencode2 lane
-  advances v2.0.18 → v2.0.20 at reviewed full commit
-  `84c9be93a56304a108f1a22df0c5d62c26d5b6ca` (tag SHA verified live).
-  Dockerfile pins, CI source_ref/build args, and the reproducible-build
-  fixture moved together; the `bytecode: true`/`splitting: true` patch
-  contract and bridge surface verified unchanged (diff is additive). kimi
+- **External worker: opencode2 v2.0.21 (items 2/29).** The opencode2 lane
+  advances v2.0.18 → v2.0.21 at reviewed full commit
+  `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (lightweight tag `v2.0.21`;
+  tag SHA verified live). Dockerfile pins, CI source_ref/build args, and
+  the reproducible-build fixture moved together; the
+  `bytecode: true`/`splitting: true` patch contract and bridge surface
+  verified unchanged at both pins this cycle (each diff is additive). kimi
   stays at 2.1.1, opencode v1 at `v1.18.25`, pebble at `2d0f3786…`
 - **Documentation parity (item 12).** Seven docs re-verified against the
   tree for changes not covered by each goal's own updates: the mt-admin
@@ -221,18 +287,19 @@ previous compatibility baseline.
 | Tool registry patches | cavepony-tool 0.4.4 (release-metadata alignment; the `version-policy` gate requires all five version fields to advance together), gitlab 0.1.7, gotify 0.1.1, llm-context 0.1.2, multica-bridge 0.1.3, ssh 0.1.2, vision-analyze 0.1.4, voice-transcribe 0.1.2, web-search 0.2.3 |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.16 (no change from v2.1.3.0) |
 | External crate updates | 121 semver-compatible updates across the ic workspace and satellite lockfile roots (notably hyper 1.11.1, reqwest 0.13.5, tokio-rustls 0.26.6, quinn 0.11.12, clap 4.6.7, thiserror 2.0.21, rkyv stack replaced by string_cache/web_atoms/zlib-rs in affected satellites); `ic/vendor/` regenerated |
-| Worker image tool pins | kimi-code `2.1.1` (no change); opencode2 `v2.0.20` at `84c9be93a56304a108f1a22df0c5d62c26d5b6ca` (was v2.0.18); opencode `v1.18.25` (no change); pebble `2d0f3786…` with the reviewed upstream lock re-pinned for the chacha20 retirement (refreshed `PEBBLE_LOCK_SHA256`) |
+| Worker image tool pins | kimi-code `2.1.1` (no change); opencode2 `v2.0.21` at `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (was v2.0.18, via v2.0.20); opencode `v1.18.25` (no change); pebble `2d0f3786…` with the reviewed upstream lock re-pinned for the chacha20 retirement (refreshed `PEBBLE_LOCK_SHA256`) |
 | Engine provider recovery | Bounded per-turn recovery after partial text for transient/unavailable provider failures; retry caps and rate-limit exclusions unchanged; failed drafts never enter history or tool execution |
 | Mission global listings | Missions whose project record is missing/unparseable remain globally enumerable; only Active ones reach the active-only listing |
-| `routine_history` | Falls back to Engine V2 mission-name lookup when the v1 routines registry misses; character-based summary truncation |
+| `routine_history` / `mission_history` | `routine_history` falls back to Engine V2 mission-name lookup when the v1 routines registry misses, with character-based summary truncation; in v2 threads it is blocked with an honest pointer to the new `mission_history` tool (project-scoped own+shared, ownership re-checked on the UUID path) |
 | Voice sidecar admission | One in-flight call per component (STT/TTS/VAD) before shared capacity; blocked workers hold both permits until settlement; poisoned lock/panic = `component_failed`/503 until restart |
 | Tool runtime hints | `LUNARWING_TOOL_ESTIMATES` read once at startup: unset/`observe` = record only, `1` = record + hints, `0` = off; restart resets learned models; no migration or new wire fields |
 | Tenant system prompts | Settings editor writes primary-scope prompts consumed as Engine V2 initialization snapshots (activate via `restart-tenant` + new conversation); existing threads keep their System message |
-| mt-admin verbs | New: `psql <tenant>`, `daemon-pid <tenant>` (read-only diagnostics); all existing verbs unchanged |
+| mt-admin verbs | New: `psql <tenant>`, `daemon-pid <tenant>` (read-only diagnostics); `status <tenant>` reports per-lane worker-image presence (WI#271); all existing verbs unchanged |
 | New tenant env defaults | `ORCHESTRATOR_SELF_MODIFY=true` rendered at add-tenant (WI#282); explicit operator values preserved on re-render; existing tenants untouched |
 | Pairing allowlist | Approvals no longer truncate the existing allowlist store before reading; concurrent approvals serialize under the file lock |
+| XMPP outbound delivery | `message` tool ack reports `Queued …` (acceptance, not delivery); enqueue refused while no session is bound; bounded 2s shutdown drain; durable spool persists every outbound message before ack with replay on bind, backoff retry, and `.failed.json` parking after 24 attempts — at-least-once semantics (post-send crash can duplicate at whole-message granularity) |
 | Pairing store (WI#184) | Design revision 3 only — no substrate change this release; landed tests pin current legacy matching and concurrent-grant semantics ahead of the secrets-store migration |
-| CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only |
+| CI validation coverage | `.full-validation-context` includes integration-target MRs; scratch branches opt in with `LUNARWING_CI_FULL_VALIDATION=1`; worker publication remains protected/push-only; the cargo-deny job runs unvendored from the repo root via `.gitlab/scripts/cargo-deny-check.sh` and fails on any `index-failure` diagnostic |
 | Deny policy | `ic/deny.toml` advisory ignores unchanged in id set (8), re-verified 2026-09-30 with blocking dependency chains documented |
 
 ## Changes
@@ -300,6 +367,35 @@ cannot race the router's engine-state tests. 90 router tests, 26 routine
 tool tests, 250 bridge tests, 1167 tools tests, and the e2e
 `routine_history` trace test pass. ENGINE-V2.md's Learning Missions section
 documents the behavior.
+
+### `mission_history` Tool and the `routine_history` v2 Block (WI#269)
+
+The missing piece behind the WI#265 fallback: Engine V2 missions had no
+first-class history tool at all. `mission_history` now joins the bridge
+`mission_*` family (`ic/src/bridge/effect_adapter.rs`), rendering
+newest-first fires from `mission.thread_history` in the same output shape
+as `routine_history` — character-safe 200-character summaries, limit
+clamped 1..=50, default 10 — so the LLM can switch tools without
+relearning the schema:
+
+- Resolution accepts `name` or `id` (also positional), scoped like
+  `mission_list` (own + shared missions in the caller's project). The UUID
+  path re-checks `project_id` and ownership after the raw store load —
+  `resolve_mission_id` accepts any well-formed UUID, so without this check
+  a thread in project A could read project B's mission history (the !1302
+  review P2, carried into this implementation).
+- A new `MissionManager::load_thread` read accessor
+  (`ic/crates/lunarwing_engine/src/runtime/mission.rs`) backs the run
+  entries; the tool is registered beside `mission_list`/`mission_update` in
+  `ic/src/bridge/router.rs`.
+- `routine_history` joins the v2-only block list: in Engine V2 threads it
+  now returns an honest "use mission_history" error (mission names come
+  from `mission_list`) instead of falling through to the wrong registry and
+  shadowing mission names.
+
+Verified with 59 `bridge::effect_adapter` tests (including the UUID-path
+scoping regression and the never-fired empty-history case) and 90
+`bridge::router` tests. ENGINE-V2.md documents both resolution paths.
 
 ### Voice Sidecar Inference Admission and Recovery (WI#264)
 
@@ -389,6 +485,35 @@ that `prompt_additions` writes nothing while the self-modify gate is off.
 The !1276 review's daemon-PID findings (as-written validation, tenant
 association, fixture cleanup) are addressed in the same pass.
 
+### mt-admin Worker-Image Store Surfacing (WI#271)
+
+Tenant worker-image failures no longer hide behind generic lines:
+
+- `_ensure_tenant_image` now captures both halves' stderr from the
+  `podman save | podman load` distribution into mktemp files and quotes
+  the first lines in the WARNING — store corruption vs a missing
+  admin-side image vs the conmon-rot class no longer collapse into one
+  generic line; the temp files are cleaned on the success, failure, and
+  mktemp-failure paths.
+- The `repair_tenant_podman_userns` post-verify checks worker-image
+  presence per selected lane via the tenant-context container wrapper
+  (new shared `_worker_image_refs` helper mirroring the four worker refs,
+  using the same gate `start_tenant` uses), so repair no longer concludes
+  "complete (probe OK)" with the pebble image absent — it warns with
+  remediation and reports `repair complete … (probe OK; worker image(s)
+  missing)`, the file's existing degraded-but-repaired idiom.
+- `mt-admin status <tenant>` gained a `Worker images:` block reporting
+  `present`/`missing` per selected lane and `not selected for tenant`
+  for the rest — read-only, init-agnostic, with no false "missing" for
+  unselected lanes.
+
+Verified with the mt-admin regression suites (tenant-image 10/10 with the
+new stderr-quoting cases, fix-podman-userns cases 9–10, openrc-status
+`Worker images:` assertions) plus repo-wide shell syntax/shellcheck. The
+rig-side smoke PARTIAL flag stays rig-owned (out of tree), and image-ID as
+a container-recreation trigger remains a deliberate-decision item per the
+WI.
+
 ### Crate Security Audit and Supply Chain (item 3)
 
 The rejected !1264 attempt was superseded by a rebuild on the merged !1262
@@ -447,6 +572,31 @@ Locked builds, the fuel budget, required artifacts, and the unchanged
 boundary ratchet are all retained. Evidence:
 [v2.1.4.0_GOAL1_CI_RECOVERY.md](docs/ops/v2.1.4.0_GOAL1_CI_RECOVERY.md).
 
+### CI cargo-deny Yanked-Crate Gate (item 20)
+
+Pipeline 4811 was green 35/35 — but the `cargo-deny` job was green
+dishonestly. Running from inside `ic/` source-replaces crates.io with
+`ic/vendor/`, so the `yanked = "deny"` policy silently degraded to one
+`warning[index-failure]` per crate (738 of them in 4811) while the job
+still exited 0; worse, those diagnostics pushed the trace past the 4 MB log
+cap, truncating the verdict away. The runner egress contract already allows
+the crates.io index, so the fix restores the intended gate rather than
+relaxing it:
+
+- New `.gitlab/scripts/cargo-deny-check.sh` runs cargo-deny from the repo
+  root with explicit `--manifest-path ic/Cargo.toml` and
+  `--config ic/deny.toml`, hides inclusion graphs to keep the trace
+  compact, and hard-fails if any `index-failure` diagnostic appears — the
+  yanked check can never be silently skipped again.
+- `.gitlab/ci/security.yml` uses the wrapper; `ic/scripts/refresh-vendor.sh`
+  routes its post-vendor advisory gate through the same wrapper instead of
+  the old vendored in-`ic/` invocation.
+- `.gitlab/scripts/validate_config.py` gained `validate_cargo_deny_gate`
+  (rejects a job bypassing the wrapper or a wrapper that loses its guards)
+  with a six-case regression suite in `.gitlab/tests/test_cargo_deny_gate.py`;
+  `.gitlab/README.md` documents the unvendored gate and the pipeline-4811
+  incident.
+
 ### Pairing Allowlist Preservation (sbpatch1)
 
 `PairingStore` approval opened the allowlist store with `truncate(true)`
@@ -492,14 +642,52 @@ item:
 The WIT channel interface text is intentionally unchanged — its `Ok`
 semantics are spelled out in the tool description and the new architecture
 doc instead of a comment-only WIT edit that would force a package version
-bump and registry-wide churn. Hard-exit loss remains
-inherently possible with a memory-only queue; the durable outbound spool +
-mission-run ledger stays tracked as the long-term fix (WI#270 fix #4,
-platform halves in #277/#276). New architecture doc:
+bump and registry-wide churn. The XMPP half of the long-term durable-spool
+fix then landed as WI#277 (next section), closing the restart-loss window
+for the XMPP lane; the mission-run ledger half remains tracked as WI#276.
+New architecture doc:
 `docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md` also records the
 mission-spec discipline (daily log → send → memory records acceptance;
 update the run baseline each time). The PR Digest mission spec itself is
 tenant workspace data, outside this repo.
+
+### Durable XMPP Outbound Spool (WI#277)
+
+The remaining channel-platform half of WI#270's fix #4: the XMPP outbound
+queue was memory-only, so a restart/crash/rebuild between the acked
+enqueue and the wire send silently lost the message — the exact PR Digest
+#59 incident class. The channel now runs a durable spool
+(`ic/src/channels/xmpp/spool.rs`):
+
+- Every `queue_outbound*` message is persisted to
+  `<omemo_store_dir>/spool/<millis>-<seq>-<uuid>.json` (atomic tmp-write +
+  fsync + rename, dir 0700 / files 0600) *before* the mpsc handoff is
+  acked — a spool write failure refuses the ack instead of queueing a
+  losable message, and a dead client task discards the record (no ack, no
+  replay).
+- The client task claims a record by atomic rename before sending (a spool
+  replay and a late in-memory copy can never both send) and deletes it on
+  success; every `Event::Online` bind replays all pending records after
+  room joins and OMEMO publish.
+- Post-enqueue failures (send_stanza, OMEMO/room prep, XEP-0363 upload)
+  are no longer bare warn-and-drop: the record retries with exponential
+  backoff (30 s base, 1 h cap), and after 24 attempts parks as
+  `<key>.failed.json` with the last error; invalid JIDs park immediately
+  as permanent. Item 19's gate/drain semantics are preserved — the
+  undrained-shutdown WARN now says messages remain spooled, not lost.
+- Internal protocol sends (pairing prompts) are deliberately unspooled,
+  and the rate limiter is not re-applied to replays (already counted at
+  the original ack).
+
+Semantics are at-least-once: a crash between wire-send and record-clear
+replays, so a duplicate is possible at whole-message granularity. Verified
+with 93 `channels::xmpp` lib tests (12 new spool unit + 4 new
+channel-level, including a restart-window replay across two channel
+instances sharing a data dir) and live on test tenant derpy: 19/19 test
+messages delivered exactly once, including a spooled (acked-but-unsent)
+record that survived `systemctl stop` and replayed on the next boot's
+Online drain. End-to-end delivery receipts (XEP-0198) and the WI#276
+engine-side mission-run ledger remain open.
 
 ### Version Bumps and Supply Chain (item 1)
 
@@ -514,21 +702,29 @@ tracked manifest/lock audit confirmed no project-owned package remains at
 workspace and the repo-root satellite lockfile roots; `ic/vendor/` was
 regenerated. Channel behavior is unchanged — the bumps are rebuild-only.
 
-### External Workers: opencode2 v2.0.20 (item 2)
+### External Workers: opencode2 v2.0.21 (items 2/29)
 
-The opencode2 lane advances v2.0.18 → v2.0.20 at reviewed full commit
-`84c9be93a56304a108f1a22df0c5d62c26d5b6ca` (tag SHA verified live against
-the anomalyco/opencode remote). Dockerfile pins, CI source_ref/build args,
-and the reproducible-build test fixture moved in step. Verified: the
-upstream `build.ts` at the new SHA still has exactly one `bytecode: true` /
-`splitting: true` (patch contract holds); the bridge surface is unchanged
-(`OpenCode.make`, `session.create` with `permissions`,
-`session.permission.reply`, `session.interrupt`, `event.subscribe`, all
-matched event names); the diff is additive — new `credential.list/create`
-endpoints are unused. Host-side reproducible-build preparation 3/3 OK.
-Whole-image reproducibility must still pass the CI candidate-vs-clean
-rebuild digest gate before promotion (CI-only, as with prior bumps). kimi
-remains at 2.1.1, opencode v1 at `v1.18.25`, and pebble at `2d0f3786…`.
+The opencode2 lane moved twice this cycle, landing at v2.0.21. Item 2
+advanced v2.0.18 → v2.0.20 at `84c9be93a56304a108f1a22df0c5d62c26d5b6ca`;
+item 29 then advanced v2.0.20 → v2.0.21 at reviewed full commit
+`8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (lightweight tag `v2.0.21`;
+both tag SHAs verified live against the anomalyco/opencode remote).
+Dockerfile pins, CI source_ref/build args, and the reproducible-build test
+fixture moved in step at each bump. Verified at the final pin: the upstream
+`build.ts` still has exactly one `bytecode: true` / `splitting: true`
+(patch contract holds); the bridge surface is unchanged on every endpoint
+the worker uses (`OpenCode.make`, `session.create` with `permissions`,
+`session.prompt`, `session.message.list`, `session.permission.reply`,
+`session.interrupt`, `event.subscribe`, all eight matched event names) —
+the v2.0.20 → v2.0.21 surface diff is additive only (an optional `message`
+param on the unused `session.form.cancel` endpoint and an
+`x-opencode-session-id` header; the `permission.reply` path is
+byte-identical), as was the v2.0.18 → v2.0.20 diff (unused
+`credential.list/create` endpoints). Host-side reproducible-build
+preparation 3/3 OK. Whole-image reproducibility must still pass the CI
+candidate-vs-clean rebuild digest gate before promotion (CI-only, as with
+prior bumps). kimi remains at 2.1.1, opencode v1 at `v1.18.25`, and pebble
+at `2d0f3786…`.
 
 ### Documentation Parity (item 12)
 
@@ -607,6 +803,11 @@ the tree at `03f5650fe` rather than taken from tracker bodies:
 - Tracker churn since the 2026-09-27 audit: 24 items created-and-closed,
   #220/#200 closed, open set grew 13 → 23.
 
+The audit is a point-in-time record at `03f5650fe`; three of its five
+genuinely-open 2.1.4.0 items have since landed in this release — #269
+(`mission_history`, item 18), #270 (outbound delivery honesty, item 19),
+and #271 (mt-admin worker-image store surfacing, item 24).
+
 ### Guides and Architecture Docs Repass (items 16/17)
 
 All 32 active guides under `docs/guides/` (excluding `history/`) and all 10
@@ -629,6 +830,33 @@ source and stamped for v2.1.4.0:
 - Link checks: every relative link and cited `ic/`/`projects/` path in the
   active guides and architecture docs resolves.
 
+### Codename Candidates (item 25)
+
+Ten release-codename candidates grounded in the cycle's actual work are
+shortlisted in
+[v2.1.4.0_CODENAME_IDEAS.md](docs/ops/v2.1.4.0_CODENAME_IDEAS.md), with no
+previous codename repeated and every prior shortlist checked against the
+history. The top pick is **Kabuto (兜)** — completing the `Yoroi` (2.1.2.0)
+→ `Ō-Yoroi` (2.1.3.0) armor lineage — with Kiwame (極め) and Shūfuku (修復)
+as alternates. The codename above remains UNKNOWN until a human picks.
+
+### Repo Housecleaning and Agent-Doc Drift (items 28, #285)
+
+Fourteen stale versioned docs moved from `docs/ops/` to
+`docs/ops/history/` via `git mv` (rename tracking preserved) — the eleven
+`v2.0.9.0_*` goal-evidence docs plus three `v2.1.3.0_*` audit/status docs —
+matching the convention prior releases already used, and the placeholder
+`docs/ov/` directory was removed. Every inbound reference was repaired in
+the same pass (guides, prior release notes, the v2.1.4.0 audit doc, the
+moved docs' self-references, and a `ic/deny.toml` comment), and a
+repo-wide grep confirms zero stale `docs/ops/v2.0.9.0_` /
+`docs/ops/v2.1.3.0_` paths remain. The root and `ic/` `AGENTS.md` files
+also took a drift pass (#285): the deeper-docs lists now name only the
+five specs that exist in the tree, every relative path resolves from its
+file's own directory, and the watchdog asset lists include the launchd
+assets with consistent init-system guidance (systemd + OpenRC first,
+launchd a distant third).
+
 ## Upgrade Notes
 
 1. Back up PostgreSQL, tenant environment files, `/etc/lunarwing/ports.json`,
@@ -644,8 +872,8 @@ source and stamped for v2.1.4.0:
 4. **Vendor snapshot.** `ic/vendor/` was regenerated for the 121 external
    crate updates; if you maintain a local vendor override, refresh it with
    `ic/scripts/refresh-vendor.sh` before building.
-5. **opencode2 rebuild.** Rebuild the opencode2 worker image at `v2.0.20`
-   (`84c9be93a…`); pull worker images by the digest recorded in
+5. **opencode2 rebuild.** Rebuild the opencode2 worker image at `v2.0.21`
+   (`8a8bd622…`); pull worker images by the digest recorded in
    `worker-image-evidence.json`. Promotion still requires the CI
    candidate-vs-clean rebuild digest gate.
 6. **Pebble worker.** The reviewed upstream lock re-pins chacha20 to 0.10.2
@@ -680,6 +908,27 @@ source and stamped for v2.1.4.0:
     design document with landed pinning tests. Existing per-channel pairing
     JSON files keep working; the secrets-store migration remains future work
     tracked in the WI.
+15. **Outbound delivery semantics (WI#270).** The `message` tool ack now
+    reports `Queued message to <channel>:<target>`; success means the
+    channel accepted the message for delivery, never that it arrived.
+    Mission specs and operators must record acceptance, not "delivered" —
+    see
+    [OUTBOUND-DELIVERY-SEMANTICS.md](docs/architecture/OUTBOUND-DELIVERY-SEMANTICS.md).
+    The XMPP channel refuses proactive enqueue while disconnected, and
+    shutdown drains the outbound queue within a bounded 2s window; since
+    WI#277 the XMPP lane persists every outbound message to a durable spool
+    before acking (note 17).
+16. **Mission history (WI#269).** In Engine V2 threads, use
+    `mission_history` (mission names come from `mission_list`);
+    `routine_history` now returns an honest pointer error there instead of
+    a wrong-registry fallthrough. No configuration change.
+17. **XMPP outbound spool (WI#277).** No configuration change; the spool
+    lives under the tenant's existing `omemo_store_dir` (`spool/`
+    subdirectory). Delivery is at-least-once — a crash between wire-send
+    and record-clear can replay a duplicate — and a message that
+    exhausts its 24 retry attempts parks as `<key>.failed.json` with the
+    last error for operator inspection/replay. The spool is XMPP-local;
+    other channels keep memory-only queues.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -697,8 +946,15 @@ source and stamped for v2.1.4.0:
   enable only for intentionally trusted private-network deployments
   (carried).
 - Kawarimi remains PostgreSQL-only (carried).
+- Outbound delivery beyond XMPP still runs memory-only queues: the WI#277
+  durable spool is XMPP-channel-local, so restart-loss of acked messages
+  remains possible on other channels. On XMPP the spool is at-least-once —
+  a crash between wire-send and record-clear can replay a duplicate
+  (whole-message granularity) — and there are no end-to-end delivery
+  receipts (XEP-0198 remains open). The engine-side mission-run ledger
+  half of WI#270's fix #4 remains tracked as WI#276.
 - OpenCode v1.18.29+ remains deliberately un-adopted for the opencode lane
-  pending upstream proof (carried; the opencode2 lane is on v2.0.20).
+  pending upstream proof (carried; the opencode2 lane is on v2.0.21).
 - Historical WI#159 behavior remains: terminal triggers
   (`thread_completed_with_issues`/`thread_completed_with_learnings`) still
   fire for Research child threads — only Mission threads are filtered
@@ -718,10 +974,6 @@ source and stamped for v2.1.4.0:
   landed allowFrom-preservation fix (!1283).
 - WI#191 later slices (LLM timing, whole-job/mission ETA, gate-wait
   analytics, durable aggregate caches) are deferred beyond this release.
-- Repo housecleaning (item 28) is tracked separately in the goals document
-  and may land after this draft is finalized; the docs/guides (item 16) and
-  docs/architecture (item 17) repasses landed after the first draft and are
-  covered in the sections above.
 
 ### Resolved or Source-Fixed Since v2.1.3.0
 
@@ -734,6 +986,20 @@ source and stamped for v2.1.4.0:
 - `routine_history` resolves Engine V2 mission names with character-safe
   summaries and registry-pointing errors (WI#265 source-fixed; the
   v2.1.3.0 known issue is closed).
+- Engine V2 missions have a first-class `mission_history` history tool with
+  project/ownership-scoped resolution, and `routine_history` is honestly
+  blocked in v2 threads with a pointer to it (WI#269 source-fixed).
+- Outbound delivery no longer over-reports: the `message` tool ack says
+  `Queued …`, the XMPP channel refuses enqueue without a bound session, and
+  shutdown drains the outbound queue in a bounded window with a WARN on
+  residue (WI#270 platform hardening landed; the durable spool half of its
+  long-term fix #4 then landed as WI#277 below, with the mission-run ledger
+  half still tracked as WI#276).
+- XMPP outbound messages survive restarts: a durable spool persists every
+  message before the ack, replays pending records on every Online bind,
+  retries post-enqueue failures with bounded backoff, and parks exhausted
+  records as `.failed.json` — verified live on derpy with 19/19 deliveries,
+  including a restart-window replay (WI#277 source-fixed).
 - The voice sidecar bounds abandoned inference admission with per-component
   readiness and explicit permanent-failure semantics; supported recovery
   via `restart-tenant` (WI#264 source-fixed; the v2.1.3.0 known issue is
@@ -748,6 +1014,9 @@ source and stamped for v2.1.4.0:
 - mt-admin `psql`/`daemon-pid` read-only diagnostics plus the WI#268
   prompt-overlay audit runbook with uninspected-on-failure semantics and
   as-written PID validation.
+- mt-admin surfaces tenant worker-image store failures with quoted stderr,
+  verifies per-lane image presence after userns repair, and reports a
+  `Worker images:` block in `status` (WI#271 source-fixed).
 - Approving a pairing sender no longer truncates the existing allowlist;
   rewrites are locked, seek-corrected, and synced.
 - New tenants default to `ORCHESTRATOR_SELF_MODIFY=true` with the operator
@@ -762,8 +1031,9 @@ source and stamped for v2.1.4.0:
   multi-version keying and no-op-override rejection.
 - Integration-target MRs now run the full validation matrix; CI recovered
   from #4679 without bypassing any gate.
-- opencode2 worker at v2.0.20 (reviewed commit, verified patch contract and
-  bridge surface); kimi 2.1.1, opencode v1, and pebble pins unchanged.
+- opencode2 worker at v2.0.21 (reviewed commit, verified patch contract and
+  bridge surface at both of the cycle's pins); kimi 2.1.1, opencode v1, and
+  pebble pins unchanged.
 - Documentation parity for the cycle: seven docs synced, four manual test
   tiers added, releases/docs indexes updated.
 - All 32 active guides and all 10 active architecture docs repassed for
@@ -774,13 +1044,31 @@ source and stamped for v2.1.4.0:
 - The cycle's open work items were reconciled in
   `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` with tree-verified
   dispositions for all 23 open items; WI#200 closed on the landed stopgap.
+- The cargo-deny yanked-crate CI gate is honest again: it runs unvendored
+  from the repo root and hard-fails on any `index-failure` diagnostic,
+  closing the silent-skip hole found in pipeline 4811 (item 20).
+- Ten codename candidates are shortlisted for the human pick in
+  `docs/ops/v2.1.4.0_CODENAME_IDEAS.md` (top pick Kabuto; the draft header
+  stays UNKNOWN until then).
+- Repo housecleaning archived fourteen stale versioned ops docs to
+  `docs/ops/history/` with every inbound link repaired and removed the
+  placeholder `docs/ov/`; the root and `ic/` `AGENTS.md` files took a
+  drift pass so their spec lists and relative paths match the tree (#285).
 
 ---
 
 *Draft status: codename, release date, and pipeline numbers for final CI
-confirmation will be filled in before the release is cut. This is the first
-repass (item 27, 2026-10-01): it folds in the work merged after the first
-draft — WI#184 design revision 3 with its landed regressions (item 11), the
-open work items audit (item 14), and the guides/architecture docs repasses
-(items 16/17). Open goal items at repass time (18–20, 22, 24, 25, 28, 29)
-may add sections; this draft covers the merged state as of 2026-10-01.*
+confirmation will be filled in before the release is cut. The first repass
+(item 27, 2026-10-01) folded in the work merged after the first draft —
+WI#184 design revision 3 with its landed regressions (item 11), the open
+work items audit (item 14), and the guides/architecture docs repasses
+(items 16/17). This second repass (item 21, 2026-10-01) folds in everything
+merged since: the `mission_history` tool and `routine_history` v2 block
+(item 18, WI#269), outbound delivery honesty (item 19, WI#270 — its Changes
+section landed with the fix itself), the cargo-deny yanked-gate repair
+(item 20), mt-admin worker-image store surfacing (item 24, WI#271), the
+codename candidates shortlist (item 25), the durable XMPP outbound spool
+(item 26, WI#277), the docs/ops housecleaning and AGENTS.md drift fixes
+(item 28, #285), and the opencode2 v2.0.21 bump (item 29). Open goal items
+at repass time (15, 22, 23) may add sections; this draft covers the merged
+state as of 2026-10-01.*
