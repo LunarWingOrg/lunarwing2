@@ -6,7 +6,7 @@
   "Cargo.toml": "624c11e8d05e59fa113abed135863df0c11b8926d01cf6be6108001448fede0e",
   "Cargo.toml.orig": "bbd93be8b7a160d0998e884d495e1fcc6542f9beb7713ea6e574821b22aff5e8",
   "LICENSE": "42cf0f78132fe1de338cbff947bf5b9f7d2d8a377cb827c9df9e90b4b9499ef7",
-  "LUNARWING-PATCH.md": "9c28b5bce31be02a5aa0b2f7d3a5c0d8b8d6f440088a18c9e032bd4d6907ca56",
+  "LUNARWING-PATCH.md": "e112258c1918f7698deb97798cf69eda69201496b7e31a681ae411df4c5b938a",
   "README.md": "4168514ca1259b74871cb03030102cfcbb90ec272b31abad42eb76b35fef40a4",
   "src/agent/builder.rs": "fbec316bccb0847f6474f4f2c71b60183050c65ab6ae99cc8b8747182e43bab2",
   "src/agent/completion.rs": "58ad41646edbb6c74773e52863e9cce61701b119dd7ad7f02dea1ff3ecb26ec4",
