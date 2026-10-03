@@ -2766,6 +2766,7 @@ fn parse_thread_failure_kind(result: &serde_json::Value) -> ThreadFailureKind {
     match value {
         "no_progress" => ThreadFailureKind::NoProgress,
         "consecutive_errors" => ThreadFailureKind::ConsecutiveErrors,
+        "budget_exhausted" => ThreadFailureKind::BudgetExhausted,
         "orchestrator" => ThreadFailureKind::Orchestrator,
         _ => ThreadFailureKind::Unknown,
     }
@@ -4154,6 +4155,26 @@ mod tests {
         ));
     }
 
+    /// WI#302: budget exhaustion parses into its own failure kind so retry
+    /// policies can refuse to auto-retry it (each re-fire gets a fresh
+    /// budget) and skill feedback can withhold the negative signal.
+    #[test]
+    fn parse_outcome_failed_budget_exhausted() {
+        let result = serde_json::json!({
+            "outcome": "failed",
+            "failure_kind": "budget_exhausted",
+            "error": "Token budget exhausted before the task completed."
+        });
+        let outcome = parse_outcome(&result);
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::BudgetExhausted,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn parse_outcome_gate_paused() {
         let result = serde_json::json!({
@@ -4207,7 +4228,7 @@ mod tests {
         ));
     }
 
-    /// WI#302: unknown outcome strings (typos, legacy arms such as
+    /// WI#302: unknown outcome strings (typos, removed arms such as
     /// "need_approval"/"need_authentication") must not silently become
     /// Completed{None}.
     #[test]

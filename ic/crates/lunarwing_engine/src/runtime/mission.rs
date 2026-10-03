@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 
 use crate::memory::RetrievalEngine;
 use crate::runtime::manager::ThreadManager;
-use crate::runtime::messaging::ThreadOutcome;
+use crate::runtime::messaging::{ThreadFailureKind, ThreadOutcome};
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
 use crate::types::is_shared_owner;
@@ -2917,18 +2917,27 @@ async fn process_mission_outcome_and_notify(
         }
         ThreadOutcome::Failed { error, kind } => {
             mission.record_approach(format!("FAILED: {error}"));
-            // WI#188: terminal failures get a retry slot when the policy has
-            // attempts left; the failure kind does not change the contract —
-            // the daily budget and max_retries are the guardrails.
-            let _ = kind;
-            pending_retry = plan_outcome_retry(store, &mission, thread_id, "failed").await;
-            notify_response = Some(match pending_retry.as_ref() {
-                Some(p) => format!(
-                    "Mission failed: {error} (retry {} of {} scheduled)",
-                    p.attempt, mission.retry_policy.max_retries
-                ),
-                None => format!("Mission failed: {error}"),
-            });
+            if matches!(kind, ThreadFailureKind::BudgetExhausted) {
+                // WI#302: budget exhaustion is deliberate work exhaustion,
+                // not a transient failure — auto-retrying would hand each
+                // re-fire a fresh budget (up to 4x the configured spend per
+                // fire). Notify once, like MaxIterations; never auto-retry.
+                notify_response = Some(format!(
+                    "Mission stopped: {error} Not retrying automatically; retry with a narrower scope or a higher budget"
+                ));
+            } else {
+                // WI#188: terminal failures get a retry slot when the policy has
+                // attempts left; the failure kind does not change the contract —
+                // the daily budget and max_retries are the guardrails.
+                pending_retry = plan_outcome_retry(store, &mission, thread_id, "failed").await;
+                notify_response = Some(match pending_retry.as_ref() {
+                    Some(p) => format!(
+                        "Mission failed: {error} (retry {} of {} scheduled)",
+                        p.attempt, mission.retry_policy.max_retries
+                    ),
+                    None => format!("Mission failed: {error}"),
+                });
+            }
             is_error = true;
         }
         ThreadOutcome::MaxIterations => {
@@ -8992,6 +9001,48 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                 .iter()
                 .any(|entry| entry.starts_with("FAILED: provider cut")),
             "failure must be recorded in the approach history"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_outcome_notifies_without_retry() {
+        // WI#302: budget exhaustion is deliberate work exhaustion — each
+        // retried fire would spend a fresh budget, so it must be recorded
+        // and notified but never auto-retried (same contract as
+        // MaxIterations).
+        let project_id = ProjectId::new();
+        let mission = Mission::new(
+            project_id,
+            "test-user",
+            "budget-bounded",
+            "goal",
+            MissionCadence::OnEvent {
+                event_pattern: "deploy ready".into(),
+            },
+        );
+        let id = mission.id;
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        store.save_mission(&mission).await.unwrap();
+
+        let exhausted = ThreadOutcome::Failed {
+            kind: ThreadFailureKind::BudgetExhausted,
+            error: "Token budget exhausted before the task completed.".into(),
+        };
+        let pending = process_mission_outcome(&store, id, ThreadId::new(), &exhausted)
+            .await
+            .unwrap();
+        assert!(
+            pending.is_none(),
+            "WI#302: budget exhaustion must not schedule an auto-retry — every retry spends a fresh budget"
+        );
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.starts_with("FAILED: Token budget exhausted")),
+            "budget exhaustion must still be recorded in the approach history"
         );
     }
 

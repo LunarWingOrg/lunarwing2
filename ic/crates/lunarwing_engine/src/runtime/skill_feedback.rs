@@ -62,6 +62,12 @@ pub(crate) async fn record_terminal_skill_usage(
 
     let success = match outcome {
         ThreadOutcome::Completed { .. } => Some(true),
+        // WI#302: running out of budget is not evidence the skills were
+        // wrong — record no signal, like an interruption.
+        ThreadOutcome::Failed {
+            kind: crate::runtime::messaging::ThreadFailureKind::BudgetExhausted,
+            ..
+        } => None,
         ThreadOutcome::Failed { .. } | ThreadOutcome::MaxIterations => Some(false),
         ThreadOutcome::Stopped | ThreadOutcome::GatePaused { .. } => None,
     };

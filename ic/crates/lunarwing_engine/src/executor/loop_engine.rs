@@ -486,17 +486,42 @@ impl ExecutionLoop {
         // Post-cleanup: persist final state, track failures for auto-rollback
         match result {
             Ok(orch_result) => {
-                // Reset the failure counter on a normal finish. A user stop
-                // (`Stopped`) is control flow, not a successful run, so it must
-                // not clear orchestrator failure/rollback history.
-                if !matches!(&orch_result.outcome, ThreadOutcome::Stopped)
-                    && let Some(store) = self.store.as_ref()
-                {
-                    crate::executor::orchestrator::reset_orchestrator_failures(
-                        store,
-                        self.thread.project_id,
-                    )
-                    .await;
+                if let Some(store) = self.store.as_ref() {
+                    if matches!(
+                        &orch_result.outcome,
+                        ThreadOutcome::Failed {
+                            kind: ThreadFailureKind::Orchestrator,
+                            ..
+                        }
+                    ) {
+                        // WI#302: a fail-loud outcome (missing/unknown outcome
+                        // from custom orchestrator code) is an orchestrator
+                        // failure too — record it so consecutive failures still
+                        // advance the auto-rollback counter instead of being
+                        // reset on every run.
+                        crate::executor::orchestrator::record_orchestrator_failure(
+                            store,
+                            self.thread.project_id,
+                            orchestrator_version,
+                        )
+                        .await;
+                        if orchestrator_version > 0 {
+                            self.emit_event(EventKind::OrchestratorRollback {
+                                from_version: orchestrator_version,
+                                to_version: orchestrator_version.saturating_sub(1),
+                                reason: "orchestrator reported a failed outcome".to_string(),
+                            });
+                        }
+                    } else if !matches!(&orch_result.outcome, ThreadOutcome::Stopped) {
+                        // Reset the failure counter on a normal finish. A user stop
+                        // (`Stopped`) is control flow, not a successful run, so it must
+                        // not clear orchestrator failure/rollback history.
+                        crate::executor::orchestrator::reset_orchestrator_failures(
+                            store,
+                            self.thread.project_id,
+                        )
+                        .await;
+                    }
                 }
                 let _ = &orch_result.tokens_used;
 

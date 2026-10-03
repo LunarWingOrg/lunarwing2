@@ -1829,6 +1829,7 @@ fn rlm_query_child_response(outcome: crate::runtime::messaging::ThreadOutcome) -
                 ),
                 ThreadFailureKind::NoProgress => "rlm_query child failed: it made no progress. Rephrase the sub-task or continue without this result.".to_string(),
                 ThreadFailureKind::ConsecutiveErrors => "rlm_query child failed: repeated action errors. Rephrase the sub-task or continue without this result.".to_string(),
+                ThreadFailureKind::BudgetExhausted => "rlm_query child failed: its budget ran out before the task completed. Continue without this result or retry with a narrower sub-task.".to_string(),
                 ThreadFailureKind::Orchestrator | ThreadFailureKind::Unknown => "rlm_query child failed internally. Continue without this result or ask the user/operator to retry.".to_string(),
             }
         }
