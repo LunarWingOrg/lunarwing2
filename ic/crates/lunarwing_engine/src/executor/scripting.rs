@@ -1783,20 +1783,7 @@ async fn handle_rlm_query(
             recursive_tokens.input_tokens += child_loop.thread.total_tokens_used;
             recursive_tokens.cost_usd += child_loop.thread.total_cost_usd;
 
-            let response = match outcome {
-                crate::runtime::messaging::ThreadOutcome::Completed { response } => {
-                    response.unwrap_or_default()
-                }
-                crate::runtime::messaging::ThreadOutcome::Failed { error, .. } => {
-                    format!("rlm_query child failed: {error}")
-                }
-                crate::runtime::messaging::ThreadOutcome::MaxIterations => {
-                    "rlm_query child reached max iterations".to_string()
-                }
-                _ => String::new(),
-            };
-
-            ExtFunctionResult::Return(MontyObject::String(response))
+            ExtFunctionResult::Return(MontyObject::String(rlm_query_child_response(outcome)))
         }
         Err(e) => {
             // The raw provider error body rides EngineError::Llm's Display —
@@ -1818,6 +1805,36 @@ async fn handle_rlm_query(
 /// the raw error string; the detailed reason is logged host-side by the caller.
 fn rlm_query_failure_message(error: &EngineError) -> String {
     super::safe_model_failure_message("rlm_query child", error)
+}
+
+/// Model-visible text for a finished `rlm_query` child loop.
+///
+/// This is the exit a child provider failure actually takes: the loop turns
+/// every orchestrator error into a `Failed` outcome whose `error` string is
+/// orchestrator-chosen text (engine-internal diagnostics for
+/// `ThreadFailureKind::Orchestrator`, free text under
+/// `ORCHESTRATOR_SELF_MODIFY`). Only the typed failure kind is rendered for the
+/// sandbox; the raw text stays host-side (WI#296).
+fn rlm_query_child_response(outcome: crate::runtime::messaging::ThreadOutcome) -> String {
+    use crate::runtime::messaging::{ThreadFailureKind, ThreadOutcome};
+
+    match outcome {
+        ThreadOutcome::Completed { response } => response.unwrap_or_default(),
+        ThreadOutcome::Failed { kind, error } => {
+            debug!(?kind, error = %error, "rlm_query child failed");
+            match kind {
+                ThreadFailureKind::Model(model) => format!(
+                    "rlm_query child failed ({model}). {}",
+                    model.recovery_instruction()
+                ),
+                ThreadFailureKind::NoProgress => "rlm_query child failed: it made no progress. Rephrase the sub-task or continue without this result.".to_string(),
+                ThreadFailureKind::ConsecutiveErrors => "rlm_query child failed: repeated action errors. Rephrase the sub-task or continue without this result.".to_string(),
+                ThreadFailureKind::Orchestrator | ThreadFailureKind::Unknown => "rlm_query child failed internally. Continue without this result or ask the user/operator to retry.".to_string(),
+            }
+        }
+        ThreadOutcome::MaxIterations => "rlm_query child reached max iterations".to_string(),
+        _ => String::new(),
+    }
 }
 
 // ── Standalone async handlers (for tokio::spawn) ────────────
@@ -4524,6 +4541,45 @@ FINAL("unexpected")
         assert!(
             !message.contains(RAW_PROVIDER_SENTINEL),
             "non-LLM errors must not leak their reason either: {message}"
+        );
+    }
+
+    /// WI#296: the `Ok(Failed)` arm is the exit a child provider failure
+    /// actually takes (the loop converts orchestrator errors into outcomes),
+    /// and its `error` string is orchestrator-chosen text — so the sandbox
+    /// must only ever see the typed kind plus fixed guidance.
+    #[test]
+    fn rlm_query_child_failed_outcome_renders_kind_not_error_text() {
+        use crate::runtime::messaging::{ThreadFailureKind, ThreadOutcome};
+        let raw = format!("Orchestrator error: {RAW_PROVIDER_SENTINEL}");
+        for kind in [
+            ThreadFailureKind::Orchestrator,
+            ThreadFailureKind::Unknown,
+            ThreadFailureKind::NoProgress,
+            ThreadFailureKind::ConsecutiveErrors,
+            ThreadFailureKind::Model(crate::types::error::ModelFailureKind::Transient),
+        ] {
+            let text = rlm_query_child_response(ThreadOutcome::Failed {
+                kind,
+                error: raw.clone(),
+            });
+            assert!(!text.contains(RAW_PROVIDER_SENTINEL), "{kind:?}: {text}");
+            assert!(!text.contains("Orchestrator error"), "{kind:?}: {text}");
+            assert!(
+                text.starts_with("rlm_query child failed"),
+                "{kind:?}: {text}"
+            );
+        }
+        let transient = rlm_query_child_response(ThreadOutcome::Failed {
+            kind: ThreadFailureKind::Model(crate::types::error::ModelFailureKind::Transient),
+            error: raw,
+        });
+        assert!(transient.contains("transient"), "{transient}");
+        assert_eq!(
+            rlm_query_child_response(ThreadOutcome::Completed {
+                response: Some("child answer".into())
+            }),
+            "child answer"
         );
     }
 
