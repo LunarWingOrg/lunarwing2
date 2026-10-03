@@ -23,7 +23,14 @@
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/302
+4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/302
+  - DONE 2026-10-03 (aj/kimi-4-20261003-0600): WI#302 "tasks are rarely hallucinated completed although not completed". Implemented the three cheap fix shapes from the KB audit `sweetiebot/terminal-completed-evidence-audit-wi302` §5 (items 1–3), which had source-verified the defect mechanisms at HEAD 0ece377c1:
+  - Fix 1 (`6bb01a410`): v1 job lane fall-through — `ic/src/worker/job.rs`: `execution_loop` now returns the `LoopOutcome`; the worker wrapper no longer falls through to `mark_completed()` ("Job completed successfully") when the loop ended via `LoopOutcome::Stopped`/`NeedApproval` without a terminal state (session teardown, daemon shutdown, channel removal). Mirrors the container lane's `Stopped → success: false`. New `loop_ended_via_stop` helper + unit test.
+  - Fix 2 (`2c96610a5`): completion sniffer — `ic/src/util.rs` `llm_signals_completion` was substring-contains, so "I have completed step 1 of 10, moving on" fired completion. A positive phrase now only counts when the rest of its line has no progress qualifiers (enumerated "step 1"/"phase two", numeric "3 of 7", hedges "but"/"moving on"/"remains"/"more to do"/"still need"). Genuine claims unchanged; 2 new regression tests pin both directions.
+  - Fix 3 (`034cacfeb`): engine-v2 `parse_outcome` (`ic/crates/lunarwing_engine/src/executor/orchestrator.rs`) fail-loud — missing/non-string/unknown `outcome` key maps to `Failed{kind: Orchestrator}` instead of `Completed{None}` (which had also suppressed the channel reply and mission history). Runtime manager already transitions the thread to Failed; missions record/notify/bounded-retry on that path. 3 new tests.
+  - Fix 4 (`3737e617b`): engine-v2 default orchestrator (`ic/crates/lunarwing_engine/orchestrator/default.py`) — token/time/cost budget exhaustion no longer transitions the thread to Completed with the budget notice as the final answer; it now transitions to Failed and returns outcome "failed" with an explicit "exhausted before the task completed" error (`failure_kind: budget_exhausted`).
+  - Verified: `cargo check` clean (lunarwing lib 4m47s; lunarwing_engine); targeted tests green — worker:: 102/102, util:: 34/34 (2 new), engine executor:: 266/266 (incl. 3 new parse_outcome); clippy `-D warnings` clean on `lunarwing` (lib+tests) and `lunarwing_engine` (lib+tests); rustfmt clean on touched files; `py_compile` clean on default.py.
+  - Deliberately out of scope (audit §5 items 4–5, larger): mission goal-claim verification tier (post-`declares_goal_achieved` evidence pass), and unifying thread-state vs outcome semantics docs. Noted on the WI.
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/301
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299
