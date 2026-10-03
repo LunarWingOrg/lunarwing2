@@ -33,13 +33,11 @@ was re-verified, the resolved worker-image graph was scanned
 patched-vs-unpatched, a full-repo yanked-crate pass retired the single yanked
 crate found anywhere in the tree (chacha20 0.10.1 in upstream Pebble's lock,
 now pinned 0.10.2 with a refreshed `PEBBLE_LOCK_SHA256`), and the Pebble lock
-guard gained multi-version record keying and no-op-override rejection. CI
-recovered from pipeline #4679's Cavepony release-metadata drift and
-orphan-mission boundary violation; integration-target MRs now run the full
-validation matrix. A later look at the green pipeline 4811 found the
-cargo-deny yanked-crate gate silently degrading to warnings under vendored
-source replacement; the job now runs unvendored from the repo root and
-hard-fails on any index-failure diagnostic.
+guard gained multi-version record keying and no-op-override rejection.
+A later look at the green pipeline 4811 found the cargo-deny yanked-crate
+gate silently degrading to warnings under vendored source replacement; the
+job now runs unvendored from the repo root and hard-fails on any
+index-failure diagnostic.
 
 Engine reliability dominates the feature work: mission execution recovers from
 transient provider failures after partial text instead of aborting the thread,
