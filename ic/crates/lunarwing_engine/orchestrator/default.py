@@ -1116,7 +1116,9 @@ def run_loop(context, goal, actions, state, config):
         # 1. Check signals
         signal = __check_signals__()
         if signal == "stop":
-            __transition_to__("completed", "stopped by signal")
+            # WI#302: a stop is an interruption, not a completion — persist
+            # failed so the thread is not listed as a success.
+            __transition_to__("failed", "stopped by signal")
             return complete_result(state, "stopped")
         if signal and isinstance(signal, dict) and "inject" in signal:
             injected_text = signal["inject"]

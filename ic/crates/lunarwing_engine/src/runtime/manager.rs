@@ -894,8 +894,10 @@ impl ThreadManager {
         }
 
         let new_event_start = thread.events.len();
-        thread.transition_to(ThreadState::Completed, Some("execution stopped".into()))?;
-        thread.transition_to(ThreadState::Done, None)?;
+        // WI#302: an externally stopped thread did not finish its work —
+        // record Failed with the stop reason rather than Completed → Done,
+        // which listed the thread as a success and made it insight-eligible.
+        thread.transition_to(ThreadState::Failed, Some("execution stopped".into()))?;
         if let Some(metadata) = thread.metadata.as_object_mut() {
             metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
             metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
@@ -1633,8 +1635,10 @@ mod tests {
             .unwrap();
 
         let saved = store.load_thread(thread_id).await.unwrap().unwrap();
-        assert_eq!(saved.state, ThreadState::Done);
-        assert!(saved.completed_at.is_some());
+        // WI#302: an externally stopped thread persists Failed("execution
+        // stopped") — terminal, but not a success record.
+        assert_eq!(saved.state, ThreadState::Failed);
+        assert!(saved.completed_at.is_none());
         assert!(
             saved
                 .metadata
@@ -2434,7 +2438,9 @@ mod tests {
             .await
             .expect("thread lookup should work")
             .expect("thread should be persisted");
-        assert_eq!(stored.state, ThreadState::Done);
+        // WI#302: a stopped thread persists Failed("execution stopped"), not
+        // Completed/Done — it must not be listed as a success.
+        assert_eq!(stored.state, ThreadState::Failed);
         assert_eq!(stored.total_tokens_used, 0);
         assert!(!stored.messages.iter().any(|message| {
             message.role == MessageRole::Assistant && message.content.contains("before-cancel")
@@ -2498,7 +2504,9 @@ mod tests {
             .await
             .expect("thread lookup should work")
             .expect("thread should be persisted");
-        assert_eq!(stored.state, ThreadState::Done);
+        // WI#302: a stopped thread persists Failed("execution stopped"), not
+        // Completed/Done — it must not be listed as a success.
+        assert_eq!(stored.state, ThreadState::Failed);
         assert_eq!(stored.total_tokens_used, 0);
         assert!(
             !stored

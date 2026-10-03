@@ -84,8 +84,12 @@ fn stopped_orchestrator_result(
     thread: &mut Thread,
     tokens_used: TokenUsage,
 ) -> Result<OrchestratorResult, EngineError> {
+    // WI#302: a stopped thread did not complete its work — persist Failed
+    // with the stop reason, not Completed. Completed would be finalized to
+    // Done downstream and the thread would render (and feed insights) as a
+    // success it never achieved.
     if thread.state == ThreadState::Running {
-        thread.transition_to(ThreadState::Completed, Some("execution stopped".into()))?;
+        thread.transition_to(ThreadState::Failed, Some("execution stopped".into()))?;
     }
     Ok(OrchestratorResult {
         outcome: ThreadOutcome::Stopped,
@@ -473,9 +477,12 @@ pub async fn execute_orchestrator(
                                 // Monty with a fabricated result: end the run as
                                 // Stopped. This is control flow, not an error, so
                                 // no failure/rollback accounting occurs.
+                                // WI#302: persist Failed with the stop reason —
+                                // Completed would finalize to Done and list the
+                                // stopped thread as a success.
                                 if thread.state == ThreadState::Running {
                                     thread.transition_to(
-                                        ThreadState::Completed,
+                                        ThreadState::Failed,
                                         Some("stopped during LLM stream".into()),
                                     )?;
                                 }
@@ -4920,7 +4927,9 @@ mod tests {
         let result = result.expect("orchestrator should return Ok");
         assert!(matches!(result.outcome, ThreadOutcome::Stopped));
         assert_eq!(result.tokens_used, TokenUsage::default());
-        assert_eq!(thread.state, ThreadState::Completed);
+        // WI#302: stopped persists Failed("stopped during LLM stream"), not
+        // Completed.
+        assert_eq!(thread.state, ThreadState::Failed);
         assert!(
             !thread
                 .messages
@@ -4985,7 +4994,8 @@ mod tests {
 
         let result = result.expect("orchestrator should return Ok");
         assert!(matches!(result.outcome, ThreadOutcome::Stopped));
-        assert_eq!(thread.state, ThreadState::Completed);
+        // WI#302: stopped persists Failed("execution stopped"), not Completed.
+        assert_eq!(thread.state, ThreadState::Failed);
         assert!(thread.events.iter().all(|event| {
             !matches!(
                 event.kind,
@@ -5135,7 +5145,8 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result.outcome, ThreadOutcome::Stopped));
-        assert_eq!(thread.state, ThreadState::Completed);
+        // WI#302: stopped persists Failed("execution stopped"), not Completed.
+        assert_eq!(thread.state, ThreadState::Failed);
         assert!(
             thread
                 .events
@@ -5198,7 +5209,8 @@ FINAL("unreached")
         .expect("orchestrator should return Ok");
 
         assert!(matches!(result.outcome, ThreadOutcome::Stopped));
-        assert_eq!(thread.state, ThreadState::Completed);
+        // WI#302: stopped persists Failed("execution stopped"), not Completed.
+        assert_eq!(thread.state, ThreadState::Failed);
         assert!(
             thread
                 .events
