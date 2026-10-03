@@ -1,5 +1,9 @@
 //! Shared utility functions used across the codebase.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 use crate::llm::{ChatMessage, Role};
 
 /// Ensure the last message in `messages` is a user-role message.
@@ -29,11 +33,97 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
     i
 }
 
+/// Enumerated-progress nouns followed by a number/ordinal: "step 1",
+/// "phase two", "part 3". `task`/`item` are deliberately absent — "I have
+/// completed task 3 as requested" is a genuine completion (the assigned
+/// task #3), and partial progress with those nouns is caught by the
+/// fraction check instead ("task 3 of 5").
+static ENUMERATED_PROGRESS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)\b(?:steps?|phases?|stages?|parts?|sections?|milestones?|subtasks?|chunks?|batches?|portions?)\s+",
+        r"(?:\d|one\b|two\b|three\b|four\b|five\b|six\b|seven\b|eight\b|nine\b|ten\b)",
+    ))
+    .unwrap() // safety: static literal regex
+});
+
+/// Ordinal-before-noun progress: "the first step", "second phase".
+static ORDINAL_PROGRESS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+",
+        r"(?:steps?|phases?|stages?|parts?|sections?|milestones?|subtasks?|chunks?|batches?|portions?)\b",
+    ))
+    .unwrap() // safety: static literal regex
+});
+
+/// Continuation markers that only make sense when more work follows:
+/// "moving on", "on to (the) next", "still need(s)". Weaker hedges
+/// ("but", "remains", "more to do") are NOT qualifiers — they appear in
+/// ordinary genuine completions ("…completed the task, but note that…",
+/// "Nothing remains.", "there is nothing more to do").
+static CONTINUATION_MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:moving on|on to (?:the )?next|still needs?)\b").unwrap() // safety: static literal regex
+});
+
+/// "N of M" fractions. Compared in code so "3 of 3" (all done) does not
+/// read as partial progress while "3 of 7" does.
+static FRACTION_OF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+)\s+of\s+(?:the\s+)?(\d+)").unwrap()); // safety: static literal regex
+
+/// "N/M" fractions, whitespace-bounded so date/path fragments such as
+/// "out/2026/10/03.txt" never match.
+static FRACTION_SLASH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|\s)(\d+)\s*/\s*(\d+)(?:\s|$)").unwrap()); // safety: static literal regex
+
+/// The remainder of the sentence that starts at `from`: the text up to the
+/// next sentence terminator or newline. Qualifiers only count against the
+/// sentence containing the claim, so a genuine claim followed by detail
+/// sentences ("Work is complete. Section 2 summarises it.") still counts.
+fn sentence_rest(text: &str, from: usize) -> &str {
+    let rest = &text[from..];
+    let end = rest.find(['.', '!', '?', '\n']).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Numeric equality tolerant of zero padding ("3" vs "03").
+fn same_count(a: &str, b: &str) -> bool {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// A fraction reads as partial progress only when numerator != denominator
+/// ("3 of 7"); "3 of 3" and "2/2" describe finished work.
+fn has_partial_fraction(sentence: &str) -> bool {
+    let partial = |caps: &regex::Captures| match (caps.get(1), caps.get(2)) {
+        (Some(n), Some(d)) => !same_count(n.as_str(), d.as_str()),
+        _ => false,
+    };
+    FRACTION_OF.captures_iter(sentence).any(|c| partial(&c))
+        || FRACTION_SLASH.captures_iter(sentence).any(|c| partial(&c))
+}
+
+/// Does the sentence containing a completion claim also contain
+/// partial-progress qualifiers that turn it into ordinary progress chatter?
+fn sentence_has_progress_qualifier(sentence: &str) -> bool {
+    ENUMERATED_PROGRESS.is_match(sentence)
+        || ORDINAL_PROGRESS.is_match(sentence)
+        || CONTINUATION_MARKER.is_match(sentence)
+        || has_partial_fraction(sentence)
+}
+
 /// Check if an LLM response explicitly signals that a job/task is complete.
 ///
 /// Uses phrase-level matching to avoid false positives from bare words like
 /// "done" or "complete" appearing in non-completion contexts (e.g. "not done yet",
 /// "the download is incomplete").
+///
+/// WI#302: a positive phrase only counts when the remainder of the sentence
+/// containing it is free of partial-progress qualifiers — "I have completed
+/// step 1 of 10, moving on" is a progress report, not a completion claim.
+/// Qualifiers are scoped to the claim's own sentence and reject only
+/// enumerated progress, uneven fractions, and explicit continuation markers,
+/// so ordinary completions with detail sentences still count.
 pub fn llm_signals_completion(response: &str) -> bool {
     let lower = response.to_lowercase();
 
@@ -80,7 +170,13 @@ pub fn llm_signals_completion(response: &str) -> bool {
         return false;
     }
 
-    positive_phrases.iter().any(|p| lower.contains(p))
+    // A positive phrase fires only when the remainder of the sentence
+    // containing it carries no partial-progress qualifier (WI#302).
+    positive_phrases.iter().any(|p| {
+        lower
+            .match_indices(p)
+            .any(|(start, _)| !sentence_has_progress_qualifier(sentence_rest(&lower, start + p.len())))
+    })
 }
 
 #[cfg(test)]
@@ -187,6 +283,91 @@ mod tests {
         assert!(!llm_signals_completion("JOB_DONE"));
         assert!(!llm_signals_completion(
             "The tool returned: TASK_COMPLETE signal"
+        ));
+    }
+
+    // ── WI#302: partial-progress chatter must not signal completion ──
+
+    #[test]
+    fn signals_completion_partial_progress_is_not_completion() {
+        assert!(!llm_signals_completion(
+            "I have completed step 1 of 10, moving on."
+        ));
+        assert!(!llm_signals_completion(
+            "I have completed phase 2. On to phase 3."
+        ));
+        assert!(!llm_signals_completion("I've completed 3 of 7 subtasks."));
+        assert!(!llm_signals_completion(
+            "I have completed the first step but two remain."
+        ));
+        assert!(!llm_signals_completion(
+            "Task is done for part 1; part 2 remains."
+        ));
+        assert!(!llm_signals_completion(
+            "Work is done on items 1-4, still need to finish items 5-8."
+        ));
+        assert!(!llm_signals_completion(
+            "Successfully completed stage one of the migration, more to do."
+        ));
+        assert!(!llm_signals_completion("I've completed task 3 of 5."));
+        assert!(!llm_signals_completion("I have completed 2/5 of the work."));
+    }
+
+    #[test]
+    fn signals_completion_genuine_completions_still_fire() {
+        // The tightened matcher must keep real completion claims, including
+        // the shapes the first WI#302 attempt wrongly rejected (H1 review).
+        assert!(llm_signals_completion("I have completed the task."));
+        assert!(llm_signals_completion(
+            "I have completed the task successfully."
+        ));
+        assert!(llm_signals_completion("The job is complete."));
+        assert!(llm_signals_completion("All done, here are the results."));
+        assert!(llm_signals_completion(
+            "I have completed the job ahead of schedule."
+        ));
+        assert!(llm_signals_completion(
+            "All steps are complete and verified."
+        ));
+        // Multi-line: a clean claim on its own line still fires even when a
+        // later line discusses follow-up work.
+        assert!(llm_signals_completion(
+            "I have completed the task.\nNext week we could extend it."
+        ));
+    }
+
+    /// H1 review vectors: genuine completions the whole-line qualifier scan
+    /// of the first WI#302 attempt classified as not-complete. Every one of
+    /// these must fire.
+    #[test]
+    fn signals_completion_h1_genuine_completion_vectors() {
+        // Standalone "but" is not a progress qualifier.
+        assert!(llm_signals_completion(
+            "I have completed the task, but note that the server is still running."
+        ));
+        // Date paths are not fractions.
+        assert!(llm_signals_completion(
+            "Task is complete. Results were saved to out/2026/10/03.txt"
+        ));
+        // N of N with numerator == denominator describes finished work.
+        assert!(llm_signals_completion(
+            "All done. Processed 3 of 3 files successfully."
+        ));
+        assert!(llm_signals_completion("All tasks complete (5 of 5)."));
+        assert!(llm_signals_completion("all done, 2/2 tests pass"));
+        // "more to do" as in "nothing more to do" is closure, not progress.
+        assert!(llm_signals_completion(
+            "The task is done — there is nothing more to do."
+        ));
+        // "remains" in a later sentence does not qualify the claim.
+        assert!(llm_signals_completion("Work is complete. Nothing remains."));
+        // Task N (the assigned task) is not enumerated partial progress.
+        assert!(llm_signals_completion(
+            "I have completed task 3 as requested."
+        ));
+        // Numbered sections in a following sentence are detail, not progress.
+        assert!(llm_signals_completion(
+            "The task is complete. Section 2 of the report summarises it."
         ));
     }
 
