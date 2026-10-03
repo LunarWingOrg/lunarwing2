@@ -2042,6 +2042,13 @@ impl Store for HybridStore {
             .collect())
     }
 
+    /// Enumerate the threads map directly — a thread whose `project.json`
+    /// is missing stays visible to global restart recovery (WI#301), the
+    /// same contract as the mission globals below.
+    async fn list_all_threads_global(&self) -> Result<Vec<Thread>, EngineError> {
+        Ok(self.threads.read().await.values().cloned().collect())
+    }
+
     async fn list_all_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
         Ok(self
             .missions
