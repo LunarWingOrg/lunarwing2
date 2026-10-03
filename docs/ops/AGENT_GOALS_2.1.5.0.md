@@ -74,7 +74,7 @@
 23. [ ] review all currently open work items - create audit document for 2.1.5.0 in docs/ops - there are similar docs in docs/ops for 2.1.4.0 and earlier releases so you can use those as references
 24. [ ] update all docs in docs/guides
 25. [ ] update all docs in docs/architecture
-26. [ ] fix issues in CI/CD (if any) - See Pipeline number 4975 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
+26. [ ] fix issues in CI/CD (if any) - See Pipeline number 5031 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
 27. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
 28. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
 29. [x] (S) RESERVED
