@@ -92,6 +92,19 @@ all other prompt-visible files keep the strict raw scan. Rejection errors name
 the offending file and the 1-based line of each rejecting match so an operator
 can repair quickly (WI#288).
 
+Rejections reach the agent as their own error class (WI#290): `memory_write`
+maps `WorkspaceError::InjectionRejected` to `ToolError::ContentRejected`
+(rendered `Content rejected: …`), not the permission-flavored `NotAuthorized`
+that read like a transient gate and invited retrying the identical write. The
+message carries the matched pattern descriptions with line numbers, states that
+the same text is rejected on every retry, tells the agent to rephrase the
+flagged wording, offers the inline-quote route only for daily logs (the one
+lane where quoting demotes a match), and warns against copying the error into
+memory — some pattern descriptions trip the scan themselves. The guidance
+wording itself is pinned scanner-clean by a regression test. The web
+`POST /api/memory/write` endpoint reports the same rejection as HTTP 422
+(matching the prompt editor) instead of 500. Gate strictness is unchanged.
+
 ### Daily-Log Quarantine (WI#288)
 
 An append to a daily log re-scans the full combined candidate, so a day file
@@ -100,8 +113,13 @@ existed) would otherwise reject every subsequent append and freeze the day's
 log with no tool-level recovery. When the combined scan fails but the new
 entry itself is clean and the pre-existing content alone trips the gate,
 `append()` quarantines the day file aside to `daily/YYYY-MM-DD.poisoned-<n>.md`
-(first free slot) and clears the day file; the rejection reason names the
-quarantine path so the caller knows a retry starts a fresh log. The quarantine
+(first free slot) and clears the day file. The discovering append is not
+applied and fails with the distinct `WorkspaceError::DailyLogQuarantined`
+(path, quarantine path, and the pre-existing matches) rather than an ordinary
+injection rejection, because the remedy is the opposite one: the new entry was
+clean, so `memory_write` tells the agent to retry it unchanged (a
+retry-inviting `ExecutionFailed`, never `ContentRejected`), and the retry lands
+on the fresh log; the web API answers HTTP 409 (WI#290). The quarantine
 copy is retained with an empty chunk projection — exact-path readable, listed,
 never search-indexed — and is never prompt-injected (daily-log injection reads
 only the exact `daily/YYYY-MM-DD.md` path). Quarantine applies only when the

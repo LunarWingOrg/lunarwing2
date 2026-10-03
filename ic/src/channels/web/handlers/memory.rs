@@ -160,16 +160,7 @@ pub async fn memory_write_handler(
                 .write_to_layer(layer_name, &req.path, &req.content, req.force)
                 .await
         }
-        .map_err(|e| {
-            use crate::error::WorkspaceError;
-            let status = match &e {
-                WorkspaceError::LayerNotFound { .. } => StatusCode::BAD_REQUEST,
-                WorkspaceError::LayerReadOnly { .. } => StatusCode::FORBIDDEN,
-                WorkspaceError::PrivacyRedirectFailed => StatusCode::UNPROCESSABLE_ENTITY,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (status, e.to_string())
-        })?;
+        .map_err(|e| (write_error_status(&e), e.to_string()))?;
         return Ok(Json(MemoryWriteResponse {
             path: req.path,
             status: "written",
@@ -183,12 +174,12 @@ pub async fn memory_write_handler(
         workspace
             .append(&req.path, &req.content)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| (write_error_status(&e), e.to_string()))?;
     } else {
         workspace
             .write(&req.path, &req.content)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| (write_error_status(&e), e.to_string()))?;
     }
 
     Ok(Json(MemoryWriteResponse {
@@ -197,6 +188,23 @@ pub async fn memory_write_handler(
         redirected: None,
         actual_layer: None,
     }))
+}
+
+/// HTTP status for a failed workspace write. Content refused by the
+/// prompt-injection gate is a client input problem (422, matching the prompt
+/// editor), and a daily-log quarantine is a retryable state conflict (409);
+/// neither is a server fault, so neither maps to 500 (WI#290).
+fn write_error_status(error: &crate::error::WorkspaceError) -> StatusCode {
+    use crate::error::WorkspaceError;
+    match error {
+        WorkspaceError::LayerNotFound { .. } => StatusCode::BAD_REQUEST,
+        WorkspaceError::LayerReadOnly { .. } => StatusCode::FORBIDDEN,
+        WorkspaceError::PrivacyRedirectFailed | WorkspaceError::InjectionRejected { .. } => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        WorkspaceError::DailyLogQuarantined { .. } => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 fn search_result_to_hit(result: &crate::workspace::SearchResult) -> SearchHit {
@@ -252,5 +260,38 @@ mod tests {
         assert_eq!(hit.path, "memory/ledger.md");
         assert_eq!(hit.content, "ledger entry");
         assert_eq!(hit.score, 0.75);
+    }
+
+    /// WI#290: content refused by the injection gate (and a daily-log
+    /// quarantine) is reported as a client-side status, not a 500.
+    #[test]
+    fn write_error_status_classifies_content_rejections() {
+        use crate::error::WorkspaceError;
+        let rejected = WorkspaceError::InjectionRejected {
+            path: "MEMORY.md".to_string(),
+            reason: "Attempt to override previous instructions (line 1)".to_string(),
+        };
+        assert_eq!(
+            write_error_status(&rejected),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let quarantined = WorkspaceError::DailyLogQuarantined {
+            path: "daily/2026-10-02.md".to_string(),
+            quarantine_path: "daily/2026-10-02.poisoned-1.md".to_string(),
+            reason: "Attempt to override previous instructions (line 2)".to_string(),
+        };
+        assert_eq!(write_error_status(&quarantined), StatusCode::CONFLICT);
+        assert_eq!(
+            write_error_status(&WorkspaceError::LayerNotFound {
+                name: "missing".to_string()
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            write_error_status(&WorkspaceError::IoError {
+                reason: "disk".to_string()
+            }),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

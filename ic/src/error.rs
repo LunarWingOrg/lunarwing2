@@ -330,6 +330,20 @@ pub enum WorkspaceError {
     #[error("Write rejected for '{path}': prompt injection detected ({reason})")]
     InjectionRejected { path: String, reason: String },
 
+    /// An append to a daily log found unquoted injection content already in
+    /// the day file, quarantined that content aside, and cleared the log
+    /// (WI#288). The new entry itself passed the scan but was not written;
+    /// retrying it unchanged lands on the fresh log.
+    #[error(
+        "Append to '{path}' not applied: content already in the log matched prompt-injection \
+         patterns ({reason}); it was quarantined to '{quarantine_path}' and the log restarted"
+    )]
+    DailyLogQuarantined {
+        path: String,
+        quarantine_path: String,
+        reason: String,
+    },
+
     #[error("Invalid lorebook document '{path}': {reason}")]
     InvalidLorebook { path: String, reason: String },
 
