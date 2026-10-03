@@ -246,6 +246,31 @@ pub trait Store: Send + Sync {
         })
     }
 
+    /// List all threads across all projects regardless of user.
+    ///
+    /// Used by: global restart recovery (WI#301). The default derives the
+    /// listing from `list_all_projects()`; adapters whose thread store can
+    /// enumerate threads directly should override — a thread whose project
+    /// document is missing would otherwise stay invisible to the recovery
+    /// sweep. Per-project load failures are logged and skipped so a single
+    /// broken project doesn't abort the global sweep.
+    async fn list_all_threads_global(&self) -> Result<Vec<Thread>, EngineError> {
+        let mut threads = Vec::new();
+        for project in self.list_all_projects().await? {
+            match self.list_all_threads(project.id).await {
+                Ok(project_threads) => threads.extend(project_threads),
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        error = %e,
+                        "list_all_threads_global: skipping project with load error"
+                    );
+                }
+            }
+        }
+        Ok(threads)
+    }
+
     /// List all missions in a project regardless of user.
     /// Used by: cron ticker, event listener, bootstrap.
     async fn list_all_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
