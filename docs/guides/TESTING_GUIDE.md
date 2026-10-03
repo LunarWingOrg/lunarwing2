@@ -45,6 +45,29 @@ Run the required tiers from [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE
 
 Treat a missing external dependency as a documented deferral, not a pass. If only the harness TensorZero probe fails, check its configured upstream before declaring the local deployment broken.
 
+### TensorZero / Tensormoon gateway bring-up
+
+Before connecting tenants to a new gateway build, exercise its OpenAI-compatible
+API against a loopback-only mock provider:
+
+```bash
+python3 ic/scripts/tests/gateway_compat_smoke.py \
+  --gateway-binary /absolute/path/to/gateway --gateway-kind tensormoon
+```
+
+Use `--gateway-kind tensorzero` with an upstream TensorZero binary. The script
+starts and stops a disposable gateway and mock provider, disables database
+observability, and passes an isolated environment with no provider credentials.
+It checks health, nonstreaming text, SSE text/usage, fragmented tool arguments,
+tool-call/result round trips, model routing, and rejection of missing functions.
+The Tensormoon lane exercises both native `tensormoon::` and legacy `tensorzero::`
+request names and expects canonical Tensormoon response names.
+
+Record the gateway commit and binary build command alongside the results.
+A pass establishes gateway API behaviour with a mock provider; it does not prove
+LunarWing's Rust client, external workers, database migrations, or a real model
+provider work end to end. Keep those validation tiers separate.
+
 ## Channels
 
 For each enabled channel, test inbound and outbound delivery, sender identity, authorization, restart recovery, and rate limits.
