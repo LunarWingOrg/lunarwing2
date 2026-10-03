@@ -2677,11 +2677,20 @@ fn sync_visible_outcome(thread: &mut Thread, outcome: &ThreadOutcome) {
 }
 
 /// Parse the orchestrator's return value into a ThreadOutcome.
+///
+/// Fail-loud contract (WI#302): the `outcome` key is required and must be one
+/// of the known outcome strings. A missing key, a non-string value, or an
+/// unknown string maps to `Failed{kind: Orchestrator}` — a malformed
+/// orchestrator result is not evidence of completed work, and silently
+/// completing the thread suppresses the error downstream (no channel reply,
+/// no mission record).
 fn parse_outcome(result: &serde_json::Value) -> ThreadOutcome {
-    let outcome = result
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .unwrap_or("completed");
+    let Some(outcome) = result.get("outcome").and_then(|v| v.as_str()) else {
+        return ThreadOutcome::Failed {
+            kind: ThreadFailureKind::Orchestrator,
+            error: "orchestrator result missing string 'outcome' key".to_string(),
+        };
+    };
 
     match outcome {
         "completed" => ThreadOutcome::Completed {
@@ -2734,7 +2743,10 @@ fn parse_outcome(result: &serde_json::Value) -> ThreadOutcome {
                 resume_output: result.get("resume_output").cloned(),
             }
         }
-        _ => ThreadOutcome::Completed { response: None },
+        other => ThreadOutcome::Failed {
+            kind: ThreadFailureKind::Orchestrator,
+            error: format!("unknown orchestrator outcome: {other:?}"),
+        },
     }
 }
 
@@ -4170,6 +4182,62 @@ mod tests {
         let result = serde_json::json!({"outcome": "stopped"});
         let outcome = parse_outcome(&result);
         assert!(matches!(outcome, ThreadOutcome::Stopped));
+    }
+
+    /// WI#302: a result without a string `outcome` key must fail loud rather
+    /// than default to Completed.
+    #[test]
+    fn parse_outcome_missing_outcome_fails_loud() {
+        let outcome = parse_outcome(&serde_json::json!({"state": {}}));
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Orchestrator,
+                ..
+            }
+        ));
+
+        let outcome = parse_outcome(&serde_json::json!({"outcome": 42}));
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Orchestrator,
+                ..
+            }
+        ));
+    }
+
+    /// WI#302: unknown outcome strings (typos, legacy arms such as
+    /// "need_approval"/"need_authentication") must not silently become
+    /// Completed{None}.
+    #[test]
+    fn parse_outcome_unknown_outcome_fails_loud() {
+        for unknown in ["done", "finished", "need_approval", "need_authentication"] {
+            let outcome = parse_outcome(&serde_json::json!({"outcome": unknown}));
+            assert!(
+                matches!(
+                    outcome,
+                    ThreadOutcome::Failed {
+                        kind: ThreadFailureKind::Orchestrator,
+                        ..
+                    }
+                ),
+                "unknown outcome {unknown:?} must fail loud"
+            );
+        }
+    }
+
+    /// WI#302: a non-dict VM return value is malformed, not a completion.
+    #[test]
+    fn parse_outcome_non_dict_result_fails_loud() {
+        let outcome = parse_outcome(&serde_json::json!("unreached"));
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Orchestrator,
+                ..
+            }
+        ));
     }
 
     /// P1-G regression for the orchestrator's JSON refund path: only
