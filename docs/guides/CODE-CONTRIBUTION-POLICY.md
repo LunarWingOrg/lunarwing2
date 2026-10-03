@@ -2,7 +2,7 @@
 
 This document is the single canonical reference for how code is contributed to LunarWing. It consolidates conventions that were previously scattered across `AGENTS.md`, the GitLab CI, subsystem specs, and guide documents. When this policy disagrees with an older document, this one wins.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0) and 2026-10-01 (v2.1.4.0).** Policy text and referenced paths were
+**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0) and 2026-10-03 (v2.1.4.0).** Policy text and referenced paths were
 re-checked against the current tree; no changes were needed (the
 `ic/src/*/CLAUDE.md` subsystem-spec glob currently resolves for `db`; other
 subsystem specs live in `docs/` as flagged in `AGENTS.md`).
@@ -19,7 +19,7 @@ This policy applies to all code merged into the `lunarwing2` repository. It does
 
 See [`AI-CODE-CONTRIBUTION-POLICY.md`](./AI-CODE-CONTRIBUTION-POLICY.md) for the complete rules. In short:
 
-- Closed-weight/proprietary models may **not** be used to generate source code merged into this repository (effective 2026-09-15).
+- Closed-weight/proprietary models may **not** be used to generate source code merged into this repository (effective 2026-11-15).
 - Open-weight models are preferred and acceptable for code generation.
 - Proprietary models are permitted only for narrow, non-code-generation purposes such as documentation refinement and security analysis.
 - All other human contribution rules still apply regardless of how the code was produced.
