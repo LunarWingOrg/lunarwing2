@@ -33,7 +33,7 @@ cavepony-wasm:
   # The wit_compat step compiles the lunarwing lib test binary; use the same
   # memory-qualified runner pool and host-side limits as the Rust matrix.
   variables:
-    CAVEPONY_EXPECTED_VERSION: "0.4.4"
+    CAVEPONY_EXPECTED_VERSION: "0.4.5"
     CAVEPONY_WASM_REQUIRED: "1"
   needs:
     - job: rust-check-default
