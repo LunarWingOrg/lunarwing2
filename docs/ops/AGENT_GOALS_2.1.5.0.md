@@ -30,7 +30,7 @@
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
-11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
+11. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296 (dupe)
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/295
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/294
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/291
@@ -51,5 +51,17 @@
 26. [ ] fix issues in CI/CD (if any) - See Pipeline number xxxx for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
 27. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
 28. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
+29. [x] (S) RESERVED
+30. [x] (S) RESERVED
+31. [x] (S) RESERVED
+32. [x] (S) RESERVED
+33. [x] (S) RESERVED
+34. [x] (S) RESERVED
+35. [x] (S) RESERVED
+36. [x] (S) RESERVED
+37. [x] (S) RESERVED
+38. [x] (S) RESERVED
+39. [x] (S) RESERVED
+40. [x] (S) RESERVED
 
 ---
