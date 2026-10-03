@@ -329,9 +329,12 @@ anything under `state/`.
 
 ### Engine V2 timeouts and model recovery
 
-These optional overrides go in `env/lunarwing.env`. None of them are written
-by provisioning; the daemon reads them from its process environment at
-startup, so restart the tenant after adding or changing them.
+These optional overrides go in `env/lunarwing.env`. `lunarwing-mt-admin.sh
+add-tenant` writes `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2` and
+`ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=2` on the first render (WI#239) and
+preserves whatever value is already there on re-render; the timeout is not
+written. The daemon reads them from its process environment at startup, so
+restart the tenant after adding or changing them.
 
 ```bash
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future cap for a deferred tool or LLM call
@@ -340,15 +343,19 @@ ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future cap for a deferred tool or 
                                         # (warn logged with timeout_type/call_id/action) and the
                                         # call resolves as an error instead of hanging the
                                         # thread forever. Default: 300 (5 minutes).
-ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Per-step model failure recovery attempts.
-                                        # Default: 1 (legacy one-attempt behavior); clamped to 0-3.
-                                        # Does not apply to context_overflow (WI#298): its
-                                        # shrink ladder changes the inputs instead of blindly
-                                        # retrying, so it always uses the policy cap (2); the
+ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2     # Per-step model failure recovery attempts.
+                                        # Provisioned as 2; the daemon's own default when
+                                        # unset is 1; clamped to 0-3; 0 disables engine
+                                        # recovery for every failure kind. When >= 1 it does
+                                        # not clamp context_overflow (WI#298): its shrink
+                                        # ladder changes the inputs instead of blindly
+                                        # retrying, so it uses the policy cap (2); the
                                         # total-attempts cap below still bounds it.
-ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4  # Total engine-level recovery attempts allowed
+ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=2  # Total engine-level recovery attempts allowed
                                         # per thread lifetime. Bounds cumulative recovery
-                                        # time. Default: 4; clamped to 16.
+                                        # time. Provisioned as 2 (one full context-overflow
+                                        # ladder uses it up); daemon default when unset is 4;
+                                        # clamped to 16; 0 disables all engine recovery.
 ```
 
 The defaults are correct for normal operation. Raise

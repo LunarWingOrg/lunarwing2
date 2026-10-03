@@ -1212,8 +1212,12 @@ def run_loop(context, goal, actions, state, config):
                 # Context-overflow recovery shrinks the request via the shrink
                 # ladder instead of blindly retrying identical input, so it is
                 # exempt from the per-streak config clamp (WI#298); the
-                # lifetime total_attempts cap below still bounds it.
-                max_attempts = policy.get("max_attempts", 0)
+                # lifetime total_attempts cap below still bounds it, and a
+                # clamp of 0 still switches engine recovery off entirely.
+                if config.get("model_recovery_max_attempts", 1) > 0:
+                    max_attempts = policy.get("max_attempts", 0)
+                else:
+                    max_attempts = 0
             else:
                 max_attempts = min(policy.get("max_attempts", 0),
                                    config.get("model_recovery_max_attempts", 1))

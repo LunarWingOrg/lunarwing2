@@ -367,9 +367,14 @@ the bridge maps it to `ModelFailureKind`. The Python orchestrator receives only
 that safe class and fixed recovery text, never provider-supplied diagnostics.
 
 - By default, recoverable model failures get one extra model request. Context-overflow
-  recovery first replaces protocol history with a bounded plain-text view of
-  the original goal and recent context. A second failure becomes a typed
-  `ThreadFailureKind::Model` outcome with actionable user text.
+  recovery instead gets the policy's full shrink ladder (two attempts, 0.60 then
+  0.35 of the recovery budget) regardless of `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS`
+  unless that is `0`: each attempt replaces protocol history with a bounded
+  plain-text view of the original goal and recent context. The failure after
+  the last allowed attempt becomes a typed `ThreadFailureKind::Model` outcome
+  with actionable user text; `ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS` bounds
+  all of this per thread lifetime (mt-admin tenants are provisioned with 2/2,
+  see `docs/ops/TENANT-CONFIGURATION.md`).
 - Mid-stream transport failures (`transient`, `unavailable`) remain recoverable
   after partial text has been streamed (WI#244). The failed response never
   reaches assistant-history or action commitment, so retrying cannot execute
@@ -867,9 +872,8 @@ disables every Engine V2 route. With Engine V2 enabled, the gateway is always
 eligible; `ENGINE_V2_CHANNELS` can additionally select the exact names `xmpp`,
 `darkirc`, and `weechat`. Values are comma-separated, trimmed, and matched
 case-insensitively by exact channel name. Empty and unknown values are ignored.
-`ENGINE_V2_MODEL_RECOVERY_ATTEMPTS` is another env var
-example: `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2`. Note there is no opt-out
-value: any entry that is not one of the eligible channel names — including
+Note there is no opt-out value: any entry that is not one of the eligible
+channel names — including
 something like `none` — is simply ignored, and the gateway always routes
 while `ENGINE_V2=true`. The only durable opt-out is `ENGINE_V2=false`.
 
@@ -1074,14 +1078,17 @@ ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/L
                                         # expiry the task is aborted and the call
                                         # resolves as an error. Default: 300
 ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Model failure recovery attempts per step.
-                                        # Default: 1; clamped to 0-3.
-                                        # Does not apply to context_overflow (WI#298):
-                                        # its shrink ladder changes the inputs instead
-                                        # of blindly retrying, so it always uses the
+                                        # Default: 1 when unset (mt-admin tenants are
+                                        # provisioned with 2); clamped to 0-3; 0 disables
+                                        # engine recovery for every failure kind.
+                                        # When >= 1 it does not clamp context_overflow
+                                        # (WI#298): its shrink ladder changes the inputs
+                                        # instead of blindly retrying, so it uses the
                                         # policy cap (2); the total-attempts cap below
                                         # still bounds it.
 ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4 # Total recovery attempts per thread lifetime.
-                                        # Default: 4; clamped to 16
+                                        # Default: 4 when unset (mt-admin tenants: 2);
+                                        # clamped to 16; 0 disables all engine recovery
 ```
 
 **Pending-gate expiry (host daemon knob, WI#111).** How long a pending
