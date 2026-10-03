@@ -1,6 +1,15 @@
 use crate::config::helpers::{parse_bool_env, parse_optional_env};
 use crate::error::ConfigError;
 
+/// Hard ceiling on tool-calling rounds per lightweight routine run (WI#291).
+///
+/// The one real bound: the operator cap (`ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS`)
+/// and every routine's `max_tool_rounds` are clamped to it. It replaces two
+/// hidden `.min(5)` clamps that silently overrode a nominal limit of 20. Kept
+/// at 10 so a full run (each round is one model call plus its tools) fits the
+/// default 300 s lightweight timeout.
+pub const LIGHTWEIGHT_MAX_TOOL_ROUNDS: u32 = 10;
+
 /// Routines configuration.
 #[derive(Debug, Clone)]
 pub struct RoutineConfig {
@@ -16,7 +25,11 @@ pub struct RoutineConfig {
     pub max_lightweight_tokens: u32,
     /// Enable tool execution in lightweight routines (default: true).
     pub lightweight_tools_enabled: bool,
-    /// Max tool iterations for lightweight routines (default: 3, max: 5).
+    /// Operator cap on tool-calling rounds per lightweight routine run
+    /// (`ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS`, default 3, at most
+    /// [`LIGHTWEIGHT_MAX_TOOL_ROUNDS`]). A routine's own `max_tool_rounds` is
+    /// capped by it; one text-only recovery turn always follows the last
+    /// round, and 0 leaves only that turn (WI#291).
     pub lightweight_max_iterations: u32,
     /// Timeout for lightweight routine execution in seconds (default: 300).
     /// Runs exceeding this are marked as failed by the stuck-run sweeper.
@@ -51,7 +64,7 @@ impl RoutineConfig {
             default_cooldown_secs: parse_optional_env("ROUTINES_DEFAULT_COOLDOWN", 300)?,
             max_lightweight_tokens: parse_optional_env("ROUTINES_MAX_TOKENS", 4096)?,
             lightweight_tools_enabled: parse_bool_env("ROUTINES_LIGHTWEIGHT_TOOLS", true)?,
-            lightweight_max_iterations: max_iterations.min(5), // cap at 5
+            lightweight_max_iterations: max_iterations.min(LIGHTWEIGHT_MAX_TOOL_ROUNDS),
             lightweight_timeout_secs: parse_optional_env("ROUTINES_LIGHTWEIGHT_TIMEOUT_SECS", 300)?,
             cron_op_timeout_secs: parse_optional_env("ROUTINES_CRON_OP_TIMEOUT_SECS", 120)?,
         })
