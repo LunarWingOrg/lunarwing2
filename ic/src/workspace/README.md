@@ -141,6 +141,26 @@ answers HTTP 422 for injection rejections (matching the prompt editor) and
 HTTP 409 for existing-content rejections and daily-log quarantines, instead
 of 500.
 
+The gate is deliberately **stricter than the sanitizer's own neutralization**
+(WI#289 — decision: document, not align). Detection matches role labels and
+override phrasing anywhere in the text, so a mid-sentence `user:` rejects
+exactly like a line-start one, while the sanitizer's render-time escaping only
+prefixes *line-start* role labels (and only when a Critical pattern fires) and
+never rewrites phrase patterns. The asymmetry stays because, for these files,
+the write gate is the only keyword defense — prompt assembly applies nothing
+(v1 engine) or only the `<|` opener break (Engine V2) — and because positional
+matching is evadable (a zero-width character or U+2028 hides a label from a
+line-start rule) while position-free matching has no position to spoof.
+Position-free is not obfuscation-proof, though: NFKC/format-character
+canonicalisation runs only in the lorebook lane, so zero-width, format-char or
+fullwidth variants of a phrase can still pass the raw scans of the other
+prompt-visible lanes (a pre-existing gap this decision does not change). False
+positives are handled by rephrasing (the rejection names the file, the matched
+pattern descriptions and their 1-based lines) or, in daily logs, by inline
+quoting. The full rationale lives in the `lunarwing_safety` sanitizer module
+docs; tests in both places pin the matrix (`detect_vs_neutralize`,
+`test_role_label_detection_is_position_free_in_every_prompt_file_class`).
+
 ### Daily-Log Quarantine (WI#288)
 
 An append to a daily log re-scans the full combined candidate, so a day file
