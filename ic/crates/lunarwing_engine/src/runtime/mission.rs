@@ -33,7 +33,9 @@ use crate::types::mission::{
 };
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::thread::{MissionContext, Thread, ThreadConfig, ThreadId, ThreadType};
+use crate::types::thread::{
+    MissionContext, RESTART_FAILURE_REASON, Thread, ThreadConfig, ThreadId, ThreadType,
+};
 
 type MissionExecutionLock = Mutex<()>;
 type MissionLockRegistry = Mutex<HashMap<MissionId, Weak<MissionExecutionLock>>>;
@@ -2339,6 +2341,11 @@ impl MissionManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn store_arc(&self) -> Arc<dyn Store> {
+        Arc::clone(&self.store)
+    }
+
     /// Post-restart sweep: re-arm retries for mission threads that recorded
     /// a pending retry before the daemon stopped (WI#188). Without this the
     /// in-memory retry timers vanish with the process.
@@ -2347,23 +2354,24 @@ impl MissionManager {
     /// `mission_retry` marker are supposed to be terminal — a Suspended row
     /// means checkpoint recovery already owns its future, so the sweep
     /// clears the marker instead of double-scheduling.
-    #[cfg(test)]
-    pub(crate) fn store_arc(&self) -> Arc<dyn Store> {
-        Arc::clone(&self.store)
-    }
-
+    ///
+    /// WI#301: a thread failed by the restart sweep itself (Failed-by-restart
+    /// marker, no `mission_retry` marker) never reached the outcome
+    /// processor, so this sweep also arms a fresh retry for it from the
+    /// mission's retry policy instead of losing the fire silently.
     pub async fn recover_pending_mission_retries(&self) -> Result<Vec<MissionId>, EngineError> {
         let mut scheduled = Vec::new();
         // A previously scheduled retry can outlive this process's active
         // index (e.g. bootstrap skips a project). Discover from durable
         // mission records instead; paused and terminal missions stay inert.
-        for mission in self.store.list_all_missions_global().await? {
+        for mut mission in self.store.list_all_missions_global().await? {
             if mission.status != MissionStatus::Active {
                 continue;
             }
             let mission_id = mission.id;
             let policy = mission.retry_policy;
-            for &thread_id in mission.thread_history.iter().rev() {
+            let history = mission.thread_history.clone();
+            for &thread_id in history.iter().rev() {
                 let thread = match self.store.load_thread(thread_id).await {
                     Ok(Some(thread)) => thread,
                     Ok(None) => continue,
@@ -2375,30 +2383,58 @@ impl MissionManager {
                 if thread.thread_type != ThreadType::Mission {
                     continue;
                 }
-                let Some(state) = RetryState::from_metadata(&thread.metadata) else {
-                    continue;
-                };
-                if !thread.state.is_terminal() {
-                    // Checkpoint recovery owns anything still resumable.
-                    clear_retry_marker(&*self.store, &thread).await;
-                    continue;
+                if self
+                    .recover_retry_for_thread(&mut mission, &thread, &policy)
+                    .await?
+                {
+                    scheduled.push(mission_id);
+                    break; // one pending retry per mission — the newest fire wins
                 }
-                if !policy.is_enabled() {
-                    clear_retry_marker(&*self.store, &thread).await;
-                    continue;
-                }
-                let Some(pending) =
-                    PendingMissionRetry::renew(&state, mission_id, &mission.user_id, &policy)
-                else {
-                    continue;
-                };
-                clear_retry_marker(&*self.store, &thread).await;
-                self.schedule_retry(pending).await;
-                scheduled.push(mission_id);
-                break; // one pending retry per mission — the newest fire wins
             }
         }
         Ok(scheduled)
+    }
+
+    /// Handle one persisted Mission thread during retry recovery. Returns
+    /// `true` when a retry was (re-)armed and the mission's scan stops —
+    /// the newest fire wins.
+    async fn recover_retry_for_thread(
+        &self,
+        mission: &mut Mission,
+        thread: &Thread,
+        policy: &MissionRetryPolicy,
+    ) -> Result<bool, EngineError> {
+        if let Some(state) = RetryState::from_metadata(&thread.metadata) {
+            if !thread.state.is_terminal() {
+                // Checkpoint recovery owns anything still resumable.
+                clear_retry_marker(&*self.store, thread).await;
+                return Ok(false);
+            }
+            if !policy.is_enabled() {
+                clear_retry_marker(&*self.store, thread).await;
+                return Ok(false);
+            }
+            let Some(pending) =
+                PendingMissionRetry::renew(&state, mission.id, &mission.user_id, policy)
+            else {
+                return Ok(false);
+            };
+            clear_retry_marker(&*self.store, thread).await;
+            self.schedule_retry(pending).await;
+            return Ok(true);
+        }
+        // WI#301: a thread the restart sweep failed never reached the outcome
+        // processor — no retry marker, no root-cause record, no dedup
+        // release. Arm a fresh retry from the mission's policy so the
+        // interrupted fire is not lost.
+        if !thread.is_failed_by_restart() {
+            return Ok(false);
+        }
+        let Some(pending) = plan_restart_failure_retry(&self.store, mission, thread).await else {
+            return Ok(false);
+        };
+        self.schedule_retry(pending).await;
+        Ok(true)
     }
 }
 
@@ -3022,6 +3058,63 @@ async fn plan_outcome_retry(
         Utc::now(),
     )?;
     debug!(mission_id = %mission.id, %attempt, %reason, "mission retry scheduled");
+    Some(pending)
+}
+
+/// Arm a retry for a thread failed by the post-restart sweep (WI#301). The
+/// outcome processor never ran for such threads, so this plays its role:
+/// root-cause record on the mission, trigger dedup release, retry marker
+/// persisted on the failed thread (durability for the NEXT restart) — then
+/// the caller schedules the re-fire. `None` when the policy is disabled or
+/// the lineage has exhausted its attempts.
+async fn plan_restart_failure_retry(
+    store: &Arc<dyn Store>,
+    mission: &mut Mission,
+    thread: &Thread,
+) -> Option<PendingMissionRetry> {
+    let policy = mission.retry_policy;
+    let attempt = current_attempt(store, thread.id).await.saturating_add(1);
+    let pending = PendingMissionRetry::new(
+        mission.id,
+        &mission.user_id,
+        attempt,
+        mission.last_trigger_payload.clone(),
+        &policy,
+        Utc::now(),
+    )?;
+
+    // Root-cause record: pre-WI#301 the fire was lost with no marker.
+    mission.record_approach(format!(
+        "FAILED: {RESTART_FAILURE_REASON} (retry {attempt} of {} scheduled by restart recovery)",
+        policy.max_retries
+    ));
+
+    // The interrupted fire's trigger dedup key was never released (the
+    // outcome processor owns that release and never ran), so the re-fire
+    // would be dedup-suppressed. Release it the same way terminal
+    // non-completions do; the retried fire re-records the key on spawn.
+    if let Some(key) = mission
+        .last_trigger_payload
+        .as_ref()
+        .and_then(trigger_dedup_key)
+        && mission.has_processed_trigger(&key)
+    {
+        mission
+            .processed_trigger_keys
+            .retain(|candidate| candidate != &key);
+        debug!(mission_id = %mission.id, dedup_key = %key, "released trigger dedup key after restart failure");
+    }
+
+    mission.updated_at = Utc::now();
+    if let Err(error) = store.save_mission(mission).await {
+        warn!(mission_id = %mission.id, %error, "failed to persist mission restart-failure retry plan");
+        return None;
+    }
+    // Marker on the failed thread so a subsequent restart re-arms this
+    // retry (same durability contract as WI#188).
+    if let Err(error) = persist_retry_marker(&**store, thread.id, &pending).await {
+        debug!(thread_id = %thread.id, %error, "failed to persist retry marker for restart-failed thread");
+    }
     Some(pending)
 }
 
@@ -9216,6 +9309,114 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         );
         let recovered = store.load_thread(thread.id).await.unwrap().unwrap();
         assert!(RetryState::from_metadata(&recovered.metadata).is_none());
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retry_recovery_arms_restart_failed_mission_thread() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "interrupted",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.last_trigger_payload = Some(serde_json::json!({"source_thread_id": "source-1"}));
+        mission.record_processed_trigger("src:source-1".into());
+        // The restart sweep failed this in-flight fire: terminal Failed with
+        // the restart marker, no retry marker (WI#301).
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Failed;
+        thread.mark_failed_by_restart();
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        assert_eq!(
+            mgr.recover_pending_mission_retries().await.unwrap(),
+            vec![mission.id]
+        );
+
+        // Retry marker persisted so the NEXT restart re-arms (WI#188 contract).
+        let recovered = store.load_thread(thread.id).await.unwrap().unwrap();
+        let state = RetryState::from_metadata(&recovered.metadata)
+            .expect("restart-failed thread must gain a retry marker");
+        assert_eq!(state.attempt, 1);
+        assert_eq!(
+            state.payload,
+            Some(serde_json::json!({"source_thread_id": "source-1"}))
+        );
+
+        let mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        // Root-cause record landed on the mission...
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains(RESTART_FAILURE_REASON)),
+            "approach history must record the restart failure: {:?}",
+            mission.approach_history
+        );
+        // ...and the interrupted fire's dedup key was released so the
+        // re-fire is not dedup-suppressed.
+        assert!(!mission.has_processed_trigger("src:source-1"));
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retry_recovery_skips_restart_failed_thread_when_policy_disabled() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "no-retry",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.retry_policy = MissionRetryPolicy {
+            max_retries: 0,
+            ..MissionRetryPolicy::default()
+        };
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Failed;
+        thread.mark_failed_by_restart();
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty(),
+            "retry-disabled missions must not be re-armed"
+        );
+
+        // Nothing mutated: no retry marker, no approach entry — the sweep
+        // stays idempotent across restarts for missions it cannot arm.
+        let recovered = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&recovered.metadata).is_none());
+        let mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(mission.approach_history.is_empty());
         mgr.shutdown().await;
     }
 }
