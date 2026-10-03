@@ -50,6 +50,7 @@ FULL_VALIDATION_JOBS = (
     "architecture-boundaries",
     "rust-clippy-all",
     "cargo-deny",
+    "satellite-advisory-sweep",
 )
 WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
 EXPECTED_INCLUDES = [
@@ -418,6 +419,42 @@ def validate_cargo_deny_gate(merged: dict, errors: list[str]) -> None:
     for fragment in required_fragments:
         if fragment not in text:
             errors.append(f"cargo-deny-check.sh lost its {fragment} guard")
+
+
+def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
+    """The satellite sweep keeps the release audit reproducible (A5).
+
+    MR !1371 review: the audit's "every committed lockfile is clean" claim
+    was produced by an uncommitted evaluator. The committed sweep script
+    plus this wiring assertion make the claim a CI gate instead.
+    """
+    job = merged.get("satellite-advisory-sweep", {})
+    script = job.get("script", []) if isinstance(job, dict) else []
+    commands = script if isinstance(script, list) else [str(script)]
+    if not any(
+        isinstance(command, str) and "check-satellite-advisories.sh" in command
+        for command in commands
+    ):
+        errors.append(
+            "satellite-advisory-sweep must invoke "
+            ".gitlab/scripts/check-satellite-advisories.sh"
+        )
+
+    wrapper = ROOT / ".gitlab" / "scripts" / "check-satellite-advisories.sh"
+    try:
+        text = wrapper.read_text(encoding="utf-8")
+    except OSError as error:
+        errors.append(f"cannot read satellite advisory sweep: {error}")
+        return
+    required_fragments = (
+        "ls-files",
+        "ic/deny.toml",
+        "--workspace --all-features",
+        "check advisories",
+    )
+    for fragment in required_fragments:
+        if fragment not in text:
+            errors.append(f"check-satellite-advisories.sh lost its {fragment} guard")
 
 
 def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
@@ -884,6 +921,7 @@ def main() -> int:
     validate_test_shapes(merged_config, errors)
     validate_cavepony_version(merged_config, errors)
     validate_cargo_deny_gate(merged_config, errors)
+    validate_satellite_advisory_sweep(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
     validate_worker_versions(errors)
     validate_deliverables_manifest(merged_config, errors)
