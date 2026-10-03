@@ -517,6 +517,52 @@ impl EffectBridgeAdapter {
         })
     }
 
+    /// Answer `tool_info` for the `mission_*` capability functions (WI#295).
+    ///
+    /// `tool_info` only consults the tool registry, but engine threads can
+    /// also call these functions, which [`Self::handle_mission_call`]
+    /// dispatches and the registry never sees — so the registry's "No tool
+    /// named … is registered" was read as "this function does not exist".
+    /// Answers only while a mission manager is wired, the same condition under
+    /// which the functions dispatch; `None` defers to the registry tool.
+    async fn engine_capability_tool_info(
+        &self,
+        lookup_name: &str,
+        parameters: &serde_json::Value,
+    ) -> Option<Result<String, crate::error::Error>> {
+        if lookup_name != "tool_info" {
+            return None;
+        }
+        let requested = crate::tools::builtin::requested_tool_name(parameters)
+            .ok()?
+            .replace('-', "_");
+        let action = mission_action_defs()
+            .into_iter()
+            .find(|action| action.name == requested)?;
+        self.mission_manager.read().await.as_ref()?;
+
+        let failed = |reason: String| -> crate::error::Error {
+            crate::error::ToolError::ExecutionFailed {
+                name: lookup_name.to_string(),
+                reason,
+            }
+            .into()
+        };
+        let answer = crate::tools::builtin::engine_action_info(
+            &action.name,
+            &action.description,
+            action.parameters_schema,
+            MISSIONS_CAPABILITY,
+            parameters,
+        )
+        .map_err(|error| failed(error.to_string()))
+        .and_then(|info| {
+            serde_json::to_string_pretty(&info)
+                .map_err(|error| failed(format!("Failed to serialize result: {error}")))
+        });
+        Some(answer)
+    }
+
     /// Handle mission_* function calls. Returns None if not a mission call.
     async fn handle_mission_call(
         &self,
@@ -1080,14 +1126,22 @@ impl EffectBridgeAdapter {
             job_ctx.metadata["notify_user"] = serde_json::json!(context.user_id);
         }
 
-        let result = crate::tools::execute::execute_tool_with_safety(
-            &self.tools,
-            &self.safety,
-            lookup_name,
-            parameters.clone(),
-            &job_ctx,
-        )
-        .await;
+        let result = match self
+            .engine_capability_tool_info(lookup_name, &parameters)
+            .await
+        {
+            Some(answer) => answer,
+            None => {
+                crate::tools::execute::execute_tool_with_safety(
+                    &self.tools,
+                    &self.safety,
+                    lookup_name,
+                    parameters.clone(),
+                    &job_ctx,
+                )
+                .await
+            }
+        };
 
         let duration = start.elapsed();
 
@@ -1449,6 +1503,136 @@ fn extract_credential_name(error_msg: &str) -> Option<String> {
             .map(String::from);
     }
     None
+}
+
+/// Capability name the `mission_*` functions are registered under.
+pub(crate) const MISSIONS_CAPABILITY: &str = "missions";
+
+/// Definitions of the `mission_*` capability functions dispatched by
+/// [`EffectBridgeAdapter::handle_mission_call`]. The router registers them so
+/// threads receive leases, and `tool_info` describes them from the same list
+/// (WI#295). Use "mission_*" names only — descriptions mention "routine" so
+/// the LLM maps user intent correctly.
+pub(crate) fn mission_action_defs() -> Vec<ActionDef> {
+    vec![
+        ActionDef {
+            name: "mission_create".into(),
+            description: "Create a new mission (routine). Use when the user wants to set up a recurring task, scheduled check, or periodic routine. Results are delivered to the current channel by default.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short name for the mission/routine"},
+                    "goal": {"type": "string", "description": "What this mission should accomplish each run"},
+                    "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'system:<source>/<event_type>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events. To subscribe to engine lifecycle events, use 'system:<source>/<event_type>' (e.g. 'system:engine/thread_start')."},
+                    "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
+                    "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
+                    "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 30 when omitted."}
+                },
+                "required": ["name", "goal"]
+            }),
+            effects: vec![],
+            requires_approval: false,
+        },
+        ActionDef {
+            name: "mission_list".into(),
+            description: "List all missions and routines in the current project.".into(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![],
+            requires_approval: false,
+        },
+        ActionDef {
+            name: "mission_fire".into(),
+            description: "Manually trigger a mission or routine to run immediately.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Mission/routine ID to trigger"}
+                },
+                "required": ["id"]
+            }),
+            effects: vec![],
+            requires_approval: false,
+        },
+        ActionDef {
+            name: "mission_pause".into(),
+            description: "Pause a running mission or routine.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Mission/routine ID to pause"}
+                },
+                "required": ["id"]
+            }),
+            effects: vec![],
+            requires_approval: false,
+        },
+        ActionDef {
+            name: "mission_resume".into(),
+            description: "Resume a paused mission or routine.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Mission/routine ID to resume"}
+                },
+                "required": ["id"]
+            }),
+            effects: vec![],
+            requires_approval: false,
+        },
+        ActionDef {
+            name: "mission_update".into(),
+            description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, retry policy, success criteria, or steering focus.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Mission/routine ID to update"},
+                    "name": {"type": "string", "description": "New name"},
+                    "goal": {"type": "string", "description": "New goal"},
+                    "cadence": {"type": "string", "description": "New cadence: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
+                    "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
+                    "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
+                    "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
+                    "max_retries": {"type": "integer", "minimum": 0, "description": "Maximum retry attempts after an interrupted or failed fire (0 disables retries). Omit all retry parameters to leave the policy unchanged."},
+                    "initial_delay_secs": {"type": "integer", "minimum": 0, "description": "Initial retry backoff delay in seconds"},
+                    "backoff_multiplier": {"type": "number", "exclusiveMinimum": 0, "description": "Positive multiplier applied to each subsequent retry delay"},
+                    "max_delay_secs": {"type": "integer", "minimum": 0, "description": "Maximum retry backoff delay in seconds"},
+                    "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"},
+                    "current_focus": {"type": ["string", "null"], "description": "Steering focus for the next thread. Omit to leave unchanged; pass null to clear."}
+                },
+                "required": ["id"]
+            }),
+            effects: vec![],
+            requires_approval: false,
+        },
+        ActionDef {
+            name: "mission_history".into(),
+            description: "View the execution history of a mission or routine: recent fires with status, duration, and result summaries. Resolves Engine V2 mission names (as shown by mission_list).".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name of the mission/routine (from mission_list); alternatively pass its UUID via 'id'"},
+                    "id": {"type": "string", "description": "Mission/routine UUID (alternative to 'name')"},
+                    "limit": {"type": "integer", "description": "Max runs to return (default: 10, max: 50)"}
+                }
+            }),
+            effects: vec![],
+            requires_approval: false,
+        },
+        ActionDef {
+            name: "mission_delete".into(),
+            description: "Delete a mission or routine. Conversation insights retain a disabled tombstone (explicit resume re-enables); optionally purge their generated memory.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Mission/routine ID to delete"},
+                    "purge_insights": {"type": "boolean", "description": "Also remove generated insights for this mission's project/user. Only for conversation-insights. Source conversations and run audit remain. Default false."}
+                },
+                "required": ["id"]
+            }),
+            effects: vec![],
+            requires_approval: false,
+        },
+    ]
 }
 
 fn is_v1_only_tool(name: &str) -> bool {
@@ -4288,6 +4472,161 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 );
             }
             other => panic!("expected Effect error, got {other:?}"),
+        }
+    }
+
+    // ── WI#295: tool_info for engine capability functions ─────────────────
+
+    /// Stand-in for the `web_search` WASM tool (not loadable in unit tests).
+    struct StubWebSearch;
+
+    #[async_trait]
+    impl Tool for StubWebSearch {
+        fn name(&self) -> &str {
+            "web_search"
+        }
+
+        fn description(&self) -> &str {
+            "Search the web"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("results", std::time::Duration::ZERO))
+        }
+    }
+
+    /// Adapter over a registry holding `tool_info` and a stub `web_search`.
+    async fn adapter_with_tool_info() -> EffectBridgeAdapter {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(StubWebSearch)).await;
+        tools.register_tool_info();
+        EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&lunarwing_safety::SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        )
+    }
+
+    async fn run_tool_info(
+        adapter: &EffectBridgeAdapter,
+        params: serde_json::Value,
+    ) -> lunarwing_engine::ActionResult {
+        adapter
+            .execute_action(
+                "tool_info",
+                params,
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_tool_info")),
+            )
+            .await
+            .expect("tool_info returns an action result")
+    }
+
+    /// WI#295 acceptance: in an engine thread `tool_info` answers for a real
+    /// registry tool exactly as before, and for an effect-capability function
+    /// (`mission_create`) with its description and parameters instead of the
+    /// false "No tool named … is registered".
+    #[tokio::test]
+    async fn tool_info_describes_registry_tools_and_mission_functions() {
+        let adapter = adapter_with_tool_info().await;
+        let (_unused, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(mgr).await;
+
+        let web = run_tool_info(&adapter, serde_json::json!({"name": "web_search"})).await;
+        assert!(!web.is_error, "{:?}", web.output);
+        assert_eq!(web.output["name"], "web_search");
+        assert_eq!(web.output["parameters"], serde_json::json!(["query"]));
+        assert!(
+            web.output.get("kind").is_none(),
+            "registry tools keep the plain answer: {:?}",
+            web.output
+        );
+
+        let mission = run_tool_info(
+            &adapter,
+            serde_json::json!({"name": "mission_create", "detail": "schema"}),
+        )
+        .await;
+        assert!(!mission.is_error, "{:?}", mission.output);
+        let def = mission_action_defs()
+            .into_iter()
+            .find(|action| action.name == "mission_create")
+            .expect("mission_create definition");
+        assert_eq!(mission.output["name"], "mission_create");
+        assert_eq!(mission.output["description"], def.description.as_str());
+        assert_eq!(mission.output["kind"], "engine_capability");
+        assert_eq!(mission.output["capability"], MISSIONS_CAPABILITY);
+        assert_eq!(mission.output["callable"], true);
+        assert_eq!(
+            mission.output["schema"]["required"],
+            serde_json::json!(["name", "goal"])
+        );
+        let params = mission.output["parameters"]
+            .as_array()
+            .expect("parameter names");
+        for expected in ["name", "goal", "cadence"] {
+            assert!(
+                params.iter().any(|p| p.as_str() == Some(expected)),
+                "missing {expected}: {params:?}"
+            );
+        }
+        let note = mission.output["note"].as_str().expect("note");
+        assert!(note.contains("CodeAct"), "{note}");
+
+        // CodeAct's positional form resolves too.
+        let positional =
+            run_tool_info(&adapter, serde_json::json!({"_args": ["mission_history"]})).await;
+        assert!(!positional.is_error, "{:?}", positional.output);
+        assert_eq!(positional.output["name"], "mission_history");
+    }
+
+    /// Without a mission manager the functions do not dispatch, so tool_info
+    /// must not claim them: the truthful registry miss stands.
+    #[tokio::test]
+    async fn tool_info_does_not_claim_mission_functions_without_mission_manager() {
+        let adapter = adapter_with_tool_info().await;
+        let result = run_tool_info(&adapter, serde_json::json!({"name": "mission_create"})).await;
+        assert!(result.is_error, "{:?}", result.output);
+        let error = result.output["error"].as_str().expect("error text");
+        assert!(
+            error.contains("No tool named 'mission_create' is registered"),
+            "{error}"
+        );
+    }
+
+    /// Drift guard: every advertised mission definition is dispatched by
+    /// `handle_mission_call`, so tool_info never describes a function that
+    /// the adapter would not run.
+    #[tokio::test]
+    async fn every_mission_action_def_is_dispatched() {
+        let (adapter, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(mgr).await;
+        let defs = mission_action_defs();
+        assert_eq!(defs.len(), 8);
+        for def in defs {
+            assert!(
+                adapter
+                    .handle_mission_call(&def.name, &serde_json::json!({}), &mission_create_ctx())
+                    .await
+                    .is_some(),
+                "{} is advertised but not dispatched",
+                def.name
+            );
         }
     }
 }

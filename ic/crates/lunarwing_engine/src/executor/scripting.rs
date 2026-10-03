@@ -364,9 +364,12 @@ async fn execute_code_with_skills_and_action_limit(
     // Build context variables including persisted state from prior steps
     let (input_names, input_values) = build_context_inputs(thread, persisted_state);
 
-    // Collect known tool names so NameLookup can return callable stubs.
-    // Without this, `mission_list()` in code raises NameError because Monty
-    // resolves the name before calling it, and Undefined → NameError.
+    // Collect known tool names so NameLookup can return callable stubs for
+    // bare-name references (`f = web_search`, `globals()`). A direct call
+    // `name(...)` does not need this: Monty compiles an undefined callee into
+    // an external call that `preflight_action` matches against the thread's
+    // leases — which is how the `mission_*` capability functions, absent from
+    // `available_actions`, stay callable (WI#295).
     let active_leases = leases.active_for_thread(thread.id).await;
     let mut known_actions: std::collections::HashSet<String> = effects
         .available_actions(&active_leases)
