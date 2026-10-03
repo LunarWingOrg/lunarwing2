@@ -1,6 +1,6 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.1.5.0
 
-## Codename: UNKNOWN
+## Codename: Bungei Fukkō - "The Renaissance" - 文芸復興 (ぶんげいふっこう, bungei fukkō) (文芸復興)
 
 **Open TODOs (v2.1.5.0) — To be done before release**
 
@@ -32,7 +32,7 @@
    - Host-side `prepare_reproducible_build_test.py` re-run: 3/3 OK, including the untouched-failure contract.
    - No stale `2.0.20` pins remain outside historical docs (history/, release notes, prior bump entries). Whole-image reproducibility still gated by the CI candidate-vs-clean-rebuild check before promotion
 
-## Phase 2 — Features & Polish
+## Phase 2 — Features & Polish (for goals referencing work items, read comments on work items as well)
 
 3. [ ] audit all crates and ensure there are no security vulnerabilities - Last attempt REJECTED - see previous MR and comments on it for revision and re-attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1371 - please use previous MR as a REFERENCE going forward for this item
 8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
