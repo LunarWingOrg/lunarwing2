@@ -27,7 +27,10 @@ use crate::llm::provider::{
 
 use crate::llm::retry::is_retryable;
 use crate::llm::stream_telemetry::{StreamTelemetry, classify_stream_failure};
-use crate::llm::streaming::{FirstStreamItem, ProviderStreamRequest, replay_first, take_first};
+use crate::llm::streaming::{
+    FirstStreamItem, ProviderStreamRequest, empty_as_error, empty_stream_error, replay_first,
+    take_first,
+};
 
 /// Configuration for per-provider cooldown behavior.
 ///
@@ -339,10 +342,14 @@ impl FailoverProvider {
                 Ok(stream) => take_first(stream).await,
                 Err(error) => FirstStreamItem::Error(error),
             };
+            // WI#297: an empty-but-successful stream is a retryable failure,
+            // never a success — the next leg must fire.
+            let first = empty_as_error(first, provider.model_name());
 
             match first {
                 FirstStreamItem::Empty => {
-                    return Ok((provider_index, futures::stream::empty().boxed()));
+                    // Defensive: empty_as_error maps Empty to a retryable error.
+                    return Err(empty_stream_error(provider.model_name(), None));
                 }
                 FirstStreamItem::Chunk { first, rest } => {
                     self.last_used.store(provider_index, Ordering::Relaxed);
@@ -813,6 +820,167 @@ mod tests {
         ));
         assert_eq!(primary.plain_calls(), 1);
         assert_eq!(fallback.plain_calls(), 0);
+    }
+
+    fn done_only_stream(finish_reason: &str) -> StreamScript {
+        StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+            usage: None,
+            finish_reason: finish_reason.to_string(),
+        })])
+    }
+
+    // WI#297 regression: an empty-but-successful stream from the primary must
+    // fire the next failover leg instead of returning Ok(empty).
+    #[tokio::test]
+    async fn empty_stream_from_primary_fails_over() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::Items(vec![])],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![successful_stream("fallback delta")],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let chunks = failover
+            .complete_stream(make_request())
+            .await
+            .expect("fallback stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fallback stream should complete");
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("fallback delta".to_string()),
+                LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                    provider: "primary".to_string(),
+                    attempts: 1,
+                    reason: StreamFailureReason::Empty,
+                }),
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 1);
+    }
+
+    // WI#297: a content-free `Done` with a non-tool finish is also an empty
+    // completion and must fail over.
+    #[tokio::test]
+    async fn empty_done_first_from_primary_fails_over() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![done_only_stream("stop")],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![successful_stream("fallback delta")],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let chunks = failover
+            .complete_stream(make_request())
+            .await
+            .expect("fallback stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fallback stream should complete");
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("fallback delta".to_string()),
+                LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                    provider: "primary".to_string(),
+                    attempts: 1,
+                    reason: StreamFailureReason::Empty,
+                }),
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 1);
+    }
+
+    // WI#297: a `Done` with a tool finish is not an empty completion and must
+    // not trigger failover.
+    #[tokio::test]
+    async fn done_first_tool_finish_does_not_fail_over() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![done_only_stream("tool_calls")],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![successful_stream("fallback delta")],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let chunks = failover
+            .complete_stream(make_request())
+            .await
+            .expect("primary stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("primary stream should complete");
+
+        assert_eq!(
+            chunks,
+            vec![LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "tool_calls".to_string(),
+            }]
+        );
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 0);
+    }
+
+    // WI#297: when every leg answers empty, the failover returns an error
+    // instead of a successful empty stream.
+    #[tokio::test]
+    async fn all_providers_empty_returns_error_not_empty_stream() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::Items(vec![])],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![done_only_stream("length")],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let result = failover.complete_stream(make_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::InvalidResponse { provider, reason })
+                if provider == "fallback" && reason.contains("finish_reason: length")
+        ));
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 1);
     }
 
     #[tokio::test]
