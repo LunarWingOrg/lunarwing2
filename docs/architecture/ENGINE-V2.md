@@ -639,6 +639,24 @@ list, so a v2 thread that asks for a name which shadows both registries
 gets an honest "use mission_history" error instead of silently returning
 the v1 object's history for a same-named routine.
 
+The two registries stay separate by design (WI#278); what crossed the
+boundary was v1 vocabulary. In a v2 thread **every** `routine_*` tool now
+errors toward its mission equivalent with the call shape
+(`routine_create` → `mission_create(name, goal, cadence)` with the routine
+prompt as the goal and the schedule/`event:`/`webhook:` form as the cadence,
+`routine_list` → `mission_list()`, `routine_fire`/`pause`/`resume`/`delete`
+→ the `mission_*(id)` verbs, `routine_update` → `mission_update(id, ...)`,
+`routine_history` → `mission_history(name)`), instead of the slash-command
+advice the remaining v1-only tools (`cancel_job`, `build_software`) keep —
+bundled skills written for v1 (`routine-advisor`, `delegation`,
+`lunarwing-workflow-orchestrator`) still name the routine tools, so the
+redirect is what keeps a v2 agent on the working path. In the other
+direction, v1 `routine_list` appends the caller's Engine V2 missions
+(default project, own + shared, like `mission_list`) read-only under
+`engine_missions`, with a note that they are not routines and that
+`routine_history` shows their runs, so a v1 agent no longer reports a live
+`self-improvement` mission as missing.
+
 The `mission_*` functions are capability actions, not registry tools: the
 eight definitions live in `mission_action_defs()` beside
 `EffectBridgeAdapter::handle_mission_call` (the router registers them as the

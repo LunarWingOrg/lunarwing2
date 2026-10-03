@@ -6701,6 +6701,59 @@ pub(crate) mod tests {
         install_test_engine_state(None).await;
     }
 
+    /// WI#278: a v1 thread's `routine_list` reports live Engine V2 missions
+    /// read-only (the registry split used to hide them entirely), scoped like
+    /// `mission_list`.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn v1_routine_list_reports_engine_missions() {
+        use crate::tools::Tool;
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let project = lunarwing_engine::ProjectId::new();
+        seed_mission_with_runs(&store, project, "alice", "self-improvement", "improved").await;
+        let mut state = make_expected_test_state(store.clone());
+        state.default_project_id = project;
+        install_test_engine_state(Some(state)).await;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend = crate::db::libsql::LibSqlBackend::new_local(&temp.path().join("routines.db"))
+            .await
+            .expect("libsql backend");
+        crate::db::Database::run_migrations(&backend)
+            .await
+            .expect("migrations");
+        let tool = crate::tools::builtin::routine::RoutineListTool::new(Arc::new(backend));
+
+        let alice = tool
+            .execute(
+                serde_json::json!({}),
+                &crate::context::JobContext::with_user("alice", "list", "list routines"),
+            )
+            .await
+            .expect("routine_list");
+        assert_eq!(alice.result["count"], 0, "no v1 routines exist");
+        let mission = &alice.result["engine_missions"]["missions"][0];
+        assert_eq!(mission["name"], "self-improvement");
+        assert_eq!(mission["kind"], "engine_mission");
+        assert_eq!(mission["runs"], 2);
+
+        let mallory = tool
+            .execute(
+                serde_json::json!({}),
+                &crate::context::JobContext::with_user("mallory", "list", "list routines"),
+            )
+            .await
+            .expect("routine_list");
+        assert!(
+            mallory.result.get("engine_missions").is_none(),
+            "another user's missions stay hidden: {}",
+            mallory.result
+        );
+
+        install_test_engine_state(None).await;
+    }
+
     #[tokio::test]
     async fn mission_history_by_name_returns_none_when_engine_uninitialized() {
         let _guard = ENGINE_STATE_TEST_LOCK.lock().await;

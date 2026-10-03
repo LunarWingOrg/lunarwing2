@@ -887,16 +887,19 @@ impl EffectBridgeAdapter {
             });
         }
 
-        // routine_history answers against the v1 routines registry; in a v2
-        // thread the same name can shadow a live mission and return the wrong
-        // object's history, so it must error honestly toward mission_history
-        // instead of falling through to the v1 store (WI#269).
-        if is_routine_history_tool(lookup_name) {
+        // The routine_* tools address the v1 routines registry; in a v2 thread
+        // routines are Engine V2 missions, and a same-named v1 routine could
+        // shadow a live mission. Each one errors honestly toward its mission_*
+        // equivalent instead of the generic slash-command advice below
+        // (WI#269 for routine_history, WI#278 for the rest). Bundled skills
+        // written for v1 still name these tools, so the redirect is what keeps
+        // a v2 agent on the working path.
+        if let Some(equivalent) = v2_mission_equivalent(lookup_name) {
             return Err(EngineError::Effect {
                 reason: format!(
-                    "Tool '{}' is not available in engine v2. \
-                     Use mission_history instead (mission names come from mission_list).",
-                    action_name
+                    "Tool '{action_name}' is not available in engine v2: routines here are \
+                     Engine V2 missions. Use {equivalent} instead (mission ids and names \
+                     come from mission_list)."
                 ),
             });
         }
@@ -1653,12 +1656,28 @@ fn is_v1_only_tool(name: &str) -> bool {
     )
 }
 
-/// v1-only tools whose v2 replacement is a mission tool. The generic
-/// "use the slash command" error would misdirect here: the honest answer is
-/// `mission_history` for history and the other `mission_*` verbs for
-/// lifecycle (WI#269).
-fn is_routine_history_tool(name: &str) -> bool {
-    matches!(name, "routine_history" | "routine-history")
+/// The Engine V2 mission function, with its call shape, that replaces a v1
+/// `routine_*` tool. The generic "use the slash command" error would
+/// misdirect for these: the honest answer is the mission equivalent
+/// (WI#269 for history, WI#278 for the rest). `None` for other names.
+fn v2_mission_equivalent(name: &str) -> Option<&'static str> {
+    Some(match name.replace('-', "_").as_str() {
+        "routine_create" => {
+            "mission_create(name, goal, cadence) — the routine prompt is the goal; the cron \
+             schedule, 'event:<pattern>' or 'webhook:<path>' is the cadence"
+        }
+        "routine_list" => "mission_list()",
+        "routine_fire" => "mission_fire(id)",
+        "routine_pause" => "mission_pause(id)",
+        "routine_resume" => "mission_resume(id)",
+        "routine_update" => {
+            "mission_update(id, ...) — goal, cadence, notify_channels, retry policy, \
+             success_criteria"
+        }
+        "routine_delete" => "mission_delete(id)",
+        "routine_history" => "mission_history(name)",
+        _ => return None,
+    })
 }
 
 /// Auth management tools from v1 that are now kernel-internal in v2.
@@ -4475,6 +4494,61 @@ FINAL(echoed + "|" + http_result["error"])"#,
         }
     }
 
+    /// WI#278: every v1 routine tool in a v2 thread points at its mission_*
+    /// equivalent (bundled v1 skills still name these tools), never at the
+    /// slash-command advice reserved for the remaining v1-only tools.
+    #[tokio::test]
+    async fn v1_routine_tools_redirect_to_their_mission_equivalents_in_v2() {
+        let adapter = make_adapter();
+        for (tool, equivalent) in [
+            ("routine_create", "mission_create(name, goal, cadence)"),
+            ("routine_list", "mission_list()"),
+            ("routine_fire", "mission_fire(id)"),
+            ("routine_pause", "mission_pause(id)"),
+            ("routine_resume", "mission_resume(id)"),
+            ("routine_update", "mission_update(id, ...)"),
+            ("routine_delete", "mission_delete(id)"),
+            ("routine_history", "mission_history(name)"),
+            ("routine-create", "mission_create(name, goal, cadence)"),
+        ] {
+            let err = adapter
+                .execute_resolved_pending_action(
+                    tool,
+                    serde_json::json!({"name": "daily-digest"}),
+                    &lease(),
+                    &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_redirect")),
+                    true,
+                )
+                .await
+                .expect_err("v1 routine tools never run in v2 threads");
+            let EngineError::Effect { reason } = err else {
+                panic!("expected Effect error for {tool}, got {err:?}");
+            };
+            assert!(reason.contains(equivalent), "{tool}: {reason}");
+            assert!(
+                reason.contains("not available in engine v2"),
+                "{tool}: {reason}"
+            );
+            assert!(!reason.contains("slash command"), "{tool}: {reason}");
+        }
+
+        let err = adapter
+            .execute_resolved_pending_action(
+                "cancel_job",
+                serde_json::json!({}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_cancel")),
+                true,
+            )
+            .await
+            .expect_err("cancel_job stays v1-only");
+        assert!(
+            matches!(err, EngineError::Effect { ref reason } if reason.contains("slash command")),
+            "{err:?}"
+        );
+    }
+
+    // ── WI#295: tool_info for engine capability functions ─────────────────
     // ── WI#295: tool_info for engine capability functions ─────────────────
 
     /// Stand-in for the `web_search` WASM tool (not loadable in unit tests).
