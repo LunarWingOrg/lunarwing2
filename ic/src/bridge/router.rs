@@ -1874,6 +1874,18 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         Err(e) => debug!("engine v2: recover_pending_mission_retries failed: {e}"),
         _ => {}
     }
+    // WI#301: record + notify mission fires the restart lost (threads the
+    // sweep above stamped Failed-by-restart). Mark-only — no auto-refire.
+    match mission_manager.record_restart_interrupted_missions().await {
+        Ok(marked) if !marked.is_empty() => {
+            debug!(
+                "engine v2: recorded {} restart-interrupted mission fire(s)",
+                marked.len()
+            );
+        }
+        Err(e) => debug!("engine v2: record_restart_interrupted_missions failed: {e}"),
+        _ => {}
+    }
     if let Some(budget) = crate::channels::budget::budget_for_channel("darkirc") {
         mission_manager
             .set_channel_context(budget.channel, budget.prompt_guidance())
