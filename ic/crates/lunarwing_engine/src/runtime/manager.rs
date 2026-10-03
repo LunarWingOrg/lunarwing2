@@ -28,7 +28,9 @@ use crate::types::error::EngineError;
 use crate::types::event::{EventKind, ThreadEvent};
 use crate::types::message::{MessageRole, ThreadMessage};
 use crate::types::project::ProjectId;
-use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadState, ThreadType};
+use crate::types::thread::{
+    RESTART_FAILURE_REASON, Thread, ThreadConfig, ThreadId, ThreadState, ThreadType,
+};
 
 /// Handle to a running thread for checking results.
 struct RunningThread {
@@ -1138,6 +1140,57 @@ impl ThreadManager {
         Ok(resumed)
     }
 
+    /// Reconcile one persisted non-terminal thread after process startup.
+    ///
+    /// The current engine does not support mid-thread replay/resume, so any
+    /// thread left in a non-terminal state is marked failed-safe: Running or
+    /// Suspended threads holding a runtime checkpoint drop to Suspended for
+    /// checkpoint resume; everything else transitions to Failed carrying the
+    /// restart-failure marker (WI#301) so recovery/refire policy can
+    /// distinguish Failed-by-restart from Failed-by-error. Returns `true`
+    /// when the thread was recovered.
+    async fn fail_safe_recover_thread(&self, thread: &mut Thread) -> Result<bool, EngineError> {
+        const PENDING_APPROVAL_METADATA_KEY: &str = "pending_approval";
+        if thread.state.is_terminal() || thread.state == ThreadState::Completed {
+            return Ok(false);
+        }
+
+        if thread.state == ThreadState::Waiting
+            && thread.metadata.get(PENDING_APPROVAL_METADATA_KEY).is_some()
+        {
+            return Ok(false);
+        }
+
+        if thread
+            .metadata
+            .get(RUNTIME_CHECKPOINT_METADATA_KEY)
+            .is_some()
+            && matches!(thread.state, ThreadState::Running | ThreadState::Suspended)
+        {
+            if thread.state == ThreadState::Running {
+                thread.transition_to(
+                    ThreadState::Suspended,
+                    Some("engine restart; resumable from checkpoint".into()),
+                )?;
+            }
+            self.store.append_events(&thread.events).await?;
+            self.store.save_thread(thread).await?;
+            return Ok(true);
+        }
+
+        if thread
+            .transition_to(ThreadState::Failed, Some(RESTART_FAILURE_REASON.into()))
+            .is_ok()
+        {
+            thread.mark_failed_by_restart();
+            self.store.append_events(&thread.events).await?;
+            self.store.save_thread(thread).await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     /// Reconcile persisted non-terminal threads after process startup.
     ///
     /// The current engine does not support mid-thread replay/resume, so any
@@ -1146,50 +1199,32 @@ impl ThreadManager {
         &self,
         project_id: ProjectId,
     ) -> Result<Vec<ThreadId>, EngineError> {
-        const PENDING_APPROVAL_METADATA_KEY: &str = "pending_approval";
-        const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
         // System operation: recover all non-terminal threads regardless of user.
         let threads = self.store.list_all_threads(project_id).await?;
         let mut recovered = Vec::new();
 
         for mut thread in threads {
-            if thread.state.is_terminal() || thread.state == ThreadState::Completed {
-                continue;
-            }
-
-            if thread.state == ThreadState::Waiting
-                && thread.metadata.get(PENDING_APPROVAL_METADATA_KEY).is_some()
-            {
-                continue;
-            }
-
-            if thread
-                .metadata
-                .get(RUNTIME_CHECKPOINT_METADATA_KEY)
-                .is_some()
-                && matches!(thread.state, ThreadState::Running | ThreadState::Suspended)
-            {
-                if thread.state == ThreadState::Running {
-                    thread.transition_to(
-                        ThreadState::Suspended,
-                        Some("engine restart; resumable from checkpoint".into()),
-                    )?;
-                }
-                self.store.append_events(&thread.events).await?;
-                self.store.save_thread(&thread).await?;
+            if self.fail_safe_recover_thread(&mut thread).await? {
                 recovered.push(thread.id);
-                continue;
             }
+        }
 
-            if thread
-                .transition_to(
-                    ThreadState::Failed,
-                    Some("engine restart before thread completion".into()),
-                )
-                .is_ok()
-            {
-                self.store.append_events(&thread.events).await?;
-                self.store.save_thread(&thread).await?;
+        Ok(recovered)
+    }
+
+    /// Reconcile persisted non-terminal threads across ALL projects after
+    /// process startup (WI#301). Mission firing is global — cross-project
+    /// missions spawn threads under their own project — so a primary-only
+    /// sweep leaves those threads as permanent zombies: never failed-safe,
+    /// never resumed, never retried, misreporting as running across every
+    /// subsequent restart.
+    pub async fn recover_all_threads_global(&self) -> Result<Vec<ThreadId>, EngineError> {
+        // System operation: recover all non-terminal threads regardless of user.
+        let threads = self.store.list_all_threads_global().await?;
+        let mut recovered = Vec::new();
+
+        for mut thread in threads {
+            if self.fail_safe_recover_thread(&mut thread).await? {
                 recovered.push(thread.id);
             }
         }
@@ -1460,6 +1495,9 @@ mod tests {
                 .filter(|thread| thread.project_id == project_id)
                 .cloned()
                 .collect())
+        }
+        async fn list_all_threads_global(&self) -> Result<Vec<Thread>, EngineError> {
+            Ok(self.threads.read().await.values().cloned().collect())
         }
         async fn update_thread_state(
             &self,
@@ -2980,6 +3018,86 @@ mod tests {
         assert_eq!(recovered, vec![running.id]);
         let saved = store.load_thread(running.id).await.unwrap().unwrap();
         assert_eq!(saved.state, ThreadState::Suspended);
+    }
+
+    #[tokio::test]
+    async fn recover_project_threads_marks_swept_thread_failed_by_restart() {
+        let store = Arc::new(MockStore::new());
+        let project = ProjectId::new();
+
+        let mut running = Thread::new(
+            "interrupted by kill",
+            ThreadType::Mission,
+            project,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        running.transition_to(ThreadState::Running, None).unwrap();
+        store.save_thread(&running).await.unwrap();
+
+        let mgr = make_manager_with_store(MockLlm::text("ignored"), Arc::clone(&store));
+        let recovered = mgr.recover_project_threads(project).await.unwrap();
+
+        assert_eq!(recovered, vec![running.id]);
+        let saved = store.load_thread(running.id).await.unwrap().unwrap();
+        assert!(
+            saved.is_failed_by_restart(),
+            "swept thread must carry the Failed-by-restart marker (WI#301)"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_all_threads_global_recovers_cross_project_threads() {
+        let store = Arc::new(MockStore::new());
+        let primary = ProjectId::new();
+        let other = ProjectId::new();
+
+        // In-flight mission thread owned by a non-primary project: the
+        // pre-WI#301 primary-only sweep left it as a permanent zombie.
+        let mut cross = Thread::new(
+            "cross-project mission fire",
+            ThreadType::Mission,
+            other,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        cross.transition_to(ThreadState::Running, None).unwrap();
+        store.save_thread(&cross).await.unwrap();
+
+        let mut local = Thread::new(
+            "primary project fire",
+            ThreadType::Foreground,
+            primary,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        local.transition_to(ThreadState::Running, None).unwrap();
+        store.save_thread(&local).await.unwrap();
+
+        // Terminal threads stay untouched by the global sweep.
+        let mut terminal = Thread::new(
+            "already failed",
+            ThreadType::Mission,
+            other,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        terminal
+            .transition_to(ThreadState::Failed, Some("boom".into()))
+            .unwrap();
+        store.save_thread(&terminal).await.unwrap();
+
+        let mgr = make_manager_with_store(MockLlm::text("ignored"), Arc::clone(&store));
+        let recovered = mgr.recover_all_threads_global().await.unwrap();
+
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered.contains(&cross.id));
+        assert!(recovered.contains(&local.id));
+
+        let saved_cross = store.load_thread(cross.id).await.unwrap().unwrap();
+        assert!(saved_cross.is_failed_by_restart());
+        let saved_terminal = store.load_thread(terminal.id).await.unwrap().unwrap();
+        assert!(!saved_terminal.is_failed_by_restart());
     }
 
     #[tokio::test]
