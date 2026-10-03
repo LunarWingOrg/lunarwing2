@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.88"
 name = "html-to-markdown-rs"
-version = "3.15.1"
+version = "3.16.0"
 authors = ["Na'aman Hirschfeld <naaman@xberg.io>"]
 build = false
 exclude = [
@@ -213,6 +213,10 @@ path = "tests/hidden_elements_tag_open_state.rs"
 [[test]]
 name = "html5ever_repair_non_ascii_test"
 path = "tests/html5ever_repair_non_ascii_test.rs"
+
+[[test]]
+name = "inline_data_media_test"
+path = "tests/inline_data_media_test.rs"
 
 [[test]]
 name = "inline_delimiter_and_whitespace_regressions"
@@ -479,6 +483,134 @@ name = "issue_505_nested_newline_span_separator_test"
 path = "tests/issue_505_nested_newline_span_separator_test.rs"
 
 [[test]]
+name = "issue_509_head_metadata_decoding"
+path = "tests/issue_509_head_metadata_decoding.rs"
+
+[[test]]
+name = "issue_544_frontmatter_scalars"
+path = "tests/issue_544_frontmatter_scalars.rs"
+
+[[test]]
+name = "issue_545_legacy_named_references"
+path = "tests/issue_545_legacy_named_references.rs"
+
+[[test]]
+name = "issue_546_span_after_block_test"
+path = "tests/issue_546_span_after_block_test.rs"
+
+[[test]]
+name = "issue_552_frontmatter_scalar_types"
+path = "tests/issue_552_frontmatter_scalar_types.rs"
+
+[[test]]
+name = "issue_553_numeric_references_without_semicolon"
+path = "tests/issue_553_numeric_references_without_semicolon.rs"
+
+[[test]]
+name = "issue_554_tier1_unknown_reference_name"
+path = "tests/issue_554_tier1_unknown_reference_name.rs"
+
+[[test]]
+name = "issue_565_tier1_fallback_message"
+path = "tests/issue_565_tier1_fallback_message.rs"
+
+[[test]]
+name = "issue_570_text_after_block_test"
+path = "tests/issue_570_text_after_block_test.rs"
+
+[[test]]
+name = "issue_583_585_block_in_list_item_test"
+path = "tests/issue_583_585_block_in_list_item_test.rs"
+
+[[test]]
+name = "issue_584_rule_after_text_test"
+path = "tests/issue_584_rule_after_text_test.rs"
+
+[[test]]
+name = "issue_603_rule_between_inline_markers_test"
+path = "tests/issue_603_rule_between_inline_markers_test.rs"
+
+[[test]]
+name = "issue_604_nested_task_list_test"
+path = "tests/issue_604_nested_task_list_test.rs"
+
+[[test]]
+name = "issue_607_wrap_rule_line_test"
+path = "tests/issue_607_wrap_rule_line_test.rs"
+
+[[test]]
+name = "issue_613_614_616_wrap_structure_test"
+path = "tests/issue_613_614_616_wrap_structure_test.rs"
+
+[[test]]
+name = "issue_615_text_after_quote_in_wrapped_list_test"
+path = "tests/issue_615_text_after_quote_in_wrapped_list_test.rs"
+
+[[test]]
+name = "issue_628_rule_in_table_cell_test"
+path = "tests/issue_628_rule_in_table_cell_test.rs"
+
+[[test]]
+name = "issue_630_632_655_task_item_blocks_test"
+path = "tests/issue_630_632_655_task_item_blocks_test.rs"
+
+[[test]]
+name = "issue_633_list_item_starts_test"
+path = "tests/issue_633_list_item_starts_test.rs"
+
+[[test]]
+name = "issue_638_table_cell_escape_options_test"
+path = "tests/issue_638_table_cell_escape_options_test.rs"
+
+[[test]]
+name = "issue_640_653_654_headings_in_blocks_test"
+path = "tests/issue_640_653_654_headings_in_blocks_test.rs"
+
+[[test]]
+name = "issue_645_647_table_cell_blocks_test"
+path = "tests/issue_645_647_table_cell_blocks_test.rs"
+
+[[test]]
+name = "issue_646_br_only_table_cell_test"
+path = "tests/issue_646_br_only_table_cell_test.rs"
+
+[[test]]
+name = "issue_651_line_start_after_hard_break_test"
+path = "tests/issue_651_line_start_after_hard_break_test.rs"
+
+[[test]]
+name = "issue_659_662_ordered_list_starts_test"
+path = "tests/issue_659_662_ordered_list_starts_test.rs"
+
+[[test]]
+name = "issue_661_heading_text_escapes_test"
+path = "tests/issue_661_heading_text_escapes_test.rs"
+
+[[test]]
+name = "issue_666_670_list_separation_test"
+path = "tests/issue_666_670_list_separation_test.rs"
+
+[[test]]
+name = "issue_667_empty_nested_item_test"
+path = "tests/issue_667_empty_nested_item_test.rs"
+
+[[test]]
+name = "issue_679_tier1_top_level_break_test"
+path = "tests/issue_679_tier1_top_level_break_test.rs"
+
+[[test]]
+name = "issue_683_br_on_own_line"
+path = "tests/issue_683_br_on_own_line.rs"
+
+[[test]]
+name = "issue_692_block_container_in_table_cell_test"
+path = "tests/issue_692_block_container_in_table_cell_test.rs"
+
+[[test]]
+name = "issue_692_details_summary_menu_legend_test"
+path = "tests/issue_692_details_summary_menu_legend_test.rs"
+
+[[test]]
 name = "json_ld_script_extraction"
 path = "tests/json_ld_script_extraction.rs"
 
@@ -493,6 +625,10 @@ path = "tests/leading_block_whitespace_test.rs"
 [[test]]
 name = "list_item_block_child_indent_test"
 path = "tests/list_item_block_child_indent_test.rs"
+
+[[test]]
+name = "list_item_complexity"
+path = "tests/list_item_complexity.rs"
 
 [[test]]
 name = "list_item_unclosed_block_sibling_test"
@@ -585,6 +721,10 @@ path = "tests/table_prepass_observability_test.rs"
 [[test]]
 name = "tables_test"
 path = "tests/tables_test.rs"
+
+[[test]]
+name = "task_item_checkbox_before_block_test"
+path = "tests/task_item_checkbox_before_block_test.rs"
 
 [[test]]
 name = "test_custom_elements"
@@ -815,6 +955,10 @@ name = "whitespace_only_output_test"
 path = "tests/whitespace_only_output_test.rs"
 
 [[test]]
+name = "wrap_opener_run_complexity"
+path = "tests/wrap_opener_run_complexity.rs"
+
+[[test]]
 name = "xml_tables_test"
 path = "tests/xml_tables_test.rs"
 
@@ -868,7 +1012,7 @@ features = ["macros"]
 version = "1.13"
 
 [dependencies.rmcp]
-version = "3.4.1"
+version = "3.5.0"
 features = [
     "server",
     "macros",

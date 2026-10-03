@@ -84,8 +84,18 @@ pub fn handle_subscript(
 
     let mut content = String::with_capacity(32);
     let children = tag.children();
+    let (open, close) = resolve_script_delimiters(options, &options.sub_symbol, '~');
+    let marker_ctx = ctx.inline_buffer(output, !open.is_empty());
     for child_handle in children.top().iter() {
-        walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
+        walk_node(
+            child_handle,
+            parser,
+            &mut content,
+            options,
+            &marker_ctx,
+            depth + 1,
+            dom_ctx,
+        );
     }
 
     if ctx.in_code {
@@ -139,7 +149,6 @@ pub fn handle_subscript(
         return;
     }
 
-    let (open, close) = resolve_script_delimiters(options, &options.sub_symbol, '~');
     emit_wrapped_inline(
         output,
         &content,
@@ -184,8 +193,18 @@ pub fn handle_superscript(
 
     let mut content = String::with_capacity(32);
     let children = tag.children();
+    let (open, close) = resolve_script_delimiters(options, &options.sup_symbol, '^');
+    let marker_ctx = ctx.inline_buffer(output, !open.is_empty());
     for child_handle in children.top().iter() {
-        walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
+        walk_node(
+            child_handle,
+            parser,
+            &mut content,
+            options,
+            &marker_ctx,
+            depth + 1,
+            dom_ctx,
+        );
     }
 
     if ctx.in_code {
@@ -239,7 +258,6 @@ pub fn handle_superscript(
         return;
     }
 
-    let (open, close) = resolve_script_delimiters(options, &options.sup_symbol, '^');
     emit_wrapped_inline(
         output,
         &content,
@@ -292,8 +310,17 @@ pub fn handle_variable(
 
     let mut content = String::with_capacity(32);
     let children = tag.children();
+    let marker_ctx = ctx.inline_buffer(output, true);
     for child_handle in children.top().iter() {
-        walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
+        walk_node(
+            child_handle,
+            parser,
+            &mut content,
+            options,
+            &marker_ctx,
+            depth + 1,
+            dom_ctx,
+        );
     }
 
     let marker = options.strong_em_symbol.to_string();
@@ -349,8 +376,17 @@ pub fn handle_definition(
 
     let mut content = String::with_capacity(32);
     let children = tag.children();
+    let marker_ctx = ctx.inline_buffer(output, true);
     for child_handle in children.top().iter() {
-        walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
+        walk_node(
+            child_handle,
+            parser,
+            &mut content,
+            options,
+            &marker_ctx,
+            depth + 1,
+            dom_ctx,
+        );
     }
 
     let marker = options.strong_em_symbol.to_string();
@@ -395,8 +431,17 @@ pub fn handle_abbreviation(
 
     let mut content = String::with_capacity(32);
     let children = tag.children();
+    let abbr_ctx = ctx.inline_buffer(output, false);
     for child_handle in children.top().iter() {
-        walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
+        walk_node(
+            child_handle,
+            parser,
+            &mut content,
+            options,
+            &abbr_ctx,
+            depth + 1,
+            dom_ctx,
+        );
     }
 
     let (prefix, suffix, trimmed) = chomp_inline(&content);
@@ -428,7 +473,6 @@ pub fn handle_abbreviation(
 ///
 /// Processes span elements with special handling for:
 /// - OCR words (elements with class "`ocrx_word")`: adds space before if needed
-/// - Whitespace normalization in normalized mode: removes single newlines
 /// - Otherwise passes through content normally
 pub fn handle_span(
     node_handle: &NodeHandle,
@@ -459,20 +503,6 @@ pub fn handle_span(
         && !output.ends_with('\n')
     {
         output.push(' ');
-    }
-
-    if !ctx.in_code
-        && options.whitespace_mode == crate::options::WhitespaceMode::Normalized
-        && output.ends_with('\n')
-        && !output.ends_with("\n\n")
-        // ~keep issue #432: never strip an intentional Markdown hard break.
-        && !output.ends_with("  \n")
-        && !output.ends_with("\\\n")
-        // ~keep issue #431: never cross a block boundary — a table row ends with
-        // ~keep "|\n"; popping it would glue this span onto the delimiter row.
-        && !output.ends_with("|\n")
-    {
-        output.pop();
     }
 
     let children = tag.children();

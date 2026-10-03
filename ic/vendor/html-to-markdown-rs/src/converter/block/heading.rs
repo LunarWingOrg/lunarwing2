@@ -6,7 +6,7 @@
 //! - Metadata collection (headers, IDs)
 //! - Visitor callbacks for custom heading processing
 
-use crate::options::{ConversionOptions, HeadingStyle};
+use crate::options::{ConversionOptions, HeadingStyle, OutputFormat};
 use std::borrow::Cow;
 use tl::{NodeHandle, Parser};
 
@@ -38,13 +38,17 @@ pub fn handle(
     let needs_leading_sep = !ctx.in_table_cell
         && !ctx.in_list_item
         && !ctx.convert_as_inline
-        && ctx.blockquote_depth == 0
+        && (ctx.blockquote_depth == 0 || continues_a_line_in_quote(output, options, level))
         && !output.is_empty()
         && !output.ends_with("\n\n");
 
     if needs_leading_sep {
         crate::converter::trim_trailing_whitespace(output);
-        output.push_str("\n\n");
+        output.push_str(if ctx.blockquote_depth > 0 && output.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        });
     }
 
     let mut text = String::new();
@@ -98,6 +102,29 @@ pub fn handle(
         };
 
         if let Some(heading_text) = heading_output {
+            // ~keep A setext heading's text line after a line of the item would continue that
+            // ~keep line's paragraph, so it starts after a blank line (issue #635).
+            let line_start = output.rfind('\n').map_or(0, |pos| pos + 1);
+            if ctx.in_list_item
+                && options.heading_style == HeadingStyle::Underlined
+                && level <= 2
+                && line_start > 0
+                && output[line_start..].trim().is_empty()
+                && !output[..line_start - 1]
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                let indent = output.split_off(line_start);
+                output.push('\n');
+                output.push_str(&indent);
+            }
+            // ~keep In a cell the heading's text is a block of the cell's one line (issue #645).
+            if ctx.in_table_cell && !ctx.convert_as_inline && !ctx.in_code && !heading_text.is_empty() {
+                crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
+            }
             output.push_str(&heading_text);
         }
 
@@ -138,6 +165,23 @@ pub fn handle(
             }
         }
     }
+}
+
+/// Whether a heading in a quote's buffer would join the line before it: text on the same line,
+/// or, for an underlined heading, a line of text above it (issue #640).
+///
+/// ~keep In a quote, a heading after a block keeps the compact style of the quote (no blank
+/// ~keep line); only a line the heading would continue gets one. The underline of a heading
+/// ~keep before it ends that heading, so it is no text.
+fn continues_a_line_in_quote(output: &str, options: &ConversionOptions, level: usize) -> bool {
+    let Some(before_line_end) = output.strip_suffix('\n') else {
+        return true;
+    };
+    let line = before_line_end.rsplit('\n').next().unwrap_or_default().trim();
+    options.heading_style == HeadingStyle::Underlined
+        && level <= 2
+        && !line.is_empty()
+        && !crate::converter::utility::escaping::is_heading_underline(line)
 }
 
 /// Determine if a heading element should allow inline images.
@@ -226,16 +270,36 @@ pub fn push_heading(output: &mut String, ctx: &Context, options: &ConversionOpti
 
     match options.heading_style {
         HeadingStyle::Underlined => {
+            // ~keep The underline is a line of the item like every quote line, so it gets the
+            // ~keep item's continuation indent; at column 0 a `-` underline is a new list item
+            // ~keep (issue #635).
+            let underline_indent = if ctx.in_list_item {
+                crate::converter::list::utils::continuation_indent_string(ctx.list_indent_columns, options)
+            } else {
+                None
+            };
+            // ~keep The text is a paragraph line, so a list marker or other block opener at its
+            // ~keep start is escaped (issue #653).
             if level == 1 {
-                output.push_str(text);
+                output.push_str(&crate::converter::utility::escaping::escape_paragraph_start(text, b'='));
                 output.push('\n');
+                output.push_str(underline_indent.as_deref().unwrap_or_default());
                 for _ in 0..text.len() {
                     output.push('=');
                 }
             } else if level == 2 {
-                output.push_str(text);
+                output.push_str(&crate::converter::utility::escaping::escape_paragraph_start(text, b'-'));
                 output.push('\n');
-                for _ in 0..text.len() {
+                output.push_str(underline_indent.as_deref().unwrap_or_default());
+                // ~keep In a list item a lone `-` line reads as an empty item marker, both to
+                // ~keep `CommonMark` after a blank line and to the item's own marker checks, so the
+                // ~keep underline there has at least two dashes (issue #635).
+                let width = if ctx.in_list_item {
+                    text.len().max(2)
+                } else {
+                    text.len()
+                };
+                for _ in 0..width {
                     output.push('-');
                 }
             } else {
@@ -243,7 +307,7 @@ pub fn push_heading(output: &mut String, ctx: &Context, options: &ConversionOpti
                     output.push('#');
                 }
                 output.push(' ');
-                output.push_str(text);
+                output.push_str(&atx_heading_text(text, options));
             }
         }
         HeadingStyle::Atx => {
@@ -251,7 +315,7 @@ pub fn push_heading(output: &mut String, ctx: &Context, options: &ConversionOpti
                 output.push('#');
             }
             output.push(' ');
-            output.push_str(text);
+            output.push_str(&atx_heading_text(text, options));
         }
         HeadingStyle::AtxClosed => {
             for _ in 0..level {
@@ -266,6 +330,19 @@ pub fn push_heading(output: &mut String, ctx: &Context, options: &ConversionOpti
         }
     }
     output.push_str(heading_suffix);
+}
+
+/// The text of an ATX heading line that ends without a closing sequence of its own, with a `#` run
+/// at its end escaped when a parser would read it as that sequence (issue #661).
+///
+/// ~keep A Djot heading has no closing sequence, so its text stays as it is.
+fn atx_heading_text<'a>(text: &'a str, options: &ConversionOptions) -> Cow<'a, str> {
+    match crate::converter::utility::escaping::atx_closing_sequence_offset(text) {
+        Some(at) if options.output_format == OutputFormat::Markdown => {
+            Cow::Owned(format!("{}\\{}", &text[..at], &text[at..]))
+        }
+        _ => Cow::Borrowed(text),
+    }
 }
 
 /// Get continuation indent string for list items.

@@ -11,13 +11,13 @@
 )]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use crate::converter::dom_context::DomContext;
 use crate::converter::main_helpers::{
     collapse_excess_blank_lines, effective_max_depth, extract_head_metadata, format_metadata_frontmatter,
-    has_custom_element_tags, repair_with_html5ever, strip_trailing_backslash_breaks, trim_line_end_whitespace,
-    trim_trailing_whitespace,
+    has_custom_element_tags, is_inline_element, repair_with_html5ever, strip_trailing_backslash_breaks,
+    trim_line_end_whitespace, trim_trailing_whitespace,
 };
 use crate::converter::plain_text::extract_plain_text;
 use crate::converter::preprocessing_helpers::{has_inline_block_misnest, should_drop_for_preprocessing};
@@ -63,6 +63,7 @@ pub fn convert_html_impl(
     #[cfg(not(feature = "visitor"))] _visitor: Option<()>,
     structure_collector: Option<StructureCollectorHandle>,
     base_url: Option<std::rc::Rc<url::Url>>,
+    document_base_href: Option<&str>,
 ) -> Result<ConversionOutput> {
     let stripped = strip_script_and_style_tags(html);
     // ~keep Before anything else looks for tags: an HTML5 bogus comment (`<?php … ?>`,
@@ -173,6 +174,7 @@ pub fn convert_html_impl(
     let is_plain_text = options.output_format == OutputFormat::Plain;
 
     let wants_frontmatter = options.extract_metadata && !options.convert_as_inline;
+    let mut frontmatter = String::new();
     #[cfg(feature = "metadata")]
     let wants_document = metadata_collector
         .as_ref()
@@ -181,21 +183,14 @@ pub fn convert_html_impl(
     let wants_document = false;
 
     if wants_frontmatter || wants_document {
-        let mut head_metadata: Option<BTreeMap<String, String>> = None;
+        let head_metadata = extract_head_metadata(dom.children(), parser, options, document_base_href);
         #[cfg(feature = "metadata")]
         let mut document_lang: Option<String> = None;
         #[cfg(feature = "metadata")]
         let mut document_dir: Option<String> = None;
 
+        #[cfg(feature = "metadata")]
         for child_handle in dom.children() {
-            if head_metadata.is_none() {
-                let metadata = extract_head_metadata(child_handle, parser, options);
-                if !metadata.is_empty() {
-                    head_metadata = Some(metadata);
-                }
-            }
-
-            #[cfg(feature = "metadata")]
             if wants_document {
                 if let Some(tl::Node::Tag(tag)) = child_handle.get(parser) {
                     let tag_name = tag.name().as_utf8_str();
@@ -215,22 +210,16 @@ pub fn convert_html_impl(
             }
         }
 
-        if wants_frontmatter {
-            if let Some(metadata) = head_metadata.as_ref() {
-                if !metadata.is_empty() {
-                    let metadata_frontmatter = format_metadata_frontmatter(metadata);
-                    output.push_str(&metadata_frontmatter);
-                }
-            }
+        if wants_frontmatter && !head_metadata.is_empty() {
+            frontmatter = format_metadata_frontmatter(&head_metadata);
+            output.push_str(&frontmatter);
         }
 
         #[cfg(feature = "metadata")]
         if wants_document {
             if let Some(ref collector) = metadata_collector {
-                if let Some(metadata) = head_metadata {
-                    if !metadata.is_empty() {
-                        collector.borrow_mut().set_head_metadata(metadata);
-                    }
+                if !head_metadata.is_empty() {
+                    collector.borrow_mut().set_head_metadata(head_metadata);
                 }
                 if let Some(lang) = document_lang {
                     collector.borrow_mut().set_language(lang);
@@ -372,6 +361,11 @@ pub fn convert_html_impl(
         collapse_excess_blank_lines(&mut output);
         output
     };
+    let output = if options.wrap {
+        wrap_after_frontmatter(&output, &frontmatter, options)
+    } else {
+        output
+    };
     let (document, tables) = finish_structure_collector(structure_collector);
     tracing::debug!(
         target: "html_to_markdown::convert",
@@ -380,6 +374,22 @@ pub fn convert_html_impl(
         "render stage complete"
     );
     Ok((output, document, tables, depth_warning))
+}
+
+/// Wrap `output` at the wrap width, leaving the `frontmatter` it starts with as it is.
+///
+/// ~keep The frontmatter is YAML, not Markdown: wrapped, its closing `---` reads as a heading
+/// ~keep underline and its keys join into one line that YAML cannot parse. The plain-text output
+/// ~keep carries no frontmatter, so all of it is wrapped.
+fn wrap_after_frontmatter(output: &str, frontmatter: &str, options: &ConversionOptions) -> String {
+    let body_start = if output.starts_with(frontmatter) {
+        frontmatter.len()
+    } else {
+        0
+    };
+    let mut wrapped = output[..body_start].to_owned();
+    wrapped.push_str(&crate::wrapper::wrap_markdown(&output[body_start..], options));
+    wrapped
 }
 
 /// Consume the structure collector and return the [`DocumentStructure`] and extracted
@@ -396,11 +406,220 @@ fn finish_structure_collector(
     }
 }
 
+/// Separate `node` from a block that ends right before it, so it does not continue that block's
+/// last line (issues #570, #571, #583, #585).
+///
+/// ~keep Every block writes its own leading blank line, so a block after a list, a table or a
+/// ~keep rule is separated whatever that block ended with. Inline content writes none, so it
+/// ~keep continued the block's last line: a lazy continuation of the last list item, or one more
+/// ~keep table row. In HTML, inline content after a block starts a block of its own, also when
+/// ~keep the block sits at the end of an inline wrapper (`<span><ul>...</ul></span>text`).
+/// ~keep Inside a list item the same holds, and `CommonMark` keeps a block in the item only when
+/// ~keep its lines start at the item's content column: see `separate_in_list_item`.
+fn separate_from_block(
+    node: &tl::Node,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    options: &ConversionOptions,
+    ctx: &Context,
+    dom_ctx: &DomContext,
+) {
+    // ~keep A heading or a link label converts inline, but in a cell the text after a block needs the break.
+    if output.is_empty() || (ctx.convert_as_inline && !ctx.in_table_cell) || ctx.in_code {
+        return;
+    }
+    if ctx.in_table_cell {
+        // ~keep A block in a cell ends with no line end, so the cell break separates the inline
+        // ~keep content after it (issue #645). A line break is a break of its own, and without
+        // ~keep `br_in_tables` a text's leading space is the break. A kept HTML block is text in a cell.
+        // ~keep A nested table adds no break: a table moved out of the cell ends its own line, and the
+        // ~keep text after a table folded into the cell joins the table's last row.
+        if is_inline_content(node, node_handle, parser, dom_ctx)
+            && !is_line_break(node_handle, parser, dom_ctx)
+            && (options.br_in_tables || !starts_with_space(node))
+            && crate::converter::utility::siblings::previous_content_block(node_handle, parser, dom_ctx)
+                .is_some_and(|block| block != "table" && !ctx.preserve_tags.contains(block))
+        {
+            crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
+        }
+        return;
+    }
+    if ctx.in_list_item {
+        if !parent_is_list(node_handle, parser, dom_ctx) {
+            separate_in_list_item(node, node_handle, parser, output, options, ctx, dom_ctx);
+        }
+    } else if !ctx.in_list
+        && ends_with_block_line_end(output)
+        && !output.ends_with("\n\n")
+        && is_inline_content(node, node_handle, parser, dom_ctx)
+        && crate::converter::utility::siblings::previous_content_block(node_handle, parser, dom_ctx).is_some()
+    {
+        output.push('\n');
+    }
+}
+
+/// Start `node` at the list item's content column when it is a block after other content of the
+/// item, or inline content after a block of the item (issue #583).
+///
+/// ~keep `CommonMark` keeps a block inside a list item only when every line of it starts at the
+/// ~keep item's content column. A block after the item's text starts on a new line at that
+/// ~keep column; each block handler then writes the blank line it needs before itself. Inline
+/// ~keep content after a block starts a paragraph of its own: a blank line, then the column. A
+/// ~keep heading is one line that nothing continues, so after it the column alone does, and the
+/// ~keep list stays tight (spec example 300: `- ## Bar\n  baz`).
+/// ~keep Where the item is not open (a list between markers, issue #615), a quote or a
+/// ~keep list written within 3 columns of the innermost real item's content column (the start
+/// ~keep of the line when no item is real) is still a real block, and text after it on the next
+/// ~keep line continues its last paragraph lazily. That text gets the blank line and the real
+/// ~keep item's column. Further in, the block's lines are the paragraph's own text, and a blank
+/// ~keep line would split the paragraph between the markers.
+/// ~keep A list is left out as the block: it already starts its own line at its own column.
+/// ~keep A lone line break is not a block's last line: the block before it wrote nothing.
+fn separate_in_list_item(
+    node: &tl::Node,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    options: &ConversionOptions,
+    ctx: &Context,
+    dom_ctx: &DomContext,
+) {
+    // ~keep A block that preprocessing drops (a `<nav>`) writes nothing, so it gets no line.
+    let starts_block = match node {
+        tl::Node::Tag(tag) => dom_ctx.tag_info(node_handle.get_inner(), parser).is_some_and(|info| {
+            is_block_level_element(&info.name)
+                && !matches!(info.name.as_str(), "ul" | "ol" | "li")
+                && !should_drop_for_preprocessing(&info.name, tag, options)
+        }),
+        _ => false,
+    };
+    let indent =
+        crate::converter::list::utils::continuation_indent_string(ctx.list_indent_columns, options).unwrap_or_default();
+    let (blank_line, block_continues_lazily) = if starts_block {
+        // ~keep A hard break right before a block is dropped here too, since the line end
+        // ~keep written below would hide it from the dispatch strip in `walk_node`.
+        if options.newline_style == NewlineStyle::Backslash {
+            strip_trailing_backslash_breaks(output, ctx.block_content_start);
+        }
+        let line_start = output.rfind('\n').map_or(0, |pos| pos + 1);
+        let line = &output[line_start..];
+        let after_content = line.is_empty()
+            || (!line.trim().is_empty() && !crate::converter::list::utils::line_is_bare_list_marker(output));
+        if !after_content {
+            return;
+        }
+        (false, false)
+    } else if ends_with_block_line_end(output) && is_inline_content(node, node_handle, parser, dom_ctx) {
+        match crate::converter::utility::siblings::previous_content_block(node_handle, parser, dom_ctx) {
+            Some(block) => (
+                !matches!(block, "h1" | "h2" | "h3" | "h4" | "h5" | "h6"),
+                matches!(block, "blockquote" | "ul" | "ol"),
+            ),
+            None => return,
+        }
+    } else {
+        return;
+    };
+    let item_is_open = crate::converter::list::utils::item_is_open(output, &indent, ctx);
+    let separates =
+        item_is_open || (block_continues_lazily && crate::converter::list::utils::block_is_real(ctx, options));
+    if !separates {
+        return;
+    }
+    trim_trailing_whitespace(output);
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    if blank_line && !output.ends_with("\n\n") {
+        output.push('\n');
+    }
+    if item_is_open {
+        output.push_str(&indent);
+    } else if let Some(real_item_indent) =
+        crate::converter::list::utils::continuation_indent_string(ctx.real_item_columns, options)
+    {
+        output.push_str(&real_item_indent);
+    }
+}
+
+/// Whether the last line of `output` holds nothing but indentation and list markers.
+///
+/// ~keep The backward scan stops at the first other character, so a long line costs nothing.
+fn at_line_start(output: &str) -> bool {
+    let before =
+        output.trim_end_matches(|c: char| c.is_ascii_digit() || matches!(c, ' ' | '\t' | '-' | '*' | '+' | '.' | ')'));
+    (before.is_empty() || before.ends_with('\n'))
+        && (output[before.len()..].trim().is_empty() || crate::converter::list::utils::line_is_bare_list_marker(output))
+}
+
+/// Whether `output` ends with a line end that a block wrote: a lone line break is not one, since
+/// the block before it wrote nothing.
+fn ends_with_block_line_end(output: &str) -> bool {
+    output.len() >= 2 && output.ends_with('\n')
+}
+
+/// Whether `node` is inline content: non-blank text or an inline element.
+fn is_inline_content(node: &tl::Node, node_handle: &tl::NodeHandle, parser: &tl::Parser, dom_ctx: &DomContext) -> bool {
+    match node {
+        tl::Node::Raw(bytes) => !bytes.as_utf8_str().trim().is_empty(),
+        tl::Node::Tag(_) => dom_ctx
+            .tag_info(node_handle.get_inner(), parser)
+            .is_some_and(|info| is_inline_element(&info.name)),
+        tl::Node::Comment(_) => false,
+    }
+}
+
+/// Whether `node` is text that starts with whitespace.
+fn starts_with_space(node: &tl::Node) -> bool {
+    matches!(node, tl::Node::Raw(bytes) if bytes.as_bytes().first().is_some_and(u8::is_ascii_whitespace))
+}
+
+/// Whether `node_handle` is a `<br>` element.
+fn is_line_break(node_handle: &tl::NodeHandle, parser: &tl::Parser, dom_ctx: &DomContext) -> bool {
+    dom_ctx
+        .tag_info(node_handle.get_inner(), parser)
+        .is_some_and(|info| info.name == "br")
+}
+
+/// Whether the parent of `node_handle` is a `<ul>` or `<ol>` (text or items between list items).
+fn parent_is_list(node_handle: &tl::NodeHandle, parser: &tl::Parser, dom_ctx: &DomContext) -> bool {
+    dom_ctx
+        .parent_of(node_handle.get_inner())
+        .and_then(|parent_id| dom_ctx.tag_info(parent_id, parser))
+        .is_some_and(|info| matches!(info.name.as_str(), "ul" | "ol"))
+}
+
 /// Recursively walk DOM nodes and convert to Markdown.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub fn walk_node(
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    options: &ConversionOptions,
+    ctx: &Context,
+    depth: usize,
+    dom_ctx: &DomContext,
+) {
+    ctx.last_list.enter(output);
+    // ~keep In a task item, the render of each node before the first content reports whether
+    // ~keep it wrote, so the item knows which element wrote first (issue #650).
+    match ctx.first_writer.as_ref().filter(|first_writer| first_writer.is_open()) {
+        Some(first_writer) => {
+            let start = output.len();
+            convert_node(node_handle, parser, output, options, ctx, depth, dom_ctx);
+            first_writer.record(*node_handle, parser, output.get(start..));
+        }
+        None => convert_node(node_handle, parser, output, options, ctx, depth, dom_ctx),
+    }
+    ctx.last_list.leave(output);
+}
+
+/// Convert one DOM node and its children to Markdown.
 #[allow(clippy::only_used_in_recursion)]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 #[allow(clippy::cast_possible_truncation)]
-pub fn walk_node(
+fn convert_node(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
@@ -415,6 +634,8 @@ pub fn walk_node(
         ctx.depth_limit_reached.set(true);
         return;
     }
+
+    separate_from_block(node, node_handle, parser, output, options, ctx, dom_ctx);
 
     match node {
         tl::Node::Raw(bytes) => {
@@ -485,8 +706,19 @@ pub fn walk_node(
             }
 
             if ctx.preserve_tags.contains(tag_name.as_ref()) {
+                let starts_line = at_line_start(output);
                 let html = serialize_tag_to_html(node_handle, parser);
                 output.push_str(&html);
+                // ~keep An HTML block ends only at a blank line, so one follows it (issue #655).
+                if starts_line
+                    && !ctx.in_marker_text()
+                    && !ctx.in_table_cell
+                    && !ctx.convert_as_inline
+                    && !ctx.in_code
+                    && crate::converter::utility::escaping::opens_block(html.trim_start())
+                {
+                    output.push_str("\n\n");
+                }
                 return;
             }
 
@@ -621,7 +853,7 @@ pub fn walk_node(
                     crate::converter::block::div::handle(node_handle, parser, output, options, ctx, depth, dom_ctx);
                 }
 
-                // ~keep `<address>`/`<search>`/`<hgroup>`/`<center>` are content-bearing block
+                // ~keep `<address>`/`<search>`/`<hgroup>`/`<center>`/`<dialog>` are content-bearing block
                 // ~keep containers with no formatting of their own beyond block separation --
                 // ~keep the same shape as `<div>`. Routing them through `div::handle` (rather
                 // ~keep than a semantic-module dispatcher) matters for Tier-1 parity: Tier-1's
@@ -631,7 +863,7 @@ pub fn walk_node(
                 // ~keep `div::handle` here -- instead of `semantic::sectioning::handle`, which
                 // ~keep has no table-cell/list-item special-casing -- keeps both tiers in
                 // ~keep agreement. See `tests/tier1_address_block_separator_test.rs`.
-                "address" | "search" | "hgroup" | "center" => {
+                "address" | "search" | "hgroup" | "center" | "dialog" => {
                     crate::converter::block::div::handle(node_handle, parser, output, options, ctx, depth, dom_ctx);
                 }
                 "caption" => crate::converter::block::table::handle_caption(
@@ -723,7 +955,7 @@ pub fn walk_node(
                     );
                 }
 
-                "details" | "summary" | "dialog" | "menu" => {
+                "details" | "summary" | "menu" => {
                     crate::converter::semantic::dispatch_semantic_handler(
                         &tag_name,
                         node_handle,

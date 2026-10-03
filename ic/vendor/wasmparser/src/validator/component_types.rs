@@ -12,6 +12,7 @@ use crate::validator::types::{
 };
 use crate::{AbstractHeapType, CompositeInnerType, HeapType, RefType, StorageType, prelude::*};
 use crate::{Error, FuncType, MemoryType, PrimitiveValType, Result, TableType, ValType};
+use alloc::borrow::Cow;
 use core::fmt;
 use core::ops::Index;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -776,6 +777,13 @@ impl ComponentValType {
             ComponentValType::Type(ty) => types[*ty].lower_gc(types, abi, options, offset, core),
         }
     }
+
+    pub(crate) fn eq(a: &Self, b: &Self, types: &TypeList, offset: u64) -> bool {
+        let cx = SubtypeCx::new(types, types);
+        let ab = cx.component_val_type(&a, &b, offset).is_ok();
+        let ba = cx.component_val_type(&b, &a, offset).is_ok();
+        ab && ba
+    }
 }
 
 trait ModuleImportKey {
@@ -1047,6 +1055,16 @@ pub struct ComponentItem {
     pub external_id: Option<String>,
 }
 
+impl ComponentItem {
+    /// Returns the full name of the interface in `implements`, if specified.
+    pub fn full_implements(&self) -> Option<Cow<'_, str>> {
+        Some(crate::with_version_suffix(
+            self.implements.as_ref()?,
+            self.version_suffix.as_deref(),
+        ))
+    }
+}
+
 impl TypeData for ComponentType {
     type Id = ComponentTypeId;
     const IS_CORE_SUB_TYPE: bool = false;
@@ -1209,10 +1227,10 @@ pub(crate) enum LoweredFuncType {
 }
 
 impl LoweredFuncType {
-    pub(crate) fn intern(self, types: &mut TypeAlloc, offset: u64) -> CoreTypeId {
+    pub(crate) fn intern(self, types: &mut TypeAlloc, offset: u64) -> Result<CoreTypeId> {
         match self {
             LoweredFuncType::New(ty) => types.intern_func_type(ty, offset),
-            LoweredFuncType::Existing(id) => id,
+            LoweredFuncType::Existing(id) => Ok(id),
         }
     }
 }
@@ -1306,7 +1324,7 @@ impl ComponentFuncType {
             (Abi::Lower, Concurrency::Async { callback: _ }) => {
                 if self.result.is_some() {
                     sig.params.max = MAX_LOWERED_TYPES;
-                    sig.params.assert_push(ValType::I32);
+                    sig.params.assert_push(ptr_size.core_type());
                     options.require_memory(offset)?;
                 }
                 sig.results.assert_push(ValType::I32);
@@ -3961,13 +3979,27 @@ impl<'a> SubtypeCx<'a> {
                 }
             }
             (EntityType::Global(_), b) => bail!(offset, "expected {}, found global", b.desc()),
-            (EntityType::Tag(a), EntityType::Tag(b)) => self.core_func_type(*a, *b, offset),
+            // Tag matching has to match both ways, see
+            // https://webassembly.github.io/spec/core/valid/matching.html#tag-types
+            (EntityType::Tag(a), EntityType::Tag(b)) => {
+                self.core_func_type(*b, *a, offset)?;
+                self.core_func_type(*a, *b, offset)
+            }
             (EntityType::Tag(_), b) => bail!(offset, "expected {}, found tag", b.desc()),
         }
     }
 
     pub(crate) fn table_type(a: &TableType, b: &TableType, offset: u64) -> Result<()> {
-        if a.element_type != b.element_type {
+        let TableType {
+            element_type,
+            shared,
+            table64,
+
+            // checked via `limits_match!` below.
+            initial: _,
+            maximum: _,
+        } = *a;
+        if element_type != b.element_type {
             bail!(
                 offset,
                 "expected table element type {}, found {}",
@@ -3975,8 +4007,11 @@ impl<'a> SubtypeCx<'a> {
                 a.element_type,
             )
         }
-        if a.shared != b.shared {
+        if shared != b.shared {
             bail!(offset, "mismatch in the shared flag for tables")
+        }
+        if table64 != b.table64 {
+            bail!(offset, "mismatch in index type used for tables")
         }
         if limits_match!(a, b) {
             Ok(())
@@ -3986,10 +4021,21 @@ impl<'a> SubtypeCx<'a> {
     }
 
     pub(crate) fn memory_type(a: &MemoryType, b: &MemoryType, offset: u64) -> Result<()> {
-        if a.shared != b.shared {
+        let MemoryType {
+            shared,
+            memory64,
+
+            // checked manually below to handle the default
+            page_size_log2: _,
+
+            // checked via `limits_match!` below.
+            initial: _,
+            maximum: _,
+        } = *a;
+        if shared != b.shared {
             bail!(offset, "mismatch in the shared flag for memories")
         }
-        if a.memory64 != b.memory64 {
+        if memory64 != b.memory64 {
             bail!(offset, "mismatch in index type used for memories")
         }
         if a.page_size_log2() != b.page_size_log2() {
@@ -4262,8 +4308,7 @@ impl<'a> SubtypeCx<'a> {
                     created: actual, ..
                 },
             ) => {
-                let prev = type_map.insert(expected, actual);
-                assert!(prev.is_none());
+                type_map.insert(expected, actual);
             }
             (ComponentEntityType::Instance(expected), ComponentEntityType::Instance(actual)) => {
                 let actual = &self.a[actual];

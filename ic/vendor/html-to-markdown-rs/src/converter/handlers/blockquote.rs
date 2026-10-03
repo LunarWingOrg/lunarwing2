@@ -55,8 +55,31 @@ pub fn handle_blockquote(
         .map(std::borrow::Cow::into_owned)
         .map(|value| ctx.resolve_url(&value).unwrap_or(value));
 
+    // ~keep The quote writes the indent of the list items around it on each of its lines, so its
+    // ~keep children start at column 0 of a container of their own, outside the item: a list in
+    // ~keep the quote counts only its own markers, and every line of an item in the quote gets
+    // ~keep the same column (issue #654). Bold or italic around the item holding the quote does
+    // ~keep not make a list in the quote text: its items open. Under the markers of a caption, a
+    // ~keep summary or an inline wrapper that does not count in the inline depth (a highlight, a
+    // ~keep deletion, a subscript), a list in the quote is still judged by where its markers fall,
+    // ~keep as outside it.
+    // ~keep A quote right after an opening inline marker starts on that marker's line, so its
+    // ~keep first line is text between the markers.
+    let first_line_follows_markers = output.is_empty() && ctx.in_marker_text();
     let blockquote_ctx = Context {
         blockquote_depth: ctx.blockquote_depth + 1,
+        in_list_item: false,
+        in_list: false,
+        list_indent_columns: 0,
+        real_item_columns: 0,
+        inline_buffer_column: None,
+        inline_depth: if first_line_follows_markers {
+            ctx.inline_depth
+        } else {
+            0
+        },
+        quote_starts_after_markers: first_line_follows_markers,
+        item_lines: crate::converter::list::utils::ItemLineScan::new_item(),
         ..ctx.clone()
     };
 
@@ -125,16 +148,38 @@ pub fn handle_blockquote(
         }
     }
 
+    if ctx.in_table_cell {
+        // ~keep A cell holds one line, so a quote in it sheds its marker as a heading, a list and
+        // ~keep a code block do there, and the cell break separates it like any block (issue #647).
+        if !trimmed_content.is_empty() {
+            // ~keep In code the quote keeps the line ends it writes there, which the cell folds.
+            if ctx.in_code {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            } else {
+                crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
+            }
+            output.push_str(trimmed_content);
+            if ctx.in_code {
+                output.push('\n');
+            }
+            if let Some(url) = cite {
+                crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
+                output.push_str("— <");
+                output.push_str(&url);
+                output.push('>');
+            }
+        }
+        return;
+    }
+
     if !trimmed_content.is_empty() {
-        // ~keep Only the outermost blockquote call writes into the real document buffer —
-        // a nested blockquote's own call writes into its parent's local `content`
-        // scratch buffer instead (see above), which the parent then re-prefixes with
-        // its own "> " on the way out. Applying the list continuation indent at every
-        // nesting level would stack it once per level; restricting it to
-        // `blockquote_depth == 0` applies it exactly once, at the boundary where this
-        // content actually reaches the list item's own text.
-        let list_indent = if ctx.in_list_item && ctx.blockquote_depth == 0 {
-            crate::converter::list::utils::continuation_indent_string(ctx.list_depth, ctx.list_indent_columns, options)
+        let list_indent = if ctx.in_list_item {
+            crate::converter::list::utils::continuation_indent_string(
+                crate::converter::list::utils::block_columns(ctx, options),
+                options,
+            )
         } else {
             None
         };
@@ -142,7 +187,7 @@ pub fn handle_blockquote(
         // ~keep A blockquote that continues already-started list item content needs its
         // first quoted line indented too; one that is the item's first content
         // instead sits right after the marker, which already provides that column
-        // (see `block/paragraph.rs::add_list_continuation_indent` for the identical
+        // (see `block/paragraph.rs`'s `is_list_continuation` for the identical
         // first-line distinction, applied there to paragraphs only).
         // A plain suffix check like `output.ends_with("* ")` also matches the closing
         // "**"/"*" of `<strong>`/`<em>` immediately followed by a migrated trailing
@@ -158,7 +203,14 @@ pub fn handle_blockquote(
             && !output.is_empty()
             && !crate::converter::list::utils::line_is_bare_list_marker(output);
 
-        if ctx.blockquote_depth > 0 {
+        // ~keep The quote is the item's first content: it starts on the marker line. A line
+        // ~keep break after the marker left the item empty and the quote outside it, also in a
+        // ~keep quote that holds the list (issue #617).
+        let at_bare_marker =
+            ctx.in_list_item && crate::converter::list::utils::trim_whitespace_after_bare_marker(output);
+        if at_bare_marker {
+            // ~keep Nothing to separate: the marker line is the quote's first line.
+        } else if ctx.blockquote_depth > 0 && !ctx.in_list_item {
             if !output.is_empty() {
                 while output.ends_with('\n') {
                     output.truncate(output.len() - 1);
@@ -166,6 +218,11 @@ pub fn handle_blockquote(
                 output.push_str("\n\n");
             }
         } else if !output.is_empty() {
+            // ~keep The quote writes its own list indent below, so the one `walk_node` put at
+            // ~keep the start of this line inside a list item goes first.
+            if ctx.in_list_item {
+                crate::converter::trim_trailing_whitespace(output);
+            }
             if output.ends_with("\n\n") {
                 output.truncate(output.len() - 1);
             } else if ctx.in_list_item {
@@ -225,7 +282,7 @@ pub fn handle_blockquote(
 
         // ~keep Add trailing newlines only when appropriate for proper spacing
         // (matching paragraph conditional logic for CommonMark compliance)
-        if !ctx.convert_as_inline && !ctx.in_table_cell && !ctx.in_list_item {
+        if !ctx.convert_as_inline && !ctx.in_list_item {
             while output.ends_with('\n') {
                 output.truncate(output.len() - 1);
             }

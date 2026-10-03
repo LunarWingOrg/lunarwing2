@@ -53,6 +53,7 @@ mod component;
 #[cfg(feature = "component-model")]
 pub mod component_types;
 mod core;
+mod custom;
 mod func;
 #[cfg(feature = "component-model")]
 pub mod names;
@@ -64,6 +65,7 @@ use self::component::*;
 pub use self::core::ValidatorResources;
 use self::core::*;
 use self::types::{TypeAlloc, Types, TypesRef};
+pub use custom::*;
 pub use func::{FuncToValidate, FuncValidator, FuncValidatorAllocations};
 pub use operators::Frame;
 
@@ -152,6 +154,10 @@ pub struct Validator {
     /// The top of the stack is the current component state.
     #[cfg(feature = "component-model")]
     components: Vec<ComponentState>,
+
+    /// The total number of modules and components, including nested ones,
+    /// seen so far in this validation.
+    modules_and_components: usize,
 
     /// Enabled WebAssembly feature flags, dictating what's valid and what
     /// isn't.
@@ -465,6 +471,7 @@ impl Validator {
             module,
             #[cfg(feature = "component-model")]
             components,
+            modules_and_components,
         } = self;
 
         assert!(
@@ -476,6 +483,7 @@ impl Validator {
         assert!(components.is_empty());
 
         *state = State::default();
+        *modules_and_components = 0;
     }
 
     /// Get this validator's unique identifier.
@@ -667,6 +675,15 @@ impl Validator {
                 return Err(Error::new("wasm version header out of order", range.start));
             }
         }
+
+        check_max(
+            self.modules_and_components,
+            1,
+            MAX_WASM_MODULES_AND_COMPONENTS,
+            "modules and components",
+            range.start,
+        )?;
+        self.modules_and_components += 1;
 
         self.state = match encoding {
             Encoding::Module => {
@@ -956,6 +973,13 @@ impl Validator {
         self.state.ensure_module("data count", offset)?;
 
         let state = self.module.as_mut().unwrap();
+
+        if !self.features.bulk_memory() {
+            bail!(
+                offset,
+                "data count section requires the bulk-memory proposal"
+            );
+        }
 
         if count > MAX_WASM_DATA_SEGMENTS as u32 {
             return Err(Error::new(
