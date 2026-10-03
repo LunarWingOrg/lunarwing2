@@ -82,7 +82,10 @@ fn is_empty_completion(finish_reason: &str) -> bool {
 /// Convert empty-stream outcomes into retryable errors so retry and failover
 /// layers treat a 200-with-nothing response as a transient failure instead of
 /// a successful empty stream (WI#297).
-pub(crate) fn empty_as_error(first: FirstStreamItem<'_>, provider: &str) -> FirstStreamItem<'_> {
+pub(crate) fn empty_as_error<'a>(
+    first: FirstStreamItem<'a>,
+    provider: &str,
+) -> FirstStreamItem<'a> {
     match first {
         FirstStreamItem::Empty => FirstStreamItem::Error(empty_stream_error(provider, None)),
         FirstStreamItem::Chunk { first, rest } => match first {
@@ -182,7 +185,7 @@ mod tests {
                     FirstStreamItem::Error(LlmError::InvalidResponse { provider, reason })
                         if provider == "primary"
                             && reason.contains(EMPTY_STREAM_MARKER)
-                            && reason.contains(finish_reason.as_str())
+                            && reason.contains(finish_reason)
                 ),
                 "finish_reason {finish_reason:?} should map to an empty-stream error"
             );

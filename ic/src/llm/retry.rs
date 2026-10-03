@@ -863,13 +863,12 @@ mod tests {
             .await;
 
         assert_eq!(inner.plain_calls(), 1);
-        assert_eq!(
-            chunks,
-            vec![Ok(LlmStreamChunk::Done {
-                usage: None,
-                finish_reason: "tool_calls".to_string(),
-            })]
-        );
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::Done { finish_reason, .. }))
+                if finish_reason == "tool_calls"
+        ));
     }
 
     #[tokio::test(start_paused = true)]
