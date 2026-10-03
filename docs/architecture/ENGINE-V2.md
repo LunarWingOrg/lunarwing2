@@ -580,6 +580,31 @@ failed thread's metadata lets the post-restart sweep enumerate persisted
 missions (even ones missing from the in-memory active index) and re-arm the
 re-fire with a fresh full backoff window (work items #188 and goal #38).
 
+A graceful daemon shutdown while a mission thread is mid-run follows the same
+path (WI#276). The outcome watcher waits with
+`ThreadManager::wait_thread_or_stop`, which keeps the thread registered in
+the running set while it runs — the old watcher joined first, taking the
+handle out of that set, so its shutdown stop never landed, the run was
+dropped mid-await at runtime teardown, and the fire vanished without a
+record, retry, or dedup-key release. On `MissionManager::shutdown` the
+watcher now stops the run and gives it 3 s (inside the manager's 5 s
+shutdown wait) to settle; the real outcome is then processed exactly as in
+normal operation — for a stopped run that records `INTERRUPTED:
+signal-stopped mid-run`, releases the trigger dedup key, and persists the
+retry marker on the now-terminal thread. The in-process retry timer is
+skipped (it would die with the daemon); the post-restart sweep re-arms the
+retry from the marker, with the usual fresh backoff and attempt accounting
+(an interrupted fire costs one retry attempt). A run that finished during
+the shutdown window has its real outcome recorded too. A run that does not
+settle within the grace is left untouched — writing then would race its own
+final save — and stays with restart recovery for in-flight threads (WI#301).
+Because the watcher no longer hides the thread, stop requests, injected
+messages, and `is_running` now reach watched mission threads during normal
+operation as well — so pausing or retiring conversation-insights now really
+stops its workers. A thread stopped while its mission is no longer Active is
+recorded as `STOPPED: mission <status> while the thread ran` and is neither
+retried nor reported as an error.
+
 `MissionManager::ensure_learning_missions()` provisions two baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.

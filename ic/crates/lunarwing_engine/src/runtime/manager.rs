@@ -31,6 +31,12 @@ use crate::types::project::ProjectId;
 use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadState, ThreadType};
 
 /// Handle to a running thread for checking results.
+/// Poll interval of [`ThreadManager::wait_thread_or_stop`] while a run is live.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Poll interval while a stopped run settles inside its grace period.
+const STOP_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 struct RunningThread {
     signal_tx: SignalSender,
     /// Cancels this run's in-flight LLM or tool work. A fresh token is created
@@ -1048,6 +1054,49 @@ impl ThreadManager {
         running
             .get(&thread_id)
             .is_some_and(|rt| !rt.handle.is_finished())
+    }
+
+    /// Wait for a thread to finish without taking it out of the running set,
+    /// stopping it if `shutdown` fires first (WI#276).
+    ///
+    /// [`Self::join_thread`] removes the handle for the whole wait, so a
+    /// later stop request, [`Self::is_running`] or an injected message can no
+    /// longer reach the thread — the mission watcher's shutdown stop never
+    /// landed for exactly that reason. Here the thread stays registered while
+    /// it runs (the router's turn-wait pattern) and is joined only once
+    /// finished. On `shutdown` the run is stopped and given `grace` to settle
+    /// so its real outcome can still be recorded. `Ok(None)`: it did not
+    /// settle in time; it stays registered and nothing is joined, so no
+    /// caller writes over a still-running thread.
+    pub async fn wait_thread_or_stop(
+        &self,
+        thread_id: ThreadId,
+        shutdown: &CancellationToken,
+        grace: std::time::Duration,
+    ) -> Result<Option<ThreadOutcome>, EngineError> {
+        let mut poll = tokio::time::interval(WAIT_POLL);
+        while self.is_running(thread_id).await {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    // A run that finished meanwhile is no longer registered;
+                    // its stop request is a harmless miss.
+                    let _ = self.request_stop(thread_id).await;
+                    let settled = tokio::time::timeout(grace, async {
+                        while self.is_running(thread_id).await {
+                            tokio::time::sleep(STOP_SETTLE_POLL).await;
+                        }
+                    })
+                    .await;
+                    if settled.is_err() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                _ = poll.tick() => {}
+            }
+        }
+        self.join_thread(thread_id).await.map(Some)
     }
 
     /// Wait for a thread to finish and return its outcome.
@@ -2377,6 +2426,113 @@ mod tests {
         fn model_name(&self) -> &str {
             "acquisition-pending"
         }
+    }
+
+    // ── WI#276: waiting without hiding the thread from stop requests ──
+
+    fn pending_acquisition_llm() -> (Arc<AcquisitionPendingLlm>, Arc<Notify>) {
+        let opened = Arc::new(Notify::new());
+        let llm = Arc::new(AcquisitionPendingLlm {
+            opened: Arc::clone(&opened),
+            dropped: Arc::new(AtomicBool::new(false)),
+        });
+        (llm, opened)
+    }
+
+    async fn spawn_mission_thread(mgr: &ThreadManager) -> ThreadId {
+        mgr.spawn_thread(
+            "mission goal",
+            ThreadType::Mission,
+            ProjectId::new(),
+            ThreadConfig::default(),
+            None,
+            "user",
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The thread stays registered (and so stoppable) while it is waited on —
+    /// `join_thread` took it out of the running set, which is why the mission
+    /// watcher's shutdown stop never landed — and on shutdown the stop lands
+    /// and the real `Stopped` outcome comes back.
+    #[tokio::test]
+    async fn wait_thread_or_stop_keeps_thread_registered_and_stops_on_shutdown() {
+        let (llm, opened) = pending_acquisition_llm();
+        let mgr = Arc::new(make_manager(llm));
+        let tid = spawn_mission_thread(&mgr).await;
+        opened.notified().await;
+
+        let shutdown = CancellationToken::new();
+        let waiter = {
+            let mgr = Arc::clone(&mgr);
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                mgr.wait_thread_or_stop(tid, &shutdown, Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            mgr.is_running(tid).await,
+            "waiting must not take the handle out of the running set"
+        );
+
+        shutdown.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the shutdown stop must land promptly")
+            .expect("waiter task")
+            .expect("wait result");
+        assert!(
+            matches!(outcome, Some(ThreadOutcome::Stopped)),
+            "{outcome:?}"
+        );
+        assert!(!mgr.is_running(tid).await);
+    }
+
+    #[tokio::test]
+    async fn wait_thread_or_stop_returns_the_outcome_of_a_finished_run() {
+        let mgr = make_manager(MockLlm::text("done"));
+        let tid = spawn_mission_thread(&mgr).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            mgr.wait_thread_or_stop(tid, &CancellationToken::new(), Duration::from_secs(1)),
+        )
+        .await
+        .expect("run finishes")
+        .expect("wait result");
+        assert!(
+            matches!(outcome, Some(ThreadOutcome::Completed { .. })),
+            "{outcome:?}"
+        );
+    }
+
+    /// A run that has not settled when the grace runs out is not joined: the
+    /// waiter reports `None` and leaves the outcome for its owner, so no
+    /// caller writes over a still-live thread.
+    #[tokio::test]
+    async fn wait_thread_or_stop_does_not_join_an_unsettled_run() {
+        let (llm, opened) = pending_acquisition_llm();
+        let mgr = make_manager(llm);
+        let tid = spawn_mission_thread(&mgr).await;
+        opened.notified().await;
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let outcome = mgr
+            .wait_thread_or_stop(tid, &shutdown, Duration::ZERO)
+            .await
+            .expect("wait result");
+        assert!(outcome.is_none(), "{outcome:?}");
+
+        // The stop request still lands, and the outcome was left in place: a
+        // waiter that had joined would make this a ThreadNotFound.
+        let stopped = tokio::time::timeout(Duration::from_secs(2), mgr.join_thread(tid))
+            .await
+            .expect("the stop request still lands")
+            .expect("outcome left for the owner");
+        assert!(matches!(stopped, ThreadOutcome::Stopped), "{stopped:?}");
     }
 
     #[tokio::test]
