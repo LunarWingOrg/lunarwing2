@@ -46,6 +46,9 @@ pub struct EffectBridgeAdapter {
     rate_limiter: RateLimiter,
     /// Mission manager for handling mission_* function calls.
     mission_manager: RwLock<Option<Arc<lunarwing_engine::MissionManager>>>,
+    /// Lease manager: lets `tool_info` report `callable` for engine
+    /// capability functions from the thread's real leases (WI#295).
+    lease_manager: RwLock<Option<Arc<lunarwing_engine::LeaseManager>>>,
     /// Centralized auth manager for pre-flight credential checks.
     auth_manager: RwLock<Option<Arc<AuthManager>>>,
     /// Coordination gate: silently blocks all tool execution for agents
@@ -68,6 +71,7 @@ impl EffectBridgeAdapter {
             settings_store: RwLock::new(None),
             rate_limiter: RateLimiter::new(),
             mission_manager: RwLock::new(None),
+            lease_manager: RwLock::new(None),
             auth_manager: RwLock::new(None),
             coordination_gate: RwLock::new(None),
         }
@@ -136,6 +140,13 @@ impl EffectBridgeAdapter {
     /// Get the mission manager if available.
     pub async fn mission_manager(&self) -> Option<Arc<lunarwing_engine::MissionManager>> {
         self.mission_manager.read().await.clone()
+    }
+
+    /// Set the lease manager (called after engine init) so `tool_info` can
+    /// answer `callable` for engine capability functions from the thread's
+    /// real leases instead of assuming every thread holds them (WI#295).
+    pub async fn set_lease_manager(&self, mgr: Arc<lunarwing_engine::LeaseManager>) {
+        *self.lease_manager.write().await = Some(mgr);
     }
 
     fn gate_paused(
@@ -525,10 +536,14 @@ impl EffectBridgeAdapter {
     /// named … is registered" was read as "this function does not exist".
     /// Answers only while a mission manager is wired, the same condition under
     /// which the functions dispatch; `None` defers to the registry tool.
+    /// `callable` reflects the calling thread's real leases when a lease
+    /// manager is wired, so a thread without the missions lease is not told
+    /// it can call the function.
     async fn engine_capability_tool_info(
         &self,
         lookup_name: &str,
         parameters: &serde_json::Value,
+        context: &ThreadExecutionContext,
     ) -> Option<Result<String, crate::error::Error>> {
         if lookup_name != "tool_info" {
             return None;
@@ -540,6 +555,19 @@ impl EffectBridgeAdapter {
             .into_iter()
             .find(|action| action.name == requested)?;
         self.mission_manager.read().await.as_ref()?;
+
+        // The single lease passed to execute_action covers `tool_info`, not
+        // the requested mission function, so `callable` must be looked up in
+        // the thread's full active lease set (adversarial-review R8). Without
+        // a lease manager the lookup is impossible; the mission-manager gate
+        // above already limits answering to where the functions dispatch.
+        let callable = match self.lease_manager.read().await.as_ref() {
+            Some(leases) => leases
+                .find_lease_for_action(context.thread_id, &action.name)
+                .await
+                .is_some(),
+            None => true,
+        };
 
         let failed = |reason: String| -> crate::error::Error {
             crate::error::ToolError::ExecutionFailed {
@@ -553,6 +581,7 @@ impl EffectBridgeAdapter {
             &action.description,
             action.parameters_schema,
             MISSIONS_CAPABILITY,
+            callable,
             parameters,
         )
         .map_err(|error| failed(error.to_string()))
@@ -1127,7 +1156,7 @@ impl EffectBridgeAdapter {
         }
 
         let result = match self
-            .engine_capability_tool_info(lookup_name, &parameters)
+            .engine_capability_tool_info(lookup_name, &parameters, context)
             .await
         {
             Some(answer) => answer,
@@ -4607,6 +4636,71 @@ FINAL(echoed + "|" + http_result["error"])"#,
             error.contains("No tool named 'mission_create' is registered"),
             "{error}"
         );
+    }
+
+    /// Adversarial-review R8: `callable` must come from the calling thread's
+    /// real leases. A thread whose leases cover only `tool_info` gets
+    /// `callable: false` and a note that does not promise a working call;
+    /// granting the missions lease flips both.
+    #[tokio::test]
+    async fn tool_info_callable_reflects_thread_leases() {
+        let adapter = adapter_with_tool_info().await;
+        let (_unused, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(mgr).await;
+        let leases = Arc::new(lunarwing_engine::LeaseManager::new());
+        adapter.set_lease_manager(Arc::clone(&leases)).await;
+
+        let thread_id = lunarwing_engine::ThreadId::new();
+        leases
+            .grant(
+                thread_id,
+                "tools",
+                lunarwing_engine::GrantedActions::Specific(vec!["tool_info".to_string()]),
+                None,
+                None,
+            )
+            .await
+            .expect("tools lease");
+
+        let unleased = adapter
+            .execute_action(
+                "tool_info",
+                serde_json::json!({"name": "mission_create"}),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_tool_info")),
+            )
+            .await
+            .expect("tool_info returns an action result");
+        assert!(!unleased.is_error, "{:?}", unleased.output);
+        assert_eq!(unleased.output["callable"], false);
+        let note = unleased.output["note"].as_str().expect("note");
+        assert!(note.contains("no lease"), "{note}");
+        assert!(!note.contains("directly callable"), "{note}");
+
+        leases
+            .grant(
+                thread_id,
+                MISSIONS_CAPABILITY,
+                lunarwing_engine::GrantedActions::Specific(vec!["mission_create".to_string()]),
+                None,
+                None,
+            )
+            .await
+            .expect("missions lease");
+
+        let leased = adapter
+            .execute_action(
+                "tool_info",
+                serde_json::json!({"name": "mission_create"}),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_tool_info")),
+            )
+            .await
+            .expect("tool_info returns an action result");
+        assert!(!leased.is_error, "{:?}", leased.output);
+        assert_eq!(leased.output["callable"], true);
+        let note = leased.output["note"].as_str().expect("note");
+        assert!(note.contains("directly callable"), "{note}");
     }
 
     /// Drift guard: every advertised mission definition is dispatched by

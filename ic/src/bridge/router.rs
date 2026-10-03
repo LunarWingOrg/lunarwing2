@@ -1608,7 +1608,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         effect_adapter.clone(),
         store_dyn.clone(),
         Arc::new(capabilities),
-        leases,
+        Arc::clone(&leases),
         policy,
     );
 
@@ -1681,6 +1681,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     effect_adapter
         .set_mission_manager(Arc::clone(&mission_manager))
         .await;
+    // Let tool_info report `callable` for mission capability functions from
+    // the thread's real leases rather than assuming every thread holds them
+    // (WI#295 adversarial-review R8).
+    effect_adapter.set_lease_manager(leases).await;
     agent
         .set_mission_manager(Arc::clone(&mission_manager))
         .await;

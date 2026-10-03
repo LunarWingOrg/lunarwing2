@@ -656,8 +656,12 @@ not exist" (WI#295; the false negative behind closed-invalid WI#281), the
 bridge answers `tool_info` for a mission function itself, from the same
 definitions: the usual name/description/parameters (plus summary or schema by
 `detail`) and `kind: "engine_capability"`, `capability: "missions"`,
-`registered_tool: false`, `callable: true`, and a note on calling it from
-CodeAct. It does so only while a mission manager is wired — the condition
+`registered_tool: false`, `callable`, and a note on calling it from
+CodeAct. `callable` is answered from the calling thread's real leases (the
+router wires the engine's `LeaseManager` into the adapter): a thread holding
+no lease for the function gets `callable: false` and a note saying the call
+would fail with a lease error, rather than a blanket `true`. The bridge
+answers only while a mission manager is wired — the condition
 under which the functions dispatch — and v1 keeps the truthful registry miss.
 `tool_info` also accepts CodeAct's positional form (`tool_info("x")`) and
 resolves legacy hyphen/underscore tool aliases like dispatch does.

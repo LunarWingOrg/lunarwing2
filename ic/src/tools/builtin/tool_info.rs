@@ -130,13 +130,15 @@ fn render_info(
 /// `tool_info` answer for an Engine V2 capability function that is not a
 /// registry tool, such as `mission_create` (WI#295). Same shape as a registry
 /// answer at every detail level, plus fields saying what it is and how to call
-/// it. Only call this where the function really is callable — the effect
-/// bridge does, for engine threads with the capability wired.
+/// it. `callable` must come from the calling thread's real leases — the
+/// effect bridge passes `false` when the thread holds no lease for the
+/// function, so the note does not promise a call that would fail.
 pub(crate) fn engine_action_info(
     name: &str,
     description: &str,
     schema: serde_json::Value,
     capability: &str,
+    callable: bool,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, ToolError> {
     let detail = ToolInfoDetail::parse(params)?;
@@ -144,12 +146,20 @@ pub(crate) fn engine_action_info(
     info["kind"] = serde_json::json!("engine_capability");
     info["capability"] = serde_json::json!(capability);
     info["registered_tool"] = serde_json::json!(false);
-    info["callable"] = serde_json::json!(true);
-    info["note"] = serde_json::json!(format!(
-        "'{name}' is not a registry tool, so the tool registry and tool_list do not show \
-         it. It is an Engine V2 '{capability}' capability function, directly callable \
-         from this thread's CodeAct code, e.g. `await {name}(...)`."
-    ));
+    info["callable"] = serde_json::json!(callable);
+    info["note"] = serde_json::json!(if callable {
+        format!(
+            "'{name}' is not a registry tool, so the tool registry and tool_list do not show \
+             it. It is an Engine V2 '{capability}' capability function, directly callable \
+             from this thread's CodeAct code, e.g. `await {name}(...)`."
+        )
+    } else {
+        format!(
+            "'{name}' is not a registry tool, so the tool registry and tool_list do not show \
+             it. It is an Engine V2 '{capability}' capability function, but this thread holds \
+             no lease for it, so calling it from CodeAct would fail with a lease error."
+        )
+    });
     Ok(info)
 }
 
@@ -428,6 +438,7 @@ mod tests {
             "Create a mission",
             schema.clone(),
             "missions",
+            true,
             &serde_json::json!({"name": "mission_create"}),
         )
         .expect("names detail");
@@ -443,11 +454,29 @@ mod tests {
         assert!(note.contains("CodeAct"), "{note}");
         assert!(names.get("schema").is_none());
 
+        // Without a lease the note must not promise a callable function
+        // (adversarial-review R8: the answer used to claim callable: true
+        // without consulting the thread's leases).
+        let unleased = engine_action_info(
+            "mission_create",
+            "Create a mission",
+            schema.clone(),
+            "missions",
+            false,
+            &serde_json::json!({"name": "mission_create"}),
+        )
+        .expect("unleased answer");
+        assert_eq!(unleased["callable"], false);
+        let note = unleased["note"].as_str().expect("note");
+        assert!(note.contains("no lease"), "{note}");
+        assert!(!note.contains("directly callable"), "{note}");
+
         let summary = engine_action_info(
             "mission_create",
             "Create a mission",
             schema.clone(),
             "missions",
+            true,
             &serde_json::json!({"name": "mission_create", "detail": "summary"}),
         )
         .expect("summary detail");
@@ -461,6 +490,7 @@ mod tests {
             "Create a mission",
             schema.clone(),
             "missions",
+            true,
             &serde_json::json!({"name": "mission_create", "detail": "schema"}),
         )
         .expect("schema detail");
@@ -472,6 +502,7 @@ mod tests {
                 "Create a mission",
                 schema,
                 "missions",
+                true,
                 &serde_json::json!({"name": "mission_create", "detail": "verbose"}),
             ),
             Err(ToolError::InvalidParameters(_))
