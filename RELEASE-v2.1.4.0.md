@@ -333,8 +333,8 @@ previous compatibility baseline.
   the latest migration with the migration chain's `ironclaw-agent-v1` alias
   removed
 
-> Fire bent the steel,<br>
-> thread drew the plates tight together,<br>
+> Fire bent the steel,
+> thread drew the plates tight together,
 > now the helm takes form. 兜
 
 ## Compatibility
@@ -1328,8 +1328,8 @@ first, launchd a distant third).
 
 ---
 
-> What the helmet guards<br>
-> was never the metal's strength:<br>
+> What the helmet guards
+> was never the metal's strength:
 > the one who keeps watch.
 
 兜
