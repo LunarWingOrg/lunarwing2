@@ -1810,8 +1810,12 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         .track_notification_task(notification_task)
         .await;
 
-    if let Err(e) = thread_manager.recover_project_threads(project_id).await {
-        debug!("engine v2: recover_project_threads failed: {e}");
+    // WI#301: sweep is global — cross-project missions spawn threads under
+    // their own project, and a primary-only sweep left those as permanent
+    // zombies. The restart-failure marker stamped here is what
+    // recover_pending_mission_retries (below) re-arms from.
+    if let Err(e) = thread_manager.recover_all_threads_global().await {
+        debug!("engine v2: recover_all_threads_global failed: {e}");
     }
     if let Err(e) = mission_manager.bootstrap_project(project_id).await {
         debug!("engine v2: bootstrap_project failed: {e}");
