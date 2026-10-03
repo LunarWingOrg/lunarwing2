@@ -310,6 +310,15 @@ fn default_model_recovery_total_attempts() -> u32 {
 
 // ── Thread ──────────────────────────────────────────────────
 
+/// Metadata key marking a thread that the post-restart recovery sweep
+/// transitioned to `Failed` (WI#301). The marker distinguishes
+/// Failed-by-restart from Failed-by-error so recovery/refire policy can
+/// treat an interrupted fire differently from an ordinary failure.
+pub const RESTART_FAILURE_METADATA_KEY: &str = "restart_failure";
+
+/// State-change reason recorded on threads the post-restart sweep fails.
+pub const RESTART_FAILURE_REASON: &str = "engine restart before thread completion";
+
 /// A thread — the unit of work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
@@ -490,6 +499,27 @@ impl Thread {
     pub fn add_internal_message(&mut self, message: ThreadMessage) {
         self.internal_messages.push(message);
         self.updated_at = Utc::now();
+    }
+
+    /// Stamp the restart-failure marker (WI#301). Called by the post-restart
+    /// recovery sweep when it transitions a non-terminal thread to `Failed`.
+    pub fn mark_failed_by_restart(&mut self) {
+        let marker = serde_json::json!({
+            "at": Utc::now().to_rfc3339(),
+            "reason": RESTART_FAILURE_REASON,
+        });
+        if let serde_json::Value::Object(map) = &mut self.metadata {
+            map.insert(RESTART_FAILURE_METADATA_KEY.to_string(), marker);
+        } else {
+            self.metadata = serde_json::json!({ RESTART_FAILURE_METADATA_KEY: marker });
+        }
+    }
+
+    /// Whether this thread was failed by the post-restart recovery sweep
+    /// (Failed-by-restart) rather than by an execution error (WI#301).
+    pub fn is_failed_by_restart(&self) -> bool {
+        self.state == ThreadState::Failed
+            && self.metadata.get(RESTART_FAILURE_METADATA_KEY).is_some()
     }
 }
 
@@ -700,5 +730,26 @@ mod tests {
             parsed.channel_context.as_deref(),
             Some("- keep replies under 400 bytes")
         );
+    }
+
+    #[test]
+    fn restart_failure_marker_distinguishes_restart_from_error_failure() {
+        let mut thread = make_thread();
+        thread
+            .transition_to(ThreadState::Running, None)
+            .expect("created -> running");
+        assert!(!thread.is_failed_by_restart());
+
+        thread
+            .transition_to(ThreadState::Failed, Some(RESTART_FAILURE_REASON.into()))
+            .expect("running -> failed");
+        // Failed by error: terminal failure without the marker.
+        assert!(!thread.is_failed_by_restart());
+
+        thread.mark_failed_by_restart();
+        assert!(thread.is_failed_by_restart());
+        let marker = &thread.metadata[RESTART_FAILURE_METADATA_KEY];
+        assert_eq!(marker["reason"], RESTART_FAILURE_REASON);
+        assert!(marker["at"].is_string());
     }
 }
