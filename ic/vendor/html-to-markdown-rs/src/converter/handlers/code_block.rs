@@ -253,7 +253,7 @@ pub fn handle_pre(
 
         if let Some(class_attr) = tag.attributes().get("class") {
             if let Some(class_bytes) = class_attr {
-                let class_str = crate::text::decode_html_entities_cow(&class_bytes.as_utf8_str()).into_owned();
+                let class_str = crate::text::decode_attribute_value_cow(&class_bytes.as_utf8_str()).into_owned();
                 for cls in class_str.split_whitespace() {
                     if let Some(stripped) = cls.strip_prefix("language-") {
                         lang = Some(String::from(stripped));
@@ -274,7 +274,7 @@ pub fn handle_pre(
                         if let Some(class_attr) = child_tag.attributes().get("class") {
                             if let Some(class_bytes) = class_attr {
                                 let class_str =
-                                    crate::text::decode_html_entities_cow(&class_bytes.as_utf8_str()).into_owned();
+                                    crate::text::decode_attribute_value_cow(&class_bytes.as_utf8_str()).into_owned();
                                 for cls in class_str.split_whitespace() {
                                     if let Some(stripped) = cls.strip_prefix("language-") {
                                         lang = Some(String::from(stripped));
@@ -460,8 +460,13 @@ fn format_code_block(
         // ~keep content inline with the block syntax dropped — the same degradation Tier-1's
         // ~keep `close_pre` already performs, and consistent with headings and list items
         // ~keep shedding their markers in a cell. Line breaks fold to a space rather than to
-        // ~keep `<br>` so that the two tiers stay byte-equal.
-        output.push_str(crate::text::fold_cell_line_breaks_verbatim_cow(content.trim_matches('\n')).as_ref());
+        // ~keep `<br>` so that the two tiers stay byte-equal. The cell break separates the block
+        // ~keep from the cell content before it (issue #645).
+        let content = content.trim_matches('\n');
+        if !content.is_empty() && !ctx.convert_as_inline && !ctx.in_code {
+            crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
+        }
+        output.push_str(crate::text::fold_cell_line_breaks_verbatim_cow(content).as_ref());
         return;
     }
 
@@ -534,7 +539,7 @@ fn format_code_block(
 ///
 /// ~keep A fenced (or indented) code block spans several physical lines, but the
 /// ~keep only call site that indented list continuation content
-/// ~keep (`block/paragraph.rs::add_list_continuation_indent`) indented a single
+/// ~keep (`block/paragraph.rs`'s list continuation) indented a single
 /// ~keep leading position, not every line a block emits. CommonMark's list
 /// ~keep container match is per physical line: a non-blank line that is not
 /// ~keep indented to `list_indent_columns` is not part of the item, so an
@@ -583,8 +588,7 @@ fn format_code_block_in_list_item(
     }
 
     let indent =
-        crate::converter::list::utils::continuation_indent_string(ctx.list_depth, ctx.list_indent_columns, options)
-            .unwrap_or_default();
+        crate::converter::list::utils::continuation_indent_string(ctx.list_indent_columns, options).unwrap_or_default();
 
     for (index, segment) in rendered.split_inclusive('\n').enumerate() {
         let line = segment.strip_suffix('\n').unwrap_or(segment);

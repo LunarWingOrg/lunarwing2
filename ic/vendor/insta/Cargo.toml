@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.66.0"
 name = "insta"
-version = "1.48.0"
+version = "1.49.0"
 authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
 build = false
 exclude = ["assets/*"]

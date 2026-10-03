@@ -62,16 +62,81 @@ pub fn handle(
         if is_table_continuation {
             emit_table_cell_break(output, options.br_in_tables);
         }
+        // ~keep A heading is one line, so a block in it is set off by spaces, as Tier 1 does.
+        let in_heading_line = ctx.in_heading && !is_table_continuation;
+        if in_heading_line && !output.is_empty() && !output.ends_with(char::is_whitespace) {
+            output.push(' ');
+        }
         let children = tag.children();
         {
             for child_handle in children.top().iter() {
                 walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
             }
         }
+        if in_heading_line && !output.ends_with(char::is_whitespace) {
+            output.push(' ');
+        }
         return;
     }
 
     let content_start_pos = output.len();
+    // ~keep An empty div in a list item leaves the item as it found it (issue #583): its list
+    // ~keep separator trims the line end, so the trimmed tail is kept to put back.
+    let kept = ctx.in_list_item.then(|| {
+        let kept_len = output.trim_end_matches([' ', '\t']).len();
+        (kept_len, output[kept_len..].to_string())
+    });
+    let is_list_continuation = open_block(output, options, ctx);
+
+    // ~keep Measured the same way `block/paragraph.rs` does, so a text node can tell "at the
+    // ~keep start of this div's line, in this div's buffer" from an inline wrapper's empty
+    // ~keep scratch buffer. Without it a whitespace-only `<span>` opening a `<div>` was pushed
+    // ~keep verbatim and `<span>    </span><img>` became an indented code block (issue #501).
+    let children_start = output.len();
+    let div_ctx = Context {
+        block_content_start: output.len(),
+        block_output_ptr: std::ptr::from_ref::<String>(output) as usize,
+        ..ctx.clone()
+    };
+
+    let children = tag.children();
+    {
+        for child_handle in children.top().iter() {
+            walk_node(child_handle, parser, output, options, &div_ctx, depth + 1, dom_ctx);
+        }
+    }
+
+    if options.newline_style == NewlineStyle::Backslash {
+        // ~keep A trailing <br> run with no following sibling has no next dispatch to catch
+        // ~keep it in `walk_node`'s pre-block-dispatch strip, since the div is simply
+        // ~keep finishing here — so this closes its own trailing run the same way
+        // ~keep `paragraph.rs` closes its own (issue #464 follow-up).
+        strip_trailing_backslash_breaks(output, content_start_pos);
+    }
+
+    if let Some((kept_len, kept_tail)) = kept.filter(|_| output.len() == children_start) {
+        output.truncate(kept_len);
+        output.push_str(&kept_tail);
+    }
+    close_block(output, ctx, content_start_pos, is_list_continuation);
+}
+
+/// Writes `text` as its own block, with the separators a div writes around its content.
+pub fn push_block(output: &mut String, options: &ConversionOptions, ctx: &Context, text: &str) {
+    let content_start_pos = output.len();
+    let is_list_continuation = open_block(output, options, ctx);
+    output.push_str(text);
+    close_block(output, ctx, content_start_pos, is_list_continuation);
+}
+
+/// Writes the break a div writes before its content and returns whether that content continues
+/// a list item.
+fn open_block(output: &mut String, options: &ConversionOptions, ctx: &Context) -> bool {
+    let is_table_continuation = (ctx.in_table_cell || ctx.in_layout_cell)
+        && !output.is_empty()
+        && !output.ends_with('|')
+        && !output.ends_with("<br>")
+        && !output.ends_with('\n');
 
     // ~keep A plain suffix check like `output.ends_with("* ")` also matches the closing
     // ~keep "**"/"*" of `<strong>`/`<em>` immediately followed by a migrated trailing
@@ -94,37 +159,17 @@ pub fn handle(
     if is_table_continuation {
         emit_table_cell_break(output, options.br_in_tables);
     } else if is_list_continuation {
-        add_list_continuation_indent(output, ctx.list_depth, false, options);
+        crate::converter::list::utils::start_block_in_list_item(output, ctx, options);
     } else if needs_leading_sep {
         trim_trailing_whitespace(output);
         output.push_str("\n\n");
     }
+    is_list_continuation
+}
 
-    // ~keep Measured the same way `block/paragraph.rs` does, so a text node can tell "at the
-    // ~keep start of this div's line, in this div's buffer" from an inline wrapper's empty
-    // ~keep scratch buffer. Without it a whitespace-only `<span>` opening a `<div>` was pushed
-    // ~keep verbatim and `<span>    </span><img>` became an indented code block (issue #501).
-    let div_ctx = Context {
-        block_content_start: output.len(),
-        block_output_ptr: std::ptr::from_ref::<String>(output) as usize,
-        ..ctx.clone()
-    };
-
-    let children = tag.children();
-    {
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, &div_ctx, depth + 1, dom_ctx);
-        }
-    }
-
-    if options.newline_style == NewlineStyle::Backslash {
-        // ~keep A trailing <br> run with no following sibling has no next dispatch to catch
-        // ~keep it in `walk_node`'s pre-block-dispatch strip, since the div is simply
-        // ~keep finishing here — so this closes its own trailing run the same way
-        // ~keep `paragraph.rs` closes its own (issue #464 follow-up).
-        strip_trailing_backslash_breaks(output, content_start_pos);
-    }
-
+/// Writes the break a div writes after its content, when anything was written from
+/// `content_start_pos` on.
+fn close_block(output: &mut String, ctx: &Context, content_start_pos: usize, is_list_continuation: bool) {
     let has_content = output.len() > content_start_pos;
 
     if has_content {
@@ -155,21 +200,5 @@ pub fn handle(
                 output.push_str("\n\n");
             }
         }
-    }
-}
-
-/// Helper function to add list continuation indentation
-fn add_list_continuation_indent(
-    output: &mut String,
-    list_depth: usize,
-    _block_level: bool,
-    _options: &ConversionOptions,
-) {
-    if !output.ends_with('\n') {
-        output.push('\n');
-    }
-
-    for _ in 0..list_depth {
-        output.push_str("  ");
     }
 }

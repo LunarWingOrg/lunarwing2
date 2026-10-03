@@ -1,8 +1,4 @@
 //! URL-encoding and destination-rendering helpers for Markdown links.
-//!
-//! Split out of `link.rs` to stay under the 1000-line quality gate; these
-//! percent-encoding/title-escaping concerns evolve independently of the
-//! DOM-walking handler that remains there.
 
 use crate::options::ConversionOptions;
 use std::borrow::Cow;
@@ -195,11 +191,11 @@ pub(super) fn entity_reference_end(bytes: &[u8], amp_index: usize) -> Option<usi
 
 /// Escape a literal `&` that starts a byte sequence CommonMark would decode as an entity or
 /// numeric character reference (`&plus;`, `&#43;`, `&#x2B;`, ...), so a destination or title
-/// string that already went through [`crate::text::decode_html_entities`] round-trips
+/// string that already went through [`crate::text::decode_attribute_value_cow`] round-trips
 /// byte-for-byte through a CommonMark parser instead of being decoded a second time.
 ///
-/// Only escapes references [`html_escape::decode_html_entities`] -- the same decoder used by
-/// `crate::text::decode_html_entities` -- actually changes: `&foo;` where `foo` is not a
+/// Only escapes references [`html_escape::decode_html_entities`] actually changes. Like
+/// CommonMark, it decodes only a reference closed by `;`: `&foo;` where `foo` is not a
 /// recognized reference name is left alone, matching the existing pinned behavior for
 /// `?a&b` (no terminating `;`, never a candidate at all).
 #[must_use]
@@ -353,6 +349,19 @@ pub fn append_url_destination(
     }
 }
 
+/// The parts of one Markdown link, as [`append_markdown_link`] renders them.
+#[derive(Clone, Copy)]
+pub struct MarkdownLink<'a> {
+    /// The link text, already escaped for the label position.
+    pub label: &'a str,
+    /// The URL/destination.
+    pub href: &'a str,
+    /// The optional link title attribute.
+    pub title: Option<&'a str>,
+    /// The unescaped link text; the `default_title` option compares it with `href`.
+    pub raw_text: &'a str,
+}
+
 /// Format and append a Markdown link to the output string.
 ///
 /// Generates the link syntax: `[label](href "title")`
@@ -367,20 +376,21 @@ pub fn append_url_destination(
 ///
 /// # Arguments
 /// * `output` - Output buffer to append the link to
-/// * `label` - The link text (already escaped)
-/// * `href` - The URL/destination
-/// * `title` - Optional link title attribute
-/// * `raw_text` - Original unprocessed text (for `default_title` option)
+/// * `link` - The link's label, destination, title and raw text
 /// * `options` - Conversion options
+/// * `reference_collector` - Collects the destination when `link_style` is `Reference`
 pub fn append_markdown_link(
     output: &mut String,
-    label: &str,
-    href: &str,
-    title: Option<&str>,
-    raw_text: &str,
+    link: &MarkdownLink<'_>,
     options: &ConversionOptions,
     reference_collector: Option<&crate::converter::reference_collector::ReferenceCollectorHandle>,
 ) {
+    let MarkdownLink {
+        label,
+        href,
+        title,
+        raw_text,
+    } = *link;
     if options.link_style == crate::options::validation::LinkStyle::Reference && !href.is_empty() {
         if let Some(collector) = reference_collector {
             let ref_num = collector.borrow_mut().get_or_insert(href, title);

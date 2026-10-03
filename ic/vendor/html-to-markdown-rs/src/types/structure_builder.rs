@@ -299,23 +299,14 @@ fn extract_head_metadata_entries(head_tag: &tl::HTMLTag, parser: &tl::Parser) ->
                 }
             }
             "meta" => {
-                if let (Some(Some(meta_name)), Some(Some(meta_content))) = (
-                    child_tag.attributes().get("name"),
-                    child_tag.attributes().get("content"),
-                ) {
-                    entries.push(MetadataEntry {
-                        key: meta_name.as_utf8_str().to_string(),
-                        value: meta_content.as_utf8_str().to_string(),
-                    });
-                }
-                if let (Some(Some(property)), Some(Some(content))) = (
-                    child_tag.attributes().get("property"),
-                    child_tag.attributes().get("content"),
-                ) {
-                    entries.push(MetadataEntry {
-                        key: property.as_utf8_str().to_string(),
-                        value: content.as_utf8_str().to_string(),
-                    });
+                let content = crate::converter::utility::attributes::decoded_attribute(child_tag, "content");
+                for key_attr in ["name", "property"] {
+                    if let (Some(Some(key)), Some(content)) = (child_tag.attributes().get(key_attr), content.as_ref()) {
+                        entries.push(MetadataEntry {
+                            key: key.as_utf8_str().to_string(),
+                            value: content.to_string(),
+                        });
+                    }
                 }
             }
             _ => {}
@@ -331,13 +322,16 @@ struct BuilderState {
     nodes: Vec<DocumentNode>,
     /// Stack of open heading-group indices: `(heading_level, node_index)`.
     group_stack: Vec<(u8, u32)>,
+    /// The document's head, the only `<head>` that gives a metadata block.
+    head: Option<tl::NodeHandle>,
 }
 
 impl BuilderState {
-    const fn new() -> Self {
+    const fn new(head: Option<tl::NodeHandle>) -> Self {
         Self {
             nodes: Vec::new(),
             group_stack: Vec::new(),
+            head,
         }
     }
 
@@ -390,7 +384,7 @@ impl BuilderState {
 #[must_use]
 pub fn build_document_structure(dom: &tl::VDom<'_>) -> DocumentStructure {
     let parser = dom.parser();
-    let mut state = BuilderState::new();
+    let mut state = BuilderState::new(crate::converter::document_head(dom.children(), parser));
 
     for handle in dom.children() {
         walk(&mut state, handle, parser, None, 0);
@@ -418,6 +412,9 @@ fn walk(state: &mut BuilderState, handle: &tl::NodeHandle, parser: &tl::Parser, 
         tl::Node::Raw(_) | tl::Node::Comment(_) => {}
         tl::Node::Tag(tag) => {
             let tag_name = tag.name().as_utf8_str().to_ascii_lowercase();
+            if tag_name == "head" && state.head != Some(*handle) {
+                return;
+            }
             process_tag(state, tag_name.as_str(), tag, parser, parent_idx, depth);
         }
     }

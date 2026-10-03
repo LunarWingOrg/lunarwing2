@@ -285,8 +285,219 @@ fn block_opener_escape_offset(line: &str) -> Option<usize> {
         return None;
     }
     let rest = line.get(indent..)?;
+    block_opener_offset(rest).map(|offset| indent + offset)
+}
+
+/// Escape the character that makes `rest`, the first line of a paragraph without its
+/// indentation, start a block, when the next line is a setext underline of `underline` (`=` or `-`).
+///
+/// ~keep At the start of a paragraph more lines start a block than can interrupt one: an empty
+/// ~keep list item (`-`, `*`, `1.`), an ordered list at any number (spec section 5.2) and a link
+/// ~keep reference definition (spec section 4.7). An underlined heading writes its text as such a
+/// ~keep line (issues #653, #661).
+pub fn escape_paragraph_start(rest: &str, underline: u8) -> Cow<'_, str> {
+    block_opener_offset(rest)
+        .or_else(|| list_marker_offset(rest))
+        .or_else(|| starts_link_reference_definition(rest, underline).then_some(0))
+        .map_or(Cow::Borrowed(rest), |at| {
+            Cow::Owned(format!("{}\\{}", &rest[..at], &rest[at..]))
+        })
+}
+
+/// Whether `rest`, the first line of a paragraph without its indentation, starts a link reference
+/// definition when a setext underline of `underline` follows it: a label, a colon, then a
+/// destination with an optional title and nothing after it, or nothing at all.
+///
+/// ~keep With nothing after the colon the destination is read from the next line. markdown-it
+/// ~keep takes an `=` underline as that destination (`CommonMark` renderers keep the heading); a
+/// ~keep `-` underline as long as a label and a colon is a thematic break, which ends the
+/// ~keep definition first in both.
+fn starts_link_reference_definition(rest: &str, underline: u8) -> bool {
+    let Some(after_label) = link_label_len(rest).and_then(|len| rest[len..].strip_prefix(':')) else {
+        return false;
+    };
+    let destination = after_label.trim_matches([' ', '\t']);
+    if destination.is_empty() {
+        return underline == b'=';
+    }
+    let Some(len) = link_destination_len(destination) else {
+        return false;
+    };
+    let after_destination = &destination[len..];
+    let title = after_destination.trim_start_matches([' ', '\t']);
+    title.is_empty() || (title.len() < after_destination.len() && is_link_title(title))
+}
+
+/// Byte length of the link label, `[` to the first unescaped `]`, that starts `text`: at most 999
+/// characters inside, no unescaped `[`, and not only spaces and tabs (spec section 4.7).
+fn link_label_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let mut at = 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'[' => return None,
+            b']' => {
+                let label = &text[1..at];
+                let valid = !label.trim_matches([' ', '\t']).is_empty() && label.chars().count() <= 999;
+                return valid.then_some(at + 1);
+            }
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// Byte length of the link destination that starts `text`: `<` to an unescaped `>` without a `<`
+/// in between, or a run of characters other than spaces and controls with balanced parentheses.
+fn link_destination_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.first() == Some(&b'<') {
+        let mut at = 1;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at += 2,
+                b'>' => return Some(at + 1),
+                b'<' => return None,
+                _ => at += 1,
+            }
+        }
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' if bytes.get(at + 1).is_some_and(u8::is_ascii_punctuation) => at += 1,
+            b'(' => depth += 1,
+            b')' if depth == 0 => break,
+            b')' => depth -= 1,
+            byte if byte <= b' ' || byte == 0x7f => break,
+            _ => {}
+        }
+        at += 1;
+    }
+    (at > 0 && depth == 0).then_some(at)
+}
+
+/// Whether `text` is exactly one link title: `"..."`, `'...'` or `(...)`, with no unescaped
+/// closing character before its end (and no unescaped `(` in a parenthesized title).
+fn is_link_title(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let close = match bytes.first() {
+        Some(b'"') => b'"',
+        Some(b'\'') => b'\'',
+        Some(b'(') => b')',
+        _ => return false,
+    };
+    let mut at = 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            byte if byte == close => return at + 1 == bytes.len(),
+            b'(' if close == b')' => return false,
+            _ => at += 1,
+        }
+    }
+    false
+}
+
+/// Byte offset within `text`, the trimmed text of an ATX heading, of the `#` run at its end when a parser
+/// reads that run as the heading's closing sequence: the run is all of the text, or follows a
+/// space or tab (spec section 4.2).
+///
+/// ~keep Escaping the run's first `#` keeps it as text: the run then follows a backslash
+/// ~keep (issue #661).
+pub fn atx_closing_sequence_offset(text: &str) -> Option<usize> {
+    let run_start = text.trim_end_matches('#').len();
+    let closes = run_start < text.len() && (run_start == 0 || matches!(text.as_bytes()[run_start - 1], b' ' | b'\t'));
+    closes.then_some(run_start)
+}
+
+/// Byte offset of the delimiter of the list marker that starts `rest`, a line without its
+/// indentation: a bullet, or one to nine digits then `.` or `)`, followed by a space, a tab or
+/// the end of the line.
+fn list_marker_offset(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let delimiter = match bytes.first()? {
+        b'-' | b'*' | b'+' => 0,
+        b'0'..=b'9' => {
+            let digits = bytes.iter().take_while(|byte| byte.is_ascii_digit()).count();
+            if digits > 9 || !matches!(bytes.get(digits), Some(b'.' | b')')) {
+                return None;
+            }
+            digits
+        }
+        _ => return None,
+    };
+    matches!(bytes.get(delimiter + 1), None | Some(b' ' | b'\t')).then_some(delimiter)
+}
+
+/// Whether `line`, with its indentation, opens a block that can interrupt a paragraph.
+pub fn line_opens_block(line: &str) -> bool {
+    block_opener_escape_offset(line).is_some()
+}
+
+/// Escape the block opener at the start of `buffer[from..]`, text just written, when that text
+/// starts a line that continues the paragraph above it.
+///
+/// ~keep A line after a hard break continues its paragraph only if it cannot interrupt it, the
+/// ~keep rule a link label's continuation lines follow (issue #651). The text starts such a line
+/// ~keep when only its container's indent is before it on the line and the line above holds text;
+/// ~keep after a blank line it starts a paragraph of its own. The indent scan stops at the first
+/// ~keep other byte, and the line above is read once per line, so the check stays linear.
+pub fn escape_continuation_line_start(buffer: &mut String, from: usize) {
+    let before = &buffer[..from];
+    let Some(line_end) = before.trim_end_matches([' ', '\t']).strip_suffix('\n') else {
+        return;
+    };
+    let line_above = &line_end[line_end.rfind('\n').map_or(0, |pos| pos + 1)..];
+    if line_above.trim().is_empty() {
+        return;
+    }
+    let text = &buffer[from..];
+    let line = &text[..text.find('\n').unwrap_or(text.len())];
+    if let Some(offset) = block_opener_escape_offset(line) {
+        buffer.insert(from + offset, '\\');
+    }
+}
+
+/// Whether `rest`, a line without its indentation, opens a block that can interrupt a paragraph.
+pub fn opens_block(rest: &str) -> bool {
+    block_opener_offset(rest).is_some()
+}
+
+/// Whether `rest`, a line without its indentation, is a setext heading underline: nothing but `=`
+/// or nothing but `-`.
+pub fn is_heading_underline(rest: &str) -> bool {
+    is_setext_underline(rest, b'=') || is_setext_underline(rest, b'-')
+}
+
+/// Whether `rest`, a line without its indentation, is a thematic break: three or more `-`, `*` or
+/// `_` and nothing else but spaces/tabs.
+pub fn is_rule(rest: &str) -> bool {
+    rest.bytes()
+        .next()
+        .is_some_and(|marker| matches!(marker, b'-' | b'*' | b'_') && is_thematic_break(rest, marker))
+}
+
+/// The fence character and the length of its run when `rest`, a line without its indentation,
+/// opens a fenced code block.
+pub fn code_fence(rest: &str) -> Option<(u8, usize)> {
     let marker = *rest.as_bytes().first()?;
-    let opens_block = match marker {
+    let run = rest.bytes().take_while(|&byte| byte == marker).count();
+    (matches!(marker, b'`' | b'~') && is_code_fence(rest, marker)).then_some((marker, run))
+}
+
+/// Byte offset within `rest`, a line without its indentation, of the character to backslash-escape
+/// so the line stops opening a block, or `None` when it opens no block that can interrupt a
+/// paragraph.
+fn block_opener_offset(rest: &str) -> Option<usize> {
+    let marker = *rest.as_bytes().first()?;
+    let opens = match marker {
         b'>' => true,
         b'#' => is_atx_heading(rest),
         b'`' | b'~' => is_code_fence(rest, marker),
@@ -298,14 +509,14 @@ fn block_opener_escape_offset(line: &str) -> Option<usize> {
         b'<' => is_html_block_opener(rest),
         // ~keep A digit cannot carry a backslash escape, so an ordered-list marker is
         // ~keep defused at its `.`/`)` delimiter instead of at its number.
-        b'0'..=b'9' => return ordered_list_delimiter_offset(rest).map(|offset| indent + offset),
+        b'0'..=b'9' => return ordered_list_delimiter_offset(rest),
         _ => false,
     };
-    opens_block.then_some(indent)
+    opens.then_some(0)
 }
 
 /// Split `line`'s leading indentation, returning `(byte length, column width)`.
-fn leading_indent(line: &str) -> (usize, usize) {
+pub fn leading_indent(line: &str) -> (usize, usize) {
     let mut length = 0usize;
     let mut column = 0usize;
     for &byte in line.as_bytes() {
@@ -363,13 +574,24 @@ fn is_bullet_list_item(rest: &str) -> bool {
 
 /// Byte offset of the `.`/`)` of an ordered list marker that can interrupt a paragraph.
 fn ordered_list_delimiter_offset(rest: &str) -> Option<usize> {
-    // ~keep Only a list starting at 1 can interrupt a paragraph (spec section 5.2).
+    let digits = first_ordered_marker_len(rest)? - 1;
     let bytes = rest.as_bytes();
-    let starts_a_list = bytes.first() == Some(&b'1')
-        && matches!(bytes.get(1), Some(b'.' | b')'))
-        && matches!(bytes.get(2), Some(b' ' | b'\t'))
-        && rest.get(3..).is_some_and(|tail| !tail.trim().is_empty());
-    starts_a_list.then_some(1)
+    let starts_a_list = matches!(bytes.get(digits + 1), Some(b' ' | b'\t'))
+        && rest.get(digits + 2..).is_some_and(|tail| !tail.trim().is_empty());
+    starts_a_list.then_some(digits)
+}
+
+/// The byte length of the ordered list marker at the start of `rest` when that marker starts a
+/// list at 1: one to nine digits whose value is 1 (`1.`, `01)`, `000000001.`), then `.` or `)`.
+///
+/// ~keep Only a list starting at 1 can interrupt a paragraph, and the start number is the
+/// ~keep marker's value, so leading zeros count; ten digits are no marker (spec section 5.2).
+pub fn first_ordered_marker_len(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let digits = bytes.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let value_is_one =
+        (1..=9).contains(&digits) && bytes[digits - 1] == b'1' && bytes[..digits - 1].iter().all(|&byte| byte == b'0');
+    (value_is_one && matches!(bytes.get(digits), Some(b'.' | b')'))).then_some(digits + 1)
 }
 
 /// An HTML block of type 1 to 6 -- the types that may interrupt a paragraph.
@@ -419,7 +641,10 @@ pub fn is_block_level_name(tag_name: &str, is_inline: bool) -> bool {
                 | "aside"
                 | "blockquote"
                 | "canvas"
+                | "center"
                 | "dd"
+                | "details"
+                | "dialog"
                 | "div"
                 | "dl"
                 | "dt"
@@ -435,18 +660,46 @@ pub fn is_block_level_name(tag_name: &str, is_inline: bool) -> bool {
                 | "h5"
                 | "h6"
                 | "header"
+                | "hgroup"
                 | "hr"
+                | "legend"
                 | "li"
                 | "main"
+                | "menu"
                 | "nav"
                 | "ol"
                 | "p"
                 | "pre"
+                | "search"
                 | "section"
+                | "summary"
                 | "table"
                 | "tfoot"
                 | "ul"
         )
+}
+
+/// Escape every `|` in a Markdown table cell that no backslash escapes yet.
+///
+/// GFM splits a row on each unescaped `|` before it reads any inline syntax, so a pipe in a
+/// code span, a link destination or title, an image description or a flattened nested table
+/// ends the cell like a pipe in plain text does, and the row no longer matches the delimiter
+/// row. `\|` is a literal pipe everywhere in a cell, code spans included. A pipe after an odd
+/// run of backslashes is escaped already and stays as it is.
+pub fn escape_cell_pipes(text: &str) -> Cow<'_, str> {
+    if !text.contains('|') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 4);
+    let mut backslashes = 0usize;
+    for c in text.chars() {
+        if c == '|' && backslashes.is_multiple_of(2) {
+            out.push('\\');
+        }
+        backslashes = if c == '\\' { backslashes + 1 } else { 0 };
+        out.push(c);
+    }
+    Cow::Owned(out)
 }
 
 /// Escape any bare pipe left in a nested table's rendered markdown: one that is neither
@@ -455,9 +708,8 @@ pub fn is_block_level_name(tag_name: &str, is_inline: bool) -> bool {
 /// them either).
 ///
 /// Scoped to a nested `<table>`'s own rendered text (see the call site in
-/// [`render_cell_text`]) rather than applied to a whole cell's composed text: other block
-/// content a cell may hold, such as `<pre>`, is deliberately left byte-for-byte alone by
-/// its own handler (issues #455/#456) and must not be escaped here.
+/// [`render_cell_text`]). Markdown output then escapes the whole cell with
+/// [`escape_cell_pipes`], because GFM also splits a row on a pipe in a code span.
 ///
 /// Walks backtick runs the same way a spec-compliant parser does: a run of N backticks
 /// opens a code span only if a later run of exactly N backticks closes it; otherwise the
@@ -530,6 +782,16 @@ pub fn find_matching_backtick_run(chars: &[char], start: usize, run_len: usize) 
 mod tests {
     use super::super::content::{chomp_inline, merge_adjacent_emphasis, normalize_link_label};
     use super::*;
+
+    #[test]
+    fn escape_cell_pipes_escapes_each_pipe_no_backslash_escapes() {
+        assert!(matches!(escape_cell_pipes("a b"), Cow::Borrowed("a b")));
+        assert_eq!(escape_cell_pipes("a|b"), r"a\|b");
+        assert_eq!(escape_cell_pipes(r"a\|b"), r"a\|b");
+        assert_eq!(escape_cell_pipes(r"a\\|b"), r"a\\\|b");
+        assert_eq!(escape_cell_pipes("`a|b` [t](u|v)"), r"`a\|b` [t](u\|v)");
+        assert_eq!(escape_cell_pipes("||"), r"\|\|");
+    }
 
     #[test]
     fn escape_link_label_leaves_plain_text_unchanged() {
@@ -819,6 +1081,132 @@ mod tests {
         let mut output = String::from("__A__");
         assert!(merge_adjacent_emphasis(&mut output, '_', 2));
         assert_eq!(output, "__A");
+    }
+
+    #[test]
+    fn opens_block_reads_an_ordered_marker_by_its_value() {
+        for line in ["1. x", "1) x", "01. x", "001) x", "000000001. x", "01.\tx"] {
+            assert!(opens_block(line), "{line:?} starts a list at 1");
+        }
+        for line in [
+            "0000000001. x",
+            "2. x",
+            "02. x",
+            "0. x",
+            "00. x",
+            "10. x",
+            "11. x",
+            "01.",
+            "01. ",
+            "01.x",
+            "01",
+        ] {
+            assert!(!opens_block(line), "{line:?} cannot interrupt a paragraph");
+        }
+        assert_eq!(block_opener_offset("001) x"), Some(3));
+        assert_eq!(block_opener_offset("1. x"), Some(1));
+    }
+
+    fn escaped_continuation(before: &str, text: &str) -> String {
+        let mut buffer = format!("{before}{text}");
+        escape_continuation_line_start(&mut buffer, before.len());
+        buffer
+    }
+
+    #[test]
+    fn escape_continuation_line_start_escapes_a_line_after_text() {
+        assert_eq!(escaped_continuation("a  \n", "1) t"), "a  \n1\\) t");
+        assert_eq!(escaped_continuation("x\n- a  \n  ", "- t"), "x\n- a  \n  \\- t");
+        assert_eq!(escaped_continuation("a\\\n\t", "> t"), "a\\\n\t\\> t");
+        assert_eq!(escaped_continuation("a  \n", "-\nx"), "a  \n\\-\nx");
+    }
+
+    #[test]
+    fn escape_continuation_line_start_leaves_other_text_alone() {
+        for (before, text) in [
+            ("", "1) t"),
+            ("a", "1) t"),
+            ("a  \nb ", "1) t"),
+            ("a\n\n", "1) t"),
+            ("a\n  \n", "1) t"),
+            ("a  \n", "2. t"),
+            ("a  \n", "    1) t"),
+            ("a  \n", "1)\n- t"),
+        ] {
+            assert_eq!(
+                escaped_continuation(before, text),
+                format!("{before}{text}"),
+                "{before:?} {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_paragraph_start_escapes_a_link_reference_definition() {
+        for text in [
+            "[a]: b",
+            "[a]:",
+            "[a]:b \"t\"",
+            "[a]:b 't'",
+            "[a]: b (t)",
+            "[a]: <b c>",
+            "[a]: <>",
+            "[**a**]: b",
+            "[a\\]]: b",
+            "[a]: b(c)",
+            "[a]: b\"t\"",
+        ] {
+            assert_eq!(escape_paragraph_start(text, b'='), format!("\\{text}"), "{text:?}");
+        }
+        assert_eq!(escape_paragraph_start("[a]: b", b'-'), "\\[a]: b");
+    }
+
+    #[test]
+    fn escape_paragraph_start_leaves_a_line_that_starts_no_definition() {
+        for text in [
+            "[a]: b c",
+            "[a]: b \"t\" x",
+            "[a]: b\\ c",
+            "[a]: b \"t",
+            "[a]: b (t(u))",
+            "[a]: b (t(u)",
+            "[a]: <b>\"t\"",
+            "[a[b]: c",
+            "[a]: b(",
+            "[a]: <b",
+            "[a]: <b<c>",
+            "[a] b",
+            "[a]",
+            "[ ]: b",
+            "[a][b]: c",
+            "[[a]]: b",
+            "a [b]: c",
+            "plain text",
+        ] {
+            assert_eq!(escape_paragraph_start(text, b'='), text, "{text:?}");
+        }
+        assert_eq!(escape_paragraph_start("[a]:", b'-'), "[a]:");
+        let long_label = format!("[{}]: b", "é".repeat(1000));
+        assert_eq!(escape_paragraph_start(&long_label, b'='), long_label);
+        let longest_label = format!("[{}]: b", "é".repeat(999));
+        assert_eq!(
+            escape_paragraph_start(&longest_label, b'='),
+            format!("\\{longest_label}")
+        );
+    }
+
+    #[test]
+    fn atx_closing_sequence_offset_finds_a_run_the_line_closes_on() {
+        assert_eq!(atx_closing_sequence_offset("#"), Some(0));
+        assert_eq!(atx_closing_sequence_offset("##"), Some(0));
+        assert_eq!(atx_closing_sequence_offset("a #"), Some(2));
+        assert_eq!(atx_closing_sequence_offset("a ##"), Some(2));
+        assert_eq!(atx_closing_sequence_offset("a\t#"), Some(2));
+        assert_eq!(atx_closing_sequence_offset("a # #"), Some(4));
+        assert_eq!(atx_closing_sequence_offset("**a** #"), Some(6));
+        for text in ["a#", "a \\#", "a \\\\#", "#a", "a # b", "plain text", ""] {
+            assert_eq!(atx_closing_sequence_offset(text), None, "{text:?}");
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
   "name": "multica-bridge",
   "display_name": "Multica/Lunartica Bridge",
   "kind": "tool",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "wit_version": "0.3.0",
   "description": "Bridge between LunarWing and a Multica/Lunartica task management server. Enables LunarWing to act as a Multica daemon runtime.",
   "keywords": [

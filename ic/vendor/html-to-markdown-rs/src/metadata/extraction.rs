@@ -13,8 +13,33 @@ pub(crate) fn extract_document_metadata(
     dir: Option<String>,
 ) -> DocumentMetadata {
     let mut doc = DocumentMetadata::default();
+    let has_title_element = head_metadata.contains_key("title");
 
     for (raw_key, value) in head_metadata {
+        // ~keep Only the `<title>`, `<base>` and `<link rel="canonical">` elements write these
+        // ~keep keys. A meta tag named `base` or `canonical` arrives as `meta-base` or
+        // ~keep `meta-canonical` and is an ordinary meta tag; one named `title` gives the title
+        // ~keep only on a page without a `<title>` element (#589). The `title` key itself is
+        // ~keep present whenever a title element was seen, even an empty one, so an empty first
+        // ~keep title still counts as a title element and blocks the meta fallback below (#527).
+        match raw_key.as_str() {
+            "title" => {
+                if !value.is_empty() {
+                    doc.title = Some(value);
+                }
+                continue;
+            }
+            "base" => {
+                doc.base_href = Some(value);
+                continue;
+            }
+            "canonical" => {
+                doc.canonical_url = Some(value);
+                continue;
+            }
+            _ => {}
+        }
+
         let mut key = raw_key.as_str();
         let mut replaced_key: Option<String> = None;
 
@@ -30,15 +55,13 @@ pub(crate) fn extract_document_metadata(
         let lower_key = key.to_ascii_lowercase();
 
         match lower_key.as_str() {
-            "title" => doc.title = Some(value),
+            "title" if !has_title_element => doc.title = Some(value),
             "description" => doc.description = Some(value),
             "author" | "creator" | "publisher" => {
                 if doc.author.is_none() {
                     doc.author = Some(value);
                 }
             }
-            "canonical" => doc.canonical_url = Some(value),
-            "base" | "base-href" => doc.base_href = Some(value),
             k if k.starts_with("og-") => {
                 let og_key = k.trim_start_matches("og-").replace('-', "_");
                 doc.open_graph.insert(og_key, value);

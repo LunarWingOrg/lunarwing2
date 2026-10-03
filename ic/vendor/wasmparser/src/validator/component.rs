@@ -11,10 +11,8 @@ use super::{
         RecordType, Remap, Remapping, ResourceId, SubtypeCx, TupleType, VariantCase, VariantType,
     },
     core::{InternRecGroup, Module},
-    types::{CoreTypeId, EntityType, TypeAlloc, TypeData, TypeInfo, TypeList},
+    types::{CoreTypeId, EntityType, TypeAlloc, TypeInfo, TypeList},
 };
-use crate::collections::index_map::Entry;
-use crate::limits::*;
 use crate::prelude::*;
 use crate::validator::names::{ComponentName, ComponentNameKind, KebabStr, KebabString};
 use crate::{
@@ -23,6 +21,8 @@ use crate::{
     GlobalType, InstantiationArgKind, MemoryType, PackedIndex, RefType, Result, SubType, TableType,
     TypeBounds, ValType, WasmFeatures, require_feature,
 };
+use crate::{collections::index_map::Entry, names::ResourceFuncKind};
+use crate::{limits::*, names::AccessorKind};
 use core::mem;
 
 fn to_kebab_string<'a>(s: &'a str, desc: &str, offset: u64) -> Result<KebabString> {
@@ -289,6 +289,13 @@ impl CanonicalOptions {
         Ok(self)
     }
 
+    pub(crate) fn ptr_type(&self) -> ValType {
+        match self.memory {
+            Some((_, ptr_size)) => ptr_size.core_type(),
+            None => ValType::I32,
+        }
+    }
+
     pub(crate) fn require_memory(&self, offset: u64) -> Result<&Self> {
         if self.memory.is_none() {
             bail!(offset, "canonical option `memory` is required");
@@ -386,7 +393,7 @@ impl CanonicalOptions {
                 callback: Some(idx),
             } => {
                 let func_ty = types[state.core_function_at(idx, offset)?].unwrap_func();
-                if func_ty.params() != [ValType::I32; 3] && func_ty.params() != [ValType::I32] {
+                if func_ty.params() != [ValType::I32; 3] || func_ty.results() != [ValType::I32] {
                     return Err(Error::new(
                         "canonical option `callback` uses a core function with an incorrect signature",
                         offset,
@@ -449,7 +456,7 @@ impl CanonicalOptions {
 
             Ok(declared_id)
         } else {
-            Ok(types.intern_func_type(actual, offset))
+            types.intern_func_type(actual, offset)
         }
     }
 }
@@ -585,10 +592,6 @@ impl ComponentState {
         let id = match ty {
             crate::ComponentType::Defined(ty) => {
                 let ty = current(components).create_defined_type(ty, types, offset)?;
-                let depth = ty.type_info(types).depth();
-                if depth > MAX_WASM_COMPONENT_TYPE_DEPTH {
-                    bail!(offset, "type nesting is too deep");
-                }
                 types.push(ty).into()
             }
             crate::ComponentType::Func(ty) => {
@@ -726,6 +729,9 @@ impl ComponentState {
                     Some(ExternKind::Import) | None => false,
                     Some(ExternKind::Export) => true,
                 };
+                if value_used && ty.abi(types).contains_borrow() {
+                    bail!(offset, "exported value type cannot contain a `borrow` type");
+                }
                 self.values.push((*ty, value_used));
                 (self.values.len(), MAX_WASM_VALUES, "values")
             }
@@ -1242,6 +1248,7 @@ impl ComponentState {
             CanonicalFunction::StreamWrite { ty, options } => {
                 self.stream_write(ty, &options, types, offset)
             }
+            CanonicalFunction::StreamForward { ty } => self.stream_forward(ty, types, offset),
             CanonicalFunction::StreamCancelRead { ty, async_ } => {
                 self.stream_cancel_read(ty, async_, types, offset)
             }
@@ -1261,6 +1268,7 @@ impl ComponentState {
             CanonicalFunction::FutureWrite { ty, options } => {
                 self.future_write(ty, &options, types, offset)
             }
+            CanonicalFunction::FutureForward { ty } => self.future_forward(ty, types, offset),
             CanonicalFunction::FutureCancelRead { ty, async_ } => {
                 self.future_cancel_read(ty, async_, types, offset)
             }
@@ -1329,7 +1337,7 @@ impl ComponentState {
         options.check_lift(types, self, core_ty_id, offset)?;
         options.check_asyncness(ty, offset)?;
         let func_ty = ty.lower(types, &options, Abi::Lift, offset)?;
-        let lowered_core_ty_id = func_ty.intern(types, offset);
+        let lowered_core_ty_id = func_ty.intern(types, offset)?;
 
         if core_ty_id == lowered_core_ty_id {
             self.funcs
@@ -1387,7 +1395,7 @@ impl ComponentState {
         options.check_asyncness(ty, offset)?;
 
         let func_ty = ty.lower(types, &options, Abi::Lower, offset)?;
-        let ty_id = func_ty.intern(types, offset);
+        let ty_id = func_ty.intern(types, offset)?;
 
         self.core_funcs.push(ty_id);
         Ok(())
@@ -1395,21 +1403,21 @@ impl ComponentState {
 
     fn resource_new(&mut self, resource: u32, types: &mut TypeAlloc, offset: u64) -> Result<()> {
         let rep = self.check_local_resource(resource, types, offset)?;
-        let id = types.intern_func_type(FuncType::new([rep], [ValType::I32]), offset);
+        let id = types.intern_func_type(FuncType::new([rep], [ValType::I32]), offset)?;
         self.core_funcs.push(id);
         Ok(())
     }
 
     fn resource_drop(&mut self, resource: u32, types: &mut TypeAlloc, offset: u64) -> Result<()> {
         self.resource_at(resource, types, offset)?;
-        let id = types.intern_func_type(FuncType::new([ValType::I32], []), offset);
+        let id = types.intern_func_type(FuncType::new([ValType::I32], []), offset)?;
         self.core_funcs.push(id);
         Ok(())
     }
 
     fn resource_rep(&mut self, resource: u32, types: &mut TypeAlloc, offset: u64) -> Result<()> {
         let rep = self.check_local_resource(resource, types, offset)?;
-        let id = types.intern_func_type(FuncType::new([ValType::I32], [rep]), offset);
+        let id = types.intern_func_type(FuncType::new([ValType::I32], [rep]), offset)?;
         self.core_funcs.push(id);
         Ok(())
     }
@@ -1422,7 +1430,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], []), offset));
+            .push(types.intern_func_type(FuncType::new([], []), offset)?);
         Ok(())
     }
 
@@ -1434,7 +1442,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], []), offset));
+            .push(types.intern_func_type(FuncType::new([], []), offset)?);
         Ok(())
     }
 
@@ -1459,14 +1467,7 @@ impl ComponentState {
                 .map(|ty| {
                     Ok((
                         KebabString::new("v").unwrap(),
-                        match ty {
-                            crate::ComponentValType::Primitive(ty) => {
-                                ComponentValType::Primitive(*ty)
-                            }
-                            crate::ComponentValType::Type(index) => {
-                                ComponentValType::Type(self.defined_type_at(*index, offset)?)
-                            }
-                        },
+                        self.create_component_val_type(*ty, offset)?,
                     ))
                 })
                 .collect::<Result<_>>()?,
@@ -1487,7 +1488,7 @@ impl ComponentState {
         options.require_sync(offset, "task.return")?;
 
         let func_ty = func_ty.lower(types, &options, Abi::Lower, offset)?;
-        let ty_id = func_ty.intern(types, offset);
+        let ty_id = func_ty.intern(types, offset)?;
 
         self.core_funcs.push(ty_id);
         Ok(())
@@ -1501,7 +1502,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], []), offset));
+            .push(types.intern_func_type(FuncType::new([], []), offset)?);
         Ok(())
     }
 
@@ -1543,7 +1544,7 @@ impl ComponentState {
         self.validate_context_immediate(i, "context.get", offset)?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], [ty]), offset));
+            .push(types.intern_func_type(FuncType::new([], [ty]), offset)?);
         Ok(())
     }
 
@@ -1563,7 +1564,7 @@ impl ComponentState {
         self.validate_context_immediate(i, "context.set", offset)?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ty], []), offset));
+            .push(types.intern_func_type(FuncType::new([ty], []), offset)?);
         Ok(())
     }
 
@@ -1605,7 +1606,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset)?);
         Ok(())
     }
 
@@ -1624,7 +1625,7 @@ impl ComponentState {
         }
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -1641,7 +1642,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], [ValType::I64]), offset));
+            .push(types.intern_func_type(FuncType::new([], [ValType::I64]), offset)?);
         Ok(())
     }
 
@@ -1664,6 +1665,7 @@ impl ComponentState {
         };
 
         let options = self.check_options(types, options, offset)?;
+        let ptr = options.ptr_type();
         if options.concurrency.is_sync() {
             require_feature::cm_more_async_builtins(
                 self.features,
@@ -1677,7 +1679,7 @@ impl ComponentState {
             .check_lower(offset)?
             .check_core_type(
                 types,
-                FuncType::new([ValType::I32; 3], [ValType::I32]),
+                FuncType::new([ValType::I32, ptr, ptr], [ptr]),
                 offset,
             )?;
 
@@ -1704,6 +1706,7 @@ impl ComponentState {
         };
 
         let options = self.check_options(types, options, offset)?;
+        let ptr = options.ptr_type();
         if options.concurrency.is_sync() {
             require_feature::cm_more_async_builtins(
                 self.features,
@@ -1716,11 +1719,33 @@ impl ComponentState {
             .check_lower(offset)?
             .check_core_type(
                 types,
-                FuncType::new([ValType::I32; 3], [ValType::I32]),
+                FuncType::new([ValType::I32, ptr, ptr], [ptr]),
                 offset,
             )?;
 
         self.core_funcs.push(ty_id);
+        Ok(())
+    }
+
+    fn stream_forward(&mut self, ty: u32, types: &mut TypeAlloc, offset: u64) -> Result<()> {
+        require_feature::cm_async(
+            self.features,
+            "`stream.forward` requires the component model async feature",
+            offset,
+        )?;
+        require_feature::cm_forward(
+            self.features,
+            "`stream.forward` requires the component model forward feature",
+            offset,
+        )?;
+
+        let ty = self.defined_type_at(ty, offset)?;
+        let ComponentDefinedType::Stream { .. } = &types[ty] else {
+            bail!(offset, "`stream.forward` requires a stream type")
+        };
+
+        self.core_funcs
+            .push(types.intern_func_type(FuncType::new([ValType::I32; 2], []), offset)?);
         Ok(())
     }
 
@@ -1750,7 +1775,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -1780,7 +1805,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -1797,7 +1822,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset)?);
         Ok(())
     }
 
@@ -1814,7 +1839,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset)?);
         Ok(())
     }
 
@@ -1831,7 +1856,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], [ValType::I64]), offset));
+            .push(types.intern_func_type(FuncType::new([], [ValType::I64]), offset)?);
         Ok(())
     }
 
@@ -1854,6 +1879,7 @@ impl ComponentState {
         };
 
         let options = self.check_options(types, options, offset)?;
+        let ptr = options.ptr_type();
         if options.concurrency.is_sync() {
             require_feature::cm_more_async_builtins(
                 self.features,
@@ -1867,7 +1893,7 @@ impl ComponentState {
             .check_lower(offset)?
             .check_core_type(
                 types,
-                FuncType::new([ValType::I32; 2], [ValType::I32]),
+                FuncType::new([ValType::I32, ptr], [ValType::I32]),
                 offset,
             )?;
 
@@ -1894,6 +1920,7 @@ impl ComponentState {
         };
 
         let options = self.check_options(types, &options, offset)?;
+        let ptr = options.ptr_type();
         if options.concurrency.is_sync() {
             require_feature::cm_more_async_builtins(
                 self.features,
@@ -1903,13 +1930,36 @@ impl ComponentState {
         }
         let ty_id = options
             .require_memory_if(offset, || elem_ty.is_some())?
+            .check_lower(offset)?
             .check_core_type(
                 types,
-                FuncType::new([ValType::I32; 2], [ValType::I32]),
+                FuncType::new([ValType::I32, ptr], [ValType::I32]),
                 offset,
             )?;
 
         self.core_funcs.push(ty_id);
+        Ok(())
+    }
+
+    fn future_forward(&mut self, ty: u32, types: &mut TypeAlloc, offset: u64) -> Result<()> {
+        require_feature::cm_async(
+            self.features,
+            "`future.forward` requires the component model async feature",
+            offset,
+        )?;
+        require_feature::cm_forward(
+            self.features,
+            "`future.forward` requires the component model forward feature",
+            offset,
+        )?;
+
+        let ty = self.defined_type_at(ty, offset)?;
+        let ComponentDefinedType::Future { .. } = &types[ty] else {
+            bail!(offset, "`future.forward` requires a future type")
+        };
+
+        self.core_funcs
+            .push(types.intern_func_type(FuncType::new([ValType::I32; 2], []), offset)?);
         Ok(())
     }
 
@@ -1939,7 +1989,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -1969,7 +2019,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -1986,7 +2036,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset)?);
         Ok(())
     }
 
@@ -2003,7 +2053,7 @@ impl ComponentState {
         };
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset)?);
         Ok(())
     }
 
@@ -2019,16 +2069,13 @@ impl ComponentState {
             offset,
         )?;
 
-        let ty_id = self
-            .check_options(types, &options, offset)?
+        let options = self.check_options(types, &options, offset)?;
+        let ptr = options.ptr_type();
+        let ty_id = options
             .require_memory(offset)?
             .require_sync(offset, "error-context.new")?
             .check_lower(offset)?
-            .check_core_type(
-                types,
-                FuncType::new([ValType::I32; 2], [ValType::I32]),
-                offset,
-            )?;
+            .check_core_type(types, FuncType::new([ptr; 2], [ValType::I32]), offset)?;
 
         self.core_funcs.push(ty_id);
         Ok(())
@@ -2046,13 +2093,14 @@ impl ComponentState {
             offset,
         )?;
 
-        let ty_id = self
-            .check_options(types, &options, offset)?
+        let options = self.check_options(types, &options, offset)?;
+        let ptr = options.ptr_type();
+        let ty_id = options
             .require_memory(offset)?
             .require_realloc(offset)?
             .require_sync(offset, "error-context.debug-message")?
             .check_lower(offset)?
-            .check_core_type(types, FuncType::new([ValType::I32; 2], []), offset)?;
+            .check_core_type(types, FuncType::new([ValType::I32, ptr], []), offset)?;
 
         self.core_funcs.push(ty_id);
         Ok(())
@@ -2066,7 +2114,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset)?);
         Ok(())
     }
 
@@ -2078,7 +2126,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -2093,7 +2141,7 @@ impl ComponentState {
         let memory64 = self.memory_at(memory, offset)?.memory64;
         let ty = if memory64 { ValType::I64 } else { ValType::I32 };
         self.core_funcs.push(
-            types.intern_func_type(FuncType::new([ValType::I32, ty], [ValType::I32]), offset),
+            types.intern_func_type(FuncType::new([ValType::I32, ty], [ValType::I32]), offset)?,
         );
         Ok(())
     }
@@ -2109,7 +2157,7 @@ impl ComponentState {
         let memory64 = self.memory_at(memory, offset)?.memory64;
         let ty = if memory64 { ValType::I64 } else { ValType::I32 };
         self.core_funcs.push(
-            types.intern_func_type(FuncType::new([ValType::I32, ty], [ValType::I32]), offset),
+            types.intern_func_type(FuncType::new([ValType::I32, ty], [ValType::I32]), offset)?,
         );
         Ok(())
     }
@@ -2122,7 +2170,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset)?);
         Ok(())
     }
 
@@ -2134,7 +2182,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32; 2], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32; 2], []), offset)?);
         Ok(())
     }
 
@@ -2146,7 +2194,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -2204,7 +2252,7 @@ impl ComponentState {
         self.core_funcs.push(types.intern_func_type(
             FuncType::new([ValType::I32, ValType::I32], [ValType::I32]),
             offset,
-        ));
+        )?);
         Ok(())
     }
 
@@ -2215,7 +2263,7 @@ impl ComponentState {
             offset,
         )?;
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], []), offset)?);
         Ok(())
     }
 
@@ -2226,7 +2274,7 @@ impl ComponentState {
             offset,
         )?;
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -2238,7 +2286,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -2250,7 +2298,7 @@ impl ComponentState {
         )?;
 
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -2261,7 +2309,7 @@ impl ComponentState {
             offset,
         )?;
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -2272,7 +2320,7 @@ impl ComponentState {
             offset,
         )?;
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -2283,7 +2331,7 @@ impl ComponentState {
             offset,
         )?;
         self.core_funcs
-            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset));
+            .push(types.intern_func_type(FuncType::new([ValType::I32], [ValType::I32]), offset)?);
         Ok(())
     }
 
@@ -2331,7 +2379,7 @@ impl ComponentState {
         let start_func_ref = RefType::concrete(true, packed_index);
         let func_ty = FuncType::new([ValType::Ref(start_func_ref), ValType::I32], [ValType::I32]);
         let core_ty = SubType::func(func_ty, true);
-        let id = types.intern_sub_type(core_ty, offset);
+        let id = types.intern_sub_type(core_ty, offset)?;
         self.core_funcs.push(id);
 
         Ok(())
@@ -2379,7 +2427,7 @@ impl ComponentState {
         // Insert the core function.
         let func_ty = FuncType::new([ValType::I32, ValType::I32], [ValType::I32]);
         let core_ty = SubType::func(func_ty, true);
-        let id = types.intern_sub_type(core_ty, offset);
+        let id = types.intern_sub_type(core_ty, offset)?;
         self.core_funcs.push(id);
 
         Ok(())
@@ -2431,7 +2479,7 @@ impl ComponentState {
 
         let func_ty = FuncType::new([], [ValType::I32]);
         let core_ty = SubType::func(func_ty, true);
-        let id = types.intern_sub_type(core_ty, offset);
+        let id = types.intern_sub_type(core_ty, offset)?;
         self.core_funcs.push(id);
 
         Ok(())
@@ -2831,13 +2879,7 @@ impl ComponentState {
             }
             ComponentTypeRef::Value(ty) => {
                 self.check_value_support(offset)?;
-                let ty = match ty {
-                    crate::ComponentValType::Primitive(ty) => ComponentValType::Primitive(*ty),
-                    crate::ComponentValType::Type(index) => {
-                        ComponentValType::Type(self.defined_type_at(*index, offset)?)
-                    }
-                };
-                ComponentEntityType::Value(ty)
+                ComponentEntityType::Value(self.create_component_val_type(*ty, offset)?)
             }
             ComponentTypeRef::Type(TypeBounds::Eq(index)) => {
                 let referenced = self.component_type_at(*index, offset)?;
@@ -3526,7 +3568,11 @@ impl ComponentState {
                 }
                 ComponentExternalKind::Value => {
                     self.check_value_support(offset)?;
-                    ComponentEntityType::Value(*self.value_at(export.index, offset)?)
+                    let ty = *self.value_at(export.index, offset)?;
+                    if ty.abi(types).contains_borrow() {
+                        bail!(offset, "exported value type cannot contain a `borrow` type");
+                    }
+                    ComponentEntityType::Value(ty)
                 }
                 ComponentExternalKind::Type => {
                     let ty = self.component_type_at(export.index, offset)?;
@@ -3964,6 +4010,36 @@ impl ComponentState {
                     offset,
                 )?;
                 let key = self.create_component_val_type(key, offset)?;
+                // Map keys are restricted to the `<keytype>` grammar
+                // production of primitive types.
+                let key_prim = match key {
+                    ComponentValType::Primitive(p) => Some(p),
+                    ComponentValType::Type(id) => match &types[id] {
+                        ComponentDefinedType::Primitive(p) => Some(*p),
+                        _ => None,
+                    },
+                };
+                {
+                    use crate::PrimitiveValType as P;
+                    match key_prim {
+                        Some(
+                            P::Bool
+                            | P::S8
+                            | P::U8
+                            | P::S16
+                            | P::U16
+                            | P::S32
+                            | P::U32
+                            | P::S64
+                            | P::U64
+                            | P::Char
+                            | P::String,
+                        ) => {}
+                        Some(P::F32 | P::F64 | P::ErrorContext) | None => {
+                            bail!(offset, "invalid map key type")
+                        }
+                    }
+                }
                 let value = self.create_component_val_type(value, offset)?;
                 let mut info = TypeInfo::new();
                 info.combine(key.info(types), offset)?;
@@ -4056,6 +4132,9 @@ impl ComponentState {
                 let ty = ty
                     .map(|ty| self.create_component_val_type(ty, offset))
                     .transpose()?;
+                if ty.is_some_and(|ty| ty.abi(types).contains_borrow()) {
+                    bail!(offset, "`future` payload cannot contain a `borrow` type");
+                }
                 let mut info = TypeInfo::new();
                 if let Some(ty) = &ty {
                     info.combine(ty.info(types), offset)?;
@@ -4086,6 +4165,9 @@ impl ComponentState {
                         "`stream<char>` is not valid at this time, use `stream<u8>` \
                          with a defined by encoding instead for now"
                     )
+                }
+                if ty.is_some_and(|ty| ty.abi(types).contains_borrow()) {
+                    bail!(offset, "`stream` payload cannot contain a `borrow` type");
                 }
                 let mut info = TypeInfo::new();
                 if let Some(ty) = &ty {
@@ -4646,17 +4728,36 @@ impl ComponentNameContext {
 
         if let ExternKind::Export = kind {
             match kebab.kind() {
-                ComponentNameKind::Label(_)
-                | ComponentNameKind::Method(_)
-                | ComponentNameKind::Static(_)
-                | ComponentNameKind::Constructor(_)
-                | ComponentNameKind::Interface(_) => {}
+                ComponentNameKind::Plain(_) | ComponentNameKind::Interface(_) => {}
 
                 ComponentNameKind::Hash(_)
                 | ComponentNameKind::Url(_)
                 | ComponentNameKind::Dependency(_) => {
                     bail!(offset, "name `{name}` is not a valid export name")
                 }
+            }
+        }
+
+        if let Some(suffix) = version_suffix {
+            require_feature::cm_canon_names(
+                *features,
+                "the `cm-canon-names` feature is not active",
+                offset,
+            )?;
+            match ty {
+                ComponentEntityType::Instance(_) => {}
+                _ => bail!(offset, "only instances can have an `versionsuffix`"),
+            }
+            if suffix.is_empty() {
+                bail!(offset, "version suffix cannot be empty");
+            }
+            // Without `implements` the version suffix applies to `name`, so
+            // it must be an interface name. Its version is validated below.
+            if implements.is_none() && !matches!(kebab.kind(), ComponentNameKind::Interface(_)) {
+                bail!(
+                    offset,
+                    "`versionsuffix` requires an interface name or `implements`"
+                );
             }
         }
 
@@ -4667,7 +4768,7 @@ impl ComponentNameContext {
                 offset,
             )?;
             match kebab.kind() {
-                ComponentNameKind::Label(_) => {}
+                ComponentNameKind::Plain(p) if p.is_bare() => {}
                 _ => bail!(offset, "name `{name}` is not valid with `implements`",),
             }
 
@@ -4679,20 +4780,12 @@ impl ComponentNameContext {
             let implements = ComponentName::new_with_features(implements, offset, *features)
                 .with_context(|| format!("`{implements}` is not a valid name"))?;
             match implements.kind() {
-                ComponentNameKind::Interface(_) => {}
+                ComponentNameKind::Interface(iface) => {
+                    iface.version(version_suffix).map_err(|e| {
+                        format_err!(offset, "invalid interface version: {}", e.message())
+                    })?;
+                }
                 _ => bail!(offset, "name `{implements}` must be an interface"),
-            }
-        }
-
-        if let Some(_) = version_suffix {
-            require_feature::cm_canon_names(
-                *features,
-                "the `cm-canon-names` feature is not active",
-                offset,
-            )?;
-            match ty {
-                ComponentEntityType::Instance(_) => {}
-                _ => bail!(offset, "only instances can have an `versionsuffix`"),
             }
         }
 
@@ -4718,6 +4811,50 @@ impl ComponentNameContext {
                 "{} name `{kebab}` conflicts with previous name `{prev}`",
                 kind.desc()
             );
+        }
+
+        // Setters must be preceded by a matching getter. This matching is
+        // stricter than strong uniqueness. The setter's param type must also
+        // match the getter's return type.
+        if let ComponentNameKind::Plain(plain) = kebab.kind()
+            && plain.accessor == Some(AccessorKind::Set)
+        {
+            let getter_name = plain.getter_for_setter();
+            match items.get(getter_name.as_str()) {
+                None => bail!(
+                    offset,
+                    "{kind} name `{kebab}` requires a preceding {kind} named `{getter_name}`",
+                    kind = kind.desc(),
+                ),
+                Some(getter) => {
+                    let ComponentEntityType::Func(setter_id) = *ty else {
+                        unreachable!()
+                    };
+                    let ComponentEntityType::Func(getter_id) = getter.ty else {
+                        unreachable!()
+                    };
+
+                    let setter_pty = &types[setter_id].params.last().unwrap().1;
+
+                    // Get the getter's "property type" by unwrapping any result<T>'s.
+                    let getter_rty = &types[getter_id].result.unwrap();
+                    let getter_property_type: &ComponentValType = match getter_rty {
+                        ComponentValType::Primitive(_) => getter_rty,
+                        ComponentValType::Type(ty) => match &types[*ty] {
+                            ComponentDefinedType::Result { ok, .. } => &ok.unwrap(),
+                            _ => getter_rty,
+                        },
+                    };
+
+                    if !ComponentValType::eq(setter_pty, getter_property_type, types, offset) {
+                        bail!(
+                            offset,
+                            "{kind} `{kebab}`'s parameter type must match the return type of `{getter_name}`",
+                            kind = kind.desc(),
+                        )
+                    }
+                }
+            }
         }
 
         // Otherwise all strings must be unique, regardless of their name, so
@@ -4764,94 +4901,167 @@ impl ComponentNameContext {
 
         match name.kind() {
             // No validation necessary for these styles of names
-            ComponentNameKind::Label(_)
-            | ComponentNameKind::Url(_)
+            ComponentNameKind::Url(_)
             | ComponentNameKind::Hash(_)
             | ComponentNameKind::Dependency(_) => {}
 
             // Validate the `version_suffix` field in the context of interface
             // names.
             ComponentNameKind::Interface(name) => {
-                if let Err(e) = name.version(version_suffix) {
-                    bail!(offset, "invalid interface version: {e}");
-                }
+                name.version(version_suffix).map_err(|e| {
+                    format_err!(offset, "invalid interface version: {}", e.message())
+                })?;
             }
 
-            // Constructors must return `(own $resource)` or
-            // `(result (own $Tresource))` and the `$resource` must be named
-            // within this context to match `rname`.
-            ComponentNameKind::Constructor(rname) => {
-                let ty = func()?;
-                if ty.async_ {
-                    bail!(offset, "constructor function cannot be async");
-                }
-                let ty = match ty.result {
-                    Some(result) => result,
-                    None => bail!(offset, "function should return one value"),
-                };
-                let resource = match ty {
-                    ComponentValType::Primitive(_) => None,
-                    ComponentValType::Type(ty) => match &types[ty] {
-                        ComponentDefinedType::Own(id) => Some(id),
-                        ComponentDefinedType::Result {
-                            ok: Some(ComponentValType::Type(ok)),
-                            ..
-                        } => match &types[*ok] {
-                            ComponentDefinedType::Own(id) => Some(id),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                };
-                let resource = match resource {
-                    Some(id) => id,
-                    None => bail!(
-                        offset,
-                        "function should return `(own $T)` or `(result (own $T))`"
-                    ),
-                };
-                self.validate_resource_name(*resource, rname, offset)?;
-            }
+            ComponentNameKind::Plain(name) => {
+                match name.resource_func {
+                    // Constructors must return `(own $resource)` or
+                    // `(result (own $Tresource))` and the `$resource` must be
+                    // named within this context to match `rname`.
+                    Some(ResourceFuncKind::Constructor) => {
+                        let ty = func()?;
+                        if ty.async_ {
+                            bail!(offset, "constructor function cannot be async");
+                        }
+                        let ty = match ty.result {
+                            Some(result) => result,
+                            None => bail!(offset, "function should return one value"),
+                        };
+                        let resource = match ty {
+                            ComponentValType::Primitive(_) => None,
+                            ComponentValType::Type(ty) => match &types[ty] {
+                                ComponentDefinedType::Own(id) => Some(id),
+                                ComponentDefinedType::Result {
+                                    ok: Some(ComponentValType::Type(ok)),
+                                    ..
+                                } => match &types[*ok] {
+                                    ComponentDefinedType::Own(id) => Some(id),
+                                    _ => None,
+                                },
+                                _ => None,
+                            },
+                        };
+                        let resource = match resource {
+                            Some(id) => id,
+                            None => bail!(
+                                offset,
+                                "function should return `(own $T)` or `(result (own $T))`"
+                            ),
+                        };
+                        self.validate_resource_name(*resource, name.resource().unwrap(), offset)?;
+                    }
 
-            // Methods must take `(param "self" (borrow $resource))` as the
-            // first argument where `$resources` matches the name `resource` as
-            // named in this context.
-            ComponentNameKind::Method(name) => {
-                let ty = func()?;
-                if ty.params.len() == 0 {
-                    bail!(offset, "function should have at least one argument");
-                }
-                let (pname, pty) = &ty.params[0];
-                if pname.as_str() != "self" {
-                    bail!(
-                        offset,
-                        "function should have a first argument called `self`",
-                    );
-                }
-                let id = match pty {
-                    ComponentValType::Primitive(_) => None,
-                    ComponentValType::Type(ty) => match &types[*ty] {
-                        ComponentDefinedType::Borrow(id) => Some(id),
-                        _ => None,
-                    },
-                };
-                let id = match id {
-                    Some(id) => id,
-                    None => bail!(
-                        offset,
-                        "function should take a first argument of `(borrow $T)`"
-                    ),
-                };
-                self.validate_resource_name(*id, name.resource(), offset)?;
-            }
+                    // Methods must take `(param "self" (borrow $resource))` as
+                    // the first argument where `$resources` matches the name
+                    // `resource` as named in this context.
+                    Some(ResourceFuncKind::Method) => {
+                        let ty = func()?;
+                        if ty.params.len() == 0 {
+                            bail!(offset, "function should have at least one argument");
+                        }
+                        let (pname, pty) = &ty.params[0];
+                        if pname.as_str() != "self" {
+                            bail!(
+                                offset,
+                                "function should have a first argument called `self`",
+                            );
+                        }
+                        let id = match pty {
+                            ComponentValType::Primitive(_) => None,
+                            ComponentValType::Type(ty) => match &types[*ty] {
+                                ComponentDefinedType::Borrow(id) => Some(id),
+                                _ => None,
+                            },
+                        };
+                        let id = match id {
+                            Some(id) => id,
+                            None => bail!(
+                                offset,
+                                "function should take a first argument of `(borrow $T)`"
+                            ),
+                        };
+                        self.validate_resource_name(*id, name.resource().unwrap(), offset)?;
+                    }
 
-            // Static methods don't have much validation beyond that they must
-            // be a function and the resource name referred to must already be
-            // in this context.
-            ComponentNameKind::Static(name) => {
-                func()?;
-                if !self.all_resource_names.contains(name.resource().as_str()) {
-                    bail!(offset, "static resource name is not known in this context");
+                    // Static methods don't have much validation beyond that they must
+                    // be a function and the resource name referred to must already be
+                    // in this context.
+                    Some(ResourceFuncKind::Static) => {
+                        func()?;
+                        if !self
+                            .all_resource_names
+                            .contains(name.resource().unwrap().as_str())
+                        {
+                            bail!(offset, "static resource name is not known in this context");
+                        }
+                    }
+
+                    None => {}
+                }
+
+                if let Some(accessor) = name.accessor {
+                    let ty = func()?;
+                    let desc = match accessor {
+                        AccessorKind::Get => "getter",
+                        AccessorKind::Set => "setter",
+                    };
+                    if ty.async_ {
+                        bail!(offset, "{desc} function cannot be async");
+                    }
+
+                    // Methods have a `self` parameter that we already validated above.
+                    let (num_own_params, besides_self) = match name.resource_func {
+                        Some(ResourceFuncKind::Method) => (ty.params.len() - 1, " besides `self`"),
+                        _ => (ty.params.len(), ""),
+                    };
+                    match accessor {
+                        // Getters take nothing and must return a value.
+                        AccessorKind::Get => {
+                            if num_own_params != 0 {
+                                bail!(
+                                    offset,
+                                    "getter function should have no parameters{besides_self}"
+                                );
+                            }
+                            match ty.result {
+                                None => bail!(offset, "getter function should return a value"),
+                                Some(ComponentValType::Primitive(_)) => {}
+                                Some(ComponentValType::Type(rty)) => match &types[rty] {
+                                    ComponentDefinedType::Result { ok, .. } if ok.is_none() => {
+                                        bail!(
+                                            offset,
+                                            "if a getter function returns a result, that result must have a value type"
+                                        )
+                                    }
+                                    _ => {}
+                                },
+                            }
+                        }
+
+                        // Setters take one value and return either nothing or `(result (error $E)?)`.
+                        AccessorKind::Set => {
+                            if num_own_params != 1 {
+                                bail!(
+                                    offset,
+                                    "setter function should have exactly one parameter{besides_self}"
+                                );
+                            }
+                            let result_ok = match ty.result {
+                                None => true,
+                                Some(ComponentValType::Primitive(_)) => false,
+                                Some(ComponentValType::Type(id)) => matches!(
+                                    &types[id],
+                                    ComponentDefinedType::Result { ok: None, .. }
+                                ),
+                            };
+                            if !result_ok {
+                                bail!(
+                                    offset,
+                                    "setter function should return nothing or `(result (error $E)?)`"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

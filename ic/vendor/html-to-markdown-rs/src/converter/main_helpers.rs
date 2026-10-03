@@ -3,7 +3,8 @@
 //! This module contains utility functions used by the main conversion pipeline,
 //! including preprocessing helpers, HTML repair, and metadata formatting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::options::ConversionOptions;
 use crate::options::NewlineStyle;
@@ -74,7 +75,13 @@ pub fn strip_trailing_backslash_breaks(output: &mut String, block_start: usize) 
     let block_start = crate::converter::utility::content::floor_char_boundary(output, block_start.min(output.len()));
     let mut stripped_breaks = 0usize;
     while output.len() > block_start && output[block_start..].ends_with("\\\n") {
-        let new_len = output.len() - "\\\n".len();
+        let mut new_len = output.len() - "\\\n".len();
+        // ~keep A marker on a line of its own in a list item follows the item's indent
+        // ~keep (issue #681); left behind, the indent hid the marker before it from this loop.
+        let indent_start = output[..new_len].trim_end_matches([' ', '\t']).len();
+        if indent_start >= block_start && output[..indent_start].ends_with('\n') {
+            new_len = indent_start;
+        }
         output.truncate(new_len);
         stripped_breaks += 1;
     }
@@ -115,6 +122,19 @@ pub fn emit_table_cell_break(output: &mut String, br_in_tables: bool) {
         output.push_str("<br>");
     } else if !output.is_empty() {
         output.push(' ');
+    }
+}
+
+/// Separate a block in a table cell from the cell content before it (issue #645).
+///
+/// A cell holds one line, so the cell break of [`emit_table_cell_break`] stands for the line a
+/// block starts or ends outside a cell. Nothing is written when the cell holds no content yet or
+/// already ends with a `<br>`. A line end that a block left folds into the break.
+pub fn separate_block_in_cell(output: &mut String, br_in_tables: bool) {
+    let content_end = output.trim_end_matches([' ', '\t', '\n']).len();
+    output.truncate(content_end);
+    if !output.is_empty() && !output.ends_with("<br>") {
+        emit_table_cell_break(output, br_in_tables);
     }
 }
 
@@ -518,23 +538,124 @@ pub fn repair_with_html5ever(input: &str) -> Option<String> {
 }
 
 /// Format metadata as YAML frontmatter.
+///
+/// ~keep The `title` key is present whenever a title element was seen, even an empty one, so
+/// ~keep `extract_document_metadata` can tell "no title element" from "an empty one" (#527). An
+/// ~keep empty title carries no frontmatter line either way, so it is the one key skipped here.
+///
+/// Keys and values come from the page, so each is written as one YAML scalar (#544): a
+/// newline, `: ` or a leading indicator would otherwise end the line or change what YAML reads.
 pub fn format_metadata_frontmatter(metadata: &BTreeMap<String, String>) -> String {
     let mut result = String::from("---\n");
     for (key, value) in metadata {
-        use std::fmt::Write as _;
-        let _ = writeln!(&mut result, "{key}: {value}");
+        if key == "title" && value.is_empty() {
+            continue;
+        }
+        push_yaml_scalar(&mut result, key);
+        result.push_str(": ");
+        push_yaml_scalar(&mut result, value);
+        result.push('\n');
     }
     result.push_str("---\n");
     result
 }
 
+/// Append `value` as a plain YAML scalar when it reads back unchanged, else as a double-quoted
+/// scalar with every non-printable character escaped.
+fn push_yaml_scalar(out: &mut String, value: &str) {
+    if is_plain_yaml_scalar(value) {
+        out.push_str(value);
+        return;
+    }
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if is_yaml_printable(c) => out.push(c),
+            c => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04X}", u32::from(c));
+            }
+        }
+    }
+    out.push('"');
+}
+
+/// A conservative subset of the YAML plain scalar in block context: no leading indicator, no
+/// `: ` or ` #`, no leading or trailing space, only printable characters, and a value a YAML
+/// reader resolves to a string (#552).
+fn is_plain_yaml_scalar(value: &str) -> bool {
+    let Some(first) = value.chars().next() else {
+        return false;
+    };
+    !matches!(
+        first,
+        '-' | '?'
+            | ':'
+            | ','
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '#'
+            | '&'
+            | '*'
+            | '!'
+            | '|'
+            | '>'
+            | '\''
+            | '"'
+            | '%'
+            | '@'
+            | '`'
+    ) && !value.starts_with(' ')
+        && !value.ends_with([' ', ':'])
+        && !value.contains(": ")
+        && !value.contains(" #")
+        && value.chars().all(|c| c != '\t' && is_yaml_printable(c))
+        && !yaml_non_string_scalar().is_match(value)
+}
+
+/// Matches a plain scalar that a YAML reader resolves to null, a boolean, a number or a timestamp:
+/// the YAML 1.2 core schema, plus the YAML 1.1 forms that readers such as PyYAML still apply
+/// (`yes`/`no`/`on`/`off`, `0b`, leading-zero octal, `_` separators, base 60, dates, `=`, `<<`).
+fn yaml_non_string_scalar() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(concat!(
+            r"^(?:~|null|Null|NULL",
+            r"|true|True|TRUE|false|False|FALSE|yes|Yes|YES|no|No|NO|on|On|ON|off|Off|OFF|y|Y|n|N",
+            r"|[-+]?(?:0b[01_]+|0o[0-7]+|0x[0-9a-fA-F_]+",
+            r"|[0-9][0-9_]*(?::[0-5]?[0-9])*(?:\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?",
+            r"|\.[0-9][0-9_]*(?:[eE][-+]?[0-9]+)?|\.(?:inf|Inf|INF))",
+            r"|\.(?:nan|NaN|NAN)",
+            r"|[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}",
+            r"(?:(?:[Tt]|[ \t]+)[0-9]{1,2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9]{1,2}(?::[0-9]{2})?))?)?",
+            r"|=|<<)$",
+        ))
+        .expect("YAML scalar type regex is well-formed")
+    })
+}
+
+/// The YAML 1.2 printable set, minus the Unicode line and paragraph separators and the
+/// byte-order mark, which YAML 1.1 readers still treat as a line break or a document marker.
+const fn is_yaml_printable(c: char) -> bool {
+    matches!(c, '\t' | ' '..='~' | '\u{A0}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+        && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{FEFF}')
+}
+
 /// Record `<meta name>`/`<meta property>` content into `metadata`, honoring `strip_tags`/
-/// `preserve_tags` for `"meta"`. Extracted from `extract_head_metadata` — same tag-name,
-/// attribute-lookup, and key-formatting logic, unchanged.
+/// `preserve_tags` for `"meta"`. The first tag per key wins, comparing keys in any letter case;
+/// `seen` holds the lower-cased keys recorded so far.
 fn collect_meta_head_metadata(
     child_tag: &tl::HTMLTag,
     options: &ConversionOptions,
     metadata: &mut BTreeMap<String, String>,
+    seen: &mut HashSet<String>,
 ) {
     if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("meta")
         || options.strip_tags.iter().any(|t| t == "meta")
@@ -550,27 +671,38 @@ fn collect_meta_head_metadata(
         child_tag.attributes().get("name").flatten(),
         crate::converter::utility::attributes::decoded_attribute(child_tag, "content"),
     ) {
-        let name_str = name.as_utf8_str();
-        metadata.insert(format!("meta-{name_str}"), content.into_owned());
+        let key = format!("meta-{}", name.as_utf8_str());
+        if seen.insert(key.to_ascii_lowercase()) {
+            metadata.insert(key, content.into_owned());
+        }
     }
     if let (Some(property), Some(content)) = (
         child_tag.attributes().get("property").flatten(),
         crate::converter::utility::attributes::decoded_attribute(child_tag, "content"),
     ) {
-        let property_str = property.as_utf8_str();
-        metadata.insert(format!("meta-{property_str}"), content.into_owned());
+        let key = format!("meta-{}", property.as_utf8_str());
+        if seen.insert(key.to_ascii_lowercase()) {
+            metadata.insert(key, content.into_owned());
+        }
     }
 }
 
-/// Record the `<title>` text into `metadata`, honoring `strip_tags`/`preserve_tags` for
-/// `"title"`. Extracted from `extract_head_metadata` — same traversal and trimming, unchanged.
+/// Record the trimmed, decoded `<title>` text into `metadata`, honoring `strip_tags`/
+/// `preserve_tags` for `"title"`. The first title wins, as in a browser; an empty one still
+/// records the `title` key, empty, so the element's presence survives even though its text does
+/// not (#527). `seen_title` is whether a title came before.
 fn collect_title_head_metadata(
     child_tag: &tl::HTMLTag,
     parser: &tl::Parser,
     options: &ConversionOptions,
     metadata: &mut BTreeMap<String, String>,
+    seen_title: &mut bool,
 ) {
-    if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("title")
+    if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("title") {
+        return;
+    }
+    let later_title = std::mem::replace(seen_title, true);
+    if later_title
         || options.strip_tags.iter().any(|t| t == "title")
         || options.preserve_tags.iter().any(|t| t == "title")
     {
@@ -584,14 +716,12 @@ fn collect_title_head_metadata(
             title_content.push_str(raw.as_utf8_str().as_ref());
         }
     }
-    title_content = title_content.trim().to_string();
-    if !title_content.is_empty() {
-        metadata.insert("title".to_string(), title_content);
-    }
+    // ~keep The title is text and carries character references like any other text (#509).
+    let title_content = crate::text::decode_html_entities_cow(title_content.trim()).into_owned();
+    metadata.insert("title".to_string(), title_content);
 }
 
-/// Record a `<link rel="canonical">` href into `metadata`. Extracted from
-/// `extract_head_metadata` — same attribute lookups and `"canonical"` substring check, unchanged.
+/// Record the decoded href of the first `<link rel="canonical">` into `metadata`.
 fn collect_link_head_metadata(child_tag: &tl::HTMLTag, metadata: &mut BTreeMap<String, String>) {
     if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("link") {
         return;
@@ -603,65 +733,117 @@ fn collect_link_head_metadata(child_tag: &tl::HTMLTag, metadata: &mut BTreeMap<S
     if !rel_str.contains("canonical") {
         return;
     }
-    let Some(href_attr) = child_tag.attributes().get("href").flatten() else {
+    let Some(href) = crate::converter::utility::attributes::decoded_attribute(child_tag, "href") else {
         return;
     };
-    let href_str = href_attr.as_utf8_str();
-    metadata.insert("canonical".to_string(), href_str.to_string());
+    metadata
+        .entry("canonical".to_string())
+        .or_insert_with(|| href.into_owned());
 }
 
-/// Record a `<base href>` into `metadata`. Extracted from `extract_head_metadata` — same
-/// attribute lookup, unchanged.
-fn collect_base_head_metadata(child_tag: &tl::HTMLTag, metadata: &mut BTreeMap<String, String>) {
-    if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("base") {
-        return;
-    }
-    let Some(href_attr) = child_tag.attributes().get("href").flatten() else {
-        return;
-    };
-    let href_str = href_attr.as_utf8_str();
-    metadata.insert("base".to_string(), href_str.to_string());
-}
-
-/// Extract metadata from the head element.
+/// Extract metadata from the head element below `roots`, recording `document_base_href` as
+/// `base` whether or not the source has a `<head>` tag.
 pub fn extract_head_metadata(
-    node_handle: &tl::NodeHandle,
+    roots: &[tl::NodeHandle],
+    parser: &tl::Parser,
+    options: &ConversionOptions,
+    document_base_href: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut metadata = head_element_metadata(roots, parser, options);
+    if let Some(href) = document_base_href {
+        metadata.insert("base".to_string(), href.to_string());
+    }
+    metadata
+}
+
+/// The title, meta and canonical link fields of the [`document_head`] below `roots`.
+fn head_element_metadata(
+    roots: &[tl::NodeHandle],
     parser: &tl::Parser,
     options: &ConversionOptions,
 ) -> BTreeMap<String, String> {
-    let mut work = vec![*node_handle];
-    while let Some(handle) = work.pop() {
-        let Some(tl::Node::Tag(tag)) = handle.get(parser) else {
-            continue;
-        };
-
-        if !tag.name().as_utf8_str().eq_ignore_ascii_case("head") {
-            let children: Vec<_> = tag.children().top().iter().copied().collect();
-            for child_handle in children.into_iter().rev() {
-                work.push(child_handle);
-            }
-            continue;
-        }
-
-        let mut metadata = BTreeMap::new();
-        {
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                    collect_meta_head_metadata(child_tag, options, &mut metadata);
-                    collect_title_head_metadata(child_tag, parser, options, &mut metadata);
-                    collect_link_head_metadata(child_tag, &mut metadata);
-                    collect_base_head_metadata(child_tag, &mut metadata);
-                }
-            }
-        }
-
-        if !metadata.is_empty() {
-            return metadata;
+    let mut metadata = BTreeMap::new();
+    let Some(tl::Node::Tag(head)) = document_head(roots, parser).and_then(|handle| handle.get(parser)) else {
+        return metadata;
+    };
+    let mut seen_meta = HashSet::new();
+    let mut seen_title = false;
+    for child_handle in head.children().top().iter() {
+        if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
+            collect_meta_head_metadata(child_tag, options, &mut metadata, &mut seen_meta);
+            collect_title_head_metadata(child_tag, parser, options, &mut metadata, &mut seen_title);
+            collect_link_head_metadata(child_tag, &mut metadata);
         }
     }
+    metadata
+}
 
-    BTreeMap::new()
+/// The first `<head>` element below `roots` before the body starts. A browser's parser ignores
+/// a `<head>` tag once the body has started, at text or at a tag that [`starts_body`].
+pub fn document_head(roots: &[tl::NodeHandle], parser: &tl::Parser) -> Option<tl::NodeHandle> {
+    let mut work: Vec<_> = roots.iter().rev().copied().collect();
+    while let Some(handle) = work.pop() {
+        match handle.get(parser) {
+            Some(tl::Node::Raw(text)) => {
+                let next_is_html = matches!(
+                    work.last().and_then(|next| next.get(parser)),
+                    Some(tl::Node::Tag(tag)) if tag.name().as_bytes().eq_ignore_ascii_case(b"html")
+                );
+                if !is_ignorable_before_head(&text.as_utf8_str(), next_is_html) {
+                    return None;
+                }
+            }
+            Some(tl::Node::Tag(tag)) => {
+                let name = tag.name().as_bytes().to_ascii_lowercase();
+                match name.as_slice() {
+                    b"head" => return Some(handle),
+                    b"html" => {
+                        let first = work.len();
+                        work.extend(tag.children().top().iter().copied());
+                        work[first..].reverse();
+                    }
+                    name if starts_body(name) => return None,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a run of text before the head is found should be skipped rather than ending the
+/// search: whitespace, or any run that sits directly in front of the document's own `<html>`
+/// tag. The WHATWG "before html" insertion mode already discards anything ahead of `<html>`
+/// itself without letting it block the parser from reaching the real head inside, whether that
+/// text is a real byte order mark (stripped earlier, so it never reaches here), one a wrong
+/// encoding guess mangled beyond recognition, or ordinary prose: a browser shows the page's
+/// title and meta tags either way. Text with nothing named `html` ahead of it, a head-only
+/// fragment, still ends the search unchanged; see
+/// `should_ignore_a_head_after_implicit_body_content_on_both_tiers`.
+pub fn is_ignorable_before_head(text: &str, next_tag_is_html: bool) -> bool {
+    next_tag_is_html || text.chars().all(|c| c.is_ascii_whitespace())
+}
+
+/// Whether a start tag named `name` (lower case) starts the body when no body has started:
+/// every tag except the ones the HTML parser's "in head" insertion mode keeps in the head.
+pub fn starts_body(name: &[u8]) -> bool {
+    !matches!(
+        name,
+        b"html"
+            | b"head"
+            | b"base"
+            | b"basefont"
+            | b"bgsound"
+            | b"link"
+            | b"meta"
+            | b"noframes"
+            | b"noscript"
+            | b"script"
+            | b"style"
+            | b"template"
+            | b"title"
+    )
 }
 
 /// Check if text has more than one character.
@@ -730,6 +912,20 @@ pub fn is_inline_element(tag_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_ignorable_before_head() {
+        assert!(is_ignorable_before_head("", false));
+        assert!(is_ignorable_before_head("   \n\t", false));
+        assert!(!is_ignorable_before_head("hello", false));
+        assert!(!is_ignorable_before_head("x", false));
+        assert!(!is_ignorable_before_head("\u{FFFD}\u{FFFD}", false));
+        // ~keep Any text sitting directly in front of the document's own `<html>` tag is
+        // ~keep forgiven, garbage or genuine prose alike (#527 regression: a mangled byte
+        // ~keep order mark reads as ordinary non-whitespace text by this point).
+        assert!(is_ignorable_before_head("\u{FFFD}\u{FFFD}", true));
+        assert!(is_ignorable_before_head("hello", true));
+    }
 
     #[test]
     fn test_trim_line_end_whitespace() {

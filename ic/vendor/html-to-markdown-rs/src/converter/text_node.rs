@@ -12,8 +12,8 @@ use std::borrow::Cow;
 use crate::converter::dom_context::DomContext;
 use crate::converter::main_helpers::{has_more_than_one_char, is_ascii_whitespace_only, is_inline_element};
 use crate::converter::utility::siblings::{
-    FollowingContent, following_sibling_content, get_next_sibling_tag, next_sibling_is_inline_tag,
-    previous_sibling_is_inline_tag,
+    FollowingContent, br_follows_enclosing_elements, following_sibling_content, get_next_sibling_tag,
+    get_previous_sibling_tag, next_sibling_is_inline_tag, previous_sibling_is_inline_tag,
 };
 use crate::options::ConversionOptions;
 use crate::text;
@@ -291,11 +291,9 @@ pub fn process_text_node(
     } else if ctx.in_code || ctx.in_ruby {
         text.into_owned()
     } else if ctx.in_table_cell {
-        // ~keep Always escape * and _ in table cells to prevent unintended emphasis.
-        // ~keep When escape_misc is false the previous implementation appended a
-        // ~keep post-pass `String::replace('|', "\\|")`.  We fold the pipe escape
-        // ~keep into the misc set so the byte-loop handles it in the same walk,
-        // ~keep avoiding a second allocation.
+        // ~keep Every escape_* option applies in a cell exactly as outside one (issue #638).
+        // ~keep A `|` is table syntax, so it is escaped even when escape_misc and escape_ascii
+        // ~keep are off; either of those escapes it already, and a second pass would double it.
         let normalized_text = if options.whitespace_mode == crate::options::WhitespaceMode::Normalized {
             text::normalize_cell_whitespace_cow(text.as_ref())
         } else {
@@ -307,8 +305,15 @@ pub fn process_text_node(
         };
         let src = normalized_text.as_ref();
         let mut out = String::with_capacity(src.len());
-        text::escape_into(&mut out, src, options.escape_misc, true, true, options.escape_ascii);
-        if !options.escape_misc {
+        text::escape_into(
+            &mut out,
+            src,
+            options.escape_misc,
+            options.escape_asterisks,
+            options.escape_underscores,
+            options.escape_ascii,
+        );
+        if !options.escape_misc && !options.escape_ascii {
             if out.contains('|') {
                 out = out.replace('|', r"\|");
             }
@@ -349,6 +354,13 @@ pub fn process_text_node(
             || output.ends_with(". ")
             || output.ends_with("] ")
             || (output.ends_with('\n') && prefix == " ")
+            // ~keep In a heading a `<br>` is written as the space itself (`line_break.rs`), so
+            // ~keep the text after it adds no second one: `<h2>a<br> b</h2>` is `## a b`. Only
+            // ~keep after a `<br>`: `<h2><span>a </span> b</h2>` keeps both spaces, as Tier-1 does.
+            || (ctx.in_heading
+                && output.ends_with(' ')
+                && prefix == " "
+                && get_previous_sibling_tag(node_handle, parser, dom_ctx) == Some("br"))
             || (output.ends_with(' ')
                 && prefix == " "
                 && !previous_sibling_is_inline_tag(node_handle, parser, dom_ctx));
@@ -379,6 +391,11 @@ pub fn process_text_node(
                     final_text.push('\n');
                 } else if let Some(next_tag) = get_next_sibling_tag(node_handle, parser, dom_ctx) {
                     if matches!(next_tag, "span") {
+                    } else if next_tag == "br" {
+                        // ~keep The <br> that follows is this line's ending: its hard-break
+                        // ~keep marker must attach to this text. A '\n' pushed here would
+                        // ~keep strand the marker on a line of its own, which cleanup then
+                        // ~keep turns into a paragraph break (issue #683).
                     } else if ctx.inline_depth > 0 || ctx.convert_as_inline || ctx.in_paragraph {
                         final_text.push(' ');
                     } else {
@@ -386,6 +403,9 @@ pub fn process_text_node(
                     }
                 } else if ctx.inline_depth > 0 || ctx.convert_as_inline || ctx.in_paragraph {
                     final_text.push(' ');
+                } else if br_follows_enclosing_elements(node_handle.get_inner(), parser, dom_ctx) {
+                    // ~keep Same as the `<br>` sibling case above, one element further out:
+                    // ~keep `<span>First\n</span><br>` (issue #683).
                 } else {
                     final_text.push('\n');
                 }
@@ -448,21 +468,9 @@ pub fn process_text_node(
     // ~keep scratch buffer rather than the real document (`in_table_cell`, `convert_as_inline`),
     // ~keep where `output` is not the list item's own accumulating text and indenting it would
     // ~keep corrupt literal content instead.
-    if ctx.in_list_item
-        && !ctx.in_code
-        && !ctx.in_ruby
-        && !ctx.in_table_cell
-        && !ctx.convert_as_inline
-        && output.ends_with('\n')
-        && !output.ends_with("\n\n")
-    {
-        if let Some(indent) =
-            crate::converter::list::utils::continuation_indent_string(ctx.list_depth, ctx.list_indent_columns, options)
-        {
-            output.push_str(&indent);
-        }
-    }
+    crate::converter::list::utils::indent_list_item_line_start(output, ctx, options);
 
+    let text_start = output.len();
     if ctx.in_list_item && final_text.contains("\n\n") {
         let indent = " ".repeat(4 * ctx.list_depth);
         let mut first = true;
@@ -476,6 +484,12 @@ pub fn process_text_node(
         }
     } else {
         output.push_str(&final_text);
+    }
+
+    // ~keep Code keeps its bytes; a Djot paragraph ends only at a blank line, so no line in it
+    // ~keep needs the escape.
+    if !ctx.in_code && options.output_format == crate::options::OutputFormat::Markdown {
+        crate::converter::utility::escaping::escape_continuation_line_start(output, text_start);
     }
 }
 

@@ -724,6 +724,14 @@ impl Parser {
                 // that means we reached the end of the data since it's
                 // just a bunch of sections concatenated after the header.
                 if eof && reader.bytes_remaining() == 0 {
+                    // If this is a nested module or component then the end of
+                    // the input must coincide with the end of the enclosing
+                    // section, otherwise the input was truncated.
+                    if let Some(max) = self.max_offset {
+                        if reader.original_position() < max {
+                            bail!(reader.original_position(), "unexpected end-of-file");
+                        }
+                    }
                     self.check_function_code_counts(reader.original_position())?;
                     self.check_data_count(reader.original_position())?;
                     return Ok(Payload::End(reader.original_position()));
@@ -936,16 +944,14 @@ impl Parser {
                     ),
                     #[cfg(feature = "component-model")]
                     (Encoding::Component, COMPONENT_START_SECTION) => {
-                        match self.counts.component_start_sections {
-                            false => self.counts.component_start_sections = true,
-                            true => {
-                                bail!(
-                                    reader.original_position(),
-                                    "component cannot have more than one start function"
-                                )
-                            }
+                        if self.counts.component_start_sections {
+                            bail!(
+                                reader.original_position(),
+                                "component cannot have more than one start function"
+                            )
                         }
                         let (start, range) = single_item(reader, section_end, "component start")?;
+                        self.counts.component_start_sections = true;
                         Ok(ComponentStartSection { start, range })
                     }
                     #[cfg(feature = "component-model")]
@@ -1903,6 +1909,29 @@ mod tests {
                 consumed: 0,
                 payload: Payload::End(18),
             }),
+        );
+    }
+
+    #[test]
+    fn component_start_section_needs_more_data() {
+        let mut p = parser_after_component_header();
+
+        // Partial section
+        assert_matches!(p.parse(&[9, 3, 0], false), Ok(Chunk::NeedMoreData(_)));
+
+        // Complete section
+        assert_matches!(
+            p.parse(&[9, 3, 0, 0, 0], false),
+            Ok(Chunk::Parsed {
+                consumed: 5,
+                payload: Payload::ComponentStartSection { .. },
+            }),
+        );
+
+        // Duplicate disallowed
+        assert_eq!(
+            p.parse(&[9, 3, 0, 0, 0], false).unwrap_err().message(),
+            "component cannot have more than one start function",
         );
     }
 
