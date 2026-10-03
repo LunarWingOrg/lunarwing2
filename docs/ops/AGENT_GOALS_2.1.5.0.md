@@ -24,7 +24,10 @@
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
 4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/302
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/301
+5. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/301
+   - DONE (2026-10-03, branch rarity/kimi-5-20261003-0800): engine-side restart recovery no longer skips in-flight mission threads. The restart sweep now stamps Failed-by-restart markers (machine-distinguishable from Failed-by-error), sweeps ALL projects (cross-project mission threads were permanent zombies), and the retry recovery sweep re-arms restart-failed mission threads per retry_policy with a root-cause record on the mission, trigger dedup release, and a persisted retry marker for the next restart.
+   - Files: ic/crates/lunarwing_engine/src/types/thread.rs, ic/crates/lunarwing_engine/src/traits/store.rs, ic/crates/lunarwing_engine/src/lib.rs, ic/crates/lunarwing_engine/src/runtime/manager.rs, ic/crates/lunarwing_engine/src/runtime/mission.rs, ic/src/bridge/store_adapter.rs, ic/src/bridge/router.rs
+   - Verification: 5 new unit tests + full lunarwing_engine suite green; cargo fmt --check clean; clippy -D warnings clean on engine crate. Graceful-shutdown watcher cancel arm is WI#276 (item #4), intentionally untouched.
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
