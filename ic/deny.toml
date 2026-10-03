@@ -2,44 +2,45 @@
 unmaintained = "workspace"
 yanked = "deny"
 ignore = [
-    # Accepted advisories — each entry re-verified against upstream 2026-09-26
-    # for v2.1.3.0. See docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md for the full
-    # audit trail. Remove an entry only when its clearing upgrade has landed
+    # Accepted advisories — each entry re-verified against upstream 2026-10-03
+    # for v2.1.5.0. See docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md for the full
+    # audit trail (v2.1.3.0 audit: docs/ops/history/v2.1.3.0_CARGO_DENY_AUDIT.md).
+    # Remove an entry only when its clearing upgrade has landed
     # in Cargo.lock AND the corresponding lockfile root has been re-checked
     # with `--config` overrides so the advisory surfaces as a hard error if
     # it ever comes back.
 
     # rustls-webpki 0.102.8 chain via libsql 0.6.0 -> hyper-rustls 0.25.0 ->
-    # rustls 0.22.4. Re-verified 2026-09-26: libsql 0.9.30 (latest stable)
+    # rustls 0.22.4. Re-verified 2026-10-03: libsql 0.9.30 (latest stable)
     # and 0.10.0-pre.4 (latest prerelease) still request hyper-rustls ^0.25
     # and hyper ^0.14, so even a libsql bump today would keep this chain.
     # Clearing requires an upstream libsql release that adopts rustls 0.23 /
     # hyper-rustls 0.27+, which is a dedicated migration, not a deny.toml edit.
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 CRL distributionPoint matching; pinned by libsql 0.6.0 legacy chain; libsql 0.9.30/0.10.0-pre.4 still pull hyper-rustls ^0.25 (re-verified 2026-09-26)" },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; same libsql 0.6.0 legacy chain as RUSTSEC-2026-0049 (re-verified 2026-09-26)" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name-constraint bypass; same libsql 0.6.0 legacy chain as RUSTSEC-2026-0049 (re-verified 2026-09-26)" },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 CRL parsing panic; same libsql 0.6.0 legacy chain as RUSTSEC-2026-0049 (re-verified 2026-09-26)" },
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 CRL distributionPoint matching; pinned by libsql 0.6.0 legacy chain; libsql 0.9.30/0.10.0-pre.4 still pull hyper-rustls ^0.25 (re-verified 2026-10-03)" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; same libsql 0.6.0 legacy chain as RUSTSEC-2026-0049 (re-verified 2026-10-03)" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name-constraint bypass; same libsql 0.6.0 legacy chain as RUSTSEC-2026-0049 (re-verified 2026-10-03)" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 CRL parsing panic; same libsql 0.6.0 legacy chain as RUSTSEC-2026-0049 (re-verified 2026-10-03)" },
 
     # failure crate — vendored libsignal-protocol path dep only.
     # failure 0.1.8 is the final release (EOL); clearing requires porting
     # the vendored wrapper off failure/failure_derive, not a version bump.
-    { id = "RUSTSEC-2019-0036", reason = "failure crate EOL type-confusion; vendored libsignal-protocol 0.1.0 path dep; failure 0.1.8 is the final release (re-verified 2026-09-26)" },
-    { id = "RUSTSEC-2020-0036", reason = "failure crate officially unmaintained; same vendored libsignal-protocol chain as RUSTSEC-2019-0036 (re-verified 2026-09-26)" },
+    { id = "RUSTSEC-2019-0036", reason = "failure crate EOL type-confusion; vendored libsignal-protocol 0.1.0 path dep; failure 0.1.8 is the final release (re-verified 2026-10-03)" },
+    { id = "RUSTSEC-2020-0036", reason = "failure crate officially unmaintained; same vendored libsignal-protocol chain as RUSTSEC-2019-0036 (re-verified 2026-10-03)" },
 
     # rsa Marvin timing side channel via russh -> rsa 0.10.0-rc.18.
-    # Re-verified 2026-09-26: rsa 0.10.0-rc.18 is still the newest published
+    # Re-verified 2026-10-03: rsa 0.10.0-rc.18 is still the newest published
     # release (max_stable 0.9.10, max 0.10.0-rc.18) and russh 0.63.3 (latest)
     # still requests rsa =0.10.0-rc.18 as an optional dep, so a russh bump
     # does not clear the advisory. Clearing requires an upstream constant-
     # time rsa release or a LunarWing policy change (reject RSA keys at
     # ingestion, drop the russh/rsa feature).
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10.0-rc.18 Marvin timing attack; no patched release exists (re-verified 2026-09-26); russh 0.63.3 still pins rsa =0.10.0-rc.18" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10.0-rc.18 Marvin timing attack; no patched release exists (re-verified 2026-10-03); russh 0.63.3 still pins rsa =0.10.0-rc.18" },
 
-    # h2 empty DATA frames — low severity. The patched 0.4.16 is locked; the
+    # h2 empty DATA frames — low severity. The patched 0.4.19 is locked; the
     # remaining 0.3.27 copy is unpatchable upstream (0.3 line ended at 0.3.27)
     # and is reached only via the legacy libsql 0.6.0 -> tonic 0.11 -> hyper 0.14
     # chain, same block as the webpki entries above.
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.16 (re-verified 2026-09-26)" },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.19 (re-verified 2026-10-03)" },
 ]
 
 [licenses]
