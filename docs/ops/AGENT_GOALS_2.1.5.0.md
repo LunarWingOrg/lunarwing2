@@ -25,7 +25,12 @@
    - Tracked-manifest/lock audit: no project-owned package or path dependency remains at 2.1.4 in any tracked Cargo.toml/Cargo.lock outside ic/vendor/ (only intentional historical fixtures in .gitlab/tests and validate_config.py reference v2.1.4.0 branch names).
    - Worker/CI audit: pebble (upstream commit 2d0f3786 + reviewed RUSTSEC-2026-0285 patched lock), opencode (v1.18.25 hold), opencode2 (v2.0.21), kimi (2.1.1) pins internally consistent across build-worker-image.sh, Dockerfiles, and ci-config cross-checks; infra images digest-pinned (buildkit v0.25.1, trivy 0.74.0, python 3.12-slim). External worker version upgrades left to item 2 per this item's own scope note.
    - CI green on a scratch branch: full-validation pipeline #4987 on rarity/kimi-1-20261003-0501-fullval (LUNARWING_CI_FULL_VALIDATION=1, sha 1136b721ea78) — 26/26 jobs success, including all four check lanes, clippy-all, cargo-deny, lockfile-only-advisory-guard, cavepony-wasm, wasm-channel-test-artifacts, architecture-boundaries, rust-test-lib/libsql/postgres-integration.
-2. [ ] update external workers - opencode2 to 2.0.21 - NEW VERSION - update from 2.0.20
+2. [x] update external workers - opencode2 to 2.0.21 - NEW VERSION - update from 2.0.20
+   - DONE (100%) 2026-10-03: lane was already advanced to v2.0.21 during the v2.1.4.0 cycle (commit `e62ccdee2`, "worker: bump opencode2 v2.0.20 -> v2.0.21"); this pass re-verified every pin and the upstream tag live.
+   - Pins confirmed at `v2.0.21` @ `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`: `opencode2.4lunarwing/Dockerfile` (OPENCODE_VERSION/OPENCODE_REF), `.gitlab/scripts/build-worker-image.sh` (source_ref + build args), `opencode2.4lunarwing/scripts/prepare_reproducible_build_test.py` fixture, `opencode2.4lunarwing/AGENTS.md` + `README.md`, `docs/ops/WORKER-CONTAINERS.md` (v2.0.21 bump entry 2026-10-01), `docs/guides/CONTRIBUTOR-ONBOARDING.md`.
+   - Tag re-verified live today: `git ls-remote https://github.com/anomalyco/opencode refs/tags/v2.0.21` → `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (matches pin).
+   - Host-side `prepare_reproducible_build_test.py` re-run: 3/3 OK, including the untouched-failure contract.
+   - No stale `2.0.20` pins remain outside historical docs (history/, release notes, prior bump entries). Whole-image reproducibility still gated by the CI candidate-vs-clean-rebuild check before promotion.
 
 ## Phase 2 — Features & Polish
 
