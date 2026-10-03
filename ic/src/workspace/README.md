@@ -105,6 +105,21 @@ wording itself is pinned scanner-clean by a regression test. The web
 `POST /api/memory/write` endpoint reports the same rejection as HTTP 422
 (matching the prompt editor) instead of 500. Gate strictness is unchanged.
 
+The gate is deliberately **stricter than the sanitizer's own neutralization**
+(WI#289 — decision: document, not align). Detection matches role labels and
+override phrasing anywhere in the text, so a mid-sentence `user:` rejects
+exactly like a line-start one, while the sanitizer's render-time escaping only
+prefixes *line-start* role labels (and only when a Critical pattern fires) and
+never rewrites phrase patterns. The asymmetry stays because, for these files,
+the write gate is the only keyword defense — prompt assembly applies nothing
+but the `<|` opener break — and because positional matching is evadable (a
+zero-width character or U+2028 hides a label from a line-start rule) while
+position-free matching is not. False positives are handled by rephrasing
+(the rejection says how) or, in daily logs, by inline quoting. The full
+rationale lives in the `lunarwing_safety` sanitizer module docs; tests in both
+places pin the matrix (`detect_vs_neutralize`,
+`test_role_label_detection_is_position_free_in_every_prompt_file_class`).
+
 ### Daily-Log Quarantine (WI#288)
 
 An append to a daily log re-scans the full combined candidate, so a day file
