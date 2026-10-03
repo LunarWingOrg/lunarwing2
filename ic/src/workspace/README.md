@@ -142,6 +142,14 @@ poison pre-exists: a poisoned entry, or a pattern split across the append
 boundary, is still a plain rejection with no file movement. Quarantine
 failures are logged and never mask the original rejection.
 
+For a deliberate repair, `memory_write(target: "daily_log", append: false)`
+replaces today's log through `write()`: only the new content is scanned, and
+the previous version (poisoned or not) is kept in the shadow backup
+`backups/daily/YYYY-MM-DD.md.bak`. The named `daily_log` target used to ignore
+`append: false` and append silently while reporting a replace (WI#288
+residual); the explicit-path form (`target: "daily/YYYY-MM-DD.md"`) always
+honored it.
+
 ### Prompt-File Shadow Backups (WI#286)
 
 A full-replace `write()` of a prompt-visible file destroys its prior content —
