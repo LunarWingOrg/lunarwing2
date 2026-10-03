@@ -162,6 +162,11 @@ pub struct ThreadConfig {
     /// Per-kind policy caps (`MODEL_RECOVERY_POLICY` in the orchestrator)
     /// apply on top. Default: 1 (legacy one-attempt behavior). Clamped to
     /// 0..=3. Env override: ENGINE_V2_MODEL_RECOVERY_ATTEMPTS.
+    /// Note: when this is at least 1, context_overflow is exempt from the
+    /// per-streak clamp (WI#298) — its shrink ladder changes the inputs
+    /// instead of blindly retrying, so it uses its policy cap (2);
+    /// `model_recovery_total_attempts` still bounds it over the thread
+    /// lifetime, and 0 still disables engine recovery for every kind.
     #[serde(default = "default_model_recovery_max_attempts")]
     pub model_recovery_max_attempts: u32,
     /// Total engine-level recovery attempts allowed per thread lifetime.

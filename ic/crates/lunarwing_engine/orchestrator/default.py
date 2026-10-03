@@ -38,7 +38,10 @@ RECOVERY_CONTEXT_MAX_CHARS = 24000
 
 # Per-kind engine recovery policy. max_attempts caps engine-visible recovery
 # retries for that failure kind (further capped by the thread config's
-# model_recovery_max_attempts). shrink (context_overflow only) scales the
+# model_recovery_max_attempts — except context_overflow, whose shrink ladder
+# changes the inputs rather than blindly retrying, so it is exempt from that
+# per-streak clamp; the lifetime model_recovery_total_attempts cap still
+# bounds it, see WI#298). shrink (context_overflow only) scales the
 # recovery context budget per attempt. Kinds absent here — and unknown kinds —
 # get no engine recovery attempt: authentication/request_rejected fail fast by
 # design, and rate_limited is owned by the provider layer's Retry-After
@@ -1205,8 +1208,19 @@ def run_loop(context, goal, actions, state, config):
             if not isinstance(kind, str) or not kind:
                 kind = "internal"
             policy = MODEL_RECOVERY_POLICY.get(kind, {"max_attempts": 0})
-            max_attempts = min(policy.get("max_attempts", 0),
-                               config.get("model_recovery_max_attempts", 1))
+            if kind == "context_overflow":
+                # Context-overflow recovery shrinks the request via the shrink
+                # ladder instead of blindly retrying identical input, so it is
+                # exempt from the per-streak config clamp (WI#298); the
+                # lifetime total_attempts cap below still bounds it, and a
+                # clamp of 0 still switches engine recovery off entirely.
+                if config.get("model_recovery_max_attempts", 1) > 0:
+                    max_attempts = policy.get("max_attempts", 0)
+                else:
+                    max_attempts = 0
+            else:
+                max_attempts = min(policy.get("max_attempts", 0),
+                                   config.get("model_recovery_max_attempts", 1))
             total_cap = config.get("model_recovery_total_attempts", 4)
             attempts = recovery.get("model_recovery_attempts", 0)
             total_attempts = recovery.get("model_recovery_total_attempts", 0)

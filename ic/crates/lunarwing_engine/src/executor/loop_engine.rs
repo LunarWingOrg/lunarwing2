@@ -1947,6 +1947,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_overflow_second_attempt_fires_at_default_config() {
+        // WI#298: context_overflow is exempt from the model_recovery_max_attempts
+        // clamp, so the 0.35 shrink rung is reachable without operator config.
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: "window exceeded".into(),
+            }),
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: "window exceeded".into(),
+            }),
+            Ok(text_response("recovered")),
+        ]));
+        let config = ThreadConfig {
+            model_recovery_max_attempts: 1,
+            ..ThreadConfig::default()
+        };
+        let (mut exec, _tx) = make_loop_with_llm(llm.clone(), Vec::new(), config).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+        ));
+        assert_eq!(llm.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_ladder_still_terminates_at_policy_cap() {
+        // WI#298: the clamp exemption does not make recovery unbounded — the
+        // policy max_attempts (2) still caps the shrink ladder.
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: "window exceeded".into(),
+            }),
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: "window exceeded".into(),
+            }),
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: "window exceeded".into(),
+            }),
+        ]));
+        let config = ThreadConfig {
+            model_recovery_max_attempts: 1,
+            ..ThreadConfig::default()
+        };
+        let (mut exec, _tx) = make_loop_with_llm(llm.clone(), Vec::new(), config).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(
+                    crate::types::error::ModelFailureKind::ContextOverflow
+                ),
+                ..
+            }
+        ));
+        assert_eq!(llm.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_recovery_stays_off_when_clamp_is_zero() {
+        // WI#298 review fix: the exemption must not revive a knob an operator
+        // set to 0 — ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=0 still disables engine
+        // recovery for context_overflow too.
+        let llm = Arc::new(ResultMockLlm::new(vec![Err(EngineError::Llm {
+            kind: crate::types::error::ModelFailureKind::ContextOverflow,
+            reason: "window exceeded".into(),
+        })]));
+        let config = ThreadConfig {
+            model_recovery_max_attempts: 0,
+            ..ThreadConfig::default()
+        };
+        let (mut exec, _tx) = make_loop_with_llm(llm.clone(), Vec::new(), config).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(
+                    crate::types::error::ModelFailureKind::ContextOverflow
+                ),
+                ..
+            }
+        ));
+        assert_eq!(llm.requests().len(), 1);
+    }
+
+    #[tokio::test]
     async fn repeated_failed_action_batches_get_one_warning_turn() {
         let responses = (0..4)
             .map(|index| action_response("test_tool", &format!("call_{index}")))
