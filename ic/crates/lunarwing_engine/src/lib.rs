@@ -404,6 +404,9 @@ pub(crate) mod tests {
                 .cloned()
                 .collect())
         }
+        async fn list_all_threads_global(&self) -> Result<Vec<Thread>, EngineError> {
+            Ok(self.threads.read().await.iter().cloned().collect())
+        }
         async fn list_all_missions(
             &self,
             project_id: ProjectId,
