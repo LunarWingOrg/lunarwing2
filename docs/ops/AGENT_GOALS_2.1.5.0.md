@@ -40,7 +40,8 @@
 
 4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/302
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/301
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
+6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
+   - DONE 100% (2026-10-03, branch aj/kimi-6-20261003-0800): watcher's GatePaused arm now discards any pending gate armed for the thread before finalize — new `finalize_regated_expired_turn` helper in `ic/src/bridge/router.rs` (NotFound is the common no-op case). Regression test `expired_gate_regated_wrap_up_discards_rearmed_gate` fixtures a real expiry-resume → re-pause cycle with an armed gate and asserts the store empties (verified red without the discard). Evidence: `cargo test --lib expired_gate` 8/8 pass; `cargo clippy --lib --tests -D warnings` clean; `cargo fmt --all -- --check` clean.
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297
