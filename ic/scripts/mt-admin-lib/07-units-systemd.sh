@@ -418,7 +418,7 @@ EOF
 
 # Render a per-tenant Quadlet .container for an external worker.
 # Mirrors the imperative env from start_tenant_<worker>: the WORKER_AUTH_TOKEN ->
-# AGENT_AUTH_TOKEN and LLM_API_KEY -> TENSORZERO_API_KEY remap is resolved here and
+# AGENT_AUTH_TOKEN and LLM_API_KEY -> TENSORMOON_API_KEY remap is resolved here and
 # inlined as Environment= in a 0600 tenant-owned unit. Kimi uses a separate
 # mode-0600 runtime env file so its API key never enters generated unit commands.
 # Returns early (no unit) when the worker has no allocated wss port.
@@ -572,7 +572,11 @@ EOF
     fi
     [[ "$worker" == "kimi" || -z "$agent_token" ]] \
       || printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
-    [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] && [[ -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
+    if [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] && [[ -n "$tz_key" ]]; then
+      printf 'Environment=TENSORMOON_API_KEY=%s\n' "$tz_key" # no-secret-scan (format string)
+      # Pre-fork name: worker images built before the TensorMoon switch read it.
+      printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key" # no-secret-scan (format string)
+    fi
     local oc_model oc_base_url
     oc_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
     oc_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
@@ -662,7 +666,7 @@ render_tenant_systemd_units() {
   local proxy_bin
   # Run from the tenant's own clone (in their home), not the admin's source repo,
   # so a tenant's services aren't coupled to another user's home directory.
-  proxy_bin="$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py"
+  proxy_bin="$(tenant_lw_root "$name")/tensormoon-proxy-configurations/lunarwing-proxy.py"
 
   local ws_adapter_path
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
@@ -678,12 +682,12 @@ render_tenant_systemd_units() {
   if tenant_proxy_enabled "$name"; then
   cat >"$user_unit_dir/lunarwing-proxy-${name}.service" <<EOF
 [Unit]
-Description=LunarWing TensorZero proxy ($name)
+Description=LunarWing TensorMoon proxy ($name)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$(command -v python3) $proxy_bin --port $proxy_port --bind 127.0.0.1 --tensorzero $DEFAULT_TENSORZERO_URL
+ExecStart=$(command -v python3) $proxy_bin --port $proxy_port --bind 127.0.0.1 --tensormoon $DEFAULT_TENSORMOON_URL
 EnvironmentFile=$env_dir/proxy.env
 Restart=on-failure
 RestartSec=5

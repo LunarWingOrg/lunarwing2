@@ -68,7 +68,7 @@ Review, rather than blindly copy, the existing `config.toml` and database-backed
 - keep provider credentials in the encrypted secrets path or protected environment;
 - use current channel and sandbox settings;
 - update model identifiers to providers/functions that the target proxy actually exposes;
-- the current TensorZero default is `tensorzero::function_name::lunarwing`, not the old `ironclaw` function name;
+- the current TensorMoon default is `tensormoon::function_name::lunarwing`, not the old `ironclaw` function name;
 - preserve custom workspace identity files and templates after checking their ownership and permissions.
 
 ## 4. Run Database Migrations on the Rehearsal Copy

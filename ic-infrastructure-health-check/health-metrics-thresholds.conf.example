@@ -21,11 +21,11 @@
 # 40 minutes means the timer itself is broken.
 THRESHOLD_lunarwing_health_report_age_seconds="crit:>2400"
 
-# TensorZero inference latency (milliseconds) — rising p95 precedes restarts.
-THRESHOLD_lunarwing_health_tensorzero_p95_ms="warn:>1500 crit:>4000"
+# TensorMoon inference latency (milliseconds) — rising p95 precedes restarts.
+THRESHOLD_lunarwing_health_tensormoon_p95_ms="warn:>1500 crit:>4000"
 
-# TensorZero error rate (fraction of requests).
-THRESHOLD_lunarwing_health_tensorzero_error_rate="crit:>0.05"
+# TensorMoon error rate (fraction of requests).
+THRESHOLD_lunarwing_health_tensormoon_error_rate="crit:>0.05"
 
 # ClickHouse disk / memory pressure (percent).
 THRESHOLD_lunarwing_health_clickhouse_disk_pct="warn:>75 crit:>90"

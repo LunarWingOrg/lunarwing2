@@ -1,17 +1,17 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "tensorzero/tensorzero::function_name::lunarwing",
+  "model": "tensormoon/tensormoon::function_name::lunarwing",
   "providers": {
-    "tensorzero": {
-      "name": "TensorZero",
+    "tensormoon": {
+      "name": "TensorMoon",
       "package": "ai:@ai-sdk/openai-compatible",
       "settings": {
         "apiKey": "unneeded",
         "baseURL": "http://192.168.1.157:3000/openai/v1/"
       },
       "models": {
-        "tensorzero::function_name::lunarwing": {
-          "name": "tensorzero::function_name::lunarwing",
+        "tensormoon::function_name::lunarwing": {
+          "name": "tensormoon::function_name::lunarwing",
           "limit": {
             "context": 959000,
             "output": 131072

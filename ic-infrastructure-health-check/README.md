@@ -18,7 +18,7 @@ cron-wrapper.sh
   │     ├── health-omemo.sh            (OMEMO key/bundle/session store)
   │     ├── health-ratelimit.sh        (throttle counters, queue depth)
   │     ├── health-clickhouse.sh       (query time, disk, memory)
-  │     ├── health-tensorzero.sh       (proxy p50/p95, error rate, queue, GPU)
+  │     ├── health-tensormoon.sh       (proxy p50/p95, error rate, queue, GPU)
   │     ├── health-models.sh           (LLM provider APIs)
   │     ├── health-llm-streams.sh      (provider stream retries, aborts, corruption, TTFC)
   │     ├── health-lunarvision.sh      (OCR + VL sidecar: health, metrics, VL status)
@@ -73,9 +73,9 @@ of the report is still produced.
 | rc-service | health-openrc.sh, self-heal (OpenRC hosts) | Pre-installed on OpenRC systems |
 | launchctl | health-launchd.sh, self-heal (macOS) | Pre-installed on macOS |
 | sudo + podman | health-systemd.sh & self-heal (per-tenant **user** units + container health) | systemd multi-tenant hosts |
-| clickhouse-client | health-clickhouse.sh, health-tensorzero.sh | ClickHouse docs |
+| clickhouse-client | health-clickhouse.sh, health-tensormoon.sh | ClickHouse docs |
 | nc (netcat) | health-xmpp.sh (port reachability) | `apt install netcat-openbsd` / `brew install netcat` |
-| nvidia-smi / rocm-smi | health-tensorzero.sh (GPU utilization) | NVIDIA driver / ROCm package |
+| nvidia-smi / rocm-smi | health-tensormoon.sh (GPU utilization) | NVIDIA driver / ROCm package |
 | flock | lunarwing-self-heal.sh (single-instance lock) | util-linux (pre-installed on most Linux) |
 
 > `timeout` is only *required* in spirit — every call site degrades gracefully
@@ -86,7 +86,7 @@ of the report is still produced.
 
 | Previously needed | Replaced by |
 |-------------------|-------------|
-| bc | `awk` for float comparisons in health-tensorzero.sh |
+| bc | `awk` for float comparisons in health-tensormoon.sh |
 
 ## Quick Start
 
@@ -114,7 +114,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | omemo | health-omemo.sh | OMEMO key/bundle/session store | `devices`, `bundles`, `sessions`, `recent_sessions` |
 | ratelimit | health-ratelimit.sh | `$BASE/ratelimit` throttle logs + queue | `throttled_last_hour`, `queue_depth` |
 | clickhouse | health-clickhouse.sh | ClickHouse responsiveness + resources | `query_time_ms`, `disk_pct`, `memory_pct` |
-| tensorzero | health-tensorzero.sh | Proxy latency/errors (from ClickHouse) + GPU | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
+| tensormoon | health-tensormoon.sh | Gateway latency (ClickHouse `ModelInference`) + GPU | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
 | models | health-models.sh | OpenRouter / OpenAI / Anthropic / local LLM APIs | `provider_count`, `providers_{healthy,degraded,critical}`, `latency_max_ms`, per-provider `provider_latency_ms` / `provider_status` (numeric map; `last_error` stays string-only in `providers[]`) |
 | llm_streams | health-llm-streams.sh | Daemon snapshots at `$BASE/runtime/llm-stream-metrics.json`; all registry tenants on MT hosts | Per-provider stream starts/completions, retries by reason, aborts, decode failures, corruption signatures, and time-to-first-chunk samples/max/last; provider and tenant are bounded Prometheus labels |
 | lunarvision | health-lunarvision.sh | OCR + VL sidecar `/health` and `/vision/metrics` | `service_status`, `ocr_available`, `vl_available`, `capabilities`, `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms` |
@@ -173,7 +173,7 @@ non-boolean `enable_voice`, missing or duplicate enabled `voice_health` ports,
 an unreachable instance, or an unready STT model makes the component critical.
 All enabled instances remain visible in `metrics.instances`, so one healthy
 tenant cannot mask a failing peer. LLM stream integrity is also monitor-only:
-recent retry/abort/corruption counters should trigger provider/TensorZero
+recent retry/abort/corruption counters should trigger provider/TensorMoon
 investigation, not an automatic tenant restart. LunarVoice is monitor-only in self-heal; the
 pipeline alerts and escalates but does not automatically restart optional model
 workloads.
@@ -206,11 +206,13 @@ workloads.
 | `HEALTH_RATELIMIT_QUEUE_DEGRADED` | health-ratelimit.sh | `100` | Queued messages before degraded |
 | `HEALTH_CLICKHOUSE_{DISK,MEMORY}_{DEGRADED,CRITICAL}` | health-clickhouse.sh | `70`/`85`, `80`/`95` | Disk and memory utilization thresholds (percent) |
 | `HEALTH_CLICKHOUSE_QUERY_{DEGRADED,CRITICAL}_MS` | health-clickhouse.sh | `1000` / `5000` | Query latency thresholds |
-| `HEALTH_TENSORZERO_P95_{DEGRADED,CRITICAL}_MS` | health-tensorzero.sh | `5000` / `15000` | Inference p95 latency thresholds |
-| `HEALTH_TENSORZERO_ERROR_{DEGRADED,CRITICAL}_PCT` | health-tensorzero.sh | `1` / `5` | Error-rate thresholds (percent; floats allowed) |
-| `HEALTH_TENSORZERO_QUEUE_{DEGRADED,CRITICAL}` | health-tensorzero.sh | `5` / `20` | Queue-depth thresholds |
-| `HEALTH_TENSORZERO_GPU_UTIL_WARN_PCT` | health-tensorzero.sh | `90` | Advisory high-GPU-utilization issue (never critical) |
-| `UNITS` | health-systemd.sh | `lunarwing.service xmpp-bridge.service tensorzero-gateway.service` | Override the base systemd units to probe |
+| `HEALTH_TENSORMOON_P95_{DEGRADED,CRITICAL}_MS` | health-tensormoon.sh | `5000` / `15000` | Inference p95 latency thresholds |
+| `HEALTH_TENSORMOON_ERROR_{DEGRADED,CRITICAL}_PCT` | health-tensormoon.sh | `1` / `5` | Error-rate thresholds (percent; floats allowed) |
+| `HEALTH_TENSORMOON_QUEUE_{DEGRADED,CRITICAL}` | health-tensormoon.sh | `5` / `20` | Queue-depth thresholds |
+| `HEALTH_TENSORMOON_GPU_UTIL_WARN_PCT` | health-tensormoon.sh | `90` | Advisory high-GPU-utilization issue (never critical) |
+| `HEALTH_TENSORMOON_CLICKHOUSE_DB` | health-tensormoon.sh | `tensormoon` | ClickHouse database holding the gateway's `ModelInference` table |
+| `TENSORMOON_SERVICE` | lunarwing-self-heal.sh | `tensormoon-gateway` | Unit the `tensormoon` component restarts (`tensorzero-gateway` on hosts still running the pre-fork unit) |
+| `UNITS` | health-systemd.sh | `lunarwing.service xmpp-bridge.service tensormoon-gateway.service` | Override the base systemd units to probe |
 | `SERVICES` | health-openrc.sh | auto-discovered | Override the OpenRC services to probe (space-separated) |
 | `INITD_DIR` | health-openrc.sh | `/etc/init.d` | Init-script directory scanned for tenant services |
 | `HEALTH_OPENRC_STATUS_TIMEOUT` | health-openrc.sh | `8` | Per-unit `rc-service status` timeout (s); `0` disables |
@@ -379,7 +381,7 @@ wedge it.
 |-----------|--------------------------------|---------------|
 | gateway | `lunarwing` | health-gateway.sh |
 | xmpp | `xmpp-bridge` | health-xmpp.sh |
-| tensorzero | `tensorzero-gateway` | health-tensorzero.sh |
+| tensormoon | `tensormoon-gateway` | health-tensormoon.sh |
 | clickhouse | `clickhouse-server` | health-clickhouse.sh |
 | lunarvision | `ocr-sidecar` | health-lunarvision.sh |
 | lunarvoice | `voice-sidecar` (monitor-only) | health-lunarvoice.sh |
@@ -596,3 +598,22 @@ harness fails loudly with a pointer to fix it.
 Requirements: `bash` + `jq` (everywhere), and `flock` for the locking test
 (skipped gracefully if absent). The OpenRC and per-unit-timeout tests skip
 gracefully when `timeout` is unavailable.
+
+## TensorMoon rename (was TensorZero)
+
+LunarWing's model gateway moved from the abandoned TensorZero to the
+organisation's fork, TensorMoon. In this directory that renamed:
+
+| Before | After |
+|--------|-------|
+| component `tensorzero`, `health-tensorzero.sh` | component `tensormoon`, `health-tensormoon.sh` |
+| metrics `lunarwing_health_tensorzero_*` | `lunarwing_health_tensormoon_*` (update external dashboards; `contrib/` is already updated) |
+| `HEALTH_TENSORZERO_*` thresholds | `HEALTH_TENSORMOON_*` (old names still read as fallbacks) |
+| self-heal target `tensorzero-gateway` | `tensormoon-gateway` (override with `TENSORMOON_SERVICE`) |
+| `health-systemd.sh` default unit `tensorzero-gateway.service` | `tensormoon-gateway.service` (override with `UNITS`) |
+
+`health-tensormoon.sh` now reads p50/p95 latency from TensorMoon's
+`ModelInference` ClickHouse table (database `HEALTH_TENSORMOON_CLICKHOUSE_DB`)
+when `clickhouse-client` can reach it, and otherwise falls back to the GPU-only
+probe as before. Full cutover runbook:
+`docs/guides/MIGRATE_TENSORZERO_TO_TENSORMOON.md`.

@@ -217,7 +217,7 @@
         { value: 'custom', label: 'Custom…' },
       ], () => render()));
       if (data.model_choice === 'custom') {
-        b.appendChild(textField(data, 'model_custom', 'Custom LLM model ID', { placeholder: 'tensorzero::function_name::…' }));
+        b.appendChild(textField(data, 'model_custom', 'Custom LLM model ID', { placeholder: 'tensormoon::function_name::…' }));
       }
       b.appendChild(textField(data, 'llm_api_key', 'LLM API key (blank if unneeded)', { type: 'password' }));
     }
@@ -264,8 +264,8 @@
       if (data.w_opencode) workers.push('opencode');
       if (data.w_opencode2) workers.push('opencode2');
       if (data.w_kimi) workers.push('kimi');
-      let model = 'tensorzero::function_name::lunarwing';
-      if (data.model_choice === 'FrontierCODE') model = 'tensorzero::function_name::FrontierCODE';
+      let model = 'tensormoon::function_name::lunarwing';
+      if (data.model_choice === 'FrontierCODE') model = 'tensormoon::function_name::FrontierCODE';
       else if (data.model_choice === 'custom') model = data.model_custom.trim();
       return {
         name: data.name.trim(),

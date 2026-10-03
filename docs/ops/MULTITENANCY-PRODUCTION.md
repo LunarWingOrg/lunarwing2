@@ -1,6 +1,6 @@
 # Production Multi-Tenant Deployment
 
-This document describes the production multi-tenant system managed by `ic/scripts/lunarwing-mt-admin.sh`. Each tenant is a real OS user with its own repo clone, build artifacts, services, PostgreSQL container, TensorZero proxy, and XMPP bridge.
+This document describes the production multi-tenant system managed by `ic/scripts/lunarwing-mt-admin.sh`. Each tenant is a real OS user with its own repo clone, build artifacts, services, PostgreSQL container, TensorMoon proxy, and XMPP bridge.
 
 ## Overview
 
@@ -10,11 +10,11 @@ The admin script runs as root and handles:
 2. **Port allocation** from a centralized registry at `/etc/lunarwing/ports.json`
 3. **Per-user repo clone** and sequential builds (flock-serialized to avoid OOM)
 4. **Per-user PostgreSQL container** (Docker or Podman)
-5. **Per-user TensorZero proxy** on its own port
+5. **Per-user TensorMoon proxy** on its own port
 6. **Per-user XMPP bridge** with its own JID
 7. **Service unit generation** for systemd (user-level) or OpenRC (system-level)
 
-> **Proxy opt-in (v1.1.9+):** The TensorZero proxy is opt-in as of v1.1.9. Use `--enable-proxy` on `add-tenant` to provision it. Without it, the daemon connects directly to the upstream LLM endpoint (`TENSORZERO_URL`). Existing tenants are unaffected until their units are re-rendered.
+> **Proxy opt-in (v1.1.9+):** The TensorMoon proxy is opt-in as of v1.1.9. Use `--enable-proxy` on `add-tenant` to provision it. Without it, the daemon connects directly to the upstream LLM endpoint (`TENSORMOON_URL`). Existing tenants are unaffected until their units are re-rendered.
 
 ## Full Run Walkthrough
 
@@ -220,7 +220,7 @@ tail -f /home/ruffles/lunarwing/logs/lunarwing.log
 - Docker or Podman installed and running
 - Rust toolchain (rustup, cargo) accessible to tenant users
 - `jq` for port registry JSON operations
-- Python 3 for the TensorZero proxy
+- Python 3 for the TensorMoon proxy
 - Git for repo cloning
 
 Run `sudo scripts/lunarwing-mt-admin.sh doctor` to verify all dependencies.
@@ -298,7 +298,7 @@ Primary block (10000-19999):
 | +1 | http | HTTP webhook endpoint |
 | +2 | bridge | XMPP bridge HTTP API |
 | +3 | postgres | PostgreSQL container port |
-| +4 | proxy | TensorZero LLM proxy |
+| +4 | proxy | TensorMoon LLM proxy |
 | +5 | weechat | WeeChat relay |
 | +6 | orchestrator | Job orchestrator API |
 | +7 | nanocode_wss | Reserved legacy Nanocode slot; never reallocated |
@@ -598,8 +598,9 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 | `LUNARWING_MT_PROFILE` | `release` | Build profile. Keep `release` for production and routine verification; do not use full debug builds. |
 | `LUNARWING_MT_BUILD_JOBS` | `$(nproc)` | Explicit Cargo job cap for tenant builds |
 | `LUNARWING_MT_SOURCE_REPO` | repository root | Source checkout cloned for each tenant |
-| `LUNARWING_MT_TENSORZERO_URL` | `http://192.168.1.157:3000/openai/v1` | Upstream LLM URL and proxy upstream default |
-| `LUNARWING_MT_LLM_BASE_URL` | empty | Fleet default `LLM_BASE_URL`; empty selects the local proxy when enabled, otherwise `LUNARWING_MT_TENSORZERO_URL` |
+| `LUNARWING_MT_TENSORMOON_URL` | `http://192.168.1.157:3000/openai/v1` | Upstream LLM URL and proxy upstream default |
+| `LUNARWING_MT_TENSORZERO_URL` | (unset) | Deprecated alias of `LUNARWING_MT_TENSORMOON_URL` (pre-fork name; warns when used) |
+| `LUNARWING_MT_LLM_BASE_URL` | empty | Fleet default `LLM_BASE_URL`; empty selects the local proxy when enabled, otherwise `LUNARWING_MT_TENSORMOON_URL` |
 | `LUNARWING_MT_BACKUP_DIR` | `/var/lib/lunarwing-backups` | PostgreSQL dump root |
 | `LUNARWING_MT_BACKUP_KEEP` | `7` | Dumps retained per tenant; `0` keeps all |
 
@@ -614,7 +615,7 @@ add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                  generate env, render and install services
 add-tenants <names> [options]    Apply the same options to comma-separated names
   --docker-group                 Add user to docker/podman group
-  --enable-proxy                 Provision the optional TensorZero proxy
+  --enable-proxy                 Provision the optional TensorMoon proxy
   --enable-darkirc               Provision DarkIRC daemon and adapter
   --with-pebble                  Select Pebble for these tenants
   --with-opencode                Select OpenCode for these tenants

@@ -77,7 +77,8 @@ sudo python3 -m hermes_kawarimi import --source /path/to/hermes/home \
 resolution). Import flags: `--apply`, `--start`, `--force` (reuse an existing
 tenant name), `--with-pebble/--with-opencode/--with-kimi`, `--with-toolchains`
 (build-tenant only), `--docker-group`,
-`--tensorzero-url`, `--llm-model`, `--save FILE` / `--resume FILE`.
+`--tensormoon-url` (`--tensorzero-url` is a deprecated alias; saved plans with the old
+`tensorzero_url` key still load), `--llm-model`, `--save FILE` / `--resume FILE`.
 
 ## Module layout
 

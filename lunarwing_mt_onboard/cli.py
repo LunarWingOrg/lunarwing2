@@ -414,16 +414,16 @@ def _configure_llm(config: TenantConfig) -> None:
     idx = _q_select(
         "LLM model",
         [
-            "tensorzero::function_name::FrontierCODE",
-            "tensorzero::function_name::lunarwing",
+            "tensormoon::function_name::FrontierCODE",
+            "tensormoon::function_name::lunarwing",
             "Custom...",
         ],
         default=1,
     )
     if idx == 0:
-        config.llm_model = "tensorzero::function_name::FrontierCODE"
+        config.llm_model = "tensormoon::function_name::FrontierCODE"
     elif idx == 1:
-        config.llm_model = "tensorzero::function_name::lunarwing"
+        config.llm_model = "tensormoon::function_name::lunarwing"
     else:
         config.llm_model = _q_text("Custom LLM model ID")
     config.llm_api_key = _q_password(

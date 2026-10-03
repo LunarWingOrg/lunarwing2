@@ -87,17 +87,24 @@
 #HEALTH_CLICKHOUSE_QUERY_CRITICAL_MS=5000
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Component: tensorzero (TensorZero gateway / model router)
+# Component: tensormoon (TensorMoon gateway / model router)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Probes ClickHouse (or GPU fallback). Thresholds (defaults shown):
-#HEALTH_TENSORZERO_P95_DEGRADED_MS=5000
-#HEALTH_TENSORZERO_P95_CRITICAL_MS=15000
-#HEALTH_TENSORZERO_ERROR_DEGRADED_PCT=1   # Floats allowed for ERROR_* only
-#HEALTH_TENSORZERO_ERROR_CRITICAL_PCT=5
-#HEALTH_TENSORZERO_QUEUE_DEGRADED=5
-#HEALTH_TENSORZERO_QUEUE_CRITICAL=20
-#HEALTH_TENSORZERO_GPU_UTIL_WARN_PCT=90   # Advisory issue only; never critical
+#HEALTH_TENSORMOON_P95_DEGRADED_MS=5000
+#HEALTH_TENSORMOON_P95_CRITICAL_MS=15000
+#HEALTH_TENSORMOON_ERROR_DEGRADED_PCT=1   # Floats allowed for ERROR_* only
+#HEALTH_TENSORMOON_ERROR_CRITICAL_PCT=5
+#HEALTH_TENSORMOON_QUEUE_DEGRADED=5
+#HEALTH_TENSORMOON_QUEUE_CRITICAL=20
+#HEALTH_TENSORMOON_GPU_UTIL_WARN_PCT=90   # Advisory issue only; never critical
+# The pre-fork HEALTH_TENSORZERO_* names are still read as fallbacks.
+# ClickHouse database holding the gateway's ModelInference table (the path of
+# the gateway's TENSORMOON_CLICKHOUSE_URL):
+#HEALTH_TENSORMOON_CLICKHOUSE_DB=tensormoon
+# Self-heal target unit for this component (set tensorzero-gateway on hosts
+# that still run the pre-fork unit name):
+#TENSORMOON_SERVICE=tensormoon-gateway
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Component: models (LLM provider APIs)

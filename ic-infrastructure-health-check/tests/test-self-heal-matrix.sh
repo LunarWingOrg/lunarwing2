@@ -72,7 +72,7 @@ b_map() {  # b_map <id> <component> <status> <expected-service>
 }
 b_map B1 gateway    degraded lunarwing
 b_map B2 xmpp       critical xmpp-bridge
-b_map B3 tensorzero critical tensorzero-gateway
+b_map B3 tensormoon critical tensormoon-gateway
 b_map B4 clickhouse critical clickhouse-server
 
 b_skip() {  # b_skip <id> <component> <expected-log-fragment>
@@ -181,11 +181,11 @@ assert_contains "$oB20" "nothing to do" "B20: absent diagnostic components creat
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},
   {component:"xmpp",      status:"critical",metrics:{}},
-  {component:"tensorzero",status:"critical",metrics:{}}]}'
+  {component:"tensormoon",status:"critical",metrics:{}}]}'
 oB9="$(run_dry "$b9" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
 assert_contains "$oB9" "would run: systemctl restart lunarwing"          "B9: gateway targeted"
 assert_contains "$oB9" "would run: systemctl restart xmpp-bridge"        "B9: xmpp targeted"
-assert_contains "$oB9" "would run: systemctl restart tensorzero-gateway" "B9: tensorzero targeted"
+assert_contains "$oB9" "would run: systemctl restart tensormoon-gateway" "B9: tensormoon targeted"
 
 echo "=== Section C: Init-system sub-unit remediation ==="
 
@@ -223,10 +223,10 @@ assert_contains "$oC4" "would run: launchctl stop/start com.lunarwing.gateway" "
 # sub-units under the active manager.)
 c5="$(sb)"; report "$c5" '{components:[{component:"openrc",status:"critical",metrics:{services:[
   {name:"clickhouse-server",status:"critical"},
-  {name:"tensorzero-gateway",status:"critical"}]}}]}'
+  {name:"tensormoon-gateway",status:"critical"}]}}]}'
 oC5="$(run_dry "$c5" LUNARWING_SERVICE_MANAGER=openrc SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
 assert_contains "$oC5" "would run: rc-service clickhouse-server restart"  "C5: first sub-unit remediated"
-assert_contains "$oC5" "would run: rc-service tensorzero-gateway restart" "C5: second sub-unit remediated"
+assert_contains "$oC5" "would run: rc-service tensormoon-gateway restart" "C5: second sub-unit remediated"
 
 # C6 — logical "gateway" degraded while systemd reports lunarwing.service
 # healthy. The logical service key ("lunarwing") and the init-unit key

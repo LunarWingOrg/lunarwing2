@@ -44,7 +44,7 @@ case "$cmd" in
   build-tenant)
     echo "=== Building tenant: $name ==="
     echo "--- Building lunarwing binary (cargo) ---"
-    for c in lunarwing-agent lunarwing-core tensorzero-client secrets-store gateway xmpp-bridge; do
+    for c in lunarwing-agent lunarwing-core tensormoon-client secrets-store gateway xmpp-bridge; do
       echo "   Compiling $c v2.1.4"
       nap
     done

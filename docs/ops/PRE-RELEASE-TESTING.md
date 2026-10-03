@@ -62,8 +62,8 @@ scripts/lunarwing-xmpp-test-env.sh down
 ```
 
 Always run `down` after the test, including after a failed `verify`. If only the
-TensorZero proxy check fails, inspect the configured upstream
-`LUNARWING_TEST_TENSORZERO_URL` before diagnosing the local install.
+TensorMoon proxy check fails, inspect the configured upstream
+`LUNARWING_TEST_TENSORMOON_URL` before diagnosing the local install.
 
 See [`HARNESS-SINGLE-TENANT.md`](HARNESS-SINGLE-TENANT.md) and
 [`MULTITENANCY-HARNESS.md`](MULTITENANCY-HARNESS.md) for platform-specific and

@@ -122,7 +122,7 @@ Remediation verification on 2026-08-11:
   passed with six-core affinity.
 - Full release aggregation remains blocked outside the MCP diff: six real channel WASM
   tests need artifacts that could not be built because `rustup`/`wasm32-wasip2` are
-  unavailable; existing skill-selection and TensorZero streaming expectations also fail.
+  unavailable; existing skill-selection and TensorMoon streaming expectations also fail.
 
 Completed verification for the host-local lifecycle checkpoint:
 

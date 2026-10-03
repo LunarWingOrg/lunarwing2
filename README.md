@@ -48,7 +48,7 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 
 **Automation and health.** An optional reflex compiler turns recurring prompts into WASM fast paths. An opt-in [multi-agent coordination pipeline](docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md) adds policy, secret detection, and rate limiting for designated rooms. The bundled [infrastructure health system](ic-infrastructure-health-check/README.md) checks and can remediate services with backoff and flapping protection, and exports Prometheus metrics — on both systemd and OpenRC.
 
-**Model providers.** Local Ollama and OpenAI-compatible endpoints (including gateways like TensorZero). Operators can add or override providers declaratively, without touching Rust.
+**Model providers.** Local Ollama and OpenAI-compatible endpoints (including gateways like TensorMoon). Operators can add or override providers declaratively, without touching Rust.
 
 ## Getting started
 

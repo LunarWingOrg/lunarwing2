@@ -36,7 +36,7 @@ set -euo pipefail
 TENANT="vex"
 XMPP_JID="${XMPP_JID:-vex@xmpp.sobe.world}"     # <-- confirm the account exists on this domain
 XMPP_PASSWORD="${XMPP_PASSWORD:-}"              # blank -> mt-admin generates one
-LLM_API_KEY="${LLM_API_KEY:-}"                 # blank -> defaults to token-vex (TensorZero proxy)
+LLM_API_KEY="${LLM_API_KEY:-}"                 # blank -> defaults to token-vex (TensorMoon proxy)
 GOTIFY_URL="${GOTIFY_URL:-}"                    # optional, e.g. https://gotify.example.com
 DOCKER_GROUP="${DOCKER_GROUP:-true}"           # add vex to the docker group (needed for sandbox + workers)
 WITH_PEBBLE="${WITH_PEBBLE:-true}"             # build the pebble worker Docker image

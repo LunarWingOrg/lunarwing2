@@ -234,14 +234,14 @@ class TestProvisionerArgs(unittest.TestCase):
             try:
                 config = TenantConfig(
                     name="alpha",
-                    llm_model="tensorzero::function_name::lunarwing",
+                    llm_model="tensormoon::function_name::lunarwing",
                 )
                 args = provisioner.build_add_tenant_args(config)
             finally:
                 provisioner.MT_ADMIN_SCRIPT = previous
 
         self.assertIn("--llm-model", args)
-        self.assertIn("tensorzero::function_name::lunarwing", args)
+        self.assertIn("tensormoon::function_name::lunarwing", args)
 
     def test_current_llm_and_worker_overrides_are_forwarded(self):
         with tempfile.TemporaryDirectory() as tmp:

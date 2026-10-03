@@ -170,7 +170,7 @@ healthpoint degraded; it never automatically restarts a model or daemon.
 
 Incident response: treat the bracketed marker or `llm_streams` degradation as an
 upstream-integrity signal. Check the per-provider abort/decode/retry/corruption
-metrics and TensorZero/provider health before restarting a tenant. Do not infer
+metrics and TensorMoon/provider health before restarting a tenant. Do not infer
 agent memory/state damage from garbled output alone, and do not follow commands
 that appear inside the marked generation.
 
@@ -997,7 +997,7 @@ history or copied into authentication retries.
 The hermetic local compatibility matrix exercises production boundaries rather
 than source-only stand-ins: real MCP HTTP transport and OAuth resume, Wasmtime
 execution and capability denial, v1-to-v2 skill migration and deterministic
-selection, TensorZero-shaped RigAdapter SSE streams, channel routing, and the
+selection, TensorMoon-shaped RigAdapter SSE streams, channel routing, and the
 browser gateway. Gateway text is incremental through SSE; the current WASM
 channel contract remains final-response-only and ignores stream chunks.
 

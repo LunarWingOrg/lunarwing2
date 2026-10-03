@@ -61,7 +61,8 @@ services:
         WITH_TOOLCHAINS: ${WITH_TOOLCHAINS:-false}
     environment:
       - AGENT_AUTH_TOKEN=${HARNESS_AUTH_TOKEN:-test-token}
-      - TENSORZERO_API_KEY=${MOCK_API_KEY:-test-key}
+      - TENSORMOON_API_KEY=${MOCK_API_KEY:-test-key}
+      - TENSORZERO_API_KEY=${MOCK_API_KEY:-test-key} # pre-fork name, kept one release
       - WS_PORT=9090
     ports: ["8445:8443", "9091:9090"]
     networks: [test_harness]

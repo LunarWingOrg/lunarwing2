@@ -28,9 +28,9 @@ use support::test_rig::{TestRig, TestRigBuilder};
 
 const USER_ID: &str = "test-user";
 const MODEL: &str = "test-model";
-const TOOL_NAME: &str = "tensorzero_echo";
+const TOOL_NAME: &str = "tensormoon_echo";
 const TOOL_CALL_ID: &str = "calltz001";
-const TOOL_RESULT_MARKER: &str = "tensorzero-rust-echo";
+const TOOL_RESULT_MARKER: &str = "tensormoon-rust-echo";
 
 #[derive(Clone)]
 enum SseFrame {
@@ -55,14 +55,14 @@ struct SseState {
     requests: Arc<Mutex<Vec<JsonValue>>>,
 }
 
-struct TensorZeroFixture {
+struct TensorMoonFixture {
     base_url: String,
     request_count: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<JsonValue>>>,
     server: tokio::task::JoinHandle<()>,
 }
 
-impl TensorZeroFixture {
+impl TensorMoonFixture {
     async fn start(scripts: Vec<Vec<SseFrame>>) -> Self {
         let request_count = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -76,14 +76,14 @@ impl TensorZeroFixture {
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("TensorZero fixture should bind to loopback");
+            .expect("TensorMoon fixture should bind to loopback");
         let address = listener
             .local_addr()
-            .expect("TensorZero fixture should expose its bound address");
+            .expect("TensorMoon fixture should expose its bound address");
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
-                .expect("TensorZero fixture should serve requests");
+                .expect("TensorMoon fixture should serve requests");
         });
 
         Self {
@@ -98,13 +98,13 @@ impl TensorZeroFixture {
         let http_client = ReqwestClient::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .expect("TensorZero fixture HTTP client should build");
+            .expect("TensorMoon fixture HTTP client should build");
         let client = openai::Client::builder()
             .api_key("test-key")
             .base_url(&self.base_url)
             .http_client(http_client)
             .build()
-            .expect("TensorZero fixture Rig client should build")
+            .expect("TensorMoon fixture Rig client should build")
             .completions_api();
         let model = client.completion_model(MODEL);
         Arc::new(RigAdapter::new(model, MODEL))
@@ -122,7 +122,7 @@ impl TensorZeroFixture {
     }
 }
 
-impl Drop for TensorZeroFixture {
+impl Drop for TensorMoonFixture {
     fn drop(&mut self) {
         self.server.abort();
     }
@@ -205,7 +205,7 @@ impl Tool for EchoTool {
 fn text_stream_script() -> Vec<SseFrame> {
     vec![
         text_delta("```repl\n", None),
-        text_delta("FINAL('tensorzero-", None),
+        text_delta("FINAL('tensormoon-", None),
         text_delta("text-ok')\n```", Some("stop")),
         usage_chunk(17, 7),
         SseFrame::done(),
@@ -237,7 +237,7 @@ fn midstream_error_script() -> Vec<SseFrame> {
         text_delta("```repl\nFINAL('partial", None),
         SseFrame::json(json!({
             "error": {
-                "message": "TensorZero provider failed mid-stream",
+                "message": "TensorMoon provider failed mid-stream",
                 "type": "inference_error"
             }
         })),
@@ -363,7 +363,7 @@ async fn text_deltas_usage_and_done_cross_the_real_adapter_chain() {
     let env = EngineV2EnvGuard::enable(Some("gateway"));
     lunarwing::bridge::reset_engine_state().await;
 
-    let fixture = TensorZeroFixture::start(vec![text_stream_script()]).await;
+    let fixture = TensorMoonFixture::start(vec![text_stream_script()]).await;
     let rig = TestRigBuilder::new()
         .with_channel_name("gateway")
         .with_llm(fixture.provider())
@@ -380,17 +380,17 @@ async fn text_deltas_usage_and_done_cross_the_real_adapter_chain() {
         1,
         "one terminal response should be delivered"
     );
-    assert_eq!(responses[0].content, "tensorzero-text-ok");
+    assert_eq!(responses[0].content, "tensormoon-text-ok");
     let chunks = captured_stream_chunks(&rig);
     assert_eq!(
         chunks,
         vec![
             "```repl\n".to_string(),
-            "FINAL('tensorzero-".to_string(),
+            "FINAL('tensormoon-".to_string(),
             "text-ok')\n```".to_string()
         ]
     );
-    assert_eq!(chunks.concat(), "```repl\nFINAL('tensorzero-text-ok')\n```");
+    assert_eq!(chunks.concat(), "```repl\nFINAL('tensormoon-text-ok')\n```");
 
     let deliveries = rig.captured_deliveries();
     let response_index = deliveries
@@ -430,9 +430,9 @@ async fn fragmented_tool_fields_reconstruct_one_action_and_structured_result() {
     let env = EngineV2EnvGuard::enable(Some("gateway"));
     lunarwing::bridge::reset_engine_state().await;
 
-    let fixture = TensorZeroFixture::start(vec![
+    let fixture = TensorMoonFixture::start(vec![
         fragmented_tool_script(),
-        terminal_script("tensorzero-tool-ok", 13, 4),
+        terminal_script("tensormoon-tool-ok", 13, 4),
     ])
     .await;
     let executions = Arc::new(AtomicUsize::new(0));
@@ -452,7 +452,7 @@ async fn fragmented_tool_fields_reconstruct_one_action_and_structured_result() {
 
     let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
     assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].content, "tensorzero-tool-ok");
+    assert_eq!(responses[0].content, "tensormoon-tool-ok");
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     assert_eq!(
         rig.tool_calls_completed()
@@ -528,7 +528,7 @@ async fn assert_repl_recovery_over_sse(arguments: &str) {
         usage_chunk(10, 5),
         SseFrame::done(),
     ]);
-    let fixture = TensorZeroFixture::start(vec![
+    let fixture = TensorMoonFixture::start(vec![
         corrupted,
         fragmented_tool_script(),
         terminal_script("repl-repaired", 13, 4),
@@ -569,7 +569,7 @@ async fn assert_strict_stream_failure(script: Vec<SseFrame>) {
     let env = EngineV2EnvGuard::enable(Some("gateway"));
     lunarwing::bridge::reset_engine_state().await;
 
-    let fixture = TensorZeroFixture::start(vec![script.clone(), script]).await;
+    let fixture = TensorMoonFixture::start(vec![script.clone(), script]).await;
     let rig = TestRigBuilder::new()
         .with_channel_name("gateway")
         .with_llm(fixture.provider())
@@ -614,7 +614,7 @@ async fn assert_strict_stream_failure(script: Vec<SseFrame>) {
     let recovery_messages = requests[1]["messages"].to_string();
     assert!(recovery_messages.contains("provider temporarily failed"));
     assert!(!recovery_messages.contains("FINAL('partial"));
-    assert!(!recovery_messages.contains("TensorZero provider failed mid-stream"));
+    assert!(!recovery_messages.contains("TensorMoon provider failed mid-stream"));
     assert_eq!(
         rig.llm_call_count(),
         0,
@@ -662,7 +662,7 @@ async fn assert_midstream_recovery(script: Vec<SseFrame>) {
     lunarwing::bridge::reset_engine_state().await;
 
     let fixture =
-        TensorZeroFixture::start(vec![script, terminal_script("decode-recovered", 12, 6)]).await;
+        TensorMoonFixture::start(vec![script, terminal_script("decode-recovered", 12, 6)]).await;
     let rig = TestRigBuilder::new()
         .with_channel_name("gateway")
         .with_llm(fixture.provider())
@@ -691,7 +691,7 @@ async fn assert_midstream_recovery(script: Vec<SseFrame>) {
     assert_stream_request(&requests[1]);
     let recovery_messages = requests[1]["messages"].to_string();
     assert!(recovery_messages.contains("provider temporarily failed"));
-    assert!(!recovery_messages.contains("TensorZero provider failed mid-stream"));
+    assert!(!recovery_messages.contains("TensorMoon provider failed mid-stream"));
     assert!(!recovery_messages.contains("FINAL('partial"));
     assert_eq!(
         assistant_messages(&rig, thread_id).await,
@@ -712,7 +712,7 @@ async fn aborted_tool_draft_is_not_executed_during_recovery() {
     let env = EngineV2EnvGuard::enable(Some("gateway"));
     lunarwing::bridge::reset_engine_state().await;
 
-    let fixture = TensorZeroFixture::start(vec![
+    let fixture = TensorMoonFixture::start(vec![
         vec![
             text_delta("aborted tool draft", None),
             tool_delta(

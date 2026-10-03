@@ -14,7 +14,7 @@ elsewhere. The built-in flow assigns the following fixed, non-overlapping ports:
 | Service | Tenant A | Tenant B |
 |---------|----------|----------|
 | PostgreSQL | 15432 | 15433 |
-| TensorZero proxy | 13002 | 13003 |
+| TensorMoon proxy | 13002 | 13003 |
 | Gateway | 18765 | 18766 |
 | HTTP webhook | 19098 | 19099 |
 | XMPP bridge | 18787 | 18788 |

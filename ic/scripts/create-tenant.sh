@@ -52,7 +52,7 @@ Options (all also settable via the matching ENV var):
   --xmpp-jid <jid>          XMPP JID         (default: <name>@\$XMPP_DOMAIN)
   --xmpp-domain <domain>    domain for the derived JID   (default: xmpp.sobe.world)
   --xmpp-password <pw>      XMPP password    (default: mt-admin generates one)
-  --llm-api-key <key>       LLM/provider key (default: token-<name> via TensorZero)
+  --llm-api-key <key>       LLM/provider key (default: token-<name> via TensorMoon)
   --llm-base-url <url>      LLM endpoint (LLM_BASE_URL)  (default: tenant's local proxy)
   --gotify-url <url>        custom Gotify URL            (default: none)
   --[no-]docker-group       add user to docker group     (default: on)

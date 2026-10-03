@@ -104,10 +104,15 @@ base = os.environ.get("OPENCODE2_BASE_URL", "").strip()
 if model:
     # v2 model selection is "<providerID>/<model-id>" (ConfigModel.Selection
     # Short form, packages/schema/src/config/model.ts). A bare function name
-    # like "tensorzero::function_name::FrontierCODE" has no slash, so build
-    # the reference against the first provider in the config (the TensorZero
+    # like "tensormoon::function_name::FrontierCODE" has no slash, so build
+    # the reference against the first provider in the config (the TensorMoon
     # provider) and register the model in that provider's models map so
     # opencode can resolve it.
+    # Pre-fork configs named the provider "tensorzero"; strip that provider
+    # prefix so OPENCODE2_MODEL=tensorzero/<model> written before the TensorMoon
+    # switch resolves against the baked provider below.
+    if model.startswith("tensorzero/"):
+        model = model[len("tensorzero/"):]
     if "/" not in model:
         providers = cfg.get("providers", {})
         if providers:

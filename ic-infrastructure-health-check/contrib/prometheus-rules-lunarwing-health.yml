@@ -89,33 +89,33 @@ groups:
             (status 4) and unknown-status units (status 3) are excluded.
 
       # ── Graduated early warnings (rising latency / error rate) ───────────
-      - alert: LunarWingTensorZeroLatencyRising
-        expr: lunarwing_health_tensorzero_p95_ms > 1500
+      - alert: LunarWingTensorMoonLatencyRising
+        expr: lunarwing_health_tensormoon_p95_ms > 1500
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "TensorZero p95 latency high on {{ $labels.instance }}"
+          summary: "TensorMoon p95 latency high on {{ $labels.instance }}"
           description: >-
             p95 {{ printf "%.0f" $value }}ms sustained >15m (warn 1500ms,
             crit 4000ms). Typically precedes timeouts and restart cycles.
 
-      - alert: LunarWingTensorZeroLatencyCritical
-        expr: lunarwing_health_tensorzero_p95_ms > 4000
+      - alert: LunarWingTensorMoonLatencyCritical
+        expr: lunarwing_health_tensormoon_p95_ms > 4000
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "TensorZero p95 latency critical on {{ $labels.instance }}"
+          summary: "TensorMoon p95 latency critical on {{ $labels.instance }}"
           description: "p95 {{ printf \"%.0f\" $value }}ms exceeds 4000ms."
 
-      - alert: LunarWingTensorZeroErrorRateRising
-        expr: lunarwing_health_tensorzero_error_rate > 0.05
+      - alert: LunarWingTensorMoonErrorRateRising
+        expr: lunarwing_health_tensormoon_error_rate > 0.05
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "TensorZero error rate elevated on {{ $labels.instance }}"
+          summary: "TensorMoon error rate elevated on {{ $labels.instance }}"
           description: >-
             {{ printf "%.1f" ($value * 100) }}% of requests failing
             sustained >10m. Model provider or network fault likely.

@@ -69,7 +69,7 @@ INSTALL_WATCHDOG=false             # Single-tenant watchdog; MT health pipeline 
 WATCHDOG_SCHEDULER="auto"
 
 # LLM
-TENSORZERO_URL="http://192.168.1.157:3000/openai/v1"
+TENSORMOON_URL="http://192.168.1.157:3000/openai/v1"
 
 # Gotify (notifications)
 GOTIFY_URL="https://gotify.darkc.sobe.world"
@@ -173,7 +173,7 @@ export LUNARWING_MT_ROOTLESS=${ROOTLESS}
 export LUNARWING_MT_PROFILE=${BUILD_PROFILE}
 export LUNARWING_MT_GOTIFY_URL=${GOTIFY_URL}
 export LUNARWING_MT_GOTIFY_TOKEN=${GOTIFY_TOKEN}
-export LUNARWING_MT_TENSORZERO_URL=${TENSORZERO_URL}
+export LUNARWING_MT_TENSORMOON_URL=${TENSORMOON_URL}
 EOF
   chmod 600 "$ENV_FILE"
   ok "wrote $ENV_FILE"
@@ -239,7 +239,7 @@ phase_1() {
   local -a flags=()
   [[ "$ENABLE_DARKIRC" == true ]] && flags+=(--enable-darkirc)
   flags+=(--gotify-url "$GOTIFY_URL")
-  flags+=(--llm-base-url "$TENSORZERO_URL")
+  flags+=(--llm-base-url "$TENSORMOON_URL")
   flags+=(--xmpp-domain "$XMPP_DOMAIN")
   [[ "$ENABLE_HEALTH" == false ]] && flags+=(--no-health)
   [[ "$ENABLE_SSH" == false ]] && flags+=(--no-ssh)
@@ -398,7 +398,7 @@ main() {
   say "  Tenants:       $TENANTS"
   say "  Service Mgr:   $SERVICE_MANAGER"
   say "  Runtime:       $CONTAINER_RUNTIME (rootless=$ROOTLESS)"
-  say "  TensorZero:    $TENSORZERO_URL"
+  say "  TensorMoon:    $TENSORMOON_URL"
   say "  Gotify:        $GOTIFY_URL"
   say "  DarkIRC:       $ENABLE_DARKIRC"
   say "  SSH:           $ENABLE_SSH"

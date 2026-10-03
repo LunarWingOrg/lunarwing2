@@ -36,9 +36,9 @@ After changing any env file, restart the affected service for changes to take ef
 
 ## LLM Provider Configuration
 
-The LLM backend is configured in `env/lunarwing.env`. The per-tenant TensorZero
-proxy is opt-in. Without `--enable-proxy`, provisioning derives TensorZero's
-OpenAI-compatible `/openai/v1` surface from `LUNARWING_MT_TENSORZERO_URL`, or
+The LLM backend is configured in `env/lunarwing.env`. The per-tenant TensorMoon
+proxy is opt-in. Without `--enable-proxy`, provisioning derives TensorMoon's
+OpenAI-compatible `/openai/v1` surface from `LUNARWING_MT_TENSORMOON_URL`, or
 uses an explicit `--llm-base-url` unchanged.
 
 ### Setting your API key
@@ -49,26 +49,32 @@ The most common post-setup task. Edit `lunarwing.env` and set:
 LLM_API_KEY=sk-your-actual-key-here
 ```
 
-If using TensorZero as a proxy, the key is passed through to the upstream provider. If pointing directly at an LLM API, this is the key for that provider.
+If using TensorMoon as a proxy, the key is passed through to the upstream provider. If pointing directly at an LLM API, this is the key for that provider.
 
 ### Switching LLM backends
 
-The default setup connects directly to the configured upstream TensorZero URL:
+The default setup connects directly to the configured upstream TensorMoon URL:
 
 ```bash
 LLM_BACKEND=openai_compatible
 LLM_BASE_URL=http://192.168.1.157:3000/openai/v1
-LLM_MODEL=tensorzero::function_name::lunarwing
+LLM_MODEL=tensormoon::function_name::lunarwing
 ```
 
-Set the upstream root or `/openai/v1` URL with `LUNARWING_MT_TENSORZERO_URL`;
+Tenants provisioned before the TensorMoon cutover still carry
+`LLM_MODEL=tensorzero::function_name::lunarwing`. TensorMoon accepts that legacy
+prefix (logging a deprecation warning per request); rewrite it with
+`migrate-tensormoon-env <name>` once the upstream gateway is TensorMoon. See
+[MIGRATE_TENSORZERO_TO_TENSORMOON.md](../guides/MIGRATE_TENSORZERO_TO_TENSORMOON.md).
+
+Set the upstream root or `/openai/v1` URL with `LUNARWING_MT_TENSORMOON_URL`;
 mt-admin adds `/openai/v1` when absent. Alternatively, set `LLM_BASE_URL`
 directly at provisioning time with `add-tenant --llm-base-url <url>` (fleet-wide:
 `LUNARWING_MT_LLM_BASE_URL`). When `--enable-proxy` is selected and no explicit
 LLM base URL is supplied, mt-admin instead writes
 `http://127.0.0.1:<proxy_port>/v1`.
 
-To point directly at OpenAI (bypassing TensorZero):
+To point directly at OpenAI (bypassing TensorMoon):
 
 ```bash
 LLM_BACKEND=openai_compatible
@@ -102,7 +108,7 @@ LLM_API_KEY=your-key
 LLM_MODEL=your-model-name
 ```
 
-### TensorZero proxy configuration
+### TensorMoon proxy configuration
 
 The proxy is disabled by default. Provision it with
 `add-tenant <name> --enable-proxy` (the command is idempotent for an existing
@@ -113,12 +119,14 @@ daemon to that loopback endpoint:
 ```bash
 PROXY_PORT=<allocated_port>
 PROXY_BIND=127.0.0.1
-TENSORZERO_URL=http://192.168.1.157:3000/openai/v1
+TENSORMOON_URL=http://192.168.1.157:3000/openai/v1
 ```
 
-`TENSORZERO_URL` is the upstream instance that the per-tenant proxy forwards to.
-Change it through `--tensorzero-url` or `LUNARWING_MT_TENSORZERO_URL`, then
-re-render/restart the tenant as appropriate.
+`TENSORMOON_URL` is the upstream instance that the per-tenant proxy forwards to.
+Change it through `--tensormoon-url` or `LUNARWING_MT_TENSORMOON_URL`, then
+re-render/restart the tenant as appropriate. The pre-fork spellings
+`--tensorzero-url` and `LUNARWING_MT_TENSORZERO_URL` are still accepted as
+deprecated aliases.
 
 ## LunarVision Configuration
 
@@ -493,7 +501,7 @@ The `state/config.toml` file is auto-seeded on first daemon start. It provides d
 
 ```toml
 llm_backend = "openai_compatible"
-selected_model = "tensorzero::function_name::lunarwing"
+selected_model = "tensormoon::function_name::lunarwing"
 openai_compatible_base_url = "http://192.168.1.157:3000/openai/v1"
 
 [agent]
@@ -549,7 +557,7 @@ The per-tenant units are:
 ```text
 lunarwing-<tenant>.service                  # main daemon
 xmpp-bridge-<tenant>.service                # XMPP bridge
-lunarwing-proxy-<tenant>.service            # TensorZero proxy
+lunarwing-proxy-<tenant>.service            # TensorMoon proxy
 lunarwing-weechat-<tenant>.service          # weechat backend
 lunarwing-weechat-adapter-<tenant>.service  # weechat WS adapter
 lunarwing-pg-<tenant>.service               # Postgres (rootless Quadlet)
@@ -569,7 +577,7 @@ Per-tenant units are system services under `/etc/init.d/`:
 ```bash
 sudo rc-service lunarwing-<tenant> restart                  # main daemon
 sudo rc-service xmpp-bridge-<tenant> restart                # XMPP bridge
-sudo rc-service lunarwing-proxy-<tenant> restart            # TensorZero proxy
+sudo rc-service lunarwing-proxy-<tenant> restart            # TensorMoon proxy
 sudo rc-service lunarwing-pg-<tenant> restart               # Postgres container
 sudo rc-service lunarwing-weechat-<tenant> restart          # weechat backend
 sudo rc-service lunarwing-weechat-adapter-<tenant> restart  # weechat WS adapter
@@ -597,7 +605,7 @@ tail -20 /home/<tenant>/lunarwing/logs/lunarwing.log
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant myagent \
   --docker-group \
   --llm-api-key sk-your-key \
-  --tensorzero-url http://your-tz-host:3000/openai/v1 \
+  --tensormoon-url http://your-tz-host:3000/openai/v1 \
   --xmpp-jid myagent@xmpp.example.com \
   --gotify-url https://gotify.example.com
 ```
@@ -608,7 +616,8 @@ These environment variables change the defaults used by `lunarwing-mt-admin.sh` 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUNARWING_MT_TENSORZERO_URL` | `http://192.168.1.157:3000/openai/v1` | Upstream TensorZero URL |
+| `LUNARWING_MT_TENSORMOON_URL` | `http://192.168.1.157:3000/openai/v1` | Upstream TensorMoon URL |
+| `LUNARWING_MT_TENSORZERO_URL` | (unset) | Deprecated alias of `LUNARWING_MT_TENSORMOON_URL` (pre-fork name; warns when used) |
 | `LUNARWING_MT_GOTIFY_URL` | (empty) | Default Gotify server URL |
 | `LUNARWING_MT_GOTIFY_TITLE` | (empty) | Default Gotify notification title |
 | `LUNARWING_MT_SOURCE_REPO` | (auto-detected) | Source repo to clone from |
@@ -654,7 +663,7 @@ Primary block:
 | +1 | HTTP webhook |
 | +2 | XMPP bridge |
 | +3 | PostgreSQL |
-| +4 | TensorZero proxy |
+| +4 | TensorMoon proxy |
 | +5 | WeeChat |
 | +6 | Orchestrator |
 | +7 | Reserved legacy Nanocode WSS slot |

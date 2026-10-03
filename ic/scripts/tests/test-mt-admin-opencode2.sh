@@ -119,7 +119,8 @@ assert_contains "$quadlet" 'PublishPort=127.0.0.1:51000:51000' 'quadlet publishe
 assert_contains "$quadlet" 'PublishPort=127.0.0.1:51001:8443' 'quadlet publishes the opencode2 health port'
 assert_contains "$quadlet" 'Environment=OPENCODE2_MODEL=new-model' 'quadlet inlines the model override'
 assert_contains "$quadlet" 'Environment=OPENCODE2_BASE_URL=https://old.example/v1' 'quadlet inlines the base URL override'
-assert_contains "$quadlet" 'Environment=TENSORZERO_API_KEY=llm%%key' 'quadlet inlines the TensorZero key'
+assert_contains "$quadlet" 'Environment=TENSORMOON_API_KEY=llm%%key' 'quadlet inlines the TensorMoon key' # no-secret-scan (fixture)
+assert_contains "$quadlet" 'Environment=TENSORZERO_API_KEY=llm%%key' 'quadlet also inlines the pre-fork TENSORZERO_API_KEY name' # no-secret-scan (fixture)
 assert_contains "$quadlet" "Environment=AGENT_AUTH_TOKEN=${minted//%/%%}" 'quadlet inlines the scoped worker credential'
 assert_not_contains "$quadlet" 'Environment=AGENT_AUTH_TOKEN=gate%%token' 'quadlet never inlines the gateway bearer'
 assert_contains "$quadlet" 'Exec=--mode websocket' 'quadlet selects websocket mode'

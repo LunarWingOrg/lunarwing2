@@ -50,12 +50,12 @@ o="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1)"
 assert_contains "$o" "SUCCESS: xmpp-bridge healthy after restart" "CH3: xmpp-bridge recovers"
 assert_eq "$(svc_state "$c" xmpp-bridge)" "up" "CH3: xmpp-bridge up"
 
-echo "=== CH4: kill tensorzero-gateway → recovered ==="
-c="$(sb)"; mk_mockbin "$c"; svc_down "$c" tensorzero-gateway
-report "$c" '{components:[{component:"tensorzero",status:"critical",metrics:{}}]}'
+echo "=== CH4: kill tensormoon-gateway → recovered ==="
+c="$(sb)"; mk_mockbin "$c"; svc_down "$c" tensormoon-gateway
+report "$c" '{components:[{component:"tensormoon",status:"critical",metrics:{}}]}'
 o="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1)"
-assert_contains "$o" "SUCCESS: tensorzero-gateway healthy after restart" "CH4: tensorzero recovers"
-assert_eq "$(svc_state "$c" tensorzero-gateway)" "up" "CH4: tensorzero up"
+assert_contains "$o" "SUCCESS: tensormoon-gateway healthy after restart" "CH4: tensormoon recovers"
+assert_eq "$(svc_state "$c" tensormoon-gateway)" "up" "CH4: tensormoon up"
 
 echo "=== CH5: clickhouse crash → recovered ==="
 c="$(sb)"; mk_mockbin "$c"; svc_down "$c" clickhouse-server

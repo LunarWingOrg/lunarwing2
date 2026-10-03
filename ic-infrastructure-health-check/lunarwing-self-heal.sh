@@ -84,7 +84,7 @@ HEALTH_CHECK_DIR="${SELF_HEAL_HEALTH_CHECK_DIR:-$SCRIPT_DIR}"
 STATE_PRUNE_TTL="${SELF_HEAL_STATE_PRUNE_TTL:-86400}"   # 24h
 
 # Logical-component remediation. In multi-tenant deployments the logical
-# components (gateway/xmpp/tensorzero/clickhouse) map to single-instance base
+# components (gateway/xmpp/tensormoon/clickhouse) map to single-instance base
 # service names (lunarwing, xmpp-bridge, ...) that DON'T exist — only per-tenant
 # init units do. Set false to remediate ONLY the auto-discovered init sub-units
 # and avoid phantom restarts/escalations of nonexistent base services.
@@ -432,7 +432,9 @@ service_substate() {
 declare -A SERVICE_MAP=(
     [gateway]="lunarwing"
     [xmpp]="xmpp-bridge"
-    [tensorzero]="tensorzero-gateway"
+    # TENSORMOON_SERVICE: set to tensorzero-gateway on hosts whose gateway unit
+    # still carries the pre-fork name.
+    [tensormoon]="${TENSORMOON_SERVICE:-tensormoon-gateway}"
     [clickhouse]="clickhouse-server"
     [lunarvision]="${LUNARVISION_SERVICE:-ocr-sidecar}"
     [lunarvoice]="${LUNARVOICE_SERVICE:-voice-sidecar}"
@@ -443,7 +445,7 @@ declare -A SERVICE_MAP=(
 declare -A COMPONENT_CHECK_MAP=(
     [gateway]="health-gateway.sh"
     [xmpp]="health-xmpp.sh"
-    [tensorzero]="health-tensorzero.sh"
+    [tensormoon]="health-tensormoon.sh"
     [clickhouse]="health-clickhouse.sh"
     [lunarvision]="health-lunarvision.sh"
     [lunarvoice]="health-lunarvoice.sh"

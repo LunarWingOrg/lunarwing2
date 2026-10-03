@@ -8,6 +8,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 EXCLUDED = {
+    "tensormoon-proxy-configurations/experimental-ironclaw-proxy-version-with-enhancements.py",
+    "tensormoon-proxy-configurations/experimental-ironclaw-proxy-version-with-enhancements-working-copy.py",
+    # Pre-rename paths: `tensorzero-proxy-configurations` is a compat symlink to
+    # the directory above, so the same draft files are reachable under both names.
     "tensorzero-proxy-configurations/experimental-ironclaw-proxy-version-with-enhancements.py",
     "tensorzero-proxy-configurations/experimental-ironclaw-proxy-version-with-enhancements-working-copy.py",
 }

@@ -126,7 +126,7 @@ run_check "health-xmpp.sh" "xmpp" > "$WORKDIR/check-xmpp.tmp" 2> "$WORKDIR/log-x
 run_check "health-omemo.sh" "omemo" > "$WORKDIR/check-omemo.tmp" 2> "$WORKDIR/log-omemo.tmp" &
 run_check "health-ratelimit.sh" "ratelimit" > "$WORKDIR/check-ratelimit.tmp" 2> "$WORKDIR/log-ratelimit.tmp" &
 run_check "health-clickhouse.sh" "clickhouse" > "$WORKDIR/check-clickhouse.tmp" 2> "$WORKDIR/log-clickhouse.tmp" &
-run_check "health-tensorzero.sh" "tensorzero" > "$WORKDIR/check-tensorzero.tmp" 2> "$WORKDIR/log-tensorzero.tmp" &
+run_check "health-tensormoon.sh" "tensormoon" > "$WORKDIR/check-tensormoon.tmp" 2> "$WORKDIR/log-tensormoon.tmp" &
 run_check "health-models.sh" "models" > "$WORKDIR/check-models.tmp" 2> "$WORKDIR/log-models.tmp" &
 run_check "health-llm-streams.sh" "llm_streams" > "$WORKDIR/check-llm-streams.tmp" 2> "$WORKDIR/log-llm-streams.tmp" &
 run_check "health-lunarvision.sh" "lunarvision" > "$WORKDIR/check-lunarvision.tmp" 2> "$WORKDIR/log-lunarvision.tmp" &
@@ -145,7 +145,7 @@ esac
 wait || true
 
 # Append logs to main log file
-for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird runtime knowledge svcmgr; do
+for comp in gateway xmpp omemo ratelimit clickhouse tensormoon models llm-streams lunarvision lunarvoice netbird runtime knowledge svcmgr; do
     [ -f "$WORKDIR/log-${comp}.tmp" ] && cat "$WORKDIR/log-${comp}.tmp" >> "$LOG_FILE" && rm -f "$WORKDIR/log-${comp}.tmp"
 done
 
@@ -155,7 +155,7 @@ check_xmpp=$(cat "$WORKDIR/check-xmpp.tmp" 2>/dev/null || echo)
 check_omemo=$(cat "$WORKDIR/check-omemo.tmp" 2>/dev/null || echo)
 check_ratelimit=$(cat "$WORKDIR/check-ratelimit.tmp" 2>/dev/null || echo)
 check_clickhouse=$(cat "$WORKDIR/check-clickhouse.tmp" 2>/dev/null || echo)
-check_tensorzero=$(cat "$WORKDIR/check-tensorzero.tmp" 2>/dev/null || echo)
+check_tensormoon=$(cat "$WORKDIR/check-tensormoon.tmp" 2>/dev/null || echo)
 check_models=$(cat "$WORKDIR/check-models.tmp" 2>/dev/null || echo)
 check_llm_streams=$(cat "$WORKDIR/check-llm-streams.tmp" 2>/dev/null || echo)
 check_lunarvision=$(cat "$WORKDIR/check-lunarvision.tmp" 2>/dev/null || echo)
@@ -175,7 +175,7 @@ components=(
     "${check_omemo:-}"
     "${check_ratelimit:-}"
     "$check_clickhouse"
-    "$check_tensorzero"
+    "$check_tensormoon"
     "$check_models" "$check_llm_streams"
     "$check_lunarvision"
     "$check_lunarvoice"
@@ -220,7 +220,7 @@ done
 components_json=""
 for comp in "$check_gateway" "$check_xmpp" \
     "${check_omemo:-}" "${check_ratelimit:-}" \
-    "$check_clickhouse" "$check_tensorzero" \
+    "$check_clickhouse" "$check_tensormoon" \
     "$check_models" "$check_llm_streams" \
     "$check_lunarvision" "$check_lunarvoice" "$check_netbird" "$check_runtime" "$check_knowledge" \
     "${check_svcmgr:-}"; do

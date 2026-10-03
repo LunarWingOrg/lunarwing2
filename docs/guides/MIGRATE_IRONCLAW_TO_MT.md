@@ -122,7 +122,7 @@ MT admin owns `/home/<tenant>/lunarwing/env/` and generated service configuratio
 Common changes include:
 
 - tenant-specific PostgreSQL, gateway, proxy, bridge, orchestrator, worker, WeeChat, and vision ports;
-- `tensorzero::function_name::lunarwing` as the current default TensorZero function;
+- `tensormoon::function_name::lunarwing` as the current default TensorMoon function;
 - per-tenant XMPP identity and bridge token;
 - registry-built WASM extensions and capability sidecars;
 - current sandbox, approval, and outbound-network policy;

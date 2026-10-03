@@ -36,7 +36,7 @@ class ImportPlan:
     with_kimi: bool = False
     with_toolchains: bool = False
     with_vision: bool = False
-    tensorzero_url: str = ""
+    tensormoon_url: str = ""
     llm_model: str = ""
 
     def validate(self) -> str | None:
@@ -67,7 +67,7 @@ class ImportPlan:
             "with_kimi": self.with_kimi,
             "with_toolchains": self.with_toolchains,
             "with_vision": self.with_vision,
-            "tensorzero_url": self.tensorzero_url,
+            "tensormoon_url": self.tensormoon_url,
             "llm_model": self.llm_model,
         }
 
@@ -93,7 +93,8 @@ class ImportPlan:
             with_kimi=_bool(data.get("with_kimi", False)),
             with_toolchains=_bool(data.get("with_toolchains", False)),
             with_vision=_bool(data.get("with_vision", False)),
-            tensorzero_url=_str(data.get("tensorzero_url", "")),
+            # `tensorzero_url` is the pre-fork key of saved import plans.
+            tensormoon_url=_str(data.get("tensormoon_url", data.get("tensorzero_url", ""))),
             llm_model=_str(data.get("llm_model", "")),
         )
 

@@ -21,7 +21,7 @@ class ImportPlanSerializationTest(unittest.TestCase):
             with_kimi=True,
             with_toolchains=True,
             with_vision=False,
-            tensorzero_url="http://tz:3000",
+            tensormoon_url="http://tz:3000",
             llm_model="claude-sonnet",
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -36,8 +36,21 @@ class ImportPlanSerializationTest(unittest.TestCase):
         self.assertTrue(loaded.with_kimi)
         self.assertTrue(loaded.with_toolchains)
         self.assertFalse(loaded.with_vision)
-        self.assertEqual(loaded.tensorzero_url, "http://tz:3000")
+        self.assertEqual(loaded.tensormoon_url, "http://tz:3000")
         self.assertEqual(loaded.llm_model, "claude-sonnet")
+
+    def test_legacy_tensorzero_url_plan_key_is_read(self) -> None:
+        loaded = ImportPlan.from_dict({"tenant": "legacy", "tensorzero_url": "http://tz:3000"})
+        self.assertEqual(loaded.tensormoon_url, "http://tz:3000")
+        data = loaded.to_dict()
+        self.assertEqual(data["tensormoon_url"], "http://tz:3000")
+        self.assertNotIn("tensorzero_url", data)
+
+    def test_tensormoon_url_plan_key_wins_over_legacy(self) -> None:
+        loaded = ImportPlan.from_dict(
+            {"tenant": "both", "tensormoon_url": "http://new:3000", "tensorzero_url": "http://old:3000"}
+        )
+        self.assertEqual(loaded.tensormoon_url, "http://new:3000")
 
     def test_no_auto_yes_field(self) -> None:
         plan = ImportPlan()

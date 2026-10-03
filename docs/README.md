@@ -58,6 +58,7 @@ How-to guides, build instructions, and setup walkthroughs.
 | [`MIGRATE_IRONCLAW_TO_LUNARWING.md`](guides/MIGRATE_IRONCLAW_TO_LUNARWING.md) | Rehearsed single-instance PostgreSQL migration from IronClaw |
 | [`MIGRATE_IRONCLAW_TO_MT.md`](guides/MIGRATE_IRONCLAW_TO_MT.md) | Guarded PostgreSQL migration into an MT-admin tenant |
 | [`MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](guides/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md) | Current unsupported status and safe requirements for libSQL cross-backend ETL |
+| [`MIGRATE_TENSORZERO_TO_TENSORMOON.md`](guides/MIGRATE_TENSORZERO_TO_TENSORMOON.md) | Gateway cutover from the abandoned TensorZero to the TensorMoon fork: renamed defaults, legacy aliases, per-tenant env migration |
 | [`TESTING_GUIDE.md`](guides/TESTING_GUIDE.md) | Current manual release matrix and links to bounded automated tiers |
 | [`DEBUG_LOG.md`](guides/DEBUG_LOG.md) | Stable logging levels, service diagnostics, and evidence collection |
 | [`EMBEDDINGS_SETUP.md`](guides/EMBEDDINGS_SETUP.md) | Database-backed and environment embedding provider configuration |

@@ -57,7 +57,7 @@ class TenantConfig:
     workers: list[WorkerType] = field(default_factory=list)
     toolchains: bool = False
     llm_base_url: str = ""
-    llm_model: str = "tensorzero::function_name::lunarwing"
+    llm_model: str = "tensormoon::function_name::lunarwing"
     opencode_model: str = ""
     opencode_base_url: str = ""
     opencode2_model: str = ""
@@ -130,7 +130,7 @@ class TenantConfig:
             toolchains=data.get("toolchains", False),
             llm_base_url=data.get("llm_base_url", ""),
             llm_model=data.get(
-                "llm_model", "tensorzero::function_name::lunarwing"
+                "llm_model", "tensormoon::function_name::lunarwing"
             ),
             opencode_model=data.get("opencode_model", ""),
             opencode_base_url=data.get("opencode_base_url", ""),

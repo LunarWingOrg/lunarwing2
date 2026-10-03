@@ -22,10 +22,11 @@ PG_PORT="${LUNARWING_TEST_PG_PORT:-5432}"
 DATABASE_URL="${LUNARWING_TEST_DATABASE_URL:-postgres://lunarwing:lunarwing@127.0.0.1:${PG_PORT}/lunarwing}"
 LIBSQL_PATH="${LUNARWING_TEST_LIBSQL_PATH:-$STATE_DIR/lunarwing.db}"
 
-# TensorZero proxy
+# TensorMoon proxy
 PROXY_PORT="${LUNARWING_TEST_PROXY_PORT:-3002}"
 PROXY_BIND="${LUNARWING_TEST_PROXY_BIND:-127.0.0.1}"
-TENSORZERO_URL="${LUNARWING_TEST_TENSORZERO_URL:-http://192.168.1.157:3000}"
+# LUNARWING_TEST_TENSORZERO_URL is the pre-fork name, kept as a fallback.
+TENSORMOON_URL="${LUNARWING_TEST_TENSORMOON_URL:-${LUNARWING_TEST_TENSORZERO_URL:-http://192.168.1.157:3000}}"
 ENABLE_PROXY="${LUNARWING_TEST_ENABLE_PROXY:-true}"
 
 # LunarWing service ports
@@ -45,7 +46,7 @@ Usage:
   scripts/lunarwing-xmpp-test-env.sh <command> [args...]
 
 Full-stack integration test harness for LunarWing.
-Manages PostgreSQL, TensorZero proxy, XMPP bridge, WASM channels/tools, and
+Manages PostgreSQL, TensorMoon proxy, XMPP bridge, WASM channels/tools, and
 the LunarWing daemon in an isolated test environment.
 
 Commands:
@@ -63,8 +64,8 @@ Commands:
   start-postgres           start PostgreSQL container (pgvector/pg16)
   stop-postgres            stop PostgreSQL container (preserves data)
   reset-postgres           remove PostgreSQL container entirely
-  start-proxy              start TensorZero lunarwing-proxy
-  stop-proxy               stop TensorZero lunarwing-proxy
+  start-proxy              start TensorMoon lunarwing-proxy
+  stop-proxy               stop TensorMoon lunarwing-proxy
   start-bridge             start xmpp-bridge with the test env
   stop-bridge              stop the bridge started by this script
   start-lunarwing [-- args]
@@ -102,7 +103,8 @@ Environment:
 
   LUNARWING_TEST_PROXY_PORT      default: 3002
   LUNARWING_TEST_PROXY_BIND      default: 127.0.0.1
-  LUNARWING_TEST_TENSORZERO_URL  default: http://192.168.1.157:3000
+  LUNARWING_TEST_TENSORMOON_URL  default: http://192.168.1.157:3000
+                                 (LUNARWING_TEST_TENSORZERO_URL: deprecated alias)
 
   LUNARWING_TEST_GATEWAY_PORT    default: 8765
   LUNARWING_TEST_HTTP_PORT       default: 9098
@@ -384,7 +386,7 @@ ensure_lunarwing_env_defaults() {
   append_env_if_missing "$path" "LUNARWING_SOCKET" "$(harness_socket_path)"
   replace_env_value "$path" "IRONCLAW_SOCKET" "$(harness_socket_path)"
   replace_env_value "$path" "LUNARWING_SOCKET" "$(harness_socket_path)"
-  replace_env_value "$path" "LLM_MODEL" "tensorzero::function_name::lunarwing"
+  replace_env_value "$path" "LLM_MODEL" "tensormoon::function_name::lunarwing"
 }
 
 ensure_bridge_env_defaults() {
@@ -439,15 +441,15 @@ write_lunarwing_env_if_missing() {
         printf 'LIBSQL_PATH=%s\n' "$LIBSQL_PATH"
       fi
       printf '\n'
-      printf '# LLM — TensorZero proxy (start with: start-proxy)\n'
+      printf '# LLM — TensorMoon proxy (start with: start-proxy)\n'
       printf 'LLM_BACKEND=openai_compatible\n'
       if [[ "$ENABLE_PROXY" == "true" ]]; then
         printf 'LLM_BASE_URL=http://%s:%s/v1\n' "$PROXY_BIND" "$PROXY_PORT"
       else
-        printf 'LLM_BASE_URL=%s/openai/v1\n' "$TENSORZERO_URL"
+        printf 'LLM_BASE_URL=%s/openai/v1\n' "$TENSORMOON_URL"
       fi
       printf 'LLM_API_KEY=token-integration-test\n'
-      printf 'LLM_MODEL=tensorzero::function_name::lunarwing\n'
+      printf 'LLM_MODEL=tensormoon::function_name::lunarwing\n'
       printf 'ALLOW_PRIVATE_IPS=1\n'
       printf '\n'
       printf '# Runtime identity\n'
@@ -505,7 +507,7 @@ write_proxy_env_if_missing() {
     {
       printf 'PROXY_PORT=%s\n' "$PROXY_PORT"
       printf 'PROXY_BIND=%s\n' "$PROXY_BIND"
-      printf 'TENSORZERO_URL=%s\n' "$TENSORZERO_URL"
+      printf 'TENSORMOON_URL=%s\n' "$TENSORMOON_URL"
     } >"$path"
   )
 }
@@ -757,10 +759,10 @@ reset_postgres() {
   say "PostgreSQL container removed"
 }
 
-# --- TensorZero proxy management ---
+# --- TensorMoon proxy management ---
 
 proxy_bin() {
-  printf '%s/tensorzero-proxy-configurations/lunarwing-proxy.py' "$LUNARWING_ROOT"
+  printf '%s/tensormoon-proxy-configurations/lunarwing-proxy.py' "$LUNARWING_ROOT"
 }
 
 proxy_ready() {
@@ -803,11 +805,11 @@ start_proxy() {
     return 0
   fi
 
-  say "starting TensorZero proxy at ${PROXY_BIND}:${PROXY_PORT} -> $TENSORZERO_URL"
+  say "starting TensorMoon proxy at ${PROXY_BIND}:${PROXY_PORT} -> $TENSORMOON_URL"
   python3 "$bin" \
     --port "$PROXY_PORT" \
     --bind "$PROXY_BIND" \
-    --tensorzero "$TENSORZERO_URL" \
+    --tensormoon "$TENSORMOON_URL" \
     >>"$LOG_DIR/proxy.log" 2>&1 &
   printf '%s\n' "$!" >"$RUN_DIR/proxy.pid"
 
@@ -1022,10 +1024,10 @@ stack_up() {
   fi
 
   if [[ "$ENABLE_PROXY" == "true" ]]; then
-    say "--- TensorZero proxy ---"
+    say "--- TensorMoon proxy ---"
     start_proxy || die "proxy failed to start"
   else
-    say "--- TensorZero proxy: disabled (LUNARWING_TEST_ENABLE_PROXY=false) ---"
+    say "--- TensorMoon proxy: disabled (LUNARWING_TEST_ENABLE_PROXY=false) ---"
   fi
 
   say "--- XMPP bridge ---"
@@ -1117,7 +1119,7 @@ verify_stack() {
   fi
 
   if [[ "$ENABLE_PROXY" == "true" ]]; then
-    _check "TensorZero proxy responds at :${PROXY_PORT}" \
+    _check "TensorMoon proxy responds at :${PROXY_PORT}" \
       proxy_ready
   fi
 
@@ -1490,12 +1492,12 @@ render_systemd() {
 
   cat >"$proxy_unit" <<EOF
 [Unit]
-Description=LunarWing TensorZero proxy test sidecar
+Description=LunarWing TensorMoon proxy test sidecar
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$(command -v python3) $(proxy_bin) --port $PROXY_PORT --bind $PROXY_BIND --tensorzero $TENSORZERO_URL
+ExecStart=$(command -v python3) $(proxy_bin) --port $PROXY_PORT --bind $PROXY_BIND --tensormoon $TENSORMOON_URL
 EnvironmentFile=$ENV_DIR/proxy.env
 Restart=on-failure
 RestartSec=5
@@ -1638,7 +1640,7 @@ render_launchd() {
     "$proxy_label" "$REPO_ROOT" "$ENV_DIR/proxy.env" \
     "$LOG_DIR/proxy.stdout.log" "$LOG_DIR/proxy.stderr.log" \
     "$(command -v python3)" "$(proxy_bin)" \
-    "--port" "$PROXY_PORT" "--bind" "$PROXY_BIND" "--tensorzero" "$TENSORZERO_URL"
+    "--port" "$PROXY_PORT" "--bind" "$PROXY_BIND" "--tensormoon" "$TENSORMOON_URL"
 
   _write_plist "$LAUNCHD_DIR/${bridge_label}.plist" \
     "$bridge_label" "$REPO_ROOT/bridges/xmpp-bridge" "$ENV_DIR/xmpp-bridge.env" \
@@ -1758,7 +1760,7 @@ doctor() {
     if proxy_ready; then
       say "  health: OK"
     else
-      say "  health: NOT responding (TensorZero may be down)"
+      say "  health: NOT responding (TensorMoon may be down)"
     fi
   else
     say "proxy: stopped"
@@ -1787,10 +1789,10 @@ doctor() {
     say "LunarWing: stopped"
   fi
 
-  # TensorZero gateway
+  # TensorMoon gateway
   local tz_code
-  tz_code="$(curl -sS -o /dev/null -w '%{http_code}' "$TENSORZERO_URL/status" 2>/dev/null || true)"
-  say "TensorZero gateway ($TENSORZERO_URL): HTTP $tz_code"
+  tz_code="$(curl -sS -o /dev/null -w '%{http_code}' "$TENSORMOON_URL/status" 2>/dev/null || true)"
+  say "TensorMoon gateway ($TENSORMOON_URL): HTTP $tz_code"
 
   say ""
   say "=== WASM artifacts ==="
@@ -2544,7 +2546,7 @@ main() {
     reset-postgres)
       reset_postgres
       ;;
-    # --- TensorZero proxy ---
+    # --- TensorMoon proxy ---
     start-proxy)
       start_proxy
       ;;

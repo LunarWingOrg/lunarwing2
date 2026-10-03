@@ -278,7 +278,7 @@ unittest.TextTestRunner(verbosity=2).run(
   "workers": ["pebble", "opencode"],
   "toolchains": false,
   "llm_base_url": "",
-  "llm_model": "tensorzero::function_name::FrontierCODE",
+  "llm_model": "tensormoon::function_name::FrontierCODE",
   "llm_api_key": "",
   "secrets_master_key": "",
   "no_ssh": false,

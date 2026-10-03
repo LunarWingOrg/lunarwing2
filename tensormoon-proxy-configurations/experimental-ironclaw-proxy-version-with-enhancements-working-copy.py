@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-IronClaw → TensorZero Proxy with /me Support
+IronClaw → TensorMoon Proxy with /me Support
 
-Sits between IronClaw and TensorZero, cleaning responses to be
-strictly OpenAI-compatible by removing TensorZero-specific fields
-that IronClaw's Rust parser can't handle (episode_id, tensorzero_cost, etc.).
+Sits between IronClaw and TensorMoon, cleaning responses to be
+strictly OpenAI-compatible by removing TensorMoon-specific fields
+that IronClaw's Rust parser can't handle (episode_id, tensormoon_cost, etc.).
 
 NEW FEATURES (ported from OpenClaw proxy):
 - Detects /me commands and routes to slash_me function
@@ -13,7 +13,7 @@ NEW FEATURES (ported from OpenClaw proxy):
 - Normal messages route to default function
 
 Usage:
-    python3 ironclaw-proxy-with-me.py --port 3002 --tensorzero http://192.168.1.157:3000
+    python3 ironclaw-proxy-with-me.py --port 3002 --tensormoon http://192.168.1.157:3000
 """
 
 import re
@@ -26,7 +26,7 @@ import argparse
 import sys
 import traceback
 
-TENSORZERO_URL = "http://192.168.1.157:3000"
+TENSORMOON_URL = "http://192.168.1.157:3000"
 PROXY_PORT = 3002
 CTCP_CHAR = '\x01'
 

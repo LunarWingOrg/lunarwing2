@@ -5,9 +5,9 @@
 > `latency_max_ms`, per-provider `provider_latency_ms` / `provider_status`
 > maps) instead of string-only series the exporter dropped, so every
 > healthpoint contributes export series. Degraded/critical thresholds in the
-> six legacy checks (gateway, xmpp, ratelimit, clickhouse, tensorzero, models)
+> six legacy checks (gateway, xmpp, ratelimit, clickhouse, tensormoon, models)
 > are env-configurable (`HEALTH_GATEWAY_*` / `HEALTH_XMPP` / `HEALTH_RATELIMIT` /
-> `HEALTH_CLICKHOUSE` / `HEALTH_TENSORZERO` / `HEALTH_MODELS` knobs,
+> `HEALTH_CLICKHOUSE` / `HEALTH_TENSORMOON` / `HEALTH_MODELS` knobs,
 > health-netbird-style validation fallback), and
 > `health-metrics-thresholds.conf.example` now carries a sample
 > early-warning rule for every healthpoint.
@@ -98,7 +98,7 @@ each emitting one JSON object (`component`, `status`, `metrics{...}`), exit
 | omemo | `health-omemo.sh` | `devices`, `bundles`, `sessions`, `recent_sessions` |
 | ratelimit | `health-ratelimit.sh` | `throttled_last_hour`, `queue_depth` |
 | clickhouse | `health-clickhouse.sh` | `query_time_ms`, `disk_pct`, `memory_pct` |
-| tensorzero | `health-tensorzero.sh` | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
+| tensormoon | `health-tensormoon.sh` | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
 | models | `health-models.sh` | `provider_count`, `providers_{healthy,degraded,critical}`, `latency_max_ms`, per-provider `provider_latency_ms` / `provider_status` numeric maps (status strings/`last_error` remain in `providers[]` and are dropped on export) |
 | llm_streams | `health-llm-streams.sh` | per-provider retry reasons, stream aborts, decode failures, corruption signatures, and time-to-first-chunk counters/timings with `provider` + `tenant` labels |
 | lunarvision | `health-lunarvision.sh` | `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms`, per-tenant `ocr_available`/`vl_available` |
@@ -151,7 +151,7 @@ Core series (every run):
 
 ```
 # Numeric component status: 0=healthy 1=degraded 2=critical 3=unknown
-lunarwing_health_status{component="tensorzero"} 0
+lunarwing_health_status{component="tensormoon"} 0
 lunarwing_health_overall_status 1
 # Staleness guard — alert when the report itself stops being produced
 lunarwing_health_report_timestamp_seconds 1786615200
@@ -164,8 +164,8 @@ strings are dropped (except fixed enumerations, which may become label values
 where cardinality is bounded, e.g. `provider` for `models`):
 
 ```
-lunarwing_health_tensorzero_p95_ms 812
-lunarwing_health_tensorzero_error_rate 0.004
+lunarwing_health_tensormoon_p95_ms 812
+lunarwing_health_tensormoon_error_rate 0.004
 lunarwing_health_clickhouse_disk_pct 61
 lunarwing_health_lunarvision_cache_hit_rate 0.87
 lunarwing_health_xmpp_connected 1
@@ -189,7 +189,7 @@ Self-heal state (from `state.json`, still Phase 1) gives the proactive layer
 its highest-value early signals:
 
 ```
-lunarwing_health_selfheal_restarts_total{service="tensorzero-gateway"} 4
+lunarwing_health_selfheal_restarts_total{service="tensormoon-gateway"} 4
 lunarwing_health_selfheal_backoff_next_attempt_seconds{service="xmpp-bridge"} 1786620000
 lunarwing_health_selfheal_escalated{service="clickhouse-server"} 1
 lunarwing_health_selfheal_flapping{service="lunarwing"} 0
@@ -203,14 +203,14 @@ matching `config.sh` conventions), with per-metric warn/crit rules:
 
 ```bash
 # metric_name  warn_expr  crit_expr   (exprs evaluated against the last value)
-THRESHOLD_lunarwing_health_tensorzero_p95_ms="warn:>1500 crit:>4000"
+THRESHOLD_lunarwing_health_tensormoon_p95_ms="warn:>1500 crit:>4000"
 THRESHOLD_lunarwing_health_clickhouse_disk_pct="warn:>75 crit:>90"
 THRESHOLD_lunarwing_health_report_age_seconds="crit:>2400"
 ```
 
 Evaluation happens at export time and produces:
 
-- `lunarwing_health_early_warning{component="tensorzero",metric="p95_ms",severity="warn"} 1`
+- `lunarwing_health_early_warning{component="tensormoon",metric="p95_ms",severity="warn"} 1`
   series for external alerting, and
 - an optional Gotify **warning** notification through the existing
   `send-notification.sh`, rate-limited by the same cooldown discipline as

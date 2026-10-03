@@ -104,12 +104,17 @@ base = os.environ.get("OPENCODE_BASE_URL", "").strip()
 if model:
     # opencode resolves a model reference as "<provider>/<model-id>", splitting on
     # the first "/" (packages/core/src/model.ts:parse). A bare function name like
-    # "tensorzero::function_name::FrontierCODE" has no slash, so opencode treats the
+    # "tensormoon::function_name::FrontierCODE" has no slash, so opencode treats the
     # whole string as the provider and the model id as empty, producing a malformed
-    # request ("tensorzero::function_name::FrontierCODE/") that the backend rejects.
+    # request ("tensormoon::function_name::FrontierCODE/") that the backend rejects.
     # Accept the bare function name and build the provider/model reference against
-    # the first provider in the config (the TensorZero provider). Also register the
+    # the first provider in the config (the TensorMoon provider). Also register the
     # model in that provider's models map so opencode can resolve it.
+    # Pre-fork configs named the provider "tensorzero"; strip that provider
+    # prefix so OPENCODE_MODEL=tensorzero/<model> written before the TensorMoon
+    # switch resolves against the baked provider below.
+    if model.startswith("tensorzero/"):
+        model = model[len("tensorzero/"):]
     if "/" not in model:
         providers = cfg.get("provider", {})
         if providers:

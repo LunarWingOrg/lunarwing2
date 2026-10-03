@@ -43,7 +43,7 @@ class ProvisionRequest(RequestModel):
     workers: list[str] = Field(default_factory=list)
     toolchains: bool = False
     llm_base_url: str = ""
-    llm_model: str = "tensorzero::function_name::lunarwing"
+    llm_model: str = "tensormoon::function_name::lunarwing"
     opencode_model: str = ""
     opencode_base_url: str = ""
     opencode2_model: str = ""

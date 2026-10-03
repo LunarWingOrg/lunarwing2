@@ -8,7 +8,7 @@
 #
 # 06-env-generation.sh — part of the lunarwing-mt-admin library.
 #
-# Tenant env-file generation (lunarwing/bridge/tensorzero/darkirc-
+# Tenant env-file generation (lunarwing/bridge/tensormoon/darkirc-
 # adapter/weechat), XMPP allow-list builders, DarkIRC writer lock + contacts +
 # managed exchange, SSH harness provisioning, env patching, and Gotify config.
 #
@@ -820,18 +820,18 @@ rotate_tenant_weechat_relay_password() (  # <tenant>, under lifecycle lock; clos
   say "Rotated WeeChat relay password for tenant '$name' (running services restarted)."
 )
 
-# TensorZero's OpenAI-compatible surface lives under /openai/v1. The daemon's
+# TensorMoon's OpenAI-compatible surface lives under /openai/v1. The daemon's
 # openai_compatible client appends /chat/completions to LLM_BASE_URL, so a bare
 # gateway root (http://host:3000) 404s every LLM turn while every health check
 # stays green (v2.1.0.0 item-23 rerun finding 1: a fresh proxy-disabled tenant
-# whose --tensorzero-url was the bare root could not answer a single prompt
+# whose --tensormoon-url was the bare root could not answer a single prompt
 # until an operator hand-appended /openai/v1). Derive the path-aware base a
-# tenant needs when it dials TENSORZERO_URL directly (proxy disabled).
+# tenant needs when it dials TENSORMOON_URL directly (proxy disabled).
 # Idempotent: an already-suffixed URL is returned unchanged, and a
 # reverse-proxy path prefix is kept (http://host/tz -> http://host/tz/openai/v1).
-tensorzero_openai_base() {
+tensormoon_openai_base() {
   local url="$1"
-  [[ -n "$url" ]] || die "tensorzero_openai_base: empty TensorZero URL"
+  [[ -n "$url" ]] || die "tensormoon_openai_base: empty TensorMoon URL"
   url="${url%"${url##*[!/]}"}" # strip trailing slashes
   case "$url" in
     */openai/v1) printf '%s\n' "$url" ;;
@@ -847,7 +847,7 @@ write_tenant_lunarwing_env() {
   local xmpp_jid
   xmpp_jid="$(resolve_tenant_xmpp_jid "$name" "${2:-}")"
   local xmpp_password="${3:-}"   # resolved below (preserve an existing one on re-run)
-  local tensorzero_url="${4:-$DEFAULT_TENSORZERO_URL}"
+  local tensormoon_url="${4:-$DEFAULT_TENSORMOON_URL}"
   local llm_api_key="${5:-}"
   local llm_base_url="${6:-}"
   local llm_model="${7:-}"
@@ -976,16 +976,16 @@ write_tenant_lunarwing_env() {
   pg_password="$(tenant_pg_password "$name")"
 
   # LLM endpoint the daemon's OpenAI-compatible client dials. When the proxy is
-  # enabled, defaults to this tenant's local TensorZero proxy. When disabled,
-  # defaults to the upstream TENSORZERO_URL's OpenAI-compatible surface
-  # (tensorzero_openai_base appends /openai/v1 to a bare gateway root — see the
+  # enabled, defaults to this tenant's local TensorMoon proxy. When disabled,
+  # defaults to the upstream TENSORMOON_URL's OpenAI-compatible surface
+  # (tensormoon_openai_base appends /openai/v1 to a bare gateway root — see the
   # helper for the 404 regression this prevents). An explicit value (from
   # --llm-base-url or LUNARWING_MT_LLM_BASE_URL) always overrides as-is.
   local llm_base_url_effective
   if tenant_proxy_enabled "$name"; then
     llm_base_url_effective="${llm_base_url:-http://127.0.0.1:${proxy_port}/v1}"
   else
-    llm_base_url_effective="${llm_base_url:-$(tensorzero_openai_base "$tensorzero_url")}"
+    llm_base_url_effective="${llm_base_url:-$(tensormoon_openai_base "$tensormoon_url")}"
   fi
 
   # Idempotent overrides for the configurable flags (--llm-model,
@@ -997,7 +997,7 @@ write_tenant_lunarwing_env() {
     llm_model_effective="$llm_model"
   else
     llm_model_effective="$(_env_existing "$path" LLM_MODEL)"
-    llm_model_effective="${llm_model_effective:-tensorzero::function_name::lunarwing}"
+    llm_model_effective="${llm_model_effective:-tensormoon::function_name::lunarwing}"
   fi
   if [[ -n "$gateway_host" ]]; then
     gateway_host_effective="$gateway_host"
@@ -1101,7 +1101,7 @@ DATABASE_URL=postgres://lunarwing:${pg_password}@127.0.0.1:${pg_port}/lunarwing
 DATABASE_SSLMODE=disable
 PGSSLMODE=disable
 
-# LLM — OpenAI-compatible endpoint (defaults to the local TensorZero proxy)
+# LLM — OpenAI-compatible endpoint (defaults to the local TensorMoon proxy)
 LLM_BACKEND=openai_compatible
 LLM_BASE_URL=${llm_base_url_effective}
 LLM_API_KEY=${llm_api_key:-token-${name}}
@@ -1428,7 +1428,7 @@ ENVEOF
 
 write_tenant_proxy_env() {
   local name="$1"
-  local tensorzero_url="${2:-$DEFAULT_TENSORZERO_URL}"
+  local tensormoon_url="${2:-$DEFAULT_TENSORMOON_URL}"
 
   local path proxy_port
   path="$(tenant_env_dir "$name")/proxy.env"
@@ -1439,11 +1439,83 @@ write_tenant_proxy_env() {
     cat >"$path" <<ENVEOF
 PROXY_PORT=$proxy_port
 PROXY_BIND=127.0.0.1
-TENSORZERO_URL=$tensorzero_url
+TENSORMOON_URL=$tensormoon_url
 ENVEOF
   )
   chown "$name:$name" "$path"
   say "wrote: $path"
+}
+
+# ── TensorZero → TensorMoon env migration ────────────────────────────────────
+# LunarWing moved from the abandoned TensorZero gateway to the organisation's
+# fork, TensorMoon. Env files written before the switch still carry
+# `tensorzero::` model prefixes (LLM_MODEL, OPENCODE_MODEL, OPENCODE2_MODEL,
+# KIMI_MODEL — including the provider-qualified `tensorzero/...` worker forms)
+# and TENSORZERO_URL in proxy.env. TensorMoon accepts the legacy
+# prefix (with a per-request deprecation warning), so nothing breaks at the
+# gateway cutover — but a TensorZero gateway does NOT accept `tensormoon::`.
+# Hence this is an explicit, opt-in rewrite to run once the upstream gateway is
+# TensorMoon. Idempotent; the tenant must be restarted to pick up the change.
+LEGACY_TENSORZERO_MODEL_KEYS=(LLM_MODEL OPENCODE_MODEL OPENCODE2_MODEL KIMI_MODEL)
+
+# Rewrite legacy TensorZero identifiers in one env file. Each (would-be)
+# change is reported with `say` and counted in MIGRATE_TENSORMOON_CHANGES (the
+# caller resets it); silent and zero-count when nothing needs rewriting.
+# Missing file = no-op.
+MIGRATE_TENSORMOON_CHANGES=0
+_migrate_env_file_tensormoon() {  # <env_file> <dry_run:true|false>
+  local path="$1" dry_run="${2:-false}" key value new_value
+  [[ -f "$path" ]] || return 0
+  for key in "${LEGACY_TENSORZERO_MODEL_KEYS[@]}"; do
+    value="$(_read_env_value "$path" "$key")"
+    new_value="$value"
+    # Worker keys may carry the provider-qualified form (tensorzero/<model>,
+    # tensorzero/tensorzero::function_name::<fn>); rewrite both halves.
+    [[ "$new_value" == tensorzero/* ]] && new_value="tensormoon/${new_value#tensorzero/}"
+    case "$new_value" in
+      tensorzero::*)            new_value="tensormoon::${new_value#tensorzero::}" ;;
+      tensormoon/tensorzero::*) new_value="tensormoon/tensormoon::${new_value#tensormoon/tensorzero::}" ;;
+    esac
+    [[ "$new_value" != "$value" ]] || continue
+    if [[ "$dry_run" == "true" ]]; then
+      say "  would set $key=$new_value in $path"
+    else
+      _env_set "$path" "$key" "$new_value" || die "failed to update $key in $path"
+      say "  set $key=$new_value in $path"
+    fi
+    MIGRATE_TENSORMOON_CHANGES=$((MIGRATE_TENSORMOON_CHANGES + 1))
+  done
+  value="$(_read_env_value "$path" TENSORZERO_URL)"
+  if [[ -n "$value" && -z "$(_read_env_value "$path" TENSORMOON_URL)" ]]; then
+    if [[ "$dry_run" == "true" ]]; then
+      say "  would add TENSORMOON_URL=$value to $path"
+    else
+      _env_set "$path" TENSORMOON_URL "$value" || die "failed to add TENSORMOON_URL to $path"
+      say "  added TENSORMOON_URL=$value to $path"
+    fi
+    MIGRATE_TENSORMOON_CHANGES=$((MIGRATE_TENSORMOON_CHANGES + 1))
+  fi
+}
+
+migrate_tenant_env_tensormoon() {  # <name> [dry_run:true|false]
+  local name="$1" dry_run="${2:-false}" mode=""
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  local env_dir
+  env_dir="$(tenant_env_dir "$name")"
+  [[ -f "$env_dir/lunarwing.env" ]] || die "env file not found: $env_dir/lunarwing.env (run add-tenant first)"
+  [[ "$dry_run" == "true" ]] && mode=" (dry-run)"
+  say "tenant '$name': TensorZero -> TensorMoon env migration$mode"
+  MIGRATE_TENSORMOON_CHANGES=0
+  _migrate_env_file_tensormoon "$env_dir/lunarwing.env" "$dry_run"
+  _migrate_env_file_tensormoon "$env_dir/proxy.env" "$dry_run"
+  if (( MIGRATE_TENSORMOON_CHANGES == 0 )); then
+    say "  nothing to migrate (already on TensorMoon names)"
+  elif [[ "$dry_run" != "true" ]]; then
+    say "  $MIGRATE_TENSORMOON_CHANGES change(s) applied; restart to pick them up: $0 stop-tenant $name && $0 start-tenant $name"
+  else
+    say "  $MIGRATE_TENSORMOON_CHANGES change(s) pending; rerun without --dry-run to apply"
+  fi
 }
 
 write_tenant_darkirc_adapter_env() {

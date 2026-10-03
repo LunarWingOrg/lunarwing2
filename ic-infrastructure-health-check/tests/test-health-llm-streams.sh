@@ -25,7 +25,7 @@ write_snapshot() {
   "schema_version": 1,
   "updated_at_unix_seconds": $last_issue,
   "providers": {
-    "tensorzero::function_name::FrontierTEE/P": {
+    "tensormoon::function_name::FrontierTEE/P": {
       "streams_started_total": 8,
       "streams_completed_total": 6,
       "retries_total": 3,
@@ -63,7 +63,7 @@ snapshot="$ROOT/metrics.json"
 write_snapshot "$snapshot" "$old"
 run_check HEALTH_LLM_STREAMS_FILE="$snapshot" HEALTH_LLM_STREAMS_TENANT=alpha HEALTH_LLM_STREAMS_ISSUE_WINDOW_SECS=900
 assert_eq "$RC" "0" "S2: old issue exits healthy"
-assert_eq "$(jq -r '.metrics.providers[0].provider' <<<"$OUT")" "tensorzero::function_name::FrontierTEE/P" "S2: provider retained as data"
+assert_eq "$(jq -r '.metrics.providers[0].provider' <<<"$OUT")" "tensormoon::function_name::FrontierTEE/P" "S2: provider retained as data"
 assert_eq "$(jq -r '.metrics.providers[0].retry_reason_decode_total' <<<"$OUT")" "2" "S2: retry reason exposed"
 assert_eq "$(jq -r '.metrics.providers[0].ttfc_last_ms' <<<"$OUT")" "125" "S2: time-to-first-chunk exposed"
 
@@ -96,11 +96,11 @@ jq -n --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 HEALTH_REPORT_DIR="$report_dir" HEALTH_METRICS_OUTPUT="$ROOT/metrics.prom" \
     "$EXPORTER" >/dev/null 2>&1
 exposition="$(cat "$ROOT/metrics.prom")"
-assert_contains "$exposition" 'lunarwing_health_llm_streams_retries_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 3' "S5: retries export with provider and tenant labels"
-assert_contains "$exposition" 'lunarwing_health_llm_streams_decode_failures_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 2' "S5: decode failures export"
-assert_contains "$exposition" 'lunarwing_health_llm_streams_corruption_repeated_phrase_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 1' "S5: corruption signature exports"
-assert_contains "$exposition" 'lunarwing_health_llm_streams_repl_argument_corruption_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 4' "S5: REPL corruption exports with tenant and provider labels"
-assert_contains "$exposition" 'lunarwing_health_llm_streams_ttfc_max_ms{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 400' "S5: TTFC exports"
+assert_contains "$exposition" 'lunarwing_health_llm_streams_retries_total{provider="tensormoon::function_name::FrontierTEE/P",tenant="alpha"} 3' "S5: retries export with provider and tenant labels"
+assert_contains "$exposition" 'lunarwing_health_llm_streams_decode_failures_total{provider="tensormoon::function_name::FrontierTEE/P",tenant="alpha"} 2' "S5: decode failures export"
+assert_contains "$exposition" 'lunarwing_health_llm_streams_corruption_repeated_phrase_total{provider="tensormoon::function_name::FrontierTEE/P",tenant="alpha"} 1' "S5: corruption signature exports"
+assert_contains "$exposition" 'lunarwing_health_llm_streams_repl_argument_corruption_total{provider="tensormoon::function_name::FrontierTEE/P",tenant="alpha"} 4' "S5: REPL corruption exports with tenant and provider labels"
+assert_contains "$exposition" 'lunarwing_health_llm_streams_ttfc_max_ms{provider="tensormoon::function_name::FrontierTEE/P",tenant="alpha"} 400' "S5: TTFC exports"
 
 # ── S6: collector → driver → saved report → exporter (WI#180 F2) ─────────────
 # The driver previously dropped check_llm_streams from the final serialized
@@ -110,7 +110,7 @@ driver_dir="$ROOT/driver"
 mkdir -p "$driver_dir"
 cp "$DIR/../infrastructure-health-check.sh" "$driver_dir/"
 cp "$CHECK" "$driver_dir/health-llm-streams.sh"
-for stub in gateway xmpp omemo ratelimit clickhouse tensorzero models lunarvision lunarvoice netbird; do
+for stub in gateway xmpp omemo ratelimit clickhouse tensormoon models lunarvision lunarvoice netbird; do
     cat >"$driver_dir/health-$stub.sh" <<EOF
 #!/usr/bin/env bash
 printf '{"component":"$stub","status":"healthy","metrics":{}}'
@@ -146,9 +146,9 @@ assert_contains "$(jq -r '.alerts[].message' "$saved_report" 2>/dev/null)" "llm_
 HEALTH_REPORT_DIR="$ROOT/driver-base/workspace/reports/health" HEALTH_METRICS_OUTPUT="$ROOT/driver-metrics.prom" \
     "$EXPORTER" >/dev/null 2>&1
 driver_exposition="$(cat "$ROOT/driver-metrics.prom")"
-assert_contains "$driver_exposition" 'lunarwing_health_llm_streams_repl_argument_corruption_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 4' \
+assert_contains "$driver_exposition" 'lunarwing_health_llm_streams_repl_argument_corruption_total{provider="tensormoon::function_name::FrontierTEE/P",tenant="alpha"} 4' \
     "S6: exporter emits REPL corruption from the driver-saved report"
-assert_contains "$driver_exposition" 'lunarwing_health_llm_streams_retries_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 3' \
+assert_contains "$driver_exposition" 'lunarwing_health_llm_streams_retries_total{provider="tensormoon::function_name::FrontierTEE/P",tenant="alpha"} 3' \
     "S6: exporter emits stream counters from the driver-saved report"
 assert_contains "$driver_exposition" 'lunarwing_health_status{component="llm_streams"} 1' \
     "S6: llm_streams component status exported"
@@ -167,7 +167,7 @@ printf '%s\n' '{"component":"openrc","status":"degraded","metrics":{"services":[
 sleep 60
 EOF
 chmod +x "$slow_dir/health-openrc.sh"
-for stub in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird; do
+for stub in gateway xmpp omemo ratelimit clickhouse tensormoon models llm-streams lunarvision lunarvoice netbird; do
     cat >"$slow_dir/health-$stub.sh" <<EOF
 #!/usr/bin/env bash
 printf '{"component":"$stub","status":"healthy","metrics":{}}'

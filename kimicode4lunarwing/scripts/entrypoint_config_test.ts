@@ -12,10 +12,10 @@ const configSectionEnd = entrypoint.indexOf("# ── always start the health se
 
 test("baked Kimi defaults use the NetBird FrontierCODEK provider", () => {
   const config = readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8")
-  assert.match(config, /^default_model = "tensorzero\/FrontierCODEK"$/m)
+  assert.match(config, /^default_model = "tensormoon\/FrontierCODEK"$/m)
   assert.match(config, /^base_url = "http:\/\/cotterhomelab3\.netbird\.selfhosted:3000\/openai\/v1"$/m)
-  assert.match(config, /^\[models\."tensorzero\/FrontierCODEK"\]$/m)
-  assert.match(config, /^model = "tensorzero::function_name::FrontierCODEK"$/m)
+  assert.match(config, /^\[models\."tensormoon\/FrontierCODEK"\]$/m)
+  assert.match(config, /^model = "tensormoon::function_name::FrontierCODEK"$/m)
   assert.match(config, /^dangerous_command_guard = true$/m)
   assert.match(config, /^command = "node \/app\/hooks\/headless_command_guard\.mjs"$/m)
 })
@@ -71,6 +71,7 @@ test("entrypoint accepts a missing Kimi API key", () => {
     KIMI_CONFIG_SOURCE: source,
   }
   delete env.KIMI_API_KEY
+  delete env.TENSORMOON_API_KEY
   delete env.TENSORZERO_API_KEY
 
   const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
@@ -85,21 +86,71 @@ test("entrypoint accepts a missing Kimi API key", () => {
   assert.match(generated, /headless_command_guard\.mjs/)
 })
 
-test("entrypoint retargets the baked model entry when KIMI_MODEL is a new model id", () => {
+test("entrypoint honours the pre-fork TENSORZERO_API_KEY name as the last fallback", () => {
   assert.ok(configSectionEnd > 0)
-  const root = mkdtempSync(join(tmpdir(), "kimi-config-retarget-"))
+  const root = mkdtempSync(join(tmpdir(), "kimi-config-legacy-api-key-"))
   const home = join(root, "home")
   const source = join(root, "source.toml")
-  writeFileSync(source, `default_model = "tensorzero/FrontierCODE"
+  writeFileSync(source, 'api_key = ""\n')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    KIMI_CODE_HOME: home,
+    KIMI_CONFIG_SOURCE: source,
+    TENSORZERO_API_KEY: "legacy-key",
+  }
+  delete env.KIMI_API_KEY
+  delete env.TENSORMOON_API_KEY
 
-[providers.tensorzero]
+  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env,
+  })
+
+  assert.equal(result.status, 0, result.stderr)
+  const generated = readFileSync(join(home, "config.toml"), "utf8")
+  assert.match(generated, /api_key = "legacy-key"/)
+})
+
+test("entrypoint prefers TENSORMOON_API_KEY over the pre-fork TENSORZERO_API_KEY name", () => {
+  assert.ok(configSectionEnd > 0)
+  const root = mkdtempSync(join(tmpdir(), "kimi-config-new-api-key-"))
+  const home = join(root, "home")
+  const source = join(root, "source.toml")
+  writeFileSync(source, 'api_key = ""\n')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    KIMI_CODE_HOME: home,
+    KIMI_CONFIG_SOURCE: source,
+    TENSORMOON_API_KEY: "new-key",
+    TENSORZERO_API_KEY: "legacy-key",
+  }
+  delete env.KIMI_API_KEY
+
+  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env,
+  })
+
+  assert.equal(result.status, 0, result.stderr)
+  const generated = readFileSync(join(home, "config.toml"), "utf8")
+  assert.match(generated, /api_key = "new-key"/)
+})
+
+test("entrypoint maps a legacy tensorzero/<alias> KIMI_MODEL onto the baked tensormoon/<alias>", () => {
+  assert.ok(configSectionEnd > 0)
+  const root = mkdtempSync(join(tmpdir(), "kimi-config-legacy-alias-"))
+  const home = join(root, "home")
+  const source = join(root, "source.toml")
+  writeFileSync(source, `default_model = "tensormoon/FrontierCODE"
+
+[providers.tensormoon]
 type = "openai"
 base_url = "http://100.88.232.146:3000/openai/v1"
 api_key = ""
 
-[models."tensorzero/FrontierCODE"]
-provider = "tensorzero"
-model = "tensorzero::function_name::FrontierCODE"
+[models."tensormoon/FrontierCODE"]
+provider = "tensormoon"
+model = "tensormoon::function_name::FrontierCODE"
 max_context_size = 859000
 capabilities = ["tool_use"]
 `)
@@ -110,15 +161,52 @@ capabilities = ["tool_use"]
       ...process.env,
       KIMI_CODE_HOME: home,
       KIMI_CONFIG_SOURCE: source,
-      KIMI_MODEL: "tensorzero::function_name::baud",
+      KIMI_MODEL: "tensorzero/FrontierCODE",
     },
   })
   assert.equal(result.status, 0, result.stderr)
   const config = readFileSync(join(home, "config.toml"), "utf8")
-  assert.match(config, /default_model = "tensorzero::function_name::baud"/)
-  assert.match(config, /\[models\."tensorzero::function_name::baud"\]/)
-  assert.match(config, /model = "tensorzero::function_name::baud"/)
-  assert.match(config, /provider = "tensorzero"/)
+  assert.match(config, /default_model = "tensormoon\/FrontierCODE"/)
+  assert.doesNotMatch(config, /tensorzero/)
+  // The baked alias is reused as-is: no retarget, still exactly one model entry.
+  assert.match(config, /\[models\."tensormoon\/FrontierCODE"\]/)
+  assert.equal(config.match(/\[models\./g)?.length, 1)
+})
+
+test("entrypoint retargets the baked model entry when KIMI_MODEL is a new model id", () => {
+  assert.ok(configSectionEnd > 0)
+  const root = mkdtempSync(join(tmpdir(), "kimi-config-retarget-"))
+  const home = join(root, "home")
+  const source = join(root, "source.toml")
+  writeFileSync(source, `default_model = "tensormoon/FrontierCODE"
+
+[providers.tensormoon]
+type = "openai"
+base_url = "http://100.88.232.146:3000/openai/v1"
+api_key = ""
+
+[models."tensormoon/FrontierCODE"]
+provider = "tensormoon"
+model = "tensormoon::function_name::FrontierCODE"
+max_context_size = 859000
+capabilities = ["tool_use"]
+`)
+
+  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      KIMI_CODE_HOME: home,
+      KIMI_CONFIG_SOURCE: source,
+      KIMI_MODEL: "tensormoon::function_name::baud",
+    },
+  })
+  assert.equal(result.status, 0, result.stderr)
+  const config = readFileSync(join(home, "config.toml"), "utf8")
+  assert.match(config, /default_model = "tensormoon::function_name::baud"/)
+  assert.match(config, /\[models\."tensormoon::function_name::baud"\]/)
+  assert.match(config, /model = "tensormoon::function_name::baud"/)
+  assert.match(config, /provider = "tensormoon"/)
   // provider/base_url lines untouched, exactly one model entry renamed
   assert.match(config, /base_url = "http:\/\/100\.88\.232\.146:3000\/openai\/v1"/)
   assert.equal(config.match(/\[models\./g)?.length, 1)

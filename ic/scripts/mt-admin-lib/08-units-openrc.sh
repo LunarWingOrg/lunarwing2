@@ -558,7 +558,7 @@ render_tenant_openrc_units() {
   local proxy_bin
   # Run from the tenant's own clone (in their home), not the admin's source repo,
   # so a tenant's services aren't coupled to another user's home directory.
-  proxy_bin="$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py"
+  proxy_bin="$(tenant_lw_root "$name")/tensormoon-proxy-configurations/lunarwing-proxy.py"
 
   local ws_adapter_path
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
@@ -1028,15 +1028,15 @@ INITEOF
   chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-${name}"
   fi
 
-  # ── TensorZero proxy init script (only when enabled) ──
+  # ── TensorMoon proxy init script (only when enabled) ──
   if tenant_proxy_enabled "$name"; then
   cat >"$OPENRC_INITD_DIR/lunarwing-proxy-${name}" <<INITEOF
 #!/sbin/openrc-run
 
-description="LunarWing TensorZero proxy ($name)"
+description="LunarWing TensorMoon proxy ($name)"
 
 : "\${proxy_command:=$(command -v python3)}"
-: "\${proxy_args:=$proxy_bin --port $proxy_port --bind 127.0.0.1 --tensorzero $DEFAULT_TENSORZERO_URL}"
+: "\${proxy_args:=$proxy_bin --port $proxy_port --bind 127.0.0.1 --tensormoon $DEFAULT_TENSORMOON_URL}"
 : "\${proxy_user:=$name}"
 : "\${proxy_group:=$name}"
 : "\${proxy_pidfile:=$run_dir/proxy.pid}"

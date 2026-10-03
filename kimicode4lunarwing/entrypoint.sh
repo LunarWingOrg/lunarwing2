@@ -74,14 +74,14 @@ done
 # KIMI_MODEL replaces default_model; when it does not match an existing
 # [models] alias, the baked model entry is retargeted (alias + model id) so
 # default_model stays resolvable — 0.37.2 fails startup otherwise.
-# KIMI_API_KEY falls back to TENSORZERO_API_KEY for the TensorZero-backed
-# default provider.
+# KIMI_API_KEY falls back to TENSORMOON_API_KEY (then to the pre-fork
+# TENSORZERO_API_KEY name) for the TensorMoon-backed default provider.
 #
 # WI#206: after overrides are applied, the fail-closed policy ([permission]
 # dangerous_command_guard = true and the PreToolUse guard hook) is re-asserted
 # and the guard-disabling env vars are scrubbed from the task environment, so
 # a task (or a prompt-injected command) cannot lower its own approval policy.
-export KIMI_API_KEY="${KIMI_API_KEY:-${TENSORZERO_API_KEY:-}}"
+export KIMI_API_KEY="${KIMI_API_KEY:-${TENSORMOON_API_KEY:-${TENSORZERO_API_KEY:-}}}"
 mkdir -p "$KIMI_CODE_HOME"
 
 if [ ! -f "$KIMI_CONFIG_SOURCE" ]; then
@@ -133,6 +133,17 @@ if kimi_model:
         old_alias = tomllib.loads(text).get("default_model", "")
     except tomllib.TOMLDecodeError:
         old_alias = ""
+# Pre-fork configs named the provider/alias prefix "tensorzero/". Map a legacy
+# KIMI_MODEL=tensorzero/<alias> onto the baked tensormoon/<alias> when that
+# alias exists, so tenant overrides written before the TensorMoon switch keep
+# resolving instead of being sent to the gateway as a bogus model id.
+if kimi_model.startswith("tensorzero/"):
+    candidate = "tensormoon/" + kimi_model[len("tensorzero/"):]
+    try:
+        if candidate in tomllib.loads(text).get("models", {}):
+            kimi_model = candidate
+    except tomllib.TOMLDecodeError:
+        pass
 text = replace_setting(text, "default_model", kimi_model, False)
 if kimi_model and old_alias and old_alias != kimi_model:
     text = retarget_model_entry(text, old_alias, kimi_model)

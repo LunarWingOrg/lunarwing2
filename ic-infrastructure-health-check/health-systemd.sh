@@ -6,11 +6,13 @@
 
 set -euo pipefail
 
-# Units to check (override via env)
+# Units to check (override via env). tensormoon-gateway.service was
+# tensorzero-gateway.service before the TensorMoon fork; set UNITS to keep
+# probing a host that still runs the old unit name.
 UNITS_DEFAULT=(
   "lunarwing.service"
   "xmpp-bridge.service"
-  "tensorzero-gateway.service"
+  "tensormoon-gateway.service"
 )
 
 # Allow override: UNITS="a.service b.timer"

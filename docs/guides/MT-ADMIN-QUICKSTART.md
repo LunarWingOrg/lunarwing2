@@ -80,7 +80,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group
 Useful opt-ins and opt-outs include:
 
 ```bash
-# Enable the per-tenant TensorZero proxy
+# Enable the per-tenant TensorMoon proxy
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-proxy
 
 # Enable the per-tenant DarkIRC daemon and adapter

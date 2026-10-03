@@ -19,7 +19,7 @@ set -euo pipefail
 TENANT="trayx"
 XMPP_JID="${XMPP_JID:-trayx@xmpp.sobe.world}"   # <-- confirm your XMPP domain
 XMPP_PASSWORD="${XMPP_PASSWORD:-}"              # blank -> mt-admin generates one
-LLM_API_KEY="${LLM_API_KEY:-}"                 # blank -> defaults to token-trayx (TensorZero proxy)
+LLM_API_KEY="${LLM_API_KEY:-}"                 # blank -> defaults to token-trayx (TensorMoon proxy)
 GOTIFY_URL="${GOTIFY_URL:-}"                    # optional, e.g. https://gotify.example.com
 DOCKER_GROUP="${DOCKER_GROUP:-false}"          # set true ONLY if trayx runs Docker sandbox/workers
                                                #   (docker group is ~root-equivalent — opt in deliberately)

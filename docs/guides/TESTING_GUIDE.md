@@ -43,7 +43,7 @@ Run the required tiers from [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE
 - [ ] configured external-worker smoke matrix
 - [ ] browser E2E and supplemental boundary checks where available
 
-Treat a missing external dependency as a documented deferral, not a pass. If only the harness TensorZero probe fails, check its configured upstream before declaring the local deployment broken.
+Treat a missing external dependency as a documented deferral, not a pass. If only the harness TensorMoon probe fails, check its configured upstream before declaring the local deployment broken.
 
 ## Channels
 

@@ -74,7 +74,7 @@ stack used by this harness:
 - `ALLOW_PRIVATE_IPS=1`
 - `LLM_BACKEND=openai_compatible`
 - `LLM_BASE_URL=http://127.0.0.1:3002/openai/v1`
-- `LLM_MODEL=tensorzero::function_name::ironclaw`
+- `LLM_MODEL=tensormoon::function_name::ironclaw`
 - `WASM_CHANNELS_ENABLED=true`
 
 Do not remove those defaults unless you are intentionally changing the test
@@ -383,5 +383,5 @@ Common checks:
 - A running system bridge on port `8787` can conflict with the harness bridge.
   Change `XMPP_BRIDGE_BIND` in the test env file when needed.
 - `verify` treats the proxy as healthy when `:3002` returns any HTTP response.
-  That confirms the local shim is running even if the upstream TensorZero
+  That confirms the local shim is running even if the upstream TensorMoon
   service returns `404` or `500` for `GET /openai/v1/models`.

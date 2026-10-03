@@ -120,7 +120,7 @@ envval() {  # <key> — extract value from the last-written fixture env
 
 # Case 1: defaults (no flags) on first write
 out="$(run_writer fixture-tenant)"
-assert_eq "default LLM_MODEL" "$(envval LLM_MODEL)" "tensorzero::function_name::lunarwing"
+assert_eq "default LLM_MODEL" "$(envval LLM_MODEL)" "tensormoon::function_name::lunarwing"
 assert_eq "default GATEWAY_HOST" "$(envval GATEWAY_HOST)" "127.0.0.1"
 assert_eq "default MASCOT_ENABLED" "$(envval MASCOT_ENABLED)" "false"
 # WI#205: the sandbox must be told which tenant directories hold credentials.
@@ -328,15 +328,15 @@ assert_eq "rerun preserves DARKIRC_ADAPTER_SECRET" \
 DARKIRC_FIXTURE_ENABLED=false
 
 # Case 5: LLM_BASE_URL derivation (v2.1.0.0 item-23 rerun finding 1).
-# Regression: a proxy-disabled tenant provisioned with a bare TensorZero root
-# (--tensorzero-url http://host:3000) used to get LLM_BASE_URL=<bare root>, and
+# Regression: a proxy-disabled tenant provisioned with a bare TensorMoon root
+# (--tensormoon-url http://host:3000) used to get LLM_BASE_URL=<bare root>, and
 # the daemon's openai_compatible client then 404'd every turn on
 # POST /chat/completions while /api/health stayed healthy. The derivation must
-# append TensorZero's OpenAI-compatible surface (/openai/v1).
+# append TensorMoon's OpenAI-compatible surface (/openai/v1).
 out="$(run_writer fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
   "glm-5-air" "0.0.0.0" "admin@xmpp.org,bob@xmpp.org")"
-assert_eq "bare tensorzero root gains /openai/v1" \
+assert_eq "bare tensormoon root gains /openai/v1" \
   "$(envval LLM_BASE_URL)" "http://tz:3030/openai/v1"
 out="$(run_writer fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "http://tz:3030/" "")"
@@ -344,20 +344,20 @@ assert_eq "trailing slash stripped before suffix" \
   "$(envval LLM_BASE_URL)" "http://tz:3030/openai/v1"
 out="$(run_writer fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "http://192.168.1.157:3000/openai/v1" "")"
-assert_eq "already-suffixed tensorzero URL unchanged" \
+assert_eq "already-suffixed tensormoon URL unchanged" \
   "$(envval LLM_BASE_URL)" "http://192.168.1.157:3000/openai/v1"
 out="$(run_writer fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "https://gw.example.test/tz" "")"
 assert_eq "reverse-proxy prefix kept" \
   "$(envval LLM_BASE_URL)" "https://gw.example.test/tz/openai/v1"
 # An explicit --llm-base-url is an operator contract: passed through verbatim,
-# never suffixed (non-TensorZero providers use their own path shapes).
+# never suffixed (non-TensorMoon providers use their own path shapes).
 out="$(run_writer fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "http://custom:9000/v1")"
 assert_eq "explicit llm-base-url preserved verbatim" \
   "$(envval LLM_BASE_URL)" "http://custom:9000/v1"
 # Proxy enabled: the tenant dials its own loopback proxy on /v1; the upstream
-# TensorZero URL is not consulted for LLM_BASE_URL.
+# TensorMoon URL is not consulted for LLM_BASE_URL.
 PROXY_FIXTURE_ENABLED=true
 out="$(run_writer fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "")"
@@ -369,19 +369,19 @@ assert_eq "proxy enabled + explicit llm-base-url wins" \
   "$(envval LLM_BASE_URL)" "http://custom:9000/v2"
 PROXY_FIXTURE_ENABLED=false
 
-echo "=== tensorzero_openai_base unit tests ==="
+echo "=== tensormoon_openai_base unit tests ==="
 assert_eq "unit bare root suffixed" \
-  "$(tensorzero_openai_base "http://tz:3030")" "http://tz:3030/openai/v1"
+  "$(tensormoon_openai_base "http://tz:3030")" "http://tz:3030/openai/v1"
 assert_eq "unit trailing slash stripped" \
-  "$(tensorzero_openai_base "http://tz:3030/")" "http://tz:3030/openai/v1"
+  "$(tensormoon_openai_base "http://tz:3030/")" "http://tz:3030/openai/v1"
 assert_eq "unit multi trailing slashes stripped" \
-  "$(tensorzero_openai_base "http://tz:3030//")" "http://tz:3030/openai/v1"
+  "$(tensormoon_openai_base "http://tz:3030//")" "http://tz:3030/openai/v1"
 assert_eq "unit already suffixed unchanged" \
-  "$(tensorzero_openai_base "http://tz:3030/openai/v1")" "http://tz:3030/openai/v1"
+  "$(tensormoon_openai_base "http://tz:3030/openai/v1")" "http://tz:3030/openai/v1"
 assert_eq "unit /openai completed to /openai/v1" \
-  "$(tensorzero_openai_base "http://tz:3030/openai")" "http://tz:3030/openai/v1"
+  "$(tensormoon_openai_base "http://tz:3030/openai")" "http://tz:3030/openai/v1"
 assert_eq "unit path prefix preserved" \
-  "$(tensorzero_openai_base "https://gw.example.test/tz")" "https://gw.example.test/tz/openai/v1"
+  "$(tensormoon_openai_base "https://gw.example.test/tz")" "https://gw.example.test/tz/openai/v1"
 
 echo "=== coordination env backfill tests ==="
 cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
@@ -692,6 +692,100 @@ if echo "$batch_dispatch_output" | grep -q 'unknown flag: --no-weechat-bootstrap
 else
   echo "  PASS: add-tenants accepts --no-weechat-bootstrap"
 fi
+
+echo "=== TensorZero -> TensorMoon compatibility tests ==="
+
+# The pre-fork env var still seeds the default upstream URL (with a warning),
+# and the new name wins when both are set.
+legacy_default="$(LUNARWING_MT_TENSORZERO_URL=http://legacy-gw:3000 \
+  bash -c 'source "$1" 2>/dev/null; printf "%s" "$DEFAULT_TENSORMOON_URL"' _ "$ADMIN_SCRIPT")"
+assert_eq "LUNARWING_MT_TENSORZERO_URL honoured as alias" "$legacy_default" "http://legacy-gw:3000"
+legacy_warn="$(LUNARWING_MT_TENSORZERO_URL=http://legacy-gw:3000 \
+  bash -c 'source "$1" >/dev/null' _ "$ADMIN_SCRIPT" 2>&1 || true)"
+if echo "$legacy_warn" | grep -q 'LUNARWING_MT_TENSORZERO_URL is deprecated'; then
+  echo "  PASS: legacy env var prints a deprecation warning"
+else
+  echo "  FAIL: legacy env var did not warn"
+  echo "        $legacy_warn"
+  failures=$((failures + 1))
+fi
+new_wins="$(LUNARWING_MT_TENSORMOON_URL=http://new-gw:3000 LUNARWING_MT_TENSORZERO_URL=http://legacy-gw:3000 \
+  bash -c 'source "$1" 2>/dev/null; printf "%s" "$DEFAULT_TENSORMOON_URL"' _ "$ADMIN_SCRIPT")"
+assert_eq "LUNARWING_MT_TENSORMOON_URL wins over the alias" "$new_wins" "http://new-gw:3000"
+assert_eq "DEFAULT_TENSORZERO_URL mirrors DEFAULT_TENSORMOON_URL" "$DEFAULT_TENSORZERO_URL" "$DEFAULT_TENSORMOON_URL"
+
+# --tensorzero-url stays accepted as a deprecated alias by both dispatchers,
+# and the migration subcommands are known to the dispatcher.
+for sub in add-tenant add-tenants; do
+  alias_out="$(bash "$ADMIN_SCRIPT" "$sub" --tensorzero-url http://legacy-gw:3000 2>&1 || true)"
+  if echo "$alias_out" | grep -q 'unknown flag: --tensorzero-url'; then
+    echo "  FAIL: $sub rejected --tensorzero-url"
+    echo "        $alias_out"
+    failures=$((failures + 1))
+  else
+    echo "  PASS: $sub accepts --tensorzero-url (deprecated alias)"
+  fi
+done
+for sub in migrate-tensormoon-env migrate-tensormoon-env-all; do
+  sub_out="$(bash "$ADMIN_SCRIPT" "$sub" --dry-run 2>&1 || true)"
+  if echo "$sub_out" | grep -qi 'unknown command'; then
+    echo "  FAIL: dispatcher does not know $sub"
+    echo "        $sub_out"
+    failures=$((failures + 1))
+  else
+    echo "  PASS: dispatcher knows $sub"
+  fi
+done
+
+# _migrate_env_file_tensormoon rewrites legacy prefixes, is dry-run aware,
+# leaves already-migrated keys alone, and is idempotent.
+mig_dir="$(mktemp -d)"
+chmod 700 "$mig_dir"
+mig_env="$mig_dir/lunarwing.env"
+cat >"$mig_env" <<'EOF'
+LLM_BACKEND=openai_compatible
+LLM_MODEL=tensorzero::function_name::lunarwing
+OPENCODE_MODEL=tensorzero::function_name::FrontierCODE
+OPENCODE2_MODEL=tensorzero/tensorzero::function_name::FrontierCODE
+KIMI_MODEL=tensormoon::function_name::FrontierCODEK
+GATEWAY_HOST=127.0.0.1
+EOF
+mig_proxy="$mig_dir/proxy.env"
+printf 'PROXY_PORT=13002\nPROXY_BIND=127.0.0.1\nTENSORZERO_URL=http://legacy-gw:3000/openai/v1\n' >"$mig_proxy"
+
+MIGRATE_TENSORMOON_CHANGES=0
+_migrate_env_file_tensormoon "$mig_env" true
+_migrate_env_file_tensormoon "$mig_proxy" true
+assert_eq "dry-run counts LLM_MODEL + OPENCODE_MODEL + OPENCODE2_MODEL + TENSORMOON_URL" "$MIGRATE_TENSORMOON_CHANGES" "4"
+assert_eq "dry-run leaves LLM_MODEL untouched" \
+  "$(_read_env_value "$mig_env" LLM_MODEL)" "tensorzero::function_name::lunarwing"
+assert_eq "dry-run leaves proxy.env untouched" "$(_read_env_value "$mig_proxy" TENSORMOON_URL)" ""
+
+MIGRATE_TENSORMOON_CHANGES=0
+_migrate_env_file_tensormoon "$mig_env" false
+_migrate_env_file_tensormoon "$mig_proxy" false
+assert_eq "apply counts four changes" "$MIGRATE_TENSORMOON_CHANGES" "4"
+assert_eq "apply rewrites LLM_MODEL" \
+  "$(_read_env_value "$mig_env" LLM_MODEL)" "tensormoon::function_name::lunarwing"
+assert_eq "apply rewrites OPENCODE_MODEL" \
+  "$(_read_env_value "$mig_env" OPENCODE_MODEL)" "tensormoon::function_name::FrontierCODE"
+assert_eq "apply rewrites provider-qualified OPENCODE2_MODEL" \
+  "$(_read_env_value "$mig_env" OPENCODE2_MODEL)" "tensormoon/tensormoon::function_name::FrontierCODE"
+assert_eq "apply keeps already-migrated KIMI_MODEL" \
+  "$(_read_env_value "$mig_env" KIMI_MODEL)" "tensormoon::function_name::FrontierCODEK"
+assert_eq "apply keeps unrelated keys" "$(_read_env_value "$mig_env" GATEWAY_HOST)" "127.0.0.1"
+assert_eq "apply leaves exactly one LLM_MODEL line" "$(grep -c '^LLM_MODEL=' "$mig_env")" "1"
+assert_eq "apply adds TENSORMOON_URL to proxy.env" \
+  "$(_read_env_value "$mig_proxy" TENSORMOON_URL)" "http://legacy-gw:3000/openai/v1"
+assert_eq "apply keeps TENSORZERO_URL in proxy.env" \
+  "$(_read_env_value "$mig_proxy" TENSORZERO_URL)" "http://legacy-gw:3000/openai/v1"
+
+MIGRATE_TENSORMOON_CHANGES=0
+_migrate_env_file_tensormoon "$mig_env" false
+_migrate_env_file_tensormoon "$mig_proxy" false
+assert_eq "second apply is a no-op" "$MIGRATE_TENSORMOON_CHANGES" "0"
+assert_eq "missing file is a no-op" "$(_migrate_env_file_tensormoon "$mig_dir/absent.env" false; echo "rc=$?")" "rc=0"
+rm -rf "$mig_dir"
 
 echo ""
 if [[ "$failures" -eq 0 ]]; then

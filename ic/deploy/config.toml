@@ -10,7 +10,7 @@
 #   LLM_API_KEY=unneeded lunarwing run
 
 llm_backend = "openai_compatible"
-selected_model = "tensorzero::function_name::lunarwing"
+selected_model = "tensormoon::function_name::lunarwing"
 openai_compatible_base_url = "http://127.0.0.1:3000/openai/v1"
 
 [agent]

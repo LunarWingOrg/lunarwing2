@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # Creates and manages OS-level LunarWing tenants. Each tenant is a real system
 # user with its own repo clone, build artifacts, services, PostgreSQL container,
-# TensorZero proxy, and XMPP bridge.
+# TensorMoon proxy, and XMPP bridge.
 #
 # Must be run as root (or via sudo).
 
@@ -71,7 +71,16 @@ OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
 OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
-DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000/openai/v1}"
+# Upstream TensorMoon gateway (the organisation's fork of the abandoned
+# TensorZero gateway LunarWing previously targeted). LUNARWING_MT_TENSORZERO_URL
+# is honoured as a deprecated alias so existing operator shells and
+# provisioning wrappers keep working through the cutover.
+if [[ -z "${LUNARWING_MT_TENSORMOON_URL:-}" && -n "${LUNARWING_MT_TENSORZERO_URL:-}" ]]; then
+  printf 'warning: LUNARWING_MT_TENSORZERO_URL is deprecated; use LUNARWING_MT_TENSORMOON_URL\n' >&2
+fi
+DEFAULT_TENSORMOON_URL="${LUNARWING_MT_TENSORMOON_URL:-${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000/openai/v1}}"
+# Pre-fork name, kept for out-of-tree scripts that source this file.
+DEFAULT_TENSORZERO_URL="$DEFAULT_TENSORMOON_URL"
 # Fleet-wide default VL (vision-language) backend URL the OCR sidecar proxies to.
 # Empty = sidecar comes up with VL disabled (vl_available=false), preserving the
 # pre-VL behavior for deployments without a local vision server. Override with
@@ -80,7 +89,7 @@ DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000
 # sidecar containers on this box.
 DEFAULT_VL_URL="${LUNARWING_MT_VL_URL:-http://host.containers.internal:8080/v1/chat/completions}"
 # Fleet-wide default for the daemon's LLM endpoint (LLM_BASE_URL). Empty = fall
-# back to each tenant's local TensorZero proxy. Set this (or --llm-base-url per
+# back to each tenant's local TensorMoon proxy. Set this (or --llm-base-url per
 # tenant) to point new tenants straight at a gateway as the proxy is phased out.
 DEFAULT_LLM_BASE_URL="${LUNARWING_MT_LLM_BASE_URL:-}"
 DEFAULT_GOTIFY_URL="${LUNARWING_MT_GOTIFY_URL:-}"
@@ -257,8 +266,9 @@ Commands:
     --xmpp-password <pass>        XMPP password (generated if omitted)
     --llm-api-key <key>            API key for the LLM backend provider
     --llm-base-url <url>           LLM endpoint the daemon dials (LLM_BASE_URL).
-                                   Default: this tenant's local TensorZero proxy
-    --tensorzero-url <url>         Upstream TensorZero URL
+                                   Default: this tenant's local TensorMoon proxy
+    --tensormoon-url <url>         Upstream TensorMoon gateway URL
+                                   (--tensorzero-url is a deprecated alias)
     --gotify-url <url>             Custom Gotify server URL (e.g. https://gotify.example.com)
     --no-health                    Don't enable the host-global health/self-heal pipeline
     --no-ssh                       Don't provision SSH harness (key pair, config, agent)
@@ -287,11 +297,11 @@ Commands:
                                    ($STUDY_NOTES_DEFAULT_HOME; still synced to latest)
     --opencode-model <model>       Override the opencode worker's LLM model
                                    (written to lunarwing.env as OPENCODE_MODEL)
-    --opencode-base-url <url>      Override the opencode worker's TensorZero baseURL
+    --opencode-base-url <url>      Override the opencode worker's TensorMoon baseURL
                                    (written to lunarwing.env as OPENCODE_BASE_URL)
     --opencode2-model <model>      Override the OpenCode 2 worker's LLM model
                                    (written to lunarwing.env as OPENCODE2_MODEL)
-    --opencode2-base-url <url>     Override the OpenCode 2 worker's TensorZero baseURL
+    --opencode2-base-url <url>     Override the OpenCode 2 worker's TensorMoon baseURL
                                    (written to lunarwing.env as OPENCODE2_BASE_URL)
     --kimi-model <model>           Override the kimi worker's LLM model
                                    (written to lunarwing.env as KIMI_MODEL)
@@ -300,7 +310,7 @@ Commands:
     --kimi-api-key-file <path>     Read kimi API key from a file, never argv
                                    (written to lunarwing.env as KIMI_API_KEY)
     --llm-model <model>            Override LLM_MODEL (default:
-                                   tensorzero::function_name::lunarwing)
+                                   tensormoon::function_name::lunarwing)
     --gateway-host <host>          Override GATEWAY_HOST bind address (default:
                                    127.0.0.1; use 0.0.0.0 for LAN access)
     --xmpp-allow-from <jids>       Comma-separated extra XMPP JIDs allowed to DM
@@ -447,13 +457,13 @@ Commands:
     --model <model>                Pebble model (default: openai/gpt-5.2)
 
   configure-opencode <name>        Set opencode worker LLM overrides for a tenant
-    --model <model>                TensorZero model (OPENCODE_MODEL; any string)
-    --base-url <url>               TensorZero baseURL (OPENCODE_BASE_URL; full URL)
+    --model <model>                TensorMoon model (OPENCODE_MODEL; any string)
+    --base-url <url>               TensorMoon baseURL (OPENCODE_BASE_URL; full URL)
                                    (restart the worker after: stop-tenant && start-tenant)
 
   configure-opencode2 <name>       Set OpenCode 2 worker LLM overrides for a tenant
-    --model <model>                TensorZero model (OPENCODE2_MODEL; any string)
-    --base-url <url>               TensorZero baseURL (OPENCODE2_BASE_URL; full URL)
+    --model <model>                TensorMoon model (OPENCODE2_MODEL; any string)
+    --base-url <url>               TensorMoon baseURL (OPENCODE2_BASE_URL; full URL)
                                    (restart the worker after: stop-tenant && start-tenant)
 
   configure-kimi <name>            Set kimi worker LLM overrides for a tenant
@@ -501,6 +511,16 @@ Commands:
 
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
+  migrate-tensormoon-env <name> [--dry-run]
+                                   Rewrite legacy tensorzero:: model prefixes
+                                   (LLM_MODEL, OPENCODE_MODEL, OPENCODE2_MODEL,
+                                   KIMI_MODEL) and TENSORZERO_URL in the tenant's
+                                   env files to the TensorMoon names. Run only once
+                                   the upstream gateway is TensorMoon (it accepts
+                                   both; TensorZero rejects tensormoon::). Restart
+                                   the tenant afterwards.
+  migrate-tensormoon-env-all [--dry-run]
+                                   Same for every registered tenant
 
   darkirc-contact list|status|doctor|adopt ...
                                    Inventory/adopt contacts using fingerprints only
@@ -548,9 +568,10 @@ Environment:
   LUNARWING_CONTAINER_RUNTIME      Override: docker or podman (persisted to /etc/lunarwing/container-runtime on first explicit use; later runs need no env var)
   LUNARWING_MT_PROFILE             Build profile: release (default) or debug
   LUNARWING_MT_SOURCE_REPO         Path to source repo to clone from
-  LUNARWING_MT_TENSORZERO_URL      Default upstream TensorZero URL
+  LUNARWING_MT_TENSORMOON_URL      Default upstream TensorMoon gateway URL
+  LUNARWING_MT_TENSORZERO_URL      Deprecated alias of LUNARWING_MT_TENSORMOON_URL
   LUNARWING_MT_LLM_BASE_URL        Fleet-wide default LLM_BASE_URL for new tenants
-                                   (empty = each tenant's local TensorZero proxy)
+                                   (empty = each tenant's local TensorMoon proxy)
   LUNARWING_MT_GOTIFY_URL          Default Gotify server URL for new tenants
   LUNARWING_MT_GOTIFY_TITLE        Default Gotify notification title for new tenants
   LUNARWING_MT_STUDY_NOTES_HOME    Default shared Study Notes checkout
@@ -591,7 +612,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" darkirc_scope_override="" with_study_mcp="false" study_mcp_home=""
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORMOON_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" darkirc_scope_override="" with_study_mcp="false" study_mcp_home=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -612,7 +633,8 @@ main() {
           --xmpp-password)   xmpp_password="$2"; shift 2 ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
-          --tensorzero-url)  tz_url="$2"; shift 2 ;;
+          --tensormoon-url)  tz_url="$2"; shift 2 ;;
+          --tensorzero-url)  tz_url="$2"; shift 2 ;;  # deprecated alias (pre-fork name)
           --gotify-url)      gotify_url="$2"; shift 2 ;;
           --gotify-title)    gotify_title="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
@@ -643,7 +665,7 @@ main() {
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" with_study_mcp="false" study_mcp_home=""
+      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORMOON_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" with_study_mcp="false" study_mcp_home=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -662,7 +684,8 @@ main() {
           --study-mcp-home)  [[ $# -ge 2 ]] || die "--study-mcp-home requires a value"; study_mcp_home="$2"; shift 2 ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
-          --tensorzero-url)  tz_url="$2"; shift 2 ;;
+          --tensormoon-url)  tz_url="$2"; shift 2 ;;
+          --tensorzero-url)  tz_url="$2"; shift 2 ;;  # deprecated alias (pre-fork name)
           --gotify-url)      gotify_url="$2"; shift 2 ;;
           --gotify-title)    gotify_title="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
@@ -1501,6 +1524,42 @@ main() {
       [[ -n "$names" ]] || { say "no tenants registered"; exit 0; }
       while IFS= read -r name; do
         patch_tenant_env "$name"
+      done <<< "$names"
+      ;;
+
+    migrate-tensormoon-env)
+      require_root
+      local name="" dry_run="false"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --dry-run) dry_run="true"; shift ;;
+          -*)        die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$name" ]]; then name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$name" ]] || die "usage: migrate-tensormoon-env <name> [--dry-run]"
+      ports_registry_init
+      migrate_tenant_env_tensormoon "$name" "$dry_run"
+      ;;
+
+    migrate-tensormoon-env-all)
+      require_root
+      local dry_run="false"
+      case "${1:-}" in
+        "") ;;
+        --dry-run) dry_run="true" ;;
+        *) die "usage: migrate-tensormoon-env-all [--dry-run]" ;;
+      esac
+      ports_registry_init
+      local names
+      names="$(all_tenant_names)"
+      [[ -n "$names" ]] || { say "no tenants registered"; exit 0; }
+      while IFS= read -r name; do
+        migrate_tenant_env_tensormoon "$name" "$dry_run"
       done <<< "$names"
       ;;
 

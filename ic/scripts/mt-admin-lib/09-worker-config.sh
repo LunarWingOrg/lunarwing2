@@ -1229,6 +1229,8 @@ start_tenant_opencode() {
 
       local llm_api_key
       llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+      [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORMOON_API_KEY=$llm_api_key")
+      # Pre-fork name: worker images built before the TensorMoon switch read it.
       [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
 
       local opencode_model opencode_base_url
@@ -1437,6 +1439,8 @@ start_tenant_opencode2() {
 
       local llm_api_key
       llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+      [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORMOON_API_KEY=$llm_api_key")
+      # Pre-fork name: worker images built before the TensorMoon switch read it.
       [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
 
       local oc2_model oc2_base_url

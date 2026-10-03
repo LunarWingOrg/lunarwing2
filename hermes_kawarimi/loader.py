@@ -251,8 +251,8 @@ def _add_tenant_args(mt: str, plan: ImportPlan) -> list[str]:
     args = [mt, "add-tenant", plan.tenant, "--no-health"]
     if plan.docker_group:
         args.append("--docker-group")
-    if plan.tensorzero_url:
-        args.extend(["--tensorzero-url", plan.tensorzero_url])
+    if plan.tensormoon_url:
+        args.extend(["--tensormoon-url", plan.tensormoon_url])
     if plan.llm_model:
         args.extend(["--llm-model", plan.llm_model])
     args.extend(_worker_flags(plan))

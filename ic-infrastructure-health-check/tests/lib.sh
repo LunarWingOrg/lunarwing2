@@ -251,7 +251,7 @@ EOF
 
     # Per-component health checks used by post-restart verification.
     local comp svc
-    for pair in gateway:lunarwing xmpp:xmpp-bridge tensorzero:tensorzero-gateway clickhouse:clickhouse-server; do
+    for pair in gateway:lunarwing xmpp:xmpp-bridge tensormoon:tensormoon-gateway clickhouse:clickhouse-server; do
         comp="${pair%%:*}"; svc="${pair##*:}"
         cat > "$bin/health-$comp.sh" <<EOF
 #!/usr/bin/env bash

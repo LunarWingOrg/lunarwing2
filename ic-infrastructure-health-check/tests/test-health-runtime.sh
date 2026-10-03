@@ -77,7 +77,7 @@ run_hc() {
 # ── A: registry discovery + healthy tenant ───────────────────────────────────
 a="$(new_sb)"; mk_registry "$a" acme acme 3001 8788
 fix_body "$a" "http://127.0.0.1:3001/api/gateway/status" \
-  '{"uptime_secs":120,"total_connections":3,"llm_backend":"tensorzero","channel_health":{"xmpp":{"healthy":true}}}'
+  '{"uptime_secs":120,"total_connections":3,"llm_backend":"tensormoon","channel_health":{"xmpp":{"healthy":true}}}'
 fix_body "$a" "http://127.0.0.1:3001/api/chat/pending-gates" '{"gates":[]}'
 fix_body "$a" "http://127.0.0.1:8788/v1/status" \
   '{"configured":true,"running":true,"queued_messages":2,"outbound_messages_last_hour":5,"omemo_enabled":true,"prekeys_available":90}'

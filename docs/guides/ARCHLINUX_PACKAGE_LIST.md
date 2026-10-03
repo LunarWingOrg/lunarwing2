@@ -27,7 +27,7 @@ The admin script, the per-tenant daemons, and the health/self-heal pipeline need
 |---------|-----|
 | `jq` | Port registry (`/etc/lunarwing/ports.json`), health-check JSON, self-heal, send-notification |
 | `git` | Per-tenant repo clones |
-| `python` (python3) | TensorZero proxy, WeeChat WS adapter, all `health-*.sh` scripts |
+| `python` (python3) | TensorMoon proxy, WeeChat WS adapter, all `health-*.sh` scripts |
 | `curl` | Self-heal Gotify pages, `health-models` probe, gateway deep-checks |
 | `util-linux` | Provides `flock` — build lock + self-heal single-instance lock (in `base`, always present) |
 
@@ -138,7 +138,7 @@ Notes:
 
 - `lunarwing_mt_onboard.secrets_ops.install_dependencies()` can `pip install cryptography
   psycopg2-binary` on demand when they are missing — venv installs are fine for these.
-- The TensorZero proxy scripts (`tensorzero-proxy-configurations/*.py`) and the WeeChat relay's
+- The TensorMoon proxy scripts (`tensormoon-proxy-configurations/*.py`) and the WeeChat relay's
   core path are stdlib-only beyond `aiohttp`; no extra modules needed.
 
 ### Test/CI-only Python packages

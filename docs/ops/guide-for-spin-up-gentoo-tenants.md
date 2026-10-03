@@ -43,7 +43,7 @@ Important boolean flags include `--enable-proxy`, `--enable-darkirc`,
 `--with-pebble`, `--with-opencode`, `--with-kimi`, `--no-health`, `--no-ssh`,
 and `--no-weechat-bootstrap`. Value flags include `--xmpp-jid`,
 `--xmpp-password`, `--llm-api-key`, `--llm-base-url`, `--llm-model`,
-`--tensorzero-url`, `--gotify-url`, `--gateway-host`, and worker model/base-URL
+`--tensormoon-url`, `--gotify-url`, `--gateway-host`, and worker model/base-URL
 settings. Use `lunarwing-mt-admin.sh help` for the current full list. Proxy,
 DarkIRC, and all persistent workers default off; WeeChat defaults on, while
 `--no-weechat-bootstrap` skips only relay configuration, not its lifecycle.
@@ -158,7 +158,7 @@ tail -f /home/luna1/lunarwing/logs/lunarwing.log
   2. **Unified cgroup v2** — `stat -fc %T /sys/fs/cgroup` must print `cgroup2fs`. Hybrid mode (tmpfs root, v2 only at `/sys/fs/cgroup/unified`, the Gentoo default) cannot delegate memory; set `rc_cgroup_mode="unified"` in `/etc/rc.conf` and reboot.
   3. **`memory` controller at root** — `grep -w memory /sys/fs/cgroup/cgroup.controllers`.
   Full details: `docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md` §0 and `docs/guides/GENTOO_PACKAGE_LIST.md` §1b.
-- **TensorZero proxy** is opt-in with `--enable-proxy` and is **not** a container under OpenRC — when selected, it runs as a tenant-owned `python3` process under `supervise-daemon` from the tenant's own `tensorzero-proxy-configurations/lunarwing-proxy.py`. PostgreSQL, LunarVision, and selected workers are rootless Podman containers with matching `-sup` crash supervisors.
+- **TensorMoon proxy** is opt-in with `--enable-proxy` and is **not** a container under OpenRC — when selected, it runs as a tenant-owned `python3` process under `supervise-daemon` from the tenant's own `tensormoon-proxy-configurations/lunarwing-proxy.py`. PostgreSQL, LunarVision, and selected workers are rootless Podman containers with matching `-sup` crash supervisors.
 - **LunarVoice** is opt-in per tenant: use `install-voice luna1 --model-manifest <trusted.json>`, optional validated `configure-voice` flags, then `activate-voice luna1`. Activation requires verified STT artifacts, publishes registry `voice_service`/`voice_health` ports, health-gates internal `8091/health` plus `/ready`, and creates the direct `lunarwing-voice-luna1` OpenRC unit with its `-sup` crash supervisor. `deactivate-voice` restores the prior transcription provider; `remove-voice` deletes tenant-owned voice assets while retaining shared models. See `projects/voice-sidecar/README.md`.
 - **WeeChat / weechat-adapter** are optional; `start-tenant` skips them non-fatally if their deps are missing, and the main daemon does not depend on them.
 - **`doctor`** returns non-zero if any check fails and includes a "root" assertion — run it via `sudo` so that check passes, and clear every `[FAIL]` before step 1.

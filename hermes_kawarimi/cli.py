@@ -184,8 +184,8 @@ def _plan_from_args(args: argparse.Namespace) -> ImportPlan:
     plan.with_kimi = plan.with_kimi or bool(args.with_kimi)
     plan.with_toolchains = plan.with_toolchains or bool(args.with_toolchains)
     plan.with_vision = plan.with_vision or bool(args.with_vision)
-    if args.tensorzero_url:
-        plan.tensorzero_url = args.tensorzero_url
+    if args.tensormoon_url:
+        plan.tensormoon_url = args.tensormoon_url
     if args.llm_model:
         plan.llm_model = args.llm_model
     return plan
@@ -220,7 +220,13 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--with-kimi", action="store_true")
     imp.add_argument("--with-toolchains", action="store_true", help="pass --with-toolchains to build-tenant")
     imp.add_argument("--with-vision", action="store_true", help="unsupported by mt-admin — will fail in preflight")
-    imp.add_argument("--tensorzero-url", default="")
+    imp.add_argument(
+        "--tensormoon-url",
+        "--tensorzero-url",
+        dest="tensormoon_url",
+        default="",
+        help="upstream TensorMoon gateway URL (--tensorzero-url is a deprecated alias)",
+    )
     imp.add_argument("--llm-model", default="")
     imp.add_argument("--save", help="write the resolved import plan to this JSON file")
     imp.add_argument("--resume", help="load an import plan from this JSON file")

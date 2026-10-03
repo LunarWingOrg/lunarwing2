@@ -1,4 +1,5 @@
-# TensorZero Gateway Configuration
+# TensorMoon Gateway Configuration
+# (formerly tensorzero.toml; same schema — TensorMoon is the fork of TensorZero 2026.6.0)
 # Last updated Sep 15 2026 19:49
 # Latest Change: switched FrontierDEEP entrypoint to ds_v41_flash_nanogpt_tee (TEE/deepseek-v4.1-flash via nanogpt)
 # Prior Change: rebuilt FrontierCODEBlind fallbacks (kimi_k3_tee_chutes, qwen38_max_nanogpt)
@@ -8,7 +9,7 @@
 [gateway]
 bind_address = "0.0.0.0:3000"
 global_outbound_http_timeout_ms = 2000000
-# Explicitly enable asynchronous observability writes (default in TensorZero 2026.4.1+).
+# Explicitly enable asynchronous observability writes (default since TensorZero 2026.4.1; TensorMoon inherits it).
 observability.async_writes = true
 
 [object_storage]

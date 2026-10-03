@@ -93,7 +93,7 @@ current status, what was fixed, and what remains untested or broken.
 |-------|-------|
 | **Status** | ✅ Working (bash syntax valid; command surface rechecked) |
 | **Language** | Bash |
-| **Purpose** | Full-stack test environment: PostgreSQL, TensorZero proxy, XMPP bridge, WASM channels/tools, and the LunarWing daemon |
+| **Purpose** | Full-stack test environment: PostgreSQL, TensorMoon proxy, XMPP bridge, WASM channels/tools, and the LunarWing daemon |
 | **Commands** | `init`, `build`, `build-wasm`, `install-wasm`, `doctor`, `up`, `down`, `status`, `verify`, `start-postgres`, `start-proxy`, `start-bridge`, `start-lunarwing`, `repl`, etc. |
 | **Docs** | `docs/ops/HARNESS-SINGLE-TENANT.md`, `docs/ops/MULTITENANCY-HARNESS.md`, `ic/testing/lunarwing-xmpp/README.md` |
 

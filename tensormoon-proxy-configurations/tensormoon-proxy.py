@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TensorZero Proxy - DEBUG VERSION
+TensorMoon Proxy - DEBUG VERSION
 Production-ready version for LAN deployment with enhanced Codex debugging.
 
 Features:
@@ -21,10 +21,10 @@ Features:
 - 5-minute timeout for slow model fallback chains
 
 Usage:
-    python3 tensorzero-proxy.py --port 3001 --tensorzero http://192.168.1.XXX:3000
+    python3 tensormoon-proxy.py --port 3001 --tensormoon http://192.168.1.XXX:3000
 
 codex.toml:
-    [model_providers.tensorzero]
+    [model_providers.tensormoon]
     base_url = "http://127.0.0.1:3001/openai/v1"
     wire_api = "responses"
 """
@@ -43,7 +43,7 @@ import os
 import traceback
 
 # Default configuration
-TENSORZERO_URL = "http://192.168.1.157:3000"
+TENSORMOON_URL = "http://192.168.1.157:3000"
 EMBEDDINGS_URL = "http://192.168.1.213:5556"
 PROXY_PORT = 3001
 
@@ -162,7 +162,7 @@ def _convert_tools_to_chat(tools: list) -> list:
     Chat Completions tools:  {type, function: {name, description, parameters}}
 
     Built-in Responses API tools (web_search, code_interpreter, etc.) have no
-    chat completions equivalent and are silently dropped — TensorZero rejects them.
+    chat completions equivalent and are silently dropped — TensorMoon rejects them.
     """
     chat_tools = []
     for tool in tools:
@@ -289,7 +289,7 @@ def _build_codex_chat_request(data: dict) -> dict:
     """Build a Chat Completions request body from a Responses API request."""
     messages = _responses_input_to_messages(data)
     req: dict = {
-        "model":    "tensorzero::function_name::codex",
+        "model":    "tensormoon::function_name::codex",
         "messages": messages,
         "stream":   data.get("stream", False),
     }
@@ -378,7 +378,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         elif '/embeddings' in self.path:
             self.handle_embeddings()
 
-        # Everything else → TensorZero passthrough
+        # Everything else → TensorMoon passthrough
         elif '/completions' in self.path or '/models' in self.path:
             self.handle_passthrough()
 
@@ -433,11 +433,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.log_message(f"📝 Messages: {json.dumps(chat_req['messages'][:2], indent=2)}...")  # First 2 msgs
 
             upstream = urllib.request.Request(
-                TENSORZERO_URL + "/openai/v1/chat/completions",
+                TENSORMOON_URL + "/openai/v1/chat/completions",
                 data=json.dumps(chat_req).encode("utf-8"),
                 headers={
                     "Content-Type":  "application/json",
-                    "Authorization": "Bearer tensorzero-proxy",
+                    "Authorization": "Bearer tensormoon-proxy",
                 },
                 method="POST"
             )
@@ -501,7 +501,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _codex_stream(self, upstream_req, resp_id: str, msg_id: str):
         """
-        Consume chat.completion.chunk SSE from TensorZero.
+        Consume chat.completion.chunk SSE from TensorMoon.
         Emit Responses API events to Codex — including function_call items.
 
         Text output events:
@@ -847,7 +847,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         content = str(content)
 
                     func = route_function(content)
-                    data['model'] = f"tensorzero::function_name::{func}"
+                    data['model'] = f"tensormoon::function_name::{func}"
 
                     if func == 'slash_me':
                         cleaned = clean_message(content)
@@ -891,11 +891,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         self.log_message(f"💬 Routed to {func}")
 
             req = urllib.request.Request(
-                TENSORZERO_URL + '/openai/v1/chat/completions',
+                TENSORMOON_URL + '/openai/v1/chat/completions',
                 data=json.dumps(data).encode('utf-8'),
                 headers={
                     'Content-Type': 'application/json',
-                    'Authorization': 'Bearer tensorzero-proxy'
+                    'Authorization': 'Bearer tensormoon-proxy'
                 },
                 method='POST'
             )
@@ -987,11 +987,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             post_data = self._read_body() or None
 
             req = urllib.request.Request(
-                TENSORZERO_URL + self.path,
+                TENSORMOON_URL + self.path,
                 data=post_data,
                 headers={
                     'Content-Type': 'application/json',
-                    'Authorization': 'Bearer tensorzero-proxy'
+                    'Authorization': 'Bearer tensormoon-proxy'
                 },
                 method=self.command
             )
@@ -1032,23 +1032,24 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def main():
-    global TENSORZERO_URL, EMBEDDINGS_URL, PROXY_PORT
+    global TENSORMOON_URL, EMBEDDINGS_URL, PROXY_PORT
 
     parser = argparse.ArgumentParser(
-        description='TensorZero Proxy with /me routing, Codex shim, and embeddings',
+        description='TensorMoon Proxy with /me routing, Codex shim, and embeddings',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python3 tensorzero-proxy.py
-    python3 tensorzero-proxy.py --tensorzero http://192.168.1.100:3000
-    python3 tensorzero-proxy.py --port 3001
+    python3 tensormoon-proxy.py
+    python3 tensormoon-proxy.py --tensormoon http://192.168.1.100:3000
+    python3 tensormoon-proxy.py --port 3001
         """
     )
 
     parser.add_argument('--port', '-p', type=int, default=PROXY_PORT,
                         help=f'Port to listen on (default: {PROXY_PORT})')
-    parser.add_argument('--tensorzero', '-t', type=str, default=TENSORZERO_URL,
-                        help=f'TensorZero URL (default: {TENSORZERO_URL})')
+    parser.add_argument('--tensormoon', '--tensorzero', '-t', dest='tensormoon', type=str,
+                        default=TENSORMOON_URL,
+                        help=f'TensorMoon gateway URL (default: {TENSORMOON_URL}; --tensorzero is a deprecated alias)')
     parser.add_argument('--embeddings', '-e', type=str, default=EMBEDDINGS_URL,
                         help=f'Embeddings server URL (default: {EMBEDDINGS_URL})')
     parser.add_argument('--bind', '-b', type=str, default='0.0.0.0',
@@ -1056,15 +1057,15 @@ Examples:
 
     args = parser.parse_args()
 
-    TENSORZERO_URL = args.tensorzero.rstrip('/')
+    TENSORMOON_URL = args.tensormoon.rstrip('/')
     EMBEDDINGS_URL = args.embeddings.rstrip('/')
     PROXY_PORT = args.port
 
     print("=" * 70)
-    print("🔄 TensorZero Proxy - /me Routing + Codex Shim + Embeddings")
+    print("🔄 TensorMoon Proxy - /me Routing + Codex Shim + Embeddings")
     print("=" * 70)
     print(f"📍 Listening on:   {args.bind}:{PROXY_PORT}")
-    print(f"🔗 Chat →          {TENSORZERO_URL}")
+    print(f"🔗 Chat →          {TENSORMOON_URL}")
     print(f"🔢 Embeddings →    {EMBEDDINGS_URL}")
     print()
     print("🎭 Routing Rules:")

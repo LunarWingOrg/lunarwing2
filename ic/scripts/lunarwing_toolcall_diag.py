@@ -3,7 +3,7 @@
 lunarwing_toolcall_diag.py
 
 Diagnostic script to test whether each lunarwing entrypoint variant handles
-native tool calls properly. Sends N requests through TensorZero with tool
+native tool calls properly. Sends N requests through TensorMoon with tool
 definitions modeled after OpenClaw built-ins, then classifies each response:
 
   - NATIVE_TOOL_CALL : model returned a proper tool_calls object
@@ -135,7 +135,7 @@ XML_PATTERNS = [
 
 def classify_response(data: dict) -> tuple[str, str]:
     """
-    Classify a TensorZero inference response.
+    Classify a TensorMoon inference response.
     Returns (classification, detail_snippet).
     """
     # Check for native tool_calls in the response content blocks
@@ -176,7 +176,7 @@ def classify_response(data: dict) -> tuple[str, str]:
 
 
 def send_inference(gateway_url: str) -> dict:
-    """Send a single inference request to TensorZero and return the JSON response."""
+    """Send a single inference request to TensorMoon and return the JSON response."""
     payload = {
         "function_name": FUNCTION_NAME,
         "stream": STREAM,

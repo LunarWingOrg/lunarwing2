@@ -1042,37 +1042,40 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TensorZeroSseState {
+    // SSE fixture shaped after the OpenAI-compatible stream of TensorZero
+    // 2026.3.2; TensorMoon (forked from TensorZero 2026.6.0) emits the same
+    // frames, only the `model` prefix changed to `tensormoon::`.
+    struct TensorMoonSseState {
         events: Arc<Vec<String>>,
         request: Arc<Mutex<Option<JsonValue>>>,
     }
 
-    struct TensorZeroSseFixture {
+    struct TensorMoonSseFixture {
         base_url: String,
         request: Arc<Mutex<Option<JsonValue>>>,
         server: tokio::task::JoinHandle<()>,
     }
 
-    impl TensorZeroSseFixture {
+    impl TensorMoonSseFixture {
         async fn start(events: Vec<String>) -> Self {
             let request = Arc::new(Mutex::new(None));
-            let state = TensorZeroSseState {
+            let state = TensorMoonSseState {
                 events: Arc::new(events),
                 request: Arc::clone(&request),
             };
             let app = Router::new()
-                .route("/openai/v1/chat/completions", post(tensorzero_sse_handler))
+                .route("/openai/v1/chat/completions", post(tensormoon_sse_handler))
                 .with_state(state);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
-                .expect("TensorZero fixture should bind");
+                .expect("TensorMoon fixture should bind");
             let address = listener
                 .local_addr()
-                .expect("TensorZero fixture should have an address");
+                .expect("TensorMoon fixture should have an address");
             let server = tokio::spawn(async move {
                 axum::serve(listener, app)
                     .await
-                    .expect("TensorZero fixture should serve requests");
+                    .expect("TensorMoon fixture should serve requests");
             });
             Self {
                 base_url: format!("http://{address}/openai/v1"),
@@ -1086,11 +1089,11 @@ mod tests {
                 .api_key("test-key")
                 .base_url(&self.base_url)
                 .build()
-                .expect("TensorZero fixture client should build")
+                .expect("TensorMoon fixture client should build")
                 .completions_api();
             Arc::new(RigAdapter::new(
-                client.completion_model("tensorzero::function_name::lunarwing"),
-                "tensorzero::function_name::lunarwing",
+                client.completion_model("tensormoon::function_name::lunarwing"),
+                "tensormoon::function_name::lunarwing",
             ))
         }
 
@@ -1099,18 +1102,18 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .clone()
-                .expect("TensorZero fixture should capture a request")
+                .expect("TensorMoon fixture should capture a request")
         }
     }
 
-    impl Drop for TensorZeroSseFixture {
+    impl Drop for TensorMoonSseFixture {
         fn drop(&mut self) {
             self.server.abort();
         }
     }
 
-    async fn tensorzero_sse_handler(
-        State(state): State<TensorZeroSseState>,
+    async fn tensormoon_sse_handler(
+        State(state): State<TensorMoonSseState>,
         Json(request): Json<JsonValue>,
     ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
         *state
@@ -1518,11 +1521,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tensorzero_2026_3_2_stream_maps_text_usage_and_done() {
-        let fixture = TensorZeroSseFixture::start(vec![
+    async fn tensormoon_stream_maps_text_usage_and_done() {
+        let fixture = TensorMoonSseFixture::start(vec![
             serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{
                     "index": 0,
                     "finish_reason": null,
@@ -1533,7 +1536,7 @@ mod tests {
             .to_string(),
             serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{
                     "index": 0,
                     "finish_reason": "stop",
@@ -1554,7 +1557,7 @@ mod tests {
             .provider()
             .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
             .await
-            .expect("TensorZero stream should open")
+            .expect("TensorMoon stream should open")
             .collect::<Vec<_>>()
             .await;
 
@@ -1586,11 +1589,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tensorzero_2026_3_2_tool_stream_preserves_fragment_order() {
-        let fixture = TensorZeroSseFixture::start(vec![
+    async fn tensormoon_tool_stream_preserves_fragment_order() {
+        let fixture = TensorMoonSseFixture::start(vec![
             serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{
                     "index": 0,
                     "finish_reason": null,
@@ -1609,7 +1612,7 @@ mod tests {
             .to_string(),
             serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{
                     "index": 0,
                     "finish_reason": null,
@@ -1627,7 +1630,7 @@ mod tests {
             .to_string(),
             serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{
                     "index": 0,
                     "finish_reason": "tool_calls",
@@ -1648,7 +1651,7 @@ mod tests {
             .provider()
             .complete_with_tools_stream(tool_stream_request())
             .await
-            .expect("TensorZero tool stream should open")
+            .expect("TensorMoon tool stream should open")
             .collect::<Vec<_>>()
             .await;
         let arguments = chunks
@@ -1668,11 +1671,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tensorzero_2026_3_2_midstream_error_is_not_silently_dropped() {
-        let fixture = TensorZeroSseFixture::start(vec![
+    async fn tensormoon_midstream_error_is_not_silently_dropped() {
+        let fixture = TensorMoonSseFixture::start(vec![
             serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{
                     "index": 0,
                     "finish_reason": null,
@@ -1683,7 +1686,7 @@ mod tests {
             .to_string(),
             serde_json::json!({
                 "error": {
-                    "message": "TensorZero provider failed mid-stream",
+                    "message": "TensorMoon provider failed mid-stream",
                     "type": "inference_error"
                 }
             })
@@ -1696,7 +1699,7 @@ mod tests {
             .provider()
             .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
             .await
-            .expect("TensorZero stream should open")
+            .expect("TensorMoon stream should open")
             .collect::<Vec<_>>()
             .await;
 
@@ -1708,7 +1711,7 @@ mod tests {
         assert!(matches!(
             chunks.get(1),
             Some(Err(LlmError::RequestFailed { reason, .. }))
-                if reason.contains("TensorZero provider failed mid-stream")
+                if reason.contains("TensorMoon provider failed mid-stream")
         ));
     }
 
@@ -1722,21 +1725,21 @@ mod tests {
         let terminal = match terminal_finish_reason {
             Some(reason) => serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{"index": 0, "finish_reason": reason, "delta": {}}],
                 "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
             }),
             None => serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{"index": 0, "delta": {}}],
                 "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
             }),
         };
-        let fixture = TensorZeroSseFixture::start(vec![
+        let fixture = TensorMoonSseFixture::start(vec![
             serde_json::json!({
                 "id": "inference-1",
-                "model": "tensorzero::function_name::lunarwing::variant_name::test",
+                "model": "tensormoon::function_name::lunarwing::variant_name::test",
                 "choices": [{
                     "index": 0,
                     "finish_reason": null,
@@ -1754,13 +1757,13 @@ mod tests {
             .provider()
             .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
             .await
-            .expect("TensorZero stream should open")
+            .expect("TensorMoon stream should open")
             .collect::<Vec<_>>()
             .await
     }
 
     #[tokio::test]
-    async fn tensorzero_stream_carries_length_finish_reason() {
+    async fn tensormoon_stream_carries_length_finish_reason() {
         let chunks = finish_reason_stream_chunks(Some("length")).await;
         assert!(matches!(
             chunks.last(),
@@ -1769,7 +1772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tensorzero_stream_carries_content_filter_finish_reason() {
+    async fn tensormoon_stream_carries_content_filter_finish_reason() {
         let chunks = finish_reason_stream_chunks(Some("content_filter")).await;
         assert!(matches!(
             chunks.last(),
@@ -1778,7 +1781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tensorzero_stream_without_finish_reason_reports_unknown() {
+    async fn tensormoon_stream_without_finish_reason_reports_unknown() {
         let chunks = finish_reason_stream_chunks(None).await;
         assert!(matches!(
             chunks.last(),

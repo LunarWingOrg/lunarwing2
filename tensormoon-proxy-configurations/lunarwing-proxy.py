@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-LunarWing → TensorZero Proxy
+LunarWing → TensorMoon Proxy
 
-Sits between LunarWing and TensorZero, cleaning responses to be
-strictly OpenAI-compatible by removing TensorZero-specific fields
-that LunarWing's Rust parser can't handle (episode_id, tensorzero_cost, etc.).
+Sits between LunarWing and TensorMoon, cleaning responses to be
+strictly OpenAI-compatible by removing TensorMoon-specific fields
+that LunarWing's Rust parser can't handle (episode_id, tensormoon_cost, etc.).
 
 Also forces tool_choice=none on all requests to prevent tool_calls responses.
 
 Usage:
-    python3 lunarwing-proxy.py --port 3002 --tensorzero http://192.168.1.157:3000
+    python3 lunarwing-proxy.py --port 3002 --tensormoon http://192.168.1.157:3000
     
 Then point LunarWing at http://192.168.1.157:3002 instead of :3000
 """
@@ -23,12 +23,12 @@ import argparse
 import sys
 import traceback
 
-TENSORZERO_URL = "http://192.168.1.157:3000"
+TENSORMOON_URL = "http://192.168.1.157:3000"
 PROXY_PORT = 3002
 
 
 def clean_response(data: dict) -> dict:
-    """Strip TensorZero-specific fields, return strict OpenAI-compatible response."""
+    """Strip TensorMoon-specific fields, return strict OpenAI-compatible response."""
     cleaned = {
         "id": data.get("id", ""),
         "object": data.get("object", "chat.completion"),
@@ -101,7 +101,7 @@ class LunarWingProxyHandler(http.server.BaseHTTPRequestHandler):
         # Health check / model list passthrough
         try:
             req = urllib.request.Request(
-                TENSORZERO_URL + ("/openai/v1" + self.path if not self.path.startswith("/openai") else self.path),
+                TENSORMOON_URL + ("/openai/v1" + self.path if not self.path.startswith("/openai") else self.path),
                 headers={"Content-Type": "application/json"},
                 method="GET",
             )
@@ -130,7 +130,7 @@ class LunarWingProxyHandler(http.server.BaseHTTPRequestHandler):
             out_body = json.dumps(data).encode("utf-8")
 
             req = urllib.request.Request(
-                TENSORZERO_URL + ("/openai/v1" + self.path if not self.path.startswith("/openai") else self.path),
+                TENSORMOON_URL + ("/openai/v1" + self.path if not self.path.startswith("/openai") else self.path),
                 data=out_body,
                 headers={
                     "Content-Type": "application/json",
@@ -187,20 +187,23 @@ class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def main():
-    global TENSORZERO_URL, PROXY_PORT
+    global TENSORMOON_URL, PROXY_PORT
 
-    parser = argparse.ArgumentParser(description="LunarWing → TensorZero Proxy")
+    parser = argparse.ArgumentParser(description="LunarWing → TensorMoon Proxy")
     parser.add_argument("--port", "-p", type=int, default=PROXY_PORT)
-    parser.add_argument("--tensorzero", "-t", type=str, default=TENSORZERO_URL)
+    parser.add_argument(
+        "--tensormoon", "--tensorzero", "-t", dest="tensormoon", type=str, default=TENSORMOON_URL,
+        help="upstream TensorMoon gateway URL (--tensorzero is a deprecated alias)",
+    )
     parser.add_argument("--bind", "-b", type=str, default="0.0.0.0")
     args = parser.parse_args()
 
-    TENSORZERO_URL = args.tensorzero.rstrip("/")
+    TENSORMOON_URL = args.tensormoon.rstrip("/")
     PROXY_PORT = args.port
 
     print(f"🔧 LunarWing Proxy")
     print(f"   Listen:     {args.bind}:{PROXY_PORT}")
-    print(f"   Forward to: {TENSORZERO_URL}")
+    print(f"   Forward to: {TENSORMOON_URL}")
     print(f"   Cleans TZ-specific fields from responses")
     print(f"   Forces tool_choice=none on all requests")
     print()

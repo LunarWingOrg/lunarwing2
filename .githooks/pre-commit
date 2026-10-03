@@ -55,7 +55,7 @@ run_secret_scan() {
   # Each pattern on its own line. Empty alt in the key-header pattern keeps it
   # matching both `-----BEGIN PRIVATE KEY-----` and `-----BEGIN RSA PRIVATE KEY-----`.
   offending="$(printf '%s\n' "$added" | command grep -E \
-    -e '(SECRETS_MASTER_KEY|GATEWAY_AUTH_TOKEN|LLM_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_OAUTH_TOKEN|POSTGRES_PASSWORD|XMPP_PASSWORD|TENSORZERO_API_KEY|BEARER_TOKEN|AUTH_TOKEN)=[^[:space:]\"#{}$]+' \
+    -e '(SECRETS_MASTER_KEY|GATEWAY_AUTH_TOKEN|LLM_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_OAUTH_TOKEN|POSTGRES_PASSWORD|XMPP_PASSWORD|TENSORMOON_API_KEY|TENSORZERO_API_KEY|BEARER_TOKEN|AUTH_TOKEN)=[^[:space:]\"#{}$]+' \
     -e '-----BEGIN (RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----' \
     -e "(master_key|secret|token|password|api_key)=['\"]?[0-9a-fA-F]{64}" \
     -e 'sk-ant-[A-Za-z0-9_-]{20,}' \

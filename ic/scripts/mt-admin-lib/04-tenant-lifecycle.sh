@@ -501,7 +501,7 @@ add_tenant() {
   local docker_group="${2:-false}"
   local xmpp_jid="${3:-}"   # resolved below (preserve an existing one on re-run)
   local xmpp_password="${4:-}"
-  local tensorzero_url="${5:-$DEFAULT_TENSORZERO_URL}"
+  local tensormoon_url="${5:-$DEFAULT_TENSORMOON_URL}"
   local gotify_url="${6:-$DEFAULT_GOTIFY_URL}"
   local gotify_title="${7:-$DEFAULT_GOTIFY_TITLE}"
   local llm_api_key="${8:-}"
@@ -578,10 +578,10 @@ add_tenant() {
   say "--- Generating environment files ---"
   write_tenant_vision_env "$name" >/dev/null
   write_tenant_voice_env "$name" >/dev/null
-  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$opencode2_model" "$opencode2_base_url"
+  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensormoon_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$opencode2_model" "$opencode2_base_url"
   write_tenant_bridge_env "$name" "$xmpp_jid" "$xmpp_password" "$xmpp_allow_from"
   if [[ "$enable_proxy" == "true" ]]; then
-    write_tenant_proxy_env "$name" "$tensorzero_url"
+    write_tenant_proxy_env "$name" "$tensormoon_url"
   fi
   if [[ "$enable_darkirc" == "true" ]]; then
     ensure_darkirc_scope_id "$name" >/dev/null
@@ -1536,13 +1536,15 @@ upgrade_tenant_locked() {
   refresh_deployed_health_pipeline
 
   # Pre-1.1.9 units embed renamed adapter paths that only keep working through
-  # the 1.1.9-only compat symlinks — warn (don't fail) if any remain.
+  # the 1.1.9-only compat symlinks, and pre-TensorMoon units embed the old
+  # tensorzero-proxy-configurations path (kept alive by a compat symlink) —
+  # warn (don't fail) if any remain.
   local stale
-  stale="$(grep -rlE 'ironclaw_weechat_wss|darkirc_channel_for_ironclaw' \
+  stale="$(grep -rlE 'ironclaw_weechat_wss|darkirc_channel_for_ironclaw|tensorzero-proxy-configurations' \
     /etc/init.d /etc/conf.d "$(tenant_home "$name")/.config/systemd/user" 2>/dev/null \
     | grep -F -- "$name" || true)"
   if [[ -n "$stale" ]]; then
-    say "WARNING: these units still embed pre-rename paths (run render-units before v2.0.0):"
+    say "WARNING: these units still embed pre-rename paths (run render-units; ironclaw paths break at v2.0.0):"
     say "$stale"
   fi
 
@@ -2002,7 +2004,7 @@ doctor() {
     fi
   fi
   _check "source repo exists" test -d "$SOURCE_REPO/ic"
-  _check "proxy script exists" test -f "$SOURCE_REPO/tensorzero-proxy-configurations/lunarwing-proxy.py"
+  _check "proxy script exists" test -f "$SOURCE_REPO/tensormoon-proxy-configurations/lunarwing-proxy.py"
   _check "health-check orchestrator present" test -x "$HEALTH_SRC_DIR/infrastructure-health-check.sh"
   _check "self-heal script present" test -x "$HEALTH_SRC_DIR/lunarwing-self-heal.sh"
   _check "curl installed (self-heal/gotify)" command -v curl

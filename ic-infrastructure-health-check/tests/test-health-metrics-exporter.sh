@@ -48,7 +48,7 @@ sb="$(mksb)"
 mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
 {"timestamp":"2026-08-15T10:00:00Z","overall_status":"healthy",
  "components":[
-  {"component":"tensorzero","status":"healthy","duration_seconds":3,
+  {"component":"tensormoon","status":"healthy","duration_seconds":3,
    "metrics":{"p50_ms":"120","p95_ms":812,"error_rate":0.004,"queue_depth":0}},
   {"component":"xmpp","status":"healthy","metrics":{"connected":true,"latency_ms":7,"error_count":0}}
  ],
@@ -57,10 +57,10 @@ EOF
 run "$sb"
 assert_eq "$RC" "0" "exporter exits 0 on a valid report"
 assert_contains "$PROM" 'lunarwing_health_overall_status 0' "overall status healthy -> 0"
-assert_contains "$PROM" 'lunarwing_health_tensorzero_p95_ms 812' "numeric metric flattened"
-assert_contains "$PROM" 'lunarwing_health_tensorzero_p50_ms 120' "numeric STRING metric coerced"
+assert_contains "$PROM" 'lunarwing_health_tensormoon_p95_ms 812' "numeric metric flattened"
+assert_contains "$PROM" 'lunarwing_health_tensormoon_p50_ms 120' "numeric STRING metric coerced"
 assert_contains "$PROM" 'lunarwing_health_xmpp_connected 1' "boolean true -> 1"
-assert_contains "$PROM" 'lunarwing_health_check_duration_seconds{component="tensorzero"} 3' "duration exported"
+assert_contains "$PROM" 'lunarwing_health_check_duration_seconds{component="tensormoon"} 3' "duration exported"
 assert_contains "$PROM" 'lunarwing_health_report_timestamp_seconds ' "report timestamp exported"
 assert_contains "$PROM" 'lunarwing_health_alerts_total 0' "alerts count exported"
 
@@ -181,17 +181,17 @@ mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
 {"timestamp":"2026-08-15T10:00:00Z","overall_status":"healthy","components":[],"alerts":[]}
 EOF
 cat > "$sb/self-heal/state.json" <<EOF
-{"tensorzero-gateway":{"retries":4,"escalated":true,"next_attempt_at":1786620000,
+{"tensormoon-gateway":{"retries":4,"escalated":true,"next_attempt_at":1786620000,
   "consecutive_unhealthy":2,"restart_history":[$flap_just_now,1786610100]},
  "xmpp-bridge":{"retries":1,"escalated":false,"consecutive_unhealthy":0,"restart_history":[]}}
 EOF
 run "$sb"
-assert_contains "$PROM" 'lunarwing_health_selfheal_restarts_total{service="tensorzero-gateway"} 4' "selfheal restarts"
-assert_contains "$PROM" 'lunarwing_health_selfheal_escalated{service="tensorzero-gateway"} 1' "selfheal escalated=1"
+assert_contains "$PROM" 'lunarwing_health_selfheal_restarts_total{service="tensormoon-gateway"} 4' "selfheal restarts"
+assert_contains "$PROM" 'lunarwing_health_selfheal_escalated{service="tensormoon-gateway"} 1' "selfheal escalated=1"
 assert_contains "$PROM" 'lunarwing_health_selfheal_escalated{service="xmpp-bridge"} 0' "selfheal escalated=0"
-assert_contains "$PROM" 'lunarwing_health_selfheal_consecutive_unhealthy{service="tensorzero-gateway"} 2' "selfheal streak"
-assert_contains "$PROM" 'lunarwing_health_selfheal_flapping{service="tensorzero-gateway"} 1' "selfheal flapping counts in-window restarts"
-assert_contains "$PROM" 'lunarwing_health_selfheal_backoff_next_attempt_seconds{service="tensorzero-gateway"} 1786620000' "selfheal backoff"
+assert_contains "$PROM" 'lunarwing_health_selfheal_consecutive_unhealthy{service="tensormoon-gateway"} 2' "selfheal streak"
+assert_contains "$PROM" 'lunarwing_health_selfheal_flapping{service="tensormoon-gateway"} 1' "selfheal flapping counts in-window restarts"
+assert_contains "$PROM" 'lunarwing_health_selfheal_backoff_next_attempt_seconds{service="tensormoon-gateway"} 1786620000' "selfheal backoff"
 
 sb_nostate="$(mksb)"
 mkreport "$sb_nostate" "2026-08-15T10:00:00Z.json" <<'EOF'
@@ -249,18 +249,18 @@ assert_absent "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_u
 mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
 {"timestamp":"2026-08-15T10:00:00Z","overall_status":"degraded",
  "components":[
-  {"component":"tensorzero","status":"degraded","metrics":{"p95_ms":5000,"error_rate":0.2}},
+  {"component":"tensormoon","status":"degraded","metrics":{"p95_ms":5000,"error_rate":0.2}},
   {"component":"lunarvision","status":"healthy","metrics":{"enabled":true,"latency_ms":42}}
  ], "alerts":[]}
 EOF
 cat > "$ROOT/th.conf" <<'EOF'
-THRESHOLD_lunarwing_health_tensorzero_p95_ms="warn:>1500 crit:>4000"
+THRESHOLD_lunarwing_health_tensormoon_p95_ms="warn:>1500 crit:>4000"
 THRESHOLD_lunarwing_health_lunarvision_latency_ms="warn:>=42"
 THRESHOLD_lunarwing_health_not_exported="crit:>1"
 EOF
 run "$sb" HEALTH_METRICS_THRESHOLDS_FILE="$ROOT/th.conf" HEALTH_METRICS_EARLY_WARNING_NOTIFY=false
-assert_contains "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_tensorzero_p95_ms",severity="warn"} 1' "warn crossing emitted"
-assert_contains "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_tensorzero_p95_ms",severity="crit"} 1' "crit crossing emitted"
+assert_contains "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_tensormoon_p95_ms",severity="warn"} 1' "warn crossing emitted"
+assert_contains "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_tensormoon_p95_ms",severity="crit"} 1' "crit crossing emitted"
 assert_contains "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_lunarvision_latency_ms",severity="warn"} 1' "warn:>= equality form"
 assert_absent  "$PROM" 'not_exported' "rule for unexported metric skipped"
 assert_absent  "$OUT" "GOTIFY" "notify off: no notifier output"
@@ -281,7 +281,7 @@ assert_absent "$PROM" 'lunarwing_health_early_warning{' "no early_warning series
 sb="$(mksb)"
 mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
 {"timestamp":"2026-08-15T10:00:00Z","overall_status":"healthy",
- "components":[{"component":"tensorzero","status":"healthy","metrics":{"p95_ms":5000}}],"alerts":[]}
+ "components":[{"component":"tensormoon","status":"healthy","metrics":{"p95_ms":5000}}],"alerts":[]}
 EOF
 mkdir -p "$ROOT/tree"
 cp "$LIB_DIR/../health-metrics-exporter.sh" "$ROOT/tree/"
