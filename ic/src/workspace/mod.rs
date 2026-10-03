@@ -135,7 +135,7 @@ fn is_system_prompt_file(path: &str) -> bool {
 /// surface: they must get the same injection scan as the other
 /// prompt-visible files (WI#132 item 1, daily-log scan gap — the incident's
 /// contamination persisted via dailies).
-fn is_daily_log_file(path: &str) -> bool {
+pub(crate) fn is_daily_log_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.starts_with("daily/") && lower.ends_with(".md")
 }
@@ -1239,10 +1239,12 @@ impl Workspace {
         Ok(quarantine_path)
     }
 
-    /// Quarantine a poisoned daily log and annotate the scan rejection so the
-    /// caller learns the poison was moved aside and a retry starts a fresh
-    /// log. A failed quarantine only logs — the original rejection stands and
-    /// the day file stays frozen (WI#288).
+    /// Quarantine a poisoned daily log and turn the scan rejection into
+    /// [`WorkspaceError::DailyLogQuarantined`], so the caller learns the
+    /// poison was moved aside and that retrying the (clean) entry unchanged
+    /// starts a fresh log — distinct from a rejection of the entry itself
+    /// (WI#290). A failed quarantine only logs — the original rejection
+    /// stands and the day file stays frozen (WI#288).
     async fn quarantine_daily_log_on_reject(
         &self,
         path: &str,
@@ -1252,12 +1254,10 @@ impl Workspace {
         match self.quarantine_daily_log(path, doc).await {
             Ok(quarantine_path) => match scan_err {
                 WorkspaceError::InjectionRejected { path, reason } => {
-                    WorkspaceError::InjectionRejected {
+                    WorkspaceError::DailyLogQuarantined {
                         path,
-                        reason: format!(
-                            "{reason}; pre-existing poison quarantined to '{quarantine_path}'; \
-                             retry the append to start a fresh daily log"
-                        ),
+                        quarantine_path,
+                        reason,
                     }
                 }
                 other => other,
@@ -1289,7 +1289,8 @@ impl Workspace {
     /// Daily logs (`daily/*.md`) whose pre-existing content alone trips the
     /// injection gate are quarantined aside (`daily/<date>.poisoned-<n>.md`)
     /// and cleared so the next append starts a fresh log (WI#288); the
-    /// discovering append itself is still rejected.
+    /// discovering append itself is not applied and fails with
+    /// [`WorkspaceError::DailyLogQuarantined`].
     pub async fn append(&self, path: &str, content: &str) -> Result<(), WorkspaceError> {
         let path = normalize_path(path);
         if is_lorebook_json_file(&path) {
@@ -4188,19 +4189,27 @@ mod runtime_index_tests {
             .await
             .expect("seed poisoned content directly");
 
-        // The discovering append is rejected and names the quarantine path.
+        // The discovering append is not applied; the error is the distinct
+        // quarantine class (WI#290), naming the quarantine path and the
+        // pre-existing matches.
         let err = workspace
             .append(day, "evening notes")
             .await
             .expect_err("append over pre-existing poison must be rejected");
         match err {
-            WorkspaceError::InjectionRejected { reason, .. } => {
+            WorkspaceError::DailyLogQuarantined {
+                path,
+                quarantine_path,
+                reason,
+            } => {
+                assert_eq!(path, day);
+                assert_eq!(quarantine_path, "daily/2026-10-02.poisoned-1.md");
                 assert!(
-                    reason.contains("daily/2026-10-02.poisoned-1.md"),
-                    "rejection should name the quarantine path: {reason}"
+                    reason.contains("Attempt to override all previous instructions (line 3)"),
+                    "reason should name the pre-existing match and its line: {reason}"
                 );
             }
-            other => panic!("expected InjectionRejected, got: {other:?}"),
+            other => panic!("expected DailyLogQuarantined, got: {other:?}"),
         }
 
         // The poisoned content is retained at the quarantine path.
@@ -4290,13 +4299,15 @@ mod runtime_index_tests {
             .await
             .expect_err("append over pre-existing poison must be rejected");
         match err {
-            WorkspaceError::InjectionRejected { reason, .. } => {
-                assert!(
-                    reason.contains("daily/2026-10-02.poisoned-2.md"),
-                    "quarantine should land at the next free slot: {reason}"
+            WorkspaceError::DailyLogQuarantined {
+                quarantine_path, ..
+            } => {
+                assert_eq!(
+                    quarantine_path, "daily/2026-10-02.poisoned-2.md",
+                    "quarantine should land at the next free slot"
                 );
             }
-            other => panic!("expected InjectionRejected, got: {other:?}"),
+            other => panic!("expected DailyLogQuarantined, got: {other:?}"),
         }
         let second = workspace
             .read("daily/2026-10-02.poisoned-2.md")
