@@ -19,7 +19,14 @@
 
 ## Phase 2 — Features & Polish
 
-3. [ ] audit all crates and ensure there are no security vulnerabilities
+3. [x] audit all crates and ensure there are no security vulnerabilities — COMPLETED 100% (2026-10-03, branch rarity/kimi-3-20261003-0701)
+  - Full audit doc: docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md
+  - All 26 checkable manifest roots pass `cargo deny check advisories` (fresh RustSec db, HEAD f8dee89 2026-10-02); CI gate `.gitlab/scripts/cargo-deny-check.sh` green: advisories/bans/licenses/sources ok
+  - Offline raw-lock semver scan of all 27 committed Cargo.lock files (incl. manifest-less pebble4lunarwing/upstream): zero active applicable vulnerability/unsound advisories beyond the accepted/guarded pins
+  - Eight accepted advisories in ic/deny.toml re-verified against upstream 2026-10-03 (libsql 0.9.30/0.10.0-pre.4 still pin hyper-rustls ^0.25; russh 0.63.3 still pins rsa =0.10.0-rc.18; failure 0.1.8 final); none removable, none added
+  - Fresh wasmtime advisories RUSTSEC-2026-0320..0327 (published 2026-10-02) already cleared by locked wasmtime/wasmtime-wasi 36.0.17
+  - Lockfile-only guard extended: pyo3 RUSTSEC-2026-0177 and atty RUSTSEC-2021-0145 now fail CI loudly if either ever starts compiling; guard also accepts cargo tree "did not match any packages" as absent
+  - Full-graph unmaintained sweep documented (six informational advisories, all transitive, none vulnerabilities); policy unchanged
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
