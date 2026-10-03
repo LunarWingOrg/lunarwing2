@@ -27,7 +27,11 @@
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/301
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299
-8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
+8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
+   - Done 100%: context_overflow is now exempt from the per-streak `model_recovery_max_attempts` config clamp in `ic/crates/lunarwing_engine/orchestrator/default.py`, so the policy's full shrink ladder (0.60x then 0.35x) fires at default config (previously clamped to 1 attempt = 0.60x only). Chose the exemption over raising the global default so blind-retry kinds (e.g. transient) keep their restart-storm protection.
+   - Config-note (tradeoff per WI#298): the clamp default of 1 exists to avoid restart storms from blind retries; context-overflow recovery changes the inputs (shrinks context) rather than retrying blindly, so that rationale does not apply to it. It remains bounded by the per-kind policy cap (2) and the lifetime `model_recovery_total_attempts` cap (default 4, `ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS`).
+   - Tests added in `ic/crates/lunarwing_engine/src/executor/loop_engine.rs`: second shrink attempt fires at default config; ladder still terminates at the policy cap. Verified: `cargo test -p lunarwing_engine --lib context_overflow` (4 passed) and `--lib recovery` (12 passed); clippy `-D warnings` clean; rustfmt clean.
+   - Docs updated: `docs/architecture/ENGINE-V2.md`, `docs/ops/TENANT-CONFIGURATION.md`, and the `ThreadConfig::model_recovery_max_attempts` doc comment in `ic/crates/lunarwing_engine/src/types/thread.rs`.
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
 11. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296 (dupe)
