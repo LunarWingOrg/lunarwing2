@@ -1398,6 +1398,147 @@ mod tests {
         assert_eq!(owner_gate_count(&db).await, 1);
     }
 
+    /// Trace that keeps asking for `owner_gate` (`tool_steps` times), then
+    /// answers with text once tools are no longer offered.
+    fn owner_gate_rounds_trace(tool_steps: usize) -> LlmTrace {
+        let mut steps: Vec<TraceStep> = (0..tool_steps)
+            .map(|round| TraceStep {
+                request_hint: None,
+                response: TraceResponse::ToolCalls {
+                    tool_calls: vec![TraceToolCall {
+                        id: format!("call_owner_gate_{round}"),
+                        name: "owner_gate".to_string(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    input_tokens: 40,
+                    output_tokens: 10,
+                },
+                expected_tool_results: vec![],
+            })
+            .collect();
+        steps.push(TraceStep {
+            request_hint: None,
+            response: TraceResponse::Text {
+                content: "ROUTINE_OK".to_string(),
+                input_tokens: 20,
+                output_tokens: 5,
+            },
+            expected_tool_results: vec![],
+        });
+        LlmTrace::single_turn("test-owner-gate-rounds", "run owner gate", steps)
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: WI#291 — max_tool_rounds: N buys exactly N tool rounds
+    // -----------------------------------------------------------------------
+
+    /// `max_tool_rounds: 3` (the default, under the default operator cap of
+    /// 3) must execute three tool rounds before the forced text-only turn.
+    /// The forced turn used to land on round N, leaving two — the digest
+    /// incident where the final send never ran.
+    #[tokio::test]
+    async fn lightweight_routine_gets_exactly_max_tool_rounds_tool_rounds() {
+        let (backend, tmp) = create_test_backend().await;
+        let db: Arc<dyn Database> = backend;
+        let tools_dir = tmp.path().join("wasm-tools");
+        let engine = setup_owner_gate_engine(
+            db.clone(),
+            owner_gate_rounds_trace(6),
+            tools_dir.as_path(),
+            Some("default"),
+            true,
+        )
+        .await;
+
+        let mut routine = make_routine("round-budget", Trigger::Manual, "Use owner_gate.");
+        if let RoutineAction::Lightweight { use_tools, .. } = &mut routine.action {
+            *use_tools = true;
+        }
+        db.create_routine(&routine).await.expect("create_routine");
+
+        let run_id = engine
+            .fire_manual(routine.id, None)
+            .await
+            .expect("fire manual");
+        let run = wait_for_run_completion(&db, routine.id, run_id).await;
+
+        assert_eq!(run.status, RunStatus::Ok);
+        assert_eq!(
+            owner_gate_count(&db).await,
+            3,
+            "max_tool_rounds: 3 must buy three tool rounds, then a text-only turn"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: WI#291 — routine_update can change a routine's tool-round budget
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn routine_update_sets_lightweight_max_tool_rounds() {
+        let (backend, tmp) = create_test_backend().await;
+        let db: Arc<dyn Database> = backend;
+        let tools_dir = tmp.path().join("wasm-tools");
+        let engine = setup_owner_gate_engine(
+            db.clone(),
+            owner_gate_trace(false),
+            tools_dir.as_path(),
+            None,
+            false,
+        )
+        .await;
+        let lightweight = make_routine("budgeted", Trigger::Manual, "Check things.");
+        db.create_routine(&lightweight)
+            .await
+            .expect("create lightweight");
+        let full_job = make_full_job_routine("full-job-budget");
+        db.create_routine(&full_job).await.expect("create full job");
+
+        let update_tool = RoutineUpdateTool::new(db.clone(), engine);
+        let ctx = JobContext::with_user("default", "update", "update routine budget");
+        let output = update_tool
+            .execute(
+                serde_json::json!({"name": "budgeted", "max_tool_rounds": 5}),
+                &ctx,
+            )
+            .await
+            .expect("routine_update should accept max_tool_rounds");
+        assert_eq!(output.result["max_tool_rounds"], 5);
+        let reloaded = db
+            .get_routine(lightweight.id)
+            .await
+            .expect("get_routine")
+            .expect("routine exists");
+        assert!(matches!(
+            reloaded.action,
+            RoutineAction::Lightweight {
+                max_tool_rounds: 5,
+                ..
+            }
+        ));
+
+        let clamped = update_tool
+            .execute(
+                serde_json::json!({"name": "budgeted", "max_tool_rounds": 999}),
+                &ctx,
+            )
+            .await
+            .expect("oversized budget is clamped, not rejected");
+        assert_eq!(
+            clamped.result["max_tool_rounds"],
+            lunarwing::config::LIGHTWEIGHT_MAX_TOOL_ROUNDS
+        );
+
+        let err = update_tool
+            .execute(
+                serde_json::json!({"name": "full-job-budget", "max_tool_rounds": 5}),
+                &ctx,
+            )
+            .await
+            .expect_err("full_job routines have no tool-round budget");
+        assert!(matches!(err, ToolError::InvalidParameters(_)), "{err:?}");
+    }
+
     // -----------------------------------------------------------------------
     // Test: full_job cron routines use the owner's active extension tools
     // -----------------------------------------------------------------------

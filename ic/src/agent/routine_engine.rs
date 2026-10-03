@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::agent::Scheduler;
 use crate::agent::routine::{
-    NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger, content_hash,
-    next_cron_fire,
+    MAX_TOOL_ROUNDS_LIMIT, NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger,
+    content_hash, next_cron_fire,
 };
 use crate::channels::{IncomingMessage, OutgoingResponse};
 use crate::config::RoutineConfig;
@@ -1516,8 +1516,9 @@ async fn execute_full_job(
 
 /// Execute a lightweight routine with optional tool support.
 ///
-/// If tools are enabled, this runs a simplified agentic loop (max 3-5 iterations).
-/// If tools are disabled, this does a single LLM call (original behavior).
+/// If tools are enabled, this runs a simplified agentic loop bounded by the
+/// routine's [`ToolRoundBudget`]. If tools are disabled, this does a single
+/// LLM call (original behavior).
 async fn execute_lightweight(
     ctx: &EngineContext,
     routine: &Routine,
@@ -1551,12 +1552,16 @@ async fn execute_lightweight(
         Err(_) => None,
     };
 
+    // Tools run only when enabled both per routine and globally; the prompt
+    // states the real round budget up front (WI#291).
+    let tools_active = use_tools && ctx.config.lightweight_tools_enabled;
+    let budget = ToolRoundBudget::new(max_tool_rounds, ctx.config.lightweight_max_iterations);
     let full_prompt = build_lightweight_prompt(
         prompt,
         &context_parts,
         state_content.as_deref(),
         &routine.notify,
-        use_tools,
+        tools_active.then_some(budget.rounds),
     );
 
     // Get system prompt
@@ -1578,14 +1583,14 @@ async fn execute_lightweight(
     };
 
     // If tools are enabled (both globally and per-routine), use the tool execution loop
-    if use_tools && ctx.config.lightweight_tools_enabled {
+    if tools_active {
         execute_lightweight_with_tools(
             ctx,
             routine,
             &system_prompt,
             &full_prompt,
             effective_max_tokens,
-            max_tool_rounds,
+            budget,
         )
         .await
     } else {
@@ -1664,12 +1669,14 @@ fn sanitize_state_content(content: &str) -> String {
     }
 }
 
+/// `tool_rounds` is the run's tool-round budget when tools are active, `None`
+/// when they are off (per routine or globally).
 fn build_lightweight_prompt(
     prompt: &str,
     context_parts: &[String],
     state_content: Option<&str>,
     notify: &NotifyConfig,
-    use_tools: bool,
+    tool_rounds: Option<u32>,
 ) -> String {
     let mut full_prompt = String::new();
     full_prompt.push_str(prompt);
@@ -1701,10 +1708,15 @@ fn build_lightweight_prompt(
         );
     }
 
-    if !use_tools {
-        full_prompt.push_str(
+    match tool_rounds.filter(|rounds| *rounds > 0) {
+        Some(rounds) => full_prompt.push_str(&format!(
+            "\nTool budget for this run: up to {rounds} tool-calling round(s), then one final \
+             text-only reply. Make tool calls that do not depend on each other together in \
+             the same round.\n"
+        )),
+        None => full_prompt.push_str(
             "\nTools are disabled for this routine run. Do not ask to call tools or describe tool limitations unless they prevent a necessary external action.\n",
-        );
+        ),
     }
 
     if !context_parts.is_empty() {
@@ -1845,10 +1857,81 @@ fn recover_routine_model_failure(
     })
 }
 
+/// Tool-round budget for one lightweight routine run (WI#291).
+///
+/// `max_tool_rounds: N` buys N tool-calling rounds followed by one text-only
+/// recovery turn — the contract the agent loop already follows. The forced
+/// turn used to land *on* round N, so a default routine (3) got only two tool
+/// rounds: the digest incident behind WI#291 ran a time check and memory
+/// reads, then had no round left for its `gotify_send`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolRoundBudget {
+    /// Tool-calling rounds this run may use.
+    rounds: u32,
+    /// The routine's own `max_tool_rounds`.
+    routine: u32,
+    /// Operator cap, `ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS`.
+    operator_cap: u32,
+}
+
+impl ToolRoundBudget {
+    fn new(routine: u32, operator_cap: u32) -> Self {
+        Self {
+            rounds: routine.min(operator_cap).min(MAX_TOOL_ROUNDS_LIMIT),
+            routine,
+            operator_cap,
+        }
+    }
+
+    /// System message for the final text-only turn. States the real numbers
+    /// and names the knob that actually bounded the run — the old text told
+    /// the agent to raise knobs that were silently capped at 5.
+    fn recovery_message(&self) -> String {
+        let Self {
+            rounds,
+            routine,
+            operator_cap,
+        } = *self;
+        if rounds == 0 {
+            return format!(
+                "Tool rounds are disabled for lightweight routines \
+                 (ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS={operator_cap}). This is the only, \
+                 text-only response: provide the best result from the context given and \
+                 state any work that needed tools."
+            );
+        }
+        let ceiling = operator_cap.min(MAX_TOOL_ROUNDS_LIMIT);
+        let next_step = if routine < ceiling {
+            format!(
+                "To give this routine more rounds, set its max_tool_rounds (up to {ceiling}) \
+                 with routine_update."
+            )
+        } else if operator_cap < MAX_TOOL_ROUNDS_LIMIT {
+            format!(
+                "The operator cap bounded this run: more rounds need \
+                 ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS raised (hard limit {MAX_TOOL_ROUNDS_LIMIT})."
+            )
+        } else {
+            format!(
+                "{MAX_TOOL_ROUNDS_LIMIT} rounds is the hard limit: split the work across \
+                 routines or reduce tool calls."
+            )
+        };
+        format!(
+            "Routine iteration limit reached: all {rounds} tool-calling round(s) of this run's \
+             budget are used (routine max_tool_rounds={routine}, operator cap \
+             ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS={operator_cap}, hard limit \
+             {MAX_TOOL_ROUNDS_LIMIT}). This is the final text-only recovery response: provide \
+             the best result now and state incomplete work. Tool calls that do not depend on \
+             each other can share one round. {next_step}"
+        )
+    }
+}
+
 /// Execute a lightweight routine with tool execution support (agentic loop).
 ///
 /// This is a simplified version of the full dispatcher loop:
-/// - Max 3-5 iterations (configurable)
+/// - At most `budget.rounds` tool-calling rounds, then one text-only turn
 /// - Sequential tool execution (not parallel)
 /// - Uses the owner's live autonomous tool scope when lightweight tools are enabled
 /// - Auto-approval of non-Always tools
@@ -1859,7 +1942,7 @@ async fn execute_lightweight_with_tools(
     system_prompt: &str,
     full_prompt: &str,
     effective_max_tokens: u32,
-    max_tool_rounds: u32,
+    budget: ToolRoundBudget,
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
     let mut messages = if system_prompt.is_empty() {
         vec![ChatMessage::user(full_prompt)]
@@ -1870,9 +1953,6 @@ async fn execute_lightweight_with_tools(
         ]
     };
 
-    let max_iterations = max_tool_rounds
-        .min(ctx.config.lightweight_max_iterations)
-        .min(5);
     let mut iteration = 0;
     let mut total_input_tokens = 0;
     let mut total_output_tokens = 0;
@@ -1895,14 +1975,12 @@ async fn execute_lightweight_with_tools(
     loop {
         iteration += 1;
 
-        // Force text-only response at iteration limit
-        let force_text = iteration >= max_iterations;
+        // Every tool round is spent: force the text-only recovery turn.
+        let force_text = iteration > budget.rounds;
 
         if force_text {
             if !iteration_warning_injected {
-                messages.push(ChatMessage::system(
-                    "Routine iteration limit reached. This is the final text-only recovery response. Provide the best result now, state incomplete work, and name any capability that must be enabled or the higher max_tool_rounds/ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS value needed to continue.",
-                ));
+                messages.push(ChatMessage::system(budget.recovery_message()));
                 iteration_warning_injected = true;
             }
             let request = CompletionRequest::new(messages.clone())
@@ -2038,25 +2116,39 @@ async fn execute_lightweight_with_tools(
 // Bound per-iteration context copy cost for lightweight tool loops.
 const MAX_TOOL_LOOP_MESSAGES: usize = 32;
 
+/// Window of the tool loop's history sent with each tool-enabled call.
+///
+/// Keeps the head — the system prompt and the routine's own prompt (the first
+/// user message) — plus the most recent messages. Dropping the routine prompt
+/// once a long run outgrew the window left the model without its task, so the
+/// head is pinned (WI#291). The tail never starts on a tool result: it moves
+/// back to the assistant message that issued the call, so a call is never cut
+/// from its results (the window can exceed the cap by that turn's results).
 fn snapshot_messages_for_tool_iteration(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     if messages.len() <= MAX_TOOL_LOOP_MESSAGES {
         return messages.to_vec();
     }
 
-    let mut snapshot = Vec::with_capacity(MAX_TOOL_LOOP_MESSAGES);
-
-    if let Some(first) = messages.first()
-        && first.role == crate::llm::Role::System
+    let head_len = messages
+        .iter()
+        .position(|message| message.role == crate::llm::Role::User)
+        .map_or(0, |index| index + 1)
+        .min(MAX_TOOL_LOOP_MESSAGES);
+    let mut tail_start = messages
+        .len()
+        .saturating_sub(MAX_TOOL_LOOP_MESSAGES - head_len)
+        .max(head_len);
+    while tail_start > head_len
+        && messages
+            .get(tail_start)
+            .is_some_and(|message| message.role == crate::llm::Role::Tool)
     {
-        snapshot.push(first.clone());
-        let tail_len = MAX_TOOL_LOOP_MESSAGES - 1;
-        let tail_start = (messages.len() - tail_len).max(1);
-        snapshot.extend_from_slice(&messages[tail_start..]);
-    } else {
-        let tail_start = messages.len() - MAX_TOOL_LOOP_MESSAGES;
-        snapshot.extend_from_slice(&messages[tail_start..]);
+        tail_start -= 1;
     }
 
+    let mut snapshot = Vec::with_capacity(head_len + messages.len() - tail_start);
+    snapshot.extend_from_slice(&messages[..head_len]);
+    snapshot.extend_from_slice(&messages[tail_start..]);
     snapshot
 }
 
@@ -2491,15 +2583,148 @@ mod tests {
     fn test_routine_config_can_hold_uncapped_max_iterations() {
         // The `RoutineConfig` struct can hold a value greater than the safety cap.
         let config = RoutineConfig {
-            lightweight_max_iterations: 10, // Set a value higher than the cap.
+            lightweight_max_iterations: 50, // Set a value higher than the cap.
             ..RoutineConfig::default()
         };
-        // The actual capping to a maximum of 5 is handled at runtime in
-        // `execute_lightweight_with_tools` and during config resolution from env vars.
+        // The cap (`LIGHTWEIGHT_MAX_TOOL_ROUNDS`) is applied during config
+        // resolution from env vars and again by `ToolRoundBudget` at runtime.
         assert_eq!(
-            config.lightweight_max_iterations, 10,
+            config.lightweight_max_iterations, 50,
             "Config struct should store the provided value"
         );
+        assert_eq!(
+            super::ToolRoundBudget::new(50, config.lightweight_max_iterations).rounds,
+            crate::config::LIGHTWEIGHT_MAX_TOOL_ROUNDS
+        );
+    }
+
+    // ── WI#291: lightweight routine tool-round budget ──────────────────
+
+    /// `max_tool_rounds: N` buys N tool rounds; the operator cap and the hard
+    /// limit bound it, and the hard limit is the single real ceiling (the old
+    /// hidden `.min(5)` clamps are gone).
+    #[test]
+    fn test_tool_round_budget_takes_the_smallest_bound() {
+        use super::ToolRoundBudget;
+        assert_eq!(ToolRoundBudget::new(3, 3).rounds, 3); // default knobs: 3, not 2
+        assert_eq!(ToolRoundBudget::new(8, 3).rounds, 3); // operator cap binds
+        assert_eq!(ToolRoundBudget::new(8, 6).rounds, 6);
+        assert_eq!(ToolRoundBudget::new(4, 6).rounds, 4); // routine binds
+        assert_eq!(ToolRoundBudget::new(10, 10).rounds, 10); // above the old 5
+        assert_eq!(
+            ToolRoundBudget::new(50, 50).rounds,
+            crate::config::LIGHTWEIGHT_MAX_TOOL_ROUNDS
+        );
+        assert_eq!(ToolRoundBudget::new(3, 0).rounds, 0); // operator disabled tools
+    }
+
+    /// The recovery message states the real numbers and names the knob that
+    /// actually bounded the run, so the agent's advice cannot silently top out.
+    #[test]
+    fn test_tool_round_budget_recovery_message_names_the_binding_knob() {
+        use super::ToolRoundBudget;
+        let routine_bound = ToolRoundBudget::new(3, 6).recovery_message();
+        assert!(
+            routine_bound.contains("all 3 tool-calling round(s)"),
+            "{routine_bound}"
+        );
+        assert!(
+            routine_bound.contains("max_tool_rounds (up to 6) with routine_update"),
+            "{routine_bound}"
+        );
+        assert!(
+            routine_bound.contains("can share one round"),
+            "{routine_bound}"
+        );
+
+        let operator_bound = ToolRoundBudget::new(6, 3).recovery_message();
+        assert!(
+            operator_bound.contains("operator cap bounded this run"),
+            "{operator_bound}"
+        );
+        assert!(
+            !operator_bound.contains("with routine_update"),
+            "raising the routine cannot help past the operator cap: {operator_bound}"
+        );
+
+        let hard_bound = ToolRoundBudget::new(10, 10).recovery_message();
+        assert!(hard_bound.contains("is the hard limit"), "{hard_bound}");
+
+        let disabled = ToolRoundBudget::new(3, 0).recovery_message();
+        assert!(disabled.contains("disabled"), "{disabled}");
+    }
+
+    #[test]
+    fn test_build_lightweight_prompt_states_tool_round_budget() {
+        let prompt = super::build_lightweight_prompt(
+            "Send the digest.",
+            &[],
+            None,
+            &NotifyConfig::default(),
+            Some(4),
+        );
+        assert!(
+            prompt.contains("up to 4 tool-calling round(s), then one final text-only reply"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("together in the same round"), "{prompt}");
+
+        // A zero budget (operator cap 0) means no tools at all.
+        let disabled = super::build_lightweight_prompt(
+            "Send the digest.",
+            &[],
+            None,
+            &NotifyConfig::default(),
+            Some(0),
+        );
+        assert!(
+            disabled.contains("Tools are disabled for this routine run"),
+            "{disabled}"
+        );
+    }
+
+    /// The routine's own prompt survives a run that outgrows the window, and
+    /// the window never starts with a tool result cut off from its call.
+    #[test]
+    fn test_snapshot_messages_pins_routine_prompt_and_keeps_tool_calls_whole() {
+        use crate::llm::{ChatMessage, Role, ToolCall};
+        let call = |id: &str| ToolCall {
+            id: id.to_string(),
+            name: "owner_gate".to_string(),
+            arguments: serde_json::json!({}),
+            reasoning: None,
+        };
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("routine prompt"),
+        ];
+        // Rounds of one assistant call + three results: 4 messages each.
+        for round in 0..10 {
+            let ids: Vec<String> = (0..3).map(|i| format!("r{round}c{i}")).collect();
+            messages.push(ChatMessage::assistant_with_tool_calls(
+                None,
+                ids.iter().map(|id| call(id)).collect(),
+            ));
+            for id in &ids {
+                messages.push(ChatMessage::tool_result(id, "owner_gate", "ok"));
+            }
+        }
+        assert!(messages.len() > super::MAX_TOOL_LOOP_MESSAGES);
+
+        let snapshot = super::snapshot_messages_for_tool_iteration(&messages);
+        assert_eq!(snapshot[0].role, Role::System); // safety: test-only no-panics CI false positive
+        assert_eq!(snapshot[1].content, "routine prompt"); // safety: test-only no-panics CI false positive
+        assert_eq!(
+            snapshot[2].role, // safety: test-only no-panics CI false positive
+            Role::Assistant,
+            "the tail must start at an assistant call, not an orphaned tool result"
+        );
+        assert_eq!(
+            snapshot.last().map(|m| m.content.as_str()),
+            Some("ok"),
+            "the newest results stay in the window"
+        );
+        assert!(snapshot.len() <= super::MAX_TOOL_LOOP_MESSAGES + 3);
     }
 
     #[test]
@@ -2546,7 +2771,7 @@ mod tests {
             &[],
             None,
             &notify,
-            false,
+            None,
         );
 
         assert!(
@@ -2574,7 +2799,7 @@ mod tests {
             ..NotifyConfig::default()
         };
 
-        let prompt = super::build_lightweight_prompt("Check inbox.", &[], None, &notify, true);
+        let prompt = super::build_lightweight_prompt("Check inbox.", &[], None, &notify, Some(3));
 
         assert!(
             !prompt.contains("# Delivery"),
