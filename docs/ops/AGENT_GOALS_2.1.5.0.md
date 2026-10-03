@@ -26,7 +26,11 @@
 4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/302
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/301
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
-7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299
+7. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299 — DONE 100%
+  - `ic/src/gate/persistence.rs`: `write_state` now writes via temp file + fsync + atomic rename (same pattern as `violation_store`); flock moved to a dedicated `pending-gates.lock` sibling since rename replaces the data file's inode; best-effort directory fsync after rename
+  - `ic/src/bridge/router.rs`: pending-gate restore failure promoted from `debug!` to `warn!` including the file path
+  - Regression tests added: `save_writes_via_atomic_temp_rename`, `interrupted_write_preserves_last_good_state` (kill mid-write → last-good state intact)
+  - Verified: `cargo test --lib gate::` 47/47 pass; `cargo clippy --lib -- -D warnings` clean; commit 8b0b7bfa1
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
