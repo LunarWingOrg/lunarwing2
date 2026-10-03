@@ -21,7 +21,12 @@ fi
 # crate|advisory|explanation — extend when another lockfile-only pin with a
 # live advisory shows up. Keep entries alphabetized by crate name.
 guarded=(
+    # atty 0.2.14 sits in the ic lockfiles only because the vendored
+    # libsignal-protocol path dep dev-depends on env_logger 0.6.2; it is not
+    # even in the resolve graph (Windows-only unaligned read, unpatched).
+    "atty|RUSTSEC-2021-0145|vendored libsignal-protocol dev-dep env_logger 0.6.2 would compile a Windows-only unaligned-read atty (no patched release)"
     "pyo3|RUSTSEC-2026-0176|jiter's optional python feature would compile an OOB-read-affected pyo3 (<0.29.0)"
+    "pyo3|RUSTSEC-2026-0177|jiter's optional python feature would compile a pyo3 whose PyCFunction::new_closure lacks a Sync bound (<0.29.0)"
 )
 
 # Every workspace root whose Cargo.lock is committed to this repo.
@@ -36,10 +41,13 @@ for root in "${lock_roots[@]}"; do
         IFS='|' read -r crate advisory explanation <<<"$entry"
         # `cargo tree -i <crate>` exits 0 even when the crate is absent from
         # the graph (it just prints "warning: nothing to print"), so the
-        # stdout must be inspected rather than the exit status.
+        # stdout must be inspected rather than the exit status. A crate that
+        # is only in the lockfile via a dev-dependency of a non-workspace
+        # path dep never even enters the resolve graph — cargo tree then
+        # errors with "did not match any packages", which is equally safe.
         out=$(taskset -c 0-17 cargo tree -i "$crate" --target all \
             --manifest-path "$root/Cargo.toml" 2>&1 || true)
-        if ! grep -q "nothing to print" <<<"$out"; then
+        if ! grep -qE "nothing to print|did not match any packages" <<<"$out"; then
             echo "ERROR: $crate is now built by $root — $advisory applies ($explanation)." >&2
             echo "       Resolve by upgrading past the advisory's patched range before merging." >&2
             failed=1
