@@ -1074,7 +1074,12 @@ ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/L
                                         # expiry the task is aborted and the call
                                         # resolves as an error. Default: 300
 ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Model failure recovery attempts per step.
-                                        # Default: 1; clamped to 0-3
+                                        # Default: 1; clamped to 0-3.
+                                        # Does not apply to context_overflow (WI#298):
+                                        # its shrink ladder changes the inputs instead
+                                        # of blindly retrying, so it always uses the
+                                        # policy cap (2); the total-attempts cap below
+                                        # still bounds it.
 ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4 # Total recovery attempts per thread lifetime.
                                         # Default: 4; clamped to 16
 ```

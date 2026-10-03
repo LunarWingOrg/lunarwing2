@@ -342,6 +342,10 @@ ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future cap for a deferred tool or 
                                         # thread forever. Default: 300 (5 minutes).
 ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Per-step model failure recovery attempts.
                                         # Default: 1 (legacy one-attempt behavior); clamped to 0-3.
+                                        # Does not apply to context_overflow (WI#298): its
+                                        # shrink ladder changes the inputs instead of blindly
+                                        # retrying, so it always uses the policy cap (2); the
+                                        # total-attempts cap below still bounds it.
 ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4  # Total engine-level recovery attempts allowed
                                         # per thread lifetime. Bounds cumulative recovery
                                         # time. Default: 4; clamped to 16.
