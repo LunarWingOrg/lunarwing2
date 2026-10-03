@@ -21,7 +21,9 @@ use lunarwing_engine::types::{is_shared_owner, shared_owner_id};
 
 use crate::agent::Agent;
 use crate::bridge::auth_manager::AuthManager;
-use crate::bridge::effect_adapter::EffectBridgeAdapter;
+use crate::bridge::effect_adapter::{
+    EffectBridgeAdapter, MISSIONS_CAPABILITY, mission_action_defs,
+};
 use crate::bridge::llm_adapter::LlmBridgeAdapter;
 use crate::bridge::store_adapter::HybridStore;
 use crate::channels::web::sse::SseManager;
@@ -1560,130 +1562,12 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
 
     // Register mission functions as a capability so threads receive leases.
     // Handled by EffectBridgeAdapter::handle_mission_call() before the
-    // regular tool executor. Use "mission_*" names only — descriptions
-    // mention "routine" so the LLM maps user intent correctly.
+    // regular tool executor; the definitions live beside that handler so
+    // tool_info can describe them too (WI#295).
     capabilities.register(Capability {
-        name: "missions".into(),
+        name: MISSIONS_CAPABILITY.into(),
         description: "Mission and routine lifecycle management".into(),
-        actions: vec![
-            lunarwing_engine::ActionDef {
-                name: "mission_create".into(),
-                description: "Create a new mission (routine). Use when the user wants to set up a recurring task, scheduled check, or periodic routine. Results are delivered to the current channel by default.".into(),
-                parameters_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Short name for the mission/routine"},
-                        "goal": {"type": "string", "description": "What this mission should accomplish each run"},
-                        "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'system:<source>/<event_type>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events. To subscribe to engine lifecycle events, use 'system:<source>/<event_type>' (e.g. 'system:engine/thread_start')."},
-                        "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
-                        "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
-                        "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 30 when omitted."}
-                    },
-                    "required": ["name", "goal"]
-                }),
-                effects: vec![],
-                requires_approval: false,
-            },
-            lunarwing_engine::ActionDef {
-                name: "mission_list".into(),
-                description: "List all missions and routines in the current project.".into(),
-                parameters_schema: serde_json::json!({"type": "object"}),
-                effects: vec![],
-                requires_approval: false,
-            },
-            lunarwing_engine::ActionDef {
-                name: "mission_fire".into(),
-                description: "Manually trigger a mission or routine to run immediately.".into(),
-                parameters_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Mission/routine ID to trigger"}
-                    },
-                    "required": ["id"]
-                }),
-                effects: vec![],
-                requires_approval: false,
-            },
-            lunarwing_engine::ActionDef {
-                name: "mission_pause".into(),
-                description: "Pause a running mission or routine.".into(),
-                parameters_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Mission/routine ID to pause"}
-                    },
-                    "required": ["id"]
-                }),
-                effects: vec![],
-                requires_approval: false,
-            },
-            lunarwing_engine::ActionDef {
-                name: "mission_resume".into(),
-                description: "Resume a paused mission or routine.".into(),
-                parameters_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Mission/routine ID to resume"}
-                    },
-                    "required": ["id"]
-                }),
-                effects: vec![],
-                requires_approval: false,
-            },
-            lunarwing_engine::ActionDef {
-                name: "mission_update".into(),
-                description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, retry policy, success criteria, or steering focus.".into(),
-                parameters_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Mission/routine ID to update"},
-                        "name": {"type": "string", "description": "New name"},
-                        "goal": {"type": "string", "description": "New goal"},
-                        "cadence": {"type": "string", "description": "New cadence: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
-                        "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
-                        "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
-                        "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
-                        "max_retries": {"type": "integer", "minimum": 0, "description": "Maximum retry attempts after an interrupted or failed fire (0 disables retries). Omit all retry parameters to leave the policy unchanged."},
-                        "initial_delay_secs": {"type": "integer", "minimum": 0, "description": "Initial retry backoff delay in seconds"},
-                        "backoff_multiplier": {"type": "number", "exclusiveMinimum": 0, "description": "Positive multiplier applied to each subsequent retry delay"},
-                        "max_delay_secs": {"type": "integer", "minimum": 0, "description": "Maximum retry backoff delay in seconds"},
-                        "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"},
-                        "current_focus": {"type": ["string", "null"], "description": "Steering focus for the next thread. Omit to leave unchanged; pass null to clear."}
-                    },
-                    "required": ["id"]
-                }),
-                effects: vec![],
-                requires_approval: false,
-            },
-            lunarwing_engine::ActionDef {
-                name: "mission_history".into(),
-                description: "View the execution history of a mission or routine: recent fires with status, duration, and result summaries. Resolves Engine V2 mission names (as shown by mission_list).".into(),
-                parameters_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Name of the mission/routine (from mission_list); alternatively pass its UUID via 'id'"},
-                        "id": {"type": "string", "description": "Mission/routine UUID (alternative to 'name')"},
-                        "limit": {"type": "integer", "description": "Max runs to return (default: 10, max: 50)"}
-                    }
-                }),
-                effects: vec![],
-                requires_approval: false,
-            },
-            lunarwing_engine::ActionDef {
-                name: "mission_delete".into(),
-                description: "Delete a mission or routine. Conversation insights retain a disabled tombstone (explicit resume re-enables); optionally purge their generated memory.".into(),
-                parameters_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Mission/routine ID to delete"},
-                        "purge_insights": {"type": "boolean", "description": "Also remove generated insights for this mission's project/user. Only for conversation-insights. Source conversations and run audit remain. Default false."}
-                    },
-                    "required": ["id"]
-                }),
-                effects: vec![],
-                requires_approval: false,
-            },
-        ],
+        actions: mission_action_defs(),
         knowledge: vec![],
         policies: vec![],
     });

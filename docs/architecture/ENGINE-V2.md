@@ -639,6 +639,24 @@ list, so a v2 thread that asks for a name which shadows both registries
 gets an honest "use mission_history" error instead of silently returning
 the v1 object's history for a same-named routine.
 
+The `mission_*` functions are capability actions, not registry tools: the
+eight definitions live in `mission_action_defs()` beside
+`EffectBridgeAdapter::handle_mission_call` (the router registers them as the
+`missions` capability so every thread type receives the lease), and CodeAct
+reaches them because Monty compiles an undefined callee into an external call
+that `preflight_action` matches against the thread's leases — they never
+appear in `available_actions`, the tool registry, or `tool_list`. So that the
+registry's "No tool named … is registered" is not read as "this function does
+not exist" (WI#295; the false negative behind closed-invalid WI#281), the
+bridge answers `tool_info` for a mission function itself, from the same
+definitions: the usual name/description/parameters (plus summary or schema by
+`detail`) and `kind: "engine_capability"`, `capability: "missions"`,
+`registered_tool: false`, `callable: true`, and a note on calling it from
+CodeAct. It does so only while a mission manager is wired — the condition
+under which the functions dispatch — and v1 keeps the truthful registry miss.
+`tool_info` also accepts CodeAct's positional form (`tool_info("x")`) and
+resolves legacy hyphen/underscore tool aliases like dispatch does.
+
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
 loaded checkpoint **before** the `Running` transition and the first model
