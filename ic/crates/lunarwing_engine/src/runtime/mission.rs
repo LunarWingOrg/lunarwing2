@@ -2430,9 +2430,7 @@ impl MissionManager {
     /// flag is persisted before the approach entry so a later boot can
     /// never duplicate the record or the notification. If the flag save
     /// fails the thread is skipped whole and retried next boot.
-    pub async fn record_restart_interrupted_missions(
-        &self,
-    ) -> Result<Vec<MissionId>, EngineError> {
+    pub async fn record_restart_interrupted_missions(&self) -> Result<Vec<MissionId>, EngineError> {
         let mut recorded = Vec::new();
         for mission in self.store.list_all_missions_global().await? {
             let mut mission = mission;
@@ -9367,15 +9365,9 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             ThreadConfig::default(),
         );
         source.state = ThreadState::Failed;
-        let pending = PendingMissionRetry::new(
-            id,
-            "test-user",
-            1,
-            None,
-            &mission.retry_policy,
-            Utc::now(),
-        )
-        .unwrap();
+        let pending =
+            PendingMissionRetry::new(id, "test-user", 1, None, &mission.retry_policy, Utc::now())
+                .unwrap();
         source.metadata = serde_json::json!({RetryState::METADATA_KEY: pending.to_retry_state()});
         mission.thread_history.push(source.id);
         store.save_thread(&source).await.unwrap();
@@ -9390,7 +9382,10 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             "a consumed retry marker must be cleared when the re-fire spawns"
         );
         assert!(
-            mgr.recover_pending_mission_retries().await.unwrap().is_empty(),
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty(),
             "the next boot must not re-arm an already-consumed retry"
         );
         mgr.shutdown().await;
