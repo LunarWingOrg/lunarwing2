@@ -61,6 +61,10 @@ const BLOCK_TAGS: &[&str] = &[
     "address",
     "hgroup",
     "search",
+    "center",
+    "dialog",
+    "menu",
+    "legend",
 ];
 
 /// Shared walker state threaded through all recursive calls.
@@ -70,6 +74,9 @@ const BLOCK_TAGS: &[&str] = &[
 struct WalkState<'a> {
     options: &'a ConversionOptions,
     excluded_node_ids: &'a HashSet<u32>,
+    /// Inside a list item, the item's buffer length right after its marker, so a block that
+    /// follows the marker directly starts on its line. A table cell starts its own buffer with `None`.
+    item_marker_end: Option<usize>,
     depth: usize,
     #[cfg(feature = "visitor")]
     visitor: Option<&'a VisitorHandle>,
@@ -80,6 +87,7 @@ impl WalkState<'_> {
         WalkState {
             options: self.options,
             excluded_node_ids: self.excluded_node_ids,
+            item_marker_end: self.item_marker_end,
             depth: self.depth + 1,
             #[cfg(feature = "visitor")]
             visitor: self.visitor,
@@ -121,6 +129,7 @@ pub fn extract_plain_text(dom: &tl::VDom, parser: &tl::Parser, options: &Convers
     let state = WalkState {
         options,
         excluded_node_ids: &excluded_node_ids,
+        item_marker_end: None,
         depth: 0,
         #[cfg(feature = "visitor")]
         visitor: options.visitor.as_ref(),
@@ -316,11 +325,17 @@ fn walk_plain(
                             buf.push_str("- ");
                         }
                     }
-                    walk_children(tag, parser, buf, false, list_ctx, &child_state);
+                    let item_state = WalkState {
+                        item_marker_end: Some(buf.len()),
+                        ..state.descend()
+                    };
+                    walk_children(tag, parser, buf, false, list_ctx, &item_state);
                     ensure_newline(buf);
                 }
                 _ if BLOCK_TAGS.contains(&tag_str) => {
-                    ensure_blank_line(buf);
+                    if state.item_marker_end != Some(buf.len()) {
+                        ensure_blank_line(buf);
+                    }
                     walk_children(tag, parser, buf, in_pre, list_ctx, &child_state);
                     ensure_blank_line(buf);
                 }
@@ -403,7 +418,10 @@ fn walk_table(table_tag: &tl::HTMLTag, parser: &tl::Parser, buf: &mut String, st
             }
         }
 
-        let cell_state = state.descend();
+        let cell_state = WalkState {
+            item_marker_end: None,
+            ..state.descend()
+        };
         for (cell_idx, cell_handle) in cell_handles.iter().enumerate() {
             if cell_idx > 0 {
                 buf.push('\t');

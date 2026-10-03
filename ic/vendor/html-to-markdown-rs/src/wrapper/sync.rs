@@ -1,10 +1,112 @@
 //! Synchronous text wrapping for Markdown output.
 
 use super::utils::{
-    is_heading, is_list_like, is_numbered_list, parse_blockquote_line, parse_list_item, wrap_blockquote_paragraph,
-    wrap_line, wrap_list_item,
+    is_heading, is_list_like, is_numbered_list, joins_into_a_block, parse_blockquote_line, parse_list_item,
+    push_paragraph_line, wrap_blockquote_paragraph, wrap_indented_line, wrap_list_item,
 };
+use crate::converter::utility::escaping::{code_fence, is_heading_underline, opens_block};
 use crate::options::ConversionOptions;
+
+/// Whether `trimmed` closes a fenced code block opened by a run of `length` `marker` characters.
+fn closes_fence(trimmed: &str, marker: u8, length: usize) -> bool {
+    code_fence(trimmed).is_some_and(|(fence, run)| fence == marker && run >= length && trimmed[run..].trim().is_empty())
+}
+
+/// The paragraph the reflow is collecting: plain text, or the text of a list item.
+#[derive(Default)]
+struct OpenParagraph {
+    indent: String,
+    /// The list item's marker, or empty for a plain paragraph.
+    marker: String,
+    text: String,
+}
+
+impl OpenParagraph {
+    const fn is_open(&self) -> bool {
+        !self.text.is_empty()
+    }
+
+    const fn is_item(&self) -> bool {
+        !self.marker.is_empty()
+    }
+
+    fn open(&mut self, indent: &str, marker: &str, line: &str) {
+        self.indent.clear();
+        self.indent.push_str(indent);
+        self.marker.clear();
+        self.marker.push_str(marker);
+        self.push_line(line);
+    }
+
+    fn push_line(&mut self, line: &str) {
+        push_paragraph_line(&mut self.text, line);
+    }
+
+    /// Whether `line`, which follows the paragraph without a blank line, continues it; `trimmed`
+    /// is `line` without its indentation.
+    ///
+    /// ~keep A line that cannot start a block is paragraph continuation text in CommonMark, at
+    /// ~keep column 0 too (a lazy line), so it stays in the paragraph or the list item (#616).
+    /// ~keep A list item line left of the text's column leaves the item and starts a list at any
+    /// ~keep number; at or right of that column only a line that interrupts a paragraph does.
+    fn continues_with(&self, line: &str, trimmed: &str) -> bool {
+        !trimmed.is_empty()
+            && (!opens_block(trimmed) || self.is_lazy_equals_underline(line, trimmed))
+            && !trimmed.starts_with('|')
+            && parse_list_item(line).is_none_or(|(indent, _, _)| indent.len() >= self.indent.len() + self.marker.len())
+    }
+
+    /// Whether `line` is a run of `=` left of the list item's text column.
+    ///
+    /// ~keep A setext underline cannot be a lazy line (CommonMark 4.3), so there it is paragraph
+    /// ~keep text; cutting the paragraph at it made the lines after it lose their hard breaks
+    /// ~keep (issue #680). A `-` run left of the column is a thematic break and ends the item.
+    /// Only when the run joins the line above: on a line of its own at the item's column, after a
+    /// hard break or after a bare marker the run would make a list item (`1.`), it would underline
+    /// the text above, so the paragraph ends there and keeps its hard break (`flush_before_line`).
+    fn is_lazy_equals_underline(&self, line: &str, trimmed: &str) -> bool {
+        self.is_item()
+            && !self.text.ends_with('\n')
+            && line.len() - trimmed.len() < self.indent.len() + self.marker.len()
+            && trimmed.trim_end().bytes().all(|byte| byte == b'=')
+            && !joins_into_a_block(&self.text, trimmed.trim_matches([' ', '\t']))
+    }
+
+    /// Write the paragraph: a plain one ends with a blank line, a list item with its line end.
+    fn flush(&mut self, out: &mut String, width: usize) {
+        if self.text.is_empty() {
+            return;
+        }
+        if self.is_item() {
+            out.push_str(&wrap_list_item(&self.indent, &self.marker, &self.text, width));
+        } else {
+            out.push_str(&wrap_indented_line(&self.indent, &self.text, width));
+            out.push_str("\n\n");
+        }
+        self.text.clear();
+    }
+
+    /// Write the paragraph before a line that ends it without a blank line between them.
+    ///
+    /// ~keep A list item's text that ends with a hard break keeps it: the line after it can still
+    /// ~keep be text of the item, a lazy `===` line after a break (`- a  \n===`), so dropped, the
+    /// ~keep break would be lost (issue #680). Before a line that ends the item it has no effect.
+    fn flush_before_line(&mut self, out: &mut String, width: usize) {
+        let spaces = if self.is_item() {
+            self.text
+                .strip_suffix('\n')
+                .map(|text| text.len() - text.trim_end_matches(' ').len())
+        } else {
+            None
+        };
+        self.flush(out, width);
+        if let Some(spaces) = spaces.filter(|&spaces| spaces >= 2) {
+            out.pop();
+            out.extend(std::iter::repeat_n(' ', spaces));
+            out.push('\n');
+        }
+    }
+}
 
 /// Wrap text at specified width while preserving Markdown formatting.
 ///
@@ -20,17 +122,33 @@ pub fn wrap_markdown(markdown: &str, options: &ConversionOptions) -> String {
         return markdown.to_string();
     }
 
+    let width = options.wrap_width;
     let mut result = String::with_capacity(markdown.len());
-    let mut in_code_block = false;
-    let mut in_paragraph = false;
-    let mut paragraph_buffer = String::new();
+    let mut open_fence: Option<(u8, usize)> = None;
+    let mut quote_fence: Option<(u8, usize)> = None;
+    let mut paragraph = OpenParagraph::default();
     let mut in_blockquote_paragraph = false;
     let mut blockquote_prefix = String::new();
+    let mut blockquote_indent = String::new();
     let mut blockquote_buffer = String::new();
 
     for line in markdown.lines() {
-        let trimmed = line.trim_start();
-        let is_code_fence = trimmed.starts_with("```");
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if let Some((marker, length)) = open_fence {
+            if closes_fence(trimmed, marker, length) {
+                open_fence = None;
+            }
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        if paragraph.is_open() && paragraph.continues_with(line, trimmed) {
+            paragraph.push_line(line);
+            continue;
+        }
+
+        let fence = code_fence(trimmed);
         let is_indented_code = line.starts_with("    ")
             && !is_list_like(trimmed)
             && !is_numbered_list(trimmed)
@@ -38,35 +156,20 @@ pub fn wrap_markdown(markdown: &str, options: &ConversionOptions) -> String {
             && !trimmed.starts_with('>')
             && !trimmed.starts_with('|');
 
-        if is_code_fence || is_indented_code {
-            if in_paragraph && !paragraph_buffer.is_empty() {
-                result.push_str(&wrap_line(&paragraph_buffer, options.wrap_width));
-                result.push_str("\n\n");
-                paragraph_buffer.clear();
-                in_paragraph = false;
-            }
-
-            if is_code_fence {
-                in_code_block = !in_code_block;
-            }
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-
-        if in_code_block {
+        if fence.is_some() || is_indented_code {
+            paragraph.flush(&mut result, width);
+            open_fence = fence;
             result.push_str(line);
             result.push('\n');
             continue;
         }
 
         if let Some((prefix, content)) = parse_blockquote_line(line) {
-            if in_paragraph && !paragraph_buffer.is_empty() {
-                result.push_str(&wrap_line(&paragraph_buffer, options.wrap_width));
-                result.push_str("\n\n");
-                paragraph_buffer.clear();
-                in_paragraph = false;
-            }
+            // ~keep The indent after the quote prefix is a list item's content column inside
+            // ~keep the quote; written without it, the paragraph would leave the item.
+            let after_prefix = &line[prefix.len()..];
+            let indent = &after_prefix[..after_prefix.len() - after_prefix.trim_start().len()];
+            paragraph.flush(&mut result, width);
 
             let mut normalized_prefix = prefix;
             if !normalized_prefix.ends_with(' ') {
@@ -76,9 +179,9 @@ pub fn wrap_markdown(markdown: &str, options: &ConversionOptions) -> String {
             if content.is_empty() {
                 if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
                     result.push_str(&wrap_blockquote_paragraph(
-                        &blockquote_prefix,
+                        &format!("{blockquote_prefix}{blockquote_indent}"),
                         &blockquote_buffer,
-                        options.wrap_width,
+                        width,
                     ));
                     result.push('\n');
                     blockquote_buffer.clear();
@@ -91,57 +194,115 @@ pub fn wrap_markdown(markdown: &str, options: &ConversionOptions) -> String {
 
             if in_blockquote_paragraph && normalized_prefix != blockquote_prefix {
                 result.push_str(&wrap_blockquote_paragraph(
-                    &blockquote_prefix,
+                    &format!("{blockquote_prefix}{blockquote_indent}"),
                     &blockquote_buffer,
-                    options.wrap_width,
+                    width,
                 ));
                 result.push('\n');
                 blockquote_buffer.clear();
                 in_blockquote_paragraph = false;
             }
 
-            if in_blockquote_paragraph {
-                blockquote_buffer.push(' ');
-                blockquote_buffer.push_str(&content);
-            } else {
+            if let Some((marker, length)) = quote_fence {
+                if closes_fence(&content, marker, length) {
+                    quote_fence = None;
+                }
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+
+            // ~keep Inside a quote a line that starts a block keeps its own line, as outside one:
+            // ~keep a heading underline, a rule, a list item, a fence, a heading, a table row (#607).
+            // ~keep A hard break before such a line stays: a `1990.` line can continue the paragraph,
+            // ~keep and the reflow does not know the column of a list item in a quote to tell.
+            let underline = in_blockquote_paragraph && is_heading_underline(&content);
+            let fence = code_fence(&content);
+            if underline
+                || fence.is_some()
+                || opens_block(&content)
+                || parse_list_item(&content).is_some()
+                || content.starts_with('|')
+            {
+                if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
+                    result.push_str(&wrap_blockquote_paragraph(
+                        &format!("{blockquote_prefix}{blockquote_indent}"),
+                        &blockquote_buffer,
+                        if underline { usize::MAX } else { width },
+                    ));
+                    if let Some(text) = blockquote_buffer.strip_suffix('\n') {
+                        result.push_str(&text[text.trim_end_matches(' ').len()..]);
+                    }
+                    result.push('\n');
+                    blockquote_buffer.clear();
+                    in_blockquote_paragraph = false;
+                }
+                quote_fence = fence;
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+
+            if !in_blockquote_paragraph {
                 blockquote_prefix = normalized_prefix;
-                blockquote_buffer.push_str(&content);
+                blockquote_indent.clear();
+                blockquote_indent.push_str(indent);
                 in_blockquote_paragraph = true;
             }
+            push_paragraph_line(&mut blockquote_buffer, after_prefix);
             continue;
-        } else if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
+        }
+        quote_fence = None;
+        if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
             result.push_str(&wrap_blockquote_paragraph(
-                &blockquote_prefix,
+                &format!("{blockquote_prefix}{blockquote_indent}"),
                 &blockquote_buffer,
-                options.wrap_width,
+                width,
             ));
             result.push('\n');
             blockquote_buffer.clear();
             in_blockquote_paragraph = false;
         }
 
-        if let Some((indent, marker, content)) = parse_list_item(line) {
-            if in_paragraph && !paragraph_buffer.is_empty() {
-                result.push_str(&wrap_line(&paragraph_buffer, options.wrap_width));
-                result.push_str("\n\n");
-                paragraph_buffer.clear();
-                in_paragraph = false;
-            }
+        // ~keep An underline right under paragraph text makes that text its heading: the text ends
+        // ~keep with one line break, and it is not reflowed, like an ATX heading. Folded into the
+        // ~keep text, or cut off by a blank line, the underline is lost (#607).
+        if paragraph.is_open() && !paragraph.is_item() && is_heading_underline(trimmed) {
+            paragraph.flush(&mut result, usize::MAX);
+            result.pop();
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
 
-            result.push_str(&wrap_list_item(&indent, &marker, &content, options.wrap_width));
+        if let Some((indent, mut marker, mut content)) = parse_list_item(line) {
+            // ~keep An item whose text starts with a marker holds a nested list on the same line, and
+            // ~keep its text continues at the nested item's content column: `- 1.` alone on a line is
+            // ~keep an empty item that the next line cannot join. Both markers wrap as one.
+            while let Some((_, inner_marker, inner_content)) = parse_list_item(&content) {
+                marker.push_str(&inner_marker);
+                content = inner_content;
+            }
+            paragraph.flush(&mut result, width);
+            if content.is_empty() {
+                result.push_str(&wrap_list_item(&indent, &marker, &content, width));
+            } else if opens_block(&content) {
+                // ~keep Text that starts a heading, a fence, a quote or a rule is not a paragraph:
+                // ~keep reflowed, a heading loses its words to the next line and a fence its code.
+                open_fence = code_fence(&content);
+                result.push_str(line);
+                result.push('\n');
+            } else {
+                paragraph.open(&indent, &marker, &content);
+            }
             continue;
         }
 
         let is_structural =
-            is_heading(trimmed) || trimmed.starts_with('>') || trimmed.starts_with('|') || trimmed.starts_with('=');
+            is_heading(trimmed) || opens_block(trimmed) || trimmed.starts_with('|') || trimmed.starts_with('=');
 
         if is_structural {
-            if in_paragraph && !paragraph_buffer.is_empty() {
-                result.push_str(&wrap_line(&paragraph_buffer, options.wrap_width));
-                result.push_str("\n\n");
-                paragraph_buffer.clear();
-                in_paragraph = false;
-            }
+            paragraph.flush_before_line(&mut result, width);
 
             result.push_str(line);
             result.push('\n');
@@ -149,37 +310,27 @@ pub fn wrap_markdown(markdown: &str, options: &ConversionOptions) -> String {
         }
 
         if line.trim().is_empty() {
-            if in_paragraph && !paragraph_buffer.is_empty() {
-                result.push_str(&wrap_line(&paragraph_buffer, options.wrap_width));
-                result.push_str("\n\n");
-                paragraph_buffer.clear();
-                in_paragraph = false;
-            } else if !in_paragraph {
+            let was_plain = paragraph.is_open() && !paragraph.is_item();
+            paragraph.flush(&mut result, width);
+            if !was_plain {
                 result.push('\n');
             }
             continue;
         }
 
-        if in_paragraph {
-            paragraph_buffer.push(' ');
-        }
-        paragraph_buffer.push_str(line.trim());
-        in_paragraph = true;
+        paragraph.open(&line[..line.len() - trimmed.len()], "", line);
     }
 
     if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
         result.push_str(&wrap_blockquote_paragraph(
-            &blockquote_prefix,
+            &format!("{blockquote_prefix}{blockquote_indent}"),
             &blockquote_buffer,
-            options.wrap_width,
+            width,
         ));
         result.push('\n');
     }
 
-    if in_paragraph && !paragraph_buffer.is_empty() {
-        result.push_str(&wrap_line(&paragraph_buffer, options.wrap_width));
-        result.push_str("\n\n");
-    }
+    paragraph.flush(&mut result, width);
 
     result
 }
@@ -197,6 +348,144 @@ mod tests {
         };
         let result = wrap_markdown(markdown, &options);
         assert_eq!(result, markdown);
+    }
+
+    fn wrap_at_20(markdown: &str) -> String {
+        let options = ConversionOptions {
+            wrap: true,
+            wrap_width: 20,
+            ..Default::default()
+        };
+        wrap_markdown(markdown, &options)
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_a_thematic_break_on_its_own_line() {
+        assert_eq!(wrap_at_20("t\n\n---\nB\n"), "t\n\n---\nB\n\n");
+        assert_eq!(wrap_at_20("***\nB\n"), "***\nB\n\n");
+        assert_eq!(wrap_at_20("___\nB\n"), "___\nB\n\n");
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_a_setext_underline_under_its_heading_text() {
+        assert_eq!(wrap_at_20("Heading\n-------\n\nx\n"), "Heading\n-------\n\nx\n\n");
+        assert_eq!(wrap_at_20("Heading\n=======\n\nx\n"), "Heading\n=======\n\nx\n\n");
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_a_rule_and_an_underline_on_their_own_lines_in_a_quote() {
+        assert_eq!(wrap_at_20("> t\n>\n> ---\n>  B\n"), "> t\n>\n> ---\n>  B\n");
+        assert_eq!(wrap_at_20("> Heading\n> -------\n> x\n"), "> Heading\n> -------\n> x\n");
+        let long_heading = "> one two three four five six\n> -------\n";
+        assert_eq!(wrap_at_20(long_heading), long_heading);
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_a_fence_open_until_a_fence_as_long_as_its_opener() {
+        let fenced = "````\n```\none two three four five six\n````\n";
+        assert_eq!(wrap_at_20(fenced), fenced);
+        let info_string = "```\n```text\none two three four five six\n```\n";
+        assert_eq!(wrap_at_20(info_string), info_string);
+        let quoted = "> ~~~\n> ```\n> one two three four five six\n> ~~~\n";
+        assert_eq!(wrap_at_20(quoted), quoted);
+        assert_eq!(
+            wrap_at_20("> ```\n> x\n> ```\n> one two three four five six\n"),
+            "> ```\n> x\n> ```\n> one two three four\n> five six\n"
+        );
+        assert_eq!(
+            wrap_at_20("```\nx\n```\none two three four five six\n"),
+            "```\nx\n```\none two three four\nfive six\n\n"
+        );
+    }
+
+    #[test]
+    fn wrap_markdown_ends_a_paragraph_or_an_item_only_at_a_line_that_starts_a_block() {
+        assert_eq!(
+            wrap_at_20("text\n| a | b |\n| --- | --- |\n"),
+            "text\n\n| a | b |\n| --- | --- |\n"
+        );
+        assert_eq!(wrap_at_20("1. a\n\n   para\n2. b\n"), "1. a\n\n   para\n\n2. b\n");
+        assert_eq!(wrap_at_20("- a\n---\n"), "- a\n---\n");
+        assert_eq!(wrap_at_20("- \n- b\n"), "-\n- b\n");
+    }
+
+    #[test]
+    fn wrap_markdown_ends_an_item_at_a_number_line_only_left_of_its_text() {
+        assert_eq!(wrap_at_20("- a  \n  1990. b\n"), "- a  \n  1990. b\n");
+        assert_eq!(wrap_at_20("1. a\\\n   57) b\n"), "1. a\\\n   57) b\n");
+        assert_eq!(
+            wrap_at_20("1. first\n\n   Released in  \n   2004. Updated later.\n"),
+            "1. first\n\n   Released in  \n   2004. Updated\n   later.\n\n"
+        );
+        assert_eq!(wrap_at_20("- a\n1990. b\n"), "- a\n1990. b\n");
+        assert_eq!(wrap_at_20("1. a\n  2. b\n"), "1. a\n  2. b\n");
+        assert_eq!(wrap_at_20("1. a\n\n   p\n  2. b\n"), "1. a\n\n   p\n\n  2. b\n");
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_a_lazy_equals_line_in_the_list_item_paragraph() {
+        // ~keep Issue #680: cut at the `===` line, the item lost the hard break after `1990.`.
+        assert_eq!(
+            wrap_at_20("- a\n===  \n  1990.  \n  b\n"),
+            "- a ===  \n  1990.  \n  b\n"
+        );
+        // ~keep At the item's text column, or under an indented plain paragraph, the run is an
+        // ~keep underline and keeps its own line.
+        assert_eq!(wrap_at_20("- a\n  ===\n"), "- a\n  ===\n");
+        assert_eq!(wrap_at_20("  a\n===\n"), "  a\n===\n");
+        // ~keep After a hard break the run would start a line of its own at the item's column
+        // ~keep and underline the text above, so the paragraph ends before it, the run stays
+        // ~keep left of the column and the break stays.
+        assert_eq!(wrap_at_20("- a  \n===\n"), "- a  \n===\n");
+        assert_eq!(wrap_at_20("- a\n===  \n===\n"), "- a ===  \n===\n");
+        assert_eq!(wrap_at_20("- q  \n  1.\n===\n"), "- q  \n  1.\n===\n");
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_a_hard_break_before_a_number_line_in_a_quote() {
+        assert_eq!(wrap_at_20("> a  \n> 1990. b\n"), "> a  \n> 1990. b\n");
+        assert_eq!(wrap_at_20("> 2. b\n"), "> 2. b\n");
+        assert_eq!(wrap_at_20("> - a\n>   2. b\n"), "> - a\n>   2. b\n");
+        assert_eq!(wrap_at_20("> - x\n> lazy\n> 2. b\n"), "> - x\n> lazy\n> 2. b\n");
+        assert_eq!(wrap_at_20("> a\\\n> 1990. b\n"), "> a\\\n> 1990. b\n");
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_an_item_of_non_breaking_spaces() {
+        assert_eq!(wrap_at_20("- \u{a0}\n"), "- \u{a0}\n");
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_a_nested_marker_on_the_line_of_its_text() {
+        assert_eq!(
+            wrap_at_20("- 1. [vote](https://example.com/vote) title\n"),
+            "- 1. [vote](https://example.com/vote)\n     title\n"
+        );
+        assert_eq!(wrap_at_20("- 1.\n"), "- 1.\n");
+        assert_eq!(
+            wrap_at_20("- ## one two three four five\n"),
+            "- ## one two three four five\n"
+        );
+        let fenced = "- ```\n  one two three four five six\n  ```\nafter\n";
+        assert_eq!(
+            wrap_at_20(fenced),
+            "- ```\n  one two three four five six\n  ```\nafter\n\n"
+        );
+    }
+
+    #[test]
+    fn wrap_markdown_reads_a_non_breaking_space_as_text() {
+        assert_eq!(wrap_at_20("a\n\u{a0}- b c\n"), "a \u{a0}- b c\n\n");
+        assert_eq!(wrap_at_20("\u{a0}- b c\n"), "\u{a0}- b c\n\n");
+        assert_eq!(
+            wrap_at_20("\u{a0}one two three four five six\n"),
+            "\u{a0}one two three four\nfive six\n\n"
+        );
+    }
+
+    #[test]
+    fn wrap_markdown_still_joins_ordinary_paragraph_lines() {
+        assert_eq!(wrap_at_20("a\nb--\n"), "a b--\n\n");
     }
 
     #[test]

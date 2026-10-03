@@ -44,16 +44,21 @@ pub fn handle_dl(
     let mut content = String::new();
     let children = tag.children();
     {
+        let dl_ctx = crate::converter::list::utils::nested_block_context(output, ctx, options);
         for child_handle in children.top().iter() {
-            crate::converter::walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
+            crate::converter::walk_node(child_handle, parser, &mut content, options, &dl_ctx, depth + 1, dom_ctx);
         }
     }
 
     let trimmed = content.trim();
     if !trimmed.is_empty() {
-        if !output.is_empty() && !output.ends_with("\n\n") {
+        // ~keep Inside a list item the list starts at the item's content column (issue #583).
+        if ctx.in_list_item && !ctx.in_table_cell && !output.is_empty() {
+            crate::converter::list::utils::start_block_in_list_item(output, ctx, options);
+        } else if !output.is_empty() && !output.ends_with("\n\n") {
             output.push_str("\n\n");
         }
+        crate::converter::block::horizontal_rule::separate_leading_rule(output, trimmed, ctx);
         output.push_str(trimmed);
         output.push_str("\n\n");
     }
@@ -136,6 +141,7 @@ pub fn handle_dt(
     if ctx.convert_as_inline {
         output.push_str(&trimmed);
     } else {
+        crate::converter::block::horizontal_rule::separate_leading_rule(output, &trimmed, ctx);
         output.push_str(&trimmed);
         output.push('\n');
     }
@@ -223,6 +229,7 @@ pub fn handle_dd(
     if ctx.convert_as_inline {
         output.push_str(&trimmed);
     } else {
+        crate::converter::block::horizontal_rule::separate_leading_rule(output, &trimmed, ctx);
         output.push_str(&trimmed);
         output.push_str("\n\n");
     }

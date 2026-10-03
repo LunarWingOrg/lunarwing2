@@ -1,340 +1,6 @@
-//! Handler for link elements (a, anchor).
+//! Link destination and title helpers shared by the link, image and media handlers.
 //!
-//! Converts HTML anchor tags to Markdown links with support for:
-//! - Standard Markdown link syntax `[label](href "title")`
-//! - Autolinks for simple URLs like `<https://example.com>`
-//! - Link label escaping for special Markdown characters
-//! - Heading-in-link special handling (wraps link around heading)
-//! - Visitor callbacks for custom link processing
-//! - Metadata collection for links (links, URLs, titles, rel attributes)
-//! - Block-level content within links (via inline context)
-
-use crate::converter::utility::content::{collect_link_label_text, normalize_link_label};
-use crate::converter::utility::escaping::escape_link_label;
-use crate::converter::utility::preprocessing::sanitize_markdown_url;
-use crate::options::ConversionOptions;
-use std::borrow::Cow;
-#[cfg(feature = "metadata")]
-use std::collections::BTreeMap;
-use tl::{NodeHandle, Parser};
-
-type Context = crate::converter::Context;
-type DomContext = crate::converter::DomContext;
-
-/// Handler for anchor/link elements: `<a>`.
-///
-/// Processes anchor tags to generate Markdown links:
-/// - Detects autolinks (link text matches href)
-/// - Extracts and normalizes link labels
-/// - Handles nested headings within links
-/// - Escapes special characters in labels
-/// - Collects metadata when feature is enabled
-/// - Supports visitor callbacks for custom processing
-///
-/// # Link Label Extraction
-/// For links with block-level content, extracts text separately.
-/// Collapses newlines and normalizes whitespace per Markdown spec.
-///
-/// # Autolinks
-/// When `autolinks` option is enabled, detects links where the text equals
-/// the href (e.g., `<a href="https://example.com">https://example.com</a>`)
-/// and outputs as `<https://example.com>` instead.
-///
-/// # Note
-/// This function references helper functions from converter.rs
-/// which must be accessible (pub(crate)) for this module to work correctly.
-pub fn handle(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    use crate::converter::block::heading::{heading_allows_inline_images, push_heading};
-    use crate::converter::utility::content::normalized_tag_name;
-    // ~keep reason: serialize_node is only used when the visitor feature is active.
-    #[allow(unused_imports)]
-    use crate::converter::utility::serialization::serialize_node;
-    use crate::converter::{find_single_heading_child, get_text_content, walk_node};
-
-    let Some(node) = node_handle.get(parser) else {
-        return;
-    };
-
-    let tl::Node::Tag(tag) = node else {
-        return;
-    };
-
-    let href_attr = tag.attributes().get("href").flatten().map(|v| {
-        let decoded = crate::text::decode_html_entities(&v.as_utf8_str());
-        let resolved = ctx.resolve_url(&decoded).unwrap_or(decoded);
-        sanitize_markdown_url(&resolved).into_owned()
-    });
-    // ~keep Still a Cow borrowed from the tag's attribute bytes in the common case
-    // ~keep (Tier-2 hot-spot pass III): `decoded_attribute` returns early when the value
-    // ~keep holds no `&`, so a title without entities allocates nothing. The note that
-    // ~keep stood here claimed decoding was "not needed" and skipped it, which emitted
-    // ~keep `title="A&amp;B"` as the literal text `A&amp;B` (issue #494).
-    let title = crate::converter::utility::attributes::decoded_attribute(tag, "title");
-
-    if let Some(href) = href_attr {
-        if ctx.in_link {
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-            }
-            return;
-        }
-
-        let owned_children: Vec<tl::NodeHandle>;
-        let children: &[tl::NodeHandle] = if let Some(c) = dom_ctx.children_of(node_handle.get_inner()) {
-            c.as_slice()
-        } else {
-            owned_children = tag.children().top().iter().copied().collect();
-            owned_children.as_slice()
-        };
-        let (inline_label, _block_nodes, saw_block) = collect_link_label_text(children, parser, dom_ctx);
-
-        // ~keep Without block descendants the sweep above already visited exactly the nodes
-        // ~keep `get_text_content` would and decoded them the same way, so its text is reused
-        // ~keep rather than walking the `<a>` subtree a second time.
-        let text_source: Cow<'_, str> = if saw_block {
-            Cow::Owned(get_text_content(node_handle, parser, dom_ctx))
-        } else {
-            Cow::Borrowed(inline_label.as_str())
-        };
-        let normalized_text = crate::text::normalize_whitespace_cow(text_source.as_ref());
-        let raw_text = normalized_text.trim();
-
-        // ~keep Check if this should be rendered as an autolink.
-        // ~keep GFM requires an absolute URI with a scheme (e.g. `https://…`, `mailto:…`);
-        // ~keep bare paths or filenames must use the full `[text](href)` form.
-        let is_autolink = options.autolinks
-            && !options.default_title
-            && !href.is_empty()
-            && has_uri_scheme(href.as_str())
-            && (raw_text == href || (href.starts_with("mailto:") && raw_text == &href[7..]));
-
-        if is_autolink {
-            output.push('<');
-            if href.starts_with("mailto:") && raw_text == &href[7..] {
-                output.push_str(raw_text);
-            } else {
-                output.push_str(&href);
-            }
-            output.push('>');
-            return;
-        }
-
-        if let Some((heading_level, heading_handle)) = find_single_heading_child(*node_handle, parser) {
-            if let Some(heading_node) = heading_handle.get(parser) {
-                if let tl::Node::Tag(heading_tag) = heading_node {
-                    let heading_name = normalized_tag_name(heading_tag.name().as_utf8_str()).into_owned();
-                    let mut heading_text = String::new();
-                    let heading_ctx = Context {
-                        in_heading: true,
-                        convert_as_inline: true,
-                        heading_allow_inline_images: heading_allows_inline_images(
-                            &heading_name,
-                            &ctx.keep_inline_images_in,
-                        ),
-                        ..ctx.clone()
-                    };
-                    walk_node(
-                        &heading_handle,
-                        parser,
-                        &mut heading_text,
-                        options,
-                        &heading_ctx,
-                        depth + 1,
-                        dom_ctx,
-                    );
-                    let trimmed_heading = heading_text.trim();
-                    if !trimmed_heading.is_empty() {
-                        let escaped_label = escape_link_label(trimmed_heading);
-                        let mut link_buffer = String::new();
-                        append_markdown_link(
-                            &mut link_buffer,
-                            &escaped_label,
-                            href.as_str(),
-                            title.as_deref(),
-                            raw_text,
-                            options,
-                            ctx.reference_collector.as_ref(),
-                        );
-                        push_heading(output, ctx, options, heading_level, link_buffer.as_str());
-                        return;
-                    }
-                }
-            }
-        }
-
-        let mut label = if saw_block {
-            let mut content = String::new();
-            let link_ctx = Context {
-                inline_depth: ctx.inline_depth + 1,
-                convert_as_inline: true,
-                in_link: true,
-                ..ctx.clone()
-            };
-            for child_handle in children {
-                let mut child_buf = String::new();
-                walk_node(
-                    child_handle,
-                    parser,
-                    &mut child_buf,
-                    options,
-                    &link_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-                if !child_buf.trim().is_empty()
-                    && !content.is_empty()
-                    && !content.chars().last().is_none_or(char::is_whitespace)
-                    && !child_buf.chars().next().is_none_or(char::is_whitespace)
-                {
-                    content.push(' ');
-                }
-                content.push_str(&child_buf);
-            }
-            if content.trim().is_empty() {
-                normalize_link_label(&inline_label)
-            } else {
-                normalize_link_label(&content)
-            }
-        } else {
-            let mut content = String::new();
-            let link_ctx = Context {
-                inline_depth: ctx.inline_depth + 1,
-                in_link: true,
-                ..ctx.clone()
-            };
-            for child_handle in children {
-                walk_node(
-                    child_handle,
-                    parser,
-                    &mut content,
-                    options,
-                    &link_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-            }
-            normalize_link_label(&content)
-        };
-
-        // ~keep `raw_text` is already the whole-subtree text when `saw_block`, so this single
-        // ~keep fallback covers both the block and inline cases.
-        if label.is_empty() && !raw_text.is_empty() {
-            label = normalize_link_label(raw_text);
-        }
-
-        if label.is_empty() && !href.is_empty() && !children.is_empty() {
-            label.clone_from(&href);
-        }
-
-        let escaped_label = escape_link_label(&label);
-
-        #[cfg(feature = "visitor")]
-        if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Link,
-                Cow::Borrowed("a"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                true,
-            );
-
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_link(&node_ctx, &href, &label, title.as_deref())
-            };
-            match visit_result {
-                VisitResult::Continue => append_markdown_link(
-                    output,
-                    &escaped_label,
-                    href.as_str(),
-                    title.as_deref(),
-                    label.as_str(),
-                    options,
-                    ctx.reference_collector.as_ref(),
-                ),
-                VisitResult::Custom(custom) => output.push_str(&custom),
-                VisitResult::Skip => {}
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                }
-                VisitResult::PreserveHtml => output.push_str(&serialize_node(node_handle, parser)),
-            }
-        } else {
-            append_markdown_link(
-                output,
-                &escaped_label,
-                href.as_str(),
-                title.as_deref(),
-                label.as_str(),
-                options,
-                ctx.reference_collector.as_ref(),
-            );
-        }
-
-        #[cfg(not(feature = "visitor"))]
-        append_markdown_link(
-            output,
-            &escaped_label,
-            href.as_str(),
-            title.as_deref(),
-            label.as_str(),
-            options,
-            ctx.reference_collector.as_ref(),
-        );
-
-        #[cfg(feature = "metadata")]
-        if ctx.metadata_wants_links {
-            if let Some(ref collector) = ctx.metadata_collector {
-                let rel_attr = tag
-                    .attributes()
-                    .get("rel")
-                    .flatten()
-                    .map(|v| v.as_utf8_str().to_string());
-                let mut attributes_map = BTreeMap::new();
-                for (key, value_opt) in tag.attributes().iter() {
-                    let key_str = key.to_string();
-                    if key_str == "href" {
-                        continue;
-                    }
-
-                    let value = value_opt.map(|v| v.to_string()).unwrap_or_default();
-                    attributes_map.insert(key_str, value);
-                }
-                collector.borrow_mut().add_link(
-                    href.clone(),
-                    label,
-                    title.as_deref().map(str::to_string),
-                    rel_attr,
-                    attributes_map,
-                );
-            }
-        }
-    } else {
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-        }
-    }
-}
+//! The `<a>` handler itself is `converter::handlers::link`.
 
 mod link_url;
 pub use link_url::*;
@@ -342,7 +8,9 @@ pub use link_url::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::ConversionOptions;
     use crate::options::validation::UrlEscapeStyle;
+    use std::borrow::Cow;
 
     fn opts_with_style(style: UrlEscapeStyle) -> ConversionOptions {
         ConversionOptions::builder().url_escape_style(style).build()
@@ -428,7 +96,17 @@ mod tests {
     fn append_markdown_link_angle_plain_url_unchanged() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "/file.pdf", None, "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "/file.pdf",
+                title: None,
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](/file.pdf)");
     }
 
@@ -441,7 +119,17 @@ mod tests {
     fn append_markdown_link_angle_percent_encodes_non_ascii() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "öö.html", "öö.html", None, "öö.html", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "öö.html",
+                href: "öö.html",
+                title: None,
+                raw_text: "öö.html",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[öö.html](%C3%B6%C3%B6.html)");
     }
 
@@ -454,10 +142,12 @@ mod tests {
         let options = opts_with_style(UrlEscapeStyle::Angle);
         append_markdown_link(
             &mut out,
-            "text",
-            "https://example.com/söq?a=1&b=2",
-            None,
-            "text",
+            &MarkdownLink {
+                label: "text",
+                href: "https://example.com/söq?a=1&b=2",
+                title: None,
+                raw_text: "text",
+            },
             &options,
             None,
         );
@@ -474,7 +164,17 @@ mod tests {
     fn append_markdown_link_angle_does_not_percent_encode_a_fragment_destination() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "#walk-up-\u{fe0e}", None, "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "#walk-up-\u{fe0e}",
+                title: None,
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](#walk-up-\u{fe0e})");
     }
 
@@ -482,7 +182,17 @@ mod tests {
     fn append_markdown_link_angle_wraps_space_in_angle_brackets() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "file", "/file (1).pdf", None, "file", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "file",
+                href: "/file (1).pdf",
+                title: None,
+                raw_text: "file",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[file](</file (1).pdf>)");
     }
 
@@ -490,7 +200,17 @@ mod tests {
     fn append_markdown_link_percent_encodes_spaces() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Percent);
-        append_markdown_link(&mut out, "file", "/file (1).pdf", None, "file", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "file",
+                href: "/file (1).pdf",
+                title: None,
+                raw_text: "file",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[file](/file%20%281%29.pdf)");
     }
 
@@ -498,7 +218,17 @@ mod tests {
     fn append_markdown_link_percent_encodes_angle_brackets() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Percent);
-        append_markdown_link(&mut out, "file", "/file <draft>.pdf", None, "file", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "file",
+                href: "/file <draft>.pdf",
+                title: None,
+                raw_text: "file",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[file](/file%20%3Cdraft%3E.pdf)");
     }
 
@@ -506,7 +236,17 @@ mod tests {
     fn append_markdown_link_percent_full_issue_example() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Percent);
-        append_markdown_link(&mut out, "file", "/file (1) <draft>.pdf", None, "file", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "file",
+                href: "/file (1) <draft>.pdf",
+                title: None,
+                raw_text: "file",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[file](/file%20%281%29%20%3Cdraft%3E.pdf)");
     }
 
@@ -535,10 +275,12 @@ mod tests {
         let options = opts_with_style(UrlEscapeStyle::Angle);
         append_markdown_link(
             &mut out,
-            "Rust",
-            "https://en.wikipedia.org/wiki/Rust_(programming_language)",
-            None,
-            "Rust",
+            &MarkdownLink {
+                label: "Rust",
+                href: "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+                title: None,
+                raw_text: "Rust",
+            },
             &options,
             None,
         );
@@ -551,10 +293,12 @@ mod tests {
         let options = opts_with_style(UrlEscapeStyle::Angle);
         append_markdown_link(
             &mut out,
-            "link",
-            "http://example.com/a)(b",
-            None,
-            "link",
+            &MarkdownLink {
+                label: "link",
+                href: "http://example.com/a)(b",
+                title: None,
+                raw_text: "link",
+            },
             &options,
             None,
         );
@@ -565,7 +309,17 @@ mod tests {
     fn append_markdown_link_angle_escapes_gt_inside_wrap_when_href_has_space_and_gt() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "/my file >.pdf", None, "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "/my file >.pdf",
+                title: None,
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](</my file \\>.pdf>)");
     }
 
@@ -573,7 +327,17 @@ mod tests {
     fn append_markdown_link_angle_produces_empty_angle_brackets_when_href_is_empty() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "", None, "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "",
+                title: None,
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](<>)");
     }
 
@@ -583,10 +347,12 @@ mod tests {
         let options = opts_with_style(UrlEscapeStyle::Percent);
         append_markdown_link(
             &mut out,
-            "link",
-            "/path with spaces",
-            Some("My Title"),
-            "link",
+            &MarkdownLink {
+                label: "link",
+                href: "/path with spaces",
+                title: Some("My Title"),
+                raw_text: "link",
+            },
             &options,
             None,
         );
@@ -645,7 +411,17 @@ mod tests {
     fn append_markdown_link_escapes_a_trailing_backslash_in_title_so_the_closing_quote_is_not_swallowed() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "/url", Some("foo\\"), "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "/url",
+                title: Some("foo\\"),
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](/url \"foo\\\\\")");
     }
 
@@ -654,7 +430,17 @@ mod tests {
         let mut out = String::new();
         let mut options = opts_with_style(UrlEscapeStyle::Angle);
         options.default_title = true;
-        append_markdown_link(&mut out, "text", "http://a\\", None, "http://a\\", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "http://a\\",
+                title: None,
+                raw_text: "http://a\\",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](http://a\\ \"http://a\\\\\")");
     }
 
@@ -665,7 +451,17 @@ mod tests {
         // un-escaping the delimiter and terminating the destination early.
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "/my file\\>.pdf", None, "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "/my file\\>.pdf",
+                title: None,
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](</my file\\\\\\>.pdf>)");
     }
 
@@ -677,7 +473,17 @@ mod tests {
     fn append_markdown_link_escapes_a_backslash_before_punctuation_in_a_balanced_destination() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "\\*", None, "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "\\*",
+                title: None,
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](\\\\*)");
     }
 
@@ -695,7 +501,17 @@ mod tests {
     fn append_markdown_link_escapes_a_trailing_backslash_in_a_balanced_destination_with_no_title() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "/path\\", None, "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "/path\\",
+                title: None,
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](/path\\\\)");
     }
 
@@ -708,7 +524,17 @@ mod tests {
     fn append_markdown_link_leaves_a_trailing_backslash_in_a_balanced_destination_unescaped_when_a_title_follows() {
         let mut out = String::new();
         let options = opts_with_style(UrlEscapeStyle::Angle);
-        append_markdown_link(&mut out, "text", "/path\\", Some("t"), "text", &options, None);
+        append_markdown_link(
+            &mut out,
+            &MarkdownLink {
+                label: "text",
+                href: "/path\\",
+                title: Some("t"),
+                raw_text: "text",
+            },
+            &options,
+            None,
+        );
         assert_eq!(out, "[text](/path\\ \"t\")");
     }
 }

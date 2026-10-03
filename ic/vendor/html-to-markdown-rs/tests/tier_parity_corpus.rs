@@ -112,13 +112,17 @@ const fn bail_variant_name(reason: &BailReason) -> &'static str {
         BailReason::UnknownEntity { .. } => "UnknownEntity",
         BailReason::HiddenElement { .. } => "HiddenElement",
         BailReason::ListNestedOrdered => "ListNestedOrdered",
+        BailReason::OrderedListAfterOrderedList => "OrderedListAfterOrderedList",
+        BailReason::EmptyNestedListItem => "EmptyNestedListItem",
         BailReason::ListItemUnsupportedBlockChild => "ListItemUnsupportedBlockChild",
+        BailReason::ListItemCheckbox => "ListItemCheckbox",
         BailReason::ImageLazyLoadSrc => "ImageLazyLoadSrc",
         BailReason::BlockquoteCite => "BlockquoteCite",
         BailReason::LinkAutolinkNestedMarkup => "LinkAutolinkNestedMarkup",
         BailReason::AdjacentInlineEmphasis => "AdjacentInlineEmphasis",
         BailReason::WhitespaceOnlyInlineEmphasis => "WhitespaceOnlyInlineEmphasis",
         BailReason::InlineMarkerNotReproduced => "InlineMarkerNotReproduced",
+        BailReason::RuleBetweenInlineMarkers => "RuleBetweenInlineMarkers",
     }
 }
 

@@ -16,6 +16,7 @@ use std::rc::Rc;
 use crate::inline_images::InlineImageCollector;
 
 use crate::converter::reference_collector::ReferenceCollectorHandle;
+use crate::options::InlineDataMedia;
 use crate::types::structure_collector::StructureCollectorHandle;
 
 /// Handle type for inline image collector when feature is enabled.
@@ -74,17 +75,75 @@ pub struct Context {
     pub(crate) inline_depth: usize,
     /// Are we inside a list item?
     pub(crate) in_list_item: bool,
+    /// Whether the list item is still open where the current output buffer will be written:
+    /// a block written after other content then starts at the item's content column.
+    ///
+    /// ~keep A container that renders its children into a buffer of its own (a definition
+    /// ~keep list, a sectioning element, a figure, a details element, a form) writes that buffer
+    /// ~keep as a whole, so the buffer cannot show whether the item has already ended. The
+    /// ~keep container works that out from its own output before it renders the children, or
+    /// ~keep passes false when it writes at the start of the line (issue #583).
+    pub(crate) list_item_open: bool,
+    /// Whether the current output buffer is written between inline markers (a summary's `**`,
+    /// a caption's `*`): the first line of a list rendered into it is text, so its items are
+    /// not open and write no content column for a block (issues #583, #615).
+    pub(crate) text_in_markers: bool,
+    /// Whether the current output buffer is an inline wrapper's own buffer that does not count in
+    /// `inline_depth`, and its first line follows the wrapper's opening marker (a `<mark>`'s
+    /// `==`, a `<del>`'s `~~`) or text on the line the wrapper is written on.
+    ///
+    /// ~keep A rule written there is text (issue #603), and so is the first line of a list, as
+    /// ~keep under `text_in_markers`.
+    pub(crate) in_marker_span: bool,
+    /// The column where the current output buffer starts when it is an inline wrapper's own
+    /// buffer with no text or opening marker before it on its line (after a list item's marker,
+    /// say): a list marker at the start of the empty buffer is written at that column, not at
+    /// the start of a line.
+    pub(crate) inline_buffer_column: Option<usize>,
+    /// Whether the current output buffer escapes every `-` once it is written (a table
+    /// caption): a `-` list marker there is text.
+    pub(crate) escapes_hyphens: bool,
     /// List nesting depth (for indentation)
     pub(crate) list_depth: usize,
-    /// Cumulative column width (in the `Spaces` indent type) that a nested list item at this
-    /// point must be indented by: the sum of every ancestor `<li>`'s own marker width
-    /// (`"- "` = 2, `"1. "` = 3, `"10. "` = 4, ...), honouring `list_indent_width` as a floor.
+    /// The content column of the innermost list item: the column its marker is written at plus
+    /// its marker width (`"- "` = 2, `"1. "` = 3, `"10. "` = 4, ...), honouring
+    /// `list_indent_width` as a floor. With the `Tabs` indent type the marker column is the one
+    /// its tabs reach.
     ///
     /// Uniform per-depth indentation (`list_depth * list_indent_width`) is only correct when
     /// every ancestor list is unordered — an ordered ancestor's marker is wider than 2 columns,
     /// so a nested list must be indented to that marker's actual content column or CommonMark
     /// parses the child as a sibling instead of nested content.
     pub(crate) list_indent_columns: usize,
+    /// The `list_indent_columns` of the innermost enclosing item whose marker line starts a list
+    /// item in the output (an open item, or a marker between markers that starts its own line),
+    /// or 0 where none does.
+    ///
+    /// ~keep A line between the markers starts a block only within 3 columns of that item's
+    /// ~keep content column; further in, it is the paragraph's text. The first item's marker
+    /// ~keep follows the opening marker, so it is text, but a nested item's marker starts its
+    /// ~keep own line and is a real list item (issue #615).
+    pub(crate) real_item_columns: usize,
+    /// Whether the first line of the innermost quote follows an opening inline marker, so that
+    /// line is text outside the quote.
+    ///
+    /// ~keep The quote's other lines then hold no paragraph that a line of a list item in it
+    /// ~keep can continue, so a block 4 or more columns past the column of the item whose marker
+    /// ~keep starts a list item is an indented code block there, not paragraph text.
+    pub(crate) quote_starts_after_markers: bool,
+    /// Whether a paragraph was open before the previous marker line of the lists: the next
+    /// marker's check stops there instead of walking back over every earlier item.
+    pub(crate) previous_marker: crate::converter::list::utils::PreviousMarker,
+    /// Where the last ordered list ended, and the delimiter it wrote.
+    pub(crate) last_list: crate::converter::list::utils::LastList,
+    /// The delimiter of the innermost ordered list when it is not `.`.
+    pub(crate) ordered_delimiter: Option<char>,
+    /// Whether the innermost list item is still open after the lines of a buffer checked so
+    /// far: each block checks only the lines written since.
+    pub(crate) item_lines: crate::converter::list::utils::ItemLineScan,
+    /// The element of a task item whose render writes the item's first content, or `None`
+    /// outside a task item.
+    pub(crate) first_writer: Option<crate::converter::list::item::FirstWriter>,
     /// Unordered list nesting depth (for bullet cycling)
     pub(crate) ul_depth: usize,
     /// Are we inside any list (ul or ol)?
@@ -160,6 +219,9 @@ pub struct Context {
     pub(crate) excluded_node_ids: Rc<HashSet<u32>>,
     /// Shared flag set when the guarded DOM walk reaches its effective depth limit.
     pub(crate) depth_limit_reached: Rc<Cell<bool>>,
+    /// Shared flag set when `inline_data_media` replaced or dropped an element. A link reads it to
+    /// tell a label emptied by that option from an empty one.
+    pub(crate) inline_data_replaced: Rc<Cell<bool>>,
     #[cfg(feature = "inline-images")]
     /// Shared collector for inline images when enabled.
     pub(crate) inline_collector: Option<InlineCollectorHandle>,
@@ -274,8 +336,20 @@ impl Context {
             convert_as_inline: options.convert_as_inline,
             inline_depth: 0,
             in_list_item: false,
+            list_item_open: false,
+            text_in_markers: false,
+            in_marker_span: false,
+            inline_buffer_column: None,
+            escapes_hyphens: false,
             list_depth: 0,
             list_indent_columns: 0,
+            real_item_columns: 0,
+            quote_starts_after_markers: false,
+            previous_marker: crate::converter::list::utils::PreviousMarker::default(),
+            last_list: crate::converter::list::utils::LastList::default(),
+            ordered_delimiter: None,
+            item_lines: crate::converter::list::utils::ItemLineScan::default(),
+            first_writer: None,
             ul_depth: 0,
             in_list: false,
             loose_list: false,
@@ -296,6 +370,7 @@ impl Context {
             keep_inline_images_in: Rc::new(options.keep_inline_images_in.iter().cloned().collect()),
             excluded_node_ids: Rc::new(HashSet::new()),
             depth_limit_reached: Rc::new(Cell::new(false)),
+            inline_data_replaced: Rc::new(Cell::new(false)),
             #[cfg(feature = "inline-images")]
             inline_collector,
             #[cfg(feature = "metadata")]
@@ -320,6 +395,49 @@ impl Context {
             measure_width_only: false,
             base_url,
         }
+    }
+
+    /// Whether the current output buffer is written between inline markers: an inline wrapper's
+    /// (`inline_depth`, a link's brackets included), a summary's or caption's (`text_in_markers`)
+    /// or a marker-only wrapper's (`in_marker_span`). A rule written there is text, since the
+    /// markers cannot span it.
+    pub(crate) const fn in_marker_text(&self) -> bool {
+        self.inline_depth > 0 || self.text_in_markers || self.in_marker_span
+    }
+
+    /// The context for the children of an inline wrapper that renders them into a buffer of its
+    /// own and then writes that buffer at the end of `output`, after its opening marker if
+    /// `opens_with_marker`.
+    ///
+    /// ~keep The buffer continues the line `output` ends on. After an opening marker or text on
+    /// ~keep that line, the first line of a list in the buffer is text, as in bold (issue #615).
+    /// ~keep After only indent or a list item's marker, the list's first marker starts an item
+    /// ~keep where that line ends, as it would with no wrapper.
+    pub(crate) fn inline_buffer(&self, output: &str, opens_with_marker: bool) -> Self {
+        let line = &output[output.rfind('\n').map_or(0, |pos| pos + 1)..];
+        let line_holds_text =
+            !line.trim().is_empty() && !crate::converter::list::utils::line_is_bare_list_marker(output);
+        let (indent_length, indent_column) = crate::converter::utility::escaping::leading_indent(line);
+        Self {
+            in_marker_span: self.in_marker_span || opens_with_marker || line_holds_text,
+            inline_buffer_column: if output.is_empty() {
+                self.inline_buffer_column
+            } else {
+                Some(indent_column + line[indent_length..].chars().count())
+            },
+            ..self.clone()
+        }
+    }
+
+    /// What to write for an element whose chosen address is `address`, as
+    /// [`crate::converter::media::inline_data_treatment`] decides, recording in
+    /// [`Self::inline_data_replaced`] when it is not [`InlineDataMedia::Keep`].
+    pub(crate) fn inline_data_treatment(&self, choice: InlineDataMedia, address: &str) -> InlineDataMedia {
+        let treatment = crate::converter::media::inline_data_treatment(choice, address);
+        if treatment != InlineDataMedia::Keep {
+            self.inline_data_replaced.set(true);
+        }
+        treatment
     }
 
     /// Resolve a `href`/`src` attribute value against [`Self::base_url`].

@@ -201,7 +201,7 @@ pub fn handle_table(
             }
         }
 
-        let table_scan = scan_table(node_handle, parser, dom_ctx);
+        let table_scan = scan_table(node_handle, parser, dom_ctx, options.br_in_tables);
         // Keep the normal table renderer at the traversal boundary: it emits the
         // truncated table structure and records the usual depth-limit warning.
         let wrapper_cell = nested_table_wrapper_cell(tag, parser, &table_scan).filter(|(_, cell_depth)| {
@@ -424,13 +424,18 @@ pub fn handle_table(
                                 let mut text = String::new();
                                 let grandchildren = child_tag.children();
                                 {
+                                    let caption_ctx = super::super::super::Context {
+                                        text_in_markers: true,
+                                        escapes_hyphens: true,
+                                        ..ctx.clone()
+                                    };
                                     for grandchild_handle in grandchildren.top().iter() {
                                         super::super::super::walk_node(
                                             grandchild_handle,
                                             parser,
                                             &mut text,
                                             options,
-                                            ctx,
+                                            &caption_ctx,
                                             depth + 1,
                                             dom_ctx,
                                         );

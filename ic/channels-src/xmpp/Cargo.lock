@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "xmpp-channel"
-version = "2.1.4"
+version = "2.1.5"
 dependencies = [
  "base64",
  "serde",

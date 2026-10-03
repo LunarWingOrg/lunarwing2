@@ -379,7 +379,7 @@ static TAGS: phf::Map<&'static [u8], TagSpec> = phf_map! {
 
     b"form"      => block(TagKind::Block),
     b"fieldset"  => block(TagKind::Block),
-    b"legend"    => block(TagKind::Block),
+    b"legend"    => block(TagKind::Summary),
     b"label"     => inline(TagKind::Inline),
     b"input"     => void_inline(TagKind::Inline),
     b"select"    => inline(TagKind::Inline),

@@ -30,8 +30,7 @@ contractions and blunt, informal phrasing. It does not generate threats, slurs,
 criminal advice, or dialogue from the show. Natural model responses receive
 additional tone guidance from the bundled Cavepony skill.
 
-Release 0.4.4 carries the v2.1.4 dependency refresh and fixes the release
-metadata drift in registry release 0.4.3. The Cargo package,
+Release 0.4.5 carries the v2.1.5 dependency refresh. The Cargo package,
 lockfile entry, capabilities metadata, registry release, and CI expectation
 are kept at the same version; `ci-config` rejects drift before the WASM build.
 Metadata corrections also require a registry version newer than the MR base;

@@ -108,15 +108,21 @@ pub enum BailReason {
         max_depth: usize,
     },
 
-    /// A named HTML entity (e.g. `&mdash;`, `&laquo;`) was encountered that is
-    /// not in Tier-1's 45-entry decode table, or a numeric character reference
-    /// was malformed / mapped to an invalid Unicode code point.
+    /// A character reference Tier-1 does not decode but Tier-2 does: a legacy
+    /// named or a numeric reference without its `;` (e.g. `&copy 2024`, `&#39s`).
     ///
-    /// Tier-1 would pass the entity through verbatim, but Tier-2 decodes it to
+    /// Tier-1 would pass the reference through verbatim, but Tier-2 decodes it to
     /// the correct character, so the outputs would diverge.  Bail so the
     /// dispatcher falls back to Tier-2.
+    ///
+    /// The one call site that constructs this variant reaches it only after
+    /// [`crate::text::decode_character_reference`] has already matched `name`, so
+    /// the reference is always a known one missing its `;`, never a truly unknown
+    /// name. [`fmt::Display`] still checks `name` itself before choosing the
+    /// wording, rather than trusting that invariant, so a name that is not
+    /// actually a recognized reference still reads as unknown.
     UnknownEntity {
-        /// The entity name between `&` and `;` (e.g. `"mdash"`, `"#x2014"`).
+        /// The reference after the `&` (e.g. `"copy"`, `"#39"`).
         name: Box<str>,
         /// Byte offset in the HTML input where the `&` was found.
         offset: usize,
@@ -152,6 +158,19 @@ pub enum BailReason {
     /// Bail so Tier-2 (which computes cumulative marker widths) is authoritative.
     ListNestedOrdered,
 
+    /// An ordered list opened after only whitespace following an ordered list.
+    ///
+    /// Tier-2 writes it with the `)` delimiter so the two lists do not merge into one (issue #666).
+    /// This scanner writes `.` only.
+    OrderedListAfterOrderedList,
+
+    /// A list item of a nested list, or one after text inside its list, closed with nothing after
+    /// its marker on the marker line.
+    ///
+    /// Such a line cannot interrupt a paragraph, so Tier-2 writes a blank line before it when it
+    /// follows text (issue #667). This scanner does not track open paragraphs.
+    EmptyNestedListItem,
+
     /// A `<blockquote>`, `<div>` (or other generic block container), `<table>`,
     /// `<dl>`, or a paragraph-continuation `<p>` opened while inside an open
     /// list item, in a shape this scanner cannot render correctly.
@@ -178,7 +197,16 @@ pub enum BailReason {
     /// list-item-agnostic `ensure_blank_line` already coincides with Tier-2
     /// there). Only `<p>` opening as a CONTINUATION of already-started text
     /// bails.
+    ///
+    /// A heading or any other generic block container anywhere in a list item, an
+    /// `<hr>` after the item's content, and inline content right after a block in a
+    /// list item, bail too: Tier-2 starts each at the item's content column (issue
+    /// #583), which this scanner does not track.
     ListItemUnsupportedBlockChild,
+
+    /// A checkbox `<input>` opened inside a list item. Tier-2 writes that item as a task item
+    /// (`- [ ]`), which this scanner does not.
+    ListItemCheckbox,
 
     /// An `<img>` had an empty (or whitespace-only) `src`, or a `src` that is a
     /// `data:` URI, while also carrying one of the lazy-load fallback attributes
@@ -260,6 +288,14 @@ pub enum BailReason {
     /// `TierStrategy::Auto` -- it is still checked here so the Tier-1/Tier-2 byte-equality
     /// contract holds under a forced Tier-1 run rather than resting on that gate.
     InlineMarkerNotReproduced,
+
+    /// An `<hr>` opened between inline markers: inside `<strong>`/`<b>`, `<em>`/`<i>`,
+    /// `<var>`/`<dfn>`, `<del>`, `<ins>`, a `<summary>`, a `<figcaption>` or a table caption.
+    ///
+    /// Tier-2 writes such a rule as the text `---` in the running line, because on a line of
+    /// its own it would end the paragraph between the markers (issue #603). Tier-1 writes it
+    /// as a block, so it bails and lets Tier-2 (authoritative) handle it.
+    RuleBetweenInlineMarkers,
 }
 
 impl fmt::Display for BailReason {
@@ -290,7 +326,16 @@ impl fmt::Display for BailReason {
             Self::TableNestedTableInSingleCellRow => write!(f, "nested <table> inside a data table's single-cell row"),
             Self::TableCaption => write!(f, "<caption> element in table"),
             Self::TableSectionOrder => write!(f, "table sections in unsupported order"),
-            Self::UnknownEntity { name, offset } => write!(f, "unknown HTML entity &{name}; at byte offset {offset}"),
+            Self::UnknownEntity { name, offset } => {
+                if is_known_reference_name(name) {
+                    write!(
+                        f,
+                        "HTML entity &{name} is missing its closing semicolon at byte offset {offset}"
+                    )
+                } else {
+                    write!(f, "unknown HTML entity &{name} at byte offset {offset}")
+                }
+            }
             Self::DepthLimitExceeded { depth, max_depth } => {
                 write!(
                     f,
@@ -306,12 +351,19 @@ impl fmt::Display for BailReason {
                     "nested list with an ordered ancestor or ordered self (cumulative indent width)"
                 )
             }
+            Self::OrderedListAfterOrderedList => {
+                write!(f, "ordered list right after an ordered list (switched delimiter)")
+            }
+            Self::EmptyNestedListItem => {
+                write!(f, "nested list item with nothing on its marker line")
+            }
             Self::ListItemUnsupportedBlockChild => {
                 write!(
                     f,
                     "block-level child of a list item in a shape this scanner cannot render correctly"
                 )
             }
+            Self::ListItemCheckbox => write!(f, "checkbox input inside a list item (a task item)"),
             Self::ImageLazyLoadSrc => write!(f, "<img> has a lazy-load placeholder src and a fallback src attribute"),
             Self::BlockquoteCite => write!(f, "<blockquote> carries a cite attribute that tier-1 does not render"),
             Self::LinkAutolinkNestedMarkup => {
@@ -323,6 +375,16 @@ impl fmt::Display for BailReason {
             Self::AdjacentInlineEmphasis => write!(f, "adjacent strong/emphasis elements would form one delimiter run"),
             Self::WhitespaceOnlyInlineEmphasis => write!(f, "strong/emphasis element with a whitespace-only body"),
             Self::InlineMarkerNotReproduced => write!(f, "inline element whose tier-2 markers tier-1 does not emit"),
+            Self::RuleBetweenInlineMarkers => write!(f, "horizontal rule between inline markers"),
         }
     }
+}
+
+/// Whether `name` (the text after `&` stored in [`BailReason::UnknownEntity`]) is a character
+/// reference [`crate::text::decode_character_reference`] recognizes, checked by feeding it back
+/// through that same decoder with a closing `;` appended. Reuses the one table both tiers read
+/// instead of a second copy of the legacy-name and numeric-reference rules.
+fn is_known_reference_name(name: &str) -> bool {
+    let closed = format!("&{name};");
+    crate::text::decode_character_reference(&closed, 0, crate::text::ReferenceContext::Text).is_some()
 }
