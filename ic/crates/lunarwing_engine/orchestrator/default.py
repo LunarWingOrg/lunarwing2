@@ -1147,14 +1147,26 @@ def run_loop(context, goal, actions, state, config):
         # 2. Check budget
         budget = __check_budget__()
         if budget.get("tokens_remaining", 1) <= 0:
-            __transition_to__("completed", "token budget exhausted")
-            return complete_result(state, "completed", "Token budget exhausted.")
+            # WI#302: resource exhaustion is not a successful completion —
+            # fail loud so the user gets the reason as an error and missions
+            # record/retry it instead of treating the notice as a final answer.
+            __transition_to__("failed", "token budget exhausted")
+            return complete_result(
+                state, "failed",
+                error="Token budget exhausted before the task completed.",
+                extra={"failure_kind": "budget_exhausted"})
         if budget.get("time_remaining_ms", 1) <= 0:
-            __transition_to__("completed", "time budget exhausted")
-            return complete_result(state, "completed", "Time budget exhausted.")
+            __transition_to__("failed", "time budget exhausted")
+            return complete_result(
+                state, "failed",
+                error="Time budget exhausted before the task completed.",
+                extra={"failure_kind": "budget_exhausted"})
         if budget.get("usd_remaining") is not None and budget["usd_remaining"] <= 0:
-            __transition_to__("completed", "cost budget exhausted")
-            return complete_result(state, "completed", "Cost budget exhausted.")
+            __transition_to__("failed", "cost budget exhausted")
+            return complete_result(
+                state, "failed",
+                error="Cost budget exhausted before the task completed.",
+                extra={"failure_kind": "budget_exhausted"})
 
         # 3. Inject prior knowledge and activate skills on first step
         if step == 0:
