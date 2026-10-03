@@ -5,13 +5,15 @@ pristine crates.io `rig-core 0.40.0`. `cargo vendor` regenerates this directory
 from the registry tarball on every run and **silently drops the patch**, so
 `ic/scripts/refresh-vendor.sh` handles it explicitly:
 
-- **Before vendoring** it fails fast unless the patch marker is present and
-  this directory is committed clean (the post-vendor restore resets it from
-  git, so uncommitted changes here would be lost).
+- **Before vendoring** it fails fast unless this directory is committed
+  clean (the post-vendor restore resets it from git, so uncommitted changes
+  here would be lost) and the patch marker is present in **every**
+  marker-bearing patched file (`RIGCORE_MARKER_FILES` in the script), so a
+  committed revert of any single file is caught, not just the first one.
 - **After vendoring** it restores the committed patched tree — patched
   sources, this file, and `.cargo-checksum.json` — from git
-  (`git checkout HEAD -- vendor/rig-core`), making a same-version refresh
-  fully self-healing.
+  (`git checkout HEAD -- vendor/rig-core`) and re-checks every marker,
+  making a same-version refresh fully self-healing.
 - If the refresh **bumped rig-core to a new version**, the restore is refused
   and the script exits nonzero: re-apply the patch onto the new sources (file
   list below; see git history for the exact diff), regenerate the per-file
@@ -30,7 +32,9 @@ the OpenAI-compatible streaming aggregator collapsed `stop`/`length`/
 `content_filter` into a generic `Other`, and downstream consumers re-guessed
 the reason from content shape.
 
-Patched files:
+Patched files (every one except the `#[cfg(test)]`-only test profiles
+carries the marker; when the patch grows a file, mark it and add it to
+`RIGCORE_MARKER_FILES` in `ic/scripts/refresh-vendor.sh`):
 
 - `src/providers/internal/openai_chat_completions_compatible.rs` —
   `CompatibleFinishReason` widened with `Stop`/`Length`/`ContentFilter`;

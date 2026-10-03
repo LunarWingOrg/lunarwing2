@@ -70,8 +70,31 @@ done
 # run. The post-vendor step below restores the committed patched tree from
 # git, so the patch must be committed and the directory clean before we start.
 RIGCORE_DIR="$VENDOR_DIR/rig-core"
-RIGCORE_MARKER_FILE="$RIGCORE_DIR/src/providers/internal/openai_chat_completions_compatible.rs"
 RIGCORE_MARKER="LUNARWING_WI292_FINISH_REASON_PATCH"
+# Every runtime file the patch touches carries the marker; all of them are
+# checked, not one sentinel, because a committed hand-revert of a single
+# sibling file would otherwise pass while the patch is half-missing at runtime
+# (WI#294 residual). The sixth patched file,
+# src/test_utils/internal_streaming_profiles.rs, is #[cfg(test)]-only and
+# carries no marker. Keep in sync with "Patched files" in
+# vendor/rig-core/LUNARWING-PATCH.md.
+RIGCORE_MARKER_FILES=(
+  src/completion/request.rs
+  src/providers/copilot/mod.rs
+  src/providers/internal/openai_chat_completions_compatible.rs
+  src/providers/openai/completion/mod.rs
+  src/providers/openai/completion/streaming.rs
+)
+
+# Print each marker-bearing rig-core file that lacks the WI#292 marker.
+rigcore_unpatched_files() {
+  local rel
+  for rel in "${RIGCORE_MARKER_FILES[@]}"; do
+    if ! grep -q "$RIGCORE_MARKER" "$RIGCORE_DIR/$rel" 2>/dev/null; then
+      printf '  %s/%s\n' "$RIGCORE_DIR" "$rel"
+    fi
+  done
+}
 
 rigcore_dirty="$(git status --porcelain -- "$RIGCORE_DIR")"
 if [[ -n "$rigcore_dirty" ]]; then
@@ -80,11 +103,21 @@ if [[ -n "$rigcore_dirty" ]]; then
   echo "  overwrite them. Commit or stash the rig-core patch first, then re-run." >&2
   exit 1
 fi
-if ! grep -q "$RIGCORE_MARKER" "$RIGCORE_MARKER_FILE" 2>/dev/null; then
-  echo "refresh-vendor: ERROR rig-core local patch (WI#292 finish_reason pass-through) is missing." >&2
+rigcore_unpatched="$(rigcore_unpatched_files)"
+if [[ -n "$rigcore_unpatched" ]]; then
+  echo "refresh-vendor: ERROR rig-core local patch (WI#292 finish_reason pass-through) is missing from:" >&2
+  echo "$rigcore_unpatched" >&2
   echo "  Re-apply it and commit (see vendor/rig-core/LUNARWING-PATCH.md and git history), then re-run." >&2
   exit 1
 fi
+# A marker-bearing file missing from RIGCORE_MARKER_FILES would escape the
+# check above; flag the list drift without failing the refresh.
+while IFS= read -r marked; do
+  rel="${marked#"$RIGCORE_DIR"/}"
+  if [[ " ${RIGCORE_MARKER_FILES[*]} " != *" $rel "* ]]; then
+    echo "refresh-vendor: WARNING $marked carries the WI#292 marker but is not in RIGCORE_MARKER_FILES; add it so a revert of it is caught." >&2
+  fi
+done < <(grep -rl "$RIGCORE_MARKER" "$RIGCORE_DIR/src")
 rigcore_committed_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$RIGCORE_DIR/Cargo.toml" | head -n1)"
 
 echo "refresh-vendor: cargo vendor --locked --no-delete $VENDOR_DIR ${sync_args[*]} $*" >&2
@@ -105,8 +138,10 @@ fi
 # Same version: the committed tree (patched sources + matching
 # .cargo-checksum.json) is the correct end state; restore it from git.
 git checkout HEAD -- "$RIGCORE_DIR"
-if ! grep -q "$RIGCORE_MARKER" "$RIGCORE_MARKER_FILE" 2>/dev/null; then
-  echo "refresh-vendor: ERROR rig-core patch restore from git failed (marker still missing after restore)." >&2
+rigcore_unpatched="$(rigcore_unpatched_files)"
+if [[ -n "$rigcore_unpatched" ]]; then
+  echo "refresh-vendor: ERROR rig-core patch restore from git failed (marker still missing after restore):" >&2
+  echo "$rigcore_unpatched" >&2
   exit 1
 fi
 echo "refresh-vendor: restored rig-core WI#292 patch from git (cargo vendor had overwritten it with pristine $rigcore_vendored_version sources)" >&2
