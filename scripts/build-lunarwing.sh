@@ -520,6 +520,34 @@ run_clean() {
     log_ok "Clean complete"
 }
 
+# cargo never re-checks vendored crates, so one patched in place at the same
+# version (e.g. the WI#292 rig-core patch) would be linked from stale artifacts
+# in a reused target dir. The checkout's guard cleans such crates before the
+# build; with --record it stores the vendor state after a successful build.
+run_vendor_guard() {
+    local guard="$IC_DIR/scripts/vendor-artifact-guard.sh"
+    local cargo_profile="dev"
+    local -a guard_cmd
+
+    [[ -f "$guard" ]] || return 0
+    if [[ "$PROFILE" == "release" ]]; then
+        cargo_profile="release"
+    fi
+    guard_cmd=(bash "$guard" --manifest-dir "$IC_DIR" --target-dir "$TARGET_DIR" --profile "$cargo_profile" "$@")
+    if [[ "$DRY_RUN" == true ]]; then
+        guard_cmd+=(--dry-run)
+    fi
+
+    if "${guard_cmd[@]}"; then
+        return 0
+    fi
+    if [[ "${1:-}" == "--record" ]]; then
+        log_warn "Could not record the vendor state of $TARGET_DIR; the next build re-checks it"
+        return 0
+    fi
+    die "Could not clean stale vendored-crate artifacts in $TARGET_DIR"
+}
+
 run_build() {
     local -a cargo_cmd=(cargo build --locked --bin lunarwing -j "$JOBS")
     local profile_dir="$PROFILE"
@@ -572,6 +600,7 @@ run_build() {
         tail -n 30 "$log_file" >&2 || true
         exit "$exit_code"
     fi
+    run_vendor_guard --record
 
     crate_count="$(grep -c '^ *Compiling ' "$log_file" 2>/dev/null || true)"
     target_size="$(du -sh "$TARGET_DIR" 2>/dev/null | awk '{print $1}' || true)"
@@ -625,6 +654,7 @@ main() {
     configure_rustc_wrapper
     print_summary
     run_clean
+    run_vendor_guard
     run_build
     run_wasm_notice
 }

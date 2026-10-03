@@ -253,7 +253,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh restore-tenant ruffles /absolute/path/back
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant ruffles
 ```
 
-Use `upgrade-tenant` only with a reviewed target ref and a clean tenant checkout. Run it in `tmux`; it performs backup, fetch/checkout, build, service rendering, environment reconciliation, and restart under lifecycle locking.
+Use `upgrade-tenant` only with a reviewed target ref and a clean tenant checkout. Run it in `tmux`; it performs backup, fetch/checkout, build, service rendering, environment reconciliation, and restart under lifecycle locking. Every tenant cargo build runs `ic/scripts/vendor-artifact-guard.sh` first, which cleans vendored crates that were patched in place since the tenant's last build (cargo never re-checks vendored sources). The first guarded upgrade of an existing tenant therefore rebuilds rig-core once.
 
 Removing a tenant without `--purge` retains recoverable data according to MT admin policy. `--purge` is irreversible:
 

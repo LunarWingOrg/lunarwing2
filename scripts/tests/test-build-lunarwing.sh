@@ -395,5 +395,52 @@ else
 fi
 assert_contains 'invalid profile is explained' "$profile_output" "Invalid profile 'optimized'"
 
+printf '%s\n' '=== vendor artifact guard wiring ==='
+
+mkdir -p "$FIXTURE/repo/ic/scripts"
+cat > "$FIXTURE/repo/ic/scripts/vendor-artifact-guard.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'GUARD %s\n' "$*" >> "${FAKE_CARGO_LOG:?}"
+if [[ "${FAKE_GUARD_FAIL:-0}" == '1' && " $* " != *' --record '* ]]; then
+    exit 3
+fi
+EOF
+
+guard_sequence() {
+    awk '/^GUARD .* --record/ { print "record"; next } /^GUARD / { print "guard"; next } /^COMMAND build / { print "build" }' \
+        "$FAKE_CARGO_LOG" | tr '\n' ' '
+}
+
+: > "$FAKE_CARGO_LOG"
+TEST_TARGET_DIR="$FIXTURE/guard-target" run_fixture -j 1 > /dev/null 2>&1
+assert_eq 'vendor guard runs before the build and records after it' "$(guard_sequence)" 'guard build record '
+guard_line="$(grep -m1 '^GUARD ' "$FAKE_CARGO_LOG" || true)"
+assert_contains 'vendor guard checks the checkout being built' "$guard_line" '/repo/ic --target-dir '
+assert_contains 'vendor guard checks the build target dir' "$guard_line" '/guard-target --profile release'
+
+: > "$FAKE_CARGO_LOG"
+run_fixture --profile debug -j 1 > /dev/null 2>&1
+assert_contains 'debug builds guard the dev profile' "$(grep '^GUARD ' "$FAKE_CARGO_LOG" || true)" '--profile dev'
+
+: > "$FAKE_CARGO_LOG"
+run_fixture --dry-run > /dev/null 2>&1
+dry_guard="$(grep '^GUARD ' "$FAKE_CARGO_LOG" | tr '\n' '|' || true)"
+assert_contains 'dry run passes --dry-run to the vendor guard' "$dry_guard" '--dry-run'
+assert_not_contains 'dry run does not record vendor state' "$dry_guard" '--record'
+
+: > "$FAKE_CARGO_LOG"
+export FAKE_GUARD_FAIL=1
+set +e
+guard_fail_output="$(run_fixture -j 1 2>&1)"
+guard_fail_rc=$?
+set -e
+unset FAKE_GUARD_FAIL
+if [[ "$guard_fail_rc" -ne 0 ]] && ! grep -q '^COMMAND build ' "$FAKE_CARGO_LOG"; then
+    pass 'vendor guard failure stops the build before cargo runs'
+else
+    fail 'vendor guard failure stops the build before cargo runs' "exit=$guard_fail_rc"
+fi
+assert_contains 'vendor guard failure is explained' "$guard_fail_output" 'Could not clean stale vendored-crate artifacts'
+
 printf '\n%d passed, %d failed\n' "$passes" "$failures"
 [[ "$failures" -eq 0 ]]

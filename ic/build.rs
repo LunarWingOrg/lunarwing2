@@ -10,6 +10,15 @@ fn main() {
 
     // ── Embed bundled skills ────────────────────────────────────────────
     embed_skills(&root);
+
+    // ── Track migrations ────────────────────────────────────────────────
+    // refinery's embed_migrations!("migrations") include_str!s each file it
+    // finds, so edits are tracked, but a NEW migration is invisible to cargo:
+    // a migration-only change would leave a reused target dir (tenant
+    // upgrades) with a binary that lacks it, while clean CI builds pass.
+    // Watching the directory reruns this script, which recompiles the crate
+    // so the macro rescans it.
+    println!("cargo:rerun-if-changed=migrations");
 }
 
 /// Collect all registry manifests into a single JSON blob at compile time.
@@ -26,6 +35,11 @@ fn embed_registry_catalog(root: &Path) {
     // Rerun if the bundles file changes (per-file watches for tools/channels
     // are emitted inside collect_json_files to track content changes reliably).
     println!("cargo:rerun-if-changed=registry/_bundles.json");
+    // Per-file watches miss NEW manifests: cargo reruns a build script only
+    // when a watched path changes, so an added tool/channel would never reach
+    // the embedded catalog of a reused target dir (tenant upgrades), while
+    // clean CI builds pass. The directory watch catches additions.
+    println!("cargo:rerun-if-changed=registry");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let out_path = out_dir.join("embedded_catalog.json");
