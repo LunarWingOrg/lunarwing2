@@ -77,7 +77,7 @@
 26. [ ] fix issues in CI/CD (if any) - See Pipeline number 5031 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
 27. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
 28. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
-29. [x] (S) RESERVED
+29. [x] (S) RESERVED4itemstoworkonwilldiscusslater
 30. [x] (S) RESERVED
 31. [x] (S) RESERVED
 32. [x] (S) RESERVED
