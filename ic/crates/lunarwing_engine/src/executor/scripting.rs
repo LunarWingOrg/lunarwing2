@@ -1798,11 +1798,26 @@ async fn handle_rlm_query(
 
             ExtFunctionResult::Return(MontyObject::String(response))
         }
-        Err(e) => ExtFunctionResult::Error(MontyException::new(
-            ExcType::RuntimeError,
-            Some(format!("rlm_query failed: {e}")),
-        )),
+        Err(e) => {
+            // The raw provider error body rides EngineError::Llm's Display —
+            // untrusted text that must stay host-side (trace/log) while the
+            // sandbox sees only the redacted classification vocabulary (WI#296).
+            debug!(error = %e, "rlm_query child loop failed");
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some(rlm_query_failure_message(&e)),
+            ))
+        }
     }
+}
+
+/// Model-visible failure text for an rlm_query child loop error.
+///
+/// `EngineError::Llm`'s Display embeds the full provider error body, so the
+/// Monty exception is built from the shared redaction vocabulary instead of
+/// the raw error string; the detailed reason is logged host-side by the caller.
+fn rlm_query_failure_message(error: &EngineError) -> String {
+    super::safe_model_failure_message("rlm_query child", error)
 }
 
 // ── Standalone async handlers (for tokio::spawn) ────────────
@@ -4472,6 +4487,101 @@ FINAL("unexpected")
             result.stdout.contains("OS operations are not permitted"),
             "os.getenv must stay denied — the sandbox contract is unchanged; stdout: {}",
             result.stdout
+        );
+    }
+
+    // ── WI#296: rlm_query redaction ───────────────────────────
+
+    /// Raw provider diagnostics as they appear inside `EngineError::Llm`'s
+    /// Display — the text that must never reach the model-visible sandbox.
+    const RAW_PROVIDER_SENTINEL: &str = "Provider tensorzero::function_name::FrontierTEEC request failed: error decoding response body";
+
+    #[test]
+    fn rlm_query_failure_message_redacts_provider_diagnostics() {
+        // Sanity: the raw reason really is embedded in the Display the old
+        // code formatted straight into the Monty exception.
+        let error = EngineError::Llm {
+            kind: crate::types::error::ModelFailureKind::Transient,
+            reason: RAW_PROVIDER_SENTINEL.into(),
+        };
+        assert!(error.to_string().contains(RAW_PROVIDER_SENTINEL));
+
+        let message = rlm_query_failure_message(&error);
+        assert!(
+            !message.contains(RAW_PROVIDER_SENTINEL),
+            "model-visible rlm_query failure must not carry provider diagnostics: {message}"
+        );
+        assert!(
+            message.contains("transient"),
+            "redacted message keeps the failure classification: {message}"
+        );
+
+        // Non-LLM engine errors collapse to the generic internal message.
+        let other = EngineError::Store {
+            reason: RAW_PROVIDER_SENTINEL.into(),
+        };
+        let message = rlm_query_failure_message(&other);
+        assert!(
+            !message.contains(RAW_PROVIDER_SENTINEL),
+            "non-LLM errors must not leak their reason either: {message}"
+        );
+    }
+
+    /// LLM backend whose every call fails with an `EngineError::Llm` carrying
+    /// raw provider diagnostics, the exact shape WI#296 observed leaking into
+    /// mission outcomes.
+    struct FailingLlm;
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for FailingLlm {
+        fn model_name(&self) -> &str {
+            "failing"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[crate::types::message::ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &crate::traits::llm::LlmCallConfig,
+        ) -> Result<crate::traits::llm::LlmOutput, EngineError> {
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: RAW_PROVIDER_SENTINEL.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rlm_query_child_provider_failure_stays_redacted() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let llm: Arc<dyn crate::traits::llm::LlmBackend> = Arc::new(FailingLlm);
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+        let mut recursive_tokens = TokenUsage::default();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            handle_rlm_query(
+                &[MontyObject::String("child task".into())],
+                &[],
+                &thread,
+                &llm,
+                &effects,
+                &leases,
+                &policy,
+                &mut recursive_tokens,
+            ),
+        )
+        .await
+        .expect("a child loop with a failing provider must terminate");
+
+        // Whether the child reports through the exception arm or a Failed
+        // outcome string, the raw provider body must stay host-side.
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains(RAW_PROVIDER_SENTINEL),
+            "rlm_query result must not expose provider diagnostics to the sandbox: {rendered}"
         );
     }
 }
