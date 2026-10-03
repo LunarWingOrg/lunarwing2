@@ -2053,6 +2053,19 @@ impl Store for HybridStore {
             .collect())
     }
 
+    /// Global thread listings must enumerate the threads map directly.
+    ///
+    /// The trait default derives the global listing from
+    /// `list_all_projects()`, but threads are discovered by directory scan
+    /// and a thread whose `project.json` is missing or unparseable still
+    /// loads into the map — its project does not. Such a thread must stay
+    /// visible to the boot-time recovery sweep (WI#301): a per-project
+    /// sweep leaves every non-owner project's in-flight threads as
+    /// permanent `Running` zombies.
+    async fn list_all_threads_global(&self) -> Result<Vec<Thread>, EngineError> {
+        Ok(self.threads.read().await.values().cloned().collect())
+    }
+
     /// Global mission listings must enumerate the missions map directly.
     ///
     /// The trait default derives both globals from `list_all_projects()`, but
@@ -2742,6 +2755,47 @@ title: \"old doc\"\n\
         assert!(
             !active_global.iter().any(|m| m.id == paused_mission.id),
             "paused mission must not be reported active"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn global_thread_listing_sees_threads_whose_project_file_is_missing() {
+        // WI#301: a thread whose project.json never loads must still be
+        // enumerable by the boot-time recovery sweep — otherwise a
+        // non-owner project's in-flight thread is a permanent `Running`
+        // zombie that no restart ever reconciles.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("thread-global-list-test", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+
+        let project = Project::new("test-user", "orphan host", "test");
+        let thread = Thread::new(
+            "interrupted mid-run",
+            lunarwing_engine::ThreadType::Mission,
+            project.id,
+            "test-user",
+            lunarwing_engine::ThreadConfig::default(),
+        );
+
+        // Persist the thread, but never the project — its project.json is
+        // absent, exactly like a tenant whose project record failed to load.
+        store.save_thread(&thread).await.expect("save thread");
+        assert!(
+            store.load_project(project.id).await.unwrap().is_none(),
+            "fixture requires the project record to be absent"
+        );
+
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        let global = reloaded
+            .list_all_threads_global()
+            .await
+            .expect("list all threads globally");
+        assert!(
+            global.iter().any(|t| t.id == thread.id),
+            "thread with missing project must appear in the global listing"
         );
     }
 

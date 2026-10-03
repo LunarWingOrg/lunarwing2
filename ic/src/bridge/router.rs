@@ -1836,8 +1836,13 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         .track_notification_task(notification_task)
         .await;
 
-    if let Err(e) = thread_manager.recover_project_threads(project_id).await {
-        debug!("engine v2: recover_project_threads failed: {e}");
+    // WI#301: the recovery sweep is global — a per-project sweep left
+    // non-owner projects' in-flight threads as permanent `Running` zombies.
+    // Sweep-failed threads are stamped Failed-by-restart so the mission-side
+    // pass below can record/notify the lost fires. Waiting threads are
+    // spared here; pending-gate reconciliation (further down) owns them.
+    if let Err(e) = thread_manager.recover_all_threads_global().await {
+        debug!("engine v2: recover_all_threads_global failed: {e}");
     }
     if let Err(e) = mission_manager.bootstrap_project(project_id).await {
         debug!("engine v2: bootstrap_project failed: {e}");

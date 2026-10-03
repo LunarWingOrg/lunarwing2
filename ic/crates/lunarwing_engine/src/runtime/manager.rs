@@ -1138,18 +1138,26 @@ impl ThreadManager {
         Ok(resumed)
     }
 
-    /// Reconcile persisted non-terminal threads after process startup.
+    /// Reconcile persisted non-terminal threads after process startup,
+    /// across every project (WI#301).
     ///
-    /// The current engine does not support mid-thread replay/resume, so any
-    /// thread left in a non-terminal state is marked failed-safe.
-    pub async fn recover_project_threads(
-        &self,
-        project_id: ProjectId,
-    ) -> Result<Vec<ThreadId>, EngineError> {
-        const PENDING_APPROVAL_METADATA_KEY: &str = "pending_approval";
+    /// The engine does not support mid-thread replay/resume, so any thread
+    /// left in a non-terminal state is marked failed-safe. The sweep is
+    /// global: a per-project sweep left every non-owner project's in-flight
+    /// threads as permanent `Running` zombies no restart ever reconciled.
+    ///
+    /// `Waiting` threads are spared unconditionally: pending-gate recovery
+    /// owns them — `reconcile_pending_gate_state` (bridge router) restores
+    /// the persisted gate or fails gateless Waiting threads itself, so the
+    /// sweep must not race it by failing a thread whose approval is still
+    /// answerable. Threads the sweep transitions to `Failed` are stamped
+    /// with [`crate::types::thread::RESTART_FAILURE_METADATA_KEY`] so
+    /// recovery/refire policy can distinguish "interrupted by restart"
+    /// from "failed by error".
+    pub async fn recover_all_threads_global(&self) -> Result<Vec<ThreadId>, EngineError> {
         const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
         // System operation: recover all non-terminal threads regardless of user.
-        let threads = self.store.list_all_threads(project_id).await?;
+        let threads = self.store.list_all_threads_global().await?;
         let mut recovered = Vec::new();
 
         for mut thread in threads {
@@ -1157,9 +1165,9 @@ impl ThreadManager {
                 continue;
             }
 
-            if thread.state == ThreadState::Waiting
-                && thread.metadata.get(PENDING_APPROVAL_METADATA_KEY).is_some()
-            {
+            // Gate-paused threads: pending-gate reconciliation owns these —
+            // it restores the persisted gate or fails the gateless ones.
+            if thread.state == ThreadState::Waiting {
                 continue;
             }
 
@@ -1188,6 +1196,7 @@ impl ThreadManager {
                 )
                 .is_ok()
             {
+                thread.mark_failed_by_restart();
                 self.store.append_events(&thread.events).await?;
                 self.store.save_thread(&thread).await?;
                 recovered.push(thread.id);
@@ -1460,6 +1469,9 @@ mod tests {
                 .filter(|thread| thread.project_id == project_id)
                 .cloned()
                 .collect())
+        }
+        async fn list_all_threads_global(&self) -> Result<Vec<Thread>, EngineError> {
+            Ok(self.threads.read().await.values().cloned().collect())
         }
         async fn update_thread_state(
             &self,
@@ -2882,7 +2894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_project_threads_marks_non_terminal_as_failed() {
+    async fn recover_all_threads_global_marks_non_terminal_as_failed_by_restart() {
         let store = Arc::new(MockStore::new());
         let project = ProjectId::new();
 
@@ -2909,17 +2921,55 @@ mod tests {
         store.save_thread(&completed).await.unwrap();
 
         let mgr = make_manager_with_store(MockLlm::text("ignored"), Arc::clone(&store));
-        let recovered = mgr.recover_project_threads(project).await.unwrap();
+        let recovered = mgr.recover_all_threads_global().await.unwrap();
 
         assert_eq!(recovered, vec![running.id]);
         let saved = store.load_thread(running.id).await.unwrap().unwrap();
         assert_eq!(saved.state, ThreadState::Failed);
+        assert!(
+            saved.is_failed_by_restart(),
+            "sweep-failed thread must carry the restart marker (WI#301)"
+        );
+        assert!(
+            !saved.is_restart_failure_recorded(),
+            "the sweep marks only; the mission-side pass records"
+        );
         let events = store.load_events(running.id).await.unwrap();
         assert!(!events.is_empty());
     }
 
     #[tokio::test]
-    async fn recover_project_threads_preserves_waiting_approval_threads() {
+    async fn recover_all_threads_global_covers_threads_outside_the_owner_project() {
+        // WI#301: the per-project sweep left non-owner projects' in-flight
+        // threads as permanent `Running` zombies.
+        let store = Arc::new(MockStore::new());
+
+        let mut foreign = Thread::new(
+            "foreign running",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "other-user",
+            ThreadConfig::default(),
+        );
+        foreign.transition_to(ThreadState::Running, None).unwrap();
+        store.save_thread(&foreign).await.unwrap();
+
+        let mgr = make_manager_with_store(MockLlm::text("ignored"), Arc::clone(&store));
+        let recovered = mgr.recover_all_threads_global().await.unwrap();
+
+        assert_eq!(recovered, vec![foreign.id]);
+        let saved = store.load_thread(foreign.id).await.unwrap().unwrap();
+        assert_eq!(saved.state, ThreadState::Failed);
+        assert!(saved.is_failed_by_restart());
+    }
+
+    #[tokio::test]
+    async fn recover_all_threads_global_spares_waiting_threads_without_approval_key() {
+        // WI#301 review: the old `pending_approval` metadata guard was dead
+        // (written nowhere in production), so real gate-paused threads were
+        // failed by the sweep before gate reconciliation could restore
+        // them. Waiting threads are now spared unconditionally; gateless
+        // ones are failed by `reconcile_pending_gate_state` instead.
         let store = Arc::new(MockStore::new());
         let project = ProjectId::new();
 
@@ -2934,25 +2984,19 @@ mod tests {
         waiting
             .transition_to(ThreadState::Waiting, Some("approval".into()))
             .unwrap();
-        waiting.metadata = serde_json::json!({
-            "pending_approval": {
-                "request_id": "req-1",
-                "action_name": "shell",
-                "call_id": "call-1"
-            }
-        });
         store.save_thread(&waiting).await.unwrap();
 
         let mgr = make_manager_with_store(MockLlm::text("ignored"), Arc::clone(&store));
-        let recovered = mgr.recover_project_threads(project).await.unwrap();
+        let recovered = mgr.recover_all_threads_global().await.unwrap();
 
         assert!(recovered.is_empty());
         let saved = store.load_thread(waiting.id).await.unwrap().unwrap();
         assert_eq!(saved.state, ThreadState::Waiting);
+        assert!(!saved.is_failed_by_restart());
     }
 
     #[tokio::test]
-    async fn recover_project_threads_suspends_checkpointed_threads() {
+    async fn recover_all_threads_global_suspends_checkpointed_threads_without_marker() {
         let store = Arc::new(MockStore::new());
         let project = ProjectId::new();
 
@@ -2975,11 +3019,15 @@ mod tests {
         store.save_thread(&running).await.unwrap();
 
         let mgr = make_manager_with_store(MockLlm::text("ignored"), Arc::clone(&store));
-        let recovered = mgr.recover_project_threads(project).await.unwrap();
+        let recovered = mgr.recover_all_threads_global().await.unwrap();
 
         assert_eq!(recovered, vec![running.id]);
         let saved = store.load_thread(running.id).await.unwrap().unwrap();
         assert_eq!(saved.state, ThreadState::Suspended);
+        assert!(
+            !saved.is_failed_by_restart(),
+            "checkpoint-resumable threads are not restart failures"
+        );
     }
 
     #[tokio::test]
