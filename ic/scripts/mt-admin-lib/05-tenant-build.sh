@@ -464,6 +464,26 @@ _run_tenant_build() {
   sudo -u "$name" nice -n 10 bash -c "$build_cmd"
 }
 
+# Shell command (run as the tenant) that builds one cargo root of the tenant
+# checkout, wrapped in scripts/vendor-artifact-guard.sh. cargo never re-checks
+# vendored crates, so a crate patched in place at the same version (the WI#292
+# rig-core patch) would otherwise be linked from the tenant's pre-patch
+# artifacts: upgrade-tenant failed with E0599 while CI, building from scratch,
+# passed. The guard is the target-dir counterpart of the container config
+# hashes in 00-common.sh: before the build it cleans crates whose recorded
+# checksum digest changed, and after a successful build it records the
+# digests (a failed record only makes the next build re-check, so it does not
+# fail the build). Checkouts that predate the guard build unguarded.
+_vendor_guarded_cargo_build() {  # <repo> <cargo-root> [extra cargo build args...]
+  local repo="$1" root="$2"
+  shift 2
+  local guard="$repo/scripts/vendor-artifact-guard.sh"
+  local guard_args="--manifest-dir '$root' --profile '$PROFILE'"
+  local build="cargo build --profile '$PROFILE' -j$BUILD_JOBS${*:+ $*}"
+  printf "cd '%s' && if [ -f '%s' ]; then bash '%s' %s && %s && { bash '%s' %s --record || true; }; else %s; fi" \
+    "$root" "$guard" "$guard" "$guard_args" "$build" "$guard" "$guard_args" "$build"
+}
+
 build_tenant() {
   local name="$1"
   local with_wasm="${2:-false}"
@@ -489,11 +509,11 @@ build_tenant() {
     local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
 
     say "building lunarwing for $name ..."
-    _run_tenant_build "$name" "$cargo_env cd '$repo' && cargo build --profile $PROFILE --bin lunarwing -j$BUILD_JOBS" \
+    _run_tenant_build "$name" "$cargo_env $(_vendor_guarded_cargo_build "$repo" "$repo" --bin lunarwing)" \
       || die "lunarwing build failed for $name"
 
     say "building xmpp-bridge for $name ..."
-    _run_tenant_build "$name" "$cargo_env cd '$repo/bridges/xmpp-bridge' && cargo build --profile $PROFILE -j$BUILD_JOBS" \
+    _run_tenant_build "$name" "$cargo_env $(_vendor_guarded_cargo_build "$repo" "$repo/bridges/xmpp-bridge")" \
       || die "xmpp-bridge build failed for $name"
 
     if [[ "$with_wasm" == "true" ]]; then

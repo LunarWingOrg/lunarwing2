@@ -758,6 +758,25 @@ These mechanisms prevent a single failed routine from permanently blocking itsel
 - Keep `LUNARWING_MT_PROFILE=release`; do not switch to a full debug build.
 - Set `LUNARWING_MT_BUILD_JOBS=6` or lower to cap tenant Cargo jobs, and increase swap if the host still runs out of memory.
 
+### Build fails after an upgrade with an item missing from a vendored crate
+
+Sometimes an `upgrade-tenant` build fails against a vendored crate (for example
+`E0599: no method named 'finish_reason'` from rig-core) even though CI and clean
+builds pass. That means the tenant's target dir still holds artifacts of a crate
+that was patched in place under `ic/vendor/` without a version change. cargo
+never re-checks vendored sources, so it reuses the old artifacts.
+
+`build_tenant` wraps every tenant cargo build in
+`ic/scripts/vendor-artifact-guard.sh`, which cleans such crates before the build
+(look for `vendor-artifact-guard:` in the build output). On an existing tenant,
+the first guarded build cleans every crate that carries a `LUNARWING-PATCH.md`
+once. A target ref that predates the guard needs a manual clean, run as the
+tenant; then re-run the upgrade:
+
+```bash
+sudo -u <tenant> -H bash -c '. "$HOME/.cargo/env" 2>/dev/null || export PATH="$HOME/.cargo/bin:$PATH"; cd ~/lunarwing/ic && cargo clean --release -p rig-core'
+```
+
 ### Tenant user can't access Docker
 
 - Verify group membership: `id <tenant>`

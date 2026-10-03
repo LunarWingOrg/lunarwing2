@@ -151,10 +151,13 @@ run_branch() {
   say "2/6 checking out branch ${branch}..."
   sudo -u "$tenant" bash -c "cd '${repo}' && git fetch origin && git checkout '${branch}'" 2>&1 | tail -3
 
-  # 3. Binary-only build (skip WASM — use snapshot)
+  # 3. Binary-only build (skip WASM — use snapshot). The vendor guard cleans
+  # vendored crates patched in place since the last build (cargo never
+  # re-checks them); branches that predate it build unguarded.
   say "3/6 building binary (binary-only, ${JOBS} jobs)..."
+  local guard="[ ! -f scripts/vendor-artifact-guard.sh ] || bash scripts/vendor-artifact-guard.sh --profile release"
   tmux new-session -d -s "btest-${tenant}" \
-    "sudo -u ${tenant} bash -c 'cd ${repo} && taskset -c ${THREADS} cargo build --release --bin lunarwing -j${JOBS} 2>&1' | tee /tmp/btest-${tenant}.log"
+    "sudo -u ${tenant} bash -c 'cd ${repo} && { ${guard}; } && taskset -c ${THREADS} cargo build --release --bin lunarwing -j${JOBS} && { ${guard} --record || true; }' 2>&1 | tee /tmp/btest-${tenant}.log"
 
   # Wait for build to finish
   local build_wait=0

@@ -42,6 +42,17 @@ for arg in "${@:-}"; do
     esac
 done
 
+# cargo never re-checks vendored crates, so one patched in place at the same
+# version would be linked from an extension's stale artifacts; the guard
+# cleans such crates before a build and records the vendor state after it
+# (see scripts/vendor-artifact-guard.sh).
+VENDOR_GUARD="scripts/vendor-artifact-guard.sh"
+vendor_guard() {  # <source-dir> [--record]
+    [[ -f "$VENDOR_GUARD" ]] || return 0
+    bash "$VENDOR_GUARD" --manifest-dir "$1" --target-dir "$1/target" \
+        --profile release --target wasm32-wasip2 "${@:2}"
+}
+
 build_extension() {
     local manifest_path="$1"
     local source_dir
@@ -80,6 +91,11 @@ build_extension() {
 
     echo "  BUILD $name ($crate_name) from $source_dir"
     rm -f "$artifact"
+    if ! vendor_guard "$source_dir"; then
+        echo "  FAIL $name (could not clean stale vendored-crate artifacts)"
+        FAILED+=("$name")
+        return 1
+    fi
     if ! cargo build --locked --release --target wasm32-wasip2 --manifest-path "$source_dir/Cargo.toml" 2>&1; then
         echo "  FAIL $name"
         FAILED+=("$name")
@@ -90,6 +106,7 @@ build_extension() {
         FAILED+=("$name")
         return 1
     fi
+    vendor_guard "$source_dir" --record || echo "  WARN $name (vendor state not recorded; the next build re-checks)"
     echo "  OK   $name"
 }
 
