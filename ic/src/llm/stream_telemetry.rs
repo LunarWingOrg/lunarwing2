@@ -219,6 +219,9 @@ async fn persist_snapshot(path: &Path, snapshot: &StreamTelemetrySnapshot) -> st
 
 pub(crate) fn classify_stream_failure(error: &LlmError) -> StreamFailureReason {
     let message = error.to_string().to_ascii_lowercase();
+    if message.contains(crate::llm::streaming::EMPTY_STREAM_MARKER) {
+        return StreamFailureReason::Empty;
+    }
     if message.contains("decod") || message.contains("malformed stream") {
         return StreamFailureReason::Decode;
     }
@@ -245,6 +248,25 @@ pub(crate) fn classify_stream_failure(error: &LlmError) -> StreamFailureReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_empty_stream_failures_as_empty() {
+        assert_eq!(
+            classify_stream_failure(&LlmError::InvalidResponse {
+                provider: "test".into(),
+                reason: "empty provider stream: ended before any chunk".into(),
+            }),
+            StreamFailureReason::Empty
+        );
+        assert_eq!(
+            classify_stream_failure(&LlmError::InvalidResponse {
+                provider: "test".into(),
+                reason: "empty provider stream: completed with no content (finish_reason: stop)"
+                    .into(),
+            }),
+            StreamFailureReason::Empty
+        );
+    }
 
     #[test]
     fn classifies_decode_and_timeout_failures() {
