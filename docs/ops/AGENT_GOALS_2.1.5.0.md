@@ -28,7 +28,13 @@
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297
+9. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297
+   - Completed 100%: empty-but-successful provider streams are now failover-eligible instead of `Ok(empty)`.
+   - `ic/src/llm/streaming.rs`: new `empty_as_error`/`empty_stream_error` helpers convert zero-chunk streams and content-free `Done` chunks (non-tool finish) into retryable `LlmError::InvalidResponse`, preserving the WI#292 `finish_reason` (stop/length/content_filter) in the message.
+   - `ic/src/llm/failover.rs`: `try_stream_providers` routes the first stream item through `empty_as_error` so the next leg fires; regressions added (empty primary → fallback fires, Done-first stop fails over, Done-first tool_calls passes through, all-empty chain returns `InvalidResponse`).
+   - `ic/src/llm/retry.rs`: sibling `Empty → Ok empty` shape fixed the same way; empty outcomes consume retry attempts then surface an error the failover layer can act on.
+   - `ic/src/llm/stream_telemetry.rs`: empty-stream failures classify as `StreamFailureReason::Empty`, matching stream_integrity's EOF classification.
+   - Verified: `cargo test --lib llm::` 625 passed / 0 failed; `cargo clippy --lib --tests -D warnings` clean; rustfmt clean.
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
 11. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296 (dupe)
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/295
