@@ -1288,13 +1288,9 @@ async fn finalize_regated_expired_turn(
             "failed to discard re-armed gate after expiry resume"
         );
     }
-    if let Err(error) = finalize_silently_stopped_thread(
-        state,
-        gate.conversation_id,
-        gate.thread_id,
-        &gate.user_id,
-    )
-    .await
+    if let Err(error) =
+        finalize_silently_stopped_thread(state, gate.conversation_id, gate.thread_id, &gate.user_id)
+            .await
     {
         debug!(
             thread_id = %gate.thread_id,
@@ -6534,6 +6530,181 @@ pub(crate) mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, "alice");
         assert!(delivered[0].1.content.contains("could not be resumed"));
+    }
+
+    /// Work item #300 regression: when the wrap-up after an expiry resume
+    /// re-pauses on another gate, the watcher ends the turn — and a pending
+    /// gate armed for that thread must be discarded with it, not left as an
+    /// orphan for boot reconcile or the expiry sweep.
+    #[tokio::test]
+    async fn expired_gate_regated_wrap_up_discards_rearmed_gate() {
+        use crate::testing::RecordingBroadcastChannel;
+
+        // LLM whose wrap-up requests another gated tool instead of finishing.
+        struct RegateLlm;
+        #[async_trait::async_trait]
+        impl lunarwing_engine::LlmBackend for RegateLlm {
+            async fn complete(
+                &self,
+                _: &[lunarwing_engine::ThreadMessage],
+                _: &[lunarwing_engine::ActionDef],
+                _: &lunarwing_engine::LlmCallConfig,
+            ) -> Result<lunarwing_engine::LlmOutput, lunarwing_engine::EngineError> {
+                Ok(lunarwing_engine::LlmOutput {
+                    response: lunarwing_engine::LlmResponse::ActionCalls {
+                        calls: vec![lunarwing_engine::ActionCall {
+                            id: "call-regate".into(),
+                            action_name: "regated_tool".into(),
+                            parameters: serde_json::json!({}),
+                        }],
+                        content: None,
+                    },
+                    usage: lunarwing_engine::TokenUsage::default(),
+                    finish_reason: "tool_calls".into(),
+                })
+            }
+            fn model_name(&self) -> &str {
+                "regate"
+            }
+        }
+
+        // Tool that always prompts for approval, so the wrap-up call pauses.
+        struct RegatedTool;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for RegatedTool {
+            fn name(&self) -> &str {
+                "regated_tool"
+            }
+            fn description(&self) -> &str {
+                "test tool that always requires approval"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+                _: &crate::context::JobContext,
+            ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+                unreachable!("a gated tool must never execute in this test")
+            }
+            fn requires_approval(
+                &self,
+                _: &serde_json::Value,
+            ) -> crate::tools::ApprovalRequirement {
+                crate::tools::ApprovalRequirement::UnlessAutoApproved
+            }
+        }
+
+        let store = Arc::new(TestStore::new());
+        let gates = Arc::new(crate::gate::store::PendingGateStore::in_memory());
+        let mut state = make_expected_test_state(store.clone());
+        state.pending_gates = Arc::clone(&gates);
+
+        // Rebuild the thread manager around the regate LLM and a real effect
+        // adapter whose registry holds the approval-gated tool.
+        let tools = Arc::new(crate::tools::ToolRegistry::new());
+        tools.register_sync(Arc::new(RegatedTool));
+        let effects = Arc::new(EffectBridgeAdapter::new(
+            tools,
+            Arc::new(lunarwing_safety::SafetyLayer::new(
+                &lunarwing_safety::SafetyConfig {
+                    max_output_length: 10_000,
+                    injection_check_enabled: false,
+                },
+            )),
+            Arc::new(crate::hooks::HookRegistry::default()),
+        ));
+        let thread_manager = Arc::new(ThreadManager::new(
+            Arc::new(RegateLlm),
+            effects,
+            store.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        state.conversation_manager = Arc::new(ConversationManager::new(
+            Arc::clone(&thread_manager),
+            store.clone(),
+        ));
+        state.thread_manager = thread_manager;
+
+        let channels = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (recorder, broadcasts) = RecordingBroadcastChannel::new("web");
+        channels.add(Box::new(recorder)).await;
+        let hooks = Arc::new(crate::hooks::HookRegistry::default());
+
+        let conv_id = state
+            .conversation_manager
+            .get_or_create_conversation("web:scope-300", "alice")
+            .await
+            .unwrap();
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+
+        let mut gate = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+        );
+        gate.conversation_id = conv_id;
+        gate.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        gates.insert(gate).await.unwrap();
+        let expired = gates.drain_expired().await;
+        assert_eq!(expired.len(), 1);
+
+        handle_expired_gates(&state, &channels, &hooks, &expired).await;
+
+        // The resumed wrap-up must really re-pause on the gated tool.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let saved = store.load_thread(thread.id).await.unwrap().unwrap();
+            if saved.state == lunarwing_engine::ThreadState::Waiting {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed wrap-up never re-paused on the gated tool"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Arm a fresh gate for the re-paused thread — the WI#300 orphan.
+        gates
+            .insert(sample_pending_gate(
+                "alice",
+                thread.id,
+                lunarwing_engine::ResumeKind::Approval {
+                    allow_always: false,
+                },
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            await_expired_gate_resume_outcome(&state, &channels, &hooks, &expired[0]),
+        )
+        .await
+        .expect("re-gated wrap-up should reach the watcher finalize promptly");
+
+        // The re-armed gate is gone — not left for boot reconcile or the sweep.
+        assert!(gates.list_for_user("alice").await.is_empty());
+
+        // The thread was ended, and the channel was told why.
+        let saved = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert_eq!(saved.state, lunarwing_engine::ThreadState::Done);
+        let delivered = broadcasts.lock().await;
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, "alice");
+        assert!(
+            delivered[0]
+                .1
+                .content
+                .contains("requested another approval")
+        );
+        assert!(delivered[0].1.content.contains("regated_tool"));
     }
 
     #[tokio::test]
