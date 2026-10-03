@@ -261,7 +261,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         .await;
 
         match result {
-            Ok(Ok(())) => {
+            Ok(Ok(loop_outcome)) => {
                 tracing::info!("Worker for job {} completed successfully", self.job_id);
                 // Only mark completed if still in an active, non-stuck state.
                 let current_state = self
@@ -275,6 +275,18 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     Ok(JobState::Stuck) => {
                         tracing::info!(
                             "Job {} returned Ok but is Stuck — leaving for self-repair",
+                            self.job_id
+                        );
+                    }
+                    // WI#302: a loop ended by a stop signal (session teardown,
+                    // daemon shutdown, channel removal) never transitioned the
+                    // job. The container lane reports Stopped as
+                    // `success: false`; mirror it by leaving the state
+                    // untouched instead of recording a false success.
+                    Ok(_) if loop_ended_via_stop(loop_outcome.as_ref()) => {
+                        tracing::info!(
+                            "Job {} loop ended via stop signal without reaching a terminal \
+                             state — not marking completed",
                             self.job_id
                         );
                     }
@@ -302,12 +314,19 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         Ok(())
     }
 
+    /// Run the plan phase and the shared agentic loop.
+    ///
+    /// Returns `Ok(None)` when the plan phase already resolved the job state
+    /// (terminal/Stuck/Completed — the wrapper re-checks state anyway), and
+    /// `Ok(Some(outcome))` carrying the agentic loop's outcome otherwise so
+    /// the wrapper can tell a stop-signalled exit apart from real completion
+    /// (WI#302).
     async fn execution_loop(
         &self,
         rx: &mut mpsc::Receiver<WorkerMessage>,
         reasoning: &Reasoning,
         reason_ctx: &mut ReasoningContext,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<LoopOutcome>, Error> {
         let job_context = self.context_manager().get_context(self.job_id).await.ok();
         let max_iterations = worker_iteration_limit(job_context.as_ref());
 
@@ -375,7 +394,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     || ctx.state == JobState::Stuck
                     || ctx.state == JobState::Completed)
             {
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -397,7 +416,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         let outcome = run_agentic_loop(&delegate, reasoning, reason_ctx, &config).await?;
 
-        match outcome {
+        match &outcome {
             LoopOutcome::Response(_) => {
                 // Completion was already handled in handle_text_response via mark_completed
             }
@@ -408,15 +427,16 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 .await?;
             }
             LoopOutcome::Failed(message) => {
-                self.mark_failed(&message).await?;
+                self.mark_failed(message).await?;
             }
             LoopOutcome::Stopped => {
-                // Stop signal handled — nothing more to do
+                // Stop signal handled — no transition here; the wrapper must
+                // not treat this as a successful completion (WI#302).
             }
             LoopOutcome::NeedApproval(_) => {}
         }
 
-        Ok(())
+        Ok(Some(outcome))
     }
 
     /// Execute multiple tools in parallel using a JoinSet.
@@ -1127,6 +1147,18 @@ fn store_fallback_in_metadata(
             );
         }
     }
+}
+
+/// WI#302: an agentic loop that ended via a stop signal (session teardown,
+/// daemon shutdown, channel removal) — or the defensive `NeedApproval` arm —
+/// never transitioned the job to a terminal state. Recording it as a
+/// successful completion would fabricate success; the container lane already
+/// reports `LoopOutcome::Stopped` as `success: false` (worker/container.rs).
+fn loop_ended_via_stop(outcome: Option<&LoopOutcome>) -> bool {
+    matches!(
+        outcome,
+        Some(LoopOutcome::Stopped) | Some(LoopOutcome::NeedApproval(_))
+    )
 }
 
 /// Job delegate: implements `LoopDelegate` for the background job context.
@@ -2314,6 +2346,36 @@ mod tests {
         store_fallback_in_metadata(&mut ctx, None);
 
         assert_eq!(ctx.metadata, original); // safety: test
+    }
+
+    /// WI#302: stop-signalled loops must not fall through to mark_completed.
+    #[test]
+    fn test_loop_ended_via_stop_detects_stop_outcomes() {
+        let pending = crate::agent::session::PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "tool".to_string(),
+            parameters: serde_json::json!({}),
+            display_parameters: serde_json::json!({}),
+            description: "desc".to_string(),
+            tool_call_id: "call-1".to_string(),
+            context_messages: Vec::new(),
+            deferred_tool_calls: Vec::new(),
+            user_timezone: None,
+            allow_always: false,
+        };
+        assert!(loop_ended_via_stop(Some(&LoopOutcome::Stopped)));
+        assert!(loop_ended_via_stop(Some(&LoopOutcome::NeedApproval(
+            Box::new(pending)
+        ))));
+        assert!(!loop_ended_via_stop(Some(&LoopOutcome::Response(
+            "done".to_string()
+        ))));
+        assert!(!loop_ended_via_stop(Some(&LoopOutcome::MaxIterations)));
+        assert!(!loop_ended_via_stop(Some(&LoopOutcome::Failed(
+            "boom".to_string()
+        ))));
+        // Plan-phase early return (state already resolved) is not a stop.
+        assert!(!loop_ended_via_stop(None));
     }
 
     #[tokio::test]
