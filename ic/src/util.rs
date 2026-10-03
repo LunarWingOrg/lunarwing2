@@ -1,5 +1,9 @@
 //! Shared utility functions used across the codebase.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 use crate::llm::{ChatMessage, Role};
 
 /// Ensure the last message in `messages` is a user-role message.
@@ -29,11 +33,34 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
     i
 }
 
+/// Partial-progress qualifiers that turn a completion-shaped phrase into
+/// ordinary progress chatter (WI#302). Checked against the remainder of the
+/// line following a positive phrase match: "I have completed step 1 of 10,
+/// moving on" is a progress report, not a completion claim.
+static PROGRESS_QUALIFIER_AFTER_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        // Enumerated progress noun + number/ordinal: "step 1", "phase two",
+        // "part 3 of 5". A bare noun ("the task") does NOT qualify — only
+        // enumerated progress does.
+        r"(?i)(?:^|[\s,;:.(\-])(?:the\s+)?(?:steps?|phases?|stages?|parts?|sections?|milestones?|subtasks?|tasks?|chunks?|batches?|portions?|items?)\s+(?:\d|one\b|two\b|three\b|four\b|five\b|six\b|seven\b|eight\b|nine\b|ten\b|first\b|second\b|third\b|fourth\b|fifth\b)",
+        // Numeric fraction: "1 of 10", "3/5", "2 of the 7"
+        r"|\d\s*(?:of|/)\s*(?:the\s+)?\d",
+        // Continuation hedges: "but ...", "moving on", "on to (the) next",
+        // "remains"/"remain", "remaining", "more to do", "still need(s)"
+        r"|\bbut\b|\bmoving on\b|\bon to (?:the )?next\b|\bremains?\b|\bremaining\b|\bmore to do\b|\bstill needs?\b",
+    ))
+    .unwrap() // safety: static literal regex
+});
+
 /// Check if an LLM response explicitly signals that a job/task is complete.
 ///
 /// Uses phrase-level matching to avoid false positives from bare words like
 /// "done" or "complete" appearing in non-completion contexts (e.g. "not done yet",
 /// "the download is incomplete").
+///
+/// WI#302: a positive phrase only counts when the remainder of its line is
+/// free of partial-progress qualifiers — "I have completed step 1 of 10,
+/// moving on" is progress chatter, not a completion claim.
 pub fn llm_signals_completion(response: &str) -> bool {
     let lower = response.to_lowercase();
 
@@ -80,7 +107,15 @@ pub fn llm_signals_completion(response: &str) -> bool {
         return false;
     }
 
-    positive_phrases.iter().any(|p| lower.contains(p))
+    // A positive phrase fires only when no match is followed (on the same
+    // line) by a partial-progress qualifier (WI#302).
+    positive_phrases.iter().any(|p| {
+        lower.match_indices(p).any(|(start, _)| {
+            let after = &lower[start + p.len()..];
+            let line_rest = after.split('\n').next().unwrap_or(after);
+            !PROGRESS_QUALIFIER_AFTER_CLAIM.is_match(line_rest)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -209,6 +244,53 @@ mod tests {
              1. Fetch actual meeting note contents\n\
              2. Create the Notion page\n\
              3. Send the completion message"
+        ));
+    }
+
+    // ── WI#302: partial-progress chatter must not signal completion ──
+
+    #[test]
+    fn signals_completion_partial_progress_is_not_completion() {
+        assert!(!llm_signals_completion(
+            "I have completed step 1 of 10, moving on."
+        ));
+        assert!(!llm_signals_completion(
+            "I have completed phase 2. On to phase 3."
+        ));
+        assert!(!llm_signals_completion("I've completed 3 of 7 subtasks."));
+        assert!(!llm_signals_completion(
+            "I have completed the first step but two remain."
+        ));
+        assert!(!llm_signals_completion(
+            "Task is done for part 1; part 2 remains."
+        ));
+        assert!(!llm_signals_completion(
+            "Work is done on items 1-4, still need to finish items 5-8."
+        ));
+        assert!(!llm_signals_completion(
+            "Successfully completed stage one of the migration, more to do."
+        ));
+    }
+
+    #[test]
+    fn signals_completion_genuine_completions_still_fire() {
+        // The tightened matcher must keep the real completion claims.
+        assert!(llm_signals_completion("I have completed the task."));
+        assert!(llm_signals_completion(
+            "I have completed the task successfully."
+        ));
+        assert!(llm_signals_completion("The job is complete."));
+        assert!(llm_signals_completion("All done, here are the results."));
+        assert!(llm_signals_completion(
+            "I have completed the job ahead of schedule."
+        ));
+        assert!(llm_signals_completion(
+            "All steps are complete and verified."
+        ));
+        // Multi-line: a clean claim on its own line still fires even when a
+        // later line discusses follow-up work.
+        assert!(llm_signals_completion(
+            "I have completed the task.\nNext week we could extend it."
         ));
     }
 
