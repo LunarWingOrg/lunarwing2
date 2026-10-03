@@ -26,7 +26,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, reload};
 
-use crate::safety::LeakDetector;
+use crate::safety::LogScrubber;
 
 /// Maximum number of recent log entries kept for late-joining SSE subscribers.
 const HISTORY_CAP: usize = 500;
@@ -50,8 +50,9 @@ pub struct LogEntry {
 pub struct LogBroadcaster {
     tx: broadcast::Sender<LogEntry>,
     recent: Mutex<VecDeque<LogEntry>>,
-    /// Scrubs secrets from log messages before broadcasting to SSE clients.
-    leak_detector: LeakDetector,
+    /// Scrubs secrets from log messages before broadcasting to SSE clients —
+    /// the same scrubber every daemon log sink uses (WI#287).
+    scrubber: Arc<LogScrubber>,
 }
 
 impl LogBroadcaster {
@@ -60,18 +61,16 @@ impl LogBroadcaster {
         Self {
             tx,
             recent: Mutex::new(VecDeque::with_capacity(HISTORY_CAP)),
-            leak_detector: LeakDetector::new(),
+            scrubber: crate::tracing_fmt::daemon_log_scrubber(),
         }
     }
 
     pub fn send(&self, mut entry: LogEntry) {
         // Scrub secrets from the message before it reaches any subscriber.
         // This is defense-in-depth: even if code elsewhere accidentally logs
-        // a secret, it won't be broadcast to SSE clients.
-        entry.message = self
-            .leak_detector
-            .scan_and_clean(&entry.message)
-            .unwrap_or_else(|_| "[log message redacted: contained blocked secret]".to_string());
+        // a secret, it won't be broadcast to SSE clients. Block-class
+        // secrets replace the whole message; redact-class ones are masked.
+        entry.message = self.scrubber.scrub(&entry.message).into_owned();
 
         // Stash in ring buffer (for late joiners)
         if let Ok(mut buf) = self.recent.lock() {
@@ -203,15 +202,39 @@ pub fn init_tracing(log_broadcaster: Arc<LogBroadcaster>) -> Arc<LogLevelHandle>
         base_filter,
     ));
 
+    // Every sink is scrubbed at write time by the same scrubber (WI#287):
+    // stderr (the journal / daemon.stderr.log), the sandbox-visible copy the
+    // shell sandbox mounts read-only at /tenant-logs, and the SSE stream.
+    let scrubber = crate::tracing_fmt::daemon_log_scrubber();
+    let sandbox_log_dir = crate::bootstrap::sandbox_log_dir();
+    let sandbox_log = crate::tracing_fmt::SandboxLogWriter::open(
+        &sandbox_log_dir,
+        std::sync::Arc::clone(&scrubber),
+    );
+    let sandbox_layer = sandbox_log.as_ref().ok().map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(writer.clone())
+    });
+
     tracing_subscriber::registry()
         .with(reload_layer)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .with_writer(crate::tracing_fmt::TruncatingStderr::default()),
+                .with_writer(crate::tracing_fmt::TruncatingStderr::scrubbed(scrubber)),
         )
+        .with(sandbox_layer)
         .with(WebLogLayer::new(log_broadcaster))
         .init();
+
+    if let Err(error) = sandbox_log {
+        tracing::warn!(
+            dir = %sandbox_log_dir.display(),
+            %error,
+            "sandbox-visible daemon log unavailable; /tenant-logs will not be mounted"
+        );
+    }
 
     handle
 }
@@ -273,8 +296,9 @@ impl Visit for MessageVisitor {
 /// Only forwards DEBUG and above. Attach to the tracing subscriber
 /// alongside the existing fmt layer.
 ///
-/// Log messages are scrubbed through `LeakDetector` in `LogBroadcaster::send()`
-/// (the single funnel point for all log output, including late-joiner history).
+/// Log messages are scrubbed through the daemon `LogScrubber` in
+/// `LogBroadcaster::send()` (the single funnel point for SSE output, including
+/// late-joiner history).
 pub struct WebLogLayer {
     broadcaster: Arc<LogBroadcaster>,
 }
@@ -308,7 +332,7 @@ impl<S: tracing::Subscriber> Layer<S> for WebLogLayer {
             timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
 
-        // LeakDetector scrubbing happens inside broadcaster.send()
+        // Secret scrubbing happens inside broadcaster.send()
         self.broadcaster.send(entry);
     }
 }
@@ -446,10 +470,19 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcaster_has_leak_detector() {
+    fn test_broadcaster_scrubs_secrets_before_broadcast_and_history() {
         let broadcaster = LogBroadcaster::new();
-        // Verify the leak detector is initialized with default patterns
-        assert!(broadcaster.leak_detector.pattern_count() > 0);
+        let mut rx = broadcaster.subscribe();
+        broadcaster.send(LogEntry {
+            level: "INFO".to_string(),
+            target: "lunarwing::test".to_string(),
+            message: "Connecting with token sk-proj-test1234567890abcdefghij".to_string(),
+            timestamp: "2026-10-03T00:00:00.000Z".to_string(),
+        });
+        let live = rx.try_recv().expect("broadcast entry");
+        assert_eq!(live.message, crate::safety::REDACTED_LOG_RECORD);
+        let history = broadcaster.recent_entries();
+        assert_eq!(history[0].message, crate::safety::REDACTED_LOG_RECORD);
     }
 
     #[test]

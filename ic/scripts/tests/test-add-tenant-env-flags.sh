@@ -126,8 +126,9 @@ assert_eq "default MASCOT_ENABLED" "$(envval MASCOT_ENABLED)" "false"
 # WI#205: the sandbox must be told which tenant directories hold credentials.
 # They are not derivable from LUNARWING_BASE_DIR (state/ is a child of the
 # tenant root; env/ and run/ are siblings), so mt-admin names them explicitly.
-assert_eq "sandbox protects env, state and run under the tenant root" \
-  "$(envval SANDBOX_PROTECTED_PATHS)" "$MT_FIXTURE/env:$MT_FIXTURE/state:$MT_FIXTURE/run"
+# WI#287: logs/ too — raw unscrubbed OpenRC logs were mountable read-write.
+assert_eq "sandbox protects env, state, run and logs under the tenant root" \
+  "$(envval SANDBOX_PROTECTED_PATHS)" "$MT_FIXTURE/env:$MT_FIXTURE/state:$MT_FIXTURE/run:$MT_FIXTURE/logs"
 assert_eq "default XMPP_JID" "$(envval XMPP_JID)" "fixture-tenant@xmpp.localhost"
 assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "user@xmpp.localhost"
 write_tenant_bridge_env fixture-tenant

@@ -9,6 +9,7 @@
 
 mod credential_detect;
 mod leak_detector;
+mod log_scrubber;
 mod policy;
 mod sanitizer;
 mod validator;
@@ -18,6 +19,7 @@ pub use leak_detector::{
     LeakAction, LeakDetectionError, LeakDetector, LeakMatch, LeakPattern, LeakScanResult,
     LeakSeverity,
 };
+pub use log_scrubber::{LogScrubber, MIN_KNOWN_SECRET_LEN, REDACTED_LOG_RECORD};
 pub use policy::{Policy, PolicyAction, PolicyRule, Severity};
 pub use sanitizer::{InjectionWarning, SanitizedOutput, Sanitizer};
 pub use validator::{ValidationResult, Validator};

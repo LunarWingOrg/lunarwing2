@@ -1,9 +1,12 @@
 //! Containment validation for the directory the generic sandbox bind-mounts.
 //!
-//! The generic sandbox mounts exactly one host directory into the container as
-//! `/workspace` ([`crate::sandbox::cli_runner::build_run_args`]). That path is
-//! chosen by the *agent* — it comes straight from the shell tool's `workdir`
-//! argument — so it must be validated before it is handed to the runtime.
+//! The generic sandbox mounts one agent-chosen host directory into the
+//! container as `/workspace` ([`crate::sandbox::cli_runner::build_run_args`]).
+//! That path comes straight from the shell tool's `workdir` argument, so it
+//! must be validated before it is handed to the runtime. (The only other
+//! host-directory binds are daemon-owned and read-only: the proxy relay socket
+//! directory and the scrubbed daemon log at [`TENANT_LOGS_MOUNT`], vetted by
+//! [`tenant_logs_mount_source`].)
 //!
 //! Without validation a contained agent can mount the tenant's configuration
 //! directory and read the plaintext gateway bearer token out of
@@ -36,6 +39,7 @@
 //! the base-dir-derived defaults as a fallback for single-node installs.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sandbox::error::SandboxError;
 
@@ -116,16 +120,83 @@ fn resolve_protected_paths_from(env_raw: Option<&str>, base: &Path) -> Vec<PathB
     resolved
 }
 
-/// Add `<root>/env` and `<root>/run` when `base` looks like an MT state dir
-/// (`<root>/<something>/state`). The explicit list already protects the base
-/// itself, so `state/` is not repeated.
+/// Add `<root>/env`, `<root>/run` and `<root>/logs` when `base` looks like an
+/// MT state dir (`<root>/<something>/state`). The explicit list already
+/// protects the base itself, so `state/` is not repeated.
+///
+/// `<root>/logs` (WI#287) holds the raw, unscrubbed OpenRC daemon and service
+/// logs; it was mountable read-write as a `workdir`, letting an agent read or
+/// rewrite them. The agent's sanctioned view is the scrubbed, read-only
+/// [`TENANT_LOGS_MOUNT`].
 fn add_mt_tenant_siblings(base: &Path, paths: &mut Vec<PathBuf>) {
     if base.file_name().and_then(|n| n.to_str()) == Some("state")
         && let Some(tenant_root) = base.parent()
     {
         paths.push(tenant_root.join("env"));
         paths.push(tenant_root.join("run"));
+        paths.push(tenant_root.join("logs"));
     }
+}
+
+/// Container path where the daemon's sandbox-visible log directory is bound
+/// read-only (WI#287).
+pub const TENANT_LOGS_MOUNT: &str = "/tenant-logs";
+
+/// Host directory to bind read-only at [`TENANT_LOGS_MOUNT`]: the daemon's
+/// sandbox-visible, secret-scrubbed log directory
+/// ([`crate::bootstrap::sandbox_log_dir`]), or `None` when it does not exist
+/// or would expose a protected path.
+pub fn tenant_logs_mount_source(protected: &[PathBuf]) -> Option<PathBuf> {
+    static REFUSAL_LOGGED: AtomicBool = AtomicBool::new(false);
+    let dir = crate::bootstrap::sandbox_log_dir();
+    match tenant_logs_mount_source_from(&dir, protected) {
+        Ok(source) => source,
+        Err(reason) => {
+            if !REFUSAL_LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    %reason,
+                    "not mounting the sandbox-visible daemon log"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Vetting for [`tenant_logs_mount_source`], split out for tests.
+///
+/// The directory is daemon-owned and expected to sit *inside* a protected base
+/// dir (single-node `<base>`, MT `<root>/state`) — which is why the runner
+/// binds it itself instead of passing it through [`validate_mount_dir`]. It
+/// must never be, or contain, a protected path or a credential-bearing file.
+/// `Ok(None)`: nothing to mount yet.
+fn tenant_logs_mount_source_from(
+    dir: &Path,
+    protected: &[PathBuf],
+) -> Result<Option<PathBuf>, String> {
+    let Ok(canonical) = dir.canonicalize() else {
+        return Ok(None);
+    };
+    if !canonical.is_dir() {
+        return Err("not a directory".to_string());
+    }
+    if let Some(exposed) = protected.iter().find(|path| {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf()) == canonical
+            || contains_protected_dir(&canonical, path)
+    }) {
+        return Err(format!(
+            "it would expose the protected path {}",
+            exposed.display()
+        ));
+    }
+    if let Some(file) = masked_files_for_mount(&canonical, &[]).first() {
+        return Err(format!(
+            "it contains the credential-bearing file {}",
+            file.display()
+        ));
+    }
+    Ok(Some(canonical))
 }
 
 /// Canonicalize `dir` and reject it unless it is safe to bind-mount.
@@ -353,7 +424,13 @@ mod tests {
             std::fs::create_dir_all(root.join("lunarwing/env")).expect("env dir");
             std::fs::create_dir_all(root.join("lunarwing/state")).expect("state dir");
             std::fs::create_dir_all(root.join("lunarwing/run")).expect("run dir");
+            std::fs::create_dir_all(root.join("lunarwing/logs")).expect("logs dir");
             std::fs::create_dir_all(root.join("lunarwing/ic/src")).expect("repo dir");
+            std::fs::write(
+                root.join("lunarwing/logs/lunarwing.err"),
+                "raw unscrubbed daemon stderr\n",
+            )
+            .expect("raw log");
             std::fs::write(
                 root.join("lunarwing/env/lunarwing.env"),
                 "GATEWAY_AUTH_TOKEN=deadbeef\n",
@@ -369,14 +446,15 @@ mod tests {
             Self { root }
         }
 
-        /// The protected set mt-admin writes: env, state and run under the
-        /// tenant root — deliberately not the root itself, because the
+        /// The protected set mt-admin writes: env, state, run and logs under
+        /// the tenant root — deliberately not the root itself, because the
         /// daemon's working directory lives inside it.
         fn protected(&self) -> Vec<PathBuf> {
             vec![
                 self.root.join("lunarwing/env"),
                 self.root.join("lunarwing/state"),
                 self.root.join("lunarwing/run"),
+                self.root.join("lunarwing/logs"),
             ]
         }
 
@@ -469,8 +547,8 @@ mod tests {
     #[test]
     fn accepts_a_repo_root_but_reports_the_dirs_to_mask() {
         let fixture = Fixture::new();
-        // The tenant root holds env/, state/ and run/, so mounting it is legal
-        // (agents run git there) — but all three must be masked.
+        // The tenant root holds env/, state/, run/ and logs/, so mounting it
+        // is legal (agents run git there) — but all four must be masked.
         let resolved = validate_mount_dir(&fixture.repo_root(), &fixture.protected())
             .expect("tenant root allowed");
         let mut destinations: Vec<String> = masked_dirs_for_mount(&resolved, &fixture.protected())
@@ -483,6 +561,7 @@ mod tests {
             destinations,
             vec![
                 "/workspace/env".to_string(),
+                "/workspace/logs".to_string(),
                 "/workspace/run".to_string(),
                 "/workspace/state".to_string(),
             ],
@@ -530,6 +609,7 @@ mod tests {
             destinations,
             vec![
                 "/workspace/lunarwing/env".to_string(),
+                "/workspace/lunarwing/logs".to_string(),
                 "/workspace/lunarwing/run".to_string(),
                 "/workspace/lunarwing/state".to_string(),
             ]
@@ -627,6 +707,8 @@ mod tests {
             "/home/tenant/lunarwing/env",
             "/home/tenant/lunarwing/run",
             "/home/tenant/lunarwing/state",
+            // WI#287: raw OpenRC daemon/service logs, previously mountable rw.
+            "/home/tenant/lunarwing/logs",
         ] {
             let want = norm(want.to_string());
             assert!(rendered.contains(&want), "missing {want} in {rendered:?}");
@@ -667,6 +749,51 @@ mod tests {
         ] {
             assert!(paths.contains(&want.to_path_buf()), "missing {want:?}");
         }
+    }
+
+    /// WI#287: the raw MT logs dir is no longer a valid rw workdir.
+    #[test]
+    fn rejects_the_raw_logs_directory() {
+        let fixture = Fixture::new();
+        let err = validate_mount_dir(&fixture.root.join("lunarwing/logs"), &fixture.protected())
+            .expect_err("raw logs dir must be denied");
+        assert_eq!(err.kind(), "mount_path_denied");
+    }
+
+    /// WI#287: the daemon-owned sandbox log dir is mountable although it sits
+    /// inside the protected state dir — the runner binds it itself, read-only.
+    #[test]
+    fn tenant_logs_source_inside_protected_base_is_accepted() {
+        let fixture = Fixture::new();
+        let dir = fixture.root.join("lunarwing/state/logs/sandbox");
+        assert_eq!(
+            tenant_logs_mount_source_from(&dir, &fixture.protected()),
+            Ok(None),
+            "nothing to mount before the daemon creates the directory"
+        );
+        std::fs::create_dir_all(&dir).expect("sandbox log dir");
+        std::fs::write(dir.join("daemon.log"), "INFO scrubbed\n").expect("log");
+        assert_eq!(
+            tenant_logs_mount_source_from(&dir, &fixture.protected()),
+            Ok(Some(dir.canonicalize().expect("canonical")))
+        );
+    }
+
+    #[test]
+    fn tenant_logs_source_never_exposes_protected_paths_or_credentials() {
+        let fixture = Fixture::new();
+        // Containing a protected dir (the tenant root holds env/), or being one.
+        for dir in [fixture.repo_root(), fixture.env_dir()] {
+            assert!(
+                tenant_logs_mount_source_from(&dir, &fixture.protected()).is_err(),
+                "{dir:?} must not be mounted as /tenant-logs"
+            );
+        }
+        // Holding a credential-bearing file.
+        let dir = fixture.root.join("lunarwing/ic/logs");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("copied.env"), "TOKEN=x\n").expect("env copy");
+        assert!(tenant_logs_mount_source_from(&dir, &fixture.protected()).is_err());
     }
 
     #[test]
