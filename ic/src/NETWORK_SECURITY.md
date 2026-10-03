@@ -438,6 +438,7 @@ Containers that the generic sandbox spawns (`podman run`/`docker run`) are confi
 | Stop grace | `--stop-timeout 10` so kill/rm terminates PID 1 instead of orphaning | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Seccomp | Runtime default profile (podman/docker default seccomp) — **supported contract**, no custom profile | this document |
 | Workspace mount | Policy-selected `ro`/`rw` + SELinux relabel (`,z`) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Daemon log mount | `/tenant-logs`, **always `ro`**: the daemon's own secret-scrubbed log copy (`<base>/logs/sandbox/`), daemon-chosen and vetted to expose no protected path (WI#287) | `src/sandbox/mount_guard.rs` — `tenant_logs_mount_source()`; `src/tracing_fmt.rs` — `SandboxLogWriter` |
 | Network | Proxy mode (allowlist) or `none` | `src/sandbox/cli_runner.rs`, this document above |
 | Tmpfs | `/tmp` (512 MB), `/home/sandbox/.cargo/registry` (1 GB) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Auto-remove | `--rm` + kill-by-name on timeout **and on cancellation** (drop guard) + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `ContainerCleanupGuard`; `src/orchestrator/reaper.rs` |
@@ -492,7 +493,38 @@ WASM tools execute HTTP requests through the host runtime, subject to:
 3. **Leak detection** — `LeakDetector` scans both outbound requests and inbound responses for secret patterns
    - Runs at two points: before sending and after receiving
    - Uses Aho-Corasick for fast multi-pattern matching
-   - **Reference:** `src/safety/leak_detector.rs`
+   - **Reference:** `crates/lunarwing_safety/src/leak_detector.rs`
+
+### Daemon Log Scrubbing and `/tenant-logs` (WI#287)
+
+**Decision: scrub at write time (option A), and give the sandbox only the
+scrubbed copy.** Every daemon log sink goes through one `LogScrubber`
+(`crates/lunarwing_safety/src/log_scrubber.rs`, built by
+`tracing_fmt::daemon_log_scrubber`): process stderr (the journal on systemd,
+`daemon.stderr.log` on OpenRC/launchd — previously raw), the SSE log stream,
+and `<base>/logs/sandbox/daemon.log`. It applies the default leak shapes,
+log-specific shapes (credentials in URLs, `?token=` query parameters), and the
+exact values of secret-named environment variables (`*TOKEN*`, `*SECRET*`,
+`*PASSWORD*`, `*API_KEY*`, ...; at least 12 bytes) — the generic shapes cannot
+recognize a tenant's 64-hex gateway token. Block-class records are replaced
+whole; redact-class matches are masked in place.
+
+The shell sandbox mounts `<base>/logs/sandbox/` read-only at `/tenant-logs`
+(`daemon.log`, rotated to `daemon.log.1` at 8 MiB; 4 KiB per event). The raw
+logs are deliberately **not** mounted: on systemd there are no files (journal);
+the OpenRC/launchd files predate scrubbing (the first-boot `?token=` banner went
+to stdout there), and the MT `<root>/logs` directory also holds other
+services' raw logs (proxy, xmpp-bridge, weechat, darkirc, babysitters). That MT
+directory was mountable read-write as a `workdir`; it is now protected
+(`add_mt_tenant_siblings`, mt-admin `SANDBOX_PROTECTED_PATHS`).
+
+Limits: only tracing output is scrubbed — raw `println!`/`eprintln!`, panic
+messages, and other processes' output are not; a secret is recognized only by
+a known shape or a configured env value (secrets fetched later from the
+secrets store are caught by shape only). Log lines the agent reads are still
+untrusted text and pass through the usual tool-output sanitization. The log
+file is `0600` in a `0700` directory, readable in-container under the same uid
+mapping that makes `/workspace` writable.
 
 ### LunarVision Service Clients
 

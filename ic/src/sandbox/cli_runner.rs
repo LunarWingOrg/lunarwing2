@@ -273,6 +273,10 @@ pub(crate) struct RunSpec<'a> {
     /// the mount (WI#211), plus the container paths to shadow with it.
     pub masked_files: &'a [String],
     pub mask_file: Option<&'a Path>,
+    /// The daemon's sandbox-visible, secret-scrubbed log directory, bound
+    /// read-only at [`crate::sandbox::mount_guard::TENANT_LOGS_MOUNT`]
+    /// (WI#287). `None` when it does not exist or failed vetting.
+    pub tenant_logs: Option<&'a Path>,
 }
 
 /// Build the `<runtime> run ...` argument vector for a sandboxed command.
@@ -365,6 +369,18 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
             args.push("-v".into());
             args.push(format!("{}:{destination}:ro,z", mask_file.display()));
         }
+    }
+
+    // The daemon's own scrubbed log, always read-only (WI#287). Daemon-chosen
+    // like the proxy relay dir, so it is vetted by
+    // `mount_guard::tenant_logs_mount_source`, not `validate_mount_dir`.
+    if let Some(logs) = spec.tenant_logs {
+        args.push("-v".into());
+        args.push(format!(
+            "{}:{}:ro,z",
+            logs.display(),
+            crate::sandbox::mount_guard::TENANT_LOGS_MOUNT
+        ));
     }
 
     // Caller-provided env first (never secrets: the shell tool passes none).
@@ -751,6 +767,7 @@ impl CliRunner {
         } else {
             Some(EmptyMaskDir::create()?)
         };
+        let tenant_logs = crate::sandbox::mount_guard::tenant_logs_mount_source(protected_paths);
 
         if network != SandboxNetworkMode::None && proxy_port == 0 {
             return Err(SandboxError::ProxyError {
@@ -793,6 +810,7 @@ impl CliRunner {
             mask_dir: mask_dir.as_ref().map(EmptyMaskDir::path),
             masked_files: &masked_file_destinations,
             mask_file: mask_file.as_ref().map(EmptyMaskFile::path),
+            tenant_logs: tenant_logs.as_deref(),
         };
         let args = build_run_args(&spec);
 
@@ -1206,7 +1224,51 @@ mod tests {
             mask_dir: None,
             masked_files: &[],
             mask_file: None,
+            tenant_logs: None,
         }
+    }
+
+    /// WI#287: the daemon's scrubbed log dir is bound read-only at
+    /// /tenant-logs for every policy and runtime — even when the workspace is
+    /// writable — and nothing is bound without a vetted source.
+    #[test]
+    fn tenant_logs_are_mounted_read_only() {
+        let logs = Path::new("/home/t/lunarwing/state/logs/sandbox");
+        for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+            for policy in [SandboxPolicy::ReadOnly, SandboxPolicy::WorkspaceWrite] {
+                let args = build_run_args(&RunSpec {
+                    tenant_logs: Some(logs),
+                    ..spec(
+                        runtime,
+                        KeepIdMode::Off,
+                        policy,
+                        SandboxNetworkMode::None,
+                        0,
+                    )
+                });
+                assert!(
+                    args.windows(2).any(|w| w
+                        == [
+                            "-v".to_string(),
+                            "/home/t/lunarwing/state/logs/sandbox:/tenant-logs:ro,z".to_string()
+                        ]),
+                    "missing read-only /tenant-logs bind in {args:?}"
+                );
+                assert!(
+                    !args.iter().any(|a| a.contains("/tenant-logs:rw")),
+                    "/tenant-logs must never be writable: {args:?}"
+                );
+            }
+        }
+
+        let args = build_run_args(&spec(
+            ContainerRuntime::Podman,
+            KeepIdMode::Off,
+            SandboxPolicy::WorkspaceWrite,
+            SandboxNetworkMode::None,
+            0,
+        ));
+        assert!(!args.iter().any(|a| a.contains("/tenant-logs")), "{args:?}");
     }
 
     /// WI#205: protected subdirectories of the workspace are shadowed by an

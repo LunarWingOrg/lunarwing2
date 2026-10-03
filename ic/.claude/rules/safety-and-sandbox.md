@@ -62,6 +62,14 @@ runtime (keep-id / rootless mapping / daemon euid). Rootful Docker under a
 root daemon refuses writable workspaces (never container root). Detached
 cleanup is backstopped by the API-independent CLI reaper with bounded probes.
 
+**Daemon logs (WI#287):** the only daemon-chosen data mount is `/tenant-logs`,
+always read-only: the daemon's secret-scrubbed copy at `<base>/logs/sandbox/`,
+vetted by `mount_guard::tenant_logs_mount_source`. Never mount raw log
+directories (systemd hosts log to the journal, so there are none; OpenRC/MT
+ones are unscrubbed and shared with other services) — MT `<root>/logs` is a
+protected path. All daemon
+log sinks share `tracing_fmt::daemon_log_scrubber`; keep new sinks on it.
+
 ## BOUNDARY: generic sandbox vs. orchestrator worker containers
 
 TWO container subsystems exist; never mix them:

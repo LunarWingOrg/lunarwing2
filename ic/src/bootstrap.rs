@@ -173,6 +173,15 @@ pub fn lunarwing_base_dir() -> PathBuf {
     LUNARWING_BASE_DIR.clone()
 }
 
+/// Directory of the daemon's sandbox-visible log, `<base_dir>/logs/sandbox`
+/// (WI#287): the daemon writes a secret-scrubbed copy of its log stream here
+/// and the shell sandbox mounts the directory read-only at `/tenant-logs`.
+/// Derived from the base dir so single-node and multi-tenant layouts (where
+/// the base dir is `<tenant root>/state`) get the same daemon-owned location.
+pub fn sandbox_log_dir() -> PathBuf {
+    lunarwing_base_dir().join("logs").join("sandbox")
+}
+
 /// Path to the LunarWing-specific `.env` file: `<base_dir>/.env`.
 pub fn lunarwing_env_path() -> PathBuf {
     lunarwing_base_dir().join(".env")

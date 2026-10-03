@@ -45,6 +45,8 @@ sudo ic/scripts/lunarwing-mt-admin.sh doctor
 
 Tenant units run under the tenant account's systemd user manager on systemd hosts and as OpenRC services on Gentoo. Do not diagnose a tenant with bare system-bus `systemctl`; it can report an inactive unit while the tenant is healthy.
 
+Every daemon log sink is secret-scrubbed at write time (2.1.5.0, WI#287): stderr (and so the journal or OpenRC `*.err` file), the web Logs stream, and a dedicated copy at `<base>/logs/sandbox/daemon.log` (multi-tenant: `<tenant home>/lunarwing/state/logs/sandbox/`, rotated to `daemon.log.1` at 8 MiB). The agent reads that copy itself from inside the shell sandbox at `/tenant-logs/daemon.log` (read-only), so "what did the daemon actually do" questions can be answered without host access. Scrubbing covers known secret shapes and the values of secret-named environment variables, not raw `println!`/panic output or other services' logs — still review logs before sharing them.
+
 ## What to Capture
 
 When reporting a problem, include:
