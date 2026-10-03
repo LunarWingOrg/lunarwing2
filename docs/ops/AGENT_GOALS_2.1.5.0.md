@@ -29,7 +29,10 @@
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297
-10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
+10. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
+  - DONE (100%): `rlm_query` child-loop `Err(e)` arm in `ic/crates/lunarwing_engine/src/executor/scripting.rs` no longer formats raw `EngineError::Llm` Display (full provider error body) into the model-visible Monty exception; it now maps through the shared `safe_model_failure_message` redaction vocabulary (classification + recovery instruction only) via a new `rlm_query_failure_message` helper, with the full reason kept in host-side `debug!` logs.
+  - Verified: `cargo check -p lunarwing_engine --tests` clean; `cargo clippy -p lunarwing_engine --tests -- -D warnings` clean; `cargo test -p lunarwing_engine --lib executor::scripting::` 50 passed / 0 failed, including new regression tests `rlm_query_failure_message_redacts_provider_diagnostics` and `rlm_query_child_provider_failure_stays_redacted`.
+  - Commit: a1a856a1a (branch aj/kimi-10-20261003-1000).
 11. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296 (dupe)
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/295
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/294
