@@ -1894,7 +1894,11 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         crate::gate::persistence::FileGatePersistence::with_default_path(),
     ))));
     if let Err(e) = pending_gates.restore_from_persistence().await {
-        debug!("engine v2: failed to restore pending gates: {e}");
+        tracing::warn!(
+            error = %e,
+            path = %crate::gate::persistence::FileGatePersistence::default_path().display(),
+            "engine v2: failed to restore pending gates"
+        );
     }
     if let Err(e) = reconcile_pending_gate_state(&store_dyn, &pending_gates).await {
         debug!("engine v2: pending gate reconciliation failed: {e}");
