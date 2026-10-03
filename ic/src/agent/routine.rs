@@ -245,7 +245,10 @@ pub enum RoutineAction {
         /// Tools requiring approval are automatically filtered out.
         #[serde(default)]
         use_tools: bool,
-        /// Max tool call rounds (default: 3). Only used when use_tools is true.
+        /// Tool-calling rounds per run (default: 3), each run ending with
+        /// one text-only recovery turn. Capped at runtime by the operator's
+        /// `ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS` and [`MAX_TOOL_ROUNDS_LIMIT`].
+        /// Only used when use_tools is true.
         #[serde(default = "default_max_tool_rounds")]
         max_tool_rounds: u32,
     },
@@ -273,8 +276,9 @@ fn default_max_tool_rounds() -> u32 {
     3
 }
 
-/// Hard upper bound for max_tool_rounds to prevent runaway loops and cost explosion.
-pub(crate) const MAX_TOOL_ROUNDS_LIMIT: u32 = 20;
+/// Hard upper bound for max_tool_rounds to prevent runaway loops and cost
+/// explosion — the same ceiling the engine enforces at runtime (WI#291).
+pub(crate) const MAX_TOOL_ROUNDS_LIMIT: u32 = crate::config::LIGHTWEIGHT_MAX_TOOL_ROUNDS;
 
 /// Clamp max_tool_rounds to [1, MAX_TOOL_ROUNDS_LIMIT].
 /// Accepts u64 to avoid truncation before clamping.
