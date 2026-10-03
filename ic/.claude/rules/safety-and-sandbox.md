@@ -10,7 +10,7 @@ paths:
 ## Safety Layer
 
 All external tool output passes through `SafetyLayer`:
-1. **Sanitizer** - Detects injection patterns, escapes dangerous content
+1. **Sanitizer** - Detects injection patterns, escapes dangerous content. Detection is position-free and deliberately stricter than its line-start-only neutralization (WI#289): do not "align" detection to positional rules — see the module docs in `crates/lunarwing_safety/src/sanitizer.rs`
 2. **Validator** - Checks length, encoding, forbidden patterns
 3. **Policy** - Rules with severity (Critical/High/Medium/Low) and actions (Block/Warn/Review/Sanitize)
 4. **Leak Detector** - Scans for 15+ secret patterns at two points: tool output before LLM, and LLM responses before user
