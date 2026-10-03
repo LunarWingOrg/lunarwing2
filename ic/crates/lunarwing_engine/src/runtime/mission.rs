@@ -46,6 +46,10 @@ const RETRY_ATTEMPT_METADATA_KEY: &str = "retry_attempt";
 /// Marker for the debug line recorded when a join handle is lost before any
 /// outcome can be observed (interrupted lineage, WI#188).
 const JOIN_LOST_APPROACH_PREFIX: &str = "INTERRUPTED: thread join handle lost";
+/// How long a mission run interrupted by daemon shutdown gets to stop and
+/// settle so its real outcome is recorded (WI#276). Kept inside the 5 s that
+/// [`MissionManager::shutdown`] waits, leaving room to persist the outcome.
+const SHUTDOWN_STOP_GRACE: Duration = Duration::from_secs(3);
 
 const MANAGED_RECURRING_METADATA_KEY: &str = "managed_recurring";
 const MANAGED_DEFINITION_VERSION_KEY: &str = "managed_definition_version";
@@ -2145,24 +2149,22 @@ impl MissionManager {
         // a Weak never awaits, so the coroutine's opaque type stays flat.
         let retry_mgr = self.weak_self.read().await.clone();
         let handle = tokio::spawn(async move {
-            let outcome = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let _ = tm.stop_thread_system(thread_id).await;
-                    let joined = tm.join_thread(thread_id).await;
-                    if cancel.is_cancelled() {
-                        // Torn down by daemon shutdown: neither record the
-                        // outcome nor schedule a retry — the post-restart
-                        // checkpoint sweep owns anything still resumable.
-                        return;
-                    }
-                    joined
-                },
-                outcome = tm.join_thread(thread_id) => outcome,
-            };
+            // WI#276: the thread stays registered while it runs, so on daemon
+            // shutdown the stop actually lands and the run's real outcome is
+            // processed below. The old watcher joined first — taking the
+            // handle out of the running set — so its shutdown stop missed,
+            // the run was dropped mid-await, and the fire was lost silently.
+            let outcome = tm
+                .wait_thread_or_stop(thread_id, &cancel, SHUTDOWN_STOP_GRACE)
+                .await;
+            let shutting_down = cancel.is_cancelled();
             match outcome {
-                Ok(outcome) => {
+                Ok(Some(outcome)) => {
                     let lock = mission_lock(&fire_locks, mission_id).await;
                     let _guard = lock.lock().await;
+                    // A Stopped outcome records the interruption, releases the
+                    // trigger dedup key and persists the retry marker on the
+                    // now-terminal thread.
                     match process_mission_outcome_and_notify(
                         &store,
                         mission_id,
@@ -2174,6 +2176,16 @@ impl MissionManager {
                     {
                         Err(e) => {
                             debug!(mission_id = %mission_id, "failed to process outcome: {e}");
+                        }
+                        Ok(Some(_pending)) if shutting_down => {
+                            // An in-process retry timer would die with the
+                            // daemon; the persisted marker is re-armed by the
+                            // post-restart sweep instead.
+                            debug!(
+                                mission_id = %mission_id,
+                                %thread_id,
+                                "mission fire interrupted by shutdown; retry persisted for restart"
+                            );
                         }
                         Ok(Some(pending)) => {
                             drop(_guard);
@@ -2189,6 +2201,19 @@ impl MissionManager {
                         }
                         Ok(None) => {}
                     }
+                }
+                Ok(None) => {
+                    // Shutdown, and the run did not stop within the grace:
+                    // writing now would race its own final save. The row stays
+                    // live for restart recovery.
+                    warn!(
+                        mission_id = %mission_id,
+                        %thread_id,
+                        "mission thread still running at shutdown; leaving it to restart recovery"
+                    );
+                }
+                Err(e) if shutting_down => {
+                    debug!(mission_id = %mission_id, %thread_id, "thread join failed during shutdown: {e}");
                 }
                 Err(e) => {
                     // Tri-state (WI#188): a lost join handle is an
@@ -2339,19 +2364,21 @@ impl MissionManager {
         }
     }
 
-    /// Post-restart sweep: re-arm retries for mission threads that recorded
-    /// a pending retry before the daemon stopped (WI#188). Without this the
-    /// in-memory retry timers vanish with the process.
-    ///
-    /// Call after thread checkpoint recovery: threads still holding a
-    /// `mission_retry` marker are supposed to be terminal — a Suspended row
-    /// means checkpoint recovery already owns its future, so the sweep
-    /// clears the marker instead of double-scheduling.
     #[cfg(test)]
     pub(crate) fn store_arc(&self) -> Arc<dyn Store> {
         Arc::clone(&self.store)
     }
 
+    /// Post-restart sweep: re-arm retries for mission threads that recorded
+    /// a pending retry before the daemon stopped (WI#188). Without this the
+    /// in-memory retry timers vanish with the process. Fires interrupted by a
+    /// graceful shutdown persist their marker too, via the outcome watcher's
+    /// shutdown stop (WI#276).
+    ///
+    /// Call after thread checkpoint recovery: threads still holding a
+    /// `mission_retry` marker are supposed to be terminal — a Suspended row
+    /// means checkpoint recovery already owns its future, so the sweep
+    /// clears the marker instead of double-scheduling.
     pub async fn recover_pending_mission_retries(&self) -> Result<Vec<MissionId>, EngineError> {
         let mut scheduled = Vec::new();
         // A previously scheduled retry can outlive this process's active
@@ -2901,6 +2928,16 @@ async fn process_mission_outcome_and_notify(
             }
         }
         ThreadOutcome::Completed { response: None } => {}
+        ThreadOutcome::Stopped if mission.status != MissionStatus::Active => {
+            // Stopped because the mission itself was paused or retired (e.g.
+            // pausing conversation-insights stops its workers): an operator
+            // decision, not an interruption — no retry, no error notice
+            // (WI#276 made these stops land).
+            mission.record_approach(format!(
+                "STOPPED: mission {:?} while the thread ran",
+                mission.status
+            ));
+        }
         ThreadOutcome::Stopped => {
             // Tri-state (WI#188): a signal-stopped thread is an interruption,
             // not an empty arm — record it, notify as error, retry.
@@ -9172,6 +9209,155 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             .is_none(),
             "redelivery while approval is pending must not spawn another thread"
         );
+    }
+
+    /// WI#276 follow-on: now that stop requests reach watched threads,
+    /// pausing a mission (which stops its conversation-insights workers) ends
+    /// them `Stopped`. That is an operator decision, not an interruption: no
+    /// retry is planned, nothing is notified as an error, and no marker is
+    /// left for a later restart to re-arm.
+    #[tokio::test]
+    async fn stopped_outcome_of_a_paused_mission_is_not_retried() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(store.clone() as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "pausable",
+                "goal",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let thread_id = mgr
+            .fire_mission(id, "test-user", None)
+            .await
+            .unwrap()
+            .expect("fire spawns");
+        wait_for_done(&mgr.store_arc(), thread_id).await;
+        mgr.pause_mission(id, "test-user").await.unwrap();
+
+        let store: Arc<dyn Store> = mgr.store_arc();
+        let pending = process_mission_outcome(&store, id, thread_id, &ThreadOutcome::Stopped)
+            .await
+            .unwrap();
+        assert!(pending.is_none(), "a paused mission's stop must not retry");
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry == "STOPPED: mission Paused while the thread ran"),
+            "{:?}",
+            mission.approach_history
+        );
+        assert!(
+            !mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.starts_with("INTERRUPTED")),
+            "{:?}",
+            mission.approach_history
+        );
+        let thread = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&thread.metadata).is_none());
+    }
+
+    /// LLM whose completion never resolves, so a mission run stays mid-call
+    /// until something stops it.
+    struct HangingLlm {
+        opened: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for HangingLlm {
+        async fn complete(
+            &self,
+            _: &[crate::types::message::ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            self.opened.notify_one();
+            futures::future::pending().await
+        }
+
+        fn model_name(&self) -> &str {
+            "hanging"
+        }
+    }
+
+    /// WI#276: daemon shutdown while a mission thread is mid-run used to lose
+    /// the fire silently — the watcher's own join had taken the handle out of
+    /// the running set, so its shutdown stop missed, the run was dropped
+    /// mid-await, and nothing was recorded. Now the stop lands, the
+    /// interruption is recorded, and the retry marker is persisted on the
+    /// terminal thread, so the post-restart sweep re-fires the mission.
+    #[tokio::test]
+    async fn shutdown_mid_run_persists_retry_for_restart_recovery() {
+        let store = Arc::new(TestStore::new());
+        let opened = Arc::new(tokio::sync::Notify::new());
+        let thread_manager = Arc::new(ThreadManager::new(
+            Arc::new(HangingLlm {
+                opened: Arc::clone(&opened),
+            }),
+            Arc::new(MockEffects),
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let mgr = Arc::new(MissionManager::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::clone(&thread_manager),
+        ));
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "nightly-digest",
+                "send the digest",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let thread_id = mgr
+            .fire_mission(id, "test-user", None)
+            .await
+            .unwrap()
+            .expect("the fire spawns a thread");
+        opened.notified().await;
+        assert!(
+            thread_manager.is_running(thread_id).await,
+            "a watched mission thread must stay registered, and so stoppable"
+        );
+
+        mgr.shutdown().await;
+
+        let thread = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert!(thread.state.is_terminal(), "{:?}", thread.state);
+        let marker = RetryState::from_metadata(&thread.metadata).expect("retry marker persisted");
+        assert_eq!(marker.attempt, 1);
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry == "INTERRUPTED: signal-stopped mid-run"),
+            "{:?}",
+            mission.approach_history
+        );
+
+        // Restart: the sweep finds the marker and re-arms the retry.
+        let restarted = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        restarted.arm_retry_wake().await;
+        assert_eq!(
+            restarted.recover_pending_mission_retries().await.unwrap(),
+            vec![id]
+        );
+        restarted.shutdown().await;
     }
 
     #[tokio::test]

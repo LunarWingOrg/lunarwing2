@@ -84,9 +84,14 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
   that already went out). End-to-end receipts would be needed to close
   this; no channel returns a delivery receipt and remote confirmation
   (e.g. XEP-0198 acks) is not part of this contract.
-- **Mission-run ledger.** The engine-side half of WI#270's long-term fix
-  (restart-window checkpointing of mission fires) is tracked in WI#276 and
-  is separate from the channel spool.
+- **Mission-run ledger.** The engine-side half of WI#270's long-term fix is
+  separate from the channel spool. A graceful shutdown no longer loses a
+  mid-run mission fire: the run is stopped within a short grace, the
+  interruption is recorded, and a persisted retry marker re-fires it after
+  restart (WI#276; see ENGINE-V2.md, mission retries). A hard kill or a run
+  that cannot stop within the grace is restart recovery's case (WI#301), and
+  a re-fired run may repeat side effects the interrupted run already
+  performed (at-least-once).
 - **Other channels.** The spool is XMPP-local. Channels with similar
   in-memory outbound queues keep their existing semantics.
 
