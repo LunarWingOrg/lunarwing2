@@ -21,7 +21,10 @@ use crate::llm::provider::{
     ToolCompletionResponse,
 };
 use crate::llm::stream_telemetry::{StreamTelemetry, classify_stream_failure};
-use crate::llm::streaming::{FirstStreamItem, ProviderStreamRequest, replay_first, take_first};
+use crate::llm::streaming::{
+    FirstStreamItem, ProviderStreamRequest, empty_as_error, empty_stream_error, replay_first,
+    take_first,
+};
 
 /// Upper bound for provider-suggested `Retry-After` delays.
 ///
@@ -252,9 +255,15 @@ impl RetryProvider {
                 Ok(stream) => take_first(stream).await,
                 Err(error) => FirstStreamItem::Error(error),
             };
+            // WI#297: an empty-but-successful stream is a retryable failure,
+            // never a success.
+            let first = empty_as_error(first, self.inner.model_name());
 
             match first {
-                FirstStreamItem::Empty => return Ok(futures::stream::empty().boxed()),
+                FirstStreamItem::Empty => {
+                    // Defensive: empty_as_error maps Empty to a retryable error.
+                    return Err(empty_stream_error(self.inner.model_name(), None));
+                }
                 FirstStreamItem::Chunk { first, rest } if retries == 0 => {
                     return Ok(replay_first(first, rest));
                 }
@@ -742,6 +751,125 @@ mod tests {
             Some(Ok(LlmStreamChunk::ToolCallDelta { index: 0, .. }))
         ));
         assert_retry_observation(&chunks);
+    }
+
+    // WI#297: an empty-but-successful stream must be retried, not returned
+    // as Ok(empty).
+    #[tokio::test(start_paused = true)]
+    async fn stream_retries_empty_stream_then_succeeds() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![]), successful_text_stream()],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let chunks = retry
+            .complete_stream(make_request())
+            .await
+            .expect("retry should open a stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.plain_calls(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hello"
+        ));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            Ok(LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                provider,
+                attempts: 1,
+                reason: StreamFailureReason::Empty,
+            })) if provider == "scripted"
+        )));
+    }
+
+    // WI#297: a content-free `Done` with a non-tool finish is also an empty
+    // completion and must be retried.
+    #[tokio::test(start_paused = true)]
+    async fn stream_retries_empty_done_first_then_succeeds() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                })]),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let chunks = retry
+            .complete_stream(make_request())
+            .await
+            .expect("retry should open a stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.plain_calls(), 2);
+        assert!(matches!(
+            chunks.first(),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hello"
+        ));
+    }
+
+    // WI#297: when every attempt answers empty, the retry layer returns an
+    // error instead of a successful empty stream.
+    #[tokio::test(start_paused = true)]
+    async fn stream_empty_retries_exhausted_returns_error() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![]), StreamScript::Items(vec![])],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let result = retry.complete_stream(make_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::InvalidResponse { provider, reason })
+                if provider == "scripted" && reason.contains("empty provider stream")
+        ));
+        assert_eq!(inner.plain_calls(), 2);
+    }
+
+    // WI#297: a `Done` with a tool finish is not an empty completion and must
+    // not be retried.
+    #[tokio::test(start_paused = true)]
+    async fn stream_done_first_tool_finish_is_not_retried() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "tool_calls".to_string(),
+                })]),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let chunks = retry
+            .complete_stream(make_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.plain_calls(), 1);
+        assert_eq!(
+            chunks,
+            vec![Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "tool_calls".to_string(),
+            })]
+        );
     }
 
     #[tokio::test(start_paused = true)]
