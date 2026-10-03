@@ -2300,6 +2300,7 @@ impl MissionManager {
             user_id,
             attempt,
             payload,
+            source_thread_id,
             ..
         } = pending;
         let spawned = self
@@ -2313,6 +2314,14 @@ impl MissionManager {
                     attempt,
                     "mission retry fired"
                 );
+                // The retry was consumed: clear the source thread's
+                // persisted marker so the post-restart sweep cannot re-arm
+                // an already-fired retry (one-shot duplicate pre-WI#301).
+                if let Some(source_thread_id) = source_thread_id
+                    && let Ok(Some(source)) = self.store.load_thread(source_thread_id).await
+                {
+                    clear_retry_marker(&*self.store, &source).await;
+                }
                 // Record the attempt number on the retried thread's own
                 // metadata so a failure of THIS thread rents the NEXT attempt
                 // (lineage grows under the shared max_retries cap instead of
@@ -2509,6 +2518,12 @@ struct PendingMissionRetry {
     attempt: u32,
     payload: Option<serde_json::Value>,
     not_before: DateTime<Utc>,
+    /// The failed thread this retry continues. When the re-fire spawns, the
+    /// source thread's persisted `mission_retry` marker is cleared so a
+    /// later boot cannot re-arm an already-consumed retry (WI#301 review
+    /// fix; closes the pre-existing WI#188 one-shot duplicate where a
+    /// successful re-fire left the parent's marker in place forever).
+    source_thread_id: Option<ThreadId>,
 }
 
 impl PendingMissionRetry {
@@ -2528,7 +2543,14 @@ impl PendingMissionRetry {
             attempt,
             payload,
             not_before: base + chrono::Duration::from_std(delay).ok()?,
+            source_thread_id: None,
         })
+    }
+
+    /// Record the failed thread this retry continues (see the field docs).
+    fn with_source_thread(mut self, thread_id: ThreadId) -> Self {
+        self.source_thread_id = Some(thread_id);
+        self
     }
 
     /// Re-arm a persisted [`RetryState`] after a daemon restart. The stored
@@ -3115,7 +3137,8 @@ async fn plan_outcome_retry(
         mission.last_trigger_payload.clone(),
         &policy,
         Utc::now(),
-    )?;
+    )?
+    .with_source_thread(thread_id);
     debug!(mission_id = %mission.id, %attempt, %reason, "mission retry scheduled");
     Some(pending)
 }
@@ -9205,6 +9228,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             attempt: 2,
             payload: Some(original.clone()),
             not_before: Utc::now(),
+            source_thread_id: None,
         })
         .await;
         let mission = store.load_mission(id).await.unwrap().unwrap();
@@ -9311,6 +9335,64 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         );
         let recovered = store.load_thread(thread.id).await.unwrap().unwrap();
         assert!(RetryState::from_metadata(&recovered.metadata).is_none());
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn successful_refire_clears_source_thread_retry_marker() {
+        // WI#301 review fix (pre-existing WI#188 one-shot duplicate): a
+        // successful re-fire left the failed parent's `mission_retry`
+        // marker in place forever, so the next boot's recovery sweep
+        // re-armed — and re-fired — an already-consumed retry.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "retry-marker-clear",
+                "goal",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let mut mission = store.load_mission(id).await.unwrap().unwrap();
+        let mut source = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        source.state = ThreadState::Failed;
+        let pending = PendingMissionRetry::new(
+            id,
+            "test-user",
+            1,
+            None,
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        source.metadata = serde_json::json!({RetryState::METADATA_KEY: pending.to_retry_state()});
+        mission.thread_history.push(source.id);
+        store.save_thread(&source).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        mgr.refire_mission_thread(pending.with_source_thread(source.id))
+            .await;
+
+        let source_after = store.load_thread(source.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&source_after.metadata).is_none(),
+            "a consumed retry marker must be cleared when the re-fire spawns"
+        );
+        assert!(
+            mgr.recover_pending_mission_retries().await.unwrap().is_empty(),
+            "the next boot must not re-arm an already-consumed retry"
+        );
         mgr.shutdown().await;
     }
 
