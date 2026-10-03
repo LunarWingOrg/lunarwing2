@@ -411,7 +411,9 @@ def validate_cargo_deny_gate(merged: dict, errors: list[str]) -> None:
     required_fragments = (
         "--manifest-path",
         "--hide-inclusion-graph",
+        "--workspace --all-features",
         'grep -q "index-failure"',
+        "advisory-db commit",
     )
     for fragment in required_fragments:
         if fragment not in text:

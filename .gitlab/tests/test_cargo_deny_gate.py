@@ -62,6 +62,8 @@ class CargoDenyGateTests(unittest.TestCase):
         for fragment, replacement in (
             ("--manifest-path", ""),
             ("--hide-inclusion-graph", ""),
+            ("--workspace --all-features", ""),
+            ("advisory-db commit", ""),
             ('grep -q "index-failure"', "true"),
         ):
             with self.subTest(fragment=fragment):
