@@ -1225,33 +1225,7 @@ async fn await_expired_gate_resume_outcome(
         // The wrap-up asked for another gate despite the injected do-not-retry
         // result. Re-arming with no user in the loop risks an expire/resume
         // loop, so end the turn instead and say so.
-        let new_action = action_name.clone();
-        if let Err(error) = finalize_silently_stopped_thread(
-            state,
-            gate.conversation_id,
-            gate.thread_id,
-            &gate.user_id,
-        )
-        .await
-        {
-            debug!(
-                thread_id = %gate.thread_id,
-                %error,
-                "failed to finalize re-gated thread after expiry resume"
-            );
-        }
-        deliver_expired_gate_text(
-            state,
-            channels,
-            hooks,
-            gate,
-            format!(
-                "The {} request for tool '{}' expired, so that action was skipped. While wrapping up, the agent requested another approval ('{new_action}'), so the turn was ended. Send your request again to retry.",
-                gate.resume_kind.kind_name(),
-                gate.action_name
-            ),
-        )
-        .await;
+        finalize_regated_expired_turn(state, channels, hooks, gate, action_name).await;
         return;
     }
 
@@ -1284,6 +1258,62 @@ async fn await_expired_gate_resume_outcome(
         ),
     };
     deliver_expired_gate_text(state, channels, hooks, gate, text).await;
+}
+
+/// End a turn whose expiry-resume wrap-up re-paused on another gate.
+///
+/// The thread is finalized as stopped and the source channel is told. Any
+/// pending gate armed for the thread while the watcher was in flight is
+/// discarded first: the turn is over, so a leftover gate would sit as an
+/// orphan (pointing at a stopped thread) until boot reconcile or the expiry
+/// sweep cleaned it up (WI#300). `NotFound` is the common case — nothing was
+/// armed — and is not an error.
+async fn finalize_regated_expired_turn(
+    state: &EngineState,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: &Arc<crate::hooks::HookRegistry>,
+    gate: &PendingGate,
+    new_action: &str,
+) {
+    let key = PendingGateKey {
+        user_id: gate.user_id.clone(),
+        thread_id: gate.thread_id,
+    };
+    if let Err(error) = state.pending_gates.discard(&key).await
+        && !matches!(error, crate::gate::store::GateStoreError::NotFound)
+    {
+        debug!(
+            thread_id = %gate.thread_id,
+            %error,
+            "failed to discard re-armed gate after expiry resume"
+        );
+    }
+    if let Err(error) = finalize_silently_stopped_thread(
+        state,
+        gate.conversation_id,
+        gate.thread_id,
+        &gate.user_id,
+    )
+    .await
+    {
+        debug!(
+            thread_id = %gate.thread_id,
+            %error,
+            "failed to finalize re-gated thread after expiry resume"
+        );
+    }
+    deliver_expired_gate_text(
+        state,
+        channels,
+        hooks,
+        gate,
+        format!(
+            "The {} request for tool '{}' expired, so that action was skipped. While wrapping up, the agent requested another approval ('{new_action}'), so the turn was ended. Send your request again to retry.",
+            gate.resume_kind.kind_name(),
+            gate.action_name
+        ),
+    )
+    .await;
 }
 
 /// Recover the v1 conversation scope from the engine conversation key
