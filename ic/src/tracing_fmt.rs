@@ -13,9 +13,10 @@
 //!   tracing_subscriber::registry()
 //!        |
 //!        +-- fmt::layer().with_writer(TruncatingStderr)  <-- scrub, then cap at 500B
-//!        |       \-- stderr (journal / daemon.stderr.log)
+//!        |       \-- stderr (the journal on systemd; on OpenRC/launchd the
+//!        |            error log: daemon.stderr.log / lunarwing.err)
 //!        |
-//!        +-- fmt::layer().with_writer(SandboxLogWriter)  <-- scrub, cap at 4 KiB
+//!        +-- fmt::layer().with_writer(SandboxLogWriter)  <-- level cap, scrub, cap at 4 KiB
 //!        |       \-- <base>/logs/sandbox/daemon.log (read-only /tenant-logs in the sandbox)
 //!        |
 //!        \-- WebLogLayer
@@ -24,8 +25,9 @@
 //!
 //! Every daemon log sink is scrubbed at write time by the same
 //! [`daemon_log_scrubber`] (WI#287); before that only the SSE stream was, so
-//! raw secrets could land in the journal or `daemon.stderr.log`.
+//! raw secrets could land in the journal or the OpenRC/launchd error log.
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -33,31 +35,96 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use lunarwing_safety::LogScrubber;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::registry::LookupSpan;
+
+use crate::sandbox::TenantLogsMode;
 
 /// The daemon's log scrubber, shared by every log sink (WI#287): default leak
-/// shapes, log-specific shapes, and the exact values of secret-named
-/// environment variables present when first used (after config load). Secrets
-/// fetched later from the secrets store are only caught by shape.
+/// shapes (64-hex redacting), log-specific shapes, and known secret values.
+/// Known values are the secret-named environment variables and URL passwords
+/// present when first used (after the env files are loaded), plus whatever is
+/// registered later through [`register_log_secret`] (the gateway token, the
+/// secrets-store overlay, secret-named runtime overrides), covered from
+/// registration on. Credentials decrypted on demand from the secrets store are
+/// caught by shape only.
 pub fn daemon_log_scrubber() -> Arc<LogScrubber> {
     static SCRUBBER: LazyLock<Arc<LogScrubber>> =
         LazyLock::new(|| Arc::new(LogScrubber::new(&known_secret_env_values())));
     Arc::clone(&SCRUBBER)
 }
 
-/// Values of environment variables whose names mark them as secrets.
+/// Teach the daemon log scrubber a secret learned after startup (WI#287
+/// review S4): the gateway bearer token (generated, or loaded from DB
+/// settings, and so never in the environment on single-node installs) and
+/// values put into the config overlays. A URL value also registers the
+/// password it embeds. Values shorter than
+/// [`lunarwing_safety::MIN_KNOWN_SECRET_LEN`] are ignored. Never emits
+/// tracing events.
+pub fn register_log_secret(secret: &str) {
+    let mut forms = vec![secret.to_string()];
+    forms.extend(url_passwords(secret));
+    daemon_log_scrubber().add_secrets(forms.iter().map(String::as_str));
+}
+
+/// Values of environment variables whose names mark them as secrets, plus
+/// passwords embedded in URL-valued variables (`DATABASE_URL`).
 fn known_secret_env_values() -> Vec<String> {
-    std::env::vars_os()
-        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(name, _)| is_secret_env_name(name))
-        .map(|(_, value)| value)
-        .collect()
+    known_secret_values(
+        std::env::vars_os().filter_map(|(name, value)| {
+            Some((name.into_string().ok()?, value.into_string().ok()?))
+        }),
+    )
+}
+
+/// Pure core of [`known_secret_env_values`], split out for tests.
+fn known_secret_values(vars: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+    let mut values = Vec::new();
+    for (name, value) in vars {
+        values.extend(url_passwords(&value));
+        if is_secret_env_name(&name) {
+            values.push(value);
+        }
+    }
+    values
+}
+
+/// The password of a `scheme://user:password@host` value, as written and
+/// percent-decoded (log text can carry either). Empty for anything else.
+fn url_passwords(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if !value.contains("://") {
+        return Vec::new();
+    }
+    let Ok(url) = url::Url::parse(value) else {
+        return Vec::new();
+    };
+    let Some(raw) = url.password() else {
+        return Vec::new();
+    };
+    let mut passwords = vec![raw.to_string()];
+    if let Ok(decoded) = urlencoding::decode(raw)
+        && decoded != raw
+    {
+        passwords.push(decoded.into_owned());
+    }
+    passwords
 }
 
 /// Env var names that carry secrets (`GATEWAY_AUTH_TOKEN`, `XMPP_PASSWORD`,
-/// `TENSORZERO_API_KEY`, `SECRETS_MASTER_KEY`, ...).
-fn is_secret_env_name(name: &str) -> bool {
+/// `TENSORZERO_API_KEY`, `SECRETS_MASTER_KEY`, ...). Names ending in `_FILE`,
+/// `_PATH` or `_DIR` point at a secret and hold a path, not the secret
+/// (WI#287 review S12).
+pub(crate) fn is_secret_env_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
+    if ["_FILE", "_PATH", "_DIR"]
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
+    {
+        return false;
+    }
     [
         "TOKEN",
         "SECRET",
@@ -71,15 +138,77 @@ fn is_secret_env_name(name: &str) -> bool {
     .any(|marker| upper.contains(marker))
 }
 
-/// Scrub one formatted event, lossily decoding non-UTF-8 bytes. A record
-/// replaced whole keeps the event's trailing newline.
+/// Remove the SGR color sequences (`ESC [ <digits and ;> m`) the stderr fmt
+/// layer writes around field names (WI#287 review NEW-1): a field value
+/// follows `ESC[0m`, so `\b`-anchored shapes (64-hex, URL credentials) never
+/// matched it. Only SGR is removed: stripping any escape sequence would let a
+/// stray `ESC[` in a field value swallow the first characters of a token.
+fn strip_sgr(text: &str) -> Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((before, after)) = rest.split_once('\u{1b}') {
+        out.push_str(before);
+        let sgr_tail = after.strip_prefix('[').and_then(|params| {
+            params
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == ';')
+                .strip_prefix('m')
+        });
+        match sgr_tail {
+            Some(tail) => rest = tail,
+            None => {
+                out.push('\u{1b}');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// Scrub one formatted event, lossily decoding non-UTF-8 bytes. Scrubbing
+/// runs on the text with its color codes removed; an event with nothing to
+/// redact keeps its original bytes (colors included), a redacted one is
+/// written plain. A record replaced whole keeps the event's trailing newline.
 fn scrub_event(scrubber: &LogScrubber, event: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(event);
-    let mut scrubbed = scrubber.scrub(&text).into_owned();
-    if text.ends_with('\n') && !scrubbed.ends_with('\n') {
-        scrubbed.push('\n');
+    let plain = strip_sgr(&text);
+    let scrubbed = scrubber.scrub(&plain);
+    // Compare content: a blocked record comes back as a borrowed constant.
+    if scrubbed.as_ref() == plain.as_ref() {
+        return event.to_vec();
     }
-    scrubbed.into_bytes()
+    let mut out = scrubbed.into_owned();
+    if text.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+/// Level cap for the sandbox-visible copy (WI#287 review S7): `None` writes
+/// no copy (`SANDBOX_TENANT_LOGS=off`); `info` caps it at INFO whatever the
+/// runtime level; `debug` follows the runtime level up to DEBUG (the
+/// per-tool-call lines), never TRACE.
+pub fn sandbox_log_cap(mode: TenantLogsMode) -> Option<LevelFilter> {
+    match mode {
+        TenantLogsMode::Off => None,
+        TenantLogsMode::Info => Some(LevelFilter::INFO),
+        TenantLogsMode::Debug => Some(LevelFilter::DEBUG),
+    }
+}
+
+/// The fmt layer writing the sandbox-visible copy: plain text, with its own
+/// level cap on top of the daemon's (reloadable) global filter.
+pub fn sandbox_log_layer<S>(writer: SandboxLogWriter, cap: LevelFilter) -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(writer)
+        .with_filter(cap)
 }
 
 /// Initialize tracing for simple CLI commands (warn level, no fancy layers).
@@ -257,11 +386,13 @@ const SANDBOX_LOG_MAX_EVENT_BYTES: usize = 4096;
 /// sandbox-visible log (WI#287).
 ///
 /// The shell sandbox mounts this file's directory read-only at
-/// `/tenant-logs`, so the agent can see what the daemon did without host
-/// access. It is the daemon's own copy, written by the process on every init
-/// system — the journal on systemd and the raw OpenRC/launchd files stay
-/// operator-only — and it holds only scrubbed records, never earlier raw log
-/// history or other services' logs.
+/// `/tenant-logs` (unless `SANDBOX_TENANT_LOGS=off`, and only where the
+/// runtime maps the sandbox user onto the daemon's uid), so the agent can see
+/// what the daemon did without host access. It is the daemon's own copy,
+/// written by the process on every init system — the journal on systemd and
+/// the raw OpenRC/launchd files (`daemon.stderr.log` / `lunarwing.err`) stay
+/// operator-only — and it holds only scrubbed records at the level cap of
+/// [`sandbox_log_cap`], never earlier raw log history or other services' logs.
 #[derive(Clone)]
 pub struct SandboxLogWriter {
     file: Arc<SandboxLogFile>,
@@ -399,12 +530,17 @@ fn open_private_append(path: &Path) -> io::Result<File> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use crate::sandbox::TenantLogsMode;
     use crate::tracing_fmt::{
-        EventBuffer, SANDBOX_LOG_FILE, SandboxLogWriter, TruncatingStderr, is_secret_env_name,
-        utf8_floor,
+        EventBuffer, SANDBOX_LOG_FILE, SandboxLogWriter, TruncatingStderr, daemon_log_scrubber,
+        is_secret_env_name, known_secret_values, register_log_secret, sandbox_log_cap,
+        sandbox_log_layer, scrub_event, utf8_floor,
     };
     use lunarwing_safety::{LogScrubber, REDACTED_LOG_RECORD};
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use std::io::Write;
 
@@ -434,8 +570,9 @@ mod tests {
         Arc::new(LogScrubber::new(&[TEST_SECRET]))
     }
 
-    /// WI#287: stderr (journal / daemon.stderr.log) is scrubbed, and before
-    /// truncation, so a cut can never leave a secret prefix behind.
+    /// WI#287: stderr (journal / daemon.stderr.log / lunarwing.err) is
+    /// scrubbed, and before truncation, so a cut can never leave a secret
+    /// prefix behind.
     #[test]
     fn test_stderr_event_is_scrubbed_before_truncation() {
         let (mut buf, sink) = test_buffer_with_scrubber(48, Some(test_scrubber()));
@@ -469,9 +606,161 @@ mod tests {
         ] {
             assert!(is_secret_env_name(name), "{name}");
         }
-        for name in ["RUST_LOG", "LUNARWING_BASE_DIR", "SANDBOX_PROTECTED_PATHS"] {
+        // Pointers to a secret hold paths, not secrets (WI#287 review S12).
+        for name in [
+            "RUST_LOG",
+            "LUNARWING_BASE_DIR",
+            "SANDBOX_PROTECTED_PATHS",
+            "GATEWAY_AUTH_TOKEN_FILE",
+            "APPLE_PRIVATE_KEY_PATH",
+            "SECRET_STORE_DIR",
+        ] {
             assert!(!is_secret_env_name(name), "{name}");
         }
+    }
+
+    /// WI#287 review NEW-1: the stderr layer colors field names, so a field
+    /// value follows `ESC[0m` and `\b`-anchored shapes never matched it. Only
+    /// shapes can match here (no known values), so this proves the strip.
+    #[test]
+    fn test_ansi_colored_field_values_are_scrubbed() {
+        let scrubber = LogScrubber::new::<&str>(&[]);
+        let pw = "Q7".repeat(8);
+        let event =
+            format!("\u{1b}[3murl\u{1b}[0m\u{1b}[2m=\u{1b}[0mpostgres://lw:{pw}@db:5432/lw\n");
+        let out = String::from_utf8(scrub_event(&scrubber, event.as_bytes())).unwrap();
+        assert!(!out.contains(&pw), "{out:?}");
+        assert!(out.contains("db:5432/lw"), "{out:?}");
+        assert!(out.ends_with('\n'), "{out:?}");
+
+        let hex = "4f0c".repeat(16);
+        let event = format!("\u{1b}[3mtoken\u{1b}[0m\u{1b}[2m=\u{1b}[0m{hex}\n");
+        let out = String::from_utf8(scrub_event(&scrubber, event.as_bytes())).unwrap();
+        assert!(!out.contains(&hex), "{out:?}");
+    }
+
+    /// Guard: an event with nothing to redact keeps its bytes, colors included.
+    #[test]
+    fn test_clean_colored_event_keeps_its_colors() {
+        let scrubber = LogScrubber::new::<&str>(&[]);
+        let event = b"\x1b[32m INFO\x1b[0m hello \x1b[3mstatus\x1b[0m\x1b[2m=\x1b[0m200\n";
+        assert_eq!(scrub_event(&scrubber, event), event.to_vec());
+    }
+
+    /// Guard: only color (SGR) sequences are stripped before scrubbing. A
+    /// stray escape right before a token (raw `%display` field content) must
+    /// not swallow the token's first characters and hide it from the shapes.
+    #[test]
+    fn test_stray_escape_cannot_hide_a_token() {
+        let scrubber = LogScrubber::new::<&str>(&[]);
+        let hex = "4f0c".repeat(16);
+        let event = format!("upstream said \u{1b}[{hex} goodbye\n");
+        let out = String::from_utf8_lossy(&scrub_event(&scrubber, event.as_bytes())).into_owned();
+        assert!(!out.contains(&hex[2..]), "{out:?}");
+        assert!(out.contains("goodbye"), "{out:?}");
+    }
+
+    /// WI#287 review S4: URL passwords from any variable (DATABASE_URL is
+    /// not secret-named) are known values, raw and percent-decoded; values of
+    /// secret-named variables are too, but not paths that point at a secret.
+    #[test]
+    fn test_known_secret_values_include_url_passwords_and_skip_pointers() {
+        let pw = "Q7".repeat(8);
+        let (left, right) = ("Ab".repeat(4), "Cd".repeat(4));
+        let xmpp = format!("xmpp-{}", "Pw9".repeat(5));
+        let vars = [
+            (
+                "DATABASE_URL".to_string(),
+                format!("postgres://lw:{pw}@127.0.0.1:5432/lw"),
+            ),
+            (
+                "OTHER_URL".to_string(),
+                format!("postgres://u:{left}%2F{right}@h/db"),
+            ),
+            (
+                "GATEWAY_AUTH_TOKEN_FILE".to_string(),
+                "/etc/lunarwing/gateway.token".to_string(),
+            ),
+            ("XMPP_PASSWORD".to_string(), xmpp.clone()),
+            ("RUST_LOG".to_string(), "lunarwing=info".to_string()),
+        ];
+        let values = known_secret_values(vars);
+        assert!(values.contains(&pw), "{values:?}");
+        assert!(values.contains(&format!("{left}%2F{right}")), "{values:?}");
+        assert!(values.contains(&format!("{left}/{right}")), "{values:?}");
+        assert!(values.contains(&xmpp), "{values:?}");
+        assert!(
+            !values.iter().any(|v| v.contains("gateway.token")),
+            "{values:?}"
+        );
+        assert!(
+            !values.iter().any(|v| v.contains("lunarwing=")),
+            "{values:?}"
+        );
+        assert!(
+            !values.iter().any(|v| v.starts_with("postgres://")),
+            "{values:?}"
+        );
+    }
+
+    /// WI#287 review S4: a secret registered at runtime reaches the shared
+    /// daemon scrubber, and a URL value registers its password too.
+    #[test]
+    fn test_register_log_secret_reaches_the_daemon_scrubber() {
+        let tok = format!("reg-{}", "Rg5".repeat(5));
+        let pw = "Yt".repeat(8);
+        register_log_secret(&tok);
+        register_log_secret(&format!("postgres://lw:{pw}@db:5432/lw"));
+        let record = format!("x {tok} y password was {pw} z");
+        let scrubbed = daemon_log_scrubber().scrub(&record).into_owned();
+        assert!(!scrubbed.contains(&tok), "{scrubbed}");
+        assert!(!scrubbed.contains(&pw), "{scrubbed}");
+        assert!(scrubbed.ends_with(" z"), "{scrubbed}");
+    }
+
+    /// Read the sandbox copy after emitting one event per level under a
+    /// global `filter` and a sandbox layer capped at `cap`.
+    fn sandbox_copy_under(filter: &str, cap: LevelFilter) -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let scrubber = Arc::new(LogScrubber::new::<&str>(&[]));
+        let writer = SandboxLogWriter::open(temp.path(), scrubber).unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(filter))
+            .with(sandbox_log_layer(writer, cap));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("wi287-info-line");
+            tracing::debug!("wi287-debug-line");
+            tracing::trace!("wi287-trace-line");
+        });
+        std::fs::read_to_string(temp.path().join(SANDBOX_LOG_FILE)).unwrap()
+    }
+
+    /// WI#287 review S7: the sandbox copy is capped at INFO by default and
+    /// at DEBUG (never TRACE) in debug mode, and never exceeds the daemon's
+    /// own runtime level.
+    #[test]
+    fn test_sandbox_log_layer_caps_at_info_or_debug() {
+        assert_eq!(sandbox_log_cap(TenantLogsMode::Off), None);
+        assert_eq!(
+            sandbox_log_cap(TenantLogsMode::Info),
+            Some(LevelFilter::INFO)
+        );
+        assert_eq!(
+            sandbox_log_cap(TenantLogsMode::Debug),
+            Some(LevelFilter::DEBUG)
+        );
+
+        let info = sandbox_copy_under("trace", LevelFilter::INFO);
+        assert!(info.contains("wi287-info-line"), "{info}");
+        assert!(!info.contains("wi287-debug-line"), "{info}");
+
+        let debug = sandbox_copy_under("trace", LevelFilter::DEBUG);
+        assert!(debug.contains("wi287-debug-line"), "{debug}");
+        assert!(!debug.contains("wi287-trace-line"), "{debug}");
+
+        let runtime_info = sandbox_copy_under("info", LevelFilter::DEBUG);
+        assert!(runtime_info.contains("wi287-info-line"), "{runtime_info}");
+        assert!(!runtime_info.contains("wi287-debug-line"), "{runtime_info}");
     }
 
     fn write_event(writer: &SandboxLogWriter, event: &str) {

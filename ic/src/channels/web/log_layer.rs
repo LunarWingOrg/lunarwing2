@@ -173,7 +173,12 @@ impl LogLevelHandle {
 ///
 /// Returns the `LogLevelHandle` so callers can swap the filter at runtime.
 /// The fmt layer and `WebLogLayer` are attached alongside the reloadable filter.
-pub fn init_tracing(log_broadcaster: Arc<LogBroadcaster>) -> Arc<LogLevelHandle> {
+/// `tenant_logs` (`SANDBOX_TENANT_LOGS`) selects the level cap of the
+/// sandbox-visible copy, or no copy at all (WI#287).
+pub fn init_tracing(
+    log_broadcaster: Arc<LogBroadcaster>,
+    tenant_logs: crate::sandbox::TenantLogsMode,
+) -> Arc<LogLevelHandle> {
     let raw_filter =
         std::env::var("RUST_LOG").unwrap_or_else(|_| "lunarwing=info,tower_http=warn".to_string());
 
@@ -203,19 +208,22 @@ pub fn init_tracing(log_broadcaster: Arc<LogBroadcaster>) -> Arc<LogLevelHandle>
     ));
 
     // Every sink is scrubbed at write time by the same scrubber (WI#287):
-    // stderr (the journal / daemon.stderr.log), the sandbox-visible copy the
-    // shell sandbox mounts read-only at /tenant-logs, and the SSE stream.
+    // stderr (the journal on systemd, the OpenRC/launchd error log
+    // daemon.stderr.log / lunarwing.err), the sandbox-visible copy the shell
+    // sandbox mounts read-only at /tenant-logs, and the SSE stream. The copy
+    // has its own level cap (SANDBOX_TENANT_LOGS); `off` writes none at all.
     let scrubber = crate::tracing_fmt::daemon_log_scrubber();
     let sandbox_log_dir = crate::bootstrap::sandbox_log_dir();
-    let sandbox_log = crate::tracing_fmt::SandboxLogWriter::open(
-        &sandbox_log_dir,
-        std::sync::Arc::clone(&scrubber),
-    );
-    let sandbox_layer = sandbox_log.as_ref().ok().map(|writer| {
-        tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_writer(writer.clone())
+    let sandbox_log = crate::tracing_fmt::sandbox_log_cap(tenant_logs).map(|cap| {
+        crate::tracing_fmt::SandboxLogWriter::open(&sandbox_log_dir, Arc::clone(&scrubber))
+            .map(|writer| (writer, cap))
     });
+    let sandbox_layer = match &sandbox_log {
+        Some(Ok((writer, cap))) => {
+            Some(crate::tracing_fmt::sandbox_log_layer(writer.clone(), *cap))
+        }
+        _ => None,
+    };
 
     tracing_subscriber::registry()
         .with(reload_layer)
@@ -228,7 +236,7 @@ pub fn init_tracing(log_broadcaster: Arc<LogBroadcaster>) -> Arc<LogLevelHandle>
         .with(WebLogLayer::new(log_broadcaster))
         .init();
 
-    if let Err(error) = sandbox_log {
+    if let Some(Err(error)) = sandbox_log {
         tracing::warn!(
             dir = %sandbox_log_dir.display(),
             %error,

@@ -69,6 +69,44 @@ impl std::str::FromStr for SandboxNetworkMode {
     }
 }
 
+/// What the daemon's sandbox-visible log copy holds, and whether the shell
+/// sandbox mounts it read-only at `/tenant-logs` (WI#287; set with
+/// `SANDBOX_TENANT_LOGS`). Parsing is strict: a typo is a config error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TenantLogsMode {
+    /// No copy and no mount — for a single-node daemon shared by several
+    /// users, whose agents would all read the same copy.
+    Off,
+    /// INFO and above, whatever the daemon's runtime level (default).
+    #[default]
+    Info,
+    /// Follows the daemon's runtime level up to DEBUG, where the per-tool-call
+    /// lines are; never TRACE.
+    Debug,
+}
+
+impl TenantLogsMode {
+    /// Whether the copy is written and mounted.
+    pub fn enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
+impl std::str::FromStr for TenantLogsMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" | "no" | "disabled" => Ok(Self::Off),
+            "info" | "on" | "true" | "1" | "yes" | "enabled" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            _ => Err(format!(
+                "invalid SANDBOX_TENANT_LOGS '{s}', expected 'off', 'info', or 'debug'"
+            )),
+        }
+    }
+}
+
 /// Configuration for the sandbox system.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
@@ -106,9 +144,13 @@ pub struct SandboxConfig {
     /// A mount at or inside one of these is refused; one *containing* one of
     /// these gets it shadowed by an empty directory bind. Populated from
     /// `SANDBOX_PROTECTED_PATHS` (mt-admin writes the tenant env directory
-    /// there) plus the base-dir defaults — see
-    /// [`crate::sandbox::mount_guard::resolve_protected_paths`].
+    /// there), plus `LUNARWING_SERVICE_LOG_DIRS` (the raw service-log
+    /// directories an init script hands over, WI#287), plus the base-dir
+    /// defaults — see [`crate::sandbox::mount_guard::resolve_protected_paths`].
     pub protected_paths: Vec<std::path::PathBuf>,
+    /// The sandbox-visible daemon log copy and its `/tenant-logs` mount
+    /// (WI#287; `SANDBOX_TENANT_LOGS`, default `info`).
+    pub tenant_logs: TenantLogsMode,
 }
 
 impl Default for SandboxConfig {
@@ -127,6 +169,7 @@ impl Default for SandboxConfig {
             runtime: SandboxRuntime::Auto,
             network: SandboxNetworkMode::None,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
+            tenant_logs: TenantLogsMode::Info,
         }
     }
 }
@@ -379,5 +422,27 @@ mod tests {
         let config = SandboxConfig::default();
         assert_eq!(config.runtime, SandboxRuntime::Auto);
         assert_eq!(config.network, SandboxNetworkMode::None);
+        assert_eq!(config.tenant_logs, TenantLogsMode::Info);
+    }
+
+    /// WI#287 review S7: off/info/debug plus boolean spellings; anything else
+    /// (including the old idea of a `full` mode) is an error, not a fallback.
+    #[test]
+    fn tenant_logs_mode_parses_and_rejects_typos() {
+        for value in ["off", "false", "0", "no", "disabled", " OFF "] {
+            assert_eq!(value.parse::<TenantLogsMode>(), Ok(TenantLogsMode::Off));
+        }
+        for value in ["info", "true", "on", "1", "yes", "enabled"] {
+            assert_eq!(value.parse::<TenantLogsMode>(), Ok(TenantLogsMode::Info));
+        }
+        assert_eq!("DEBUG".parse::<TenantLogsMode>(), Ok(TenantLogsMode::Debug));
+        for value in ["full", "offf", "trace", ""] {
+            let err = value.parse::<TenantLogsMode>().expect_err(value);
+            assert!(err.contains("SANDBOX_TENANT_LOGS"), "{err}");
+        }
+        assert_eq!(TenantLogsMode::default(), TenantLogsMode::Info);
+        assert!(!TenantLogsMode::Off.enabled());
+        assert!(TenantLogsMode::Info.enabled());
+        assert!(TenantLogsMode::Debug.enabled());
     }
 }

@@ -1054,6 +1054,11 @@ write_tenant_lunarwing_env() {
   sandbox_image="${sandbox_image:-lunarwing-sandbox:latest}"
   sandbox_auto_pull="$(_env_existing "$path" SANDBOX_AUTO_PULL)"
   sandbox_auto_pull="${sandbox_auto_pull:-false}"
+  # Sandbox-visible daemon log (WI#287): info caps the copy at INFO; an
+  # operator-set off or debug is preserved on re-render.
+  local sandbox_tenant_logs
+  sandbox_tenant_logs="$(_env_existing "$path" SANDBOX_TENANT_LOGS)"
+  sandbox_tenant_logs="${sandbox_tenant_logs:-info}"
 
   # Sensible new-tenant defaults (WI#239): each of these is written into the
   # rendered lunarwing.env with the value below UNLESS the operator has
@@ -1250,6 +1255,14 @@ SANDBOX_AUTO_PULL=$sandbox_auto_pull
 # off for new tenants.
 SANDBOX_POLICY=$sandbox_policy
 SANDBOX_ALLOW_FULL_ACCESS=$sandbox_allow_full_access
+# Sandbox-visible daemon log (WI#287): the daemon writes a secret-scrubbed copy
+# of its own log under state/logs/sandbox, and the shell sandbox mounts it
+# read-only at /tenant-logs (podman 5+, or podman 4.3+ when the tenant uid is
+# 1000, or docker). info = INFO and above whatever the runtime level; debug =
+# follows the runtime level up to DEBUG, where the tool-call lines are; off =
+# no copy and no mount. An invalid value fails every lunarwing command that
+# loads the config. Preserved on re-render.
+SANDBOX_TENANT_LOGS=$sandbox_tenant_logs
 
 # Directories the generic sandbox must never expose (WI#205). The sandbox
 # mounts an agent-chosen working directory, so anything reachable from a mount
