@@ -52,6 +52,7 @@ pub use ssh::SshTool;
 pub use ssh_git::SshGitTool;
 pub use time::TimeTool;
 pub use tool_info::ToolInfoTool;
+pub(crate) use tool_info::{engine_action_info, requested_tool_name};
 mod html_converter;
 pub mod image_analyze;
 pub mod image_edit;

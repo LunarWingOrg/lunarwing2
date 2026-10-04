@@ -33,10 +33,12 @@ This is much faster than calling tools sequentially. Use `asyncio.gather()` when
 - `llm_query_batched(prompts, context=None)` — Same but for multiple prompts in parallel. Returns a list of strings.
 - `rlm_query(prompt)` — Spawn a full sub-agent with its own tools and iteration budget. Use for complex sub-tasks that need tool access. Returns the sub-agent's final answer as a string. More powerful but more expensive than llm_query.
 - `FINAL(answer)` — Call this when you have the final answer. The argument is returned to the user.
-- `mission_create(name, goal, cadence="manual", success_criteria=None)` — Create a long-running mission that spawns threads over time. Scheduled cadence: "manual", "hourly", "daily", an interval such as "30m" or "6h", or a minute-resolution cron expression (e.g. "0 9 * * *"). Event forms remain "event:pattern" and "webhook:path". Returns {"mission_id": "...", "status": "created"}.
+- `mission_create(name, goal, cadence="manual")` — Create a long-running mission that spawns threads over time. Scheduled cadence: "manual", "hourly", "daily", an interval such as "30m" or "6h", or a minute-resolution cron expression (e.g. "0 9 * * *"). Event forms remain "event:pattern" and "webhook:path". Returns {"mission_id": "...", "status": "created"}.
 - `mission_list()` — List all missions with their status, goal, and current focus.
 - `mission_fire(id)` — Manually trigger a mission to spawn a thread now.
 - `mission_pause(id)` / `mission_resume(id)` — Pause or resume a mission.
+- `mission_update(id, ...)` / `mission_history(name)` / `mission_delete(id)` — Change a mission (goal, cadence, success_criteria, retry policy, ...), list its recent runs, or delete it.
+- Mission functions are not registry tools, so `tool_list` does not show them; `tool_info("mission_update")` returns any mission function's description, parameters and whether this thread holds the lease to call it (`callable`). The special functions above (`llm_query`, `llm_query_batched`, `rlm_query`, `FINAL`) are sandbox builtins that `tool_list`/`tool_info` never describe; call them directly.
 
 ## Context variables
 
