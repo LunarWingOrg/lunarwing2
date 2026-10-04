@@ -344,6 +344,24 @@ pub enum WorkspaceError {
         reason: String,
     },
 
+    /// An append to a prompt-visible file was refused only because the
+    /// content already stored in the file trips the injection gate on its
+    /// own; the new entry passed the entry scan (WI#290). Rephrasing or
+    /// resending the entry cannot help — every append to the file fails
+    /// until the stored content is repaired — so the caller is told to
+    /// escalate or repair rather than retry. Classification only: the gate
+    /// and the refusal are unchanged, and `reason` is the combined-scan match
+    /// list (its line numbers all fall inside the stored file). Default-scope
+    /// daily logs in this state are quarantined instead
+    /// ([`WorkspaceError::DailyLogQuarantined`]); layer daily logs are not
+    /// quarantined and get this classification like any other prompt-visible
+    /// file. Boundary splits (stored content clean on its own) and poisoned
+    /// entries stay [`WorkspaceError::InjectionRejected`].
+    #[error(
+        "Append to '{path}' not applied: content already in the file matched prompt-injection          patterns ({reason}); the new entry itself passed the scan"
+    )]
+    ExistingContentRejected { path: String, reason: String },
+
     #[error("Invalid lorebook document '{path}': {reason}")]
     InvalidLorebook { path: String, reason: String },
 

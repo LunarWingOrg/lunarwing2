@@ -192,8 +192,10 @@ pub async fn memory_write_handler(
 
 /// HTTP status for a failed workspace write. Content refused by the
 /// prompt-injection gate is a client input problem (422, matching the prompt
-/// editor), and a daily-log quarantine is a retryable state conflict (409);
-/// neither is a server fault, so neither maps to 500 (WI#290).
+/// editor); a daily-log quarantine and an append refused only because of
+/// content already stored in the file are state conflicts (409: the request
+/// body was fine, the stored file is not). None is a server fault, so none
+/// maps to 500 (WI#290).
 fn write_error_status(error: &crate::error::WorkspaceError) -> StatusCode {
     use crate::error::WorkspaceError;
     match error {
@@ -202,7 +204,8 @@ fn write_error_status(error: &crate::error::WorkspaceError) -> StatusCode {
         WorkspaceError::PrivacyRedirectFailed | WorkspaceError::InjectionRejected { .. } => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        WorkspaceError::DailyLogQuarantined { .. } => StatusCode::CONFLICT,
+        WorkspaceError::DailyLogQuarantined { .. }
+        | WorkspaceError::ExistingContentRejected { .. } => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -262,8 +265,9 @@ mod tests {
         assert_eq!(hit.score, 0.75);
     }
 
-    /// WI#290: content refused by the injection gate (and a daily-log
-    /// quarantine) is reported as a client-side status, not a 500.
+    /// WI#290: content refused by the injection gate (422), a daily-log
+    /// quarantine and an append refused because of stored content (409) are
+    /// reported as client-side statuses, not a 500.
     #[test]
     fn write_error_status_classifies_content_rejections() {
         use crate::error::WorkspaceError;
@@ -281,6 +285,11 @@ mod tests {
             reason: "Attempt to override previous instructions (line 2)".to_string(),
         };
         assert_eq!(write_error_status(&quarantined), StatusCode::CONFLICT);
+        let stored_poison = WorkspaceError::ExistingContentRejected {
+            path: "MEMORY.md".to_string(),
+            reason: "Attempt to inject user message (line 1)".to_string(),
+        };
+        assert_eq!(write_error_status(&stored_poison), StatusCode::CONFLICT);
         assert_eq!(
             write_error_status(&WorkspaceError::LayerNotFound {
                 name: "missing".to_string()
