@@ -9932,8 +9932,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
         let thread = store.load_thread(thread_id).await.unwrap().unwrap();
         assert!(thread.state.is_terminal(), "{:?}", thread.state);
-        let marker =
-            RetryState::from_metadata(&thread.metadata).expect("retry marker persisted");
+        let marker = RetryState::from_metadata(&thread.metadata).expect("retry marker persisted");
         assert_eq!(marker.attempt, 1);
         let mission = store.load_mission(id).await.unwrap().unwrap();
         assert!(

@@ -2500,7 +2500,10 @@ mod tests {
             .expect("the shutdown stop must land promptly")
             .expect("waiter task")
             .expect("wait result");
-        assert!(matches!(outcome, Some(ThreadOutcome::Stopped)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Some(ThreadOutcome::Stopped)),
+            "{outcome:?}"
+        );
         assert!(!mgr.is_running(tid).await);
     }
 
