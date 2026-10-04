@@ -127,7 +127,7 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Verify sandbox and full-access double opt-in behavior.
 - [ ] Restore the database backup or execute the documented rollback in staging.
 - [ ] Confirm watchdog/self-heal alerts and restart limits behave as documented.
-- [ ] **Pending-gates corrupt-file quarantine** (v2.1.5.0, WI#299) — with a gate paused in `pending-gates.json`, corrupt the file and restart the engine: the unreadable file is renamed to `pending-gates.json.corrupt-<ts>` (warn-level log naming both paths), saves proceed against fresh empty state, and the orphaned Waiting threads fail at boot reconciliation. Also confirm temp/lock files are created `0600` and a save replaces the live inode atomically (see `docs/architecture/ENGINE-V2.md`).
+- [ ] **Pending-gates corrupt-file quarantine** (v2.1.5.0, WI#299) — with a gate paused in `pending-gates.json`, corrupt the file and restart the engine: the unreadable file is renamed to `pending-gates.json.corrupt-<ts>` (warn-level log naming both paths), saves proceed against fresh empty state, and the orphaned Waiting threads fail at boot reconciliation. Also confirm temp/lock files are created `0600` and a save replaces the live inode atomically (see `../architecture/ENGINE-V2.md`).
 
 ## Cleanup and Sign-Off
 
