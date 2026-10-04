@@ -38,7 +38,7 @@ This is much faster than calling tools sequentially. Use `asyncio.gather()` when
 - `mission_fire(id)` — Manually trigger a mission to spawn a thread now.
 - `mission_pause(id)` / `mission_resume(id)` — Pause or resume a mission.
 - `mission_update(id, ...)` / `mission_history(name)` / `mission_delete(id)` — Change a mission (goal, cadence, success_criteria, retry policy, ...), list its recent runs, or delete it.
-- Mission functions are not registry tools, so `tool_list` does not show them; `tool_info("mission_update")` returns any mission function's description and parameters.
+- Mission functions are not registry tools, so `tool_list` does not show them; `tool_info("mission_update")` returns any mission function's description, parameters and whether this thread holds the lease to call it (`callable`). The special functions above (`llm_query`, `llm_query_batched`, `rlm_query`, `FINAL`) are sandbox builtins that `tool_list`/`tool_info` never describe; call them directly.
 
 ## Context variables
 

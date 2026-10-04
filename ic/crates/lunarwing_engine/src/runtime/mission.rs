@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::capability::lease::LeaseManager;
 use crate::memory::RetrievalEngine;
 use crate::runtime::manager::ThreadManager;
 use crate::runtime::messaging::ThreadOutcome;
@@ -360,6 +361,16 @@ impl MissionManager {
     /// Token host-owned notification tasks can use for coordinated shutdown.
     pub fn cancellation_token(&self) -> CancellationToken {
         self.task_cancel.clone()
+    }
+
+    /// The lease manager of the [`ThreadManager`] this mission manager runs
+    /// threads on: the lease set the executor's preflight consults before any
+    /// action — `mission_*` included — reaches the host. The bridge reads it
+    /// so `tool_info` reports a mission function callable only on threads
+    /// holding the lease to call it (WI#295). Intended for read-only lookups:
+    /// a borrow, not the grant/revoke authority.
+    pub fn leases(&self) -> &LeaseManager {
+        &self.thread_manager.leases
     }
 
     async fn track_task(&self, handle: JoinHandle<()>) {
@@ -3691,6 +3702,26 @@ mod tests {
             Arc::new(PolicyEngine::new()),
         ));
         MissionManager::new(store, thread_manager)
+    }
+
+    /// WI#295: the bridge derives `tool_info`'s `callable` from
+    /// [`MissionManager::leases`], which must be the lease manager of the
+    /// thread manager this mission manager runs threads on — the set the
+    /// executor's preflight consults — not a copy or a fresh one.
+    #[tokio::test]
+    async fn leases_accessor_is_the_thread_managers_lease_manager() {
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::new());
+        let leases = Arc::new(LeaseManager::new());
+        let thread_manager = Arc::new(ThreadManager::new(
+            MockLlm::text("done"),
+            Arc::new(MockEffects),
+            Arc::clone(&store),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::clone(&leases),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let mgr = MissionManager::new(store, thread_manager);
+        assert!(std::ptr::eq(mgr.leases(), leases.as_ref()));
     }
 
     // ── Tests ───────────────────────────────────────────────
