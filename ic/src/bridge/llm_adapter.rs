@@ -91,6 +91,18 @@ fn classify_provider_error(error: &LlmError) -> ModelFailureKind {
     match error {
         LlmError::RateLimited { .. } => ModelFailureKind::RateLimited,
         LlmError::InvalidResponse { .. } | LlmError::Json(_) => ModelFailureKind::InvalidOutput,
+        // WI#297: deterministic empties (a refusal or an output-budget
+        // truncation) fail fast with honest terminal guidance rather than
+        // burning an engine recovery attempt mislabeled as invalid output;
+        // exhausted transient empties behave like any other transient.
+        LlmError::EmptyStream { finish, .. } => match finish {
+            crate::llm::FinishReason::ContentFilter | crate::llm::FinishReason::Length => {
+                ModelFailureKind::RequestRejected
+            }
+            crate::llm::FinishReason::Stop
+            | crate::llm::FinishReason::ToolUse
+            | crate::llm::FinishReason::Unknown => ModelFailureKind::Transient,
+        },
         LlmError::ReplArgumentCorruption { .. } => ModelFailureKind::ReplArgumentCorruption,
         LlmError::ContextLengthExceeded { .. } => ModelFailureKind::ContextOverflow,
         LlmError::ModelNotAvailable { .. } => ModelFailureKind::Unavailable,

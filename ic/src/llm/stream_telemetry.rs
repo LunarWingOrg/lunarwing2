@@ -229,6 +229,7 @@ pub(crate) fn classify_stream_failure(error: &LlmError) -> StreamFailureReason {
 
     match error {
         LlmError::RateLimited { .. } => StreamFailureReason::RateLimited,
+        LlmError::EmptyStream { .. } => StreamFailureReason::Empty,
         LlmError::InvalidResponse { .. } | LlmError::Json(_) => StreamFailureReason::InvalidOutput,
         LlmError::ReplArgumentCorruption { .. } => StreamFailureReason::InvalidOutput,
         LlmError::RequestFailed { .. } | LlmError::Http(_) | LlmError::Io(_) => {
@@ -261,6 +262,23 @@ mod tests {
                 reason: "turn deadline elapsed".into(),
             }),
             StreamFailureReason::Timeout
+        );
+    }
+
+    // WI#297: typed empty-stream errors classify as Empty without relying on
+    // message substrings.
+    #[test]
+    fn classifies_empty_stream_failures_as_empty() {
+        assert_eq!(
+            classify_stream_failure(&crate::llm::streaming::empty_stream_error("test", None)),
+            StreamFailureReason::Empty
+        );
+        assert_eq!(
+            classify_stream_failure(&crate::llm::streaming::empty_stream_error(
+                "test",
+                Some("stop")
+            )),
+            StreamFailureReason::Empty
         );
     }
 

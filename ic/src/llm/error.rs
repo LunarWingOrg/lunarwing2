@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::llm::provider::FinishReason;
+
 /// LLM provider errors.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -16,6 +18,23 @@ pub enum LlmError {
 
     #[error("Invalid response from {provider}: {reason}")]
     InvalidResponse { provider: String, reason: String },
+
+    /// The provider returned a successful-but-empty stream: zero chunks
+    /// before EOF, or a terminal `Done` chunk arriving first (WI#297).
+    ///
+    /// `finish` carries the WI#292 terminal classification so the retry and
+    /// failover layers can distinguish transient empties (`Stop`, `Unknown`,
+    /// and `ToolUse` anomalies where a `Done` claims tool calls that never
+    /// arrived) from deterministic ones (`Length`, `ContentFilter`) that the
+    /// same request cannot fix.
+    #[error("Provider {provider} returned an empty stream: {detail}")]
+    EmptyStream {
+        provider: String,
+        finish: FinishReason,
+        /// Operator-facing detail, e.g. "ended before any chunk" or
+        /// "completed with no content (finish_reason: stop)".
+        detail: String,
+    },
 
     #[error("REPL argument corruption from {provider}: {signature}")]
     ReplArgumentCorruption {
@@ -63,6 +82,15 @@ impl LlmError {
             }
             Self::RateLimited { .. } => "rate_limited",
             Self::InvalidResponse { .. } | Self::Json(_) => "invalid_output",
+            Self::EmptyStream { finish, .. } => match finish {
+                // Deterministic, request-specific empties get honest,
+                // non-retryable guidance instead of a mislabeled repair loop.
+                FinishReason::ContentFilter => "content_filtered",
+                FinishReason::Length => "output_budget_exhausted",
+                FinishReason::Stop | FinishReason::ToolUse | FinishReason::Unknown => {
+                    "empty_response"
+                }
+            },
             Self::ReplArgumentCorruption { .. } => "repl_argument_corruption",
             Self::ContextLengthExceeded { .. } => "context_overflow",
             Self::ModelNotAvailable { .. } => "unavailable",
@@ -102,6 +130,9 @@ impl LlmError {
             "invalid_output" => Some(
                 "Model failure observation: the previous provider response was invalid. Repair the response shape and continue without repeating completed work.",
             ),
+            "empty_response" => Some(
+                "Model failure observation: the provider returned an empty response after normal retries. Continue from current state; finish concisely or choose another available approach.",
+            ),
             "repl_argument_corruption" => Some(
                 lunarwing_engine::ModelFailureKind::ReplArgumentCorruption.recovery_instruction(),
             ),
@@ -126,6 +157,15 @@ impl LlmError {
             }
             "invalid_output" => {
                 "The model returned invalid output after one repair attempt. Retry with another model or review provider compatibility."
+            }
+            "empty_response" => {
+                "The model provider kept returning empty responses after retries and one recovery attempt. Retry later or configure a fallback model."
+            }
+            "content_filtered" => {
+                "The model provider refused to generate content for this request (content filter). Rephrase the request or choose another model."
+            }
+            "output_budget_exhausted" => {
+                "The model used its entire output budget before producing visible text. Raise the output token limit or choose another model."
             }
             "repl_argument_corruption" => {
                 lunarwing_engine::ModelFailureKind::ReplArgumentCorruption.terminal_message()
@@ -193,5 +233,46 @@ mod tests {
 
         assert_eq!(error.recovery_kind(), "context_overflow");
         assert!(error.terminal_guidance().contains("larger-context model"));
+    }
+
+    #[test]
+    fn transient_empty_stream_gets_one_bounded_recovery_attempt() {
+        for finish in [
+            crate::llm::provider::FinishReason::Stop,
+            crate::llm::provider::FinishReason::ToolUse,
+            crate::llm::provider::FinishReason::Unknown,
+        ] {
+            let error = LlmError::EmptyStream {
+                provider: "test-provider".to_string(),
+                finish,
+                detail: "completed with no content".to_string(),
+            };
+
+            assert_eq!(error.recovery_kind(), "empty_response");
+            assert!(error.recovery_instruction().is_some());
+            assert!(error.terminal_guidance().contains("empty responses"));
+            assert!(!error.terminal_guidance().contains("test-provider"));
+        }
+    }
+
+    #[test]
+    fn deterministic_empty_stream_fails_fast_with_honest_guidance() {
+        let filtered = LlmError::EmptyStream {
+            provider: "test-provider".to_string(),
+            finish: crate::llm::provider::FinishReason::ContentFilter,
+            detail: "completed with no content (finish_reason: content_filter)".to_string(),
+        };
+        assert_eq!(filtered.recovery_kind(), "content_filtered");
+        assert!(filtered.recovery_instruction().is_none());
+        assert!(filtered.terminal_guidance().contains("refused"));
+
+        let truncated = LlmError::EmptyStream {
+            provider: "test-provider".to_string(),
+            finish: crate::llm::provider::FinishReason::Length,
+            detail: "completed with no content (finish_reason: length)".to_string(),
+        };
+        assert_eq!(truncated.recovery_kind(), "output_budget_exhausted");
+        assert!(truncated.recovery_instruction().is_none());
+        assert!(truncated.terminal_guidance().contains("output budget"));
     }
 }
