@@ -91,14 +91,15 @@ fn classify_provider_error(error: &LlmError) -> ModelFailureKind {
     match error {
         LlmError::RateLimited { .. } => ModelFailureKind::RateLimited,
         LlmError::InvalidResponse { .. } | LlmError::Json(_) => ModelFailureKind::InvalidOutput,
-        // WI#297: deterministic empties (a refusal or an output-budget
-        // truncation) fail fast with honest terminal guidance rather than
-        // burning an engine recovery attempt mislabeled as invalid output;
-        // exhausted transient empties behave like any other transient.
+        // WI#297: deterministic empties get their own engine kinds so the
+        // user-facing terminal text distinguishes a content-filter refusal
+        // from an output-budget truncation (MR !1395 F-1). Both are
+        // non-recoverable (0 engine recovery attempts per `default.py`
+        // policy); exhausted transient empties behave like any other
+        // transient.
         LlmError::EmptyStream { finish, .. } => match finish {
-            crate::llm::FinishReason::ContentFilter | crate::llm::FinishReason::Length => {
-                ModelFailureKind::RequestRejected
-            }
+            crate::llm::FinishReason::ContentFilter => ModelFailureKind::ContentFiltered,
+            crate::llm::FinishReason::Length => ModelFailureKind::OutputBudgetExhausted,
             crate::llm::FinishReason::Stop
             | crate::llm::FinishReason::ToolUse
             | crate::llm::FinishReason::Unknown => ModelFailureKind::Transient,
@@ -650,6 +651,56 @@ mod tests {
             }),
             ModelFailureKind::Transient
         );
+    }
+
+    // WI#297 (MR !1395 F-1): deterministic empties map to their own engine
+    // kinds so the user-facing terminal text distinguishes a content-filter
+    // refusal from an output-budget truncation instead of collapsing both
+    // into the generic request-rejected message.
+    #[test]
+    fn deterministic_empty_streams_render_distinct_terminal_text() {
+        let filtered = classify_provider_error(&LlmError::EmptyStream {
+            provider: "test".into(),
+            finish: FinishReason::ContentFilter,
+            detail: "completed with no content (finish_reason: content_filter)".into(),
+        });
+        assert_eq!(filtered, ModelFailureKind::ContentFiltered);
+        assert!(!filtered.is_recoverable());
+        assert_eq!(
+            filtered.terminal_message(),
+            "The model provider refused to generate content for this request (content filter). Rephrase the request or choose another model."
+        );
+
+        let truncated = classify_provider_error(&LlmError::EmptyStream {
+            provider: "test".into(),
+            finish: FinishReason::Length,
+            detail: "completed with no content (finish_reason: length)".into(),
+        });
+        assert_eq!(truncated, ModelFailureKind::OutputBudgetExhausted);
+        assert!(!truncated.is_recoverable());
+        assert_eq!(
+            truncated.terminal_message(),
+            "The model used its entire output budget before producing visible text. Raise the output token limit or choose another model."
+        );
+
+        assert_ne!(filtered.terminal_message(), truncated.terminal_message());
+        assert_ne!(
+            filtered.terminal_message(),
+            ModelFailureKind::RequestRejected.terminal_message()
+        );
+    }
+
+    #[test]
+    fn transient_empty_streams_remain_transient() {
+        for finish in [FinishReason::Stop, FinishReason::ToolUse, FinishReason::Unknown] {
+            let kind = classify_provider_error(&LlmError::EmptyStream {
+                provider: "test".into(),
+                finish,
+                detail: "completed with no content".into(),
+            });
+            assert_eq!(kind, ModelFailureKind::Transient);
+            assert!(kind.is_recoverable());
+        }
     }
 
     #[derive(Default)]

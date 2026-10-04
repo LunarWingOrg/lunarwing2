@@ -1547,6 +1547,8 @@ mod tests {
             ModelFailureKind::RateLimited,
             ModelFailureKind::Authentication,
             ModelFailureKind::RequestRejected,
+            ModelFailureKind::ContentFiltered,
+            ModelFailureKind::OutputBudgetExhausted,
             ModelFailureKind::InvalidOutput,
             ModelFailureKind::ContextOverflow,
             ModelFailureKind::Internal,
