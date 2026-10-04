@@ -697,6 +697,46 @@ list, so a v2 thread that asks for a name which shadows both registries
 gets an honest "use mission_history" error instead of silently returning
 the v1 object's history for a same-named routine.
 
+The `mission_*` functions are capability actions, not registry tools: the
+eight definitions live in `mission_action_defs()` beside
+`EffectBridgeAdapter::handle_mission_call`, and the router registers them as
+the `missions` capability — Stateful today, so the planner grants it to
+Foreground, Research and Mission threads at spawn. CodeAct reaches them
+because Monty compiles a direct call to an undefined name into an external
+call that `preflight_action` matches against the thread's leases; they are
+absent from `available_actions`, the tool registry, `tool_list` and CodeAct's
+globals, so only a direct call works. So that the registry's "No tool named …
+is registered" is not read as "this function does not exist" (WI#295; the
+false negative behind closed-invalid WI#281), the bridge answers `tool_info`
+for a mission function itself, from the same definitions: the usual
+name/description/parameters (plus summary or schema by `detail`) and
+`kind: "engine_capability"`, `capability: "missions"`,
+`registered_tool: false`, `callable`, and a note. `callable` reports a
+capability — whether the asking thread holds the lease to call the function
+— not guidance on whether it should: it mirrors the executor's lease
+preflight and is true only while that thread holds a valid lease covering
+the function in `MissionManager::leases()`, the thread manager's lease set
+that preflight consults. A thread without one gets the same definition with
+`callable: false` and a note saying a call from it would be refused. Today
+that means threads resumed after a daemon restart (the lease manager is
+in-memory and never rehydrated, and `refresh_resumed_thread_leases` re-grants
+registry tools only — a known gap left over from WI#186/WI#169), threads
+whose lease was revoked or narrowed, and any future denylist entry.
+`rlm_query` children run on a private copy of their parent's leases that the
+host cannot see, so a thread the host holds no leases for is answered `true`
+rather than a false "not callable". The answer is static definition text,
+produced after every `tool_info` gate (permissions, approval, supervision,
+rate limit, auth, hooks) and before output sanitization; it skips
+`execute_tool_with_safety` because nothing runs that could time out and its
+inputs are a fixed-name lookup plus the `detail` enum. It is produced only
+while a mission manager is wired — the condition under which the functions
+dispatch — and v1 keeps the truthful registry miss. The CodeAct special
+functions (`llm_query`, `llm_query_batched`, `rlm_query`, `FINAL`) are
+sandbox builtins that `tool_list`/`tool_info` never describe; the preamble
+tells the model to call them directly. `tool_info` also accepts CodeAct's
+positional form (`tool_info("x")`) and resolves legacy hyphen/underscore
+tool aliases like dispatch does.
+
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
 loaded checkpoint **before** the `Running` transition and the first model
