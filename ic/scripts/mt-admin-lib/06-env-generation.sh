@@ -1259,6 +1259,8 @@ SANDBOX_ALLOW_FULL_ACCESS=$sandbox_allow_full_access
 #   state/  config.toml (worker auth_tokens), pending-gates, workspace-template
 #   run/    lunarwing.sock, and the world-writable ssh-agent/ dir holding
 #          ssh-agent.sock (tenant identity)
+#   logs/   raw, unscrubbed OpenRC daemon and service logs (WI#287); the agent
+#          sees the daemon's scrubbed copy read-only at /tenant-logs instead
 #
 # Deliberately NOT the whole tenant root: the daemon's WorkingDirectory is
 # <root>/ic, and the shell tool defaults to the daemon cwd, so protecting the
@@ -1269,7 +1271,7 @@ SANDBOX_ALLOW_FULL_ACCESS=$sandbox_allow_full_access
 # LUNARWING_BASE_DIR ($state_dir is a child of the root; env/ is a sibling).
 # The daemon refuses a mount at or inside one of these, and shadows them with
 # an empty mount when a legitimate parent (the tenant home) is mounted.
-SANDBOX_PROTECTED_PATHS=$(tenant_lw_root "$name")/env:$(tenant_lw_root "$name")/state:$(tenant_lw_root "$name")/run
+SANDBOX_PROTECTED_PATHS=$(tenant_lw_root "$name")/env:$(tenant_lw_root "$name")/state:$(tenant_lw_root "$name")/run:$(tenant_lw_root "$name")/logs
 
 # Agent tool loop (WI#239): local-tools dev mode off, auto-approve off, and a
 # hard cap on tool iterations per turn so a runaway loop cannot spin forever.
