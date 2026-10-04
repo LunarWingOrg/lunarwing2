@@ -1304,9 +1304,11 @@ REFLEX_COMPILER_ENABLED=$reflex_compiler_enabled
 
 # Lightweight routines (WI#291): cap on tool-calling rounds per run. A routine
 # gets min(its max_tool_rounds, this cap, 10) rounds plus one final text-only
-# reply, and can raise its own max_tool_rounds (routine_update) up to this cap.
-# More rounds take longer: keep ROUTINES_LIGHTWEIGHT_TIMEOUT_SECS (default 300)
-# in mind when raising it.
+# reply. The cap does not lift a routine's own max_tool_rounds (3 unless set);
+# raise one routine as the tenant with:
+#   lunarwing routines edit --name <routine> --max-tool-rounds <n>
+# (see docs/ops/TENANT-CONFIGURATION.md). More rounds take longer: keep
+# ROUTINES_LIGHTWEIGHT_TIMEOUT_SECS (default 300) in mind when raising it.
 ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=$routines_lightweight_max_iterations
 
 # Daemon mode

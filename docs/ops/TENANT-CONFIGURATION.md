@@ -464,6 +464,45 @@ The mt-admin env writer sets `AGENT_AUTO_APPROVE_TOOLS=false` on new tenants.
 Re-rendering preserves an existing canonical override; an older tenant with
 only `AUTO_APPROVE_TOOLS` has that value migrated to the canonical key.
 
+### Lightweight routine tool rounds (WI#291)
+
+`add-tenant` writes `ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=6` on the first render
+and preserves an existing value on re-render; `upgrade-tenant` and `patch-env`
+do not add it, so older tenants run with the daemon default of 3. The daemon
+reads it at startup: restart the tenant after changing it (see
+[Applying Changes](#applying-changes)).
+
+A tool-enabled lightweight (v1) routine gets
+`min(its max_tool_rounds, ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS, 10)` tool-calling
+rounds, then one final text-only reply. The variable is a ceiling: it does not
+lift a routine's own `max_tool_rounds` (3 unless set), so raising it alone
+changes nothing for a routine still at 3. Tenant chats run on Engine V2 by
+default (the gateway plus the opted-in XMPP, WeeChat and DarkIRC channels),
+where the `routine_*` tools redirect to mission tools and cannot edit v1
+routines. Raise one of the owner's routines from the host instead, as the
+tenant, with the tenant's environment loaded by the safe loader mt-admin uses
+for `refresh-knowledge`. It is invoked through `bash` and is init-agnostic
+despite its name, so this works on systemd and OpenRC hosts:
+
+```bash
+sudo -u <tenant> bash /home/<tenant>/lunarwing/ic/scripts/lunarwing-openrc-env-exec.sh \
+  --env-file /home/<tenant>/lunarwing/env/lunarwing.env -- \
+  /home/<tenant>/lunarwing/ic/target/release/lunarwing --no-onboard \
+  routines edit --name <routine> --max-tool-rounds <n>
+```
+
+`<n>` is 1–10; run `routines list` the same way to see the names. The binary
+is under `target/release` unless `LUNARWING_MT_PROFILE` selected another build
+profile. The command edits routines owned by the tenant's `LUNARWING_OWNER_ID`
+and prints a note when the routine runs without tools, when tools are disabled
+for lightweight routines, or when the cap is below `<n>`. Cron and manual
+routines use the new value at their next fire, event routines after the next
+event-cache refresh (about a minute); the daemon needs no restart. When a run
+uses up its rounds, its final reply names the knob that bounded it (both, when
+the routine's value equals the cap). Every round is one model call plus its
+tools, so keep `ROUTINES_LIGHTWEIGHT_TIMEOUT_SECS` (default 300) in mind when
+raising either value.
+
 ### Enabling heartbeat
 
 The heartbeat system runs proactive periodic tasks. To enable:

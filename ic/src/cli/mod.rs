@@ -480,6 +480,34 @@ mod tests {
         ));
     }
 
+    /// The command that the routine limit message and the docs print is a
+    /// valid invocation, also behind the global `--no-onboard` flag that the
+    /// multi-tenant procedure uses (WI#291 review R2).
+    #[test]
+    fn routines_edit_max_tool_rounds_flag_parses() {
+        let command = crate::agent::routine_engine::ROUTINES_EDIT_COMMAND
+            .replace("<routine>", "digest")
+            .replace("<n>", "5");
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        let mut with_no_onboard = argv.clone();
+        with_no_onboard.insert(1, "--no-onboard");
+
+        for args in [argv, with_no_onboard] {
+            let cli = Cli::try_parse_from(args.iter().copied())
+                .unwrap_or_else(|e| panic!("{args:?} should parse: {e}"));
+            let Some(Command::Routines(RoutinesCommand::Edit {
+                name,
+                max_tool_rounds,
+                ..
+            })) = cli.command
+            else {
+                panic!("{args:?} should parse as `routines edit`");
+            };
+            assert_eq!(name, "digest");
+            assert_eq!(max_tool_rounds, Some(5));
+        }
+    }
+
     #[test]
     #[cfg(feature = "import")]
     fn test_help_output() {
