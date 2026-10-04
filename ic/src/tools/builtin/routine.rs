@@ -148,7 +148,7 @@ fn execution_properties() -> Value {
             "minimum": 1,
             "maximum": crate::agent::routine::MAX_TOOL_ROUNDS_LIMIT,
             "default": 3,
-            "description": "Only applies when execution.mode='lightweight' and use_tools=true. Runtime-capped to prevent loops."
+            "description": "Only applies when execution.mode='lightweight' and use_tools=true. Tool-calling rounds per run, followed by one final text-only reply. Capped at runtime by the operator's ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS and the hard limit (the maximum); batch independent tool calls in one round."
         }
     })
 }
@@ -313,7 +313,7 @@ fn lightweight_execution_variant() -> Value {
                 "minimum": 1,
                 "maximum": crate::agent::routine::MAX_TOOL_ROUNDS_LIMIT,
                 "default": 3,
-                "description": "Only applies when use_tools=true. Runtime-capped to prevent loops."
+                "description": "Only applies when use_tools=true. Tool-calling rounds per run, followed by one final text-only reply. Capped at runtime by the operator's ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS and the hard limit (the maximum); batch independent tool calls in one round."
             }
         }
     })
@@ -644,6 +644,12 @@ pub(crate) fn routine_update_parameters_schema() -> Value {
             "description": {
                 "type": "string",
                 "description": "New description"
+            },
+            "max_tool_rounds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": crate::agent::routine::MAX_TOOL_ROUNDS_LIMIT,
+                "description": "Lightweight routines only: new tool-calling rounds per run (each run ends with one text-only reply). Capped at runtime by the operator's ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS. No effect while the routine runs without tools (use_tools=false)."
             }
         },
         "required": ["name"]
@@ -1260,7 +1266,8 @@ impl Tool for RoutineUpdateTool {
 
     fn description(&self) -> &str {
         "Update an existing routine. Can change prompt, description, enabled state, cron schedule/timezone, \
-         Pass the routine name and only the fields you want to change. This does not convert trigger types."
+         and a lightweight routine's tool-round budget (max_tool_rounds). Pass the routine name and only \
+         the fields you want to change. This does not convert trigger types."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1283,21 +1290,7 @@ impl Tool for RoutineUpdateTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("DB error: {e}")))?
             .ok_or_else(|| ToolError::ExecutionFailed(format!("routine '{}' not found", name)))?;
 
-        // Apply updates
-        if let Some(enabled) = params.get("enabled").and_then(|v| v.as_bool()) {
-            routine.enabled = enabled;
-        }
-
-        if let Some(desc) = params.get("description").and_then(|v| v.as_str()) {
-            routine.description = desc.to_string();
-        }
-
-        if let Some(prompt) = params.get("prompt").and_then(|v| v.as_str()) {
-            match &mut routine.action {
-                RoutineAction::Lightweight { prompt: p, .. } => *p = prompt.to_string(),
-                RoutineAction::FullJob { description: d, .. } => *d = prompt.to_string(),
-            }
-        }
+        apply_field_updates(&mut routine, &params)?;
 
         // Validate timezone param if provided
         let new_timezone = params
@@ -1353,20 +1346,75 @@ impl Tool for RoutineUpdateTool {
         // Refresh event cache in case trigger changed
         self.engine.refresh_event_cache().await;
 
-        let result = serde_json::json!({
-            "name": routine.name,
-            "enabled": routine.enabled,
-            "trigger_type": routine.trigger.type_tag(),
-            "next_fire_at": routine.next_fire_at.map(|t| t.to_rfc3339()),
-            "status": "updated",
-        });
-
+        let result = routine_update_result(&routine, params.get("max_tool_rounds").is_some());
         Ok(ToolOutput::success(result, start.elapsed()))
     }
 
     fn requires_sanitization(&self) -> bool {
         false
     }
+}
+
+/// Apply `routine_update`'s plain field edits (enabled, description, prompt
+/// and a lightweight routine's `max_tool_rounds`) to the loaded routine.
+/// Schedule and timezone are validated together by the caller.
+fn apply_field_updates(routine: &mut Routine, params: &Value) -> Result<(), ToolError> {
+    if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
+        routine.enabled = enabled;
+    }
+
+    if let Some(desc) = params.get("description").and_then(Value::as_str) {
+        routine.description = desc.to_string();
+    }
+
+    if let Some(prompt) = params.get("prompt").and_then(Value::as_str) {
+        match &mut routine.action {
+            RoutineAction::Lightweight { prompt: p, .. } => *p = prompt.to_string(),
+            RoutineAction::FullJob { description: d, .. } => *d = prompt.to_string(),
+        }
+    }
+
+    // WI#291: the per-routine tool-round budget was settable only at
+    // creation, so a routine that ran out of rounds could never be fixed.
+    if let Some(value) = params.get("max_tool_rounds") {
+        let rounds = value.as_u64().ok_or_else(|| {
+            ToolError::InvalidParameters("max_tool_rounds must be a positive integer".to_string())
+        })?;
+        if routine.action.set_max_tool_rounds(rounds).is_none() {
+            return Err(ToolError::InvalidParameters(
+                "max_tool_rounds applies only to lightweight routines".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `routine_update`'s response. A lightweight routine's budget and `use_tools`
+/// are always echoed, and a budget set on a routine that runs without tools
+/// carries a note, because it has no effect there (WI#291 review N3).
+fn routine_update_result(routine: &Routine, rounds_requested: bool) -> Value {
+    let mut result = serde_json::json!({
+        "name": routine.name,
+        "enabled": routine.enabled,
+        "trigger_type": routine.trigger.type_tag(),
+        "next_fire_at": routine.next_fire_at.map(|t| t.to_rfc3339()),
+        "status": "updated",
+    });
+    if let RoutineAction::Lightweight {
+        max_tool_rounds,
+        use_tools,
+        ..
+    } = &routine.action
+    {
+        result["max_tool_rounds"] = serde_json::json!(max_tool_rounds);
+        result["use_tools"] = serde_json::json!(use_tools);
+        if rounds_requested && !use_tools {
+            result["note"] = serde_json::json!(
+                "max_tool_rounds applies only when use_tools=true; this routine runs without tools"
+            );
+        }
+    }
+    result
 }
 
 // ==================== routine_delete ====================
@@ -2433,9 +2481,14 @@ mod tests {
             "schedule",
             "timezone",
             "description",
+            "max_tool_rounds",
         ] {
             let _ = schema_property(&schema, field);
         }
+        assert_eq!(
+            schema_property(&schema, "max_tool_rounds")["maximum"],
+            crate::agent::routine::MAX_TOOL_ROUNDS_LIMIT
+        );
 
         let schedule_description = schema_property(&schema, "schedule")
             .get("description")

@@ -52,7 +52,7 @@ pub use self::hygiene::HygieneConfig;
 pub use self::knowledge::{KnowledgeSeedConfig, KnowledgeSweepConfig, KnowledgeSyncConfig};
 pub use self::llm::default_session_path;
 pub use self::oauth::OAuthConfig;
-pub use self::routines::RoutineConfig;
+pub use self::routines::{LIGHTWEIGHT_MAX_TOOL_ROUNDS, RoutineConfig};
 pub use self::safety::SafetyConfig;
 use self::safety::resolve_safety_config;
 pub use self::sandbox::{

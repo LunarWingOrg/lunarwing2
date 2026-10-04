@@ -1088,6 +1088,11 @@ write_tenant_lunarwing_env() {
   skill_prune_quarantine_days="$(_env_existing "$path" SKILL_PRUNE_QUARANTINE_DAYS)"
   skill_prune_quarantine_days="${skill_prune_quarantine_days:-15}"
   reflex_compiler_enabled="$(_env_existing "$path" REFLEX_COMPILER_ENABLED)";     reflex_compiler_enabled="${reflex_compiler_enabled:-false}"
+  # WI#291: operator cap on tool-calling rounds per lightweight routine run.
+  # The daemon default (3) left a digest routine no round for its final send.
+  local routines_lightweight_max_iterations
+  routines_lightweight_max_iterations="$(_env_existing "$path" ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS)"
+  routines_lightweight_max_iterations="${routines_lightweight_max_iterations:-6}"
 
   (
     umask 077
@@ -1281,6 +1286,15 @@ SKILL_PRUNE_QUARANTINE_DAYS=$skill_prune_quarantine_days
 # Reflex compiler (WI#239): keep disabled by default for new tenants until the
 # feature is promoted out of experimental status.
 REFLEX_COMPILER_ENABLED=$reflex_compiler_enabled
+
+# Lightweight routines (WI#291): cap on tool-calling rounds per run. A routine
+# gets min(its max_tool_rounds, this cap, 10) rounds plus one final text-only
+# reply. The cap does not lift a routine's own max_tool_rounds (3 unless set);
+# raise one routine as the tenant with:
+#   lunarwing routines edit --name <routine> --max-tool-rounds <n>
+# (see docs/ops/TENANT-CONFIGURATION.md). More rounds take longer: keep
+# ROUTINES_LIGHTWEIGHT_TIMEOUT_SECS (default 300) in mind when raising it.
+ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=$routines_lightweight_max_iterations
 
 # Daemon mode
 CLI_ENABLED=false
