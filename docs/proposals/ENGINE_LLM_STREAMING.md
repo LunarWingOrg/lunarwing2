@@ -161,6 +161,25 @@ first stream item. The first successful chunk is the commit point. After that
 chunk, later errors pass through unchanged and no second provider is opened,
 preventing duplicate visible text.
 
+An empty-but-successful stream is never a success (WI#297). Before the commit
+check, the layers consume past leading content-free `TextDelta("")` chunks;
+zero chunks before EOF or a terminal `Done` arriving first (any finish string —
+a `Done`-first stream is content-free even when it claims `tool_calls`) become
+a typed `LlmError::EmptyStream` carrying the WI#292 finish classification:
+
+- `stop`/`unknown` (and the `tool_calls` anomaly) are transient: retried
+  against the same provider, then failed over to the next leg, and charged to
+  cooldown/circuit-breaker accounting.
+- `length` and `content_filter` are deterministic: the identical request
+  cannot fix an output-budget truncation or a refusal, so they are
+  non-retryable, do not fail over, and do not charge cooldown. They surface
+  with honest terminal guidance instead of a mislabeled invalid-output repair
+  loop.
+
+The smart-routing cascade treats a transient empty from the cheap leg as an
+escalation trigger to the primary (matching the pre-typed-error "uncertain"
+behavior); deterministic empties propagate without escalating.
+
 Failover binds the selected provider to the current Tokio task before returning
 the stream so model attribution remains request-scoped under concurrency.
 
