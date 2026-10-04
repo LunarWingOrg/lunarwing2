@@ -1145,7 +1145,8 @@ impl Workspace {
         // content (the incident that clobbered MEMORY.md). Keep a rolling
         // shadow copy so the previous version is recoverable in-place.
         if is_system_prompt_file(&path) && !doc.content.is_empty() && doc.content != content {
-            self.shadow_backup_prompt_file(&path, &doc.content).await;
+            self.shadow_backup_prompt_file(&self.user_id, &path, &doc.content)
+                .await;
         }
 
         // Compute chunks + embeddings upfront (no DB connections held).
@@ -1162,33 +1163,96 @@ impl Workspace {
     }
 
     /// Persist a rolling shadow copy of a prompt-visible file's content to
-    /// `backups/<path>.bak` before [`Workspace::write`] replaces it (WI#286).
+    /// `backups/<path>.bak` in the given scope before [`Workspace::write`] or
+    /// [`Workspace::write_to_layer`] replaces it (WI#286).
     ///
-    /// One slot per file, overwritten on each replace. The backup is stored
-    /// with an empty chunk projection: retrievable by exact-path `read()`,
-    /// visible in `list()`, but never search-indexed. Backup content is not
-    /// rescanned (the `backups/` prefix is not prompt-visible), so even a
-    /// previously poisoned file can still be replaced. Failures are logged
-    /// and never block the write itself.
-    async fn shadow_backup_prompt_file(&self, path: &str, prior_content: &str) {
+    /// For most prompt-visible files this is one slot per file, overwritten on
+    /// each replace. Daily logs keep older generations: before the slot is
+    /// overwritten its content rolls aside to the first free
+    /// `backups/daily/<date>.md.bak.<n>`, so repeated same-day replaces
+    /// (including the WI#288 repair path) never silently discard a version an
+    /// operator may still need to inspect. The backup is stored with an empty
+    /// chunk projection: retrievable by exact-path `read()`, visible in
+    /// `list()`, but never search-indexed. Backup content is not rescanned
+    /// (the `backups/` prefix is not prompt-visible), so even a previously
+    /// poisoned file can still be replaced. Every backup emits a
+    /// `lunarwing::safety` warn audit line with the path, byte count and
+    /// backup path. Failures are logged and never block the write itself.
+    async fn shadow_backup_prompt_file(&self, scope: &str, path: &str, prior_content: &str) {
         let backup_path = format!("backups/{path}.bak");
         let result: Result<(), WorkspaceError> = async {
+            if is_daily_log_file(path) {
+                self.rotate_daily_log_backup(scope, &backup_path, prior_content)
+                    .await?;
+            }
             let backup_doc = self
                 .storage
-                .get_or_create_document_by_path(&self.user_id, self.agent_id, &backup_path)
+                .get_or_create_document_by_path(scope, self.agent_id, &backup_path)
                 .await?;
             self.storage
                 .update_document_and_replace_chunks(backup_doc.id, prior_content, &[])
                 .await
         }
         .await;
-        if let Err(e) = result {
-            tracing::warn!(
+        match result {
+            Ok(()) => tracing::warn!(
+                target: "lunarwing::safety",
+                path = %path,
+                backup = %backup_path,
+                prior_bytes = prior_content.len(),
+                "prompt-visible file replaced; previous version kept in the shadow backup"
+            ),
+            Err(e) => tracing::warn!(
                 path = %path,
                 error = %e,
                 "prompt-file shadow backup failed; proceeding with write"
-            );
+            ),
         }
+    }
+
+    /// Roll an existing daily-log backup slot aside to the first free
+    /// `<backup_path>.<n>` so the slot can be overwritten without losing the
+    /// previous generation (WI#288 review). No-op when the slot is absent,
+    /// empty, or already holds exactly `incoming_prior` (a retried replace of
+    /// the same version must not grow slots).
+    async fn rotate_daily_log_backup(
+        &self,
+        scope: &str,
+        backup_path: &str,
+        incoming_prior: &str,
+    ) -> Result<(), WorkspaceError> {
+        let existing = match self
+            .storage
+            .get_document_by_path(scope, self.agent_id, backup_path)
+            .await
+        {
+            Ok(doc) => doc,
+            Err(WorkspaceError::DocumentNotFound { .. }) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if existing.content.is_empty() || existing.content == incoming_prior {
+            return Ok(());
+        }
+        let mut n = 1u32;
+        let slot_path = loop {
+            let candidate = format!("{backup_path}.{n}");
+            match self
+                .storage
+                .get_document_by_path(scope, self.agent_id, &candidate)
+                .await
+            {
+                Ok(_) => n += 1,
+                Err(WorkspaceError::DocumentNotFound { .. }) => break candidate,
+                Err(e) => return Err(e),
+            }
+        };
+        let slot_doc = self
+            .storage
+            .get_or_create_document_by_path(scope, self.agent_id, &slot_path)
+            .await?;
+        self.storage
+            .update_document_and_replace_chunks(slot_doc.id, &existing.content, &[])
+            .await
     }
 
     /// Move a poisoned daily log aside to `daily/<date>.poisoned-<n>.md` and
@@ -1466,6 +1530,14 @@ impl Workspace {
             .storage
             .get_or_create_document_by_path(&scope, self.agent_id, &path)
             .await?;
+
+        // Same WI#286 shadow backup as `write()`: a layer-scoped replace of a
+        // prompt-visible file destroys its prior content just the same, and
+        // the memory_write schema promises the backup for every replace lane.
+        if is_system_prompt_file(&path) && !doc.content.is_empty() && doc.content != content {
+            self.shadow_backup_prompt_file(&scope, &path, &doc.content)
+                .await;
+        }
 
         let prepared = self.prepare_chunks_for_path(&path, content).await;
         self.storage
@@ -4162,6 +4234,83 @@ mod runtime_index_tests {
         assert!(
             results.is_empty(),
             "shadow backup content must not be searchable: {results:?}"
+        );
+    }
+
+    /// WI#288 review (layer bypass): a layer-scoped full replace of a
+    /// prompt-visible file gets the same shadow backup as `write()` — the
+    /// memory_write schema promises the backup for every replace lane.
+    #[tokio::test]
+    async fn layer_replace_of_prompt_file_has_shadow_backup() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let backup_path = "backups/MEMORY.md.bak";
+
+        workspace
+            .write_to_layer("private", paths::MEMORY, "layer version one", false)
+            .await
+            .expect("first layer write");
+        assert!(
+            matches!(
+                workspace.read(backup_path).await,
+                Err(WorkspaceError::DocumentNotFound { .. })
+            ),
+            "first write of an empty document must not create a backup"
+        );
+
+        workspace
+            .write_to_layer("private", paths::MEMORY, "layer version two", false)
+            .await
+            .expect("layer replace");
+        let backup = workspace.read(backup_path).await.expect("read backup");
+        assert_eq!(backup.content, "layer version one");
+        let current = workspace.read(paths::MEMORY).await.expect("read memory");
+        assert_eq!(current.content, "layer version two");
+    }
+
+    /// WI#288 review (S8): repeated same-day replaces of a daily log keep
+    /// every prior generation — the `.bak` slot rolls aside to the first free
+    /// `.bak.<n>` before being overwritten, so the version an operator may
+    /// still need (e.g. quarantined poison's predecessor) is never silently
+    /// discarded.
+    #[tokio::test]
+    async fn daily_log_shadow_backup_rotates_generations() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let day = "daily/2026-10-03.md";
+        let backup_path = "backups/daily/2026-10-03.md.bak";
+
+        for content in ["morning", "midday", "evening"] {
+            workspace.write(day, content).await.expect("write day log");
+        }
+        assert_eq!(
+            workspace
+                .read(backup_path)
+                .await
+                .expect("latest backup")
+                .content,
+            "midday",
+            ".bak always holds the immediately prior version"
+        );
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.1"))
+                .await
+                .expect("first rotated generation")
+                .content,
+            "morning"
+        );
+
+        // A retried write of the current content is a no-op replace: the
+        // backup never fires and no new slot appears.
+        workspace
+            .write(day, "evening")
+            .await
+            .expect("no-op rewrite");
+        assert!(
+            matches!(
+                workspace.read(&format!("{backup_path}.2")).await,
+                Err(WorkspaceError::DocumentNotFound { .. })
+            ),
+            "no-op rewrite must not rotate a new slot"
         );
     }
 
