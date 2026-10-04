@@ -18,13 +18,16 @@
 #     pass-through, see vendor/rig-core/LUNARWING-PATCH.md). cargo vendor
 #     regenerates it from crates.io on every run, wiping the patch, so this
 #     script verifies the patch before vendoring and restores the committed
-#     patched tree from git afterwards. The one case that still fails loudly
-#     is a rig-core version bump: re-apply the patch onto the new sources and
-#     commit it first (LUNARWING-PATCH.md describes the flow).
+#     patched tree from git afterwards — also when cargo vendor itself fails
+#     or is interrupted (anything short of SIGKILL), so the patch is not left
+#     wiped. The one case that still fails loudly is a rig-core version bump:
+#     re-apply the patch onto the new sources and commit it first
+#     (LUNARWING-PATCH.md describes the flow).
 #   - The post-vendor set check compares vendor/ against the committed
 #     Cargo.lock files (the approved pins). It must only report drift, never
 #     re-resolve versions: any stray means the lockfiles drifted, so fix the
-#     locks first and re-run.
+#     locks first and re-run. (.vendor-staging* temp dirs that an interrupted
+#     cargo vendor leaves behind are removed before vendoring, not reported.)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -101,6 +104,10 @@ if [[ -n "$rigcore_dirty" ]]; then
   echo "refresh-vendor: ERROR $RIGCORE_DIR has uncommitted changes." >&2
   echo "  The post-vendor step restores the committed patch from git, which would" >&2
   echo "  overwrite them. Commit or stash the rig-core patch first, then re-run." >&2
+  echo "  If they are left over from an earlier refresh (e.g. one stopped at a rig-core" >&2
+  echo "  version bump), re-apply the patch onto the new sources and commit, or back the" >&2
+  echo "  bump out of the lockfiles and discard them from the repo root with:" >&2
+  echo "    git checkout HEAD -- ic/$RIGCORE_DIR && git clean -fd -- ic/$RIGCORE_DIR" >&2
   exit 1
 fi
 rigcore_unpatched="$(rigcore_unpatched_files)"
@@ -111,17 +118,54 @@ if [[ -n "$rigcore_unpatched" ]]; then
   exit 1
 fi
 # A marker-bearing file missing from RIGCORE_MARKER_FILES would escape the
-# check above; flag the list drift without failing the refresh.
+# check above; flag the list drift without failing the refresh. The scan walks
+# the whole crate, not just src/ (a patch hunk can land in build.rs, tests/ or
+# examples/); LUNARWING-PATCH.md only documents the marker and is skipped.
 while IFS= read -r marked; do
   rel="${marked#"$RIGCORE_DIR"/}"
+  if [[ "$rel" == LUNARWING-PATCH.md ]]; then
+    continue
+  fi
   if [[ " ${RIGCORE_MARKER_FILES[*]} " != *" $rel "* ]]; then
     echo "refresh-vendor: WARNING $marked carries the WI#292 marker but is not in RIGCORE_MARKER_FILES; add it so a revert of it is caught." >&2
   fi
-done < <(grep -rl "$RIGCORE_MARKER" "$RIGCORE_DIR/src")
+done < <(grep -rl "$RIGCORE_MARKER" "$RIGCORE_DIR")
 rigcore_committed_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$RIGCORE_DIR/Cargo.toml" | head -n1)"
 
+# An interrupted cargo vendor also leaves its .vendor-staging* temp dirs in the
+# vendor dir. cargo ignores dot dirs in a directory source and never deletes
+# them (--no-delete, and its own cleanup skips dot entries), but the set check
+# below would report them as strays ("lockfiles drifted"). They are never
+# legitimate outside a running cargo vendor, so clear them first.
+for staging in "$VENDOR_DIR"/.vendor-staging*; do
+  [[ -d "$staging" ]] || continue
+  echo "refresh-vendor: removing $staging left behind by an interrupted cargo vendor run" >&2
+  rm -rf -- "$staging"
+done
+
+# cargo vendor resolves and downloads everything first, then deletes and
+# re-extracts each crate dir in turn, rig-core among them. If it fails or is
+# interrupted after rewriting rig-core (set -e exit, Ctrl-C, SIGTERM, SIGHUP —
+# bash runs the EXIT trap for all of them), put the committed patched tree
+# back so the patch is not left wiped and a plain re-run starts clean. The
+# tree was clean before cargo ran (guard above), so any change or new file
+# here is cargo's. Restore before writing anything and without errexit:
+# stderr may already be gone (a `| tee` reader killed by the same Ctrl-C, a
+# hung-up terminal), and a failed write must not cut the restore short.
+rigcore_restore_after_aborted_vendor() {
+  set +e
+  [[ -n "$(git status --porcelain -- "$RIGCORE_DIR" 2>/dev/null)" ]] || return 0
+  if git checkout -q HEAD -- "$RIGCORE_DIR" && git clean -fdq -- "$RIGCORE_DIR"; then
+    echo "refresh-vendor: cargo vendor stopped after rewriting $RIGCORE_DIR; restored the committed WI#292 patch from git." >&2
+  else
+    echo "refresh-vendor: ERROR cargo vendor stopped after rewriting $RIGCORE_DIR and the restore failed; from the repo root run: git checkout HEAD -- ic/$RIGCORE_DIR && git clean -fd -- ic/$RIGCORE_DIR" >&2
+  fi
+}
+
 echo "refresh-vendor: cargo vendor --locked --no-delete $VENDOR_DIR ${sync_args[*]} $*" >&2
+trap rigcore_restore_after_aborted_vendor EXIT
 cargo vendor --locked --no-delete "$VENDOR_DIR" "${sync_args[@]}" "$@"
+trap - EXIT
 
 # --- WI#292 rig-core patch restore (post-vendor) ---
 # cargo vendor just rewrote rig-core from the registry. If the version moved,
@@ -132,7 +176,10 @@ if [[ "$rigcore_vendored_version" != "$rigcore_committed_version" ]]; then
   echo "refresh-vendor: ERROR rig-core was re-vendored at a NEW version ($rigcore_committed_version -> $rigcore_vendored_version)." >&2
   echo "  The WI#292 patch does not auto-apply across versions: re-apply it onto the new" >&2
   echo "  sources, regenerate rig-core's .cargo-checksum.json, commit, then re-run this script." >&2
-  echo "  (See vendor/rig-core/LUNARWING-PATCH.md and git history for the patch diff.)" >&2
+  echo "  cargo vendor removed $RIGCORE_DIR/LUNARWING-PATCH.md; from the repo root read it with" >&2
+  echo "  git show HEAD:ic/$RIGCORE_DIR/LUNARWING-PATCH.md (patch commits: git log -- ic/$RIGCORE_DIR/src)." >&2
+  echo "  To back the bump out instead, revert it in the lockfiles, then from the repo root run:" >&2
+  echo "    git checkout HEAD -- ic/$RIGCORE_DIR && git clean -fd -- ic/$RIGCORE_DIR" >&2
   exit 1
 fi
 # Same version: the committed tree (patched sources + matching
