@@ -316,6 +316,7 @@ impl SandboxManager {
                 network: self.config.network,
                 proxy_port,
                 protected_paths: &self.config.protected_paths,
+                tenant_logs: self.config.tenant_logs.enabled(),
             })
             .await?;
         Ok(container_output.into())

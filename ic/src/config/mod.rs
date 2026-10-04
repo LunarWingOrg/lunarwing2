@@ -496,6 +496,12 @@ fn merge_injected_vars(new_entries: HashMap<String, String>) {
     if new_entries.is_empty() {
         return;
     }
+    // Every overlay value is a secret that is not in the process environment
+    // the log scrubber starts from (WI#287 review S4); short or empty values
+    // are ignored by the scrubber.
+    for value in new_entries.values() {
+        crate::tracing_fmt::register_log_secret(value);
+    }
     match INJECTED_VARS.lock() {
         Ok(mut map) => map.extend(new_entries),
         Err(poisoned) => poisoned.into_inner().extend(new_entries),
@@ -507,6 +513,9 @@ fn merge_injected_vars(new_entries: HashMap<String, String>) {
 /// Used by the setup wizard to make credentials available to `optional_env()`
 /// without calling `unsafe { std::env::set_var }`.
 pub fn inject_single_var(key: &str, value: &str) {
+    // Overlay values are secrets: keep them out of every daemon log sink
+    // (WI#287 review S4).
+    crate::tracing_fmt::register_log_secret(value);
     match INJECTED_VARS.lock() {
         Ok(mut map) => {
             map.insert(key.to_string(), value.to_string());

@@ -1212,4 +1212,71 @@ mod tests {
         assert!(content.contains("lunarwing_base_dir='/srv/lunarwing'"));
         assert!(content.contains("lunarwing_rc_need='xmpp-bridge'"));
     }
+
+    /// Source the committed OpenRC init under `sh` with conf.d-style
+    /// `assignments` and an env file, run `load_env`, and report what it
+    /// exported as `LUNARWING_SERVICE_LOG_DIRS|SANDBOX_PROTECTED_PATHS`.
+    #[cfg(unix)]
+    fn openrc_load_env_exports(assignments: &str, env_file_body: &str) -> String {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let init = temp.path().join("lunarwing.openrc");
+        let env_file = temp.path().join("lunarwing.env");
+        std::fs::write(&init, OPENRC_LUNARWING_INIT).expect("init script");
+        std::fs::write(&env_file, env_file_body).expect("env file");
+        let script = format!(
+            "lunarwing_env_file='{}'\n{assignments}\n. '{}'\nload_env && printf '%s|%s' \
+             \"${{LUNARWING_SERVICE_LOG_DIRS-}}\" \"${{SANDBOX_PROTECTED_PATHS-}}\"",
+            env_file.display(),
+            init.display()
+        );
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env_remove("LUNARWING_SERVICE_LOG_DIRS")
+            .env_remove("SANDBOX_PROTECTED_PATHS")
+            .output()
+            .expect("run sh");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// WI#287 review S3: the OpenRC template's raw stdout/stderr files are
+    /// unscrubbed, so `load_env` hands their directories to the daemon as
+    /// LUNARWING_SERVICE_LOG_DIRS. It must never export SANDBOX_PROTECTED_PATHS
+    /// itself: that would shadow a value from `<base>/.env`, which the daemon
+    /// loads without overriding the environment.
+    #[cfg(unix)]
+    #[test]
+    fn openrc_init_exports_service_log_dirs_without_touching_protected_paths() {
+        assert_eq!(
+            openrc_load_env_exports(
+                "lunarwing_log_dir=/var/log/lw\n\
+                 lunarwing_output_log=/var/log/lw/lunarwing.log\n\
+                 lunarwing_error_log=/srv/errs/lunarwing.err",
+                "SANDBOX_PROTECTED_PATHS=/srv/extra\n",
+            ),
+            "/var/log/lw:/srv/errs|/srv/extra"
+        );
+        assert_eq!(openrc_load_env_exports("", ""), "/var/log/lunarwing|");
+    }
+
+    /// Guard: `/`, empty and relative log locations are never handed over (a
+    /// protected `/` would refuse every sandbox mount).
+    #[cfg(unix)]
+    #[test]
+    fn openrc_init_never_exports_root_or_relative_log_dirs() {
+        assert_eq!(
+            openrc_load_env_exports(
+                "lunarwing_log_dir=/\n\
+                 lunarwing_output_log=lunarwing.log\n\
+                 lunarwing_error_log=/lunarwing.err",
+                "",
+            ),
+            "|"
+        );
+    }
 }

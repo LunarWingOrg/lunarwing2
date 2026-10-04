@@ -70,6 +70,31 @@ load_env() {
         . "${lunarwing_env_file}"
         set +a
     fi
+
+    export_service_log_dirs
+}
+
+# WI#287: the raw stdout/stderr files written by this service are unscrubbed
+# (stdout can carry the gateway URL banner; stderr predates write-time
+# scrubbing), so their directories are handed to the daemon, which adds them
+# to the shell sandbox's protected set (never mountable as a workdir, masked
+# inside a parent mount). A separate variable, not SANDBOX_PROTECTED_PATHS:
+# exporting that here would shadow a value set in <base>/.env, which the
+# daemon loads without overriding the environment.
+export_service_log_dirs() {
+    _lw_dirs="${LUNARWING_SERVICE_LOG_DIRS:-}"
+    for _lw_dir in "${lunarwing_log_dir}" "${output_log%/*}" "${error_log%/*}"; do
+        case "${_lw_dir}" in
+            /|"") continue ;;
+            /*) ;;
+            *) continue ;;
+        esac
+        case ":${_lw_dirs}:" in
+            *":${_lw_dir}:"*) ;;
+            *) _lw_dirs="${_lw_dirs:+${_lw_dirs}:}${_lw_dir}" ;;
+        esac
+    done
+    export LUNARWING_SERVICE_LOG_DIRS="${_lw_dirs}"
 }
 
 prepare_paths() {

@@ -125,6 +125,7 @@ pub use cli_runner::{
 };
 pub use config::{
     ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy, SandboxRuntime,
+    TenantLogsMode,
 };
 pub use container::{ContainerOutput, ContainerRunner, connect_docker};
 pub use detect::{
