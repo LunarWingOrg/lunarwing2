@@ -109,16 +109,33 @@ poison pre-exists: a poisoned entry, or a pattern split across the append
 boundary, is still a plain rejection with no file movement. Quarantine
 failures are logged and never mask the original rejection.
 
+For a deliberate repair, `memory_write(target: "daily_log", append: false)`
+replaces today's log through `write()`: only the new content is scanned, and
+the previous version (poisoned or not) is kept in the shadow backup
+`backups/daily/YYYY-MM-DD.md.bak` (earlier generations roll aside to numbered
+`.bak.<n>` slots). The named `daily_log` target used to ignore `append: false`
+and append silently while reporting a replace (WI#288 residual); the
+explicit-path form (`target: "daily/YYYY-MM-DD.md"`) always honored it. When a
+`layer` is specified the write routes through the layer methods: replaces get
+the same shadow backup, but appends do not quarantine — a poisoned layer-scope
+day file rejects until it is replaced or repaired by an operator.
+
 ### Prompt-File Shadow Backups (WI#286)
 
 A full-replace `write()` of a prompt-visible file destroys its prior content —
 the mechanism behind the incident where a session's context dump clobbered the
 curated `MEMORY.md`. Before replacing non-empty, differing content, `write()`
-now persists the previous version to a rolling single-slot shadow copy at
-`backups/<path>.bak` (e.g. `backups/MEMORY.md.bak`). Backups are retrievable
-by exact-path `read()` and visible in `list()`, but are stored with an empty
-chunk projection so they never enter the search index. Backup failures are
-logged and never block the write itself.
+and `write_to_layer()` now persist the previous version to a shadow copy at
+`backups/<path>.bak` in the written scope (e.g. `backups/MEMORY.md.bak`), and
+every backup emits a `lunarwing::safety` warn audit line naming the path, the
+prior byte count and the backup path. Most prompt-visible files keep a single
+rolling slot, overwritten on each replace; daily logs retain every generation —
+before the slot is overwritten, its content rolls aside to the first free
+`backups/daily/<date>.md.bak.<n>` — so repeated same-day replaces (including
+the WI#288 repair path) never silently discard a version. Backups are
+retrievable by exact-path `read()` and visible in `list()`, but are stored
+with an empty chunk projection so they never enter the search index. Backup
+failures are logged and never block the write itself.
 
 ## Operator Prompt Editing (WI#220)
 
