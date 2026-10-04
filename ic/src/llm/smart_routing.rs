@@ -1009,7 +1009,25 @@ impl LlmProvider for SmartRoutingProvider {
                     "Smart routing: Moderate stream -> cheap model (cascade enabled)"
                 );
                 self.stats.cheap_requests.fetch_add(1, Ordering::Relaxed);
-                let cheap_stream = self.cheap.complete_stream(request.clone()).await?;
+                let cheap_stream = match self.cheap.complete_stream(request.clone()).await {
+                    Ok(stream) => stream,
+                    // WI#297 F4: the retry layer now surfaces an empty cheap
+                    // stream as a typed error instead of an empty success.
+                    // Restore the pre-existing cascade behavior — an empty
+                    // cheap answer was judged uncertain and escalated — rather
+                    // than propagating past the primary straight to failover.
+                    Err(error) if crate::llm::streaming::is_transient_empty_stream(&error) => {
+                        tracing::info!(
+                            cheap_model = %self.cheap.model_name(),
+                            primary_model = %self.primary.model_name(),
+                            "Smart routing: Escalating stream to primary (cheap model returned an empty stream)"
+                        );
+                        self.stats.cascade_escalations.fetch_add(1, Ordering::Relaxed);
+                        self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
+                        return self.primary.complete_stream(request).await;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let buffered =
                     buffer_completion_stream(self.cheap.model_name(), cheap_stream).await?;
 
@@ -1843,6 +1861,93 @@ mod tests {
         assert_eq!(stats.cheap_requests, 1);
         assert_eq!(stats.primary_requests, 1);
         assert_eq!(stats.cascade_escalations, 1);
+    }
+
+    // WI#297 F4: with the retry layer converting an empty cheap stream into a
+    // typed error, the cascade must still escalate to the primary instead of
+    // propagating the error past it into the failover layer.
+    #[tokio::test]
+    async fn moderate_cascade_escalates_when_cheap_stream_is_empty() {
+        use crate::llm::retry::{RetryConfig, RetryProvider};
+
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary-", "answer"])],
+            vec![],
+        ));
+        let cheap_inner = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![StreamScript::Items(vec![])],
+            vec![],
+        ));
+        let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
+            cheap_inner.clone(),
+            RetryConfig { max_retries: 0 },
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config());
+
+        let chunks = router
+            .complete_stream(make_request("Deploy this to production"))
+            .await
+            .expect("primary stream should open after empty-cheap escalation")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [LlmStreamChunk::TextDelta(first), LlmStreamChunk::TextDelta(second), LlmStreamChunk::Done { .. }]
+                if first == "primary-" && second == "answer"
+        ));
+        assert_eq!(cheap_inner.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 1);
+        let stats = router.stats();
+        assert_eq!(stats.cheap_requests, 1);
+        assert_eq!(stats.primary_requests, 1);
+        assert_eq!(stats.cascade_escalations, 1);
+    }
+
+    // WI#297 F4: deterministic empties (`length`) are request-specific — they
+    // propagate honestly instead of escalating to the primary.
+    #[tokio::test]
+    async fn moderate_cascade_propagates_deterministic_empty_without_escalating() {
+        use crate::llm::retry::{RetryConfig, RetryProvider};
+
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary"])],
+            vec![],
+        ));
+        let cheap_inner = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "length".to_string(),
+            })])],
+            vec![],
+        ));
+        let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
+            cheap_inner.clone(),
+            RetryConfig { max_retries: 0 },
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config());
+
+        let result = router
+            .complete_stream(make_request("Deploy this to production"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::EmptyStream {
+                finish: FinishReason::Length,
+                ..
+            })
+        ));
+        assert_eq!(cheap_inner.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 0);
+        assert_eq!(router.stats().cascade_escalations, 0);
     }
 
     #[tokio::test]
