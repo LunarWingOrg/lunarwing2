@@ -13,9 +13,14 @@
 //!   A mid-sentence `user:` is reported exactly like a line-start one.
 //! - **Neutralization** (the content [`Sanitizer::sanitize`] returns) is much
 //!   narrower: the `<|` opener is broken unconditionally; and only when a
-//!   Critical pattern is present, `|>`/`[INST]`/`[/INST]` are escaped, null
-//!   bytes removed, and **line-start** `system:`/`user:`/`assistant:` labels
-//!   prefixed with `[ESCAPED]`. Mid-sentence labels and the phrase patterns
+//!   Critical pattern is present, null bytes are removed **first** (so a NUL
+//!   embedded in a token — `|\0>`, `[IN\0ST]` — cannot reconstitute the token
+//!   after escaping), then `|>`/`[INST]`/`[/INST]` are escaped in every ASCII
+//!   case variant (detection is case-insensitive, so the escape must be too),
+//!   and **line-start** `system:`/`user:`/`assistant:` labels prefixed with
+//!   `[ESCAPED]`. "Line-start" means `str::lines`: a lone `\r`, `\x0b` or
+//!   U+2028 does not start a line for this rule even where a renderer would
+//!   wrap there. Mid-sentence labels and the phrase patterns
 //!   (instruction-override wording, role-change wording, `eval(`, …) are never
 //!   rewritten.
 //!
@@ -24,23 +29,28 @@
 //! 1. For prompt-visible workspace files (identity files, `MEMORY.md`, daily
 //!    logs, lorebooks) the write-time gate is the **only** keyword defense:
 //!    those files reach the model through prompt assembly, which applies
-//!    nothing but the `<|` opener break. Narrowing detection would narrow the
-//!    only ingress check.
+//!    nothing (v1 engine) or only the `<|` opener break (Engine V2).
+//!    Narrowing detection would narrow the only ingress check.
 //! 2. Positional rules are evadable. A zero-width character before a label
 //!    hides it from the line-start rule (`trim_start` does not strip format
 //!    characters), and U+2028 renders as a line break while `str::lines`
 //!    does not split on it. Position-free matching has no position to spoof.
+//!    Position-free is not obfuscation-proof either: detection scans the text
+//!    as given, so zero-width/format/fullwidth variants of a phrase still
+//!    pass unless the caller canonicalizes first — only the lorebook write
+//!    lane does (a known, pre-existing gap this decision does not change).
 //! 3. Most patterns are phrases with no readable "neutralized" form, so full
 //!    alignment is impossible; only the role-label family could align, and
 //!    only by weakening detection (point 2).
 //! 4. False positives have remedies that do not weaken the gate: rephrase
-//!    (the rejection error says so, WI#290), or quote a short phrase inline
-//!    in a daily log, where a fully quoted match demotes to describing
-//!    context (WI#280).
+//!    (the rejection names the file, the matched pattern descriptions and
+//!    their line numbers), or quote a short phrase inline in a daily log,
+//!    where a fully quoted match demotes to describing context (WI#280).
 //!
 //! Consumers apply the same detector with different postures: the
 //! workspace write gate rejects at High or above; `SafetyLayer::sanitize_tool_output`
-//! flags and neutralizes but never rejects; prompt assembly only breaks `<|`.
+//! flags and neutralizes but never rejects; prompt assembly breaks only `<|`
+//! (Engine V2; the v1 engine applies nothing to the assembled system prompt).
 //! The `detect_vs_neutralize` tests below pin this matrix.
 
 use std::ops::Range;
@@ -300,16 +310,17 @@ impl Sanitizer {
 
     /// Escape content to neutralize potential injections.
     fn escape_content(&self, content: &str) -> String {
-        // Replace special patterns with escaped versions
-        let mut escaped = content.to_string();
+        // Remove null bytes FIRST: a NUL embedded in a token (`|\0>`,
+        // `[IN\0ST]`) would otherwise survive the escape pass and reconstitute
+        // the live token once stripped (WI#289 review).
+        let mut escaped = content.replace('\x00', "");
 
-        // Escape special tokens
+        // Escape special tokens. Detection is ASCII case-insensitive, so the
+        // escape must be too — `[inst]` is Critical to the matcher and must
+        // not pass through unescaped.
         escaped = escaped.replace("|>", "|\\>");
-        escaped = escaped.replace("[INST]", "\\[INST]");
-        escaped = escaped.replace("[/INST]", "\\[/INST]");
-
-        // Remove null bytes
-        escaped = escaped.replace('\x00', "");
+        escaped = escape_ascii_token_any_case(&escaped, "[INST]");
+        escaped = escape_ascii_token_any_case(&escaped, "[/INST]");
 
         // Escape role markers at the start of lines
         let lines: Vec<&str> = escaped.lines().collect();
@@ -336,6 +347,33 @@ impl Default for Sanitizer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Escape every ASCII-case variant of `token` by prefixing a backslash.
+/// Detection is case-insensitive (Aho-Corasick `ascii_case_insensitive`), so
+/// neutralization must catch the same variants or a lowercase `[inst]` would
+/// be flagged Critical yet rendered unchanged (WI#289 review).
+fn escape_ascii_token_any_case(text: &str, token: &str) -> String {
+    debug_assert!(token.is_ascii(), "token must be ASCII: {token:?}");
+    let bytes = text.as_bytes();
+    let token = token.as_bytes();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut i = 0;
+    while i + token.len() <= bytes.len() {
+        if bytes[i..i + token.len()].eq_ignore_ascii_case(token) {
+            // ASCII-only match region: always on char boundaries.
+            out.push('\\');
+            out.push_str(&text[i..i + token.len()]);
+            i += token.len();
+        } else {
+            // Advance one whole char so `i` stays on a char boundary.
+            let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&text[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out.push_str(&text[i..]);
+    out
 }
 
 #[cfg(test)]
@@ -880,6 +918,39 @@ mod tests {
                 "{}",
                 result.content
             );
+        }
+
+        #[test]
+        fn nul_inside_a_token_cannot_reconstitute_it_after_escaping() {
+            let sanitizer = Sanitizer::new();
+            // Null bytes are removed BEFORE the token escapes, so a NUL split
+            // cannot hide a token from the escape pass (WI#289 review).
+            for (input, expected) in [
+                ("|\0>", "|\\>"),
+                ("[IN\0ST]", "\\[INST]"),
+                ("[/IN\0ST]", "\\[/INST]"),
+            ] {
+                let result = sanitizer.sanitize(input);
+                assert_eq!(severity_of(&result, "null_byte"), Some(Severity::Critical));
+                assert_eq!(result.content, expected, "{input:?}");
+            }
+        }
+
+        #[test]
+        fn token_escape_matches_detection_case_insensitively() {
+            let sanitizer = Sanitizer::new();
+            // The matcher is ASCII case-insensitive, so `[inst]` is Critical;
+            // the escape must catch the same variants or the flagged token
+            // would render unchanged (WI#289 review).
+            for (input, expected) in [
+                ("[inst]", "\\[inst]"),
+                ("[/Inst]", "\\[/Inst]"),
+                ("x [INST] y [inst] z", "x \\[INST] y \\[inst] z"),
+                ("caf\u{e9} [InSt]", "caf\u{e9} \\[InSt]"),
+            ] {
+                let result = sanitizer.sanitize(input);
+                assert_eq!(result.content, expected, "{input:?}");
+            }
         }
     }
 }
