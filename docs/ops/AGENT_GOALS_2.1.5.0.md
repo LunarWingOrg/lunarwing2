@@ -114,7 +114,11 @@
 25. [ ] review all currently open work items - create audit document for 2.1.5.0 in docs/ops - there are similar docs in docs/ops for 2.1.4.0 and earlier releases so you can use those as references
 26. [ ] update all docs in docs/guides
 27. [ ] update all docs in docs/architecture
-28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5098 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
+28. [x] fix issues in CI/CD (if any) - See Pipeline number 5098 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
+   - DONE 2026-10-04: audited pipeline 5098 (master, sha 68a8782cd) — all 36 jobs GREEN, including cargo-deny, satellite-advisory-sweep, and lockfile-only-advisory-guard. The "cargo deny has issue now" note was stale: it referred to the wasmtime advisories RUSTSEC-2026-0321/0322/0323 that failed pipeline 4922 on 2026-10-02 and were fixed the same day by `5cbc180fb` (wasmtime/wasmtime-wasi 36.0.17, on master); every master pipeline since 4976 is green.
+   - Re-verified locally against today's advisory DB (ef6173cbc5, 2026-10-03): `.gitlab/scripts/cargo-deny-check.sh` (advisories/bans/licenses/sources ok, no index-failure), `check-satellite-advisories.sh` (26 roots ok, 1 manifest-less skip), `check-lockfile-only-advisories.sh` (ok) — all exit 0.
+   - Found and fixed one live CI/CD issue: `panic-policy` false-failed MR !1401's pipeline 5107 because `ic/scripts/check_no_panics.py` flagged `assert!`/`assert_eq!` inside `fuzz_target!` bodies as production panics. cargo-fuzz targets under `crates/*/fuzz/fuzz_targets/` are test-only harnesses (separate fuzzing workspace, never linked into shipped binaries), so `collect_violations` now skips those paths, pinned by a new self-test (`test_collect_violations_skips_fuzz_targets`, 14/14 pass) and documented in `.gitlab/README.md`. Reproduced the failure on the MR !1401 diff (exit 1) before the fix and verified exit 0 after; full `panic-policy.sh` run green.
+   - Commits: checker fix `42d90f768`, README `829e5ed3c`, goals evidence (this commit).
 29. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
 30. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
 31. [x] (S) RESERVED4itemstoworkonwilldiscusslater
