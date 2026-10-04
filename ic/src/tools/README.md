@@ -153,9 +153,9 @@ output is bounded. The same pagination contract is the model for fixing
 - Approval policy: `never` (default), `unless_auto_approved`, or `always`
 
 `always` cannot be bypassed by global auto-approval. It also rejects user
-`Always` grants unless tool explicitly opts in; built-in `ssh` is narrow
-exception. WASM tools with SSH capability always use non-bypassable `always`,
-regardless of declared policy.
+`Always` grants unless tool explicitly opts in; built-in `ssh` and
+`secret_delete` are the narrow exceptions. WASM tools with SSH capability
+always use non-bypassable `always`, regardless of declared policy.
 
 ### What Does NOT Go in Main Agent
 
