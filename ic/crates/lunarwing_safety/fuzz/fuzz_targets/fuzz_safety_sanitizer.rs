@@ -1,5 +1,5 @@
 #![no_main]
-use lunarwing_safety::{Sanitizer, Severity};
+use lunarwing_safety::Sanitizer;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -12,10 +12,13 @@ fuzz_target!(|data: &[u8]| {
         for w in &result.warnings {
             assert!(w.location.end <= s.len());
         }
-        // Verify invariant: critical severity triggers modification
-        let has_critical = result.warnings.iter().any(|w| w.severity == Severity::Critical);
-        if has_critical {
-            assert!(result.was_modified);
+        // WI#289: detection is deliberately stricter than neutralization, so
+        // Critical detection does NOT imply modification — phrase patterns
+        // (e.g. "ignore all previous") have no neutralized form; only special
+        // tokens, null bytes and line-start role labels are rewritten. What
+        // must hold instead: unmodified output is byte-identical to the input.
+        if !result.was_modified {
+            assert_eq!(result.content, s);
         }
     }
 });

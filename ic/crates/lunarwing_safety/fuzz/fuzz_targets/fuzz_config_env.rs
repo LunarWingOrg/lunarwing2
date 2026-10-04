@@ -7,12 +7,12 @@ fuzz_target!(|data: &[u8]| {
         // Exercise Sanitizer: detect and neutralize prompt injection attempts.
         let sanitizer = Sanitizer::new();
         let sanitized = sanitizer.sanitize(input);
-        // The sanitized content must never be empty when input is non-empty,
-        // because sanitization wraps/escapes rather than deleting.
-        if !input.is_empty() {
+        // WI#289: sanitization may legitimately empty its input — null-byte
+        // removal deletes bytes, so an all-NUL input sanitizes to "".
+        if !input.is_empty() && sanitized.content.is_empty() {
             assert!(
-                !sanitized.content.is_empty(),
-                "sanitize() produced empty content for non-empty input"
+                input.chars().all(|c| c == '\0'),
+                "sanitize() produced empty content for non-NUL input"
             );
         }
         // If no modification occurred, content must equal input.
