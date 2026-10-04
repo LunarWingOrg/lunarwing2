@@ -3251,6 +3251,15 @@ mod tests {
             "a quoted label in a daily log is describing context"
         );
         assert!(validate_prompt_write("notes/meeting.md", mid_sentence).is_ok());
+        // An overlapping Medium pattern (`act as` inside "Contact assistant:")
+        // must not swallow the High label it touches (WI#289 review).
+        assert!(
+            matches!(
+                validate_prompt_write("SOUL.md", "Contact assistant: ping ops"),
+                Err(WorkspaceError::InjectionRejected { .. })
+            ),
+            "overlapping Medium pattern must not hide the High role label"
+        );
     }
 
     #[test]

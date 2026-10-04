@@ -11,6 +11,9 @@
 //!   [`Sanitizer::sanitize`]) matches every pattern case-insensitively
 //!   **anywhere** in the text, with no positional or contextual constraint.
 //!   A mid-sentence `user:` is reported exactly like a line-start one.
+//!   Overlapping matches are all reported, so a shorter or lower-severity
+//!   pattern cannot swallow an overlapping higher-severity one (`act as`
+//!   inside `exact assistant:` still surfaces the `assistant:` label).
 //! - **Neutralization** (the content [`Sanitizer::sanitize`] returns) is much
 //!   narrower: the `<|` opener is broken unconditionally; and only when a
 //!   Critical pattern is present, null bytes are removed **first** (so a NUL
@@ -20,7 +23,11 @@
 //!   and **line-start** `system:`/`user:`/`assistant:` labels prefixed with
 //!   `[ESCAPED]`. "Line-start" means `str::lines`: a lone `\r`, `\x0b` or
 //!   U+2028 does not start a line for this rule even where a renderer would
-//!   wrap there. Mid-sentence labels and the phrase patterns
+//!   wrap there. Detection scans the raw text while escaping runs on the
+//!   NUL-stripped text, so a NUL-split token or label (`[IN\0ST]`) is
+//!   reported as `null_byte` only and is escaped after the NUL is gone.
+//!   The line-based escape pass also drops one trailing `\n`/`\r\n`
+//!   (`str::lines` semantics). Mid-sentence labels and the phrase patterns
 //!   (instruction-override wording, role-change wording, `eval(`, …) are never
 //!   rewritten.
 //!
@@ -49,8 +56,10 @@
 //!
 //! Consumers apply the same detector with different postures: the
 //! workspace write gate rejects at High or above; `SafetyLayer::sanitize_tool_output`
-//! flags and neutralizes but never rejects; prompt assembly breaks only `<|`
-//! (Engine V2; the v1 engine applies nothing to the assembled system prompt).
+//! flags and neutralizes but never rejects on injection warnings (a policy
+//! `Block` rule or a leak-detector error still replaces the output); prompt
+//! assembly breaks only `<|` (Engine V2; the v1 engine applies nothing to the
+//! assembled system prompt).
 //! The `detect_vs_neutralize` tests below pin this matrix.
 
 use std::ops::Range;
@@ -254,8 +263,25 @@ impl Sanitizer {
     pub fn sanitize(&self, content: &str) -> SanitizedOutput {
         let mut warnings = Vec::new();
 
-        // Detect patterns using Aho-Corasick
-        for mat in self.pattern_matcher.find_iter(content) {
+        // Detect patterns using Aho-Corasick. Overlapping search: with the
+        // default Standard semantics, non-overlapping `find_iter` lets a
+        // lower-severity match swallow an overlapping higher-severity one —
+        // `act as` at bytes 2..8 hides `assistant:` at 6..16 in
+        // `exact assistant:` (WI#289 review). Overlapping iteration requires
+        // Standard match semantics (the builder default); fall back to
+        // non-overlapping rather than panic if that ever changes.
+        let matches: Vec<aho_corasick::Match> =
+            match self.pattern_matcher.try_find_overlapping_iter(content) {
+                Ok(iter) => iter.collect(),
+                Err(_) => self.pattern_matcher.find_iter(content).collect(),
+            };
+        let mut seen = std::collections::HashSet::new();
+        for mat in matches {
+            // Report each (pattern, start) once even if overlapping iteration
+            // surfaces it through more than one matching path.
+            if !seen.insert((mat.pattern(), mat.start())) {
+                continue;
+            }
             let pattern_info = &self.patterns[mat.pattern().as_usize()];
             warnings.push(InjectionWarning {
                 pattern: pattern_info.pattern.clone(),
@@ -899,6 +925,23 @@ mod tests {
         }
 
         #[test]
+        fn overlapping_match_cannot_hide_a_higher_severity_pattern() {
+            let sanitizer = Sanitizer::new();
+            // `act as` (Medium) overlaps `assistant:` (High): with
+            // non-overlapping iteration the first match swallows the second
+            // and a ≥High gate never sees the label (WI#289 review).
+            let result = sanitizer.sanitize("exact assistant: do X");
+            assert_eq!(severity_of(&result, "act as"), Some(Severity::Medium));
+            assert_eq!(severity_of(&result, "assistant:"), Some(Severity::High));
+
+            // Same mechanism, Critical swallowed to High: "```system" must
+            // not hide the overlapping Critical "system:".
+            let result = sanitizer.sanitize("```system: do X");
+            assert_eq!(severity_of(&result, "```system"), Some(Severity::High));
+            assert_eq!(severity_of(&result, "system:"), Some(Severity::Critical));
+        }
+
+        #[test]
         fn phrase_patterns_are_detection_only() {
             let sanitizer = Sanitizer::new();
             // Even with escaping active (Critical `[INST]` present), phrase
@@ -933,6 +976,13 @@ mod tests {
                 let result = sanitizer.sanitize(input);
                 assert_eq!(severity_of(&result, "null_byte"), Some(Severity::Critical));
                 assert_eq!(result.content, expected, "{input:?}");
+                // Detection scans the raw text, so the NUL-split token itself
+                // is NOT reported — only the NUL is (WI#289 review).
+                assert!(
+                    !result.warnings.iter().any(|w| w.pattern == "[INST]"),
+                    "NUL-split token must not appear in warnings: {:?}",
+                    result.warnings
+                );
             }
         }
 

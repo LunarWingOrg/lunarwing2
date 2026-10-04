@@ -95,7 +95,9 @@ can repair quickly (WI#288).
 The gate is deliberately **stricter than the sanitizer's own neutralization**
 (WI#289 — decision: document, not align). Detection matches role labels and
 override phrasing anywhere in the text, so a mid-sentence `user:` rejects
-exactly like a line-start one, while the sanitizer's render-time escaping only
+exactly like a line-start one, and overlapping matches are all reported, so a
+benign-looking phrase cannot hide a label it touches (`act as` overlapping
+`assistant:` still rejects), while the sanitizer's render-time escaping only
 prefixes *line-start* role labels (and only when a Critical pattern fires) and
 never rewrites phrase patterns. The asymmetry stays because, for these files,
 the write gate is the only keyword defense — prompt assembly applies nothing

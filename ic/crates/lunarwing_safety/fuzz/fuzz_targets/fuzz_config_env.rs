@@ -8,12 +8,12 @@ fuzz_target!(|data: &[u8]| {
         let sanitizer = Sanitizer::new();
         let sanitized = sanitizer.sanitize(input);
         // WI#289: sanitization may legitimately empty its input — null-byte
-        // removal deletes bytes, so an all-NUL input sanitizes to "".
+        // removal deletes bytes, and the line-based escape pass drops one
+        // trailing \n/\r\n (str::lines semantics), so e.g. "\0\n" → "".
         if !input.is_empty() && sanitized.content.is_empty() {
-            assert!(
-                input.chars().all(|c| c == '\0'),
-                "sanitize() produced empty content for non-NUL input"
-            );
+            let stripped = input.replace('\0', "");
+            let only_deletable = matches!(stripped.as_str(), "" | "\n" | "\r\n");
+            assert!(only_deletable, "emptied non-deletable: {input:?}"); // safety: fuzz oracle
         }
         // If no modification occurred, content must equal input.
         if !sanitized.was_modified {
