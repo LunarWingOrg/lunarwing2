@@ -494,7 +494,10 @@ pub trait LlmProvider: Send + Sync {
     ///
     /// Providers that do not support native streaming inherit a safe fallback
     /// that performs the existing blocking completion and emits one text delta
-    /// followed by terminal metadata.
+    /// followed by terminal metadata. An empty completion emits no text delta
+    /// at all (matching `complete_with_tools_stream`), so the WI#297
+    /// empty-stream detection in the retry/failover layers sees the
+    /// `Done`-first shape regardless of provider.
     async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
         let response = self.complete(request).await?;
         let usage = TokenUsage {
@@ -503,13 +506,14 @@ pub trait LlmProvider: Send + Sync {
             cache_read_input_tokens: response.cache_read_input_tokens,
             cache_creation_input_tokens: response.cache_creation_input_tokens,
         };
-        let chunks = vec![
-            Ok(LlmStreamChunk::TextDelta(response.content)),
-            Ok(LlmStreamChunk::Done {
-                usage: Some(usage),
-                finish_reason: response.finish_reason.as_str().to_string(),
-            }),
-        ];
+        let mut chunks = Vec::new();
+        if !response.content.is_empty() {
+            chunks.push(Ok(LlmStreamChunk::TextDelta(response.content)));
+        }
+        chunks.push(Ok(LlmStreamChunk::Done {
+            usage: Some(usage),
+            finish_reason: response.finish_reason.as_str().to_string(),
+        }));
         Ok(stream::iter(chunks).boxed())
     }
 

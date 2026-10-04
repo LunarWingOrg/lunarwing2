@@ -3,7 +3,7 @@ use futures::stream;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, LlmProvider, LlmStream, LlmStreamChunk, ToolCompletionRequest,
+    CompletionRequest, FinishReason, LlmProvider, LlmStream, LlmStreamChunk, ToolCompletionRequest,
 };
 
 #[derive(Clone)]
@@ -24,23 +24,99 @@ impl ProviderStreamRequest {
     }
 }
 
-pub(crate) enum FirstStreamItem<'a> {
-    Empty,
+/// Outcome of opening a provider stream and consuming past any content-free
+/// leading chunks (WI#297).
+///
+/// There is deliberately no `Empty` variant: an empty-but-successful stream
+/// is reported as [`LlmError::EmptyStream`] so retry and failover layers
+/// treat a 200-with-nothing response as a failure instead of a successful
+/// empty stream.
+pub(crate) enum StreamOpening<'a> {
+    /// First meaningful chunk plus the rest of the stream. A terminal `Done`
+    /// never appears here — it is terminal by contract, so a `Done` arriving
+    /// first means the stream carried no content whatever its finish string.
+    Content { first: LlmStreamChunk, rest: LlmStream<'a> },
+    /// Stream setup failed, a pre-content item errored, or the stream proved
+    /// to be empty.
     Error(LlmError),
-    Chunk {
-        first: LlmStreamChunk,
-        rest: LlmStream<'a>,
-    },
 }
 
-pub(crate) async fn take_first<'a>(mut stream: LlmStream<'a>) -> FirstStreamItem<'a> {
-    match stream.next().await {
-        None => FirstStreamItem::Empty,
-        Some(Err(error)) => FirstStreamItem::Error(error),
-        Some(Ok(first)) => FirstStreamItem::Chunk {
-            first,
-            rest: stream,
-        },
+/// Build the typed empty-stream error for a provider stream that produced no
+/// content (WI#297).
+///
+/// `raw_finish_reason` is the provider's terminal finish string when a `Done`
+/// chunk was seen; `None` means the stream ended before any chunk at all. The
+/// WI#292 classification is kept typed so retry/failover can distinguish
+/// transient empties from deterministic `Length`/`ContentFilter` ones, while
+/// `detail` keeps the raw spelling visible to operators.
+pub(crate) fn empty_stream_error(provider: &str, raw_finish_reason: Option<&str>) -> LlmError {
+    let (finish, detail) = match raw_finish_reason {
+        Some(raw) => (
+            FinishReason::from_stream_reason(raw),
+            format!("completed with no content (finish_reason: {raw})"),
+        ),
+        None => (
+            FinishReason::Unknown,
+            "ended before any chunk".to_string(),
+        ),
+    };
+    LlmError::EmptyStream {
+        provider: provider.to_string(),
+        finish,
+        detail,
+    }
+}
+
+/// Whether an empty completion with this finish reason could change if the
+/// same request were retried against this provider or failed over to the next
+/// leg (WI#297).
+///
+/// `Stop`/`Unknown` (and `ToolUse` anomalies where a `Done` claims tool calls
+/// that never arrived) are transient. `Length` is deterministic — the model
+/// burned its output budget before any visible text — and `ContentFilter` is
+/// a refusal; neither is fixed by re-sending the identical request.
+pub(crate) fn is_transient_empty_finish(finish: &FinishReason) -> bool {
+    matches!(
+        finish,
+        FinishReason::Stop | FinishReason::ToolUse | FinishReason::Unknown
+    )
+}
+
+/// Whether `error` is a transient empty-stream outcome that callers may
+/// retry, fail over, or cascade-escalate on (WI#297).
+pub(crate) fn is_transient_empty_stream(error: &LlmError) -> bool {
+    matches!(
+        error,
+        LlmError::EmptyStream { finish, .. } if is_transient_empty_finish(finish)
+    )
+}
+
+/// Consume `stream` past leading content-free `TextDelta("")` chunks and
+/// classify the first meaningful item.
+///
+/// Some providers (notably the blocking `complete_stream` fallback before
+/// WI#297, and chat gateways) emit an empty text delta ahead of `Done` for an
+/// empty completion; skipping those keeps detection shape-independent so the
+/// failover chain cannot accept an empty answer as success.
+pub(crate) async fn open_stream<'a>(
+    mut stream: LlmStream<'a>,
+    provider: &str,
+) -> StreamOpening<'a> {
+    loop {
+        match stream.next().await {
+            None => return StreamOpening::Error(empty_stream_error(provider, None)),
+            Some(Err(error)) => return StreamOpening::Error(error),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text.is_empty() => continue,
+            Some(Ok(LlmStreamChunk::Done { finish_reason, .. })) => {
+                return StreamOpening::Error(empty_stream_error(provider, Some(&finish_reason)));
+            }
+            Some(Ok(first)) => {
+                return StreamOpening::Content {
+                    first,
+                    rest: stream,
+                };
+            }
+        }
     }
 }
 
@@ -52,18 +128,29 @@ pub(crate) fn replay_first<'a>(first: LlmStreamChunk, rest: LlmStream<'a>) -> Ll
 mod tests {
     use futures::StreamExt;
 
-    use super::{FirstStreamItem, replay_first, take_first};
+    use super::{
+        StreamOpening, empty_stream_error, is_transient_empty_finish, is_transient_empty_stream,
+        open_stream, replay_first,
+    };
+    use crate::llm::provider::FinishReason;
     use crate::llm::{LlmError, LlmStreamChunk};
 
+    fn done_chunk(finish_reason: &str) -> LlmStreamChunk {
+        LlmStreamChunk::Done {
+            usage: None,
+            finish_reason: finish_reason.to_string(),
+        }
+    }
+
     #[tokio::test]
-    async fn take_first_separates_the_first_successful_chunk() {
+    async fn open_stream_separates_the_first_successful_chunk() {
         let stream = futures::stream::iter([
             Ok(LlmStreamChunk::TextDelta("first".to_string())),
             Ok(LlmStreamChunk::TextDelta("second".to_string())),
         ])
         .boxed();
 
-        let FirstStreamItem::Chunk { first, rest } = take_first(stream).await else {
+        let StreamOpening::Content { first, rest } = open_stream(stream, "test").await else {
             panic!("expected a successful first chunk");
         };
 
@@ -83,7 +170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn take_first_separates_an_initial_error() {
+    async fn open_stream_separates_an_initial_error() {
         let stream = futures::stream::iter([Err(LlmError::RequestFailed {
             provider: "test".to_string(),
             reason: "failed before output".to_string(),
@@ -91,16 +178,149 @@ mod tests {
         .boxed();
 
         assert!(matches!(
-            take_first(stream).await,
-            FirstStreamItem::Error(LlmError::RequestFailed { provider, reason })
+            open_stream(stream, "test").await,
+            StreamOpening::Error(LlmError::RequestFailed { provider, reason })
                 if provider == "test" && reason == "failed before output"
         ));
     }
 
     #[tokio::test]
-    async fn take_first_reports_an_empty_stream() {
+    async fn open_stream_maps_zero_chunks_to_typed_empty_stream_error() {
         let stream = futures::stream::empty().boxed();
 
-        assert!(matches!(take_first(stream).await, FirstStreamItem::Empty));
+        assert!(matches!(
+            open_stream(stream, "primary").await,
+            StreamOpening::Error(LlmError::EmptyStream {
+                provider,
+                finish: FinishReason::Unknown,
+                detail,
+            }) if provider == "primary" && detail == "ended before any chunk"
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_stream_maps_done_first_to_typed_empty_stream_error() {
+        // `stop`/`length`/`content_filter`/"" and the tool-finish anomaly all
+        // count: a terminal `Done` first means the stream carried no content
+        // (WI#297 F5).
+        for finish_reason in ["stop", "length", "content_filter", "tool_calls", ""] {
+            let stream = futures::stream::iter([Ok(done_chunk(finish_reason))]).boxed();
+
+            let opening = open_stream(stream, "primary").await;
+
+            assert!(
+                matches!(
+                    opening,
+                    StreamOpening::Error(LlmError::EmptyStream { provider, detail, .. })
+                        if provider == "primary" && detail.contains(finish_reason)
+                ),
+                "finish_reason {finish_reason:?} should map to an empty-stream error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_stream_skips_leading_empty_text_deltas() {
+        let stream = futures::stream::iter([
+            Ok(LlmStreamChunk::TextDelta(String::new())),
+            Ok(LlmStreamChunk::TextDelta(String::new())),
+            Ok(LlmStreamChunk::TextDelta("real content".to_string())),
+        ])
+        .boxed();
+
+        let StreamOpening::Content { first, .. } = open_stream(stream, "primary").await else {
+            panic!("expected the leading empty deltas to be skipped");
+        };
+
+        assert!(matches!(
+            &first,
+            LlmStreamChunk::TextDelta(text) if text == "real content"
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_stream_maps_empty_deltas_then_done_to_empty_stream_error() {
+        // The WI#297 F1 production shape: `[TextDelta(""), Done{stop}]`.
+        let stream = futures::stream::iter([
+            Ok(LlmStreamChunk::TextDelta(String::new())),
+            Ok(done_chunk("stop")),
+        ])
+        .boxed();
+
+        assert!(matches!(
+            open_stream(stream, "primary").await,
+            StreamOpening::Error(LlmError::EmptyStream {
+                provider,
+                finish: FinishReason::Stop,
+                ..
+            }) if provider == "primary"
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_stream_treats_tool_call_chunks_as_content() {
+        let stream = futures::stream::iter([
+            Ok(LlmStreamChunk::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("search".to_string()),
+                args_delta: "{}".to_string(),
+            }),
+            Ok(done_chunk("tool_calls")),
+        ])
+        .boxed();
+
+        assert!(matches!(
+            open_stream(stream, "primary").await,
+            StreamOpening::Content {
+                first: LlmStreamChunk::ToolCallDelta { index: 0, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_stream_error_classifies_finish_reasons() {
+        let length = empty_stream_error("primary", Some("max_tokens"));
+        assert!(matches!(
+            length,
+            LlmError::EmptyStream {
+                finish: FinishReason::Length,
+                ..
+            }
+        ));
+
+        let eof = empty_stream_error("primary", None);
+        assert!(matches!(
+            eof,
+            LlmError::EmptyStream {
+                finish: FinishReason::Unknown,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn transient_empty_finish_classification() {
+        assert!(is_transient_empty_finish(&FinishReason::Stop));
+        assert!(is_transient_empty_finish(&FinishReason::Unknown));
+        assert!(is_transient_empty_finish(&FinishReason::ToolUse));
+        assert!(!is_transient_empty_finish(&FinishReason::Length));
+        assert!(!is_transient_empty_finish(&FinishReason::ContentFilter));
+    }
+
+    #[test]
+    fn transient_empty_stream_only_matches_typed_empty_errors() {
+        let transient = empty_stream_error("primary", Some("stop"));
+        assert!(is_transient_empty_stream(&transient));
+
+        let deterministic = empty_stream_error("primary", Some("content_filter"));
+        assert!(!is_transient_empty_stream(&deterministic));
+
+        let other = LlmError::InvalidResponse {
+            provider: "primary".to_string(),
+            reason: "some other invalid response".to_string(),
+        };
+        assert!(!is_transient_empty_stream(&other));
     }
 }

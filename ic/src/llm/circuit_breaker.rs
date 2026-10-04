@@ -237,7 +237,10 @@ impl CircuitBreakerProvider {
 /// This answers: "should this error count toward tripping the circuit breaker?"
 ///
 /// Includes `SessionExpired` because repeated session failures signal backend
-/// auth infrastructure trouble.
+/// auth infrastructure trouble, and transient `EmptyStream` outcomes
+/// (WI#297): a provider that keeps answering 200-with-nothing is degraded.
+/// Deterministic empties (`length`/`content_filter`) are request-specific and
+/// excluded.
 ///
 /// Excludes client errors that are the caller's problem, not backend trouble:
 /// `AuthFailed`, `ContextLengthExceeded`, `ModelNotAvailable`, `Json`.
@@ -245,16 +248,17 @@ impl CircuitBreakerProvider {
 /// See also `retry::is_retryable()` which answers a different question:
 /// "could retrying this exact request succeed?"
 fn is_transient(err: &LlmError) -> bool {
-    matches!(
-        err,
-        LlmError::RequestFailed { .. }
-            | LlmError::RateLimited { .. }
-            | LlmError::InvalidResponse { .. }
-            | LlmError::SessionExpired { .. }
-            | LlmError::SessionRenewalFailed { .. }
-            | LlmError::Http(_)
-            | LlmError::Io(_)
-    )
+    crate::llm::streaming::is_transient_empty_stream(err)
+        || matches!(
+            err,
+            LlmError::RequestFailed { .. }
+                | LlmError::RateLimited { .. }
+                | LlmError::InvalidResponse { .. }
+                | LlmError::SessionExpired { .. }
+                | LlmError::SessionRenewalFailed { .. }
+                | LlmError::Http(_)
+                | LlmError::Io(_)
+        )
 }
 
 #[async_trait]
