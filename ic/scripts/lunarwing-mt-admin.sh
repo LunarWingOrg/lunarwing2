@@ -567,6 +567,8 @@ value is preserved across re-provision):
                                    the breaker opens and fast-fails (default 7)
   LLM_CIRCUIT_BREAKER_RECOVERY_SECS  Seconds the breaker stays open before it
                                    probes for recovery (default 45)
+  ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS  Cap on tool-calling rounds per lightweight
+                                   routine run (new tenants 6; hard limit 10)
 EOF
 }
 
