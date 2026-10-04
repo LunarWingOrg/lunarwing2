@@ -270,13 +270,16 @@ mod tests {
     #[test]
     fn classifies_empty_stream_failures_as_empty() {
         assert_eq!(
-            classify_stream_failure(&crate::llm::streaming::empty_stream_error("test", None)),
+            classify_stream_failure(&crate::llm::streaming::empty_stream_error(
+                "test", None, None
+            )),
             StreamFailureReason::Empty
         );
         assert_eq!(
             classify_stream_failure(&crate::llm::streaming::empty_stream_error(
                 "test",
-                Some("stop")
+                Some("stop"),
+                None
             )),
             StreamFailureReason::Empty
         );

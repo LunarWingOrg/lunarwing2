@@ -27,6 +27,13 @@ pub enum LlmError {
     /// and `ToolUse` anomalies where a `Done` claims tool calls that never
     /// arrived) from deterministic ones (`Length`, `ContentFilter`) that the
     /// same request cannot fix.
+    ///
+    /// `usage` is the token usage the provider still billed for the empty
+    /// completion when it reported it (a `Done`-first chunk). Retry and
+    /// failover decorators fold the usage of attempts they discard forward
+    /// (into this field on exhaustion, or into the `Retried` stream
+    /// observation on success) so billed tokens are never silently dropped
+    /// from cost accounting (MR !1395 F-2).
     #[error("Provider {provider} returned an empty stream: {detail}")]
     EmptyStream {
         provider: String,
@@ -34,6 +41,8 @@ pub enum LlmError {
         /// Operator-facing detail, e.g. "ended before any chunk" or
         /// "completed with no content (finish_reason: stop)".
         detail: String,
+        /// Billed usage of the empty completion(s) this error covers.
+        usage: Option<crate::llm::provider::TokenUsage>,
     },
 
     #[error("REPL argument corruption from {provider}: {signature}")]
@@ -246,6 +255,7 @@ mod tests {
                 provider: "test-provider".to_string(),
                 finish,
                 detail: "completed with no content".to_string(),
+                usage: None,
             };
 
             assert_eq!(error.recovery_kind(), "empty_response");
@@ -261,6 +271,7 @@ mod tests {
             provider: "test-provider".to_string(),
             finish: crate::llm::provider::FinishReason::ContentFilter,
             detail: "completed with no content (finish_reason: content_filter)".to_string(),
+            usage: None,
         };
         assert_eq!(filtered.recovery_kind(), "content_filtered");
         assert!(filtered.recovery_instruction().is_none());
@@ -270,6 +281,7 @@ mod tests {
             provider: "test-provider".to_string(),
             finish: crate::llm::provider::FinishReason::Length,
             detail: "completed with no content (finish_reason: length)".to_string(),
+            usage: None,
         };
         assert_eq!(truncated.recovery_kind(), "output_budget_exhausted");
         assert!(truncated.recovery_instruction().is_none());

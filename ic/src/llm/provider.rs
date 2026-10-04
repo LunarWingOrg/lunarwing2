@@ -462,7 +462,7 @@ pub struct ModelMetadata {
 }
 
 /// Token usage from a single LLM call.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -475,6 +475,21 @@ pub struct TokenUsage {
 impl TokenUsage {
     pub fn total(&self) -> u32 {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Field-wise saturating sum, used to fold the usage of billed-but-empty
+    /// stream attempts into one accounting total (WI#297).
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(rhs.cache_read_input_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(rhs.cache_creation_input_tokens),
+        }
     }
 }
 

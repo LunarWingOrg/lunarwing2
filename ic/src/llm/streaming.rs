@@ -3,7 +3,8 @@ use futures::stream;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, FinishReason, LlmProvider, LlmStream, LlmStreamChunk, ToolCompletionRequest,
+    CompletionRequest, FinishReason, LlmProvider, LlmStream, LlmStreamChunk, TokenUsage,
+    ToolCompletionRequest,
 };
 
 #[derive(Clone)]
@@ -44,6 +45,20 @@ pub(crate) enum StreamOpening<'a> {
     Error(LlmError),
 }
 
+/// Maximum length of the provider's raw finish spelling kept in the
+/// operator-facing detail string (MR !1395 F-6).
+const MAX_RAW_FINISH_CHARS: usize = 64;
+
+/// Sanitize the provider's raw finish string for the operator-facing detail:
+/// strip control characters and cap the length so a hostile or buggy gateway
+/// cannot inject unbounded or terminal-control text into host-side logs.
+fn sanitize_raw_finish(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_RAW_FINISH_CHARS)
+        .collect()
+}
+
 /// Build the typed empty-stream error for a provider stream that produced no
 /// content (WI#297).
 ///
@@ -51,12 +66,20 @@ pub(crate) enum StreamOpening<'a> {
 /// chunk was seen; `None` means the stream ended before any chunk at all. The
 /// WI#292 classification is kept typed so retry/failover can distinguish
 /// transient empties from deterministic `Length`/`ContentFilter` ones, while
-/// `detail` keeps the raw spelling visible to operators.
-pub(crate) fn empty_stream_error(provider: &str, raw_finish_reason: Option<&str>) -> LlmError {
+/// `detail` keeps the raw spelling visible to operators. `usage` carries the
+/// tokens the provider still billed for the empty completion (MR !1395 F-2).
+pub(crate) fn empty_stream_error(
+    provider: &str,
+    raw_finish_reason: Option<&str>,
+    usage: Option<TokenUsage>,
+) -> LlmError {
     let (finish, detail) = match raw_finish_reason {
         Some(raw) => (
             FinishReason::from_stream_reason(raw),
-            format!("completed with no content (finish_reason: {raw})"),
+            format!(
+                "completed with no content (finish_reason: {})",
+                sanitize_raw_finish(raw)
+            ),
         ),
         None => (FinishReason::Unknown, "ended before any chunk".to_string()),
     };
@@ -64,6 +87,7 @@ pub(crate) fn empty_stream_error(provider: &str, raw_finish_reason: Option<&str>
         provider: provider.to_string(),
         finish,
         detail,
+        usage,
     }
 }
 
@@ -104,11 +128,18 @@ pub(crate) async fn open_stream<'a>(
 ) -> StreamOpening<'a> {
     loop {
         match stream.next().await {
-            None => return StreamOpening::Error(empty_stream_error(provider, None)),
+            None => return StreamOpening::Error(empty_stream_error(provider, None, None)),
             Some(Err(error)) => return StreamOpening::Error(error),
             Some(Ok(LlmStreamChunk::TextDelta(text))) if text.is_empty() => continue,
-            Some(Ok(LlmStreamChunk::Done { finish_reason, .. })) => {
-                return StreamOpening::Error(empty_stream_error(provider, Some(&finish_reason)));
+            Some(Ok(LlmStreamChunk::Done {
+                finish_reason,
+                usage,
+            })) => {
+                return StreamOpening::Error(empty_stream_error(
+                    provider,
+                    Some(&finish_reason),
+                    usage,
+                ));
             }
             Some(Ok(first)) => {
                 return StreamOpening::Content {
@@ -132,7 +163,7 @@ mod tests {
         StreamOpening, empty_stream_error, is_transient_empty_finish, is_transient_empty_stream,
         open_stream, replay_first,
     };
-    use crate::llm::provider::FinishReason;
+    use crate::llm::provider::{FinishReason, TokenUsage};
     use crate::llm::{LlmError, LlmStreamChunk};
 
     fn done_chunk(finish_reason: &str) -> LlmStreamChunk {
@@ -194,6 +225,7 @@ mod tests {
                 provider,
                 finish: FinishReason::Unknown,
                 detail,
+                usage: None,
             }) if provider == "primary" && detail == "ended before any chunk"
         ));
     }
@@ -284,7 +316,7 @@ mod tests {
 
     #[test]
     fn empty_stream_error_classifies_finish_reasons() {
-        let length = empty_stream_error("primary", Some("max_tokens"));
+        let length = empty_stream_error("primary", Some("max_tokens"), None);
         assert!(matches!(
             length,
             LlmError::EmptyStream {
@@ -293,7 +325,7 @@ mod tests {
             }
         ));
 
-        let eof = empty_stream_error("primary", None);
+        let eof = empty_stream_error("primary", None, None);
         assert!(matches!(
             eof,
             LlmError::EmptyStream {
@@ -314,10 +346,10 @@ mod tests {
 
     #[test]
     fn transient_empty_stream_only_matches_typed_empty_errors() {
-        let transient = empty_stream_error("primary", Some("stop"));
+        let transient = empty_stream_error("primary", Some("stop"), None);
         assert!(is_transient_empty_stream(&transient));
 
-        let deterministic = empty_stream_error("primary", Some("content_filter"));
+        let deterministic = empty_stream_error("primary", Some("content_filter"), None);
         assert!(!is_transient_empty_stream(&deterministic));
 
         let other = LlmError::InvalidResponse {
@@ -325,5 +357,56 @@ mod tests {
             reason: "some other invalid response".to_string(),
         };
         assert!(!is_transient_empty_stream(&other));
+    }
+
+    // MR !1395 F-2: the usage of a billed-but-empty `Done`-first completion
+    // rides along on the typed error so decorators can account for it.
+    #[tokio::test]
+    async fn open_stream_carries_done_usage_into_the_empty_stream_error() {
+        let stream = futures::stream::iter([Ok(LlmStreamChunk::Done {
+            usage: Some(TokenUsage {
+                input_tokens: 1200,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+            finish_reason: "length".to_string(),
+        })])
+        .boxed();
+
+        assert!(matches!(
+            open_stream(stream, "primary").await,
+            StreamOpening::Error(LlmError::EmptyStream {
+                provider,
+                finish: FinishReason::Length,
+                usage: Some(TokenUsage {
+                    input_tokens: 1200,
+                    output_tokens: 0,
+                    ..
+                }),
+                ..
+            }) if provider == "primary"
+        ));
+    }
+
+    // MR !1395 F-6: the raw finish spelling embedded in the operator-facing
+    // detail is capped and stripped of control characters.
+    #[tokio::test]
+    async fn open_stream_sanitizes_the_raw_finish_reason_in_detail() {
+        let hostile = format!("stop\u{1b}[2J\u{07}{}", "x".repeat(200));
+        let stream = futures::stream::iter([Ok(LlmStreamChunk::Done {
+            usage: None,
+            finish_reason: hostile,
+        })])
+        .boxed();
+
+        let StreamOpening::Error(LlmError::EmptyStream { detail, .. }) =
+            open_stream(stream, "primary").await
+        else {
+            panic!("expected an empty-stream error");
+        };
+
+        assert!(!detail.chars().any(char::is_control));
+        assert!(detail.len() <= "completed with no content (finish_reason: )".len() + 64);
     }
 }

@@ -957,18 +957,20 @@ mod tests {
         use crate::llm::provider::FinishReason;
         use crate::llm::streaming::empty_stream_error;
 
-        assert!(is_retryable(&empty_stream_error("p", Some("stop"))));
-        assert!(is_retryable(&empty_stream_error("p", None)));
-        assert!(is_retryable(&empty_stream_error("p", Some("tool_calls"))));
+        assert!(is_retryable(&empty_stream_error("p", Some("stop"), None)));
+        assert!(is_retryable(&empty_stream_error("p", None, None)));
+        assert!(is_retryable(&empty_stream_error("p", Some("tool_calls"), None)));
         assert!(!is_retryable(&LlmError::EmptyStream {
             provider: "p".to_string(),
             finish: FinishReason::Length,
             detail: "completed with no content (finish_reason: length)".to_string(),
+            usage: None,
         }));
         assert!(!is_retryable(&LlmError::EmptyStream {
             provider: "p".to_string(),
             finish: FinishReason::ContentFilter,
             detail: "completed with no content (finish_reason: content_filter)".to_string(),
+            usage: None,
         }));
     }
 

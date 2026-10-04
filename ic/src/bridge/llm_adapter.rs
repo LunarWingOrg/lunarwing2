@@ -663,6 +663,7 @@ mod tests {
             provider: "test".into(),
             finish: FinishReason::ContentFilter,
             detail: "completed with no content (finish_reason: content_filter)".into(),
+            usage: None,
         });
         assert_eq!(filtered, ModelFailureKind::ContentFiltered);
         assert!(!filtered.is_recoverable());
@@ -675,6 +676,7 @@ mod tests {
             provider: "test".into(),
             finish: FinishReason::Length,
             detail: "completed with no content (finish_reason: length)".into(),
+            usage: None,
         });
         assert_eq!(truncated, ModelFailureKind::OutputBudgetExhausted);
         assert!(!truncated.is_recoverable());
@@ -697,6 +699,7 @@ mod tests {
                 provider: "test".into(),
                 finish,
                 detail: "completed with no content".into(),
+                usage: None,
             });
             assert_eq!(kind, ModelFailureKind::Transient);
             assert!(kind.is_recoverable());
