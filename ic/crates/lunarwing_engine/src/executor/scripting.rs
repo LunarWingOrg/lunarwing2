@@ -3790,8 +3790,75 @@ except:
 "#;
 
         let result = run_code(code, effects, &thread).await.unwrap();
-        // Tool not found raises NameError before we even get to dispatch
+        // The wildcard `tools` lease covers `unknown_tool`, so the call is
+        // dispatched to the mock executor (which answers it) rather than
+        // raising; either way the script reaches a FINAL.
         assert!(result.final_answer.is_some(), "stdout: {}", result.stdout);
+    }
+
+    // ── Leased but unadvertised action (the WI#295 premise) ──
+
+    /// The `mission_*` functions are never in `available_actions`, yet CodeAct
+    /// reaches them: Monty compiles a direct call to an undefined name into
+    /// an external call, and `preflight_action` matches it against the
+    /// thread's leases without consulting the advertised list. A leased but
+    /// unadvertised action therefore reaches the effect executor, and an
+    /// unleased one is refused by preflight with a `RuntimeError` — not a
+    /// `NameError`. `tool_info`'s `callable` answer rests on this (WI#295).
+    #[tokio::test]
+    async fn leased_action_absent_from_available_actions_is_callable_from_code() {
+        let thread = make_test_thread();
+        // Advertises nothing: `available_actions` is empty.
+        let mock = Arc::new(MockEffects::new(vec![], vec![]));
+        let effects: Arc<dyn EffectExecutor> = mock.clone();
+        let leases = LeaseManager::new();
+        leases
+            .grant(
+                thread.id,
+                "missions",
+                GrantedActions::Specific(vec!["mission_list".into()]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let code = r#"
+result = await mission_list()
+FINAL(str(result))
+"#;
+        let result = run_code_with_leases(code, effects.clone(), &thread, &leases)
+            .await
+            .unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        let calls = mock.calls_snapshot();
+        assert_eq!(calls.len(), 1, "exactly one dispatched call: {calls:?}");
+        assert_eq!(calls[0].0, "mission_list");
+
+        let code = r#"
+try:
+    await mission_delete("x")
+    FINAL("reached")
+except Exception as e:
+    FINAL(type(e).__name__ + ":" + str(e))
+"#;
+        let result = run_code_with_leases(code, effects, &thread, &leases)
+            .await
+            .unwrap();
+        let answer = result.final_answer.as_deref().unwrap_or_default();
+        assert!(
+            answer.starts_with("RuntimeError:"),
+            "preflight refuses an unleased action with RuntimeError; answer: \
+             {answer}, stdout: {}",
+            result.stdout
+        );
+        assert!(answer.contains("mission_delete"), "{answer}");
+        assert!(!answer.contains("NameError"), "{answer}");
+        assert_eq!(
+            mock.calls_snapshot().len(),
+            1,
+            "the refused call never reaches the executor"
+        );
     }
 
     // ── FINAL works without await ───────────────────────────

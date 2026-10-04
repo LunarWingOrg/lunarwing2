@@ -16,7 +16,8 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use lunarwing_engine::{
-    ActionDef, ActionResult, CapabilityLease, EffectExecutor, EngineError, ThreadExecutionContext,
+    ActionDef, ActionResult, CapabilityLease, EffectExecutor, EngineError, LeaseManager,
+    ThreadExecutionContext, ThreadId,
 };
 
 use crate::bridge::auth_manager::{AuthCheckResult, AuthManager};
@@ -525,10 +526,24 @@ impl EffectBridgeAdapter {
     /// named … is registered" was read as "this function does not exist".
     /// Answers only while a mission manager is wired, the same condition under
     /// which the functions dispatch; `None` defers to the registry tool.
+    ///
+    /// `callable` follows the asking thread's leases ([`thread_may_call`] over
+    /// [`lunarwing_engine::MissionManager::leases`], the set the executor's
+    /// preflight consults): a thread holding no lease for the function — one
+    /// resumed after a restart, or whose lease was revoked or narrowed — is
+    /// told so instead of being promised a call preflight refuses (review R8).
+    ///
+    /// The answer is static definition text, so it skips
+    /// `execute_tool_with_safety` (parameter validation, per-tool timeout):
+    /// nothing runs that could time out, and the inputs are a fixed-name
+    /// lookup plus the `detail` enum. Every `tool_info` gate (permissions,
+    /// approval, supervision, rate limit, auth, hooks) has already run when
+    /// this is reached, and the caller still sanitizes the output.
     async fn engine_capability_tool_info(
         &self,
         lookup_name: &str,
         parameters: &serde_json::Value,
+        context: &ThreadExecutionContext,
     ) -> Option<Result<String, crate::error::Error>> {
         if lookup_name != "tool_info" {
             return None;
@@ -539,7 +554,10 @@ impl EffectBridgeAdapter {
         let action = mission_action_defs()
             .into_iter()
             .find(|action| action.name == requested)?;
-        self.mission_manager.read().await.as_ref()?;
+        // Clone the handle so the read guard is gone before the awaits below.
+        let mission_manager = self.mission_manager.read().await.as_ref().cloned()?;
+        let callable =
+            thread_may_call(mission_manager.leases(), context.thread_id, &action.name).await;
 
         let failed = |reason: String| -> crate::error::Error {
             crate::error::ToolError::ExecutionFailed {
@@ -553,6 +571,7 @@ impl EffectBridgeAdapter {
             &action.description,
             action.parameters_schema,
             MISSIONS_CAPABILITY,
+            callable,
             parameters,
         )
         .map_err(|error| failed(error.to_string()))
@@ -561,6 +580,34 @@ impl EffectBridgeAdapter {
                 .map_err(|error| failed(format!("Failed to serialize result: {error}")))
         });
         Some(answer)
+    }
+
+    /// Run `tool_info` — answering for an engine capability function when the
+    /// request names one ([`Self::engine_capability_tool_info`]) — or any
+    /// other tool through `execute_tool_with_safety` (parameter validation,
+    /// per-tool timeout). Split out of `execute_action_internal` so the
+    /// capability branch does not grow it further.
+    async fn run_tool_or_capability_info(
+        &self,
+        lookup_name: &str,
+        parameters: &serde_json::Value,
+        job_ctx: &JobContext,
+        context: &ThreadExecutionContext,
+    ) -> Result<String, crate::error::Error> {
+        if let Some(answer) = self
+            .engine_capability_tool_info(lookup_name, parameters, context)
+            .await
+        {
+            return answer;
+        }
+        crate::tools::execute::execute_tool_with_safety(
+            &self.tools,
+            &self.safety,
+            lookup_name,
+            parameters.clone(),
+            job_ctx,
+        )
+        .await
     }
 
     /// Handle mission_* function calls. Returns None if not a mission call.
@@ -1126,22 +1173,9 @@ impl EffectBridgeAdapter {
             job_ctx.metadata["notify_user"] = serde_json::json!(context.user_id);
         }
 
-        let result = match self
-            .engine_capability_tool_info(lookup_name, &parameters)
-            .await
-        {
-            Some(answer) => answer,
-            None => {
-                crate::tools::execute::execute_tool_with_safety(
-                    &self.tools,
-                    &self.safety,
-                    lookup_name,
-                    parameters.clone(),
-                    &job_ctx,
-                )
-                .await
-            }
-        };
+        let result = self
+            .run_tool_or_capability_info(lookup_name, &parameters, &job_ctx, context)
+            .await;
 
         let duration = start.elapsed();
 
@@ -1515,124 +1549,177 @@ pub(crate) const MISSIONS_CAPABILITY: &str = "missions";
 /// the LLM maps user intent correctly.
 pub(crate) fn mission_action_defs() -> Vec<ActionDef> {
     vec![
-        ActionDef {
-            name: "mission_create".into(),
-            description: "Create a new mission (routine). Use when the user wants to set up a recurring task, scheduled check, or periodic routine. Results are delivered to the current channel by default.".into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Short name for the mission/routine"},
-                    "goal": {"type": "string", "description": "What this mission should accomplish each run"},
-                    "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'system:<source>/<event_type>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events. To subscribe to engine lifecycle events, use 'system:<source>/<event_type>' (e.g. 'system:engine/thread_start')."},
-                    "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
-                    "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
-                    "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 30 when omitted."}
-                },
-                "required": ["name", "goal"]
-            }),
-            effects: vec![],
-            requires_approval: false,
-        },
-        ActionDef {
-            name: "mission_list".into(),
-            description: "List all missions and routines in the current project.".into(),
-            parameters_schema: serde_json::json!({"type": "object"}),
-            effects: vec![],
-            requires_approval: false,
-        },
-        ActionDef {
-            name: "mission_fire".into(),
-            description: "Manually trigger a mission or routine to run immediately.".into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Mission/routine ID to trigger"}
-                },
-                "required": ["id"]
-            }),
-            effects: vec![],
-            requires_approval: false,
-        },
-        ActionDef {
-            name: "mission_pause".into(),
-            description: "Pause a running mission or routine.".into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Mission/routine ID to pause"}
-                },
-                "required": ["id"]
-            }),
-            effects: vec![],
-            requires_approval: false,
-        },
-        ActionDef {
-            name: "mission_resume".into(),
-            description: "Resume a paused mission or routine.".into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Mission/routine ID to resume"}
-                },
-                "required": ["id"]
-            }),
-            effects: vec![],
-            requires_approval: false,
-        },
-        ActionDef {
-            name: "mission_update".into(),
-            description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, retry policy, success criteria, or steering focus.".into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Mission/routine ID to update"},
-                    "name": {"type": "string", "description": "New name"},
-                    "goal": {"type": "string", "description": "New goal"},
-                    "cadence": {"type": "string", "description": "New cadence: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
-                    "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
-                    "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
-                    "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
-                    "max_retries": {"type": "integer", "minimum": 0, "description": "Maximum retry attempts after an interrupted or failed fire (0 disables retries). Omit all retry parameters to leave the policy unchanged."},
-                    "initial_delay_secs": {"type": "integer", "minimum": 0, "description": "Initial retry backoff delay in seconds"},
-                    "backoff_multiplier": {"type": "number", "exclusiveMinimum": 0, "description": "Positive multiplier applied to each subsequent retry delay"},
-                    "max_delay_secs": {"type": "integer", "minimum": 0, "description": "Maximum retry backoff delay in seconds"},
-                    "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"},
-                    "current_focus": {"type": ["string", "null"], "description": "Steering focus for the next thread. Omit to leave unchanged; pass null to clear."}
-                },
-                "required": ["id"]
-            }),
-            effects: vec![],
-            requires_approval: false,
-        },
-        ActionDef {
-            name: "mission_history".into(),
-            description: "View the execution history of a mission or routine: recent fires with status, duration, and result summaries. Resolves Engine V2 mission names (as shown by mission_list).".into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Name of the mission/routine (from mission_list); alternatively pass its UUID via 'id'"},
-                    "id": {"type": "string", "description": "Mission/routine UUID (alternative to 'name')"},
-                    "limit": {"type": "integer", "description": "Max runs to return (default: 10, max: 50)"}
-                }
-            }),
-            effects: vec![],
-            requires_approval: false,
-        },
-        ActionDef {
-            name: "mission_delete".into(),
-            description: "Delete a mission or routine. Conversation insights retain a disabled tombstone (explicit resume re-enables); optionally purge their generated memory.".into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Mission/routine ID to delete"},
-                    "purge_insights": {"type": "boolean", "description": "Also remove generated insights for this mission's project/user. Only for conversation-insights. Source conversations and run audit remain. Default false."}
-                },
-                "required": ["id"]
-            }),
-            effects: vec![],
-            requires_approval: false,
-        },
+        mission_create_def(),
+        mission_list_def(),
+        mission_fire_def(),
+        mission_pause_def(),
+        mission_resume_def(),
+        mission_update_def(),
+        mission_history_def(),
+        mission_delete_def(),
     ]
+}
+
+fn mission_create_def() -> ActionDef {
+    ActionDef {
+        name: "mission_create".into(),
+        description: "Create a new mission (routine). Use when the user wants to set up a recurring task, scheduled check, or periodic routine. Results are delivered to the current channel by default.".into(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Short name for the mission/routine"},
+                "goal": {"type": "string", "description": "What this mission should accomplish each run"},
+                "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'system:<source>/<event_type>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events. To subscribe to engine lifecycle events, use 'system:<source>/<event_type>' (e.g. 'system:engine/thread_start')."},
+                "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
+                "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
+                "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 30 when omitted."}
+            },
+            "required": ["name", "goal"]
+        }),
+        effects: vec![],
+        requires_approval: false,
+    }
+}
+
+fn mission_list_def() -> ActionDef {
+    ActionDef {
+        name: "mission_list".into(),
+        description: "List all missions and routines in the current project.".into(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+        effects: vec![],
+        requires_approval: false,
+    }
+}
+
+fn mission_fire_def() -> ActionDef {
+    ActionDef {
+        name: "mission_fire".into(),
+        description: "Manually trigger a mission or routine to run immediately.".into(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Mission/routine ID to trigger"}
+            },
+            "required": ["id"]
+        }),
+        effects: vec![],
+        requires_approval: false,
+    }
+}
+
+fn mission_pause_def() -> ActionDef {
+    ActionDef {
+        name: "mission_pause".into(),
+        description: "Pause a running mission or routine.".into(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Mission/routine ID to pause"}
+            },
+            "required": ["id"]
+        }),
+        effects: vec![],
+        requires_approval: false,
+    }
+}
+
+fn mission_resume_def() -> ActionDef {
+    ActionDef {
+        name: "mission_resume".into(),
+        description: "Resume a paused mission or routine.".into(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Mission/routine ID to resume"}
+            },
+            "required": ["id"]
+        }),
+        effects: vec![],
+        requires_approval: false,
+    }
+}
+
+fn mission_update_def() -> ActionDef {
+    ActionDef {
+        name: "mission_update".into(),
+        description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, retry policy, success criteria, or steering focus.".into(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Mission/routine ID to update"},
+                "name": {"type": "string", "description": "New name"},
+                "goal": {"type": "string", "description": "New goal"},
+                "cadence": {"type": "string", "description": "New cadence: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
+                "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
+                "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
+                "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
+                "max_retries": {"type": "integer", "minimum": 0, "description": "Maximum retry attempts after an interrupted or failed fire (0 disables retries). Omit all retry parameters to leave the policy unchanged."},
+                "initial_delay_secs": {"type": "integer", "minimum": 0, "description": "Initial retry backoff delay in seconds"},
+                "backoff_multiplier": {"type": "number", "exclusiveMinimum": 0, "description": "Positive multiplier applied to each subsequent retry delay"},
+                "max_delay_secs": {"type": "integer", "minimum": 0, "description": "Maximum retry backoff delay in seconds"},
+                "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"},
+                "current_focus": {"type": ["string", "null"], "description": "Steering focus for the next thread. Omit to leave unchanged; pass null to clear."}
+            },
+            "required": ["id"]
+        }),
+        effects: vec![],
+        requires_approval: false,
+    }
+}
+
+fn mission_history_def() -> ActionDef {
+    ActionDef {
+        name: "mission_history".into(),
+        description: "View the execution history of a mission or routine: recent fires with status, duration, and result summaries. Resolves Engine V2 mission names (as shown by mission_list).".into(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name of the mission/routine (from mission_list); alternatively pass its UUID via 'id'"},
+                "id": {"type": "string", "description": "Mission/routine UUID (alternative to 'name')"},
+                "limit": {"type": "integer", "description": "Max runs to return (default: 10, max: 50)"}
+            }
+        }),
+        effects: vec![],
+        requires_approval: false,
+    }
+}
+
+fn mission_delete_def() -> ActionDef {
+    ActionDef {
+        name: "mission_delete".into(),
+        description: "Delete a mission or routine. Conversation insights retain a disabled tombstone (explicit resume re-enables); optionally purge their generated memory.".into(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Mission/routine ID to delete"},
+                "purge_insights": {"type": "boolean", "description": "Also remove generated insights for this mission's project/user. Only for conversation-insights. Source conversations and run audit remain. Default false."}
+            },
+            "required": ["id"]
+        }),
+        effects: vec![],
+        requires_approval: false,
+    }
+}
+
+/// Whether `thread_id` holds the lease to call `action_name` according to the
+/// thread manager's lease set — the predicate behind `tool_info`'s `callable`
+/// for mission functions (WI#295, review R8). It mirrors the executor's lease
+/// preflight: a valid lease covering the action, with hyphen/underscore
+/// normalization. Policy is not evaluated, because mission functions are
+/// absent from `available_actions` and preflight skips policy for them too.
+///
+/// The thread manager's leases decide for every thread they hold leases for,
+/// which includes every top-level thread whose `tool_info` call they just
+/// authorized. An `rlm_query` child runs on a private copy of its parent's
+/// leases that the host cannot see, so a thread with no leases here is
+/// answered `true` rather than a false "not callable" — the WI#295 failure
+/// mode again. Do not reduce this to `find_lease_for_action` alone.
+async fn thread_may_call(leases: &LeaseManager, thread_id: ThreadId, action_name: &str) -> bool {
+    leases
+        .find_lease_for_action(thread_id, action_name)
+        .await
+        .is_some()
+        || leases.active_for_thread(thread_id).await.is_empty()
 }
 
 fn is_v1_only_tool(name: &str) -> bool {
@@ -3984,18 +4071,32 @@ FINAL(echoed + "|" + http_result["error"])"#,
         Arc<MissionManager>,
         Arc<dyn lunarwing_engine::Store>,
     ) {
+        let (mgr, _leases, store) = mission_manager_with_leases();
+        (make_adapter(), mgr, store)
+    }
+
+    /// A mission manager over a thread manager whose [`LeaseManager`] the
+    /// test keeps, so `tool_info`'s `callable` can be driven by granting and
+    /// revoking leases (WI#295, review R8). Also hands back the backing store,
+    /// which the WI#269 history tests seed directly.
+    fn mission_manager_with_leases() -> (
+        Arc<MissionManager>,
+        Arc<LeaseManager>,
+        Arc<dyn lunarwing_engine::Store>,
+    ) {
         let store: Arc<dyn lunarwing_engine::Store> =
             Arc::new(crate::bridge::store_adapter::HybridStore::new(None));
+        let leases = Arc::new(LeaseManager::new());
         let thread_manager = Arc::new(ThreadManager::new(
             Arc::new(NeverCalledLlm),
             Arc::new(NeverCalledEffects),
             Arc::clone(&store),
             Arc::new(CapabilityRegistry::new()),
-            Arc::new(LeaseManager::new()),
+            Arc::clone(&leases),
             Arc::new(PolicyEngine::new()),
         ));
-        let mgr = Arc::new(MissionManager::new(store.clone(), thread_manager));
-        (make_adapter(), mgr, store)
+        let mgr = Arc::new(MissionManager::new(Arc::clone(&store), thread_manager));
+        (mgr, leases, store)
     }
 
     fn mission_create_ctx() -> lunarwing_engine::ThreadExecutionContext {
@@ -4526,39 +4627,89 @@ FINAL(echoed + "|" + http_result["error"])"#,
         adapter: &EffectBridgeAdapter,
         params: serde_json::Value,
     ) -> lunarwing_engine::ActionResult {
+        run_tool_info_on(adapter, lunarwing_engine::ThreadId::new(), params).await
+    }
+
+    /// `tool_info` as asked by `thread_id`, so the answer can depend on that
+    /// thread's leases.
+    async fn run_tool_info_on(
+        adapter: &EffectBridgeAdapter,
+        thread_id: lunarwing_engine::ThreadId,
+        params: serde_json::Value,
+    ) -> lunarwing_engine::ActionResult {
         adapter
             .execute_action(
                 "tool_info",
                 params,
                 &lease(),
-                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_tool_info")),
+                &exec_ctx(thread_id, Some("call_tool_info")),
             )
             .await
             .expect("tool_info returns an action result")
     }
 
+    /// Grant `thread` a `capability` lease covering exactly `actions`.
+    async fn grant(
+        leases: &LeaseManager,
+        thread: lunarwing_engine::ThreadId,
+        capability: &str,
+        actions: &[&str],
+    ) -> CapabilityLease {
+        leases
+            .grant(
+                thread,
+                capability,
+                lunarwing_engine::GrantedActions::Specific(
+                    actions.iter().map(|action| (*action).to_string()).collect(),
+                ),
+                None,
+                None,
+            )
+            .await
+            .expect("grant lease")
+    }
+
+    /// Every advertised mission function name, for a lease covering them all.
+    fn all_mission_function_names() -> Vec<String> {
+        mission_action_defs()
+            .into_iter()
+            .map(|action| action.name)
+            .collect()
+    }
+
     /// WI#295 acceptance: in an engine thread `tool_info` answers for a real
     /// registry tool exactly as before, and for an effect-capability function
     /// (`mission_create`) with its description and parameters instead of the
-    /// false "No tool named … is registered".
+    /// false "No tool named … is registered". The asking thread holds the
+    /// `missions` lease, so the function is reported callable; a near-miss
+    /// name is not a mission function and keeps the registry miss.
     #[tokio::test]
     async fn tool_info_describes_registry_tools_and_mission_functions() {
         let adapter = adapter_with_tool_info().await;
-        let (_unused, mgr) = adapter_with_mission_manager();
+        let (mgr, leases, _store) = mission_manager_with_leases();
         adapter.set_mission_manager(mgr).await;
+        let thread = lunarwing_engine::ThreadId::new();
+        grant(&leases, thread, "tools", &["tool_info"]).await;
+        let mission_names = all_mission_function_names();
+        let mission_names: Vec<&str> = mission_names.iter().map(String::as_str).collect();
+        grant(&leases, thread, MISSIONS_CAPABILITY, &mission_names).await;
 
-        let web = run_tool_info(&adapter, serde_json::json!({"name": "web_search"})).await;
+        let web =
+            run_tool_info_on(&adapter, thread, serde_json::json!({"name": "web_search"})).await;
         assert!(!web.is_error, "{:?}", web.output);
-        assert_eq!(web.output["name"], "web_search");
-        assert_eq!(web.output["parameters"], serde_json::json!(["query"]));
-        assert!(
-            web.output.get("kind").is_none(),
-            "registry tools keep the plain answer: {:?}",
-            web.output
+        assert_eq!(
+            web.output,
+            serde_json::json!({
+                "name": "web_search",
+                "description": "Search the web",
+                "parameters": ["query"]
+            }),
+            "registry tools keep the plain answer"
         );
 
-        let mission = run_tool_info(
+        let mission = run_tool_info_on(
             &adapter,
+            thread,
             serde_json::json!({"name": "mission_create", "detail": "schema"}),
         )
         .await;
@@ -4571,6 +4722,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
         assert_eq!(mission.output["description"], def.description.as_str());
         assert_eq!(mission.output["kind"], "engine_capability");
         assert_eq!(mission.output["capability"], MISSIONS_CAPABILITY);
+        assert_eq!(mission.output["registered_tool"], false);
         assert_eq!(mission.output["callable"], true);
         assert_eq!(
             mission.output["schema"]["required"],
@@ -4589,10 +4741,29 @@ FINAL(echoed + "|" + http_result["error"])"#,
         assert!(note.contains("CodeAct"), "{note}");
 
         // CodeAct's positional form resolves too.
-        let positional =
-            run_tool_info(&adapter, serde_json::json!({"_args": ["mission_history"]})).await;
+        let positional = run_tool_info_on(
+            &adapter,
+            thread,
+            serde_json::json!({"_args": ["mission_history"]}),
+        )
+        .await;
         assert!(!positional.is_error, "{:?}", positional.output);
         assert_eq!(positional.output["name"], "mission_history");
+
+        // Matching is exact (after hyphen normalization): a near-miss is not
+        // described as a mission function, the registry miss stands.
+        let near_miss = run_tool_info_on(
+            &adapter,
+            thread,
+            serde_json::json!({"name": "mission_creat"}),
+        )
+        .await;
+        assert!(near_miss.is_error, "{:?}", near_miss.output);
+        let error = near_miss.output["error"].as_str().expect("error text");
+        assert!(
+            error.contains("No tool named 'mission_creat' is registered"),
+            "{error}"
+        );
     }
 
     /// Without a mission manager the functions do not dispatch, so tool_info
@@ -4628,5 +4799,142 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 def.name
             );
         }
+    }
+
+    /// Review R8: `callable` follows the asking thread's leases. Thread T
+    /// holds only a `live_tools` lease for `tool_info` — the shape of a
+    /// thread resumed after a restart, which is re-leased registry tools only
+    /// — while another thread O holds the `missions` lease. The answer for T
+    /// must be "not callable", so the check is keyed on the asking thread and
+    /// not on whether anyone holds the lease.
+    #[tokio::test]
+    async fn tool_info_reports_unleased_mission_function_as_not_callable() {
+        let adapter = adapter_with_tool_info().await;
+        let (mgr, leases, _store) = mission_manager_with_leases();
+        adapter.set_mission_manager(mgr).await;
+        let asking = lunarwing_engine::ThreadId::new();
+        let other = lunarwing_engine::ThreadId::new();
+        grant(&leases, asking, "live_tools", &["tool_info"]).await;
+        grant(&leases, other, MISSIONS_CAPABILITY, &["mission_create"]).await;
+
+        let result = run_tool_info_on(
+            &adapter,
+            asking,
+            serde_json::json!({"name": "mission_create"}),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["kind"], "engine_capability");
+        assert_eq!(result.output["registered_tool"], false);
+        assert_eq!(
+            result.output["callable"], false,
+            "a thread without the missions lease must not be told it can call \
+             mission_create: {:?}",
+            result.output
+        );
+        let note = result.output["note"].as_str().expect("note");
+        assert!(note.contains("no active lease"), "{note}");
+        assert!(!note.contains("directly callable"), "{note}");
+    }
+
+    /// Review R8: `callable` is per function and tracks the lease: a
+    /// `missions` lease for a subset covers only that subset, a hyphen alias
+    /// resolves like dispatch, and revoking the lease flips the answer.
+    #[tokio::test]
+    async fn tool_info_callable_follows_the_threads_mission_lease() {
+        let adapter = adapter_with_tool_info().await;
+        let (mgr, leases, _store) = mission_manager_with_leases();
+        adapter.set_mission_manager(mgr).await;
+        let thread = lunarwing_engine::ThreadId::new();
+        grant(&leases, thread, "tools", &["tool_info"]).await;
+        let missions = grant(
+            &leases,
+            thread,
+            MISSIONS_CAPABILITY,
+            &["mission_list", "mission_history"],
+        )
+        .await;
+
+        let listed = run_tool_info_on(
+            &adapter,
+            thread,
+            serde_json::json!({"name": "mission_list"}),
+        )
+        .await;
+        assert!(!listed.is_error, "{:?}", listed.output);
+        assert_eq!(listed.output["callable"], true, "{:?}", listed.output);
+
+        let delete = run_tool_info_on(
+            &adapter,
+            thread,
+            serde_json::json!({"name": "mission_delete"}),
+        )
+        .await;
+        assert!(!delete.is_error, "{:?}", delete.output);
+        assert_eq!(delete.output["name"], "mission_delete");
+        assert_eq!(
+            delete.output["callable"], false,
+            "the lease covers mission_list and mission_history only: {:?}",
+            delete.output
+        );
+
+        let aliased = run_tool_info_on(
+            &adapter,
+            thread,
+            serde_json::json!({"name": "mission-history"}),
+        )
+        .await;
+        assert!(!aliased.is_error, "{:?}", aliased.output);
+        assert_eq!(aliased.output["name"], "mission_history");
+        assert_eq!(aliased.output["callable"], true, "{:?}", aliased.output);
+
+        leases.revoke(missions.id, "test").await;
+        let revoked = run_tool_info_on(
+            &adapter,
+            thread,
+            serde_json::json!({"name": "mission_list"}),
+        )
+        .await;
+        assert!(!revoked.is_error, "{:?}", revoked.output);
+        assert_eq!(
+            revoked.output["callable"], false,
+            "a revoked lease no longer makes the function callable: {:?}",
+            revoked.output
+        );
+    }
+
+    /// An `rlm_query` child runs on a private copy of its parent's leases
+    /// that the host's lease manager never sees. Parent P holds `tool_info`
+    /// and all eight mission functions here; a fresh child id C has no leases
+    /// in this manager and must still be answered `callable: true` — unknown
+    /// is not "not callable" (the WI#295 false negative again). This rejects
+    /// both a find-only check (false for C) and a global-emptiness check
+    /// (false for C, because P's leases exist).
+    #[tokio::test]
+    async fn tool_info_keeps_mission_functions_callable_on_private_leases() {
+        let adapter = adapter_with_tool_info().await;
+        let (mgr, leases, _store) = mission_manager_with_leases();
+        adapter.set_mission_manager(mgr).await;
+        let parent = lunarwing_engine::ThreadId::new();
+        let child = lunarwing_engine::ThreadId::new();
+        grant(&leases, parent, "tools", &["tool_info"]).await;
+        let mission_names = all_mission_function_names();
+        let mission_names: Vec<&str> = mission_names.iter().map(String::as_str).collect();
+        grant(&leases, parent, MISSIONS_CAPABILITY, &mission_names).await;
+
+        let result = run_tool_info_on(
+            &adapter,
+            child,
+            serde_json::json!({"name": "mission_create"}),
+        )
+        .await;
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["kind"], "engine_capability");
+        assert_eq!(
+            result.output["callable"], true,
+            "a thread the host holds no leases for is answered callable, not \
+             refused: {:?}",
+            result.output
+        );
     }
 }

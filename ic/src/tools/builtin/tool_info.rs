@@ -11,8 +11,9 @@
 //! The tool itself only knows the tool registry. Engine V2 threads can also
 //! call capability functions that are not registry tools (the `mission_*`
 //! family); the effect bridge answers `tool_info` for those with
-//! [`engine_action_info`] so a registry miss is never mistaken for "this
-//! function does not exist" (WI#295).
+//! [`engine_action_info`] — including whether the asking thread holds the
+//! lease to call the function (`callable`) — so a registry miss is never
+//! mistaken for "this function does not exist" (WI#295).
 
 use std::sync::Weak;
 
@@ -129,14 +130,19 @@ fn render_info(
 
 /// `tool_info` answer for an Engine V2 capability function that is not a
 /// registry tool, such as `mission_create` (WI#295). Same shape as a registry
-/// answer at every detail level, plus fields saying what it is and how to call
-/// it. Only call this where the function really is callable — the effect
-/// bridge does, for engine threads with the capability wired.
+/// answer at every detail level, plus fields saying what it is and whether
+/// the asking thread holds the lease to call it: `callable` is that thread's
+/// lease-based capability, which the effect bridge derives from the thread
+/// manager's leases (the set the executor's preflight consults) and passes
+/// in. The bridge calls this only where the function dispatches — engine
+/// threads with a mission manager wired; the note tells a thread without the
+/// lease that a call from it is refused.
 pub(crate) fn engine_action_info(
     name: &str,
     description: &str,
     schema: serde_json::Value,
     capability: &str,
+    callable: bool,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, ToolError> {
     let detail = ToolInfoDetail::parse(params)?;
@@ -144,12 +150,21 @@ pub(crate) fn engine_action_info(
     info["kind"] = serde_json::json!("engine_capability");
     info["capability"] = serde_json::json!(capability);
     info["registered_tool"] = serde_json::json!(false);
-    info["callable"] = serde_json::json!(true);
-    info["note"] = serde_json::json!(format!(
-        "'{name}' is not a registry tool, so the tool registry and tool_list do not show \
-         it. It is an Engine V2 '{capability}' capability function, directly callable \
-         from this thread's CodeAct code, e.g. `await {name}(...)`."
-    ));
+    info["callable"] = serde_json::json!(callable);
+    let note = if callable {
+        format!(
+            "'{name}' is not a registry tool, so the tool registry and tool_list do not show \
+             it. It is an Engine V2 '{capability}' capability function, directly callable \
+             from this thread's CodeAct code, e.g. `await {name}(...)`."
+        )
+    } else {
+        format!(
+            "'{name}' is not a registry tool, so the tool registry and tool_list do not show \
+             it. It is an Engine V2 '{capability}' capability function, but this thread holds \
+             no active lease for it, so a call from this thread is refused."
+        )
+    };
+    info["note"] = serde_json::json!(note);
     Ok(info)
 }
 
@@ -428,6 +443,7 @@ mod tests {
             "Create a mission",
             schema.clone(),
             "missions",
+            true,
             &serde_json::json!({"name": "mission_create"}),
         )
         .expect("names detail");
@@ -448,6 +464,7 @@ mod tests {
             "Create a mission",
             schema.clone(),
             "missions",
+            true,
             &serde_json::json!({"name": "mission_create", "detail": "summary"}),
         )
         .expect("summary detail");
@@ -461,6 +478,7 @@ mod tests {
             "Create a mission",
             schema.clone(),
             "missions",
+            true,
             &serde_json::json!({"name": "mission_create", "detail": "schema"}),
         )
         .expect("schema detail");
@@ -472,10 +490,41 @@ mod tests {
                 "Create a mission",
                 schema,
                 "missions",
+                true,
                 &serde_json::json!({"name": "mission_create", "detail": "verbose"}),
             ),
             Err(ToolError::InvalidParameters(_))
         ));
+    }
+
+    /// Review R8: a thread without the lease gets the same definition with
+    /// `callable: false` and a note that says so — never "directly callable".
+    #[test]
+    fn test_engine_action_info_reports_unleased_function_as_not_callable() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"]
+        });
+        let info = engine_action_info(
+            "mission_delete",
+            "Delete a mission",
+            schema,
+            "missions",
+            false,
+            &serde_json::json!({"name": "mission_delete"}),
+        )
+        .expect("names detail");
+        assert_eq!(info["name"], "mission_delete");
+        assert_eq!(info["parameters"], serde_json::json!(["id"]));
+        assert_eq!(info["kind"], "engine_capability");
+        assert_eq!(info["capability"], "missions");
+        assert_eq!(info["registered_tool"], false);
+        assert_eq!(info["callable"], false);
+        let note = info["note"].as_str().expect("note");
+        assert!(note.contains("not a registry tool"), "{note}");
+        assert!(note.contains("no active lease"), "{note}");
+        assert!(!note.contains("directly callable"), "{note}");
     }
 
     #[tokio::test]
