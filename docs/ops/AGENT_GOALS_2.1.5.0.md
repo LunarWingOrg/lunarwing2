@@ -34,11 +34,10 @@
 
 ## Phase 2 — Features & Polish (for goals referencing work items, read comments on work items as well)
 
-3. [x] audit all crates and ensure there are no security vulnerabilities - Last attempt REJECTED - see previous MR and comments on it for revision and re-attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1371 - please use previous MR as a REFERENCE going forward for this item
-   - DONE (re-attempt, branch `rarity/kimi-3-20261003-2200`): all six MR !1371 adversarial findings (A1-A6) addressed; audit doc `docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md`, advisory-db `ef6173c` (2026-10-03)
+3. [x] audit all crates and ensure there are no security vulnerabilities - Last attempt REJECTED - see previous MR and comments on it for revision and re-attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1371 - please use previous MR as a REFERENCE going forward for this item   - DONE (re-attempt, branch `rarity/kimi-3-20261003-2200`): all six MR !1371 adversarial findings (A1-A6) addressed; audit doc `docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md`, advisory-db `ef6173c` (2026-10-03)
    - A1 (conclusion honesty): the audit now states the real posture — 8 vulnerability advisories + 1 informational accepted and shipped: 5 compile into default builds (rustls-webpki 0.102.8 x4 + h2 0.3.27 via the libsql 0.6.0 legacy chain; webpki validates libSQL remote-replica TLS), 3 compile into every feature set (rsa via the LunarWing-enabled russh "rsa" feature, failure x2 via the vendored libsignal-protocol OMEMO wrapper). No unaccounted advisory exists in any committed lockfile.
    - A2 (guard false premise): `.gitlab/scripts/check-lockfile-only-advisories.sh` now queries `cargo tree --workspace --all-features --target all` (vendored libsignal path deps are workspace members, so atty via env_logger dev-dep DOES resolve); per-entry modes (`absent` pyo3 / `no-dev` atty); a guard entry whose crate leaves the lockfile fails as stale; taskset aligned to 0-11; 5 hermetic `.gitlab/tests` cases pin pass/fail/stale branches.
-   - A3 (exposure + follow-ups): `ic/deny.toml` entries carry exposure statements; bans floors deny h2 >=0.4.0,<0.4.19 and rustls-webpki >=0.103.0,<0.103.15 so patched copies cannot silently downgrade; clearing work items filed: #304 (libsql legacy chain), #305 (russh rsa feature), #306 (libsignal wrapper off failure+rental).
+   - A3 (exposure + follow-ups)
    - A4 (graph coverage): `cargo-deny-check.sh` and the guard now audit `--workspace --all-features` (~900 crates, what CI compiles); the widened graph surfaced only rental 0.5.6 (RUSTSEC-2021-0134, informational unmaintained) — accepted with exposure note.
    - A5 (reproducibility): new committed `.gitlab/scripts/check-satellite-advisories.sh` sweeps all 26 manifest roots (git-discovered, pinned cargo-deny, shared policy) and is wired as the `satellite-advisory-sweep` full-validation job; both gates print the advisory-db commit; validate_config.py + tests pin the wiring.
    - A6 (scope): audit doc names the unaudited surfaces — 7 Python requirements files, 2 npm lockfiles (kimicode4lunarwing), digest-pinned container images (trivy-scanned, items #1/#2), and five lock-less dev/test manifests
@@ -86,8 +85,8 @@
 29. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
 30. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
 31. [x] (S) RESERVED4itemstoworkonwilldiscusslater
-32. [x] (S) RESERVED
-33. [x] (S) RESERVED
+32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/307
+33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/303 - time to update opencode2 again yay
 34. [x] (S) RESERVED
 35. [x] (S) RESERVED
 36. [x] (S) RESERVED
