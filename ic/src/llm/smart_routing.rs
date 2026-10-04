@@ -1022,7 +1022,9 @@ impl LlmProvider for SmartRoutingProvider {
                             primary_model = %self.primary.model_name(),
                             "Smart routing: Escalating stream to primary (cheap model returned an empty stream)"
                         );
-                        self.stats.cascade_escalations.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .cascade_escalations
+                            .fetch_add(1, Ordering::Relaxed);
                         self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
                         return self.primary.complete_stream(request).await;
                     }

@@ -35,7 +35,10 @@ pub(crate) enum StreamOpening<'a> {
     /// First meaningful chunk plus the rest of the stream. A terminal `Done`
     /// never appears here — it is terminal by contract, so a `Done` arriving
     /// first means the stream carried no content whatever its finish string.
-    Content { first: LlmStreamChunk, rest: LlmStream<'a> },
+    Content {
+        first: LlmStreamChunk,
+        rest: LlmStream<'a>,
+    },
     /// Stream setup failed, a pre-content item errored, or the stream proved
     /// to be empty.
     Error(LlmError),
@@ -55,10 +58,7 @@ pub(crate) fn empty_stream_error(provider: &str, raw_finish_reason: Option<&str>
             FinishReason::from_stream_reason(raw),
             format!("completed with no content (finish_reason: {raw})"),
         ),
-        None => (
-            FinishReason::Unknown,
-            "ended before any chunk".to_string(),
-        ),
+        None => (FinishReason::Unknown, "ended before any chunk".to_string()),
     };
     LlmError::EmptyStream {
         provider: provider.to_string(),
@@ -200,19 +200,22 @@ mod tests {
 
     #[tokio::test]
     async fn open_stream_maps_done_first_to_typed_empty_stream_error() {
-        // `stop`/`length`/`content_filter`/"" and the tool-finish anomaly all
-        // count: a terminal `Done` first means the stream carried no content
-        // (WI#297 F5).
+        // `stop`/`length`/`content_filter`/`tool_calls`/"" all count: a
+        // terminal `Done` first means the stream carried no content (WI#297
+        // F5). Assert the exact detail so an empty finish reason cannot make
+        // the assertion vacuous (F8).
         for finish_reason in ["stop", "length", "content_filter", "tool_calls", ""] {
             let stream = futures::stream::iter([Ok(done_chunk(finish_reason))]).boxed();
 
             let opening = open_stream(stream, "primary").await;
 
+            let expected_detail =
+                format!("completed with no content (finish_reason: {finish_reason})");
             assert!(
                 matches!(
                     opening,
                     StreamOpening::Error(LlmError::EmptyStream { provider, detail, .. })
-                        if provider == "primary" && detail.contains(finish_reason)
+                        if provider == "primary" && detail == expected_detail
                 ),
                 "finish_reason {finish_reason:?} should map to an empty-stream error"
             );
