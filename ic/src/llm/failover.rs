@@ -1071,10 +1071,11 @@ mod tests {
         let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
 
         for _ in 0..4 {
-            failover
+            let stream = failover
                 .complete_stream(make_request())
                 .await
                 .expect("fallback stream should open");
+            collect_ok(stream).await;
         }
 
         // First three requests charged the primary (threshold 3 -> cooldown);
