@@ -248,7 +248,8 @@ pub enum RoutineAction {
         /// Tool-calling rounds per run (default: 3), each run ending with
         /// one text-only recovery turn. Capped at runtime by the operator's
         /// `ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS` and [`MAX_TOOL_ROUNDS_LIMIT`].
-        /// Only used when use_tools is true.
+        /// Only used when use_tools is true. Changed later with
+        /// `routine_update` or `lunarwing routines edit --max-tool-rounds`.
         #[serde(default = "default_max_tool_rounds")]
         max_tool_rounds: u32,
     },
@@ -369,6 +370,22 @@ impl RoutineAction {
             other => Err(RoutineError::UnknownActionType {
                 action_type: other.to_string(),
             }),
+        }
+    }
+
+    /// Set a lightweight routine's tool-round budget, clamped to 1 through
+    /// [`MAX_TOOL_ROUNDS_LIMIT`] like a stored row, and return the stored
+    /// value. A full-job routine has no tool-round budget: it is left
+    /// unchanged and `None` is returned.
+    pub(crate) fn set_max_tool_rounds(&mut self, rounds: u64) -> Option<u32> {
+        match self {
+            RoutineAction::Lightweight {
+                max_tool_rounds, ..
+            } => {
+                *max_tool_rounds = clamp_max_tool_rounds(rounds);
+                Some(*max_tool_rounds)
+            }
+            RoutineAction::FullJob { .. } => None,
         }
     }
 
@@ -1167,5 +1184,43 @@ mod tests {
             }
             _ => panic!("expected Lightweight"),
         }
+    }
+
+    #[test]
+    fn test_set_max_tool_rounds_clamps_lightweight_and_skips_full_job() {
+        let mut lightweight = RoutineAction::Lightweight {
+            prompt: "Send the digest.".to_string(),
+            context_paths: Vec::new(),
+            max_tokens: 4096,
+            use_tools: true,
+            max_tool_rounds: 3,
+        };
+        for (requested, stored) in [(5, 5), (0, 1), (999, MAX_TOOL_ROUNDS_LIMIT)] {
+            assert_eq!(lightweight.set_max_tool_rounds(requested), Some(stored));
+            assert!(
+                matches!(
+                    &lightweight,
+                    RoutineAction::Lightweight { max_tool_rounds, .. } if *max_tool_rounds == stored
+                ),
+                "{requested} should be stored as {stored}: {lightweight:?}"
+            );
+        }
+
+        let mut full_job = RoutineAction::FullJob {
+            title: "Deploy review".to_string(),
+            description: "Review and deploy pending changes".to_string(),
+            max_iterations: 7,
+        };
+        assert_eq!(full_job.set_max_tool_rounds(5), None);
+        assert!(
+            matches!(
+                &full_job,
+                RoutineAction::FullJob {
+                    max_iterations: 7,
+                    ..
+                }
+            ),
+            "{full_job:?}"
+        );
     }
 }

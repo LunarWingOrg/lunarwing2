@@ -10,8 +10,10 @@ use clap::Subcommand;
 use uuid::Uuid;
 
 use crate::agent::routine::{
-    NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RunStatus, Trigger, next_cron_fire,
+    MAX_TOOL_ROUNDS_LIMIT, NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RunStatus,
+    Trigger, next_cron_fire,
 };
+use crate::config::RoutineConfig;
 use crate::db::Database;
 
 /// Routines subcommands.
@@ -90,6 +92,11 @@ pub enum RoutinesCommand {
         /// New cooldown in seconds
         #[arg(long)]
         cooldown: Option<u64>,
+
+        /// New tool-calling rounds per run for a lightweight routine (1-10);
+        /// runs still stay within ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS
+        #[arg(long)]
+        max_tool_rounds: Option<u32>,
     },
 
     /// Enable a routine
@@ -172,18 +179,17 @@ pub async fn run_routines_command(
             description,
             timezone,
             cooldown,
+            max_tool_rounds,
         } => {
-            edit(
-                &db,
-                user_id,
-                &name,
-                schedule.as_deref(),
-                prompt.as_deref(),
-                description.as_deref(),
-                timezone.as_deref(),
+            let edits = RoutineEdits {
+                schedule: schedule.as_deref(),
+                prompt: prompt.as_deref(),
+                description: description.as_deref(),
+                timezone: timezone.as_deref(),
                 cooldown,
-            )
-            .await
+                max_tool_rounds,
+            };
+            edit(&db, user_id, &name, edits).await
         }
         RoutinesCommand::Enable { name } => set_enabled(&db, user_id, &name, true).await,
         RoutinesCommand::Disable { name } => set_enabled(&db, user_id, &name, false).await,
@@ -386,24 +392,30 @@ async fn create(
 
 // ── Edit ────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+/// The changes one `routines edit` asks for; `None` leaves a field as it is.
+struct RoutineEdits<'a> {
+    schedule: Option<&'a str>,
+    prompt: Option<&'a str>,
+    description: Option<&'a str>,
+    timezone: Option<&'a str>,
+    cooldown: Option<u64>,
+    max_tool_rounds: Option<u32>,
+}
+
 async fn edit(
     db: &Arc<dyn Database>,
     user_id: &str,
     name: &str,
-    schedule: Option<&str>,
-    prompt: Option<&str>,
-    description: Option<&str>,
-    timezone: Option<&str>,
-    cooldown: Option<u64>,
+    edits: RoutineEdits<'_>,
 ) -> anyhow::Result<()> {
     let mut routine = require_routine(db, user_id, name).await?;
+    let timezone = edits.timezone;
     validate_timezone_arg(timezone)?;
 
     let mut changed = false;
 
     // Update schedule if provided (only valid for cron routines).
-    if let Some(new_schedule) = schedule {
+    if let Some(new_schedule) = edits.schedule {
         let tz = timezone.or(match &routine.trigger {
             Trigger::Cron { timezone, .. } => timezone.as_deref(),
             _ => None,
@@ -432,7 +444,7 @@ async fn edit(
         }
     }
 
-    if let Some(new_prompt) = prompt {
+    if let Some(new_prompt) = edits.prompt {
         match &mut routine.action {
             RoutineAction::Lightweight { prompt: p, .. } => {
                 *p = new_prompt.to_string();
@@ -445,13 +457,19 @@ async fn edit(
         }
     }
 
-    if let Some(new_desc) = description {
+    if let Some(new_desc) = edits.description {
         routine.description = new_desc.to_string();
         changed = true;
     }
 
-    if let Some(cd) = cooldown {
+    if let Some(cd) = edits.cooldown {
         routine.guardrails.cooldown = std::time::Duration::from_secs(cd);
+        changed = true;
+    }
+
+    // Checked before anything is saved, so a refused value changes nothing.
+    if let Some(rounds) = edits.max_tool_rounds {
+        apply_max_tool_rounds(&mut routine.action, rounds)?;
         changed = true;
     }
 
@@ -463,7 +481,69 @@ async fn edit(
     routine.updated_at = Utc::now();
     db.update_routine(&routine).await?;
     println!("Updated routine '{}'", name);
+    if let Some(rounds) = edits.max_tool_rounds {
+        print_max_tool_rounds_notes(&routine.action, rounds);
+    }
     Ok(())
+}
+
+/// Set a lightweight routine's tool-round budget (WI#291). Unlike
+/// `routine_update`, an out-of-range value is refused rather than clamped, so
+/// the operator sees the real ceiling.
+fn apply_max_tool_rounds(action: &mut RoutineAction, rounds: u32) -> anyhow::Result<()> {
+    if !(1..=MAX_TOOL_ROUNDS_LIMIT).contains(&rounds) {
+        anyhow::bail!("--max-tool-rounds must be between 1 and {MAX_TOOL_ROUNDS_LIMIT}");
+    }
+    if action.set_max_tool_rounds(u64::from(rounds)).is_none() {
+        anyhow::bail!("--max-tool-rounds applies only to lightweight routines");
+    }
+    Ok(())
+}
+
+/// Settings that keep a new `max_tool_rounds` from taking effect. `config` is
+/// the routine config as this process resolves it from the environment the
+/// daemon also reads (`None` when it cannot be resolved).
+fn max_tool_rounds_notes(
+    rounds: u32,
+    use_tools: bool,
+    config: Option<&RoutineConfig>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !use_tools {
+        notes.push(
+            "this routine runs without tools (use_tools=false), so max_tool_rounds has no effect"
+                .to_string(),
+        );
+    }
+    if let Some(config) = config {
+        if !config.lightweight_tools_enabled {
+            notes.push(
+                "ROUTINES_LIGHTWEIGHT_TOOLS=false disables tools for every lightweight routine, \
+                 so max_tool_rounds has no effect until it is enabled and the daemon restarted"
+                    .to_string(),
+            );
+        }
+        let cap = config.lightweight_max_iterations;
+        if cap < rounds {
+            notes.push(format!(
+                "runs stay within ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS={cap}; raise it and \
+                 restart the daemon to use {rounds} rounds"
+            ));
+        }
+    }
+    notes
+}
+
+/// Print the notes for a `--max-tool-rounds` edit. The routine config is
+/// resolved only here, so the other edits never depend on it.
+fn print_max_tool_rounds_notes(action: &RoutineAction, rounds: u32) {
+    let RoutineAction::Lightweight { use_tools, .. } = action else {
+        return;
+    };
+    let config = RoutineConfig::resolve().ok();
+    for note in max_tool_rounds_notes(rounds, *use_tools, config.as_ref()) {
+        println!("Note: {note}");
+    }
 }
 
 // ── Enable / Disable ────────────────────────────────────────
@@ -798,5 +878,139 @@ mod tests {
             }
             other => panic!("expected lightweight action, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn max_tool_rounds_notes_flag_settings_that_make_the_budget_moot() {
+        let config = |cap: u32, tools: bool| RoutineConfig {
+            lightweight_max_iterations: cap,
+            lightweight_tools_enabled: tools,
+            ..RoutineConfig::default()
+        };
+
+        let capped = max_tool_rounds_notes(6, true, Some(&config(3, true)));
+        assert_eq!(capped.len(), 1, "{capped:?}");
+        assert!(
+            capped
+                .iter()
+                .all(|note| note.contains("ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=3")),
+            "{capped:?}"
+        );
+
+        let fits = max_tool_rounds_notes(3, true, Some(&config(6, true)));
+        assert!(fits.is_empty(), "{fits:?}");
+
+        let no_tools = max_tool_rounds_notes(5, false, None);
+        assert_eq!(no_tools.len(), 1, "{no_tools:?}");
+        assert!(
+            no_tools.iter().all(|note| note.contains("use_tools=false")),
+            "{no_tools:?}"
+        );
+
+        let tools_off = max_tool_rounds_notes(5, true, Some(&config(6, false)));
+        assert_eq!(tools_off.len(), 1, "{tools_off:?}");
+        assert!(
+            tools_off
+                .iter()
+                .all(|note| note.contains("ROUTINES_LIGHTWEIGHT_TOOLS=false")),
+            "{tools_off:?}"
+        );
+    }
+
+    /// `routines edit --max-tool-rounds` is the per-routine budget surface
+    /// that works on every engine (WI#291 review R2).
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn cli_edit_sets_lightweight_max_tool_rounds() {
+        let harness = crate::testing::TestHarnessBuilder::new().build().await;
+        let db = harness.db.clone();
+        run_routines_command(
+            RoutinesCommand::Create {
+                name: "cli-digest".to_string(),
+                schedule: "0 0 9 * * *".to_string(),
+                prompt: "Prepare the morning digest.".to_string(),
+                description: "CLI created routine".to_string(),
+                timezone: Some("UTC".to_string()),
+                cooldown: 300,
+                notify_channel: None,
+            },
+            db.clone(),
+            "user1",
+        )
+        .await
+        .expect("create routine");
+
+        let edit_rounds = |name: &str, rounds: u32| RoutinesCommand::Edit {
+            name: name.to_string(),
+            schedule: None,
+            prompt: None,
+            description: None,
+            timezone: None,
+            cooldown: None,
+            max_tool_rounds: Some(rounds),
+        };
+        let stored_rounds = |routine: Option<Routine>| match routine.map(|r| r.action) {
+            Some(RoutineAction::Lightweight {
+                max_tool_rounds, ..
+            }) => max_tool_rounds,
+            other => panic!("expected the lightweight cli-digest, got {other:?}"),
+        };
+
+        run_routines_command(edit_rounds("cli-digest", 6), db.clone(), "user1")
+            .await
+            .expect("edit max_tool_rounds");
+        let routine = db.get_routine_by_name("user1", "cli-digest").await;
+        assert_eq!(stored_rounds(routine.expect("get routine")), 6);
+
+        for out_of_range in [11, 0] {
+            let err =
+                run_routines_command(edit_rounds("cli-digest", out_of_range), db.clone(), "user1")
+                    .await
+                    .expect_err("out-of-range budgets are refused, not clamped");
+            assert!(err.to_string().contains("between 1 and 10"), "{err}");
+        }
+        let routine = db.get_routine_by_name("user1", "cli-digest").await;
+        assert_eq!(
+            stored_rounds(routine.expect("get routine")),
+            6,
+            "a refused value must not be saved"
+        );
+
+        let now = Utc::now();
+        let full_job = Routine {
+            id: Uuid::new_v4(),
+            name: "cli-full-job".to_string(),
+            description: "Full-job routine".to_string(),
+            user_id: "user1".to_string(),
+            enabled: true,
+            trigger: Trigger::Manual,
+            action: RoutineAction::FullJob {
+                title: "Review".to_string(),
+                description: "Review pending changes".to_string(),
+                max_iterations: 5,
+            },
+            guardrails: RoutineGuardrails {
+                cooldown: std::time::Duration::from_secs(0),
+                max_concurrent: 1,
+                dedup_window: None,
+                retry: Default::default(),
+            },
+            notify: NotifyConfig::default(),
+            last_run_at: None,
+            next_fire_at: None,
+            run_count: 0,
+            consecutive_failures: 0,
+            state: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        db.create_routine(&full_job).await.expect("create full job");
+        let err = run_routines_command(edit_rounds("cli-full-job", 5), db.clone(), "user1")
+            .await
+            .expect_err("full_job routines have no tool-round budget");
+        assert!(
+            err.to_string().contains("only to lightweight routines"),
+            "{err}"
+        );
     }
 }

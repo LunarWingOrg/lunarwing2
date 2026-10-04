@@ -162,6 +162,10 @@ assert_eq "default ORCHESTRATOR_SELF_MODIFY" \
 # daemon default of 3.
 assert_eq "default ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS" \
   "$(envval ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS)" "6"
+# WI#291 review R2: the cap does not lift a routine's own budget, and Engine V2
+# chats cannot edit v1 routines, so the rendered comment names the host CLI.
+assert_eq "env comment names the per-routine CLI" \
+  "$(grep -c 'routines edit --name <routine> --max-tool-rounds <n>' "$MT_FIXTURE/env/lunarwing.env" || true)" "1"
 # WI#154: MT tenants default to kernel-enforced no-egress sandbox networking.
 assert_eq "default SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "none"
 # WI#223: MT tenants pin the podman runtime, the lean locally-built sandbox

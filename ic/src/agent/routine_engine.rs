@@ -1857,6 +1857,38 @@ fn recover_routine_model_failure(
     })
 }
 
+/// Host command that changes one routine's `max_tool_rounds` on every engine
+/// (WI#291 review R2). The placeholders stay literal: routine names are
+/// unvalidated user strings and are never interpolated into a system message.
+pub(crate) const ROUTINES_EDIT_COMMAND: &str =
+    "lunarwing routines edit --name <routine> --max-tool-rounds <n>";
+
+/// Where one routine's `max_tool_rounds` can be raised, as the tail of a
+/// sentence. `routine_update` works only in legacy-engine (v1) chats: Engine
+/// V2 redirects the `routine_*` tools to mission tools, which cannot edit v1
+/// routines, and a routine cannot call `routine_update` on itself (autonomous
+/// denylist). The host CLI works on every engine.
+fn raise_routine_advice(up_to: u32) -> String {
+    format!(
+        "set its max_tool_rounds (up to {up_to}) with routine_update from a legacy-engine (v1) \
+         chat, or on the host with `{ROUTINES_EDIT_COMMAND}` (Engine V2 chats cannot edit v1 \
+         routines; on a multi-tenant host the operator runs it as the tenant)"
+    )
+}
+
+/// The knob that bounded a lightweight run's tool rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingKnob {
+    /// The routine's own `max_tool_rounds`, below the operator cap.
+    Routine,
+    /// The operator cap, below the routine's own value.
+    Operator,
+    /// Both are equal (the default 3/3): raising only one changes nothing.
+    Both,
+    /// [`MAX_TOOL_ROUNDS_LIMIT`].
+    HardLimit,
+}
+
 /// Tool-round budget for one lightweight routine run (WI#291).
 ///
 /// `max_tool_rounds: N` buys N tool-calling rounds followed by one text-only
@@ -1883,6 +1915,22 @@ impl ToolRoundBudget {
         }
     }
 
+    /// Which knob bounded this run. Below the hard limit `rounds` equals the
+    /// routine's value, the operator cap, or both.
+    fn binding_knob(&self) -> BindingKnob {
+        if self.rounds >= MAX_TOOL_ROUNDS_LIMIT {
+            return BindingKnob::HardLimit;
+        }
+        match (
+            self.routine == self.rounds,
+            self.operator_cap == self.rounds,
+        ) {
+            (true, true) => BindingKnob::Both,
+            (true, false) => BindingKnob::Routine,
+            _ => BindingKnob::Operator,
+        }
+    }
+
     /// System message for the final text-only turn. States the real numbers
     /// and names the knob that actually bounded the run — the old text told
     /// the agent to raise knobs that were silently capped at 5.
@@ -1900,23 +1948,7 @@ impl ToolRoundBudget {
                  state any work that needed tools."
             );
         }
-        let ceiling = operator_cap.min(MAX_TOOL_ROUNDS_LIMIT);
-        let next_step = if routine < ceiling {
-            format!(
-                "To give this routine more rounds, set its max_tool_rounds (up to {ceiling}) \
-                 with routine_update."
-            )
-        } else if operator_cap < MAX_TOOL_ROUNDS_LIMIT {
-            format!(
-                "The operator cap bounded this run: more rounds need \
-                 ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS raised (hard limit {MAX_TOOL_ROUNDS_LIMIT})."
-            )
-        } else {
-            format!(
-                "{MAX_TOOL_ROUNDS_LIMIT} rounds is the hard limit: split the work across \
-                 routines or reduce tool calls."
-            )
-        };
+        let next_step = self.next_step();
         format!(
             "Routine iteration limit reached: all {rounds} tool-calling round(s) of this run's \
              budget are used (routine max_tool_rounds={routine}, operator cap \
@@ -1926,12 +1958,44 @@ impl ToolRoundBudget {
              each other can share one round. {next_step}"
         )
     }
+
+    /// Advice that can actually raise the budget past this run's rounds. At a
+    /// tie both knobs must rise: naming only the operator cap there (the old
+    /// text, at the default 3/3) asked for an env change that does nothing
+    /// for a routine still at 3 (WI#291 review N1).
+    fn next_step(&self) -> String {
+        match self.binding_knob() {
+            BindingKnob::Routine => format!(
+                "To give this routine more rounds, {}.",
+                raise_routine_advice(self.operator_cap.min(MAX_TOOL_ROUNDS_LIMIT))
+            ),
+            BindingKnob::Operator => format!(
+                "The operator cap bounded this run: more rounds need \
+                 ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS raised (up to this routine's {}; hard limit \
+                 {MAX_TOOL_ROUNDS_LIMIT}; read at daemon start).",
+                self.routine.min(MAX_TOOL_ROUNDS_LIMIT)
+            ),
+            BindingKnob::Both => format!(
+                "This routine's max_tool_rounds and the operator cap \
+                 ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS are both {}, so raising only one changes \
+                 nothing: raise the operator cap (hard limit {MAX_TOOL_ROUNDS_LIMIT}; read at \
+                 daemon start) and {}.",
+                self.rounds,
+                raise_routine_advice(MAX_TOOL_ROUNDS_LIMIT)
+            ),
+            BindingKnob::HardLimit => format!(
+                "{MAX_TOOL_ROUNDS_LIMIT} rounds is the hard limit: split the work across \
+                 routines or reduce tool calls."
+            ),
+        }
+    }
 }
 
 /// Execute a lightweight routine with tool execution support (agentic loop).
 ///
 /// This is a simplified version of the full dispatcher loop:
 /// - At most `budget.rounds` tool-calling rounds, then one text-only turn
+/// - A provider-recovery retry does not spend a tool round
 /// - Sequential tool execution (not parallel)
 /// - Uses the owner's live autonomous tool scope when lightweight tools are enabled
 /// - Auto-approval of non-Always tools
@@ -1953,7 +2017,9 @@ async fn execute_lightweight_with_tools(
         ]
     };
 
-    let mut iteration = 0;
+    // Only executed tool rounds count: a provider-recovery retry re-asks the
+    // model without spending one (WI#291 review R7).
+    let mut tool_rounds_used: u32 = 0;
     let mut total_input_tokens = 0;
     let mut total_output_tokens = 0;
     let mut provider_recovery_attempted = false;
@@ -1973,10 +2039,8 @@ async fn execute_lightweight_with_tools(
             .await;
 
     loop {
-        iteration += 1;
-
         // Every tool round is spent: force the text-only recovery turn.
-        let force_text = iteration > budget.rounds;
+        let force_text = tool_rounds_used >= budget.rounds;
 
         if force_text {
             if !iteration_warning_injected {
@@ -2107,6 +2171,7 @@ async fn execute_lightweight_with_tools(
                 // Add tool result to context
                 messages.push(ChatMessage::tool_result(&tc.id, &tc.name, &result_content));
             }
+            tool_rounds_used += 1;
 
             // Continue loop to next LLM call
         }
@@ -2652,6 +2717,61 @@ mod tests {
 
         let disabled = ToolRoundBudget::new(3, 0).recovery_message();
         assert!(disabled.contains("disabled"), "{disabled}");
+    }
+
+    /// When the routine's own value equals the operator cap (the default 3/3
+    /// on every single-node daemon and every existing tenant), raising only
+    /// the cap is a no-op: the message must say that both knobs bind.
+    #[test]
+    fn test_tool_round_budget_tie_names_both_knobs() {
+        use super::ToolRoundBudget;
+        let tie = ToolRoundBudget::new(3, 3).recovery_message();
+        for expected in [
+            "are both 3",
+            "raising only one changes nothing",
+            "raise the operator cap",
+            "max_tool_rounds (up to 10)",
+        ] {
+            assert!(tie.contains(expected), "missing {expected:?}: {tie}");
+        }
+        assert!(
+            !tie.contains("The operator cap bounded this run"),
+            "an operator-only raise changes nothing at a tie: {tie}"
+        );
+
+        let tie_six = ToolRoundBudget::new(6, 6).recovery_message();
+        assert!(tie_six.contains("are both 6"), "{tie_six}");
+    }
+
+    /// Engine V2 chats redirect `routine_update` to mission tools, so advice
+    /// to raise a routine names the host CLI too, on every engine (review R2).
+    #[test]
+    fn test_tool_round_budget_names_every_routine_edit_surface() {
+        use super::{ROUTINES_EDIT_COMMAND, ToolRoundBudget};
+        for (routine, cap) in [(3, 6), (3, 3)] {
+            let message = ToolRoundBudget::new(routine, cap).recovery_message();
+            for expected in [
+                ROUTINES_EDIT_COMMAND,
+                "routine_update",
+                "Engine V2 chats cannot edit v1 routines",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "missing {expected:?}: {message}"
+                );
+            }
+        }
+
+        // Past the operator cap, raising the routine cannot help.
+        let operator_bound = ToolRoundBudget::new(6, 3).recovery_message();
+        assert!(
+            !operator_bound.contains(ROUTINES_EDIT_COMMAND),
+            "{operator_bound}"
+        );
+        assert!(
+            !operator_bound.contains("with routine_update"),
+            "{operator_bound}"
+        );
     }
 
     #[test]
