@@ -472,7 +472,18 @@ ExecutionMode:
 **Resolution flow**:
 1. Gate returns `Pause` -- `PendingGate` is inserted into the in-memory store
    and persisted through `FileGatePersistence` under
-   `$LUNARWING_BASE_DIR/pending-gates.json`
+   `$LUNARWING_BASE_DIR/pending-gates.json`. Writes are atomic: state goes to
+   a unique `pending-gates.json.tmp-*` sibling (mode 0600 — the file carries
+   unredacted tool parameters), is fsynced, and is renamed over the live
+   file, so a crash mid-write keeps the last complete state; a best-effort
+   directory fsync follows the rename. Mutual exclusion uses a persistent
+   `pending-gates.lock` sibling because rename replaces the data file's
+   inode, which cannot carry the flock. The data file exists only after the
+   first save. An unparseable live file is renamed aside to
+   `pending-gates.json.corrupt-<timestamp>` (warn-level log naming both
+   paths) and reads fall back to empty state so saves proceed; boot
+   reconciliation then fails the orphaned Waiting threads — the designed
+   degraded path.
 2. SSE broadcasts `AppEvent::GateRequired` to the user
 3. Web UI shows approval/auth prompt
 4. User responds with `GateResolution`
@@ -503,7 +514,10 @@ Extension-wide auth completion cannot dismiss a different pending request for
 the same extension.
 
 Startup restore removes expired gates from disk as well as skipping them in
-memory; pruning failure is logged and never revives an expired approval.
+memory; pruning failure is logged and never revives an expired approval. A
+restore failure (real I/O error, e.g. an unreadable state file) is logged at
+warn level with the file path — never at debug, where a corrupt store would
+be invisible in production logs (WI#299).
 Conversation lookups and creation share a store-backed hydration path, using
 the same conversations-before-index lock order and rechecking after I/O. Auth
 resolution accepts an exact UUID thread hint as a fallback while still enforcing
