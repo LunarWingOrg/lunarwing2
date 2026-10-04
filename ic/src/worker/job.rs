@@ -225,6 +225,7 @@ impl Worker {
             Some(WorkerMessage::Start) => {}
             Some(WorkerMessage::Stop) | None => {
                 tracing::debug!("Worker for job {} stopped before starting", self.job_id);
+                self.mark_stopped().await?;
                 return Ok(());
             }
             Some(WorkerMessage::Ping) | Some(WorkerMessage::UserMessage(_)) => {}
@@ -261,8 +262,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         .await;
 
         match result {
-            Ok(Ok(())) => {
-                tracing::info!("Worker for job {} completed successfully", self.job_id);
+            Ok(Ok(loop_outcome)) => {
+                tracing::info!("Worker for job {} execution loop ended", self.job_id);
                 // Only mark completed if still in an active, non-stuck state.
                 let current_state = self
                     .context_manager()
@@ -277,6 +278,11 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             "Job {} returned Ok but is Stuck — leaving for self-repair",
                             self.job_id
                         );
+                    }
+                    Ok(_) if loop_ended_via_stop(loop_outcome.as_ref()) => {
+                        if matches!(loop_outcome, Some(LoopOutcome::Stopped)) {
+                            self.mark_stopped().await?;
+                        }
                     }
                     Ok(_) => {
                         self.mark_completed().await?;
@@ -302,12 +308,19 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         Ok(())
     }
 
+    /// Run the plan phase and the shared agentic loop.
+    ///
+    /// Returns `Ok(None)` when the plan phase already resolved the job state
+    /// (terminal/Stuck/Completed — the wrapper re-checks state anyway), and
+    /// `Ok(Some(outcome))` carrying the agentic loop's outcome otherwise so
+    /// the wrapper can tell a stop-signalled exit apart from real completion
+    /// (WI#302).
     async fn execution_loop(
         &self,
         rx: &mut mpsc::Receiver<WorkerMessage>,
         reasoning: &Reasoning,
         reason_ctx: &mut ReasoningContext,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<LoopOutcome>, Error> {
         let job_context = self.context_manager().get_context(self.job_id).await.ok();
         let max_iterations = worker_iteration_limit(job_context.as_ref());
 
@@ -375,7 +388,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     || ctx.state == JobState::Stuck
                     || ctx.state == JobState::Completed)
             {
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -384,6 +397,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             worker: self,
             rx: tokio::sync::Mutex::new(rx),
             consecutive_rate_limits: std::sync::atomic::AtomicUsize::new(0),
+            consecutive_text_only: std::sync::atomic::AtomicUsize::new(0),
         };
 
         let config = AgenticLoopConfig {
@@ -397,7 +411,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         let outcome = run_agentic_loop(&delegate, reasoning, reason_ctx, &config).await?;
 
-        match outcome {
+        match &outcome {
             LoopOutcome::Response(_) => {
                 // Completion was already handled in handle_text_response via mark_completed
             }
@@ -408,15 +422,16 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 .await?;
             }
             LoopOutcome::Failed(message) => {
-                self.mark_failed(&message).await?;
+                self.mark_failed(message).await?;
             }
             LoopOutcome::Stopped => {
-                // Stop signal handled — nothing more to do
+                // Stop signal handled — no transition here; the wrapper must
+                // not treat this as a successful completion (WI#302).
             }
             LoopOutcome::NeedApproval(_) => {}
         }
 
-        Ok(())
+        Ok(Some(outcome))
     }
 
     /// Execute multiple tools in parallel using a JoinSet.
@@ -889,6 +904,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             "Worker for job {} received stop signal during plan execution",
                             self.job_id
                         );
+                        self.mark_stopped().await?;
                         return Ok(());
                     }
                     WorkerMessage::Ping => {
@@ -990,6 +1006,41 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         params: &serde_json::Value,
     ) -> Result<String, Error> {
         Self::execute_tool_inner(&self.deps, self.job_id, tool_name, params).await
+    }
+
+    /// Stop is a terminal non-success, including stops observed during planning.
+    async fn mark_stopped(&self) -> Result<(), Error> {
+        let changed = self
+            .context_manager()
+            .update_context(self.job_id, |ctx| {
+                if ctx.state.is_terminal() || ctx.state == JobState::Completed {
+                    return Ok(false);
+                }
+                ctx.transition_to(
+                    JobState::Cancelled,
+                    Some("Execution stopped before completion".into()),
+                )?;
+                Ok::<_, String>(true)
+            })
+            .await?
+            .map_err(|reason| crate::error::JobError::ContextError {
+                id: self.job_id,
+                reason,
+            })?;
+        if changed {
+            self.log_event(
+                "result",
+                serde_json::json!({
+                    "status": "cancelled", "success": false,
+                    "message": "Execution stopped before completion",
+                }),
+            );
+            self.persist_status(
+                JobState::Cancelled,
+                Some("Execution stopped before completion".into()),
+            );
+        }
+        Ok(())
     }
 
     async fn mark_completed(&self) -> Result<(), Error> {
@@ -1129,6 +1180,18 @@ fn store_fallback_in_metadata(
     }
 }
 
+/// WI#302: an agentic loop that ended via a stop signal (session teardown,
+/// daemon shutdown, channel removal) — or the defensive `NeedApproval` arm —
+/// never transitioned the job to a terminal state. Recording it as a
+/// successful completion would fabricate success; the container lane already
+/// reports `LoopOutcome::Stopped` as `success: false` (worker/container.rs).
+fn loop_ended_via_stop(outcome: Option<&LoopOutcome>) -> bool {
+    matches!(
+        outcome,
+        Some(LoopOutcome::Stopped) | Some(LoopOutcome::NeedApproval(_))
+    )
+}
+
 /// Job delegate: implements `LoopDelegate` for the background job context.
 ///
 /// Handles: signal channel (stop/ping/user messages), cancellation checks,
@@ -1138,6 +1201,7 @@ struct JobDelegate<'a> {
     rx: tokio::sync::Mutex<&'a mut mpsc::Receiver<WorkerMessage>>,
     /// Tracks consecutive rate-limit errors to fail fast instead of burning iterations.
     consecutive_rate_limits: std::sync::atomic::AtomicUsize,
+    consecutive_text_only: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> JobDelegate<'a> {
@@ -1385,6 +1449,19 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             return TextAction::Return(LoopOutcome::Response(text.to_string()));
         }
 
+        // A conservative completion matcher must not cost hundreds of extra
+        // calls. Stop bounded chatter as a failure, never as evidence of success.
+        if self
+            .consecutive_text_only
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            >= 2
+        {
+            return TextAction::Return(LoopOutcome::Failed(
+                "No completion signal after three text-only responses; job not confirmed complete"
+                    .into(),
+            ));
+        }
+
         // Add assistant response to context
         reason_ctx.messages.push(ChatMessage::assistant(text));
 
@@ -1405,6 +1482,8 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
     ) -> Result<Option<LoopOutcome>, crate::error::Error> {
+        self.consecutive_text_only
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         if let Some(ref text) = content {
             self.worker.log_event(
                 "message",
@@ -1845,6 +1924,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.state, JobState::Completed);
+    }
+
+    #[tokio::test]
+    async fn stop_during_plan_cancels_job_without_calling_llm_or_tools() {
+        let worker = make_worker(vec![]).await;
+        worker
+            .context_manager()
+            .update_context(worker.job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(WorkerMessage::Stop).await.unwrap();
+        let reasoning = Reasoning::new(worker.deps.llm.clone());
+        let mut ctx = ReasoningContext::new();
+        let plan: ActionPlan = serde_json::from_value(serde_json::json!({
+            "goal": "goal", "confidence": 1.0,
+            "actions": [{"tool_name": "must_not_run", "parameters": {},
+                "reasoning": "test", "expected_outcome": "must not execute"}]
+        }))
+        .unwrap();
+        worker
+            .execute_plan(&mut rx, &reasoning, &mut ctx, &plan)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker
+                .context_manager()
+                .get_context(worker.job_id)
+                .await
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+        worker.mark_stopped().await.unwrap();
+        assert!(ctx.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_only_progress_is_bounded_without_fabricating_success() {
+        let worker = make_worker(vec![]).await;
+        let (_tx, mut rx) = mpsc::channel(2);
+        let delegate = JobDelegate {
+            worker: &worker,
+            rx: tokio::sync::Mutex::new(&mut rx),
+            consecutive_rate_limits: std::sync::atomic::AtomicUsize::new(0),
+            consecutive_text_only: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut ctx = ReasoningContext::new();
+        for _ in 0..2 {
+            assert!(matches!(
+                delegate
+                    .handle_text_response("I have completed step 1 of 10, moving on.", &mut ctx)
+                    .await,
+                TextAction::Continue
+            ));
+        }
+        assert!(matches!(
+            delegate
+                .handle_text_response("I have completed step 1 of 10, moving on.", &mut ctx)
+                .await,
+            TextAction::Return(LoopOutcome::Failed(_))
+        ));
+        assert_ne!(
+            worker
+                .context_manager()
+                .get_context(worker.job_id)
+                .await
+                .unwrap()
+                .state,
+            JobState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_signalled_worker_finishes_cancelled_not_completed() {
+        let worker = make_worker(vec![]).await;
+        let contexts = worker.deps.context_manager.clone();
+        let id = worker.job_id;
+        contexts
+            .update_context(id, |ctx| ctx.transition_to(JobState::InProgress, None))
+            .await
+            .unwrap()
+            .unwrap();
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(WorkerMessage::Start).await.unwrap();
+        tx.send(WorkerMessage::Stop).await.unwrap();
+        worker.run(rx).await.unwrap();
+        assert_eq!(
+            contexts.get_context(id).await.unwrap().state,
+            JobState::Cancelled
+        );
     }
 
     /// Build a Worker with the given approval context.
@@ -2314,6 +2487,36 @@ mod tests {
         store_fallback_in_metadata(&mut ctx, None);
 
         assert_eq!(ctx.metadata, original); // safety: test
+    }
+
+    /// WI#302: stop-signalled loops must not fall through to mark_completed.
+    #[test]
+    fn test_loop_ended_via_stop_detects_stop_outcomes() {
+        let pending = crate::agent::session::PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "tool".to_string(),
+            parameters: serde_json::json!({}),
+            display_parameters: serde_json::json!({}),
+            description: "desc".to_string(),
+            tool_call_id: "call-1".to_string(),
+            context_messages: Vec::new(),
+            deferred_tool_calls: Vec::new(),
+            user_timezone: None,
+            allow_always: false,
+        };
+        assert!(loop_ended_via_stop(Some(&LoopOutcome::Stopped)));
+        assert!(loop_ended_via_stop(Some(&LoopOutcome::NeedApproval(
+            Box::new(pending)
+        ))));
+        assert!(!loop_ended_via_stop(Some(&LoopOutcome::Response(
+            "done".to_string()
+        ))));
+        assert!(!loop_ended_via_stop(Some(&LoopOutcome::MaxIterations)));
+        assert!(!loop_ended_via_stop(Some(&LoopOutcome::Failed(
+            "boom".to_string()
+        ))));
+        // Plan-phase early return (state already resolved) is not a stop.
+        assert!(!loop_ended_via_stop(None));
     }
 
     #[tokio::test]

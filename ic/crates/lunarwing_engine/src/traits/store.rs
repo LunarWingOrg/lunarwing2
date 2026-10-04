@@ -254,6 +254,20 @@ pub trait Store: Send + Sync {
         })
     }
 
+    /// Enumerate persisted threads across all projects, including projects
+    /// other than the configured owner project (WI#301). The boot-time
+    /// recovery sweep must not leave a non-owner project's in-flight threads
+    /// as permanent `Running` zombies, and must not silently skip a project
+    /// on a listing failure. Adapters whose thread index is not keyed by
+    /// project should override this to enumerate threads directly.
+    async fn list_all_threads_global(&self) -> Result<Vec<Thread>, EngineError> {
+        let mut threads = Vec::new();
+        for project in self.list_all_projects().await? {
+            threads.extend(self.list_all_threads(project.id).await?);
+        }
+        Ok(threads)
+    }
+
     /// Enumerate persisted missions across all projects, including ones that
     /// did not enter the in-memory active index during startup. Retry recovery
     /// must not silently drop a project's pending fires on a listing failure.

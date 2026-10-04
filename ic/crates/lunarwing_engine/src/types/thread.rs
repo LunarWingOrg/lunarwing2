@@ -496,6 +496,58 @@ impl Thread {
         self.internal_messages.push(message);
         self.updated_at = Utc::now();
     }
+
+    /// Stamp the restart-failure marker (WI#301). Called by the boot-time
+    /// recovery sweep when it fails a thread that was still in flight at
+    /// kill time. The marker is permanent history — it is never cleared —
+    /// so recovery/refire policy can distinguish "interrupted by restart"
+    /// from "failed by error" for the lifetime of the record.
+    pub fn mark_failed_by_restart(&mut self) {
+        upsert_metadata_bool(&mut self.metadata, RESTART_FAILURE_METADATA_KEY);
+    }
+
+    /// Whether the boot-time sweep failed this thread after a daemon restart
+    /// (as opposed to the thread failing on its own).
+    pub fn is_failed_by_restart(&self) -> bool {
+        metadata_flag(&self.metadata, RESTART_FAILURE_METADATA_KEY)
+    }
+
+    /// Stamp that the mission-side recovery pass has recorded and notified
+    /// this restart-lost fire (WI#301). Keeps the record/notify pass
+    /// idempotent across repeated boots while the permanent
+    /// `restart_failure` marker stays as history.
+    pub fn mark_restart_failure_recorded(&mut self) {
+        upsert_metadata_bool(&mut self.metadata, RESTART_FAILURE_RECORDED_METADATA_KEY);
+    }
+
+    /// Whether the mission-side recovery pass already recorded/notified the
+    /// restart-lost fire for this thread.
+    pub fn is_restart_failure_recorded(&self) -> bool {
+        metadata_flag(&self.metadata, RESTART_FAILURE_RECORDED_METADATA_KEY)
+    }
+}
+
+/// Metadata key marking a thread the boot-time recovery sweep failed because
+/// the daemon restarted while the thread was still in flight (WI#301).
+pub const RESTART_FAILURE_METADATA_KEY: &str = "restart_failure";
+
+/// Metadata key recording that the restart-lost fire was already recorded in
+/// the mission's approach history and notified to its channels (WI#301).
+pub const RESTART_FAILURE_RECORDED_METADATA_KEY: &str = "restart_failure_recorded";
+
+fn metadata_flag(metadata: &serde_json::Value, key: &str) -> bool {
+    metadata
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn upsert_metadata_bool(metadata: &mut serde_json::Value, key: &str) {
+    if let serde_json::Value::Object(map) = metadata {
+        map.insert(key.to_string(), serde_json::Value::Bool(true));
+    } else {
+        *metadata = serde_json::json!({ key: true });
+    }
 }
 
 #[cfg(test)]
@@ -705,5 +757,54 @@ mod tests {
             parsed.channel_context.as_deref(),
             Some("- keep replies under 400 bytes")
         );
+    }
+
+    // ── Restart-failure markers (WI#301) ────────────────────
+
+    #[test]
+    fn restart_markers_default_to_absent() {
+        let t = make_thread();
+        assert!(!t.is_failed_by_restart());
+        assert!(!t.is_restart_failure_recorded());
+    }
+
+    #[test]
+    fn mark_failed_by_restart_sets_only_the_restart_flag() {
+        let mut t = make_thread();
+        t.mark_failed_by_restart();
+        assert!(t.is_failed_by_restart());
+        assert!(!t.is_restart_failure_recorded());
+    }
+
+    #[test]
+    fn restart_failure_recorded_is_independent_of_the_failure_marker() {
+        let mut t = make_thread();
+        t.mark_failed_by_restart();
+        t.mark_restart_failure_recorded();
+        assert!(t.is_failed_by_restart());
+        assert!(t.is_restart_failure_recorded());
+    }
+
+    #[test]
+    fn restart_markers_handle_non_object_metadata() {
+        let mut t = make_thread();
+        t.metadata = serde_json::Value::Null;
+        t.mark_failed_by_restart();
+        assert!(t.is_failed_by_restart());
+        t.metadata = serde_json::Value::String("legacy".into());
+        t.mark_restart_failure_recorded();
+        assert!(t.is_restart_failure_recorded());
+        assert!(!t.is_failed_by_restart());
+    }
+
+    #[test]
+    fn restart_markers_survive_metadata_round_trip() {
+        let mut t = make_thread();
+        t.mark_failed_by_restart();
+        t.mark_restart_failure_recorded();
+        let json = serde_json::to_string(&t).expect("serialize");
+        let parsed: Thread = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.is_failed_by_restart());
+        assert!(parsed.is_restart_failure_recorded());
     }
 }

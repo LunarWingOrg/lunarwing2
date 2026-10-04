@@ -55,6 +55,10 @@ pub enum ThreadFailureKind {
     Model(ModelFailureKind),
     NoProgress,
     ConsecutiveErrors,
+    /// Token/time/cost budget exhausted before the task completed (WI#302).
+    /// Treated like `MaxIterations` by retry policies: notify, never
+    /// auto-retry — each retried fire would spend a fresh budget.
+    BudgetExhausted,
     Orchestrator,
     Unknown,
 }
