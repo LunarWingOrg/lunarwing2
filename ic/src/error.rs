@@ -358,7 +358,8 @@ pub enum WorkspaceError {
     /// file. Boundary splits (stored content clean on its own) and poisoned
     /// entries stay [`WorkspaceError::InjectionRejected`].
     #[error(
-        "Append to '{path}' not applied: content already in the file matched prompt-injection          patterns ({reason}); the new entry itself passed the scan"
+        "Append to '{path}' not applied: content already in the file matched prompt-injection \
+         patterns ({reason}); the new entry itself passed the scan"
     )]
     ExistingContentRejected { path: String, reason: String },
 
