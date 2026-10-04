@@ -118,7 +118,15 @@
 29. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
 30. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
 31. [x] (S) RESERVED4itemstoworkonwilldiscusslater
-32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/307
+32. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/307
+   - DONE (2026-10-04, branch `rarity/kimi-32-20261004-1800`, commit fa02981cb): `SecretDeleteTool` no longer sits at `UnlessAutoApproved` — `requires_approval` now returns `ApprovalRequirement::Always` in `ic/src/tools/builtin/secrets_tools.rs`, so global and session auto-approve can never silently permit irreversible, unrecoverable credential deletion (the WI's one-auto-approve-away blast radius).
+   - `allows_always_approval() -> true` explicitly, mirroring the repo's own ssh.rs pattern the WI cited: only a deliberate per-user "always allow" grant persists; global auto-approve and autonomous execution stay blocked regardless. (Both legacy paths — `agent/dispatcher.rs`, `agent/thread_ops.rs` — and the engine-v2 gate paths — `gate/approval.rs`, `bridge/effect_adapter.rs` — honor this combination; stale pre-change AlwaysAllow rows are only consulted when the tool opts in, and here opt-in is the documented intent.)
+   - `allows_autonomous_execution() -> false` added for the whole secrets family (`secret_list` + `secret_delete` — the only two secrets tools in this tree), restoring tool.rs's documented two-layer model with `AUTONOMOUS_TOOL_DENYLIST` retained as name-based defense-in-depth; enforced at `agent/scheduler.rs`, `worker/job.rs`, `worker/mcp.rs` even if the denylist regresses.
+   - Fix-sketch item 3 (secret_create/update tier review) is moot: no such tools exist — storing secrets is UI-only via the extension setup flow (`/api/extensions/{name}/setup`), values never enter the LLM conversation. Verified by repo-wide grep for `secret_*` tool registrations.
+   - Docs updated in the same commit: `ic/src/tools/README.md` approval-policy paragraph now names `secret_delete` alongside `ssh` as the narrow user-grant opt-ins; `Tool::allows_autonomous_execution` doc comment lists the secrets tools among the hard exclusions.
+   - Regression tests added (4) in secrets_tools.rs pin: Always tier with `needs_prompt(true, true)`, explicit-grant-only bypass via `needs_prompt_with_user_grant`, autonomous exclusion + denylist presence for both tools, and `secret_list` keeping its `Never` tier.
+   - Verification: `cargo test -p lunarwing --lib tools::builtin::secrets_tools` 6/6 pass; adjacent suites `tools::autonomy gate::approval tools::permissions tools::builtin::ssh tools::builtin::secrets` 46/46 pass; `cargo clippy -p lunarwing --lib --tests -- -D warnings` clean; `cargo fmt --all -- --check` clean.
+   - Not done (out of scope, cross-referenced in the WI only): the engine-crate `AUTONOMOUS_TOOL_DENYLIST` copy in `ic/crates/lunarwing_engine/src/gate/tool_tier.rs` still omits `ssh`/`ssh_git` (the herd's known denylist-drift finding) — the per-tool `allows_autonomous_execution` overrides now make the secrets family independent of that drift.
 33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/303 - time to update opencode2 again yay
 34. [x] (S) RESERVED4WIs
 35. [x] (S) RESERVED4WIs
