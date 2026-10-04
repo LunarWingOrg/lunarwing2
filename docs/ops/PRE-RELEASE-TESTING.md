@@ -1,6 +1,8 @@
 # Pre-Release Testing
 
-> Last reconciled with the repository on 2026-08-05. Do not carry historical
+> Last reconciled with the repository on 2026-10-04 (v2.1.5.0 pre-release;
+> cargo/taskset tiers, `ic/scripts/release-test.sh`, and the XMPP harness path
+> re-verified against the tree). Do not carry historical
 > pass counts forward: record the tested commit and fresh results for each
 > release candidate.
 
