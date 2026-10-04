@@ -444,9 +444,11 @@ mod tests {
 
         assert_eq!(
             chunk,
-            EngineChunk::ProviderObservation(lunarwing_engine::ProviderStreamObservation::Retried {
-                discarded_usage: None
-            })
+            EngineChunk::ProviderObservation(
+                lunarwing_engine::ProviderStreamObservation::Retried {
+                    discarded_usage: None
+                }
+            )
         );
     }
 
@@ -470,15 +472,17 @@ mod tests {
 
         assert_eq!(
             chunk,
-            EngineChunk::ProviderObservation(lunarwing_engine::ProviderStreamObservation::Retried {
-                discarded_usage: Some(TokenUsage {
-                    input_tokens: 2000,
-                    output_tokens: 0,
-                    cache_read_tokens: 300,
-                    cache_write_tokens: 50,
-                    cost_usd: 0.0,
-                }),
-            })
+            EngineChunk::ProviderObservation(
+                lunarwing_engine::ProviderStreamObservation::Retried {
+                    discarded_usage: Some(TokenUsage {
+                        input_tokens: 2000,
+                        output_tokens: 0,
+                        cache_read_tokens: 300,
+                        cache_write_tokens: 50,
+                        cost_usd: 0.0,
+                    }),
+                }
+            )
         );
     }
 
@@ -745,7 +749,11 @@ mod tests {
 
     #[test]
     fn transient_empty_streams_remain_transient() {
-        for finish in [FinishReason::Stop, FinishReason::ToolUse, FinishReason::Unknown] {
+        for finish in [
+            FinishReason::Stop,
+            FinishReason::ToolUse,
+            FinishReason::Unknown,
+        ] {
             let kind = classify_provider_error(&LlmError::EmptyStream {
                 provider: "test".into(),
                 finish,

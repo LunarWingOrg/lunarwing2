@@ -831,7 +831,9 @@ impl SmartRoutingProvider {
         match self.cheap.complete_stream(request.clone()).await {
             Ok(stream) => Ok(CheapStreamOutcome::Cheap(stream)),
             Err(error) if crate::llm::streaming::is_transient_empty_stream(&error) => {
-                self.stats.cascade_escalations.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .cascade_escalations
+                    .fetch_add(1, Ordering::Relaxed);
                 self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
                 let usage = empty_stream_usage(&error);
                 if let (Some(usage), Some(telemetry)) = (usage, &self.telemetry) {
@@ -1087,7 +1089,9 @@ impl LlmProvider for SmartRoutingProvider {
                 // Restore the pre-existing cascade behavior — an empty
                 // cheap answer was judged uncertain and escalated — rather
                 // than propagating past the primary straight to failover.
-                let cheap_stream = match self.cheap_stream_escalating_on_empty(request.clone()).await?
+                let cheap_stream = match self
+                    .cheap_stream_escalating_on_empty(request.clone())
+                    .await?
                 {
                     CheapStreamOutcome::Cheap(stream) => stream,
                     CheapStreamOutcome::Escalated(stream) => return Ok(stream),

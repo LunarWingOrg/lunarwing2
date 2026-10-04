@@ -95,7 +95,9 @@ impl StreamAccumulator {
                 usage,
                 finish_reason,
             } => {
-                self.usage = usage.unwrap_or_default().saturating_add(self.discarded_usage);
+                self.usage = usage
+                    .unwrap_or_default()
+                    .saturating_add(self.discarded_usage);
                 self.finish_reason = finish_reason;
                 self.saw_done = true;
             }

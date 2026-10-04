@@ -1061,7 +1061,11 @@ mod tests {
 
         assert!(is_retryable(&empty_stream_error("p", Some("stop"), None)));
         assert!(is_retryable(&empty_stream_error("p", None, None)));
-        assert!(is_retryable(&empty_stream_error("p", Some("tool_calls"), None)));
+        assert!(is_retryable(&empty_stream_error(
+            "p",
+            Some("tool_calls"),
+            None
+        )));
         assert!(!is_retryable(&LlmError::EmptyStream {
             provider: "p".to_string(),
             finish: FinishReason::Length,

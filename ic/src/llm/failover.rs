@@ -357,7 +357,9 @@ impl FailoverProvider {
                     self.last_used.store(provider_index, Ordering::Relaxed);
                     self.cooldowns[provider_index].reset();
                     if let (Some(usage), Some(telemetry)) = (discarded_usage, &self.telemetry) {
-                        telemetry.record_discarded_empty_usage("failover", usage).await;
+                        telemetry
+                            .record_discarded_empty_usage("failover", usage)
+                            .await;
                     }
                     let stream = if retries == 0 {
                         replay_first(first, rest)
