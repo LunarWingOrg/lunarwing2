@@ -272,12 +272,12 @@ impl RetryProvider {
                     return Ok(replay_first(first, rest));
                 }
                 StreamOpening::Content { first, rest } => {
-                    if let Some(usage) = discarded_usage {
-                        if let Some(telemetry) = &self.telemetry {
-                            telemetry
-                                .record_discarded_empty_usage(self.inner.model_name(), usage)
-                                .await;
-                        }
+                    if let Some(usage) = discarded_usage
+                        && let Some(telemetry) = &self.telemetry
+                    {
+                        telemetry
+                            .record_discarded_empty_usage(self.inner.model_name(), usage)
+                            .await;
                     }
                     let observation = LlmStreamObservation::Retried {
                         provider: self.inner.model_name().to_string(),
