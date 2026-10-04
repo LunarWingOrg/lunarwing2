@@ -9,6 +9,20 @@ cargo-deny:
     - bash .gitlab/scripts/install-cargo-deny.sh
     - bash .gitlab/scripts/cargo-deny-check.sh
 
+# Makes the release audit's "every committed lockfile is clean" claim
+# reproducible in CI: the same pinned cargo-deny over every manifest root
+# with a tracked Cargo.lock, not just the ic workspace (MR !1371 review A5).
+satellite-advisory-sweep:
+  extends:
+    - .rust-job
+    - .full-validation-context
+  stage: security
+  needs:
+    - cargo-metadata
+  script:
+    - bash .gitlab/scripts/install-cargo-deny.sh
+    - bash .gitlab/scripts/check-satellite-advisories.sh
+
 # cargo-deny filters crates that are pinned in Cargo.lock but never resolved
 # into the built graph, so advisories against such pins stay invisible. This
 # guard fails loudly if one of those pins ever starts compiling.

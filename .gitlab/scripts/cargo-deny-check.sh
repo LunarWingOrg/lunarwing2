@@ -17,6 +17,13 @@
 #      index lookup no longer needs them to identify a locked crate.
 #   3. Fails the job if any index-failure diagnostic still appears, so the
 #      yanked gate can never be silently skipped again.
+#   4. Checks the graph CI actually compiles: --workspace --all-features
+#      (rust-check-all-features / rust-clippy-all). A root-package default-
+#      feature query audits ~889 crates while CI builds ~900 — the extras
+#      include openssl/openssl-sys, rental, json5, and the
+#      lunarwing_health_metrics workspace member (MR !1371 review A4).
+#   5. Prints the advisory-db commit that judged the tree so the CI trace
+#      records exactly which RustSec database revision produced the verdict.
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
@@ -43,7 +50,15 @@ status=0
 (cd "$repo_root" && taskset -c 0-11 "$deny_bin" deny \
     --manifest-path "$manifest" \
     --config "$config_file" \
+    --workspace --all-features \
     check --hide-inclusion-graph 2>&1) | tee "$log" || status=1
+
+# Record which RustSec advisory-db revision produced the verdict above.
+db_dir=$(find "${CARGO_HOME:-$HOME/.cargo}"/advisory-dbs -maxdepth 1 -mindepth 1 \
+    -type d -name 'advisory-db-*' 2>/dev/null | head -n 1 || true)
+if [[ -n "$db_dir" ]] && command -v git >/dev/null 2>&1; then
+    echo "advisory-db commit: $(git -C "$db_dir" rev-parse HEAD) ($(git -C "$db_dir" log -1 --format=%cs))"
+fi
 
 # index-failure means cargo-deny could not query a crate's registry index —
 # the yanked = "deny" policy was not verifiably enforced for that crate.
