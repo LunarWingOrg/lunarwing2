@@ -666,6 +666,42 @@ carry no dedup key, so an automatic re-fire could duplicate real work.
 Refiring is an operator decision — manual re-fire, or the next cadence tick
 for cron missions.
 
+A graceful daemon shutdown while a mission thread is mid-run follows the
+retry path instead (WI#276). The outcome watcher waits with
+`ThreadManager::wait_thread_or_stop`, which keeps the thread registered in
+the running set while it runs — the old watcher joined first, taking the
+handle out of that set, so its shutdown stop never landed, the run was
+dropped mid-await at runtime teardown, and the fire vanished without a
+record, retry, or dedup-key release. On `MissionManager::shutdown` the
+watcher now stops the run and gives it 3 s to settle (the shutdown wait is
+the grace plus a margin for the post-stop writes); the real outcome is then
+processed exactly as in normal operation — for a stopped run that records
+`INTERRUPTED: signal-stopped mid-run`, releases the trigger dedup key, and
+persists the retry marker on the now-terminal thread. The in-process retry
+timer is skipped (it would die with the daemon); the post-restart sweep
+re-arms the retry from the marker, with the usual fresh backoff and attempt
+accounting (an interrupted fire costs one retry attempt). Should a shutdown
+abort still land between the marker write and the mission-side dedup
+release, the sweep releases the stale dedup key before re-arming, so the
+retry cannot be suppressed as already processed on every boot. A run that
+finished during the shutdown window has its real outcome recorded too. A
+run that does not settle within the grace is left untouched — writing then
+would race its own final save — and stays with restart recovery for
+in-flight threads (WI#301). Because the watcher no longer hides the thread,
+stop requests, injected messages, and `is_running` now reach watched
+mission threads during normal operation as well — so pausing or retiring
+conversation-insights now really stops its workers. A thread stopped while
+its mission is no longer Active is recorded as `STOPPED: mission <status>
+while the thread ran` and is neither retried nor reported as an error.
+
+Whether an interrupted fire re-fires therefore depends on how it was
+interrupted, and the asymmetry is deliberate: a gracefully stopped run is
+known to have ended at a cooperative stop point, so re-firing it is safe
+enough — still at-least-once, since side effects performed before the stop
+may repeat — while a restart-killed run's side effects are partially
+applied at an unknown point, so it stays record-only and is never
+auto-refired (WI#301).
+
 These recovery markers are additive thread metadata; no database migration is
 needed. Downgrading restores the older completion/recovery behavior and does
 not reconstruct interrupted work. Operators should inspect interrupted fires
