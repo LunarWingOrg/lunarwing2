@@ -9,7 +9,7 @@
 | Part two of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.1.8.0 |
 | LunarHub (extension marketplace/decentralized binary distribution) — phased rollout starting with foundation repairs (unified verified installer, atomic WASM update/rollback, bounded MCP discovery), then binary/artifact distribution, signed catalog + CAS lifecycle, and finally hosted catalog/deep links | v2.1.8.0 |
 | Beta for Desktop/Mobile companion applications for LunarWing (first alpha version should be available by 2.1.6.0) | v2.1.8.0 |
-| Firstmate Integration | v2.1.8.0 |
+| Firstmate/herdr.dev Integration | v2.1.8.0 |
 | Wayland Desktop Computer Use Capability with upgraded multimodal capable MCP server | v2.1.8.0 |
 | Lightweight external workers and external worker loops with timers | v2.1.8.0 |
 | Part 2 of planned overhaul of some LLM engine functionality | v2.1.8.0 |
