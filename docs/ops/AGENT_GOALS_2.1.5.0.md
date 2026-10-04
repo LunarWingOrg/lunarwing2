@@ -42,7 +42,7 @@
    - A5 (reproducibility): new committed `.gitlab/scripts/check-satellite-advisories.sh` sweeps all 26 manifest roots (git-discovered, pinned cargo-deny, shared policy) and is wired as the `satellite-advisory-sweep` full-validation job; both gates print the advisory-db commit; validate_config.py + tests pin the wiring.
    - A6 (scope): audit doc names the unaudited surfaces — 7 Python requirements files, 2 npm lockfiles (kimicode4lunarwing), digest-pinned container images (trivy-scanned, items #1/#2), and five lock-less dev/test manifests
    - Verified locally: cargo-deny `advisories ok, bans ok, licenses ok, sources ok`; satellite sweep 26/26 roots ok (+1 manifest-less gated by verify_upstream_lock.py); lockfile-only guard ok; 51/51 .gitlab/tests; validate_config.py; shell-syntax (239 scripts) + shellcheck clean
-4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
+4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298 - Brightdawn confirmed close now
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
