@@ -8,7 +8,7 @@ mascot plays the matching sprite animation instead of staying static.
 The whole feature is presentation-layer only: no message content, agent
 behavior, or session state is affected.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0) and 2026-10-01 (v2.1.4.0).** The emote parser,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** The emote parser,
 sprite allowlist (`Emote::ALL_SPRITES`), wire contract, and mascot widget
 were re-checked against `ic/src/channels/web/emote.rs` and
 `ic/src/channels/web/static/mascot.js`; no changes were needed.

@@ -2,7 +2,7 @@
 
 Embeddings are optional and disabled by default. When enabled, LunarWing uses them for vector-backed workspace memory search.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0) and 2026-10-01 (v2.1.4.0).** Environment knobs
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** Environment knobs
 (`EMBEDDING_ENABLED/PROVIDER/MODEL/BASE_URL/DIMENSION/CACHE_SIZE`,
 `OLLAMA_BASE_URL`), the 10 000-entry default cache, the `>= 1` cache-size
 floor, provider list, and shared outbound URL validation were re-checked
