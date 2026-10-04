@@ -6716,9 +6716,10 @@ pub(crate) mod tests {
         // The re-armed gate is gone — not left for boot reconcile or the sweep.
         assert!(gates.list_for_user("alice").await.is_empty());
 
-        // The thread was ended, and the channel was told why.
+        // The stopped wrap-up is not a successful completion (WI#302), and
+        // the channel was told why.
         let saved = store.load_thread(thread.id).await.unwrap().unwrap();
-        assert_eq!(saved.state, lunarwing_engine::ThreadState::Done);
+        assert_eq!(saved.state, lunarwing_engine::ThreadState::Failed);
         let delivered = broadcasts.lock().await;
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, "alice");

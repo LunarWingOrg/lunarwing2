@@ -371,6 +371,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["success"], true);
         rig.assert_first_removed().await;
+        // Cancellation must not persist a successful completion (WI#302).
         assert_eq!(
             rig.store
                 .load_thread(rig.first.thread_id)
@@ -378,7 +379,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            lunarwing_engine::ThreadState::Done
+            lunarwing_engine::ThreadState::Failed
         );
         assert_eq!(
             rig.store

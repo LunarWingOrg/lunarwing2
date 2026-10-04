@@ -235,8 +235,8 @@ mod tests {
         } else {
             // Blocked-tool path: AutonomousUnavailable is returned to the model
             // for recovery instead of failing the job immediately. Provide
-            // non-completion text so the job exhausts max_iterations without
-            // ever executing the gated tool.
+            // Three text-only iterations (selection + response each) fail as
+            // unconfirmed completion without ever executing the gated tool.
             for i in 0..6 {
                 steps.push(TraceStep {
                     request_hint: None,
@@ -1551,14 +1551,11 @@ mod tests {
             .await
             .expect("load job failure reason")
             .expect("missing job failure reason");
-        // AutonomousUnavailable is recovered into the model loop; without a
-        // usable alternative the job ends via max-iterations / provider
-        // exhaustion rather than a direct tool-error terminal reason.
-        assert!(
-            failure_reason.contains("owner_gate")
-                || failure_reason.contains("Maximum iterations")
-                || failure_reason.contains("kept failing after retries"),
-            "expected missing-tool block or post-recovery failure, got {failure_reason}"
+        // AutonomousUnavailable is recovered into the model loop; the trace's
+        // three non-completion responses must terminate as failure (WI#302).
+        assert_eq!(
+            failure_reason,
+            "No completion signal after three text-only responses; job not confirmed complete"
         );
     }
 
@@ -1597,11 +1594,9 @@ mod tests {
             .await
             .expect("load job failure reason")
             .expect("missing job failure reason");
-        assert!(
-            failure_reason.contains("owner_gate")
-                || failure_reason.contains("Maximum iterations")
-                || failure_reason.contains("kept failing after retries"),
-            "expected owner-mismatch block or post-recovery failure, got {failure_reason}"
+        assert_eq!(
+            failure_reason,
+            "No completion signal after three text-only responses; job not confirmed complete"
         );
     }
 
