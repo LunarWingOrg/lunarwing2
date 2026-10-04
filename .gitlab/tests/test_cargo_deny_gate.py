@@ -62,6 +62,8 @@ class CargoDenyGateTests(unittest.TestCase):
         for fragment, replacement in (
             ("--manifest-path", ""),
             ("--hide-inclusion-graph", ""),
+            ("--workspace --all-features", ""),
+            ("advisory-db commit", ""),
             ('grep -q "index-failure"', "true"),
         ):
             with self.subTest(fragment=fragment):
@@ -75,6 +77,54 @@ class CargoDenyGateTests(unittest.TestCase):
         text = WRAPPER.read_text(encoding="utf-8")
         self.assertIn('(cd "$repo_root"', text)
         self.assertNotIn('cd "$repo_root/ic"', text)
+
+
+SWEEP = ROOT / ".gitlab/scripts/check-satellite-advisories.sh"
+
+
+class SatelliteAdvisorySweepTests(unittest.TestCase):
+    """The v2.1.5.0 audit's every-lockfile claim must be a CI gate (A5)."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        (self.root / ".gitlab/scripts").mkdir(parents=True)
+        self.wrapper = self.root / ".gitlab/scripts/check-satellite-advisories.sh"
+        self.wrapper.write_text(SWEEP.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def errors(self, merged):
+        errors = []
+        with mock.patch.object(config, "ROOT", self.root):
+            config.validate_satellite_advisory_sweep(merged, errors)
+        return errors
+
+    def test_current_ci_and_wrapper_pass(self):
+        merged = {"satellite-advisory-sweep": {"script": ["bash .gitlab/scripts/check-satellite-advisories.sh"]}}
+        self.assertEqual(self.errors(merged), [])
+
+    def test_missing_job_or_invocation_is_rejected(self):
+        self.assertTrue(any("check-satellite-advisories.sh" in error for error in self.errors({})))
+        merged = {"satellite-advisory-sweep": {"script": ["bash .gitlab/scripts/cargo-deny-check.sh"]}}
+        self.assertTrue(any("check-satellite-advisories.sh" in error for error in self.errors(merged)))
+
+    def test_missing_wrapper_is_rejected(self):
+        self.wrapper.unlink()
+        merged = {"satellite-advisory-sweep": {"script": ["bash .gitlab/scripts/check-satellite-advisories.sh"]}}
+        self.assertTrue(any("cannot read satellite advisory sweep" in error for error in self.errors(merged)))
+
+    def test_wrapper_losing_guards_is_rejected(self):
+        contract = {"satellite-advisory-sweep": {"script": ["bash .gitlab/scripts/check-satellite-advisories.sh"]}}
+        for fragment in ("ls-files", "ic/deny.toml", "--workspace --all-features", "check advisories"):
+            with self.subTest(fragment=fragment):
+                text = SWEEP.read_text(encoding="utf-8")
+                self.assertIn(fragment, text)
+                self.wrapper.write_text(text.replace(fragment, ""), encoding="utf-8")
+                self.assertTrue(any(fragment in error for error in self.errors(contract)))
+                self.wrapper.write_text(text, encoding="utf-8")
+
+    def test_sweep_is_a_full_validation_job(self):
+        self.assertIn("satellite-advisory-sweep", config.FULL_VALIDATION_JOBS)
 
 
 if __name__ == "__main__":

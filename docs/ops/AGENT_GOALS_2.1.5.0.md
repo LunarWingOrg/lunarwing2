@@ -1,6 +1,6 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.1.5.0
 
-## Codename: UNKNOWN
+## Codename: Bungei Fukkō - "The Renaissance" - 文芸復興 (ぶんげいふっこう, bungei fukkō) (文芸復興)
 
 **Open TODOs (v2.1.5.0) — To be done before release**
 
@@ -29,55 +29,63 @@
    - DONE (100%) 2026-10-03: lane was already advanced to v2.0.21 during the v2.1.4.0 cycle (commit `e62ccdee2`, "worker: bump opencode2 v2.0.20 -> v2.0.21"); this pass re-verified every pin and the upstream tag live.
    - Pins confirmed at `v2.0.21` @ `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`: `opencode2.4lunarwing/Dockerfile` (OPENCODE_VERSION/OPENCODE_REF), `.gitlab/scripts/build-worker-image.sh` (source_ref + build args), `opencode2.4lunarwing/scripts/prepare_reproducible_build_test.py` fixture, `opencode2.4lunarwing/AGENTS.md` + `README.md`, `docs/ops/WORKER-CONTAINERS.md` (v2.0.21 bump entry 2026-10-01), `docs/guides/CONTRIBUTOR-ONBOARDING.md`.
    - Tag re-verified live today: `git ls-remote https://github.com/anomalyco/opencode refs/tags/v2.0.21` → `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72` (matches pin).
-   - Host-side `prepare_reproducible_build_test.py` re-run: 3/3 OK, including the untouched-failure contract.
-   - No stale `2.0.20` pins remain outside historical docs (history/, release notes, prior bump entries). Whole-image reproducibility still gated by the CI candidate-vs-clean-rebuild check before promotion.
+   - Host-side `prepare_reproducible_build_test.py` re-run: 3/3 OK, including the untouched-failure contract
+   - No stale `2.0.20` pins remain outside historical docs (history/, release notes, prior bump entries). Whole-image reproducibility still gated by the CI candidate-vs-clean-rebuild check before promotion
 
-## Phase 2 — Features & Polish
+## Phase 2 — Features & Polish (for goals referencing work items, read comments on work items as well)
 
-3. [ ] audit all crates and ensure there are no security vulnerabilities
+3. [x] audit all crates and ensure there are no security vulnerabilities - Last attempt REJECTED - see previous MR and comments on it for revision and re-attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1371 - please use previous MR as a REFERENCE going forward for this item
+   - DONE (re-attempt, branch `rarity/kimi-3-20261003-2200`): all six MR !1371 adversarial findings (A1-A6) addressed; audit doc `docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md`, advisory-db `ef6173c` (2026-10-03).
+   - A1 (conclusion honesty): the audit now states the real posture — 8 vulnerability advisories + 1 informational accepted and shipped: 5 compile into default builds (rustls-webpki 0.102.8 x4 + h2 0.3.27 via the libsql 0.6.0 legacy chain; webpki validates libSQL remote-replica TLS), 3 compile into every feature set (rsa via the LunarWing-enabled russh "rsa" feature, failure x2 via the vendored libsignal-protocol OMEMO wrapper). No unaccounted advisory exists in any committed lockfile.
+   - A2 (guard false premise): `.gitlab/scripts/check-lockfile-only-advisories.sh` now queries `cargo tree --workspace --all-features --target all` (vendored libsignal path deps are workspace members, so atty via env_logger dev-dep DOES resolve); per-entry modes (`absent` pyo3 / `no-dev` atty); a guard entry whose crate leaves the lockfile fails as stale; taskset aligned to 0-11; 5 hermetic `.gitlab/tests` cases pin pass/fail/stale branches.
+   - A3 (exposure + follow-ups): `ic/deny.toml` entries carry exposure statements; bans floors deny h2 >=0.4.0,<0.4.19 and rustls-webpki >=0.103.0,<0.103.15 so patched copies cannot silently downgrade; clearing work items filed: #304 (libsql legacy chain), #305 (russh rsa feature), #306 (libsignal wrapper off failure+rental).
+   - A4 (graph coverage): `cargo-deny-check.sh` and the guard now audit `--workspace --all-features` (~900 crates, what CI compiles); the widened graph surfaced only rental 0.5.6 (RUSTSEC-2021-0134, informational unmaintained) — accepted with exposure note.
+   - A5 (reproducibility): new committed `.gitlab/scripts/check-satellite-advisories.sh` sweeps all 26 manifest roots (git-discovered, pinned cargo-deny, shared policy) and is wired as the `satellite-advisory-sweep` full-validation job; both gates print the advisory-db commit; validate_config.py + tests pin the wiring.
+   - A6 (scope): audit doc names the unaudited surfaces — 7 Python requirements files, 2 npm lockfiles (kimicode4lunarwing), digest-pinned container images (trivy-scanned, items #1/#2), and five lock-less dev/test manifests.
+   - Verified locally: cargo-deny `advisories ok, bans ok, licenses ok, sources ok`; satellite sweep 26/26 roots ok (+1 manifest-less gated by verify_upstream_lock.py); lockfile-only guard ok; 51/51 .gitlab/tests; validate_config.py; shell-syntax (239 scripts) + shellcheck clean.
+4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/302
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/301
-6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
+5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/302 - Last attempt REJECTED - see previous MR and comments on it for revision and re-attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1368 - please use previous MR as a REFERENCE going forward for this item
+6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/301 - Last attempt REJECTED - see previous MR and comments on it for revision and re-attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1372 - please use previous MR as a REFERENCE going forward for this item
+7. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
+8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/300
    - DONE 100% (2026-10-03, branch aj/kimi-6-20261003-0800): watcher's GatePaused arm now discards any pending gate armed for the thread before finalize — new `finalize_regated_expired_turn` helper in `ic/src/bridge/router.rs` (NotFound is the common no-op case). Regression test `expired_gate_regated_wrap_up_discards_rearmed_gate` fixtures a real expiry-resume → re-pause cycle with an armed gate and asserts the store empties (verified red without the discard). Evidence: `cargo test --lib expired_gate` 8/8 pass; `cargo clippy --lib --tests -D warnings` clean; `cargo fmt --all -- --check` clean.
-7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299
-8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
+9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/299 - Last attempt REJECTED - see previous MR and comments on it for revision and re-attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1375 - please use previous MR as a REFERENCE going forward for this item
+10. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298
    - Done 100%: context_overflow is now exempt from the per-streak `model_recovery_max_attempts` config clamp in `ic/crates/lunarwing_engine/orchestrator/default.py`, so the policy's full shrink ladder (0.60x then 0.35x) fires at default config (previously clamped to 1 attempt = 0.60x only). Chose the exemption over raising the global default so blind-retry kinds (e.g. transient) keep their restart-storm protection. This holds at the compiled default of 1; mt-admin tenants have run with `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2`/`TOTAL=2` since WI#239, where the second rung was already reachable but the lifetime cap is 2.
    - Config-note (tradeoff per WI#298): the clamp default of 1 exists to avoid restart storms from blind retries; context-overflow recovery changes the inputs (shrinks context) rather than retrying blindly, so that rationale does not apply to it. It remains bounded by the per-kind policy cap (2) and the lifetime `model_recovery_total_attempts` cap (default 4, `ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS`).
    - Tests added in `ic/crates/lunarwing_engine/src/executor/loop_engine.rs`: second shrink attempt fires at default config; ladder still terminates at the policy cap. Verified: `cargo test -p lunarwing_engine --lib context_overflow` (4 passed) and `--lib recovery` (12 passed); clippy `-D warnings` clean; rustfmt clean.
-   - Docs updated: `docs/architecture/ENGINE-V2.md`, `docs/ops/TENANT-CONFIGURATION.md`, and the `ThreadConfig::model_recovery_max_attempts` doc comment in `ic/crates/lunarwing_engine/src/types/thread.rs`.
-   - Review fix: `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=0` still disables engine recovery for context_overflow too (the exemption applies only when the clamp is >= 1); new test `context_overflow_recovery_stays_off_when_clamp_is_zero`; the two WI#298 tests now pin `model_recovery_max_attempts: 1` explicitly instead of inheriting the test runner's environment; `docs/ops/TENANT-CONFIGURATION.md` now states what provisioning writes (2/2) and the stale one-attempt prose and a misplaced sentence in `docs/architecture/ENGINE-V2.md` were corrected.
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297
-10. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
+   - Docs updated: `docs/architecture/ENGINE-V2.md`, `docs/ops/TENANT-CONFIGURATION.md`, and the `ThreadConfig::model_recovery_max_attempts` doc comment in `ic/crates/lunarwing_engine/src/types/thread.rs`
+   - Review fix: `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=0` still disables engine recovery for context_overflow too (the exemption applies only when the clamp is >= 1); new test `context_overflow_recovery_stays_off_when_clamp_is_zero`; the two WI#298 tests now pin `model_recovery_max_attempts: 1` explicitly instead of inheriting the test runner's environment; `docs/ops/TENANT-CONFIGURATION.md` now states what provisioning writes (2/2) and the stale one-attempt prose and a misplaced sentence in `docs/architecture/ENGINE-V2.md` were corrected
+11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/297 - Last attempt REJECTED - see previous MR and comments on it for revision and re-attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1377 - please use previous MR as a REFERENCE going forward for this item
+12. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296
   - DONE (review-corrected): both model-visible exits of the `rlm_query` child loop in `ic/crates/lunarwing_engine/src/executor/scripting.rs` are now built from typed failure kinds only. The `Err(e)` arm maps through the shared `safe_model_failure_message` vocabulary; note that at this tree it cannot carry a provider error (`ExecutionLoop::run` converts every orchestrator error into `Ok(ThreadOutcome::Failed { kind: Orchestrator, .. })` and the child loop runs with no store), so that half is defence in depth. The `Ok(Failed { kind, error })` arm — the exit a child provider failure actually takes — no longer forwards the orchestrator's `error` string (engine-internal diagnostics for `Orchestrator`, free text under `ORCHESTRATOR_SELF_MODIFY`); `rlm_query_child_response` renders only the kind plus the fixed recovery instruction and logs the raw text host-side at debug.
-  - Verified: `cargo test -p lunarwing_engine --lib executor::scripting::` green including `rlm_query_failure_message_redacts_provider_diagnostics`, `rlm_query_child_failed_outcome_renders_kind_not_error_text` (every `ThreadFailureKind` with a raw provider sentinel in `error`) and `rlm_query_child_provider_failure_stays_redacted` (end-to-end child loop with a failing provider); `cargo fmt --check` clean.
-  - Commits: a1a856a1a + the review fix (branch aj/kimi-10-20261003-1000). If the FrontierTEEC text that motivated WI#296 is observed again in a mission outcome, it is not on the rlm_query path and needs its own triage.
-11. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296 (dupe)
-12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/295
-13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/294
-14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/291
-15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/290
-16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/289
-17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/288
-18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/287
-19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/278
-20. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/276
+  - Verified: `cargo test -p lunarwing_engine --lib executor::scripting::` green including `rlm_query_failure_message_redacts_provider_diagnostics`, `rlm_query_child_failed_outcome_renders_kind_not_error_text` (every `ThreadFailureKind` with a raw provider sentinel in `error`) and `rlm_query_child_provider_failure_stays_redacted` (end-to-end child loop with a failing provider); `cargo fmt --check` clean
+  - Commits: a1a856a1a + the review fix (branch aj/kimi-10-20261003-1000). If the FrontierTEEC text that motivated WI#296 is observed again in a mission outcome, it is not on the rlm_query path and needs its own triage
+13. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/296 (DUPE)
+14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/295 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
+15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/294 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
+16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/291 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
+17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/290 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
+18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/289 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
+19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/288 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
+20. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/287 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
+21. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/278 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
+22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/276 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 but the comments from the adversarial review must be heeded
 
 ## Phase 5 - Miscellaneous (for goals referencing work items, read comments on work items as well)
 
-21. [ ] take a look at any documentation that should be updated and update necessary documentation
-22. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
-23. [ ] review all currently open work items - create audit document for 2.1.5.0 in docs/ops - there are similar docs in docs/ops for 2.1.4.0 and earlier releases so you can use those as references
-24. [ ] update all docs in docs/guides
-25. [ ] update all docs in docs/architecture
-26. [ ] fix issues in CI/CD (if any) - See Pipeline number 4975 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
-27. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
-28. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
-29. [x] (S) RESERVED
-30. [x] (S) RESERVED
-31. [x] (S) RESERVED
+23. [ ] take a look at any documentation that should be updated and update necessary documentation
+24. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
+25. [ ] review all currently open work items - create audit document for 2.1.5.0 in docs/ops - there are similar docs in docs/ops for 2.1.4.0 and earlier releases so you can use those as references
+26. [ ] update all docs in docs/guides
+27. [ ] update all docs in docs/architecture
+28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5031 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
+29. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
+30. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
+31. [x] (S) RESERVED4itemstoworkonwilldiscusslater
 32. [x] (S) RESERVED
 33. [x] (S) RESERVED
 34. [x] (S) RESERVED
@@ -87,5 +95,7 @@
 38. [x] (S) RESERVED
 39. [x] (S) RESERVED
 40. [x] (S) RESERVED
+41. [x] (S) RESERVED
+42. [x] (S) RESERVED
 
 ---
