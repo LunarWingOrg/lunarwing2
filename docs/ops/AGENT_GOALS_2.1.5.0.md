@@ -112,7 +112,12 @@
 23. [ ] take a look at any documentation that should be updated and update necessary documentation
 24. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
 25. [ ] review all currently open work items - create audit document for 2.1.5.0 in docs/ops - there are similar docs in docs/ops for 2.1.4.0 and earlier releases so you can use those as references
-26. [ ] update all docs in docs/guides
+26. [x] update all docs in docs/guides
+   - DONE 100% (2026-10-04, branch rarity/kimi-26-20261004-1500): all 32 active guides (docs/guides minus history/) re-validated against the v2.1.5.0 tree; every one now carries a 2026-10-04 (v2.1.5.0) revalidation stamp.
+   - Substantive: CONTRIBUTOR-ONBOARDING §2 freeze status moved to the v2.1.5.0 checklist (v2.1.4.0 Kabuto shipped 2026-10-03; 2.1.5 crate/pin state, engine-v2 boot/recovery hardening); version-move records appended for multica (registry 0.1.14 + multica-bridge 0.1.4), darkirc (registry 0.1.11), and weechat (registry 0.2.12), with all WASM channel crates at workspace 2.1.5.
+   - Verified-held claims (no content change needed): mt-admin verb set, create-tenant --minimal/--no-pebble, TUNNEL_URL/NetBird knobs, embeddings env + 10_000 cache default, emote parser + Emote::ALL_SPRITES, --supervised/AGENT_SUPERVISED_MODE, default RUST_LOG filter, KNOW: coordination hook, configure-vision-* verbs, knowledge sweep/keyset paging, voice admission, ssh.allowed_hosts, darkirc MT topology, gotify registry paths, distro package lists, ironclaw migration chains, contribution policies, tenant system-prompt editor.
+   - Note: TensorZero naming in guides stays correct for this tree — the TensorMoon cutover (bb7db9d3d) is not an ancestor of this branch and arrives with its own MR.
+   - Docs-only; no code changed, no cargo gates apply. Commits: 58e466355, 01305cab7, 0eafc408e, 96e79cb29, bfec57ee2, plus this goals commit.
 27. [ ] update all docs in docs/architecture
 28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5098 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
 29. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
