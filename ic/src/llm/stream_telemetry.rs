@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::llm::error::LlmError;
-use crate::llm::provider::{OutputCorruptionKind, StreamFailureReason};
+use crate::llm::provider::{OutputCorruptionKind, StreamFailureReason, TokenUsage};
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
 const MAX_PROVIDER_CHARS: usize = 128;
@@ -44,6 +44,15 @@ struct ProviderStreamMetrics {
     corruption_total: u64,
     #[serde(default)]
     repl_argument_corruption_total: u64,
+    /// Tokens providers billed for successful-but-empty stream attempts that
+    /// a decorator discarded and recovered past (WI#297, MR !1395 F-2).
+    /// Recorded when the discarded usage is forwarded on a `Retried`
+    /// observation or an escalation, so the counters measure recovered waste
+    /// exactly once per discarded attempt.
+    #[serde(default)]
+    empty_stream_discarded_input_tokens_total: u64,
+    #[serde(default)]
+    empty_stream_discarded_output_tokens_total: u64,
     ttfc_samples_total: u64,
     ttfc_sum_ms: u64,
     ttfc_max_ms: u64,
@@ -137,6 +146,25 @@ impl StreamTelemetry {
         let metrics = provider_metrics(&mut snapshot, provider);
         metrics.repl_argument_corruption_total =
             metrics.repl_argument_corruption_total.saturating_add(1);
+        metrics.last_issue_unix_seconds = unix_timestamp();
+        snapshot.updated_at_unix_seconds = unix_timestamp();
+        self.persist(&snapshot).await;
+    }
+
+    /// Record tokens a provider billed for an empty stream attempt that a
+    /// decorator discarded and recovered past (WI#297, MR !1395 F-2).
+    pub(crate) async fn record_discarded_empty_usage(&self, provider: &str, usage: TokenUsage) {
+        if usage.total() == 0 {
+            return;
+        }
+        let mut snapshot = self.snapshot.lock().await;
+        let metrics = provider_metrics(&mut snapshot, provider);
+        metrics.empty_stream_discarded_input_tokens_total = metrics
+            .empty_stream_discarded_input_tokens_total
+            .saturating_add(u64::from(usage.input_tokens));
+        metrics.empty_stream_discarded_output_tokens_total = metrics
+            .empty_stream_discarded_output_tokens_total
+            .saturating_add(u64::from(usage.output_tokens));
         metrics.last_issue_unix_seconds = unix_timestamp();
         snapshot.updated_at_unix_seconds = unix_timestamp();
         self.persist(&snapshot).await;

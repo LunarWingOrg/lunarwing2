@@ -155,6 +155,48 @@ pub(crate) fn replay_first<'a>(first: LlmStreamChunk, rest: LlmStream<'a>) -> Ll
     stream::iter([Ok(first)]).chain(rest).boxed()
 }
 
+/// The billed usage carried by a typed empty-stream error, if any (WI#297).
+pub(crate) fn empty_stream_usage(error: &LlmError) -> Option<TokenUsage> {
+    match error {
+        LlmError::EmptyStream { usage, .. } => *usage,
+        _ => None,
+    }
+}
+
+/// Sum the billed usage of an intercepted empty attempt into `acc`
+/// (MR !1395 F-2). Non-empty errors carry no usage and leave `acc` untouched.
+pub(crate) fn accumulate_empty_usage(acc: &mut Option<TokenUsage>, error: &LlmError) {
+    if let Some(usage) = empty_stream_usage(error) {
+        *acc = Some(acc.map_or(usage, |total| total.saturating_add(usage)));
+    }
+}
+
+/// Fold the accumulated discarded usage into a terminal empty-stream error so
+/// the next layer — or the terminal warn log — accounts for every discarded
+/// attempt, not just the last one (MR !1395 F-2).
+pub(crate) fn fold_discarded_usage(error: LlmError, discarded: Option<TokenUsage>) -> LlmError {
+    match (error, discarded) {
+        (
+            LlmError::EmptyStream {
+                provider,
+                finish,
+                detail,
+                usage,
+            },
+            Some(discarded),
+        ) => {
+            let usage = Some(usage.map_or(discarded, |u| u.saturating_add(discarded)));
+            LlmError::EmptyStream {
+                provider,
+                finish,
+                detail,
+                usage,
+            }
+        }
+        (error, _) => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;

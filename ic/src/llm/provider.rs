@@ -243,6 +243,12 @@ pub enum LlmStreamObservation {
         provider: String,
         attempts: u32,
         reason: StreamFailureReason,
+        /// Sum of token usage from billed-but-empty attempts the retry and
+        /// failover layers discarded before this stream finally produced
+        /// content (WI#297, MR !1395 F-2). `None` when no discarded attempt
+        /// reported usage. The engine adds this to the successful call's
+        /// usage so cost accounting sees every billed call.
+        discarded_usage: Option<TokenUsage>,
     },
     Aborted {
         provider: String,

@@ -277,6 +277,21 @@ impl TokenUsage {
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }
+
+    /// Field-wise saturating sum, used to fold provider-billed usage of
+    /// discarded empty stream attempts into the successful call's recorded
+    /// usage (WI#297, MR !1395 F-2).
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_add(rhs.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_add(rhs.cache_write_tokens),
+            cost_usd: self.cost_usd + rhs.cost_usd,
+        }
+    }
 }
 
 /// Serde helper for Duration as milliseconds.

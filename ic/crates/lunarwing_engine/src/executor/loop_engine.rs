@@ -1361,7 +1361,9 @@ mod tests {
                     args_delta: "{}".to_string(),
                 }),
                 Ok(LlmStreamChunk::ProviderObservation(
-                    ProviderStreamObservation::Retried,
+                    ProviderStreamObservation::Retried {
+                        discarded_usage: None,
+                    },
                 )),
                 Ok(LlmStreamChunk::Done {
                     usage: None,

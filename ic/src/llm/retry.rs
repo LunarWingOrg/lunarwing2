@@ -17,12 +17,13 @@ use rust_decimal::Decimal;
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
     CompletionRequest, CompletionResponse, LlmProvider, LlmStream, LlmStreamChunk,
-    LlmStreamObservation, ModelMetadata, StreamFailureReason, ToolCompletionRequest,
+    LlmStreamObservation, ModelMetadata, StreamFailureReason, TokenUsage, ToolCompletionRequest,
     ToolCompletionResponse,
 };
 use crate::llm::stream_telemetry::{StreamTelemetry, classify_stream_failure};
 use crate::llm::streaming::{
-    ProviderStreamRequest, StreamOpening, is_transient_empty_finish, open_stream, replay_first,
+    ProviderStreamRequest, StreamOpening, accumulate_empty_usage, empty_stream_usage,
+    fold_discarded_usage, is_transient_empty_finish, open_stream, replay_first,
 };
 
 /// Upper bound for provider-suggested `Retry-After` delays.
@@ -253,6 +254,11 @@ impl RetryProvider {
     ) -> Result<LlmStream<'a>, LlmError> {
         let mut retries = 0;
         let mut last_reason = StreamFailureReason::Unknown;
+        // MR !1395 F-2: token usage of billed-but-empty attempts discarded
+        // before the stream finally produced content. Forwarded on the
+        // `Retried` observation on success, folded into the returned error on
+        // exhaustion — never silently dropped.
+        let mut discarded_usage: Option<TokenUsage> = None;
         for attempt in 0..=self.config.max_retries {
             // WI#297: an empty-but-successful stream surfaces as a typed
             // `EmptyStream` error here, never as `Ok(empty)`.
@@ -266,26 +272,38 @@ impl RetryProvider {
                     return Ok(replay_first(first, rest));
                 }
                 StreamOpening::Content { first, rest } => {
+                    if let Some(usage) = discarded_usage {
+                        if let Some(telemetry) = &self.telemetry {
+                            telemetry
+                                .record_discarded_empty_usage(self.inner.model_name(), usage)
+                                .await;
+                        }
+                    }
                     let observation = LlmStreamObservation::Retried {
                         provider: self.inner.model_name().to_string(),
                         attempts: retries,
                         reason: last_reason,
+                        discarded_usage,
                     };
                     return Ok(replay_with_observation(first, rest, observation));
                 }
                 StreamOpening::Error(error) => {
                     if !is_retryable(&error) || attempt == self.config.max_retries {
-                        return Err(error);
+                        return Err(fold_discarded_usage(error, discarded_usage));
                     }
                     let delay = retry_delay(&error, attempt);
                     last_reason = self.record_retry(&error).await;
                     retries += 1;
+                    let empty_usage = empty_stream_usage(&error);
+                    accumulate_empty_usage(&mut discarded_usage, &error);
                     tracing::warn!(
                         provider = %self.inner.model_name(),
                         attempt = attempt + 1,
                         max_retries = self.config.max_retries,
                         delay_ms = delay.as_millis() as u64,
                         error = %error,
+                        empty_attempt_input_tokens = empty_usage.map_or(0, |u| u.input_tokens),
+                        empty_attempt_output_tokens = empty_usage.map_or(0, |u| u.output_tokens),
                         "Retrying stream before first chunk{label}"
                     );
                     tokio::time::sleep(delay).await;
@@ -443,6 +461,7 @@ mod tests {
                 provider,
                 attempts: 1,
                 reason: StreamFailureReason::RateLimited,
+                ..
             })) if provider == "scripted"
         )));
     }
@@ -767,6 +786,7 @@ mod tests {
                 provider,
                 attempts: 1,
                 reason: StreamFailureReason::Empty,
+                ..
             })) if provider == "scripted"
         )));
     }
@@ -948,6 +968,88 @@ mod tests {
         assert!(matches!(
             result,
             Err(LlmError::EmptyStream { provider, .. }) if provider == "scripted"
+        ));
+        assert_eq!(inner.plain_calls(), 2);
+    }
+
+    fn billed_empty_stream(finish_reason: &str, input_tokens: u32) -> StreamScript {
+        StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+            usage: Some(TokenUsage {
+                input_tokens,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+            finish_reason: finish_reason.to_string(),
+        })])
+    }
+
+    // MR !1395 F-2: the usage of billed-but-empty attempts discarded before a
+    // successful retry is summed into the `Retried` observation so the bridge
+    // can account for it.
+    #[tokio::test(start_paused = true)]
+    async fn stream_retried_observation_carries_discarded_empty_usage() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                billed_empty_stream("stop", 900),
+                billed_empty_stream("stop", 1100),
+                successful_text_stream(),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(3));
+
+        let chunks = retry
+            .complete_stream(make_request())
+            .await
+            .expect("retry should open a stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(inner.plain_calls(), 3);
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            Ok(LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                provider,
+                attempts: 2,
+                reason: StreamFailureReason::Empty,
+                discarded_usage: Some(TokenUsage {
+                    input_tokens: 2000,
+                    output_tokens: 0,
+                    ..
+                }),
+            })) if provider == "scripted"
+        )));
+    }
+
+    // MR !1395 F-2: on exhaustion the returned error folds the usage of every
+    // discarded attempt, so an outer failover leg keeps accounting it.
+    #[tokio::test(start_paused = true)]
+    async fn stream_empty_exhaustion_folds_discarded_usage_into_the_error() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                billed_empty_stream("stop", 900),
+                billed_empty_stream("stop", 1100),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(1));
+
+        let result = retry.complete_stream(make_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::EmptyStream {
+                provider,
+                usage: Some(TokenUsage {
+                    input_tokens: 2000,
+                    output_tokens: 0,
+                    ..
+                }),
+                ..
+            }) if provider == "scripted"
         ));
         assert_eq!(inner.plain_calls(), 2);
     }

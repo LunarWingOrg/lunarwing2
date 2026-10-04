@@ -21,13 +21,16 @@ use rust_decimal::Decimal;
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
     CompletionRequest, CompletionResponse, LlmProvider, LlmStream, LlmStreamChunk,
-    LlmStreamObservation, ModelMetadata, StreamFailureReason, ToolCompletionRequest,
+    LlmStreamObservation, ModelMetadata, StreamFailureReason, TokenUsage, ToolCompletionRequest,
     ToolCompletionResponse,
 };
 
 use crate::llm::retry::is_retryable;
 use crate::llm::stream_telemetry::{StreamTelemetry, classify_stream_failure};
-use crate::llm::streaming::{ProviderStreamRequest, StreamOpening, open_stream, replay_first};
+use crate::llm::streaming::{
+    ProviderStreamRequest, StreamOpening, accumulate_empty_usage, empty_stream_usage,
+    fold_discarded_usage, open_stream, replay_first,
+};
 
 /// Configuration for per-provider cooldown behavior.
 ///
@@ -332,6 +335,11 @@ impl FailoverProvider {
         let mut retries = 0;
         let mut last_reason = StreamFailureReason::Unknown;
         let mut last_failed_provider = String::new();
+        // MR !1395 F-2: folded usage of billed-but-empty attempts discarded
+        // by earlier legs (their retry layers already folded per-attempt
+        // usage into the error). Forwarded on the `Retried` observation on
+        // success, folded into the terminal error otherwise.
+        let mut discarded_usage: Option<TokenUsage> = None;
 
         for (position, provider_index) in available.iter().copied().enumerate() {
             let provider = self.providers[provider_index].as_ref();
@@ -348,6 +356,9 @@ impl FailoverProvider {
                 StreamOpening::Content { first, rest } => {
                     self.last_used.store(provider_index, Ordering::Relaxed);
                     self.cooldowns[provider_index].reset();
+                    if let (Some(usage), Some(telemetry)) = (discarded_usage, &self.telemetry) {
+                        telemetry.record_discarded_empty_usage("failover", usage).await;
+                    }
                     let stream = if retries == 0 {
                         replay_first(first, rest)
                     } else {
@@ -358,12 +369,15 @@ impl FailoverProvider {
                                 provider: last_failed_provider,
                                 attempts: retries,
                                 reason: last_reason,
+                                discarded_usage,
                             },
                         )
                     };
                     return Ok((provider_index, stream));
                 }
-                StreamOpening::Error(error) if !is_retryable(&error) => return Err(error),
+                StreamOpening::Error(error) if !is_retryable(&error) => {
+                    return Err(fold_discarded_usage(error, discarded_usage));
+                }
                 StreamOpening::Error(error) => {
                     self.record_provider_failure(provider_index);
                     last_reason = classify_stream_failure(&error);
@@ -374,6 +388,13 @@ impl FailoverProvider {
                             .record_retry(&last_failed_provider, last_reason)
                             .await;
                     }
+                    let empty_usage = empty_stream_usage(&error);
+                    // Accumulate every leg except the last one: the terminal
+                    // error keeps its own usage and the fold adds the rest,
+                    // so no leg is counted twice (MR !1395 F-2).
+                    if position + 1 < available.len() {
+                        accumulate_empty_usage(&mut discarded_usage, &error);
+                    }
                     self.log_next_provider(
                         position,
                         &available,
@@ -381,15 +402,26 @@ impl FailoverProvider {
                         &error,
                         "stream setup",
                     );
+                    if let Some(usage) = empty_usage {
+                        tracing::warn!(
+                            provider = %last_failed_provider,
+                            input_tokens = usage.input_tokens,
+                            output_tokens = usage.output_tokens,
+                            "Discarding billed-but-empty stream attempt during failover"
+                        );
+                    }
                     last_error = Some(error);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| LlmError::RequestFailed {
-            provider: "failover".to_string(),
-            reason: "all available providers failed before the first stream chunk".to_string(),
-        }))
+        Err(fold_discarded_usage(
+            last_error.unwrap_or_else(|| LlmError::RequestFailed {
+                provider: "failover".to_string(),
+                reason: "all available providers failed before the first stream chunk".to_string(),
+            }),
+            discarded_usage,
+        ))
     }
 }
 
@@ -741,6 +773,7 @@ mod tests {
                     provider: "primary".to_string(),
                     attempts: 1,
                     reason: StreamFailureReason::Transport,
+                    discarded_usage: None,
                 }),
                 LlmStreamChunk::Done {
                     usage: None,
@@ -843,6 +876,7 @@ mod tests {
                     provider: "primary".to_string(),
                     attempts: 1,
                     reason: StreamFailureReason::Empty,
+                    discarded_usage: None,
                 }),
                 LlmStreamChunk::Done {
                     usage: None,
@@ -877,6 +911,108 @@ mod tests {
         .await;
 
         assert_empty_failover_chunks(&chunks);
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 1);
+    }
+
+    // MR !1395 F-2: the usage of a billed-but-empty leg discarded before the
+    // fallback answered is summed into the failover `Retried` observation.
+    #[tokio::test]
+    async fn billed_empty_leg_usage_rides_the_failover_observation() {
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+                usage: Some(TokenUsage {
+                    input_tokens: 1500,
+                    output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+                finish_reason: "stop".to_string(),
+            })])],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![successful_stream("fallback delta")],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let chunks = collect_ok(
+            failover
+                .complete_stream(make_request())
+                .await
+                .expect("fallback stream should open"),
+        )
+        .await;
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::TextDelta("fallback delta".to_string()),
+                LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                    provider: "primary".to_string(),
+                    attempts: 1,
+                    reason: StreamFailureReason::Empty,
+                    discarded_usage: Some(TokenUsage {
+                        input_tokens: 1500,
+                        output_tokens: 0,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                }),
+                LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                },
+            ]
+        );
+        assert_eq!(primary.plain_calls(), 1);
+        assert_eq!(fallback.plain_calls(), 1);
+    }
+
+    // MR !1395 F-2: when every leg answers billed-but-empty, the terminal
+    // error folds the usage of all discarded legs.
+    #[tokio::test]
+    async fn all_legs_billed_empty_fold_usage_into_the_terminal_error() {
+        let billed_empty = || {
+            StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+                usage: Some(TokenUsage {
+                    input_tokens: 700,
+                    output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+                finish_reason: "stop".to_string(),
+            })])
+        };
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![billed_empty()],
+            vec![],
+        ));
+        let fallback = Arc::new(ScriptedStreamingProvider::new(
+            "fallback",
+            vec![billed_empty()],
+            vec![],
+        ));
+        let failover = FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap();
+
+        let result = failover.complete_stream(make_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::EmptyStream {
+                provider,
+                usage: Some(TokenUsage {
+                    input_tokens: 1400,
+                    output_tokens: 0,
+                    ..
+                }),
+                ..
+            }) if provider == "fallback"
+        ));
         assert_eq!(primary.plain_calls(), 1);
         assert_eq!(fallback.plain_calls(), 1);
     }
@@ -1199,6 +1335,7 @@ mod tests {
                     provider: "primary".to_string(),
                     attempts: 1,
                     reason: StreamFailureReason::Transport,
+                    discarded_usage: None,
                 }),
                 LlmStreamChunk::Done {
                     usage: None,
@@ -1254,6 +1391,7 @@ mod tests {
                     provider: "primary".to_string(),
                     attempts: 1,
                     reason: StreamFailureReason::Transport,
+                    discarded_usage: None,
                 }),
                 LlmStreamChunk::ToolCallDelta {
                     index: 0,
