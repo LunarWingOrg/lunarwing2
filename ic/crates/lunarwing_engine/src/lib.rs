@@ -60,7 +60,10 @@ pub use types::provenance::Provenance;
 pub use types::step::{
     ActionCall, ActionResult, ExecutionTier, LlmResponse, Step, StepId, StepStatus, TokenUsage,
 };
-pub use types::thread::{Thread, ThreadConfig, ThreadId, ThreadState, ThreadType};
+pub use types::thread::{
+    RESTART_FAILURE_METADATA_KEY, RESTART_FAILURE_RECORDED_METADATA_KEY, Thread, ThreadConfig,
+    ThreadId, ThreadState, ThreadType,
+};
 
 // ── Re-exports: traits ──────────────────────────────────────
 

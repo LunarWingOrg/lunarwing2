@@ -1836,8 +1836,13 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         .track_notification_task(notification_task)
         .await;
 
-    if let Err(e) = thread_manager.recover_project_threads(project_id).await {
-        debug!("engine v2: recover_project_threads failed: {e}");
+    // WI#301: the recovery sweep is global — a per-project sweep left
+    // non-owner projects' in-flight threads as permanent `Running` zombies.
+    // Sweep-failed threads are stamped Failed-by-restart so the mission-side
+    // pass below can record/notify the lost fires. Waiting threads are
+    // spared here; pending-gate reconciliation (further down) owns them.
+    if let Err(e) = thread_manager.recover_all_threads_global().await {
+        debug!("engine v2: recover_all_threads_global failed: {e}");
     }
     if let Err(e) = mission_manager.bootstrap_project(project_id).await {
         debug!("engine v2: bootstrap_project failed: {e}");
@@ -1867,6 +1872,18 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
             );
         }
         Err(e) => debug!("engine v2: recover_pending_mission_retries failed: {e}"),
+        _ => {}
+    }
+    // WI#301: record + notify mission fires the restart lost (threads the
+    // sweep above stamped Failed-by-restart). Mark-only — no auto-refire.
+    match mission_manager.record_restart_interrupted_missions().await {
+        Ok(marked) if !marked.is_empty() => {
+            debug!(
+                "engine v2: recorded {} restart-interrupted mission fire(s)",
+                marked.len()
+            );
+        }
+        Err(e) => debug!("engine v2: record_restart_interrupted_missions failed: {e}"),
         _ => {}
     }
     if let Some(budget) = crate::channels::budget::budget_for_channel("darkirc") {
@@ -1916,11 +1933,18 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         }
     }
 
+    let gate_persistence = crate::gate::persistence::FileGatePersistence::with_default_path();
+    let pending_gates_path = gate_persistence.path().to_path_buf();
     let pending_gates = Arc::new(crate::gate::store::PendingGateStore::new(Some(Arc::new(
-        crate::gate::persistence::FileGatePersistence::with_default_path(),
+        gate_persistence,
     ))));
     if let Err(e) = pending_gates.restore_from_persistence().await {
-        debug!("engine v2: failed to restore pending gates: {e}");
+        // Corrupt-on-restore hides pending approvals, so surface it (WI#299).
+        tracing::warn!(
+            error = %e,
+            path = %pending_gates_path.display(),
+            "engine v2: failed to restore pending gates"
+        );
     }
     if let Err(e) = reconcile_pending_gate_state(&store_dyn, &pending_gates).await {
         debug!("engine v2: pending gate reconciliation failed: {e}");
@@ -6692,9 +6716,10 @@ pub(crate) mod tests {
         // The re-armed gate is gone — not left for boot reconcile or the sweep.
         assert!(gates.list_for_user("alice").await.is_empty());
 
-        // The thread was ended, and the channel was told why.
+        // The stopped wrap-up is not a successful completion (WI#302), and
+        // the channel was told why.
         let saved = store.load_thread(thread.id).await.unwrap().unwrap();
-        assert_eq!(saved.state, lunarwing_engine::ThreadState::Done);
+        assert_eq!(saved.state, lunarwing_engine::ThreadState::Failed);
         let delivered = broadcasts.lock().await;
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, "alice");

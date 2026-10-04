@@ -521,16 +521,13 @@ impl LoopDelegate for ContainerDelegate {
         )
         .await;
 
-        // Track consecutive text-only responses. If the LLM produces 3+
-        // text responses in a row without tool calls, it's done working.
+        // Bound text-only chatter without treating repetition as success.
         let mut text_count = self.consecutive_text_only.lock().await;
         *text_count += 1;
         let consecutive = *text_count;
         drop(text_count);
 
-        let is_done = crate::util::llm_signals_completion(text)
-            || is_post_work_chatter(text)
-            || consecutive >= 3;
+        let is_done = crate::util::llm_signals_completion(text) || is_post_work_chatter(text);
 
         if is_done {
             let last = self.last_output.lock().await;
@@ -540,6 +537,13 @@ impl LoopDelegate for ContainerDelegate {
                 last.clone()
             };
             return TextAction::Return(LoopOutcome::Response(output));
+        }
+
+        if consecutive >= 3 {
+            return TextAction::Return(LoopOutcome::Failed(
+                "No completion signal after three text-only responses; job not confirmed complete"
+                    .into(),
+            ));
         }
 
         reason_ctx.messages.push(ChatMessage::assistant(text));

@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 
 use crate::memory::RetrievalEngine;
 use crate::runtime::manager::ThreadManager;
-use crate::runtime::messaging::ThreadOutcome;
+use crate::runtime::messaging::{ThreadFailureKind, ThreadOutcome};
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
 use crate::types::is_shared_owner;
@@ -33,7 +33,9 @@ use crate::types::mission::{
 };
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::thread::{MissionContext, Thread, ThreadConfig, ThreadId, ThreadType};
+use crate::types::thread::{
+    MissionContext, Thread, ThreadConfig, ThreadId, ThreadState, ThreadType,
+};
 
 type MissionExecutionLock = Mutex<()>;
 type MissionLockRegistry = Mutex<HashMap<MissionId, Weak<MissionExecutionLock>>>;
@@ -242,6 +244,9 @@ pub struct MissionManager {
     /// without forcing every caller-facing method onto `&Arc<Self>` receivers
     /// (work item #188 retry wake).
     weak_self: RwLock<Option<Weak<Self>>>,
+    /// Startup retry admissions for this process. Durable markers remain until
+    /// spawn, so repeated recovery calls must not create parallel sleep tasks.
+    recovered_retries: Mutex<std::collections::HashSet<ThreadId>>,
 }
 
 fn normalize_cron_expression(expression: &str) -> String {
@@ -339,6 +344,7 @@ impl MissionManager {
             task_handles: Mutex::new(Vec::new()),
             mission_create_lock: Mutex::new(()),
             weak_self: RwLock::new(None),
+            recovered_retries: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -2300,6 +2306,7 @@ impl MissionManager {
             user_id,
             attempt,
             payload,
+            source_thread_id,
             ..
         } = pending;
         let spawned = self
@@ -2313,6 +2320,14 @@ impl MissionManager {
                     attempt,
                     "mission retry fired"
                 );
+                // The retry was consumed: clear the source thread's
+                // persisted marker so the post-restart sweep cannot re-arm
+                // an already-fired retry (one-shot duplicate pre-WI#301).
+                if let Some(source_thread_id) = source_thread_id
+                    && let Ok(Some(source)) = self.store.load_thread(source_thread_id).await
+                {
+                    clear_retry_marker(&*self.store, &source).await;
+                }
                 // Record the attempt number on the retried thread's own
                 // metadata so a failure of THIS thread rents the NEXT attempt
                 // (lineage grows under the shared max_retries cap instead of
@@ -2353,6 +2368,7 @@ impl MissionManager {
     }
 
     pub async fn recover_pending_mission_retries(&self) -> Result<Vec<MissionId>, EngineError> {
+        let mut admitted = self.recovered_retries.lock().await;
         let mut scheduled = Vec::new();
         // A previously scheduled retry can outlive this process's active
         // index (e.g. bootstrap skips a project). Discover from durable
@@ -2366,39 +2382,133 @@ impl MissionManager {
             for &thread_id in mission.thread_history.iter().rev() {
                 let thread = match self.store.load_thread(thread_id).await {
                     Ok(Some(thread)) => thread,
-                    Ok(None) => continue,
+                    Ok(None) => break,
                     Err(error) => {
                         warn!(%mission_id, %thread_id, %error, "failed to load thread for retry recovery");
-                        continue;
+                        break; // do not fall back to an older fire on read failure
                     }
                 };
                 if thread.thread_type != ThreadType::Mission {
                     continue;
                 }
+                if admitted.contains(&thread.id) {
+                    break;
+                }
                 let Some(state) = RetryState::from_metadata(&thread.metadata) else {
-                    continue;
+                    break; // a later fire supersedes older retry markers
                 };
-                if !thread.state.is_terminal() {
+                if thread.state != ThreadState::Failed || thread.is_failed_by_restart() {
                     // Checkpoint recovery owns anything still resumable.
                     clear_retry_marker(&*self.store, &thread).await;
-                    continue;
+                    break;
                 }
                 if !policy.is_enabled() {
                     clear_retry_marker(&*self.store, &thread).await;
-                    continue;
+                    break;
                 }
                 let Some(pending) =
-                    PendingMissionRetry::renew(&state, mission_id, &mission.user_id, &policy)
+                    PendingMissionRetry::renew(&state, mission_id, &thread.user_id, &policy)
                 else {
-                    continue;
+                    break;
                 };
-                clear_retry_marker(&*self.store, &thread).await;
-                self.schedule_retry(pending).await;
+                // Keep the durable marker until the retry actually spawns.
+                // Clearing it at timer admission loses the retry on another boot.
+                self.schedule_retry(pending.with_source_thread(thread.id))
+                    .await;
+                admitted.insert(thread.id);
                 scheduled.push(mission_id);
                 break; // one pending retry per mission — the newest fire wins
             }
         }
         Ok(scheduled)
+    }
+
+    /// Post-restart bookkeeping (WI#301): for every mission thread the
+    /// boot-time sweep failed as in-flight at kill time, record the lost
+    /// fire in the mission's approach history and notify the mission's
+    /// channels. Run after `ThreadManager::recover_all_threads_global`,
+    /// which is what stamps the `restart_failure` marker.
+    ///
+    /// Mark-only by design: restart-lost fires are NOT auto-refired. The
+    /// interrupted run's side effects (channel messages, webhooks,
+    /// third-party writes) are partially applied, and payload-less
+    /// cron/manual fires carry no dedup key, so an automatic re-fire can
+    /// duplicate real work — and a persisted restart marker would re-arm
+    /// it again on every later boot. Operators get the thread marker, the
+    /// approach-history record, and a notification instead; refiring is a
+    /// deliberate operator decision (manual re-fire, or the next cadence
+    /// tick for cron missions).
+    ///
+    /// Persist the history entry before acknowledging it on the thread.
+    /// Entries carry the thread ID so a crash between those writes is
+    /// recoverable without duplicating history. Notifications are best-effort
+    /// and may repeat if the process dies before the acknowledgement saves.
+    pub async fn record_restart_interrupted_missions(&self) -> Result<Vec<MissionId>, EngineError> {
+        let mut recorded = Vec::new();
+        for mission in self.store.list_all_missions_global().await? {
+            let mut mission = mission;
+            let mut changed = false;
+            let history = mission.thread_history.clone();
+            for thread_id in history {
+                if self
+                    .record_restart_interrupted_thread(&mut mission, thread_id)
+                    .await?
+                {
+                    changed = true;
+                }
+            }
+            if changed {
+                recorded.push(mission.id);
+            }
+        }
+        Ok(recorded)
+    }
+
+    /// Record one restart-failed thread on its mission before acknowledging it.
+    /// Returns true when the mission record was mutated.
+    async fn record_restart_interrupted_thread(
+        &self,
+        mission: &mut Mission,
+        thread_id: ThreadId,
+    ) -> Result<bool, EngineError> {
+        let Some(mut thread) = self.store.load_thread(thread_id).await? else {
+            return Ok(false);
+        };
+        if thread.thread_type != ThreadType::Mission
+            || thread.state != ThreadState::Failed
+            || thread.project_id != mission.project_id
+            || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
+            || !thread.is_failed_by_restart()
+            || thread.is_restart_failure_recorded()
+        {
+            return Ok(false);
+        }
+        let entry = format!(
+            "INTERRUPTED: engine restart before thread completion ({thread_id}; fire lost; not auto-refired)"
+        );
+        if !mission.approach_history.contains(&entry) {
+            mission.record_approach(entry);
+        }
+        mission.updated_at = Utc::now();
+        self.store.save_mission(mission).await?;
+        if !mission.notify_channels.is_empty() {
+            // Best-effort: ignore send errors (no subscribers = no problem).
+            let _ = self.notification_tx.send(MissionNotification {
+                mission_id: mission.id,
+                mission_name: mission.name.clone(),
+                thread_id,
+                user_id: thread.user_id.clone(),
+                notify_channels: mission.notify_channels.clone(),
+                response: Some(
+                    "Mission fire interrupted by engine restart; the fire was lost and will not be re-run automatically"
+                        .to_string(),
+                ),
+                is_error: true,
+            });
+        }
+        thread.mark_restart_failure_recorded();
+        self.store.save_thread(&thread).await?;
+        Ok(true)
     }
 }
 
@@ -2414,6 +2524,12 @@ struct PendingMissionRetry {
     attempt: u32,
     payload: Option<serde_json::Value>,
     not_before: DateTime<Utc>,
+    /// The failed thread this retry continues. When the re-fire spawns, the
+    /// source thread's persisted `mission_retry` marker is cleared so a
+    /// later boot cannot re-arm an already-consumed retry (WI#301 review
+    /// fix; closes the pre-existing WI#188 one-shot duplicate where a
+    /// successful re-fire left the parent's marker in place forever).
+    source_thread_id: Option<ThreadId>,
 }
 
 impl PendingMissionRetry {
@@ -2433,7 +2549,14 @@ impl PendingMissionRetry {
             attempt,
             payload,
             not_before: base + chrono::Duration::from_std(delay).ok()?,
+            source_thread_id: None,
         })
+    }
+
+    /// Record the failed thread this retry continues (see the field docs).
+    fn with_source_thread(mut self, thread_id: ThreadId) -> Self {
+        self.source_thread_id = Some(thread_id);
+        self
     }
 
     /// Re-arm a persisted [`RetryState`] after a daemon restart. The stored
@@ -2917,18 +3040,27 @@ async fn process_mission_outcome_and_notify(
         }
         ThreadOutcome::Failed { error, kind } => {
             mission.record_approach(format!("FAILED: {error}"));
-            // WI#188: terminal failures get a retry slot when the policy has
-            // attempts left; the failure kind does not change the contract —
-            // the daily budget and max_retries are the guardrails.
-            let _ = kind;
-            pending_retry = plan_outcome_retry(store, &mission, thread_id, "failed").await;
-            notify_response = Some(match pending_retry.as_ref() {
-                Some(p) => format!(
-                    "Mission failed: {error} (retry {} of {} scheduled)",
-                    p.attempt, mission.retry_policy.max_retries
-                ),
-                None => format!("Mission failed: {error}"),
-            });
+            if matches!(kind, ThreadFailureKind::BudgetExhausted) {
+                // WI#302: budget exhaustion is deliberate work exhaustion,
+                // not a transient failure — auto-retrying would hand each
+                // re-fire a fresh budget (up to 4x the configured spend per
+                // fire). Notify once, like MaxIterations; never auto-retry.
+                notify_response = Some(format!(
+                    "Mission stopped: {error} Not retrying automatically; retry with a narrower scope or a higher budget"
+                ));
+            } else {
+                // WI#188: terminal failures get a retry slot when the policy has
+                // attempts left; the failure kind does not change the contract —
+                // the daily budget and max_retries are the guardrails.
+                pending_retry = plan_outcome_retry(store, &mission, thread_id, "failed").await;
+                notify_response = Some(match pending_retry.as_ref() {
+                    Some(p) => format!(
+                        "Mission failed: {error} (retry {} of {} scheduled)",
+                        p.attempt, mission.retry_policy.max_retries
+                    ),
+                    None => format!("Mission failed: {error}"),
+                });
+            }
             is_error = true;
         }
         ThreadOutcome::MaxIterations => {
@@ -3020,7 +3152,8 @@ async fn plan_outcome_retry(
         mission.last_trigger_payload.clone(),
         &policy,
         Utc::now(),
-    )?;
+    )?
+    .with_source_thread(thread_id);
     debug!(mission_id = %mission.id, %attempt, %reason, "mission retry scheduled");
     Some(pending)
 }
@@ -3367,7 +3500,6 @@ mod tests {
     use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
     use crate::types::project::{Project, ProjectId};
     use crate::types::step::{ActionResult, LlmResponse, Step, TokenUsage};
-    use crate::types::thread::ThreadState;
 
     // ── TestStore — in-memory Store that persists missions ───
 
@@ -8996,6 +9128,48 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
     }
 
     #[tokio::test]
+    async fn budget_exhausted_outcome_notifies_without_retry() {
+        // WI#302: budget exhaustion is deliberate work exhaustion — each
+        // retried fire would spend a fresh budget, so it must be recorded
+        // and notified but never auto-retried (same contract as
+        // MaxIterations).
+        let project_id = ProjectId::new();
+        let mission = Mission::new(
+            project_id,
+            "test-user",
+            "budget-bounded",
+            "goal",
+            MissionCadence::OnEvent {
+                event_pattern: "deploy ready".into(),
+            },
+        );
+        let id = mission.id;
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        store.save_mission(&mission).await.unwrap();
+
+        let exhausted = ThreadOutcome::Failed {
+            kind: ThreadFailureKind::BudgetExhausted,
+            error: "Token budget exhausted before the task completed.".into(),
+        };
+        let pending = process_mission_outcome(&store, id, ThreadId::new(), &exhausted)
+            .await
+            .unwrap();
+        assert!(
+            pending.is_none(),
+            "WI#302: budget exhaustion must not schedule an auto-retry — every retry spends a fresh budget"
+        );
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.starts_with("FAILED: Token budget exhausted")),
+            "budget exhaustion must still be recorded in the approach history"
+        );
+    }
+
+    #[tokio::test]
     async fn stopped_outcome_schedles_retry_and_records_interrupted() {
         // WI#188 tri-state: a signal-stopped thread is an interruption, not
         // an empty arm — record it, notify as an error, schedule a retry.
@@ -9110,6 +9284,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             attempt: 2,
             payload: Some(original.clone()),
             not_before: Utc::now(),
+            source_thread_id: None,
         })
         .await;
         let mission = store.load_mission(id).await.unwrap().unwrap();
@@ -9215,7 +9390,350 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             vec![mission.id]
         );
         let recovered = store.load_thread(thread.id).await.unwrap().unwrap();
-        assert!(RetryState::from_metadata(&recovered.metadata).is_none());
+        assert!(RetryState::from_metadata(&recovered.metadata).is_some());
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mgr.shutdown().await;
+        // A new process must still recover a timer that never reached spawn.
+        let rebooted = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        rebooted.arm_retry_wake().await;
+        assert_eq!(
+            rebooted.recover_pending_mission_retries().await.unwrap(),
+            vec![mission.id]
+        );
+        rebooted.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn successful_refire_clears_source_thread_retry_marker() {
+        // WI#301 review fix (pre-existing WI#188 one-shot duplicate): a
+        // successful re-fire left the failed parent's `mission_retry`
+        // marker in place forever, so the next boot's recovery sweep
+        // re-armed — and re-fired — an already-consumed retry.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "retry-marker-clear",
+                "goal",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let mut mission = store.load_mission(id).await.unwrap().unwrap();
+        let mut source = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        source.state = ThreadState::Failed;
+        let pending =
+            PendingMissionRetry::new(id, "test-user", 1, None, &mission.retry_policy, Utc::now())
+                .unwrap();
+        source.metadata = serde_json::json!({RetryState::METADATA_KEY: pending.to_retry_state()});
+        mission.thread_history.push(source.id);
+        store.save_thread(&source).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        mgr.refire_mission_thread(pending.with_source_thread(source.id))
+            .await;
+
+        let source_after = store.load_thread(source.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&source_after.metadata).is_none(),
+            "a consumed retry marker must be cleared when the re-fire spawns"
+        );
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the next boot must not re-arm an already-consumed retry"
+        );
+        mgr.shutdown().await;
+    }
+
+    // ── Restart-lost fire record/notify (WI#301) ────────────
+
+    /// A mission whose newest thread was failed by the boot sweep with the
+    /// restart marker. `notify_channels` controls the notification arm.
+    async fn restart_failed_mission_fixture(
+        store: &Arc<TestStore>,
+        notify_channels: Vec<String>,
+    ) -> (Mission, Thread) {
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "interrupted",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.notify_channels = notify_channels;
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Failed;
+        thread.mark_failed_by_restart();
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        (mission, thread)
+    }
+
+    #[tokio::test]
+    async fn restart_interrupted_fire_is_recorded_and_notified() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) =
+            restart_failed_mission_fixture(&store, vec!["darkirc".into()]).await;
+
+        assert_eq!(
+            mgr.record_restart_interrupted_missions().await.unwrap(),
+            vec![mission.id]
+        );
+
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(saved_mission.approach_history.len(), 1);
+        assert!(
+            saved_mission.approach_history[0].contains("INTERRUPTED: engine restart"),
+            "approach entry must name the root cause: {:?}",
+            saved_mission.approach_history
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(saved_thread.is_failed_by_restart());
+        assert!(saved_thread.is_restart_failure_recorded());
+
+        let notif = rx.try_recv().expect("a notification must be emitted");
+        assert!(notif.is_error);
+        assert_eq!(notif.mission_id, mission.id);
+        assert_eq!(notif.thread_id, thread.id);
+        assert_eq!(notif.notify_channels, vec!["darkirc".to_string()]);
+        assert!(
+            notif
+                .response
+                .as_deref()
+                .is_some_and(|r| r.contains("not be re-run automatically")),
+            "notification must say the fire is not auto-refired: {:?}",
+            notif.response
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_interrupted_record_is_idempotent_across_boots() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, _) = restart_failed_mission_fixture(&store, vec!["darkirc".into()]).await;
+
+        assert_eq!(
+            mgr.record_restart_interrupted_missions().await.unwrap(),
+            vec![mission.id]
+        );
+        // Second boot on the same store: no re-record, no re-notify.
+        assert!(
+            mgr.record_restart_interrupted_missions()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(saved.approach_history.len(), 1);
+        let _ = rx.try_recv();
+        assert!(
+            rx.try_recv().is_err(),
+            "a second boot must not re-notify the same lost fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_record_skips_error_failed_threads() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let (mut mission, mut thread) =
+            restart_failed_mission_fixture(&store, vec!["darkirc".into()]).await;
+        // Undo the restart marker: this thread failed by error, not restart.
+        thread.metadata = serde_json::json!({});
+        store.save_thread(&thread).await.unwrap();
+        mission.approach_history.clear();
+        store.save_mission(&mission).await.unwrap();
+
+        assert!(
+            mgr.record_restart_interrupted_missions()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(saved.approach_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_record_skips_non_mission_threads() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let (mission, thread) = restart_failed_mission_fixture(&store, Vec::new()).await;
+        let mut thread = thread;
+        thread.thread_type = ThreadType::Foreground;
+        store.save_thread(&thread).await.unwrap();
+
+        assert!(
+            mgr.record_restart_interrupted_missions()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(saved.approach_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_record_works_without_notify_channels() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let (mission, thread) = restart_failed_mission_fixture(&store, Vec::new()).await;
+
+        assert_eq!(
+            mgr.record_restart_interrupted_missions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(saved_mission.approach_history.len(), 1);
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(saved_thread.is_restart_failure_recorded());
+    }
+
+    #[tokio::test]
+    async fn restart_record_retries_after_history_save_failure_without_losing_marker() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = restart_failed_mission_fixture(&store, vec!["xmpp".into()]).await;
+        store.failing_mission_saves.write().await.push(mission.id);
+        assert!(mgr.record_restart_interrupted_missions().await.is_err());
+        assert!(
+            !store
+                .load_thread(thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_restart_failure_recorded()
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(
+            store
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .approach_history
+                .is_empty()
+        );
+        assert_eq!(
+            mgr.record_restart_interrupted_missions().await.unwrap(),
+            vec![mission.id]
+        );
+        assert!(rx.try_recv().unwrap().is_error);
+        assert_eq!(
+            store
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .approach_history
+                .len(),
+            1
+        );
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_record_recovers_crash_between_history_and_ack() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let (mission, thread) = restart_failed_mission_fixture(&store, Vec::new()).await;
+        mgr.record_restart_interrupted_missions().await.unwrap();
+        // Simulate durable history but missing thread acknowledgement at kill.
+        store.save_thread(&thread).await.unwrap();
+        mgr.record_restart_interrupted_missions().await.unwrap();
+        assert_eq!(
+            store
+                .load_mission(mission.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .approach_history
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .load_thread(thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_restart_failure_recorded()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_recovery_does_not_rearm_older_fire_after_success() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let (mut mission, mut old) = restart_failed_mission_fixture(&store, Vec::new()).await;
+        let pending = PendingMissionRetry::new(
+            mission.id,
+            "test-user",
+            1,
+            None,
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        old.metadata = serde_json::json!({RetryState::METADATA_KEY: pending.to_retry_state()});
+        store.save_thread(&old).await.unwrap();
+        let mut newest = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            mission.project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        newest.state = ThreadState::Done;
+        mission.thread_history.push(newest.id);
+        store.save_thread(&newest).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
