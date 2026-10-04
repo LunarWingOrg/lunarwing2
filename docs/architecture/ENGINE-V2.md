@@ -584,6 +584,45 @@ payloads. If the daemon restarts mid-backoff, the pending retry marker on the
 failed thread's metadata lets the post-restart sweep enumerate persisted
 missions (even ones missing from the in-memory active index) and re-arm the
 re-fire with a fresh full backoff window (work items #188 and goal #38).
+Recovery considers only the latest mission fire: older markers cannot replay
+work after a newer success. Timer admission retains the durable marker until
+spawn and is deduplicated within the process, so another restart during backoff
+does not silently lose the retry.
+
+Budget exhaustion (tokens, time, or cost) produces `Failed(BudgetExhausted)`,
+never completion, and does not schedule a fresh-budget mission retry. Missing
+or unknown orchestrator outcomes fail as `Orchestrator` and count toward
+rollback. Stopped engine threads persist as Failed while retaining the Stopped
+runtime outcome. Legacy workers persist cancellation on stop and bound three
+consecutive unconfirmed text-only responses as failure, rather than success.
+
+Restart recovery for in-flight threads (work item #301): at boot,
+`ThreadManager::recover_all_threads_global` sweeps every project's persisted
+threads — a per-project sweep used to leave non-owner projects' in-flight
+threads as permanent `Running` zombies. Threads holding a
+`runtime_checkpoint` are suspended for checkpoint resume; `Waiting` threads
+are spared unconditionally because pending-gate reconciliation owns them (it
+restores the persisted gate or fails gateless ones itself). Every other
+non-terminal thread is failed with reason "engine restart before thread
+completion" and stamped with a permanent `restart_failure` metadata marker,
+distinct from Failed-by-error. `MissionManager::record_restart_interrupted_missions`
+then records each restart-lost mission fire in the mission's approach history
+("INTERRUPTED: engine restart before thread completion") and emits an error
+notification to the mission's `notify_channels`; a persisted
+`restart_failure_recorded` flag acknowledges the saved history. History is saved
+first and contains the thread ID for crash-safe deduplication; a failed save
+leaves the acknowledgement unset for the next boot. Notifications are best-effort
+and may repeat after a crash before acknowledgement. Restart-lost fires are
+deliberately NOT auto-refired: the interrupted
+run's side effects are partially applied and payload-less cron/manual fires
+carry no dedup key, so an automatic re-fire could duplicate real work.
+Refiring is an operator decision — manual re-fire, or the next cadence tick
+for cron missions.
+
+These recovery markers are additive thread metadata; no database migration is
+needed. Downgrading restores the older completion/recovery behavior and does
+not reconstruct interrupted work. Operators should inspect interrupted fires
+before manually refiring tasks with external side effects.
 
 `MissionManager::ensure_learning_missions()` provisions two baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement

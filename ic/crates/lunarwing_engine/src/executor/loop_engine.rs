@@ -486,15 +486,12 @@ impl ExecutionLoop {
         // Post-cleanup: persist final state, track failures for auto-rollback
         match result {
             Ok(orch_result) => {
-                // Reset the failure counter on a normal finish. A user stop
-                // (`Stopped`) is control flow, not a successful run, so it must
-                // not clear orchestrator failure/rollback history.
-                if !matches!(&orch_result.outcome, ThreadOutcome::Stopped)
-                    && let Some(store) = self.store.as_ref()
-                {
-                    crate::executor::orchestrator::reset_orchestrator_failures(
+                if let Some(store) = self.store.as_ref() {
+                    account_orchestrator_outcome(
                         store,
                         self.thread.project_id,
+                        orchestrator_version,
+                        &orch_result.outcome,
                     )
                     .await;
                 }
@@ -554,6 +551,27 @@ impl ExecutionLoop {
                 })
             }
         }
+    }
+}
+
+/// Malformed return values are failures even when the interpreter returned Ok.
+/// A stop is control flow and must not erase preceding rollback evidence.
+async fn account_orchestrator_outcome(
+    store: &Arc<dyn crate::traits::store::Store>,
+    project_id: crate::types::project::ProjectId,
+    version: u64,
+    outcome: &ThreadOutcome,
+) {
+    match outcome {
+        ThreadOutcome::Failed {
+            kind: ThreadFailureKind::Orchestrator,
+            ..
+        } => {
+            crate::executor::orchestrator::record_orchestrator_failure(store, project_id, version)
+                .await;
+        }
+        ThreadOutcome::Stopped => {}
+        _ => crate::executor::orchestrator::reset_orchestrator_failures(store, project_id).await,
     }
 }
 
@@ -2133,6 +2151,40 @@ mod tests {
 
         let outcome = exec.run().await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Stopped));
+        assert_eq!(exec.thread.state, ThreadState::Failed);
+    }
+
+    #[tokio::test]
+    async fn exhausted_budgets_return_typed_failure_not_completion() {
+        for config in [
+            ThreadConfig {
+                max_tokens_total: Some(0),
+                ..ThreadConfig::default()
+            },
+            ThreadConfig {
+                max_duration: Some(Duration::ZERO),
+                ..ThreadConfig::default()
+            },
+            ThreadConfig {
+                max_budget_usd: Some(0.0),
+                ..ThreadConfig::default()
+            },
+        ] {
+            let (mut exec, _tx) = make_loop(vec![], vec![], config).await;
+            let outcome = exec.run().await.unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ThreadOutcome::Failed {
+                        kind: ThreadFailureKind::BudgetExhausted,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(exec.thread.state, ThreadState::Failed);
+            assert_eq!(exec.thread.step_count, 0);
+        }
     }
 
     #[tokio::test]
@@ -3090,6 +3142,35 @@ mod tests {
 
         // A user stop must not clear orchestrator failure history.
         assert_eq!(failure_count(&store, project_id).await, 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_outcomes_accumulate_until_custom_orchestrator_is_skipped() {
+        use crate::types::memory::{DocType, MemoryDoc};
+        let project = ProjectId::new();
+        let doc = MemoryDoc::new(
+            project,
+            crate::types::shared_owner_id(),
+            DocType::Note,
+            "orchestrator",
+            "custom code",
+        )
+        .with_tags(vec!["orchestrator_code".into()]);
+        let mut doc = doc;
+        doc.metadata = serde_json::json!({"version": 1});
+        let store: Arc<dyn crate::traits::store::Store> =
+            Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let outcome = ThreadOutcome::Failed {
+            kind: ThreadFailureKind::Orchestrator,
+            error: "malformed outcome".into(),
+        };
+        for count in 1..=3 {
+            account_orchestrator_outcome(&store, project, 1, &outcome).await;
+            assert_eq!(failure_count(&store, project).await, count);
+        }
+        let (_, version) =
+            crate::executor::orchestrator::load_orchestrator(Some(&store), project, true).await;
+        assert_eq!(version, 0);
     }
 
     // ── Skill-feedback ID transport tests ──────────────────────

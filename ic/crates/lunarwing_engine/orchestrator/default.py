@@ -1116,7 +1116,9 @@ def run_loop(context, goal, actions, state, config):
         # 1. Check signals
         signal = __check_signals__()
         if signal == "stop":
-            __transition_to__("completed", "stopped by signal")
+            # WI#302: a stop is an interruption, not a completion — persist
+            # failed so the thread is not listed as a success.
+            __transition_to__("failed", "stopped by signal")
             return complete_result(state, "stopped")
         if signal and isinstance(signal, dict) and "inject" in signal:
             injected_text = signal["inject"]
@@ -1150,14 +1152,26 @@ def run_loop(context, goal, actions, state, config):
         # 2. Check budget
         budget = __check_budget__()
         if budget.get("tokens_remaining", 1) <= 0:
-            __transition_to__("completed", "token budget exhausted")
-            return complete_result(state, "completed", "Token budget exhausted.")
+            # WI#302: resource exhaustion is not a successful completion —
+            # fail loud so the user gets the reason as an error and missions
+            # record it without retrying with a fresh budget.
+            __transition_to__("failed", "token budget exhausted")
+            return complete_result(
+                state, "failed",
+                error="Token budget exhausted before the task completed.",
+                extra={"failure_kind": "budget_exhausted"})
         if budget.get("time_remaining_ms", 1) <= 0:
-            __transition_to__("completed", "time budget exhausted")
-            return complete_result(state, "completed", "Time budget exhausted.")
+            __transition_to__("failed", "time budget exhausted")
+            return complete_result(
+                state, "failed",
+                error="Time budget exhausted before the task completed.",
+                extra={"failure_kind": "budget_exhausted"})
         if budget.get("usd_remaining") is not None and budget["usd_remaining"] <= 0:
-            __transition_to__("completed", "cost budget exhausted")
-            return complete_result(state, "completed", "Cost budget exhausted.")
+            __transition_to__("failed", "cost budget exhausted")
+            return complete_result(
+                state, "failed",
+                error="Cost budget exhausted before the task completed.",
+                extra={"failure_kind": "budget_exhausted"})
 
         # 3. Inject prior knowledge and activate skills on first step
         if step == 0:
@@ -1424,10 +1438,8 @@ def run_loop(context, goal, actions, state, config):
                 __transition_to__("completed", "FINAL() in code")
                 return complete_result(state, "completed", result["final_answer"])
 
-            # Check for unified gate pause (new path)
+            # Check for unified gate pause
             gate = result.get("pending_gate")
-            if gate is None:
-                gate = result.get("need_approval")
             if gate is not None and isinstance(gate, dict) and gate.get("gate_paused"):
                 mark_gate_pause(state)
                 __save_checkpoint__(state, {
@@ -1446,35 +1458,6 @@ def run_loop(context, goal, actions, state, config):
                     "parameters": gate.get("parameters", {}),
                     "resume_kind": gate.get("resume_kind", {}),
                     "resume_output": gate.get("resume_output"),
-                }
-
-            # Check for approval or authentication needed (legacy path)
-            if result.get("need_approval") is not None:
-                approval = result["need_approval"]
-                mark_gate_pause(state)
-                __save_checkpoint__(state, {
-                    "nudge_count": consecutive_nudges,
-                    "consecutive_errors": consecutive_errors,
-                    "compaction_count": state.get("compaction_count", 0),
-                    "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
-                })
-                if approval.get("need_authentication"):
-                    __transition_to__("waiting", "authentication needed")
-                    return {
-                        "outcome": "need_authentication",
-                        "state": state,
-                        "credential_name": approval.get("credential_name", ""),
-                        "action_name": approval.get("action_name", ""),
-                        "call_id": approval.get("call_id", ""),
-                        "parameters": approval.get("parameters", {}),
-                    }
-                __transition_to__("waiting", "approval needed")
-                return {
-                    "outcome": "need_approval",
-                    "state": state,
-                    "action_name": approval.get("action_name", ""),
-                    "call_id": approval.get("call_id", ""),
-                    "parameters": approval.get("parameters", {}),
                 }
 
             progress = observe_work_progress(state, code_step_failed(result))
@@ -1533,13 +1516,13 @@ def run_loop(context, goal, actions, state, config):
             results = __execute_actions_parallel__(calls)
             append_structured_action_results(working_messages, calls, results)
 
-            # Check results for auth/approval interrupts
+            # Check results for gate interrupts
             for r_idx, r in enumerate(results):
                 if r is None:
                     continue
 
                 if r.get("gate_paused"):
-                    # Unified gate pause (replaces separate need_approval/need_authentication)
+                    # Unified gate pause
                     mark_gate_pause(state)
                     __save_checkpoint__(state, {
                         "nudge_count": consecutive_nudges,
@@ -1560,41 +1543,6 @@ def run_loop(context, goal, actions, state, config):
                         "parameters": orig_call.get("params", {}),
                         "resume_kind": gate.get("resume_kind", {}),
                         "resume_output": gate.get("resume_output"),
-                    }
-
-                if r.get("need_authentication"):
-                    mark_gate_pause(state)
-                    __save_checkpoint__(state, {
-                        "nudge_count": consecutive_nudges,
-                        "consecutive_errors": consecutive_errors,
-                        "compaction_count": state.get("compaction_count", 0),
-                        "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
-                    })
-                    __transition_to__("waiting", "authentication needed")
-                    return {
-                        "outcome": "need_authentication",
-                        "state": state,
-                        "credential_name": r.get("credential_name", ""),
-                        "action_name": r.get("action_name", ""),
-                        "call_id": r.get("call_id", ""),
-                        "parameters": r.get("parameters", {}),
-                    }
-
-                if r.get("need_approval"):
-                    mark_gate_pause(state)
-                    __save_checkpoint__(state, {
-                        "nudge_count": consecutive_nudges,
-                        "consecutive_errors": consecutive_errors,
-                        "compaction_count": state.get("compaction_count", 0),
-                        "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
-                    })
-                    __transition_to__("waiting", "approval needed")
-                    return {
-                        "outcome": "need_approval",
-                        "state": state,
-                        "action_name": r.get("action_name", ""),
-                        "call_id": r.get("call_id", ""),
-                        "parameters": r.get("parameters", {}),
                     }
 
             progress = observe_work_progress(state, action_batch_failed(calls, results))
