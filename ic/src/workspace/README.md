@@ -109,9 +109,9 @@ the reliable form: one backtick pair on a single line, at most 200 bytes
 (`MAX_QUOTED_SPAN_BYTES`) between them, with no other quote mark left open
 before it on that line (an earlier unbalanced quote swallows the backticks).
 The hint also says that quoting neutralizes nothing: the phrase is stored
-verbatim and stays model-visible in later system prompts, since prompt
-assembly breaks only `<|` — so quote only what the record needs, never text
-meant to steer the assistant. The guidance and all three agent-facing
+verbatim and stays model-visible in later system prompts — prompt assembly
+escapes nothing on the v1 path and breaks only `<|` under Engine V2 — so
+quote only what the record needs, never text meant to steer the assistant. The guidance and all three agent-facing
 messages (injection rejection, existing-content rejection, daily-log
 quarantine) are pinned scanner-clean with real pattern descriptions by a
 regression test: every scanner hit lies inside the echoed list. Gate
@@ -164,7 +164,9 @@ prompt-injected (daily-log injection reads only the exact
 `daily/YYYY-MM-DD.md` path). Quarantine applies only when the poison
 pre-exists: a poisoned entry, or a pattern split across the append boundary,
 is still a plain rejection with no file movement. Quarantine failures are
-logged and never mask the original rejection.
+logged and never mask the rejection; the refused append is then relabelled
+`ExistingContentRejected` (the stored content alone already failed the gate,
+so rephrase advice would blame the clean entry).
 
 ### Prompt-File Shadow Backups (WI#286)
 
