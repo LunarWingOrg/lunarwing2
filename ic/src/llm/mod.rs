@@ -380,14 +380,17 @@ pub async fn build_provider_chain(
             cheap = %cheap.model_name(),
             "Smart routing enabled"
         );
-        Arc::new(SmartRoutingProvider::new(
-            llm,
-            cheap,
-            SmartRoutingConfig {
-                cascade_enabled: config.smart_routing_cascade,
-                ..SmartRoutingConfig::default()
-            },
-        ))
+        Arc::new(
+            SmartRoutingProvider::new(
+                llm,
+                cheap,
+                SmartRoutingConfig {
+                    cascade_enabled: config.smart_routing_cascade,
+                    ..SmartRoutingConfig::default()
+                },
+            )
+            .with_telemetry(Arc::clone(&telemetry)),
+        )
     } else {
         llm
     };
