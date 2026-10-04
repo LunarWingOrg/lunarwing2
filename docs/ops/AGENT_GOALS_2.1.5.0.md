@@ -115,7 +115,10 @@
 26. [ ] update all docs in docs/guides
 27. [ ] update all docs in docs/architecture
 28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5098 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
-29. [ ] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
+29. [x] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
+   - DONE (2026-10-04, branch `rarity/kimi-29-20261004-1600`): `docs/ops/v2.1.5.0_CODENAME_IDEAS.md` written, following the `v2.1.4.0_CODENAME_IDEAS.md` format (cycle summary, 10 candidates, top picks, recommendation).
+   - Recommendation: keep the goals header's pre-selected **Bungei Fukkō (文芸復興, "The Renaissance")** — the cycle is mostly previously REJECTED/SALVAGED MRs reborn through adversarial review. Fallbacks: Tamahagane (玉鋼, folded steel = review process), Yomigaeri (蘇り, resurrection = recovery spine).
+   - No previous release codename reused (checked against the lineage list in `v2.1.4.0_CODENAME_IDEAS.md` + Kabuto v2.1.4.0); the file's pre-existing seed shortlist notes (keimō / bunmei kaika / satori / runesansu) preserved as a "considered, not shortlisted" section.
 30. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
 31. [x] (S) RESERVED4itemstoworkonwilldiscusslater
 32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/307
