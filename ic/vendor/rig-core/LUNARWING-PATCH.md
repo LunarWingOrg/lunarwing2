@@ -9,15 +9,29 @@ from the registry tarball on every run and **silently drops the patch**, so
   clean (the post-vendor restore resets it from git, so uncommitted changes
   here would be lost) and the patch marker is present in **every**
   marker-bearing patched file (`RIGCORE_MARKER_FILES` in the script), so a
-  committed revert of any single file is caught, not just the first one.
+  committed revert of any single file is caught, not just the first one. It
+  also warns, without failing, about any file in this directory that carries
+  the marker but is missing from that list.
 - **After vendoring** it restores the committed patched tree — patched
   sources, this file, and `.cargo-checksum.json` — from git
   (`git checkout HEAD -- vendor/rig-core`) and re-checks every marker,
-  making a same-version refresh fully self-healing.
+  making a same-version refresh fully self-healing. If `cargo vendor` itself
+  fails or is interrupted (an error, Ctrl-C, SIGTERM or SIGHUP; not SIGKILL)
+  after rewriting this directory, the same restore runs before the script
+  exits, also dropping any files cargo added, so a plain re-run starts
+  clean.
 - If the refresh **bumped rig-core to a new version**, the restore is refused
-  and the script exits nonzero: re-apply the patch onto the new sources (file
-  list below; see git history for the exact diff), regenerate the per-file
-  SHA-256 entries in `.cargo-checksum.json`, commit, then re-run the refresh.
+  and the script exits nonzero, leaving the new pristine sources in place
+  (this file is gone from the working tree then; read it with
+  `git show HEAD:ic/vendor/rig-core/LUNARWING-PATCH.md`). Re-apply the patch
+  onto them (file list below; the original patch is commit `4b810a082`,
+  `git show 4b810a082 -- ic/vendor/rig-core/src` from the repo root), bring
+  this file back with the new version, regenerate the per-file SHA-256
+  entries in `.cargo-checksum.json`, commit, then re-run the refresh. To back
+  out of the bump instead, revert the rig-core version change in the
+  lockfiles and discard the new sources from the repo root with
+  `git checkout HEAD -- ic/vendor/rig-core && git clean -fd -- ic/vendor/rig-core`
+  (the clean drops files the new version added).
 
 Editing any file under `vendor/rig-core/` (including this one) without
 regenerating its entry in `.cargo-checksum.json` breaks cargo's
@@ -33,8 +47,10 @@ the OpenAI-compatible streaming aggregator collapsed `stop`/`length`/
 the reason from content shape.
 
 Patched files (every one except the `#[cfg(test)]`-only test profiles
-carries the marker; when the patch grows a file, mark it and add it to
-`RIGCORE_MARKER_FILES` in `ic/scripts/refresh-vendor.sh`):
+carries the marker; when the patch grows, drops or moves a file, update the
+markers, `RIGCORE_MARKER_FILES` in `ic/scripts/refresh-vendor.sh` and
+`MARKER_FILES` in `ic/scripts/tests/test-refresh-vendor-rigcore-guard.sh` to
+match; CI checks that all three agree):
 
 - `src/providers/internal/openai_chat_completions_compatible.rs` —
   `CompatibleFinishReason` widened with `Stop`/`Length`/`ContentFilter`;
