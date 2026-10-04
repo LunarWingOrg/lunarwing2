@@ -172,13 +172,39 @@ a typed `LlmError::EmptyStream` carrying the WI#292 finish classification:
   cooldown/circuit-breaker accounting.
 - `length` and `content_filter` are deterministic: the identical request
   cannot fix an output-budget truncation or a refusal, so they are
-  non-retryable, do not fail over, and do not charge cooldown. They surface
-  with honest terminal guidance instead of a mislabeled invalid-output repair
-  loop.
+  non-retryable, do not fail over, and do not charge cooldown. On the Engine
+  V2 path they surface as the dedicated `content_filtered` /
+  `output_budget_exhausted` failure kinds (0 engine recovery attempts, each
+  with its own terminal message: a content-filter refusal tells the user to
+  rephrase or switch models; an output-budget truncation tells them to raise
+  the output token limit) instead of the generic request-rejected text.
 
-The smart-routing cascade treats a transient empty from the cheap leg as an
-escalation trigger to the primary (matching the pre-typed-error "uncertain"
-behavior); deterministic empties propagate without escalating.
+Empty-stream detection lives in the Retry/Failover decorators, so with
+`max_retries = 0` and no fallback configured the pre-WI#297 behavior remains:
+the integrity layer reports the empty stream as `Aborted{Empty}` and no
+retry/failover semantics apply.
+
+The typed error also carries the token usage the provider billed for the
+empty completion (a `Done`-first chunk reports usage). Retry and failover sum
+the usage of every discarded empty attempt and forward it on the `Retried`
+stream observation; the engine's stream accumulator folds that
+`discarded_usage` into the successful call's recorded usage, so thread-level
+token accounting sees every billed call (a transient-empty storm can no
+longer hide up to N billed calls per logical request). On exhaustion the
+accumulated usage is folded into the returned error instead, and the bridge
+warn-logs it when the failure turns terminal. `StreamTelemetry` records
+per-provider `empty_stream_discarded_input/output_tokens_total` counters at
+each forwarding point, and the per-attempt warn logs carry the token counts.
+
+The smart-routing composite treats a transient empty from the cheap leg as an
+escalation trigger to the primary on every cheap-routed arm (Simple,
+Moderate with or without cascade), matching the pre-typed-error "uncertain"
+behavior; without this, repeated cheap empties would charge the enclosing
+failover leg's cooldown and eventually bypass the primary for all traffic.
+Deterministic empties propagate without escalating. The discarded cheap
+attempt's billed usage is recorded in telemetry and logged but is not
+forwarded at thread level: the escalated primary stream is opened fresh, so
+there is no content chunk to attach an observation to.
 
 Failover binds the selected provider to the current Tokio task before returning
 the stream so model attribution remains request-scoped under concurrency.
