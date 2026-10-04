@@ -1933,11 +1933,18 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         }
     }
 
+    let gate_persistence = crate::gate::persistence::FileGatePersistence::with_default_path();
+    let pending_gates_path = gate_persistence.path().to_path_buf();
     let pending_gates = Arc::new(crate::gate::store::PendingGateStore::new(Some(Arc::new(
-        crate::gate::persistence::FileGatePersistence::with_default_path(),
+        gate_persistence,
     ))));
     if let Err(e) = pending_gates.restore_from_persistence().await {
-        debug!("engine v2: failed to restore pending gates: {e}");
+        // Corrupt-on-restore hides pending approvals, so surface it (WI#299).
+        tracing::warn!(
+            error = %e,
+            path = %pending_gates_path.display(),
+            "engine v2: failed to restore pending gates"
+        );
     }
     if let Err(e) = reconcile_pending_gate_state(&store_dyn, &pending_gates).await {
         debug!("engine v2: pending gate reconciliation failed: {e}");
