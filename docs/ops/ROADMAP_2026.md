@@ -19,6 +19,7 @@
 | Lunarvision support for multimodal models | v2.2.2.0 |
 | TensorMoon integration as a first-class, self-maintained LunarWing component (packaging/lifecycle, managed config, vendor posture, observability unification) Unified Inference Routing and evaluations | v2.2.2.0 |
 | Part 2 of planned overhaul of some LLM engine functionality | v2.2.2.0 |
+| IPv6 Support | v2.2.2.0 |
 | Next Generation MCP Engine Part 4 Completion | v2.2.4.0 |
 | Firstmate/herdr.dev Integration | v2.2.4.0 |
 | OpenAI API Compatible Responses Support, with or without a custom websocket implementation | v2.2.6.0 |
