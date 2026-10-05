@@ -199,7 +199,12 @@
 36. [x] (S) RESERVED4WIs
 37. [x] (S) RESERVED4WIs
 38. [x] (S) HRDR
-39. [ ] repass of goal number 25
+39. [x] repass of goal number 25
+   - DONE 100% (2026-10-05, branch `sweetiebot/kimi-39-20261005-1500`): repassed the open-work-items audit in place at `docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md` (re-stamped 15:10 UTC at HEAD `67f03aff2`, same structure as the item-25 pass).
+   - Tracker state: 20 open items (was 25) — 15 of the old set closed (#287/#290/#308/#297/#294/#273/#289/#307/#304/#309/#310/#278/#199/#198/#191, closure times 01:28–12:31Z), #274 reappeared and closed 12:19Z, and 10 new items filed (#311–#320).
+   - The 2.1.5.0-labeled open set is now five: #311 (items 43/42 — lifecycle fix landed, !1431 merged, live tenant acceptance outstanding), #288 (item 19 — third MR !1437 open after !1433 salvaged), #303 (item 33 — retargeted opencode 2.0.23, tag `0fd7e282` verified live, MR !1438 open), #319 (item 46 — P-9 recovery-guidance residual), #320 (item 41 — external-worker test tenant).
+   - Code-facing dispositions re-verified against this tree: wizard `env_or_override` (wizard.rs:580/673/1186), `ExistingContentRejected` (error.rs:364), `ContentFiltered`/`OutputBudgetExhausted` (engine error.rs:27/31), `mission_action_defs` resume catalog (effect_adapter.rs:556/1561), `v1_routine_redirect` (effect_adapter.rs:1817), `SANDBOX_TENANT_LOGS` (7 files), `RIGCORE_MARKER_FILES` (refresh-vendor.sh:84), #311 auto-complete pins (mission.rs:6264/6317), #288 High floor still at workspace/mod.rs:185, #276 cancel arm still at mission.rs:2215, #317 boot order at router.rs:1764, #315 `search_blobs` no-ref (lib.rs:302), #303 pins still v2.0.21 (Dockerfile:7), #248 `sandboxtunmode` still `2ed3d0395` on origin.
+   - Docs-only change; no cargo gates apply. Commit: `4f54c3e21`.
 40. [x] (S) RESERVED4NVMES
 41. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/320 - will involve creating a test tenant and interacting with it substantially. expect this to be a long one.
 42. [ ] Clearly something went very very wrong with the work done from the 43rd goal.... See comments on WI 311 and address properly this time....
