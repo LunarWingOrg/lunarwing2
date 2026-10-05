@@ -6,7 +6,7 @@ LunarWing controls local filesystem and shell tools through three separate layer
 2. **Sandbox policy** limits filesystem and network access.
 3. **Tool permission** decides whether an invocation runs, asks for approval, or is disabled.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19, 2026-09-27 (v2.1.3.0), and 2026-10-01 (v2.1.4.0).** `ALLOW_LOCAL_TOOLS`,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19, 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** `ALLOW_LOCAL_TOOLS`,
 `AGENT_AUTO_APPROVE_TOOLS`, and the `full_access` double opt-in
 (`SANDBOX_ALLOW_FULL_ACCESS`) were re-checked against the config resolver and
 sandbox manager. Updated for the v2.1.2.0 generic podman-first sandbox: new

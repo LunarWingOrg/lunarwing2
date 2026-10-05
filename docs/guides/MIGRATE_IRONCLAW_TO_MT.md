@@ -2,7 +2,7 @@
 
 This runbook moves one PostgreSQL-backed IronClaw instance into a tenant managed by `ic/scripts/lunarwing-mt-admin.sh`. Rehearse with a dump and copied state before the final cutover.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0) and 2026-10-01 (v2.1.4.0).** Every referenced
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** Every referenced
 mt-admin subcommand (`add-tenant`, `list-tenants`, `status`, `stop-tenant`,
 `restore-tenant`, `build-tenant`, `start-tenant`, `doctor`, `restart-tenant`)
 was re-checked against the current script; the guarded restore path, state
