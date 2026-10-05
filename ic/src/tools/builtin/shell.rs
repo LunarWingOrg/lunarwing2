@@ -929,7 +929,9 @@ impl Tool for ShellTool {
     fn description(&self) -> &str {
         "Execute shell commands. Use for running builds, tests, git operations, and other CLI tasks. \
          Commands run in a subprocess with captured output. Long-running commands have a timeout. \
-         When Docker sandbox is enabled, commands run in isolated containers for security. \
+         When Docker sandbox is enabled, commands run in isolated containers for security; \
+         if /tenant-logs exists there, it holds the daemon's own log (secret-scrubbed, \
+         read-only): daemon.log, previous rotation daemon.log.1. \
          Output is bounded; truncated=true and a warning mean the captured data is incomplete, \
          even if success=true. Use files or smaller chunks for large payloads."
     }

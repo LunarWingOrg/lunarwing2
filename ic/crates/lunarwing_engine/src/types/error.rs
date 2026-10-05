@@ -21,6 +21,14 @@ pub enum ModelFailureKind {
     Unavailable,
     Authentication,
     RequestRejected,
+    /// The provider answered successfully but with no content because its
+    /// content filter refused the request (WI#297). Deterministic and
+    /// request-specific: re-sending the identical request cannot succeed.
+    ContentFiltered,
+    /// The provider answered successfully but with no visible content because
+    /// the model spent its entire output budget first (`length`, WI#297).
+    /// Deterministic: the identical request burns the same budget again.
+    OutputBudgetExhausted,
     Internal,
 }
 
@@ -35,6 +43,8 @@ impl ModelFailureKind {
             Self::Unavailable => "unavailable",
             Self::Authentication => "authentication",
             Self::RequestRejected => "request_rejected",
+            Self::ContentFiltered => "content_filtered",
+            Self::OutputBudgetExhausted => "output_budget_exhausted",
             Self::Internal => "internal",
         }
     }
@@ -49,6 +59,8 @@ impl ModelFailureKind {
             "unavailable" => Some(Self::Unavailable),
             "authentication" => Some(Self::Authentication),
             "request_rejected" => Some(Self::RequestRejected),
+            "content_filtered" => Some(Self::ContentFiltered),
+            "output_budget_exhausted" => Some(Self::OutputBudgetExhausted),
             "internal" => Some(Self::Internal),
             _ => None,
         }
@@ -57,7 +69,13 @@ impl ModelFailureKind {
     /// Whether one model-visible recovery request can reasonably change the
     /// outcome after provider-level retries and failover have been exhausted.
     pub const fn is_recoverable(self) -> bool {
-        !matches!(self, Self::Authentication | Self::RequestRejected)
+        !matches!(
+            self,
+            Self::Authentication
+                | Self::RequestRejected
+                | Self::ContentFiltered
+                | Self::OutputBudgetExhausted
+        )
     }
 
     /// Safe control text for one model-visible recovery request.
@@ -86,6 +104,12 @@ impl ModelFailureKind {
             }
             Self::RequestRejected => {
                 "The provider rejected this request. Ask the user/operator to review model and tool compatibility or choose another model."
+            }
+            Self::ContentFiltered => {
+                "The provider refused to generate content for this request (content filter). Ask the user/operator to rephrase the request or choose another model."
+            }
+            Self::OutputBudgetExhausted => {
+                "The model used its entire output budget before producing visible text. Ask the user/operator to raise the output token limit or choose another model."
             }
             Self::Internal => {
                 "Model failure observation: the model gateway failed internally. Gateway may have recovered; continue from current state and finish concisely."
@@ -119,6 +143,12 @@ impl ModelFailureKind {
             }
             Self::RequestRejected => {
                 "The model provider rejected this request. Review model and tool compatibility or choose another model."
+            }
+            Self::ContentFiltered => {
+                "The model provider refused to generate content for this request (content filter). Rephrase the request or choose another model."
+            }
+            Self::OutputBudgetExhausted => {
+                "The model used its entire output budget before producing visible text. Raise the output token limit or choose another model."
             }
             Self::Internal => {
                 "The model gateway failed after one recovery attempt. Check provider configuration and service logs, then retry."

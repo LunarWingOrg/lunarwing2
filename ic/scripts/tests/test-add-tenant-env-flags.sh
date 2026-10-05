@@ -126,8 +126,9 @@ assert_eq "default MASCOT_ENABLED" "$(envval MASCOT_ENABLED)" "false"
 # WI#205: the sandbox must be told which tenant directories hold credentials.
 # They are not derivable from LUNARWING_BASE_DIR (state/ is a child of the
 # tenant root; env/ and run/ are siblings), so mt-admin names them explicitly.
-assert_eq "sandbox protects env, state and run under the tenant root" \
-  "$(envval SANDBOX_PROTECTED_PATHS)" "$MT_FIXTURE/env:$MT_FIXTURE/state:$MT_FIXTURE/run"
+# WI#287: logs/ too — raw unscrubbed OpenRC logs were mountable read-write.
+assert_eq "sandbox protects env, state, run and logs under the tenant root" \
+  "$(envval SANDBOX_PROTECTED_PATHS)" "$MT_FIXTURE/env:$MT_FIXTURE/state:$MT_FIXTURE/run:$MT_FIXTURE/logs"
 assert_eq "default XMPP_JID" "$(envval XMPP_JID)" "fixture-tenant@xmpp.localhost"
 assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "user@xmpp.localhost"
 write_tenant_bridge_env fixture-tenant
@@ -173,6 +174,8 @@ assert_eq "default SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "none"
 assert_eq "default SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "podman"
 assert_eq "default SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "lunarwing-sandbox:latest"
 assert_eq "default SANDBOX_AUTO_PULL" "$(envval SANDBOX_AUTO_PULL)" "false"
+# WI#287: the sandbox-visible daemon log copy is capped at INFO by default.
+assert_eq "default SANDBOX_TENANT_LOGS" "$(envval SANDBOX_TENANT_LOGS)" "info"
 # Legacy IRONCLAW_* aliases must NOT be generated for new tenants (v2.0.8.0);
 # the daemon still accepts them for existing tenants.
 assert_eq "base dir written" "$(envval LUNARWING_BASE_DIR)" "$MT_FIXTURE/state"
@@ -216,6 +219,7 @@ sed -i \
   -e 's/^SANDBOX_RUNTIME=.*/SANDBOX_RUNTIME=docker/' \
   -e 's/^SANDBOX_IMAGE=.*/SANDBOX_IMAGE=custom-sandbox:v2/' \
   -e 's/^SANDBOX_AUTO_PULL=.*/SANDBOX_AUTO_PULL=true/' \
+  -e 's/^SANDBOX_TENANT_LOGS=.*/SANDBOX_TENANT_LOGS=off/' \
   "$MT_FIXTURE/env/lunarwing.env"
 cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
@@ -264,6 +268,7 @@ assert_eq "rerun preserves SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "proxy"
 assert_eq "rerun preserves SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "docker"
 assert_eq "rerun preserves SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "custom-sandbox:v2"
 assert_eq "rerun preserves SANDBOX_AUTO_PULL" "$(envval SANDBOX_AUTO_PULL)" "true"
+assert_eq "rerun preserves SANDBOX_TENANT_LOGS" "$(envval SANDBOX_TENANT_LOGS)" "off"
 
 echo "=== approval setting migration tests ==="
 # Canonical key must win even when a conflicting legacy value is present.
@@ -304,6 +309,7 @@ sed -i \
   -e '/^SANDBOX_RUNTIME=/d' \
   -e '/^SANDBOX_IMAGE=/d' \
   -e '/^SANDBOX_AUTO_PULL=/d' \
+  -e '/^SANDBOX_TENANT_LOGS=/d' \
   "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant
 assert_eq "re-run adds MASCOT_ENABLED default" "$(envval MASCOT_ENABLED)" "false"
@@ -318,6 +324,7 @@ assert_eq "re-run adds SANDBOX_NETWORK default" "$(envval SANDBOX_NETWORK)" "non
 assert_eq "re-run adds SANDBOX_RUNTIME default" "$(envval SANDBOX_RUNTIME)" "podman"
 assert_eq "re-run adds SANDBOX_IMAGE default" "$(envval SANDBOX_IMAGE)" "lunarwing-sandbox:latest"
 assert_eq "re-run adds SANDBOX_AUTO_PULL default" "$(envval SANDBOX_AUTO_PULL)" "false"
+assert_eq "re-run adds SANDBOX_TENANT_LOGS default" "$(envval SANDBOX_TENANT_LOGS)" "info"
 
 # Case 3c: external LunarVision mode must survive every full env re-render.
 VISION_MODE_FIXTURE=external

@@ -2838,7 +2838,9 @@ mod tests {
     #[test]
     fn stream_observations_form_one_safe_context_line() {
         let line = observation_context(&[
-            ProviderStreamObservation::Retried,
+            ProviderStreamObservation::Retried {
+                discarded_usage: None,
+            },
             ProviderStreamObservation::Corrupted,
         ])
         .expect("observation line");

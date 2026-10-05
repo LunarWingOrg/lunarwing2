@@ -197,6 +197,15 @@ pub enum ToolError {
     #[error("Not authorized: {0}")]
     NotAuthorized(String),
 
+    /// The call's content was refused by a content gate (e.g. the workspace
+    /// prompt-injection scan). Unlike [`ToolError::NotAuthorized`], no
+    /// permission or approval unblocks it: resubmitting the same content
+    /// fails the same way, so the remedy is changing the content — the
+    /// call's own, or content already stored in the file the call extends
+    /// (WI#290).
+    #[error("Content rejected: {0}")]
+    ContentRejected(String),
+
     #[error("Rate limited, retry after {0:?}")]
     RateLimited(Option<Duration>),
 

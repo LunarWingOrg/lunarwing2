@@ -22,6 +22,21 @@ cleanup path is the `ContainerCleanupGuard` detached kill/rm plus the
 API-independent bounded CLI sweep. See
 [`v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
 
+**`/tenant-logs` (WI#287).** The daemon writes a secret-scrubbed copy of its
+own log to `<base>/logs/sandbox/daemon.log` (MT: `<tenant root>/state/logs/sandbox/`)
+and sandboxed runs see it read-only at `/tenant-logs`. mt-admin renders
+`SANDBOX_TENANT_LOGS=info` (INFO and above, whatever the runtime level) and
+preserves an operator-set value on re-render; `upgrade-tenant` does not
+re-render the env, so existing tenants keep the daemon default, which is also
+`info`. `debug` follows the runtime level up to DEBUG (the tool-call lines);
+`off` writes no copy and mounts nothing. An invalid value fails every
+`lunarwing` command that loads the config. The copy is daemon-owned (`0700`
+directory, `0600` file), so it is mounted only where the runtime maps the
+sandbox user onto the tenant's uid: docker, podman 5+ (keep-id pinned to
+1000), or podman 4.3+ when the tenant uid is 1000. Other podman 4.x tenants
+get no mount. The raw `<tenant root>/logs` directory stays protected: it is
+neither a valid `workdir` nor visible through a tenant-root mount.
+
 ## LunarWing Worker
 
 The main sandbox worker. Its runtime image includes Git, build-essential, Node.js/npm, Python 3, Rust, and GitHub CLI; it does not install a Claude Code executable. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.

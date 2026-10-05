@@ -390,7 +390,13 @@ that safe class and fixed recovery text, never provider-supplied diagnostics.
   the separate subscriber-lag recovery path.
 - Authentication and rejected-request failures skip model retry because an
   unchanged request cannot repair credentials or compatibility. Their terminal
-  text names the operator action required.
+  text names the operator action required. The same fail-fast rule covers the
+  two deterministic provider-empty kinds (WI#297): `content_filtered` (the
+  provider refused; rephrase or switch models) and `output_budget_exhausted`
+  (the model spent its whole output budget before visible text; raise the
+  output token limit or switch models). Both are produced by the host
+  retry/failover empty-stream detection and reach the engine as their own
+  kinds, never as the generic rejected-request text.
 - Reaching `max_iterations` schedules one final tool-capable model request before
   returning `ThreadOutcome::MaxIterations`.
 - Three consecutive code steps or structured action batches with no successful

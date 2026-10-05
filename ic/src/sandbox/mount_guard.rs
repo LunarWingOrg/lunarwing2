@@ -1,9 +1,12 @@
 //! Containment validation for the directory the generic sandbox bind-mounts.
 //!
-//! The generic sandbox mounts exactly one host directory into the container as
-//! `/workspace` ([`crate::sandbox::cli_runner::build_run_args`]). That path is
-//! chosen by the *agent* — it comes straight from the shell tool's `workdir`
-//! argument — so it must be validated before it is handed to the runtime.
+//! The generic sandbox mounts one agent-chosen host directory into the
+//! container as `/workspace` ([`crate::sandbox::cli_runner::build_run_args`]).
+//! That path comes straight from the shell tool's `workdir` argument, so it
+//! must be validated before it is handed to the runtime. (The only other
+//! host-directory binds are daemon-owned and read-only: the proxy relay socket
+//! directory and the scrubbed daemon log at [`TENANT_LOGS_MOUNT`], vetted by
+//! [`tenant_logs_mount_source`].)
 //!
 //! Without validation a contained agent can mount the tenant's configuration
 //! directory and read the plaintext gateway bearer token out of
@@ -34,14 +37,28 @@
 //! parent. The tenant's own env directory is therefore supplied explicitly via
 //! `SANDBOX_PROTECTED_PATHS` (mt-admin writes it during env generation), with
 //! the base-dir-derived defaults as a fallback for single-node installs.
+//!
+//! An init script that redirects the daemon's raw stdout/stderr outside the
+//! base dir (the committed OpenRC template: `/var/log/lunarwing`) hands those
+//! directories over in `LUNARWING_SERVICE_LOG_DIRS` (WI#287). That list is
+//! only ever *added* to `SANDBOX_PROTECTED_PATHS`, never a replacement: the
+//! daemon loads `.env` files without overriding the environment, so an init
+//! script that exported `SANDBOX_PROTECTED_PATHS` itself would silently shadow
+//! the operator's value.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sandbox::error::SandboxError;
 
 /// Environment variable holding extra directories the sandbox may never
 /// expose. `:`-separated, like `PATH`.
 pub const PROTECTED_PATHS_ENV: &str = "SANDBOX_PROTECTED_PATHS";
+
+/// Environment variable an init script exports with the directories its raw,
+/// unscrubbed service logs are redirected to (WI#287 review S3). `:`-separated
+/// and always unioned with [`PROTECTED_PATHS_ENV`], never replacing it.
+pub const SERVICE_LOG_DIRS_ENV: &str = "LUNARWING_SERVICE_LOG_DIRS";
 
 /// Credential-bearing file names that must never be a mount target.
 ///
@@ -55,15 +72,34 @@ const ENV_SUFFIX: &str = ".env";
 
 /// Resolve the protected directory set for this process.
 ///
-/// Explicit `SANDBOX_PROTECTED_PATHS` entries win; the base-dir-derived
-/// defaults (`<base>/env`, `<base>`, and `<base>/.env`'s directory) are always
-/// included because they cover the single-node layout, where the env file
-/// genuinely is `<base>/.env`.
+/// Explicit `SANDBOX_PROTECTED_PATHS` entries, plus the init-owned
+/// `LUNARWING_SERVICE_LOG_DIRS` entries (additive only), plus the
+/// base-dir-derived defaults (`<base>/env`, `<base>`, and `<base>/.env`'s
+/// directory), which are always included because they cover the single-node
+/// layout, where the env file genuinely is `<base>/.env`.
 pub fn resolve_protected_paths() -> Vec<PathBuf> {
-    resolve_protected_paths_from(
+    let explicit = explicit_protected_entries(
         std::env::var(PROTECTED_PATHS_ENV).ok().as_deref(),
-        &crate::bootstrap::lunarwing_base_dir(),
-    )
+        std::env::var(SERVICE_LOG_DIRS_ENV).ok().as_deref(),
+    );
+    resolve_protected_paths_from(explicit.as_deref(), &crate::bootstrap::lunarwing_base_dir())
+}
+
+/// Union of the operator's `SANDBOX_PROTECTED_PATHS` and the init script's
+/// `LUNARWING_SERVICE_LOG_DIRS` as one `:`-separated list (empty entries
+/// dropped), or `None` when neither names anything.
+fn explicit_protected_entries(
+    protected: Option<&str>,
+    service_logs: Option<&str>,
+) -> Option<String> {
+    let entries: Vec<&str> = [protected, service_logs]
+        .into_iter()
+        .flatten()
+        .flat_map(|raw| raw.split(':'))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    (!entries.is_empty()).then(|| entries.join(":"))
 }
 
 /// Protected set for an explicit env override and base dir.
@@ -116,16 +152,83 @@ fn resolve_protected_paths_from(env_raw: Option<&str>, base: &Path) -> Vec<PathB
     resolved
 }
 
-/// Add `<root>/env` and `<root>/run` when `base` looks like an MT state dir
-/// (`<root>/<something>/state`). The explicit list already protects the base
-/// itself, so `state/` is not repeated.
+/// Add `<root>/env`, `<root>/run` and `<root>/logs` when `base` looks like an
+/// MT state dir (`<root>/<something>/state`). The explicit list already
+/// protects the base itself, so `state/` is not repeated.
+///
+/// `<root>/logs` (WI#287) holds the raw, unscrubbed OpenRC daemon and service
+/// logs; it was mountable read-write as a `workdir`, letting an agent read or
+/// rewrite them. The agent's sanctioned view is the scrubbed, read-only
+/// [`TENANT_LOGS_MOUNT`].
 fn add_mt_tenant_siblings(base: &Path, paths: &mut Vec<PathBuf>) {
     if base.file_name().and_then(|n| n.to_str()) == Some("state")
         && let Some(tenant_root) = base.parent()
     {
         paths.push(tenant_root.join("env"));
         paths.push(tenant_root.join("run"));
+        paths.push(tenant_root.join("logs"));
     }
+}
+
+/// Container path where the daemon's sandbox-visible log directory is bound
+/// read-only (WI#287).
+pub const TENANT_LOGS_MOUNT: &str = "/tenant-logs";
+
+/// Host directory to bind read-only at [`TENANT_LOGS_MOUNT`]: the daemon's
+/// sandbox-visible, secret-scrubbed log directory
+/// ([`crate::bootstrap::sandbox_log_dir`]), or `None` when it does not exist
+/// or would expose a protected path.
+pub fn tenant_logs_mount_source(protected: &[PathBuf]) -> Option<PathBuf> {
+    static REFUSAL_LOGGED: AtomicBool = AtomicBool::new(false);
+    let dir = crate::bootstrap::sandbox_log_dir();
+    match tenant_logs_mount_source_from(&dir, protected) {
+        Ok(source) => source,
+        Err(reason) => {
+            if !REFUSAL_LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    %reason,
+                    "not mounting the sandbox-visible daemon log"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Vetting for [`tenant_logs_mount_source`], split out for tests.
+///
+/// The directory is daemon-owned and expected to sit *inside* a protected base
+/// dir (single-node `<base>`, MT `<root>/state`) — which is why the runner
+/// binds it itself instead of passing it through [`validate_mount_dir`]. It
+/// must never be, or contain, a protected path or a credential-bearing file.
+/// `Ok(None)`: nothing to mount yet.
+fn tenant_logs_mount_source_from(
+    dir: &Path,
+    protected: &[PathBuf],
+) -> Result<Option<PathBuf>, String> {
+    let Ok(canonical) = dir.canonicalize() else {
+        return Ok(None);
+    };
+    if !canonical.is_dir() {
+        return Err("not a directory".to_string());
+    }
+    if let Some(exposed) = protected.iter().find(|path| {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf()) == canonical
+            || contains_protected_dir(&canonical, path)
+    }) {
+        return Err(format!(
+            "it would expose the protected path {}",
+            exposed.display()
+        ));
+    }
+    if let Some(file) = masked_files_for_mount(&canonical, &[]).first() {
+        return Err(format!(
+            "it contains the credential-bearing file {}",
+            file.display()
+        ));
+    }
+    Ok(Some(canonical))
 }
 
 /// Canonicalize `dir` and reject it unless it is safe to bind-mount.
@@ -353,7 +456,13 @@ mod tests {
             std::fs::create_dir_all(root.join("lunarwing/env")).expect("env dir");
             std::fs::create_dir_all(root.join("lunarwing/state")).expect("state dir");
             std::fs::create_dir_all(root.join("lunarwing/run")).expect("run dir");
+            std::fs::create_dir_all(root.join("lunarwing/logs")).expect("logs dir");
             std::fs::create_dir_all(root.join("lunarwing/ic/src")).expect("repo dir");
+            std::fs::write(
+                root.join("lunarwing/logs/lunarwing.err"),
+                "raw unscrubbed daemon stderr\n",
+            )
+            .expect("raw log");
             std::fs::write(
                 root.join("lunarwing/env/lunarwing.env"),
                 "GATEWAY_AUTH_TOKEN=deadbeef\n",
@@ -369,14 +478,15 @@ mod tests {
             Self { root }
         }
 
-        /// The protected set mt-admin writes: env, state and run under the
-        /// tenant root — deliberately not the root itself, because the
+        /// The protected set mt-admin writes: env, state, run and logs under
+        /// the tenant root — deliberately not the root itself, because the
         /// daemon's working directory lives inside it.
         fn protected(&self) -> Vec<PathBuf> {
             vec![
                 self.root.join("lunarwing/env"),
                 self.root.join("lunarwing/state"),
                 self.root.join("lunarwing/run"),
+                self.root.join("lunarwing/logs"),
             ]
         }
 
@@ -469,8 +579,8 @@ mod tests {
     #[test]
     fn accepts_a_repo_root_but_reports_the_dirs_to_mask() {
         let fixture = Fixture::new();
-        // The tenant root holds env/, state/ and run/, so mounting it is legal
-        // (agents run git there) — but all three must be masked.
+        // The tenant root holds env/, state/, run/ and logs/, so mounting it
+        // is legal (agents run git there) — but all four must be masked.
         let resolved = validate_mount_dir(&fixture.repo_root(), &fixture.protected())
             .expect("tenant root allowed");
         let mut destinations: Vec<String> = masked_dirs_for_mount(&resolved, &fixture.protected())
@@ -483,6 +593,7 @@ mod tests {
             destinations,
             vec![
                 "/workspace/env".to_string(),
+                "/workspace/logs".to_string(),
                 "/workspace/run".to_string(),
                 "/workspace/state".to_string(),
             ],
@@ -530,6 +641,7 @@ mod tests {
             destinations,
             vec![
                 "/workspace/lunarwing/env".to_string(),
+                "/workspace/lunarwing/logs".to_string(),
                 "/workspace/lunarwing/run".to_string(),
                 "/workspace/lunarwing/state".to_string(),
             ]
@@ -627,6 +739,8 @@ mod tests {
             "/home/tenant/lunarwing/env",
             "/home/tenant/lunarwing/run",
             "/home/tenant/lunarwing/state",
+            // WI#287: raw OpenRC daemon/service logs, previously mountable rw.
+            "/home/tenant/lunarwing/logs",
         ] {
             let want = norm(want.to_string());
             assert!(rendered.contains(&want), "missing {want} in {rendered:?}");
@@ -667,6 +781,106 @@ mod tests {
         ] {
             assert!(paths.contains(&want.to_path_buf()), "missing {want:?}");
         }
+    }
+
+    /// WI#287 review S3: the init script's raw service-log directories join
+    /// the operator's list (never replacing it) and are refused as a mount.
+    #[test]
+    fn service_log_dirs_join_the_protected_set() {
+        let fixture = Fixture::new();
+        let raw_logs = fixture.root.join("var-log-lunarwing");
+        std::fs::create_dir_all(&raw_logs).expect("raw log dir");
+        let raw = raw_logs.to_string_lossy().into_owned();
+        assert_eq!(
+            explicit_protected_entries(Some("/srv/extra"), Some(&raw)),
+            Some(format!("/srv/extra:{raw}"))
+        );
+        assert_eq!(explicit_protected_entries(None, None), None);
+        assert_eq!(explicit_protected_entries(Some(" : "), Some("")), None);
+        assert_eq!(
+            explicit_protected_entries(Some(" "), Some("/a: /b")),
+            Some("/a:/b".to_string())
+        );
+
+        let base = fixture.root.join("lunarwing/state");
+        let without = resolve_protected_paths_from(Some("/srv/extra"), &base);
+        assert!(
+            validate_mount_dir(&raw_logs, &without).is_ok(),
+            "outside every default, so mountable without the init's list"
+        );
+        let joined = explicit_protected_entries(Some("/srv/extra"), Some(&raw));
+        let with = resolve_protected_paths_from(joined.as_deref(), &base);
+        assert!(with.contains(&PathBuf::from("/srv/extra")), "{with:?}");
+        match validate_mount_dir(&raw_logs, &with) {
+            Err(SandboxError::MountPathDenied { reason, .. }) => {
+                assert!(reason.contains("protected directory"), "{reason}");
+            }
+            other => panic!("raw service-log dir must be denied, got {other:?}"),
+        }
+    }
+
+    /// WI#287: the raw MT logs dir is no longer a valid rw workdir.
+    #[test]
+    fn rejects_the_raw_logs_directory() {
+        let fixture = Fixture::new();
+        let err = validate_mount_dir(&fixture.root.join("lunarwing/logs"), &fixture.protected())
+            .expect_err("raw logs dir must be denied");
+        assert_eq!(err.kind(), "mount_path_denied");
+    }
+
+    /// WI#287: the daemon-owned sandbox log dir is mountable although it sits
+    /// inside the protected state dir — the runner binds it itself, read-only.
+    #[test]
+    fn tenant_logs_source_inside_protected_base_is_accepted() {
+        let fixture = Fixture::new();
+        let dir = fixture.root.join("lunarwing/state/logs/sandbox");
+        assert_eq!(
+            tenant_logs_mount_source_from(&dir, &fixture.protected()),
+            Ok(None),
+            "nothing to mount before the daemon creates the directory"
+        );
+        std::fs::create_dir_all(&dir).expect("sandbox log dir");
+        std::fs::write(dir.join("daemon.log"), "INFO scrubbed\n").expect("log");
+        assert_eq!(
+            tenant_logs_mount_source_from(&dir, &fixture.protected()),
+            Ok(Some(dir.canonicalize().expect("canonical")))
+        );
+    }
+
+    /// Guard (WI#287 review S3): `lunarwing service install` logs inside
+    /// `<base>/logs`, and the OpenRC template hands that directory to the
+    /// daemon as a protected path. The scrubbed copy below it stays mountable:
+    /// it neither is nor contains the protected raw-log directory.
+    #[test]
+    fn tenant_logs_source_inside_a_protected_log_dir_is_accepted() {
+        let fixture = Fixture::new();
+        let raw_logs = fixture.root.join("lunarwing/state/logs");
+        let dir = raw_logs.join("sandbox");
+        std::fs::create_dir_all(&dir).expect("sandbox log dir");
+        std::fs::write(raw_logs.join("daemon.stderr.log"), "raw\n").expect("raw log");
+        let mut protected = fixture.protected();
+        protected.push(raw_logs);
+        assert_eq!(
+            tenant_logs_mount_source_from(&dir, &protected),
+            Ok(Some(dir.canonicalize().expect("canonical")))
+        );
+    }
+
+    #[test]
+    fn tenant_logs_source_never_exposes_protected_paths_or_credentials() {
+        let fixture = Fixture::new();
+        // Containing a protected dir (the tenant root holds env/), or being one.
+        for dir in [fixture.repo_root(), fixture.env_dir()] {
+            assert!(
+                tenant_logs_mount_source_from(&dir, &fixture.protected()).is_err(),
+                "{dir:?} must not be mounted as /tenant-logs"
+            );
+        }
+        // Holding a credential-bearing file.
+        let dir = fixture.root.join("lunarwing/ic/logs");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("copied.env"), "TOKEN=x\n").expect("env copy");
+        assert!(tenant_logs_mount_source_from(&dir, &fixture.protected()).is_err());
     }
 
     #[test]

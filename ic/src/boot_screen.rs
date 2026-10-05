@@ -5,7 +5,17 @@
 //! - **Tier 2 (conditional):** Gateway URL, tunnel URL, non-default channels.
 //! - **Tier 3 (removed):** Database, tool count, features → use `lunarwing status`.
 
+use std::borrow::Cow;
+use std::io::IsTerminal;
+
 use crate::cli::fmt;
+
+/// Shown instead of the gateway token when stdout is not a terminal, naming
+/// where to read the token instead (WI#287 review S3): the environment value
+/// wins over the stored setting (`config/channels.rs`), and multi-tenant
+/// tenants always set it.
+const HIDDEN_GATEWAY_TOKEN: &str =
+    "<hidden: GATEWAY_AUTH_TOKEN, or lunarwing config get channels.gateway_auth_token>";
 
 /// All displayable fields for the boot screen.
 pub struct BootInfo {
@@ -37,6 +47,32 @@ pub struct BootInfo {
 }
 
 const KW: usize = 10;
+
+/// The gateway URL as the boot screen prints it. When stdout is not a
+/// terminal it is a file (an OpenRC/launchd stdout log, a pipe into a
+/// journal), where the bearer token would sit unscrubbed on disk: the value
+/// of `token=` is replaced by a pointer to where the token can be read
+/// (WI#287 review S3). Other query parameters are kept.
+pub fn gateway_url_for_display(url: &str, stdout_is_terminal: bool) -> Cow<'_, str> {
+    if stdout_is_terminal {
+        return Cow::Borrowed(url);
+    }
+    let Some((head, value)) = url
+        .split_once("?token=")
+        .map(|(head, value)| (format!("{head}?token="), value))
+        .or_else(|| {
+            url.split_once("&token=")
+                .map(|(head, value)| (format!("{head}&token="), value))
+        })
+    else {
+        return Cow::Borrowed(url);
+    };
+    let rest = value
+        .find(['&', '#'])
+        .and_then(|end| value.get(end..))
+        .unwrap_or("");
+    Cow::Owned(format!("{head}{HIDDEN_GATEWAY_TOKEN}{rest}"))
+}
 
 /// Print the boot screen to stdout.
 ///
@@ -90,7 +126,7 @@ pub fn print_boot_screen(info: &BootInfo) {
 
     // ── Tier 2: conditional ───────────────────────────────────────────
 
-    // Gateway URL
+    // Gateway URL (token masked when stdout is a file, WI#287)
     if let Some(ref url) = info.gateway_url {
         println!(
             "  {}{:<width$}{}  {}{}{}",
@@ -98,7 +134,7 @@ pub fn print_boot_screen(info: &BootInfo) {
             "gateway",
             fmt::reset(),
             fmt::link(),
-            url,
+            gateway_url_for_display(url, std::io::stdout().is_terminal()),
             fmt::reset(),
             width = KW,
         );
@@ -313,6 +349,41 @@ mod tests {
         };
         // Should not panic
         print_boot_screen(&info);
+    }
+
+    /// WI#287 review S3: off a terminal the banner never writes the token;
+    /// it points at where to read it and keeps the rest of the URL.
+    #[test]
+    fn gateway_url_token_is_masked_when_stdout_is_not_a_terminal() {
+        let url = "http://127.0.0.1:3001/?token=abc123";
+        assert_eq!(gateway_url_for_display(url, true), url);
+
+        let shown = gateway_url_for_display(url, false);
+        assert!(!shown.contains("abc123"), "{shown}");
+        assert!(
+            shown.starts_with("http://127.0.0.1:3001/?token="),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "GATEWAY_AUTH_TOKEN, or lunarwing config get channels.gateway_auth_token"
+            ),
+            "{shown}"
+        );
+
+        let shown = gateway_url_for_display("http://h:1/?token=abc123&x=1#frag", false);
+        assert!(!shown.contains("abc123"), "{shown}");
+        assert!(shown.ends_with(">&x=1#frag"), "{shown}");
+
+        let shown = gateway_url_for_display("http://h:1/?a=b&token=abc123", false);
+        assert!(!shown.contains("abc123"), "{shown}");
+        assert!(
+            shown.starts_with("http://h:1/?a=b&token=<hidden"),
+            "{shown}"
+        );
+
+        let plain = "http://h:1/";
+        assert_eq!(gateway_url_for_display(plain, false), plain);
     }
 
     #[test]

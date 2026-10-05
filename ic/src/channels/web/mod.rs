@@ -90,6 +90,10 @@ impl GatewayChannel {
             OsRng.fill_bytes(&mut bytes);
             bytes.iter().map(|b| format!("{b:02x}")).collect()
         });
+        // Generated here or loaded from DB settings, so on single-node
+        // installs never in the environment the log scrubber starts from:
+        // register it so every daemon log sink redacts it (WI#287 review S4).
+        crate::tracing_fmt::register_log_secret(&auth_token);
 
         let auth = CombinedAuthState {
             env_auth: MultiAuthState::single(auth_token, owner_id.clone()),

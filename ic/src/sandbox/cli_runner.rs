@@ -137,6 +137,57 @@ pub(crate) fn user_for(runtime: ContainerRuntime, docker_rootless: bool) -> Stri
     }
 }
 
+/// In-container uid of the podman sandbox user (`--user 1000:1000`, and the
+/// uid `keep-id:uid=` pins on podman >= 5).
+const SANDBOX_UID: u32 = 1000;
+
+/// Whether the sandbox user can read a daemon-owned `0700` directory bound
+/// into the container (WI#287 review S6), i.e. whether the runtime maps the
+/// in-container user onto the daemon's own uid — the same mapping that makes
+/// `/workspace` writable:
+///
+/// - docker: rootful runs as the daemon's euid, rootless maps container root
+///   onto the host user;
+/// - podman >= 5 (`keep-id:uid=1000`): the host user is the sandbox user;
+/// - podman 4.3+ (`keep-id`): the host uid keeps its number, so only a daemon
+///   running as uid 1000 is the sandbox user;
+/// - older or unknown podman (no keep-id): the sandbox user is a subuid.
+pub(crate) fn daemon_owned_mounts_readable(
+    runtime: ContainerRuntime,
+    keep_id: KeepIdMode,
+    daemon_uid: u32,
+) -> bool {
+    match (runtime, keep_id) {
+        (ContainerRuntime::Docker, _) | (ContainerRuntime::Podman, KeepIdMode::UidPinned) => true,
+        (ContainerRuntime::Podman, KeepIdMode::Plain) => daemon_uid == SANDBOX_UID,
+        (ContainerRuntime::Podman, KeepIdMode::Off) => false,
+    }
+}
+
+/// The daemon's effective uid; `u32::MAX` (never the sandbox uid) on
+/// platforms without uids.
+fn current_euid() -> u32 {
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        u32::MAX
+    }
+}
+
+/// Source for the read-only `/tenant-logs` bind of one run (WI#287): only
+/// when `SANDBOX_TENANT_LOGS` is not `off` and the runtime mapping lets the
+/// sandbox user read the daemon-owned copy, then vetted by
+/// [`crate::sandbox::mount_guard::tenant_logs_mount_source`].
+fn tenant_logs_for_run(enabled: bool, readable: bool, protected: &[PathBuf]) -> Option<PathBuf> {
+    if !(enabled && readable) {
+        return None;
+    }
+    crate::sandbox::mount_guard::tenant_logs_mount_source(protected)
+}
+
 /// Probe order for runtime detection, honoring the configured preference.
 pub(crate) fn runtime_probe_order(preferred: SandboxRuntime) -> [ContainerRuntime; 2] {
     match preferred {
@@ -273,6 +324,11 @@ pub(crate) struct RunSpec<'a> {
     /// the mount (WI#211), plus the container paths to shadow with it.
     pub masked_files: &'a [String],
     pub mask_file: Option<&'a Path>,
+    /// The daemon's sandbox-visible, secret-scrubbed log directory, bound
+    /// read-only at [`crate::sandbox::mount_guard::TENANT_LOGS_MOUNT`]
+    /// (WI#287). `None` when `SANDBOX_TENANT_LOGS=off`, when the runtime
+    /// mapping cannot read it, or when it does not exist or failed vetting.
+    pub tenant_logs: Option<&'a Path>,
 }
 
 /// Build the `<runtime> run ...` argument vector for a sandboxed command.
@@ -365,6 +421,18 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
             args.push("-v".into());
             args.push(format!("{}:{destination}:ro,z", mask_file.display()));
         }
+    }
+
+    // The daemon's own scrubbed log, always read-only (WI#287). Daemon-chosen
+    // like the proxy relay dir, so it is vetted by
+    // `mount_guard::tenant_logs_mount_source`, not `validate_mount_dir`.
+    if let Some(logs) = spec.tenant_logs {
+        args.push("-v".into());
+        args.push(format!(
+            "{}:{}:ro,z",
+            logs.display(),
+            crate::sandbox::mount_guard::TENANT_LOGS_MOUNT
+        ));
     }
 
     // Caller-provided env first (never secrets: the shell tool passes none).
@@ -596,6 +664,9 @@ pub struct ExecParams<'a> {
     pub proxy_port: u16,
     /// Directories that must never be readable inside the mount (WI#205).
     pub protected_paths: &'a [std::path::PathBuf],
+    /// Whether the daemon's scrubbed log copy may be bound at `/tenant-logs`
+    /// (`SANDBOX_TENANT_LOGS` is not `off`, WI#287).
+    pub tenant_logs: bool,
 }
 
 /// Runs sandboxed commands via the podman/docker CLI.
@@ -608,6 +679,9 @@ pub struct CliRunner {
     docker_rootless: bool,
     /// `--user` value computed at detect time (WI#179 concern 4).
     user: String,
+    /// Whether the sandbox user can read the daemon-owned `/tenant-logs`
+    /// copy under this runtime's uid mapping (WI#287).
+    tenant_logs_readable: bool,
     image: String,
 }
 
@@ -623,19 +697,24 @@ impl CliRunner {
                 ContainerRuntime::Podman => (probe_podman_version().await, false),
                 ContainerRuntime::Docker => (None, probe_docker_rootless().await),
             };
+            let keep_id = keep_id_mode_for(runtime, version);
+            let tenant_logs_readable =
+                daemon_owned_mounts_readable(runtime, keep_id, current_euid());
             tracing::info!(
                 runtime = runtime.binary(),
                 podman_version = ?version,
                 docker_rootless,
-                keep_id = ?keep_id_mode_for(runtime, version),
+                keep_id = ?keep_id,
+                tenant_logs_readable,
                 "Generic sandbox: using container runtime CLI"
             );
             let _ = SELECTED_RUNTIME.set(runtime);
             return Ok(Self {
                 runtime,
-                keep_id: keep_id_mode_for(runtime, version),
+                keep_id,
                 docker_rootless,
                 user: user_for(runtime, docker_rootless),
+                tenant_logs_readable,
                 image,
             });
         }
@@ -706,6 +785,7 @@ impl CliRunner {
             network,
             proxy_port,
             protected_paths,
+            tenant_logs,
         } = params;
 
         // Containment gate at the runner boundary (WI#205). `SandboxManager`
@@ -751,6 +831,8 @@ impl CliRunner {
         } else {
             Some(EmptyMaskDir::create()?)
         };
+        let tenant_logs =
+            tenant_logs_for_run(tenant_logs, self.tenant_logs_readable, protected_paths);
 
         if network != SandboxNetworkMode::None && proxy_port == 0 {
             return Err(SandboxError::ProxyError {
@@ -793,6 +875,7 @@ impl CliRunner {
             mask_dir: mask_dir.as_ref().map(EmptyMaskDir::path),
             masked_files: &masked_file_destinations,
             mask_file: mask_file.as_ref().map(EmptyMaskFile::path),
+            tenant_logs: tenant_logs.as_deref(),
         };
         let args = build_run_args(&spec);
 
@@ -1206,7 +1289,85 @@ mod tests {
             mask_dir: None,
             masked_files: &[],
             mask_file: None,
+            tenant_logs: None,
         }
+    }
+
+    /// WI#287: the daemon's scrubbed log dir is bound read-only at
+    /// /tenant-logs for every policy and runtime — even when the workspace is
+    /// writable — and nothing is bound without a vetted source.
+    #[test]
+    fn tenant_logs_are_mounted_read_only() {
+        let logs = Path::new("/home/t/lunarwing/state/logs/sandbox");
+        for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+            for policy in [SandboxPolicy::ReadOnly, SandboxPolicy::WorkspaceWrite] {
+                let args = build_run_args(&RunSpec {
+                    tenant_logs: Some(logs),
+                    ..spec(
+                        runtime,
+                        KeepIdMode::Off,
+                        policy,
+                        SandboxNetworkMode::None,
+                        0,
+                    )
+                });
+                assert!(
+                    args.windows(2).any(|w| w
+                        == [
+                            "-v".to_string(),
+                            "/home/t/lunarwing/state/logs/sandbox:/tenant-logs:ro,z".to_string()
+                        ]),
+                    "missing read-only /tenant-logs bind in {args:?}"
+                );
+                assert!(
+                    !args.iter().any(|a| a.contains("/tenant-logs:rw")),
+                    "/tenant-logs must never be writable: {args:?}"
+                );
+            }
+        }
+
+        let args = build_run_args(&spec(
+            ContainerRuntime::Podman,
+            KeepIdMode::Off,
+            SandboxPolicy::WorkspaceWrite,
+            SandboxNetworkMode::None,
+            0,
+        ));
+        assert!(!args.iter().any(|a| a.contains("/tenant-logs")), "{args:?}");
+    }
+
+    /// WI#287 review S6: the daemon-owned `0700` copy is readable only where
+    /// the sandbox user is the daemon's uid.
+    #[test]
+    fn daemon_owned_mounts_readable_only_under_owner_mapping() {
+        use ContainerRuntime::{Docker, Podman};
+        assert!(daemon_owned_mounts_readable(Docker, KeepIdMode::Off, 1234));
+        assert!(daemon_owned_mounts_readable(Docker, KeepIdMode::Off, 0));
+        assert!(daemon_owned_mounts_readable(
+            Podman,
+            KeepIdMode::UidPinned,
+            1234
+        ));
+        assert!(daemon_owned_mounts_readable(
+            Podman,
+            KeepIdMode::Plain,
+            1000
+        ));
+        assert!(!daemon_owned_mounts_readable(
+            Podman,
+            KeepIdMode::Plain,
+            1001
+        ));
+        assert!(!daemon_owned_mounts_readable(Podman, KeepIdMode::Off, 1000));
+    }
+
+    /// WI#287 review S6/S7: nothing is bound when SANDBOX_TENANT_LOGS is off
+    /// or the runtime mapping cannot read the copy.
+    #[test]
+    fn tenant_logs_for_run_requires_knob_and_readable_mapping() {
+        assert_eq!(tenant_logs_for_run(false, true, &[]), None);
+        assert_eq!(tenant_logs_for_run(true, false, &[]), None);
+        assert_eq!(tenant_logs_for_run(false, false, &[]), None);
     }
 
     /// WI#205: protected subdirectories of the workspace are shadowed by an
@@ -1765,6 +1926,7 @@ mod tests {
             network: SandboxNetworkMode::None,
             proxy_port: 0,
             protected_paths: &[],
+            tenant_logs: false,
         };
         let name_probe = uuid::Uuid::new_v4();
         // `image_exists` must pass first or the timeout run itself fails for

@@ -309,10 +309,23 @@ def added_lines_for_file(base: str, head: str, path: pathlib.Path) -> set[int]:
     return added
 
 
+def is_fuzz_target_path(path: pathlib.Path) -> bool:
+    # cargo-fuzz targets (<crate>/fuzz/fuzz_targets/*.rs) are test-only
+    # harnesses built by a separate fuzzing workspace and never linked into
+    # production binaries; asserting invariants is their entire purpose.
+    parts = path.parts
+    return any(
+        parts[i] == "fuzz" and parts[i + 1] == "fuzz_targets"
+        for i in range(len(parts) - 1)
+    )
+
+
 def collect_violations(base: str, head: str) -> list[tuple[str, int, str]]:
     violations: list[tuple[str, int, str]] = []
 
     for path in changed_rust_files(base, head):
+        if is_fuzz_target_path(path):
+            continue
         source_path = PROJECT_ROOT / path
         if not source_path.exists():
             continue
@@ -634,6 +647,46 @@ class CheckNoPanicsTests(unittest.TestCase):
             violations,
             [("src/example.rs", 8, '    value.expect("boom");')],
         )
+
+    def test_collect_violations_skips_fuzz_targets(self) -> None:
+        # Fuzz targets are test-only harnesses (cargo-fuzz workspace, never
+        # linked into production binaries): their asserts must not be flagged
+        # even when an MR adds new ones (pipeline 5107 false failure).
+        source_text = (
+            "#![no_main]\n"
+            "use libfuzzer_sys::fuzz_target;\n"
+            'fuzz_target!(|data: &[u8]| {\n'
+            "    assert!(data.len() <= 1024);\n"
+            "});\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = pathlib.Path(directory)
+            source = (
+                project_root
+                / "crates"
+                / "lunarwing_safety"
+                / "fuzz"
+                / "fuzz_targets"
+                / "fuzz_example.rs"
+            )
+            source.parent.mkdir(parents=True)
+            source.write_text(source_text, encoding="utf-8")
+
+            with (
+                mock.patch(f"{__name__}.PROJECT_ROOT", project_root),
+                mock.patch(
+                    f"{__name__}.changed_rust_files",
+                    return_value=[
+                        pathlib.Path(
+                            "crates/lunarwing_safety/fuzz/fuzz_targets/fuzz_example.rs"
+                        )
+                    ],
+                ),
+                mock.patch(f"{__name__}.added_lines_for_file", return_value={4}),
+            ):
+                violations = collect_violations("base", "head")
+
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":
