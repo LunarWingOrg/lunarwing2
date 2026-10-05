@@ -184,8 +184,9 @@ pub struct Mission {
     pub updated_at: DateTime<Utc>,
     /// When the next thread should be spawned (for Cron cadence).
     pub next_fire_at: Option<DateTime<Utc>>,
-    /// When this mission last spawned a thread (UTC). `None` means the
-    /// mission has never fired. Surfaced in mission listings so an "Active"
+    /// When this mission last spawned a thread (UTC). Legacy records may lack
+    /// this timestamp despite having thread history; use `has_fired()` to
+    /// distinguish them from missions with no recorded runs. An "Active"
     /// status cannot be mistaken for a dispatching one (registry honesty,
     /// work item #143 / WI#109 follow-up).
     #[serde(default)]
@@ -366,6 +367,12 @@ pub fn trigger_dedup_key(payload: &serde_json::Value) -> Option<String> {
 }
 
 impl Mission {
+    /// Old persisted missions predate `last_fired_at`; history is also evidence
+    /// of a fire. A missing timestamp alone must not be reported as never fired.
+    pub fn has_fired(&self) -> bool {
+        self.last_fired_at.is_some() || !self.thread_history.is_empty()
+    }
+
     pub fn new(
         project_id: ProjectId,
         user_id: impl Into<String>,

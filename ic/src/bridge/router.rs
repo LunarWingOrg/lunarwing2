@@ -4324,10 +4324,28 @@ fn mission_to_info(m: &lunarwing_engine::types::mission::Mission) -> EngineMissi
         max_threads_per_day: m.max_threads_per_day,
         budget_exhausted: m.max_threads_per_day > 0 && m.threads_today >= m.max_threads_per_day,
         last_fired_at: m.last_fired_at.map(|dt| dt.to_rfc3339()),
-        never_fired: m.last_fired_at.is_none(),
+        never_fired: !m.has_fired(),
         created_at: m.created_at.to_rfc3339(),
         updated_at: m.updated_at.to_rfc3339(),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_mission_listing_uses_history_when_timestamp_is_missing() {
+    let mut mission = lunarwing_engine::Mission::new(
+        lunarwing_engine::ProjectId::new(),
+        "owner",
+        "legacy",
+        "goal",
+        lunarwing_engine::MissionCadence::Manual,
+    );
+    assert!(mission_to_info(&mission).never_fired);
+    mission
+        .thread_history
+        .push(lunarwing_engine::ThreadId::new());
+    assert!(!mission_to_info(&mission).never_fired);
+    assert!(mission_to_info(&mission).last_fired_at.is_none());
 }
 
 /// List engine threads, optionally filtered by project.

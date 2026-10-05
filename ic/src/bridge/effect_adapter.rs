@@ -444,10 +444,12 @@ impl EffectBridgeAdapter {
             "name": mission.name,
             "kind": "engine_mission",
             "mission_id": mission.id.to_string(),
+            "project_id": mission.project_id.to_string(),
+            "schedule": mission_schedule_info(&mission),
             "status": format!("{:?}", mission.status),
             "total_runs": mission.thread_history.len(),
             "last_fired_at": mission.last_fired_at.map(|dt| dt.to_rfc3339()),
-            "never_fired": mission.last_fired_at.is_none(),
+            "never_fired": !mission.has_fired(),
             "runs": runs,
         }))
     }
@@ -717,16 +719,7 @@ impl EffectBridgeAdapter {
                             };
                             match budget_result {
                                 Some(Err(e)) => Err(e),
-                                _ => {
-                                    let mut out = serde_json::json!({
-                                        "mission_id": id.to_string(),
-                                        "status": "created",
-                                    });
-                                    if let Some(max) = max_threads_per_day {
-                                        out["max_threads_per_day"] = serde_json::json!(max);
-                                    }
-                                    Ok(out)
-                                }
+                                _ => mission_created_info(mgr, id, max_threads_per_day).await,
                             }
                         }
                         Err(e) => Err(e),
@@ -746,6 +739,8 @@ impl EffectBridgeAdapter {
                                 && m.threads_today >= m.max_threads_per_day;
                             serde_json::json!({
                                 "id": m.id.to_string(),
+                                "project_id": m.project_id.to_string(),
+                                "schedule": mission_schedule_info(m),
                                 "name": m.name,
                                 "goal": m.goal,
                                 "status": format!("{:?}", m.status),
@@ -756,7 +751,7 @@ impl EffectBridgeAdapter {
                                 "max_threads_per_day": m.max_threads_per_day,
                                 "budget_exhausted": budget_exhausted,
                                 "last_fired_at": m.last_fired_at.map(|dt| dt.to_rfc3339()),
-                                "never_fired": m.last_fired_at.is_none(),
+                                "never_fired": !m.has_fired(),
                             })
                         })
                         .collect();
@@ -1576,6 +1571,55 @@ pub(crate) fn mission_action_defs() -> Vec<ActionDef> {
     ]
 }
 
+/// Report the persisted schedule, not a newly calculated occurrence that could
+/// hide an overdue tick. Serialization of MissionCadence excludes webhook secrets.
+fn mission_schedule_info(mission: &lunarwing_engine::Mission) -> serde_json::Value {
+    let (timezone, fields) = match &mission.cadence {
+        lunarwing_engine::MissionCadence::Cron {
+            expression,
+            timezone,
+        } => (
+            Some(timezone.as_deref().unwrap_or("UTC")),
+            Some(match expression.split_whitespace().count() {
+                5 => "minute hour day-of-month month day-of-week",
+                6 => "second minute hour day-of-month month day-of-week",
+                _ => "second minute hour day-of-month month day-of-week year",
+            }),
+        ),
+        _ => (None, None),
+    };
+    serde_json::json!({
+        "cadence": mission.cadence,
+        "timezone": timezone,
+        "cron_fields": fields,
+        "next_fire_at": mission.next_fire_at.map(|dt| dt.to_rfc3339()),
+    })
+}
+
+async fn mission_created_info(
+    mgr: &lunarwing_engine::MissionManager,
+    id: lunarwing_engine::MissionId,
+    max_threads_per_day: Option<u32>,
+) -> Result<serde_json::Value, EngineError> {
+    let mission = mgr
+        .get_mission(id)
+        .await?
+        .ok_or_else(|| EngineError::Store {
+            reason: format!("created mission {id} is missing"),
+        })?;
+    let mut out = serde_json::json!({
+        "mission_id": id.to_string(),
+        "status": "created",
+        "mission_status": format!("{:?}", mission.status),
+        "project_id": mission.project_id.to_string(),
+        "schedule": mission_schedule_info(&mission),
+    });
+    if let Some(max) = max_threads_per_day {
+        out["max_threads_per_day"] = serde_json::json!(max);
+    }
+    Ok(out)
+}
+
 fn mission_create_def() -> ActionDef {
     ActionDef {
         name: "mission_create".into(),
@@ -1585,7 +1629,7 @@ fn mission_create_def() -> ActionDef {
             "properties": {
                 "name": {"type": "string", "description": "Short name for the mission/routine"},
                 "goal": {"type": "string", "description": "What this mission should accomplish each run"},
-                "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'system:<source>/<event_type>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events. To subscribe to engine lifecycle events, use 'system:<source>/<event_type>' (e.g. 'system:engine/thread_start')."},
+                "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'system:<source>/<event_type>', 'webhook:<path>', '30m', '6h', or cron in UTC. Five fields: minute hour day-of-month month day-of-week. Six fields prepend seconds (must be 0); seven append year. Daily 10:15 UTC is '15 10 * * *' or '0 15 10 * * *'; '0 10 15 * * *' means 15:10 UTC. Check the returned schedule.next_fire_at. 'event:<pattern>' matches incoming message text; internal lifecycle subscriptions use 'system:<source>/<event_type>' (e.g. 'system:engine/thread_start')."},
                 "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
                 "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
                 "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 30 when omitted."}
@@ -1600,7 +1644,7 @@ fn mission_create_def() -> ActionDef {
 fn mission_list_def() -> ActionDef {
     ActionDef {
         name: "mission_list".into(),
-        description: "List all missions and routines in the current project.".into(),
+        description: "List your own and shared missions in the current project, including parsed cadence, timezone and persisted next-fire time. This is not a global listing; a mission absent here may belong to another project. Completed recurring missions require mission_resume to enable future triggers.".into(),
         parameters_schema: serde_json::json!({"type": "object"}),
         effects: vec![],
         requires_approval: false,
@@ -1665,7 +1709,7 @@ fn mission_update_def() -> ActionDef {
                 "id": {"type": "string", "description": "Mission/routine ID to update"},
                 "name": {"type": "string", "description": "New name"},
                 "goal": {"type": "string", "description": "New goal"},
-                "cadence": {"type": "string", "description": "New cadence: 'manual', 'hourly', 'daily', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
+                "cadence": {"type": "string", "description": "New cadence: 'manual', 'hourly', 'daily', '30m', '6h', or UTC cron. Five fields: minute hour day-of-month month day-of-week; six prepend zero seconds; seven append year. Daily 10:15 UTC: '15 10 * * *' or '0 15 10 * * *'. Inspect mission_list for the persisted next-fire time after updating."},
                 "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
                 "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
                 "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
@@ -4490,6 +4534,166 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_mission_history_does_not_claim_never_fired() {
+        let (adapter, mgr, store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let ctx = mission_create_ctx();
+        let mut mission = lunarwing_engine::Mission::new(
+            ctx.project_id,
+            &ctx.user_id,
+            "legacy digest",
+            "digest",
+            parse_cadence("0 10 15 * * *").unwrap(),
+        );
+        mission.status = lunarwing_engine::MissionStatus::Completed;
+        mission
+            .thread_history
+            .push(lunarwing_engine::ThreadId::new());
+        let mut legacy = serde_json::to_value(&mission).unwrap();
+        legacy.as_object_mut().unwrap().remove("last_fired_at");
+        let mission = serde_json::from_value(legacy).unwrap();
+        store.save_mission(&mission).await.unwrap();
+        for action in ["mission_history", "mission_list"] {
+            let result = adapter
+                .handle_mission_call(action, &serde_json::json!({"name": "legacy digest"}), &ctx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!result.is_error);
+            let value = if action == "mission_list" {
+                &result.output[0]
+            } else {
+                &result.output
+            };
+            assert_eq!(value["never_fired"], false);
+            assert_eq!(value["last_fired_at"], serde_json::Value::Null);
+            assert_eq!(value["status"], "Completed");
+            assert_eq!(value["project_id"], ctx.project_id.to_string());
+            assert_eq!(value["schedule"]["timezone"], "UTC");
+            assert_eq!(
+                value["schedule"]["cadence"]["Cron"]["expression"],
+                "0 10 15 * * *"
+            );
+        }
+    }
+
+    #[test]
+    fn mission_schedule_diagnostics_never_expose_webhook_secrets() {
+        let mission = lunarwing_engine::Mission::new(
+            lunarwing_engine::ProjectId::new(),
+            "owner",
+            "hook",
+            "goal",
+            lunarwing_engine::MissionCadence::Webhook {
+                path: "events".into(),
+                secret: Some("private-webhook-key".into()),
+            },
+        );
+        let info = mission_schedule_info(&mission);
+        assert!(!info.to_string().contains("private-webhook-key"));
+        assert_eq!(info["cadence"]["Webhook"]["path"], "events");
+        assert!(info["timezone"].is_null());
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn persisted_mission_adapter(
+        store: Arc<dyn lunarwing_engine::Store>,
+    ) -> (EffectBridgeAdapter, Arc<MissionManager>) {
+        let thread_manager = Arc::new(ThreadManager::new(
+            Arc::new(StubEngineLlm),
+            Arc::new(NeverCalledEffects),
+            store.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let mgr = Arc::new(MissionManager::new(store, thread_manager));
+        let adapter = make_adapter();
+        adapter.set_mission_manager(mgr.clone()).await;
+        (adapter, mgr)
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn created_cron_survives_store_reload_and_fires_after_global_bootstrap() {
+        use crate::bridge::store_adapter::HybridStore;
+        use lunarwing_engine::{MissionId, MissionStatus, Project, Store};
+        let (db, _temp) = crate::testing::test_db().await;
+        let workspace = Arc::new(crate::workspace::Workspace::new_with_db("owner", db));
+        let store = Arc::new(HybridStore::new(Some(workspace.clone())));
+        let (adapter, mgr) = persisted_mission_adapter(store.clone()).await;
+        let mut ctx = mission_create_ctx();
+        let project = Project::new(&ctx.user_id, "digest project", "test");
+        ctx.project_id = project.id;
+        store.save_project(&project).await.unwrap();
+        let created = adapter.handle_mission_call("mission_create", &serde_json::json!({
+            "name": "pr-digest-rebuild", "goal": "Produce digest", "cadence": "0 10 15 * * *",
+            "notify_channels": ["test"],
+        }), &ctx).await.unwrap().unwrap();
+        assert!(!created.is_error, "{:?}", created.output);
+        assert_eq!(created.output["mission_status"], "Active");
+        assert_eq!(created.output["schedule"]["timezone"], "UTC");
+        let id = MissionId(
+            uuid::Uuid::parse_str(created.output["mission_id"].as_str().unwrap()).unwrap(),
+        );
+        let mut mission = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(
+            created.output["schedule"]["next_fire_at"],
+            mission.next_fire_at.unwrap().to_rfc3339()
+        );
+        assert!(!mission.has_fired());
+        // Keep the not-due assertion deterministic even at the daily cron boundary.
+        mission.next_fire_at = Some(chrono::Utc::now() + chrono::Duration::days(1));
+        store.save_mission(&mission).await.unwrap();
+        assert!(mgr.tick("fallback").await.unwrap().is_empty());
+        // Simulate downtime across a due tick without sleeping for a day.
+        mission.next_fire_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        store.save_mission(&mission).await.unwrap();
+        mgr.shutdown().await;
+        drop((adapter, mgr, store));
+
+        let reloaded = Arc::new(HybridStore::new(Some(workspace)));
+        reloaded.load_state_from_workspace().await.unwrap();
+        let (adapter, mgr) = persisted_mission_adapter(reloaded.clone()).await;
+        let mut notifications = mgr.subscribe_notifications();
+        let other_project = lunarwing_engine::ProjectId::new();
+        assert_eq!(mgr.bootstrap_project(other_project).await.unwrap(), 0);
+        assert_eq!(mgr.bootstrap_all_projects().await.unwrap(), 1);
+        // A different project's empty listing is not deletion from storage.
+        let mut other_ctx = ctx.clone();
+        other_ctx.project_id = other_project;
+        let other = adapter
+            .handle_mission_call("mission_list", &serde_json::json!({}), &other_ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.output, serde_json::json!([]));
+        let own = adapter
+            .handle_mission_call("mission_list", &serde_json::json!({}), &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.output[0]["id"], id.to_string());
+        let spawned = mgr.tick("wrong-fallback-owner").await.unwrap();
+        assert_eq!(spawned.len(), 1);
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_secs(5), notifications.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(notification.mission_id, id);
+        assert!(!notification.is_error);
+        let persisted = reloaded.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(persisted.status, MissionStatus::Active);
+        assert_eq!(persisted.thread_history, spawned);
+        assert!(persisted.has_fired());
+        assert_eq!(persisted.user_id, ctx.user_id);
+        assert!(persisted.next_fire_at.unwrap() > chrono::Utc::now());
+        assert!(mgr.tick("fallback").await.unwrap().is_empty());
+        mgr.shutdown().await;
     }
 
     async fn run_mission_create(
