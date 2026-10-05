@@ -192,16 +192,42 @@ logged and never mask the rejection; the refused append is then relabelled
 `ExistingContentRejected` (the stored content alone already failed the gate,
 so rephrase advice would blame the clean entry).
 
+For a deliberate repair, `memory_write(target: "daily_log", append: false)`
+replaces today's log through `write()`: only the new content is scanned, and
+the previous version (poisoned or not) is kept in the shadow backup
+`backups/daily/YYYY-MM-DD.md.bak` (earlier generations roll aside to numbered
+`.bak.<n>` slots). The named `daily_log` target used to ignore `append: false`
+and append silently while reporting a replace (WI#288 residual); the
+explicit-path form (`target: "daily/YYYY-MM-DD.md"`) always honored it. When a
+`layer` is specified the write routes through the layer methods: replaces get
+the same shadow backup, but appends do not quarantine — a poisoned layer-scope
+day file rejects until it is replaced or repaired by an operator.
+
 ### Prompt-File Shadow Backups (WI#286)
 
 A full-replace `write()` of a prompt-visible file destroys its prior content —
 the mechanism behind the incident where a session's context dump clobbered the
 curated `MEMORY.md`. Before replacing non-empty, differing content, `write()`
-now persists the previous version to a rolling single-slot shadow copy at
-`backups/<path>.bak` (e.g. `backups/MEMORY.md.bak`). Backups are retrievable
-by exact-path `read()` and visible in `list()`, but are stored with an empty
-chunk projection so they never enter the search index. Backup failures are
-logged and never block the write itself.
+and `write_to_layer()` now persist the previous version to a shadow copy at
+`backups/<path>.bak` in the written scope (e.g. `backups/MEMORY.md.bak`), and
+every backup emits a `lunarwing::safety` warn audit line naming the path, the
+prior byte count and the backup path. Most prompt-visible files keep a single
+rolling slot, overwritten on each replace; daily logs additionally retain the
+eight most recent earlier generations — before the slot is overwritten, its
+content rolls aside to the first free `backups/daily/<date>.md.bak.<n>`, and at
+the cap the oldest generation is discarded (with its own audit line) and the
+rest shift down — so repeated same-day replaces (including the WI#288 repair
+path) never silently discard a recent version, and retained storage stays
+bounded. A replace retried after a crash between the backup and the replace
+commit grows no duplicate generation. Backups are retrievable by exact-path
+`read()` and visible in `list()`, but are stored with an empty chunk
+projection so they never enter the search index. Because they can hold
+quarantined injection content and are the recovery evidence for replaced
+prompt files, the `backups/` prefix is reserved: the memory tools reject
+writes and reads under it and hide it from tree listings, and the web
+`POST /api/memory/write` route answers HTTP 403 for it (operator reads stay
+open). Backup and rotation failures are logged and never block the write
+itself.
 
 ## Operator Prompt Editing (WI#220)
 
@@ -239,8 +265,9 @@ documents that legitimately appear in results (for example
 `engine/knowledge/summaries/*`) carry an explicit `"provenance":
 "engine_internal"` label so they are never silently ordinary-looking memory.
 
-All agent-facing memory tools reserve `engine/.runtime/**`: writes and direct
-reads are rejected, and tree listings hide the subtree. Direct `Workspace` APIs
+All agent-facing memory tools reserve `engine/.runtime/**` and the
+shadow-backup prefix `backups/`: writes and direct reads are rejected, and
+tree listings hide both subtrees. Direct `Workspace` APIs
 remain available to the Engine for recovery. `memory_read` returns at most 6,000
 source bytes per page plus `next_offset` and a revision required for later pages;
 each response is at most 8,000 serialized bytes. `memory_tree` returns at most
