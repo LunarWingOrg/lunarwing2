@@ -13,6 +13,14 @@ operational procedures.
   reports, test plans, and codename notes.
 - Other files in this directory are point-in-time reviews or migration-era
   scratch records whose filenames still carry useful provenance.
+- `v2.1.4.0/` holds the completed Kabuto cycle's security audits, work-item
+  reconciliation, codename shortlist, and implementation verification records.
+- The 2026-10-05 housekeeping pass also moved dated CI/SIS/REPL/DarkIRC
+  records, the original Gentoo setup and 1.1.9 acceptance plan, upstream
+  research, and resolved security findings here. Any remaining follow-ups
+  in those snapshots describe their recorded baseline, not current status.
+- Existing raw CI/export/repair excerpts and placeholders were relocated for
+  provenance rather than deleted. Do not add new transcripts or placeholders.
 - Older archived ops material also exists under
   [`docs/internal/history/archive/ops/`](../../internal/history/archive/ops/).
 

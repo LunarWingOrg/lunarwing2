@@ -19,4 +19,3 @@
   - MT-ADMIN-QUICKSTART.md - tip added after add-tenant example
   - guide-for-spin-up-gentoo-tenants.md - flag added to optional flags list
 
-

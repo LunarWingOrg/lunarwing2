@@ -159,7 +159,8 @@
 27. [ ] update all docs in docs/architecture
 28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5158 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
 29. [x] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
-30. [ ] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
+30. [x] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory
+    - DONE (2026-10-05): archived 26 prior-release reports, dated implementation/review/research records and legacy scratch artifacts; retained current procedures and unresolved operational ledgers. Prior-release evidence is indexed under `docs/ops/history/`, with v2.1.4.0 records grouped by release. Repaired affected Markdown links; historical prose/commit-path citations retain their original context. `docs/ov` was already absent from this branch (no tracked files or directory).
 31. [x] (S) RESERVED4itemstoworkonwilldiscusslater
 32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/307 - see last attempt MR and comments on it: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1412
 33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/303 - time to update opencode2 again yay

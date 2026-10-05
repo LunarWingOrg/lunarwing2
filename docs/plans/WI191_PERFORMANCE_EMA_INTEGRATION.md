@@ -12,7 +12,7 @@ whole-job/mission-run estimates, gate-wait analytics, held-out workload
 evaluation and durable caches remain follow-ups; tool calls within those
 jobs are covered by this slice. Costs are only learned when actually reported,
 and are not displayed. See the
-[goal-10 evidence record](../ops/v2.1.4.0_GOAL10_EMA_VALIDATION.md) for checks run.
+[goal-10 evidence record](../ops/history/v2.1.4.0/v2.1.4.0_GOAL10_EMA_VALIDATION.md) for checks run.
 
 Original plan reviewed against
 `wire-in-ema` at `05ddcc5cd` (2026-09-26). Tracker:

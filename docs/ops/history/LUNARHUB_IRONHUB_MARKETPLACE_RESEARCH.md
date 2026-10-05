@@ -8,8 +8,8 @@
 > v2.0.8.0 or later, not v2.0.7.0.
 
 - **Goal:** Item 9 in the v2.0.6.0 cycle; the checklist was not preserved, so see
-  [`RELEASE-v2.0.6.0.md`](../releases/RELEASE-v2.0.6.0.md) for the shipped record.
-- **Earlier analysis:** [`IRONCLAW_IDEAS_TAKEAWAYS.md`](IRONCLAW_IDEAS_TAKEAWAYS.md)
+  [`RELEASE-v2.0.6.0.md`](../../releases/RELEASE-v2.0.6.0.md) for the shipped record.
+- **Earlier analysis:** [`Ic_IDEAS_TAKEAWAYS.md`](Ic_IDEAS_TAKEAWAYS.md)
 - **LunarWing source inspected:** commit `9cb27d4b31a1acae4938671eb98a0b529e48e7cb`
 - **IronClaw source inspected:**
   [`0b5fcde996910137358fc1dfd25bce39ef98df91`](https://github.com/nearai/ironclaw/tree/0b5fcde996910137358fc1dfd25bce39ef98df91),

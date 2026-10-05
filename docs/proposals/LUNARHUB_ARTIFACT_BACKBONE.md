@@ -2,7 +2,7 @@
 
 > **Status (2026-08-24): PROPOSED — open for review.**
 > Originates from the LunarHub/IronHub marketplace research
-> ([`../ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md`](../ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md),
+> ([marketplace research](../ops/history/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md),
 > status: RESEARCH COMPLETE; IMPLEMENTATION DEFERRED) and an IRC design
 > discussion (rarity, 2026-08-24) reframing LunarHub short-term as a
 > **fleet-private artifact backbone** rather than a public marketplace. This
@@ -301,7 +301,7 @@ before Phase A is considered complete. Grouped, numbered for referral.
 
 ## References
 
-- [`../ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md`](../ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md) — authoritative marketplace architecture, phases, gates.
+- [Marketplace research](../ops/history/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md) — historical architecture, phases, gates.
 - [`../ops/ROADMAP_2026.md`](../ops/ROADMAP_2026.md) — marketplace rows (v2.1.4.0, v2.1.5.0).
 - [`../ops/IRONCLAW_IDEAS_TAKEAWAYS.md`](../ops/IRONCLAW_IDEAS_TAKEAWAYS.md) — earlier analysis corrected by the research doc.
 - `ic/src/tools/mcp/marketplace.rs`, `ic/src/tools/mcp/config.rs` — trust stack to reuse.

@@ -184,7 +184,7 @@ store or database was deleted. The generic repair verb still fails closed if
 migration cannot restore runtime introspection; do not claim it automatically
 recovers this missing-file case.
 
-See [the real-web acceptance record](../ops/GOAL12_REAL_WEB_ACCEPTANCE.md) for
+See [the real-web acceptance record](../ops/history/GOAL12_REAL_WEB_ACCEPTANCE.md) for
 post-deployment worker/export/restart evidence.
 
 ## The repair path (kept for already-broken pairings)

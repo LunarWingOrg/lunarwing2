@@ -223,7 +223,7 @@ CodeAct step. The event now fires under the `StepRecord` spelling,
 transcripts) and `StepRecord`, and error-shaped previews win over the
 `[stdout]` prefix check — previously `[stdout]\nOSError: …` reported "Code
 executed". Evidence:
-[`docs/ops/GOAL34_SEALED_STEP_OUTPUT.md`](docs/ops/GOAL34_SEALED_STEP_OUTPUT.md).
+[`docs/ops/history/GOAL34_SEALED_STEP_OUTPUT.md`](../ops/history/GOAL34_SEALED_STEP_OUTPUT.md).
 
 ### Managed WeeChat Relay Password Rotation (WI#202, goal 8)
 

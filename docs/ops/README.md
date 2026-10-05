@@ -46,7 +46,7 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 - [`SSH-HARNESS-SETUP.md`](SSH-HARNESS-SETUP.md)
 - [`PRE-RELEASE-TESTING.md`](PRE-RELEASE-TESTING.md)
 - [`TEST-SCRIPTS-STATUS.md`](TEST-SCRIPTS-STATUS.md)
-- [`TEST-PLAN-UPGRADED-TENANT-1.1.9.md`](TEST-PLAN-UPGRADED-TENANT-1.1.9.md)
+- Historical [1.1.9 upgrade acceptance](history/TEST-PLAN-UPGRADED-TENANT-1.1.9.md).
 
 ## Component operations
 
@@ -58,7 +58,7 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 - WeeChat: [`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md).
 - XMPP: [`XMPP_TRANSFERS.md`](XMPP_TRANSFERS.md),
   [`XMPP_KNOWN_ISSUES.md`](XMPP_KNOWN_ISSUES.md), and
-  [`XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md`](XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md).
+  the resolved [body-limit review](history/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md).
 - MCP: [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md) and
   [`MCP_ADDITIONS.md`](MCP_ADDITIONS.md).
 - SSH: [`SSH_KEY_LOG_EXPOSURE_KAGEHO.md`](SSH_KEY_LOG_EXPOSURE_KAGEHO.md)
