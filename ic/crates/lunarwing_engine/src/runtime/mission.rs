@@ -107,10 +107,10 @@ fn mission_context(
     }
 }
 
-/// A cron occurrence completing is not the scheduled mission completing.
+/// A scheduled/event occurrence completing is not the mission completing.
 /// Managed learning missions have the same contract for event-driven runs.
 fn keeps_running_after_success(mission: &Mission) -> bool {
-    matches!(mission.cadence, MissionCadence::Cron { .. }) || is_recurring_learning_mission(mission)
+    !matches!(mission.cadence, MissionCadence::Manual) || is_recurring_learning_mission(mission)
 }
 
 fn is_recurring_learning_mission(mission: &Mission) -> bool {
@@ -470,6 +470,7 @@ impl MissionManager {
     ) -> Result<usize, EngineError> {
         self.self_improvement_enabled
             .store(self_improvement_on, Ordering::Relaxed);
+        self.report_parked_recurring_missions().await;
         let missions = self.store.list_all_active_missions_global().await?;
         let existing: Vec<MissionId> = self.active.read().await.clone();
         let new_missions: Vec<Mission> = missions
@@ -481,6 +482,44 @@ impl MissionManager {
             .collect();
         self.bootstrap_from_missions(new_missions, self_improvement_on)
             .await
+    }
+
+    /// Legacy Completed recurring missions need an explicit owner decision:
+    /// resuming can run tools/send notifications after the owner accepted a
+    /// previous completion report. Warn at each boot rather than revive work.
+    async fn report_parked_recurring_missions(&self) {
+        let missions = match self.store.list_all_missions_global().await {
+            Ok(missions) => missions,
+            Err(error) => {
+                warn!(%error, "could not inspect completed recurring missions for recovery guidance");
+                return;
+            }
+        };
+        for mission in missions {
+            if mission.status != MissionStatus::Completed
+                || matches!(mission.cadence, MissionCadence::Manual)
+                || is_recurring_learning_mission(&mission)
+                || mission.deleted_at.is_some()
+            {
+                continue;
+            }
+            let response = format!(
+                "Recurring mission is Completed and will not fire. Earlier versions could complete it after a single successful run. Review its history, then call mission_resume(id=\"{}\") to resume future triggers, or mission_pause to keep it stopped. Missed triggers are not replayed.",
+                mission.id
+            );
+            warn!(mission_id = %mission.id, user_id = %mission.user_id, "{response}");
+            if let Some(&thread_id) = mission.thread_history.last() {
+                let _ = self.notification_tx.send(MissionNotification {
+                    mission_id: mission.id,
+                    mission_name: mission.name,
+                    thread_id,
+                    user_id: mission.user_id,
+                    notify_channels: mission.notify_channels,
+                    response: Some(response),
+                    is_error: true,
+                });
+            }
+        }
     }
 
     async fn bootstrap_from_missions(
@@ -747,7 +786,7 @@ impl MissionManager {
             }
         }
         self.active.write().await.retain(|mid| *mid != id);
-        debug!(mission_id = %id, "mission paused");
+        tracing::info!(mission_id = %id, user_id, "mission paused; future triggers disabled");
         self.stop_insight_workers(id).await?;
         Ok(())
     }
@@ -804,7 +843,7 @@ impl MissionManager {
         if !active.contains(&id) {
             active.push(id);
         }
-        debug!(mission_id = %id, "mission resumed");
+        tracing::info!(mission_id = %id, user_id, "mission resumed");
         Ok(())
     }
 
@@ -816,7 +855,7 @@ impl MissionManager {
             .update_mission_status(id, MissionStatus::Completed)
             .await?;
         self.active.write().await.retain(|mid| *mid != id);
-        debug!(mission_id = %id, "mission completed");
+        tracing::info!(mission_id = %id, "mission explicitly completed; future triggers disabled");
         Ok(())
     }
 
@@ -843,7 +882,7 @@ impl MissionManager {
             .update_mission_status(id, MissionStatus::Completed)
             .await?;
         self.active.write().await.retain(|mid| *mid != id);
-        debug!(mission_id = %id, "mission completed by {user_id}");
+        tracing::info!(mission_id = %id, user_id, "mission explicitly completed; future triggers disabled");
         Ok(())
     }
 
@@ -910,7 +949,7 @@ impl MissionManager {
             self.store.delete_mission(id).await?;
         }
         self.active.write().await.retain(|mid| *mid != id);
-        debug!(mission_id = %id, "mission deleted by {user_id}");
+        tracing::info!(mission_id = %id, user_id, "mission deleted; future triggers disabled");
         Ok(())
     }
 
@@ -2922,7 +2961,7 @@ fn build_meta_prompt(
         mission.thread_history.len() + 1
     ));
 
-    // Instructions. Cron and system-managed learning missions are recurring workers;
+    // Instructions. Scheduled/event missions are recurring workers;
     // completing one event must not imply that the mission itself is terminal.
     let next_focus_instruction = if insights {
         "2. Which source evidence supports each saved insight; if none, report no new insights"
@@ -2930,7 +2969,7 @@ fn build_meta_prompt(
         "2. What the next focus should be (for the next thread)"
     };
     let completion_instruction = if keeps_running_after_success(mission) {
-        "3. Whether this event/run was handled successfully (yes/no)".to_string()
+        "3. Whether this event/run was handled successfully (yes/no). Completing a run does not stop the mission; use mission_pause only when the owner wants future runs stopped.".to_string()
     } else {
         // The status line must stand alone: goal #30 observed an honest
         // report *ending* with "GOAL ACHIEVED: YES" auto-complete the
@@ -6369,6 +6408,161 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             MissionStatus::Completed,
             "mission should be completed when goal is achieved"
         );
+    }
+
+    #[tokio::test]
+    async fn channel_event_mission_keeps_firing_after_success() {
+        assert_repeated_event_mission(MissionCadence::OnEvent {
+            event_pattern: "deploy".into(),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn system_event_mission_keeps_firing_after_success() {
+        assert_repeated_event_mission(MissionCadence::OnSystemEvent {
+            source: "test".into(),
+            event_type: "deploy".into(),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn webhook_mission_keeps_firing_after_success() {
+        assert_repeated_event_mission(MissionCadence::Webhook {
+            path: "deploy".into(),
+            secret: Some("test-secret".into()),
+        })
+        .await;
+    }
+
+    async fn assert_repeated_event_mission(cadence: MissionCadence) {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let mgr = make_mission_manager_with_response(
+            store.clone(),
+            "FINAL(\"Mission complete.\\nGoal achieved: yes\")",
+        );
+        let project = ProjectId::new();
+        let id = mgr
+            .create_mission(
+                project,
+                "owner",
+                "deployment",
+                "handle deployments",
+                cadence.clone(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(build_meta_prompt(&mission, &[], &None).contains("use mission_pause"));
+        for run in 1..=2 {
+            let spawned = match &cadence {
+                MissionCadence::OnEvent { .. } => {
+                    mgr.fire_on_channel_event("deploy", "owner", None).await
+                }
+                MissionCadence::OnSystemEvent { .. } => {
+                    mgr.fire_on_system_event(project, "test", "deploy", "owner", None)
+                        .await
+                }
+                MissionCadence::Webhook { .. } => {
+                    mgr.fire_webhook_mission(
+                        "deploy",
+                        Some("test-secret"),
+                        serde_json::json!({"delivery_id": run}),
+                    )
+                    .await
+                }
+                _ => unreachable!("event cadence required"),
+            }
+            .unwrap();
+            assert_eq!(spawned.len(), 1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let saved = store.load_mission(id).await.unwrap().unwrap();
+                    if saved.approach_history.len() == run {
+                        assert_eq!(saved.status, MissionStatus::Active);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_warns_owner_about_parked_recurring_missions_without_reviving() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(store.clone());
+        let mut notifications = mgr.subscribe_notifications();
+        let cadences = [
+            MissionCadence::Cron {
+                expression: "0 10 * * *".into(),
+                timezone: None,
+            },
+            MissionCadence::OnEvent {
+                event_pattern: "deploy".into(),
+            },
+            MissionCadence::OnSystemEvent {
+                source: "test".into(),
+                event_type: "deploy".into(),
+            },
+            MissionCadence::Webhook {
+                path: "deploy".into(),
+                secret: Some("test-secret".into()),
+            },
+            MissionCadence::Manual,
+        ];
+        let mut expected = Vec::new();
+        for cadence in cadences {
+            for status in [
+                MissionStatus::Completed,
+                MissionStatus::Paused,
+                MissionStatus::Failed,
+            ] {
+                let mut mission =
+                    Mission::new(ProjectId::new(), "owner", "parked", "goal", cadence.clone());
+                mission.status = status;
+                mission.thread_history.push(ThreadId::new());
+                mission.notify_channels = vec!["gateway".into()];
+                if status == MissionStatus::Completed && !matches!(cadence, MissionCadence::Manual)
+                {
+                    expected.push(mission.id);
+                }
+                store.save_mission(&mission).await.unwrap();
+            }
+        }
+        assert_eq!(mgr.bootstrap_all_projects().await.unwrap(), 0);
+        for _ in 0..expected.len() {
+            let notification = notifications.try_recv().unwrap();
+            assert!(expected.contains(&notification.mission_id));
+            assert_eq!(notification.user_id, "owner");
+            assert_eq!(notification.notify_channels, vec!["gateway"]);
+            assert!(notification.response.unwrap().contains(&format!(
+                "mission_resume(id=\"{}\")",
+                notification.mission_id
+            )));
+            assert_eq!(
+                store
+                    .load_mission(notification.mission_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                MissionStatus::Completed
+            );
+        }
+        assert!(notifications.try_recv().is_err());
+        for id in expected {
+            assert!(mgr.resume_mission(id, "other").await.is_err());
+            mgr.resume_mission(id, "owner").await.unwrap();
+            assert_eq!(
+                store.load_mission(id).await.unwrap().unwrap().status,
+                MissionStatus::Active
+            );
+        }
     }
 
     #[tokio::test]

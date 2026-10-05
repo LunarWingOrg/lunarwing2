@@ -644,17 +644,24 @@ needed. Downgrading restores the older completion/recovery behavior and does
 not reconstruct interrupted work. Operators should inspect interrupted fires
 before manually refiring tasks with external side effects.
 
-Cron missions remain active after successful runs (WI#311), even if a final
+All non-manual missions (cron, channel events, system events and webhooks)
+remain active after successful runs (WI#311), even if a final
 response declares `Goal achieved: yes` or `Mission complete`. Their prompt asks
-about this run's success rather than overall goal completion. Explicit completion,
-pause, and failure still stop scheduling; a cron cadence does not override status.
-Older user cron missions already parked in Completed are not auto-reactivated,
-because persisted records cannot distinguish phrase-driven completion from an
-intentional stop. Inspect their history, then use `mission_resume(id=...)`
-as the owner to restore the existing mission and compute its next future fire.
-Missed occurrences are not replayed. Non-cron, non-managed missions retain the
-standalone goal-declaration completion contract. Downgrading restores the old
-phrase-driven completion behavior for cron missions; no schema change is needed.
+about this run's success rather than overall goal completion, and names
+`mission_pause` as the way to stop future runs. Only Active missions dispatch;
+cadence does not override persisted status. User-facing intentional stops are
+pause or deletion; the completion APIs have no production callers today.
+Older user recurring missions parked in Completed were subject to phrase-driven
+completion. They are not automatically revived because the owner may have accepted
+that completion report; revival could unexpectedly run tools and send notifications.
+Global startup logs a warning for each such record and sends best-effort recovery
+guidance through its configured notification channels when a last thread exists.
+This repeats at startup until the owner resumes, pauses, or deletes the mission.
+Inspect the history, then use `mission_resume(id=...)` as the owner to recover
+paused, completed or failed missions. Cron recovery computes its next future fire;
+missed occurrences/events are not replayed. Manual, non-managed missions retain
+the standalone goal-declaration completion contract. Downgrading restores the old
+phrase-driven completion behavior for recurring missions; no schema change is needed.
 
 `MissionManager::ensure_learning_missions()` provisions two baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement
@@ -736,7 +743,11 @@ preflight and is true only while that thread holds a valid lease covering
 the function in `MissionManager::leases()`, the thread manager's lease set
 that preflight consults. A thread without one gets the same definition with
 `callable: false` and a note saying a call from it would be refused, including
-threads whose lease was revoked or narrowed and any future denylist entry.
+threads whose lease is currently revoked or narrowed. Resume refresh re-grants
+missing actions under the current planner, including on same-process approval
+resumes; it does not preserve a separate per-thread revocation policy (none is
+currently exposed in production). Persistent revocation/narrowing would need its
+own recovery contract before being exposed.
 On restart resume (WI#309), the bridge's unscoped `registered_actions` catalog
 includes the same eight mission definitions when a mission manager is wired.
 `refresh_resumed_thread_leases` restores missing grants through the ordinary

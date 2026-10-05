@@ -1619,7 +1619,7 @@ fn mission_fire_def() -> ActionDef {
 fn mission_pause_def() -> ActionDef {
     ActionDef {
         name: "mission_pause".into(),
-        description: "Pause a running mission or routine.".into(),
+        description: "Pause a mission or routine to disable future triggers. Can also keep a completed mission stopped.".into(),
         parameters_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -1635,7 +1635,7 @@ fn mission_pause_def() -> ActionDef {
 fn mission_resume_def() -> ActionDef {
     ActionDef {
         name: "mission_resume".into(),
-        description: "Resume a paused mission or routine.".into(),
+        description: "Resume a paused, completed or failed mission or routine. Use to recover recurring missions stopped by an earlier run's completion report; future triggers resume without replaying missed runs.".into(),
         parameters_schema: serde_json::json!({
             "type": "object",
             "properties": {
