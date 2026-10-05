@@ -4580,7 +4580,6 @@ pub async fn list_engine_missions(
         }
         None => state.default_project_id,
     };
-
     let missions = state
         .store
         .list_missions_with_shared(pid, user_id)
@@ -4588,6 +4587,61 @@ pub async fn list_engine_missions(
         .map_err(|e| engine_err("list missions", e))?;
 
     Ok(missions.iter().map(mission_to_info).collect())
+}
+
+/// List the missions a read-only surface should show `user_id`, resolving
+/// the caller's own project first (WI#278): a non-owner's missions live in
+/// the project `resolve_user_project` would give them, not the engine
+/// default, so scanning only the default reports them as missing.
+///
+/// Unlike the chat path this never creates a project — a user with none
+/// falls back to the engine default, whose shared missions are visible to
+/// them anyway.
+pub async fn list_engine_missions_for_user(user_id: &str) -> Result<Vec<EngineMissionInfo>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(Vec::new());
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let pid = resolve_user_project_readonly(&state.store, user_id, state.default_project_id).await;
+    let missions = state
+        .store
+        .list_missions_with_shared(pid, user_id)
+        .await
+        .map_err(|e| engine_err("list missions", e))?;
+
+    Ok(missions.iter().map(mission_to_info).collect())
+}
+
+/// Read-only variant of `resolve_user_project` for listing surfaces
+/// (WI#278): the same pick — the fallback when the caller owns it,
+/// otherwise the caller's own "default" project — but never creates one.
+/// Shared-owner callers keep the engine default, where the shared missions
+/// they own live.
+async fn resolve_user_project_readonly(
+    store: &Arc<dyn Store>,
+    user_id: &str,
+    fallback: lunarwing_engine::ProjectId,
+) -> lunarwing_engine::ProjectId {
+    if is_shared_owner(user_id) {
+        return fallback;
+    }
+    if let Ok(Some(project)) = store.load_project(fallback).await
+        && project.is_owned_by(user_id)
+    {
+        return fallback;
+    }
+    match store.list_projects(user_id).await {
+        Ok(projects) => projects
+            .iter()
+            .find(|project| project.name == "default")
+            .map(|project| project.id)
+            .unwrap_or(fallback),
+        Err(_) => fallback,
+    }
 }
 
 /// Get a single mission by ID.
@@ -5939,6 +5993,7 @@ pub(crate) mod tests {
         threads: TokioRwLock<HashMap<lunarwing_engine::ThreadId, lunarwing_engine::Thread>>,
         docs: TokioRwLock<HashMap<lunarwing_engine::DocId, lunarwing_engine::MemoryDoc>>,
         missions: TokioRwLock<HashMap<lunarwing_engine::MissionId, lunarwing_engine::Mission>>,
+        projects: TokioRwLock<HashMap<lunarwing_engine::ProjectId, lunarwing_engine::Project>>,
         block_next_thread_load: AtomicBool,
         thread_load_started: Notify,
         continue_thread_load: Notify,
@@ -5952,6 +6007,7 @@ pub(crate) mod tests {
                 threads: TokioRwLock::new(HashMap::new()),
                 docs: TokioRwLock::new(HashMap::new()),
                 missions: TokioRwLock::new(HashMap::new()),
+                projects: TokioRwLock::new(HashMap::new()),
                 block_next_thread_load: AtomicBool::new(false),
                 thread_load_started: Notify::new(),
                 continue_thread_load: Notify::new(),
@@ -6024,21 +6080,32 @@ pub(crate) mod tests {
         }
         async fn save_project(
             &self,
-            _: &lunarwing_engine::Project,
+            project: &lunarwing_engine::Project,
         ) -> Result<(), lunarwing_engine::EngineError> {
+            self.projects
+                .write()
+                .await
+                .insert(project.id, project.clone());
             Ok(())
         }
         async fn load_project(
             &self,
-            _: lunarwing_engine::ProjectId,
+            id: lunarwing_engine::ProjectId,
         ) -> Result<Option<lunarwing_engine::Project>, lunarwing_engine::EngineError> {
-            Ok(None)
+            Ok(self.projects.read().await.get(&id).cloned())
         }
         async fn list_projects(
             &self,
-            _user_id: &str,
+            user_id: &str,
         ) -> Result<Vec<lunarwing_engine::Project>, lunarwing_engine::EngineError> {
-            Ok(vec![])
+            Ok(self
+                .projects
+                .read()
+                .await
+                .values()
+                .filter(|project| project.user_id == user_id)
+                .cloned()
+                .collect())
         }
         async fn list_all_projects(
             &self,
@@ -6930,7 +6997,8 @@ pub(crate) mod tests {
 
     /// WI#278: a v1 thread's `routine_list` reports live Engine V2 missions
     /// read-only (the registry split used to hide them entirely), scoped like
-    /// `mission_list`.
+    /// `mission_list` — the caller's own project, not only the engine
+    /// default, so a non-owner's missions are not reported missing.
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn v1_routine_list_reports_engine_missions() {
@@ -6939,18 +7007,22 @@ pub(crate) mod tests {
         let store = Arc::new(TestStore::new());
         let project = lunarwing_engine::ProjectId::new();
         seed_mission_with_runs(&store, project, "alice", "self-improvement", "improved").await;
+        // A non-owner's missions live in their own "default" project
+        // (resolve_user_project), never in the engine default project.
+        let bob_project = lunarwing_engine::Project::new("bob", "default", "Default project");
+        let bob_project_id = bob_project.id;
+        store
+            .save_project(&bob_project)
+            .await
+            .expect("save project");
+        seed_mission_with_runs(&store, bob_project_id, "bob", "digest", "sent").await;
+        assert_ne!(project, bob_project_id, "distinct projects");
         let mut state = make_expected_test_state(store.clone());
         state.default_project_id = project;
         install_test_engine_state(Some(state)).await;
 
-        let temp = tempfile::tempdir().expect("tempdir");
-        let backend = crate::db::libsql::LibSqlBackend::new_local(&temp.path().join("routines.db"))
-            .await
-            .expect("libsql backend");
-        crate::db::Database::run_migrations(&backend)
-            .await
-            .expect("migrations");
-        let tool = crate::tools::builtin::routine::RoutineListTool::new(Arc::new(backend));
+        let (db, _temp) = crate::testing::test_db().await;
+        let tool = crate::tools::builtin::routine::RoutineListTool::new(db);
 
         let alice = tool
             .execute(
@@ -6964,6 +7036,25 @@ pub(crate) mod tests {
         assert_eq!(mission["name"], "self-improvement");
         assert_eq!(mission["kind"], "engine_mission");
         assert_eq!(mission["runs"], 2);
+
+        // The caller's own project is scanned: bob sees his own mission even
+        // though it lives outside the engine default project.
+        let bob = tool
+            .execute(
+                serde_json::json!({}),
+                &crate::context::JobContext::with_user("bob", "list", "list routines"),
+            )
+            .await
+            .expect("routine_list");
+        let bob_missions = &bob.result["engine_missions"]["missions"];
+        assert_eq!(
+            bob_missions.as_array().map(Vec::len),
+            Some(1),
+            "bob sees exactly his own mission: {}",
+            bob.result
+        );
+        assert_eq!(bob_missions[0]["name"], "digest");
+        assert_eq!(bob_missions[0]["runs"], 2);
 
         let mallory = tool
             .execute(

@@ -1640,10 +1640,12 @@ async fn v1_routine_runs(
 }
 
 /// Read-only listing of the caller's Engine V2 missions for `routine_list`
-/// (WI#278), or `None` when the engine is not running or has none. A lookup
-/// failure only drops the section — the v1 listing stays authoritative.
+/// (WI#278), or `None` when the engine is not running or has none. The
+/// caller's own project is scanned (non-owner missions do not live in the
+/// engine default project). A lookup failure only drops the section — the
+/// v1 listing stays authoritative.
 async fn engine_missions_listing(user_id: &str) -> Option<serde_json::Value> {
-    match crate::bridge::list_engine_missions(None, user_id).await {
+    match crate::bridge::list_engine_missions_for_user(user_id).await {
         Ok(missions) => render_engine_missions(&missions),
         Err(error) => {
             tracing::debug!(%error, "engine mission listing for routine_list failed");
