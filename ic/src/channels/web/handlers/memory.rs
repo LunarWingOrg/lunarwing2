@@ -144,13 +144,22 @@ pub async fn memory_write_handler(
     let workspace = resolve_workspace(&state, &user).await?;
 
     // Shadow backup files (backups/) are written only by the shadow-backup
-    // rotation itself; they can hold quarantined injection content, so this
-    // route must not overwrite or erase them (WI#288 review T-2). Reads stay
-    // open for operator recovery.
-    if crate::workspace::is_backup_path(&crate::workspace::normalize_path(&req.path)) {
+    // rotation itself, and quarantined daily logs (daily/*.poisoned-*.md)
+    // hold live injection evidence; neither may be overwritten or erased
+    // through this route (WI#288 review T-2/J-2). Reads stay open for
+    // operator recovery.
+    let normalized_path = crate::workspace::normalize_path(&req.path);
+    if crate::workspace::is_backup_path(&normalized_path) {
         return Err((
             StatusCode::FORBIDDEN,
             "backups/ paths are reserved for the shadow-backup rotation".to_string(),
+        ));
+    }
+    if crate::workspace::is_quarantined_daily_log(&normalized_path) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "quarantined daily logs (daily/*.poisoned-*.md) are reserved as injection evidence"
+                .to_string(),
         ));
     }
 
