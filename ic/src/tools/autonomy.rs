@@ -5,29 +5,8 @@ use crate::extensions::ExtensionManager;
 
 use super::ToolRegistry;
 
-pub const AUTONOMOUS_TOOL_DENYLIST: &[&str] = &[
-    "routine_create",
-    "routine_update",
-    "routine_delete",
-    "routine_fire",
-    "event_emit",
-    "create_job",
-    "job_prompt",
-    "restart",
-    "tool_install",
-    "tool_auth",
-    "tool_activate",
-    "tool_deactivate",
-    "tool_update",
-    "tool_remove",
-    "tool_upgrade",
-    "skill_install",
-    "skill_remove",
-    "secret_list",
-    "secret_delete",
-    "ssh",
-    "ssh_git",
-];
+// Share the planner's list so discovery and lease classification cannot drift.
+pub use lunarwing_engine::gate::tool_tier::AUTONOMOUS_TOOL_DENYLIST;
 
 pub fn is_autonomous_tool_denylisted(tool_name: &str) -> bool {
     AUTONOMOUS_TOOL_DENYLIST.contains(&tool_name)
@@ -72,7 +51,17 @@ pub async fn autonomous_allowed_tool_names(
         );
     }
 
-    allowed
+    // Per-tool opt-outs are independent of the static name denylist. Resolve
+    // owner-scoped tools here so lightweight routines inherit this gate too.
+    let mut permitted = HashSet::new();
+    for name in allowed {
+        if let Some((_, tool)) = tools.get_resolved_for_user(&name, owner_id).await
+            && tool.allows_autonomous_execution()
+        {
+            permitted.insert(name);
+        }
+    }
+    permitted
 }
 
 #[cfg(test)]
@@ -103,6 +92,10 @@ mod tests {
 
         fn description(&self) -> &str {
             "test tool"
+        }
+
+        fn allows_autonomous_execution(&self) -> bool {
+            self.name != "interactive_only"
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
@@ -182,12 +175,16 @@ mod tests {
         tools.register_sync(Arc::new(FakeTool { name: "echo" }));
         tools.register_sync(Arc::new(FakeTool { name: "restart" }));
         tools.register_sync(Arc::new(FakeTool { name: "ssh" }));
+        tools.register_sync(Arc::new(FakeTool {
+            name: "interactive_only",
+        }));
 
         let allowed = autonomous_allowed_tool_names(&tools, None, "default").await;
 
         assert!(allowed.contains("echo"));
         assert!(!allowed.contains("restart"));
         assert!(!allowed.contains("ssh"));
+        assert!(!allowed.contains("interactive_only"));
     }
 
     #[tokio::test]
@@ -199,11 +196,18 @@ mod tests {
             .register(Arc::new(FakeTool { name: "owner_gate" }))
             .await;
         write_test_extension_wasm(&tools_dir, "owner_gate").await;
+        tools
+            .register(Arc::new(FakeTool {
+                name: "interactive_only",
+            }))
+            .await;
+        write_test_extension_wasm(&tools_dir, "interactive_only").await;
         let manager = make_extension_manager(tools.clone(), &tools_dir, "default");
 
         let allowed = autonomous_allowed_tool_names(&tools, Some(&manager), "default").await;
 
         assert!(allowed.contains("owner_gate"));
+        assert!(!allowed.contains("interactive_only"));
     }
 
     #[tokio::test]

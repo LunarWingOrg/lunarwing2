@@ -166,6 +166,20 @@ output is bounded. The same pagination contract is the model for fixing
 exception. WASM tools with SSH capability always use non-bypassable `always`,
 regardless of declared policy.
 
+`secret_delete` also uses non-bypassable `always` (WI#307): each deletion
+requires approval, even with global/session auto-approve or an old persisted
+grant. A persisted `always_allow` row for `secret_delete`, however created,
+is ignored by every approval path. Generic settings writes/imports can still
+create the row; this is an execution-time gate, not a settings-write lock.
+Migration V28 removes legacy `tool_permissions.secret_delete = always_allow`
+rows for all users in PostgreSQL and libSQL; disabled/ask rows are retained.
+libSQL guards JSON extraction so malformed legacy TEXT values are retained
+without aborting startup.
+Downgrading does not restore deleted grants. Both `secret_list` and
+`secret_delete` opt out of autonomous execution, in addition to the name
+denylist. The shared autonomous catalog filters these opt-outs for routines;
+Engine V2 checks them again at execution, including approval resumes.
+
 ### What Does NOT Go in Main Agent
 
 - Service-specific auth flows (OAuth for Notion, GitHub, etc.)

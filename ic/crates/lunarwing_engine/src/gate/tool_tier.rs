@@ -32,6 +32,8 @@ pub const AUTONOMOUS_TOOL_DENYLIST: &[&str] = &[
     "skill_remove",
     "secret_list",
     "secret_delete",
+    "ssh",
+    "ssh_git",
 ];
 
 /// Returns true if the action name is in the autonomous tool denylist.

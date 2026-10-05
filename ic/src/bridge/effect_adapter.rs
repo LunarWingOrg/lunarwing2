@@ -973,6 +973,13 @@ impl EffectBridgeAdapter {
             .get_resolved_for_user(action_name, &context.user_id)
             .await
         {
+            if context.thread_type != lunarwing_engine::ThreadType::Foreground
+                && !tool.allows_autonomous_execution()
+            {
+                return Err(EngineError::LeaseDenied {
+                    reason: format!("Tool '{action_name}' does not permit autonomous execution."),
+                });
+            }
             let permission_state = self
                 .tool_permission_state(&context.user_id, lookup_name)
                 .await;
@@ -3074,6 +3081,125 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 .await,
             Some(PermissionState::Disabled)
         );
+    }
+
+    async fn secret_approval_fixture() -> (
+        EffectBridgeAdapter,
+        Arc<crate::secrets::InMemorySecretsStore>,
+    ) {
+        use crate::secrets::{CreateSecretParams, SecretsStore};
+        use crate::tools::builtin::{SecretDeleteTool, SecretListTool};
+        let secrets = Arc::new(crate::testing::credentials::test_secrets_store());
+        secrets
+            .create("test_user", CreateSecretParams::new("first", "fixture"))
+            .await
+            .unwrap();
+        secrets
+            .create("test_user", CreateSecretParams::new("second", "fixture"))
+            .await
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(SecretDeleteTool::new(secrets.clone())))
+            .await;
+        tools
+            .register(Arc::new(SecretListTool::new(secrets.clone())))
+            .await;
+        let mut adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&lunarwing_safety::SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        adapter.globally_auto_approved = true;
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.secret_delete",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .unwrap();
+        adapter.set_settings_store(settings).await;
+        (adapter, secrets)
+    }
+
+    #[tokio::test]
+    async fn secrets_require_interactive_per_call_approval_despite_old_grants() {
+        use crate::secrets::SecretsStore;
+        let (adapter, secrets) = secret_approval_fixture().await;
+        let foreground = exec_ctx(lunarwing_engine::ThreadId::new(), Some("delete"));
+        for name in ["first", "second"] {
+            let result = adapter
+                .execute_action(
+                    "secret_delete",
+                    serde_json::json!({"name": name}),
+                    &lease(),
+                    &foreground,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(EngineError::GatePaused { resume_kind, .. })
+                if matches!(*resume_kind, lunarwing_engine::ResumeKind::Approval { allow_always: false }))
+            );
+            assert!(
+                secrets
+                    .list("test_user")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.name == name)
+            );
+            if name == "first" {
+                let approved = adapter
+                    .execute_resolved_pending_action(
+                        "secret_delete",
+                        serde_json::json!({"name": name}),
+                        &lease(),
+                        &foreground,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!approved.is_error);
+                assert!(
+                    !secrets
+                        .list("test_user")
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|s| s.name == name)
+                );
+            }
+        }
+        for kind in [
+            lunarwing_engine::ThreadType::Research,
+            lunarwing_engine::ThreadType::Mission,
+        ] {
+            let context =
+                exec_ctx_for_type(lunarwing_engine::ThreadId::new(), Some("background"), kind);
+            for name in ["secret_list", "secret_delete"] {
+                for approved in [false, true] {
+                    let result = adapter
+                        .execute_action_internal(
+                            name,
+                            serde_json::json!({"name": "second"}),
+                            &lease(),
+                            &context,
+                            approved,
+                        )
+                        .await;
+                    assert!(
+                        matches!(result, Err(EngineError::LeaseDenied { .. })),
+                        "{kind:?} {name}: {result:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(secrets.list("test_user").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

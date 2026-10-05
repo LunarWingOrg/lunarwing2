@@ -969,6 +969,12 @@ Wraps tool execution and safety layer as `EffectExecutor`:
   resumed thread may gain. In particular, mission leases exclude administrative
   and autonomous-denylisted actions such as `create_job`; foreground leases keep
   them behind their normal interactive gates.
+- Before executing a registry tool, including an approval resume, the adapter
+  rejects non-foreground calls when `allows_autonomous_execution()` is false.
+  Both secrets tools opt out; `secret_delete` additionally requires approval
+  for each foreground deletion and ignores persistent `always_allow` grants.
+  Daemon discovery and engine lease planning share the autonomous denylist,
+  including `ssh`/`ssh_git`; per-tool opt-outs are independently rechecked.
 
 ### HybridStore (`ic/src/bridge/store_adapter.rs`)
 

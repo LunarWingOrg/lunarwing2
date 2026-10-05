@@ -78,10 +78,16 @@ The seeded permission baseline is conservative:
 - unknown tools also default to `ask_each_time`;
 - a small set of read-only or messaging helpers defaults to `always_allow`;
 - an explicit `disabled` permission prevents use;
-- intrinsically always-gated tools cannot be changed to `always_allow` unless
-  the tool explicitly opts in; built-in `ssh` is the narrow exception.
+- intrinsically always-gated tools ignore persistent `always_allow` grants unless
+  the tool explicitly opts in, as built-in `ssh` does.
 
-The authenticated web approval card offers **Approve**, **Deny**, and, when the tool permits it, **Always**. The `tool_permission_set` built-in tool can also request a permission change through the approval path. Persisted per-user settings are the source of truth; do not edit the settings table directly for routine administration.
+`secret_delete` never permits **Always**: approve each irreversible deletion
+individually. Global/session auto-approval cannot bypass it. Upgrade migration
+V28 removes older persistent deletion grants for every user, preserving
+`disabled` and `ask_each_time`; a downgrade does not restore those grants.
+Both secrets tools (`secret_list`, `secret_delete`) are interactive-only.
+
+The authenticated web approval card offers **Approve**, **Deny**, and, when the tool permits it, **Always**. A persisted `always_allow` row for `secret_delete`, however created, is ignored by every approval path. The generic settings API/import can still write such a row; enforcement is at execution, not a settings-write lock. Do not edit the settings table directly for routine administration.
 
 For non-interactive development or CI only, the current global environment override is:
 

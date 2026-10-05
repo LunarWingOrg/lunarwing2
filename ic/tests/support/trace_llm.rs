@@ -260,8 +260,9 @@ impl LlmTrace {
 ///
 /// **Concurrency assumption:** Uses `AtomicUsize` for step indexing, so
 /// concurrent calls to `complete`/`complete_with_tools` may consume steps
-/// in non-deterministic order. Current tests are single-threaded per rig;
-/// if parallel tool execution is ever enabled, steps may interleave.
+/// in non-deterministic order, even on a single-threaded runtime. Tests that
+/// dispatch scheduled workers must isolate their completions from foreground
+/// replay (see `ScheduledJobTrace` in `e2e_builtin_tool_coverage.rs`).
 pub struct TraceLlm {
     model_name: String,
     steps: Vec<TraceStep>,
