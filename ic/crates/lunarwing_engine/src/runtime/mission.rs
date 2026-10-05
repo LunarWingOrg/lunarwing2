@@ -608,14 +608,7 @@ impl MissionManager {
         notify_channels: Vec<String>,
     ) -> Result<MissionId, EngineError> {
         Ok(self
-            .create_mission_detailed(
-                project_id,
-                user_id,
-                name,
-                goal,
-                cadence,
-                notify_channels,
-            )
+            .create_mission_detailed(project_id, user_id, name, goal, cadence, notify_channels)
             .await?
             .id)
     }

@@ -4857,8 +4857,7 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert_eq!(second.output["deduplicated"], true);
         assert_eq!(second.output["requested_cadence"], "15 10 * * *");
         assert_eq!(
-            second.output["schedule"]["cadence"]["Cron"]["expression"],
-            "0 10 15 * * *",
+            second.output["schedule"]["cadence"]["Cron"]["expression"], "0 10 15 * * *",
             "persisted cadence is unchanged by the deduped re-create"
         );
         assert!(
