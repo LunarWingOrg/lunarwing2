@@ -88,10 +88,12 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
   separate from the channel spool. A graceful shutdown no longer loses a
   mid-run mission fire: the run is stopped within a short grace, the
   interruption is recorded, and a persisted retry marker re-fires it after
-  restart (WI#276; see ENGINE-V2.md, mission retries). A hard kill or a run
-  that cannot stop within the grace is restart recovery's case (WI#301), and
-  a re-fired run may repeat side effects the interrupted run already
-  performed (at-least-once).
+  restart (WI#276; see ENGINE-V2.md, mission retries). A run that cannot
+  stop within the grace is still recorded and stamped at shutdown; the boot
+  sweep resolves the stamp against the thread's final state and retries a
+  settled stop, while a hard kill stays restart recovery's record-only case
+  (WI#301). A re-fired run may repeat side effects the interrupted run
+  already performed (at-least-once).
 - **Other channels.** The spool is XMPP-local. Channels with similar
   in-memory outbound queues keep their existing semantics.
 

@@ -674,33 +674,62 @@ handle out of that set, so its shutdown stop never landed, the run was
 dropped mid-await at runtime teardown, and the fire vanished without a
 record, retry, or dedup-key release. On `MissionManager::shutdown` the
 watcher now stops the run and gives it 3 s to settle (the shutdown wait is
-the grace plus a margin for the post-stop writes); the real outcome is then
-processed exactly as in normal operation — for a stopped run that records
-`INTERRUPTED: signal-stopped mid-run`, releases the trigger dedup key, and
-persists the retry marker on the now-terminal thread. The in-process retry
-timer is skipped (it would die with the daemon); the post-restart sweep
-re-arms the retry from the marker, with the usual fresh backoff and attempt
-accounting (an interrupted fire costs one retry attempt). Should a shutdown
-abort still land between the marker write and the mission-side dedup
-release, the sweep releases the stale dedup key before re-arming, so the
-retry cannot be suppressed as already processed on every boot. A run that
-finished during the shutdown window has its real outcome recorded too. A
-run that does not settle within the grace is left untouched — writing then
-would race its own final save — and stays with restart recovery for
-in-flight threads (WI#301). Because the watcher no longer hides the thread,
-stop requests, injected messages, and `is_running` now reach watched
-mission threads during normal operation as well — so pausing or retiring
+the grace plus a margin for the post-stop writes; the stop request itself
+shares the grace budget so a wedged signal channel cannot stall it); the
+real outcome is then processed exactly as in normal operation — for a
+stopped run that records `INTERRUPTED: signal-stopped mid-run`, releases
+the trigger dedup key, and persists the retry marker on the now-terminal
+thread. The in-process retry timer is skipped (it would die with the
+daemon); the post-restart sweep re-arms the retry from the marker, with the
+usual fresh backoff and attempt accounting (an interrupted fire costs one
+retry attempt). Outcome writes are ordered so the retry marker is the final
+commit write: the mission row (approach history plus the dedup release) is
+saved first, so an abort in the window leaves either no trace (the clean
+pre-WI#188 loss, with the key already released for redelivery) or a mission
+row without a marker — never a marker whose release never saved. Markers
+written in the opposite order by older builds can still pair a live marker
+with a recorded key; the sweep releases that stale key before re-arming.
+The shutdown-time "retry scheduled" broadcast has no live consumer, so the
+marker records the notice as undelivered and the boot sweep emits it once
+when re-arming, acknowledging the delivery on the marker itself (the same
+pattern as the WI#301 acknowledgement). A run that finished during the
+shutdown window has its real outcome recorded too. A run that does not
+settle within the grace cannot have its thread row written (its own final
+save lands during teardown), so the watcher records the mission row only —
+`INTERRUPTED: shutdown while the thread was still stopping (<thread_id>)`,
+the dedup release, and a `pending_shutdown_interruption` stamp in mission
+metadata. At boot, `resolve_pending_shutdown_interruptions` resolves the
+stamp against the thread's final persisted state: a stop that settled
+during teardown (host-stop terminal reason) earns the retry the watcher
+would have planned, with the boot-time notice; a thread the restart sweep
+stamped stays WI#301's record case; a run that completed needs no retry; a
+run that failed on its own during teardown is record-only, because the
+persisted row does not carry the failure kind and WI#302 forbids retrying
+budget exhaustion; a suspended or waiting thread stays with checkpoint or
+gate recovery. Because the watcher no longer hides the thread, stop
+requests, injected messages, and `is_running` now reach watched mission
+threads during normal operation as well — so pausing or retiring
 conversation-insights now really stops its workers. A thread stopped while
 its mission is no longer Active is recorded as `STOPPED: mission <status>
 while the thread ran` and is neither retried nor reported as an error.
 
 Whether an interrupted fire re-fires therefore depends on how it was
-interrupted, and the asymmetry is deliberate: a gracefully stopped run is
-known to have ended at a cooperative stop point, so re-firing it is safe
-enough — still at-least-once, since side effects performed before the stop
-may repeat — while a restart-killed run's side effects are partially
-applied at an unknown point, so it stays record-only and is never
-auto-refired (WI#301).
+interrupted, and the asymmetry is deliberate — but the stop itself is NOT
+cooperative. `request_stop` cancels the run token, so any active provider
+stream or tool future is dropped mid-flight; a gracefully stopped run's
+side effects can be partially applied exactly like a restart-killed run's.
+The difference is observability, not cleanliness: the graceful path records
+the real outcome and releases the dedup key before the process exits, so
+the retry policy can re-arm with attempt accounting and a released trigger,
+while a restart kill is discovered only at boot with no outcome and stays
+record-only (WI#301). Re-firing remains at-least-once in both cases: side
+effects performed before the interruption may repeat, and for payload-less
+cron/manual fires the armed retry can run beside the next cadence tick —
+accepted under the WI#188 retry contract, which already retries failed
+fires on the same terms. Webhook/event fires carry a dedup key, so an
+external redelivery suppresses the armed retry instead of doubling the
+work. Operators of side-effecting missions should treat an interruption
+retry like any at-least-once redelivery.
 
 These recovery markers are additive thread metadata; no database migration is
 needed. Downgrading restores the older completion/recovery behavior and does
