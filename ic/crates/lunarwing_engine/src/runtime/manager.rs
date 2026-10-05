@@ -1067,9 +1067,11 @@ impl ThreadManager {
     /// landed for exactly that reason. Here the thread stays registered while
     /// it runs (the router's turn-wait pattern) and is joined only once
     /// finished. On `shutdown` the run is stopped and given `grace` to settle
-    /// so its real outcome can still be recorded. `Ok(None)`: it did not
-    /// settle in time; it stays registered and nothing is joined, so no
-    /// caller writes over a still-running thread.
+    /// so its real outcome can still be recorded; the stop request itself
+    /// shares the grace budget, so a wedged signal channel cannot stall the
+    /// shutdown wait past `grace`. `Ok(None)`: it did not settle in time; it
+    /// stays registered and nothing is joined, so no caller writes over a
+    /// still-running thread.
     pub async fn wait_thread_or_stop(
         &self,
         thread_id: ThreadId,
@@ -1083,8 +1085,8 @@ impl ThreadManager {
                 _ = shutdown.cancelled() => {
                     // A run that finished meanwhile is no longer registered;
                     // its stop request is a harmless miss.
-                    let _ = self.request_stop(thread_id).await;
                     let settled = tokio::time::timeout(grace, async {
+                        let _ = self.request_stop(thread_id).await;
                         while self.is_running(thread_id).await {
                             tokio::time::sleep(STOP_SETTLE_POLL).await;
                         }
