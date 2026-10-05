@@ -181,14 +181,14 @@
    - Note: TensorZero naming in guides stays correct for this tree — the TensorMoon cutover (bb7db9d3d) is not an ancestor of this branch and arrives with its own MR.
    - Docs-only; no code changed, no cargo gates apply. Commits: 58e466355, 01305cab7, 0eafc408e, 96e79cb29, bfec57ee2, plus this goals commit.
 27. [ ] update all docs in docs/architecture
-28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5187 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
+28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5202 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
 29. [x] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
-30. [x] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory — re-attempt after [!1422 review](https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1422#note_6163).
+30. [x] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory — re-attempt after [!1422 review](https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1422#note_6163)
     - DONE (2026-10-05): re-applied the archive with I-1–I-9 follow-ups: repaired current plain-path citations (including XMPP source comments), removed the empty CI placeholder and redundant memory/DarkIRC pointers, archived the unreferenced screenshot and completed incident, and indexed the remaining current Nanocode/cgroup procedures. Kept cited historical transcripts with an explicit existing-evidence exception; no new transcripts added. `docs/ov` is already absent.
-    - Flat `history/v2.1.4.0_*.md` names follow the adjacent v2.1.x layout. Restored v2.1.3.0/v2.1.4.0 checklists from their final pre-removal/replacement revisions (sources recorded in the archive index), with relative links repaired. Added a per-file archive index and fixed the review's pre-existing dangling references. Release-description links retain repository-root conventions. The Gentoo package/production guides deliberately redirect operators to the maintained tenant guide rather than the historical setup report.
+    - Flat `history/v2.1.4.0_*.md` names follow the adjacent v2.1.x layout. Restored v2.1.3.0/v2.1.4.0 checklists from their final pre-removal/replacement revisions (sources recorded in the archive index), with relative links repaired. Added a per-file archive index and fixed the review's pre-existing dangling references. Release-description links retain repository-root conventions. The Gentoo package/production guides deliberately redirect operators to the maintained tenant guide rather than the historical setup report
     - Verification: repository local-link comparison against the branch baseline and current-doc/source moved-path scan passed (release-description root paths handled explicitly); `git diff --check` passed. Historical prose and commit-pinned citations remain snapshots.
 31. [x] (S) RESERVED4itemstoworkonwilldiscusslater
-32. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/307 — re-attempt after [!1422 review](https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1422#note_6163) and pipeline 5167 failure.
+32. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/307
     - DONE (2026-10-05): re-applied non-bypassable per-call deletion approval, both secrets tools' autonomous opt-outs, and all-owner PostgreSQL/libSQL V28 grant cleanup. H-1: docs now explain that persisted `always_allow` rows are ignored at execution, not refused by a nonexistent settings UI/tool. H-2: guarded libSQL extraction with `json_valid`; malformed target/unrelated rows survive two real migration executions without preventing startup. H-3: added a live PostgreSQL JSONB selectivity/idempotence test, using a session-local table, and wired it into the PostgreSQL integration CI job.
     - H-4: retained the explicit no-persistent-approval override as intentional documentation of the security contract. H-5: documented the non-foreground execution/resume gate in ENGINE-V2. H-6/Y-4: daemon discovery and engine lease planning now share one denylist, including SSH/SSH Git; dynamic per-tool opt-outs remain independently enforced. V28 cleanup is irreversible on downgrade; runtime protection does not depend on cleanup, and generic settings writes can still create inert grant rows.
     - CI job 96673 failed `e2e_builtin_tool_coverage::job_create_status`: the real scheduled worker could consume the foreground trace's next response. The test now isolates the worker's pending completion and forces the worker-first interleaving before advancing the foreground replay. It retains scheduler dispatch, both successful tool calls, UUID forwarding, and in-progress-status assertions; no assertion was weakened.
@@ -201,7 +201,7 @@
 38. [x] (S) HRDR
 39. [ ] repass of goal number 25
 40. [x] (S) RESERVED4NVMES
-41. [x] (S) RESERVED
+41. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/320 - will involve creating a test tenant and interacting with it substantially. expect this to be a long one.
 42. [ ] Clearly something went very very wrong with the work done from the 43rd goal.... See comments on WI 311 and address properly this time....
     - INVESTIGATED / IMPLEMENTED (2026-10-05): read all WI#311 comments. Operator confirmed the reported build `5e2b3aae8`, which predates both WI#311 fixes. The reported cron `0 10 15 * * *` means 15:10 UTC, not 10:15. No regression in the fixed scheduler was established. See [investigation and recovery steps](v2.1.5.0_GOAL42_MISSION_DIAGNOSTICS.md).
     - Fixed a confirmed reporting defect: legacy missions with thread history but no `last_fired_at` no longer report `never_fired=true`. Create/list/history now expose project and persisted schedule diagnostics; schemas explain cron field order. Added fixed-date cron, legacy-record, webhook-secret and real workspace reload/global-bootstrap regressions.
@@ -215,7 +215,7 @@
 45. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/309
     - DONE (2026-10-05): the bridge includes canonical mission action definitions in the unscoped resume lease catalog when its mission manager is wired. Missing grants use the existing thread-type planner, persistence and rollback path; execution prompts remain registry-only. Restart recovery is documented in `docs/architecture/ENGINE-V2.md`
     - Verification: 267 bridge-filter tests and 31 engine thread-manager tests passed. New real-manager/CodeAct coverage resumes Waiting and Suspended threads with stale persisted IDs and an empty in-memory lease manager across all three thread types; proves explicit mission grants, truthful tool_info, owner-filtered listing and successful mission_update, and rejects another owner's resume before granting leases. Unwired-executor and unleased-catalog checks passed. Combined-tree daemon Clippy, PostgreSQL-only/libSQL-only compile checks, formatting and diff checks passed.
-46. [x] (S) Reserved
+46. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/319
 47. [x] (S) Reserved
 48. [x] (S) Reserved
 
