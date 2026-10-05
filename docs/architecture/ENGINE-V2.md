@@ -735,11 +735,16 @@ capability — whether the asking thread holds the lease to call the function
 preflight and is true only while that thread holds a valid lease covering
 the function in `MissionManager::leases()`, the thread manager's lease set
 that preflight consults. A thread without one gets the same definition with
-`callable: false` and a note saying a call from it would be refused. Today
-that means threads resumed after a daemon restart (the lease manager is
-in-memory and never rehydrated, and `refresh_resumed_thread_leases` re-grants
-registry tools only — a known gap left over from WI#186/WI#169), threads
-whose lease was revoked or narrowed, and any future denylist entry.
+`callable: false` and a note saying a call from it would be refused, including
+threads whose lease was revoked or narrowed and any future denylist entry.
+On restart resume (WI#309), the bridge's unscoped `registered_actions` catalog
+includes the same eight mission definitions when a mission manager is wired.
+`refresh_resumed_thread_leases` restores missing grants through the ordinary
+thread-type lease planner, alongside live registry tools; it does not revive
+persisted lease IDs or grant a wildcard. Owner validation happens before this
+refresh, and failed resume persistence rolls back newly granted leases. The
+scoped model-visible catalog and `tool_list` remain registry-only. No schema
+change is needed; older binaries lose these mission grants again on restart.
 `rlm_query` children run on a private copy of their parent's leases that the
 host cannot see, so a thread the host holds no leases for is answered `true`
 rather than a false "not callable". The answer is static definition text,

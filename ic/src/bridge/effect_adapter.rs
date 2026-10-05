@@ -1375,7 +1375,16 @@ impl EffectExecutor for EffectBridgeAdapter {
     }
 
     async fn registered_actions(&self) -> Result<Vec<ActionDef>, EngineError> {
-        Ok(self.registered_action_defs().await)
+        let mut actions = self.registered_action_defs().await;
+        // WI#309: restart loses in-memory leases, including the non-registry
+        // missions capability. Supply its real definitions to the existing
+        // lease planner on resume, only while its executor is wired.
+        if self.mission_manager.read().await.is_some() {
+            let missions = mission_action_defs();
+            actions.retain(|action| !missions.iter().any(|m| m.name == action.name));
+            actions.extend(missions);
+        }
+        Ok(actions)
     }
 }
 
@@ -4062,6 +4071,184 @@ FINAL(echoed + "|" + http_result["error"])"#,
     fn adapter_with_mission_manager() -> (EffectBridgeAdapter, Arc<MissionManager>) {
         let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
         (adapter, mgr)
+    }
+
+    #[tokio::test]
+    async fn mission_resume_catalog_requires_wired_executor() {
+        let (adapter, mgr) = adapter_with_mission_manager();
+        assert!(adapter.registered_actions().await.unwrap().is_empty());
+        adapter.set_mission_manager(mgr).await;
+        let actions = adapter.registered_actions().await.unwrap();
+        let expected = mission_action_defs();
+        assert_eq!(actions.len(), expected.len());
+        for (action, definition) in actions.iter().zip(expected) {
+            assert_eq!(action.name, definition.name);
+            assert_eq!(action.parameters_schema, definition.parameters_schema);
+            assert_eq!(action.effects, definition.effects);
+            assert_eq!(action.requires_approval, definition.requires_approval);
+        }
+        // Re-grant catalog must not leak unleased definitions into prompts.
+        assert!(adapter.available_actions(&[]).await.unwrap().is_empty());
+    }
+
+    struct ResumedMissionLlm {
+        leases: Arc<LeaseManager>,
+        thread_id: lunarwing_engine::ThreadId,
+    }
+
+    #[async_trait]
+    impl lunarwing_engine::LlmBackend for ResumedMissionLlm {
+        fn model_name(&self) -> &str {
+            "resumed-mission"
+        }
+
+        async fn complete(
+            &self,
+            _: &[lunarwing_engine::ThreadMessage],
+            _: &[ActionDef],
+            _: &lunarwing_engine::LlmCallConfig,
+        ) -> Result<lunarwing_engine::LlmOutput, EngineError> {
+            // Check before execution completes and revokes the leases. Merely
+            // asking tool_info is insufficient: no host leases means its child
+            // fallback also answers true (WI#295).
+            let leases = self.leases.active_for_thread(self.thread_id).await;
+            assert!(!leases.is_empty());
+            for action in mission_action_defs() {
+                assert_eq!(
+                    leases
+                        .iter()
+                        .filter(|l| l.covers_action(&action.name))
+                        .count(),
+                    1
+                );
+            }
+            assert!(leases.iter().all(|l| matches!(
+                l.granted_actions,
+                lunarwing_engine::GrantedActions::Specific(_)
+            )));
+            Ok(lunarwing_engine::LlmOutput {
+                response: lunarwing_engine::LlmResponse::Text(r#"```repl
+info = await tool_info("mission_update")
+missions = await mission_list()
+await mission_update(id=missions[0]["id"], current_focus="resumed successfully")
+FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["name"] + "|" + str(len(missions)))
+```"#.into()),
+                usage: lunarwing_engine::TokenUsage::default(),
+                finish_reason: "stop".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_resumed_threads_can_discover_and_update_own_mission() {
+        use lunarwing_engine::{ThreadState, ThreadType};
+        for thread_type in [
+            ThreadType::Foreground,
+            ThreadType::Mission,
+            ThreadType::Research,
+        ] {
+            for state in [ThreadState::Waiting, ThreadState::Suspended] {
+                assert_resumed_mission_control(thread_type, state).await;
+            }
+        }
+    }
+
+    async fn assert_resumed_mission_control(
+        thread_type: lunarwing_engine::ThreadType,
+        state: lunarwing_engine::ThreadState,
+    ) {
+        use lunarwing_engine::{Mission, MissionCadence, ProjectId, Thread, ThreadConfig};
+        let store: Arc<dyn lunarwing_engine::Store> =
+            Arc::new(crate::bridge::store_adapter::HybridStore::new(None));
+        let mut thread = Thread::new(
+            "resume mission control",
+            thread_type,
+            ProjectId::new(),
+            "owner",
+            ThreadConfig::default(),
+        );
+        thread.state = state;
+        // Persisted lease IDs from the old daemon do not exist in the new manager.
+        thread
+            .capability_leases
+            .push(lunarwing_engine::LeaseId::new());
+        store.save_thread(&thread).await.unwrap();
+        let own = Mission::new(
+            thread.project_id,
+            "owner",
+            "own",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let foreign = Mission::new(
+            thread.project_id,
+            "other",
+            "foreign",
+            "goal",
+            MissionCadence::Manual,
+        );
+        store.save_mission(&own).await.unwrap();
+        store.save_mission(&foreign).await.unwrap();
+        let adapter = Arc::new(make_adapter());
+        adapter
+            .tools
+            .register(Arc::new(crate::tools::builtin::ToolInfoTool::new(
+                Arc::downgrade(&adapter.tools),
+            )))
+            .await;
+        let leases = Arc::new(LeaseManager::new());
+        let tm = Arc::new(ThreadManager::new(
+            Arc::new(ResumedMissionLlm {
+                leases: leases.clone(),
+                thread_id: thread.id,
+            }),
+            adapter.clone(),
+            store.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            leases.clone(),
+            Arc::new(PolicyEngine::new()),
+        ));
+        adapter
+            .set_mission_manager(Arc::new(MissionManager::new(store.clone(), tm.clone())))
+            .await;
+        assert!(
+            tm.resume_thread(thread.id, "other", None, None, None)
+                .await
+                .is_err()
+        );
+        assert!(leases.active_for_thread(thread.id).await.is_empty());
+        tm.resume_thread(thread.id, "owner", None, None, None)
+            .await
+            .unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), tm.join_thread(thread.id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(outcome, lunarwing_engine::ThreadOutcome::Completed { response: Some(ref text) }
+            if text == "callable|own|1"),
+            "{thread_type:?}/{state:?}: {outcome:?}"
+        );
+        assert_eq!(
+            store
+                .load_mission(own.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .as_deref(),
+            Some("resumed successfully")
+        );
+        assert!(
+            store
+                .load_mission(foreign.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .is_none()
+        );
     }
 
     /// Like [`adapter_with_mission_manager`] but hands back the backing store

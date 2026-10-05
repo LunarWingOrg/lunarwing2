@@ -172,7 +172,9 @@
 44. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/310
     - DONE (2026-10-05): wizard reconnect/interactive/quick backend reads now honor the runtime overlay. Backend autodetection respects already-configured overlay values. Runtime config loading skips both instance and working-directory dotenv mutation; startup loading and process-env precedence are preserved. Dotenv edits require restart, documented in `ic/src/setup/README.md`.
     - Verification: 344 targeted config/setup/bootstrap tests passed; subprocess regressions exercise real backend resolution, absent/existing DB files, explicit env versus overlay, startup loading, dotenv additions during runtime and actual wizard libSQL reconnect plus DB-backed reload. Daemon Clippy (`--lib --tests -- -D warnings`), PostgreSQL-only and libSQL-only `cargo check --lib --tests`, formatting and diff checks passed.
-45. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/309
+45. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/309
+    - DONE (2026-10-05): the bridge includes canonical mission action definitions in the unscoped resume lease catalog when its mission manager is wired. Missing grants use the existing thread-type planner, persistence and rollback path; execution prompts remain registry-only. Restart recovery is documented in `docs/architecture/ENGINE-V2.md`.
+    - Verification: 267 bridge-filter tests and 31 engine thread-manager tests passed. New real-manager/CodeAct coverage resumes Waiting and Suspended threads with stale persisted IDs and an empty in-memory lease manager across all three thread types; proves explicit mission grants, truthful tool_info, owner-filtered listing and successful mission_update, and rejects another owner's resume before granting leases. Unwired-executor and unleased-catalog checks passed. Combined-tree daemon Clippy, PostgreSQL-only/libSQL-only compile checks, formatting and diff checks passed.
 46. [x] (S) Reserved
 47. [x] (S) Reserved
 48. [x] (S) Reserved
