@@ -6,6 +6,7 @@ typographical corrections that don't change meaning).
 
 | Release | Codename | Date | Notes |
 |---------|----------|------|-------|
+| [v2.1.4.0](RELEASE-v2.1.4.0.md) | Kabuto (兜) | 2026-10-03 | Engine/mission recovery hardening, dependency re-audit, tenant system-prompt editor, tool runtime estimates, XMPP outbound spool |
 | [v2.1.3.0](RELEASE-v2.1.3.0.md) | Ō-Yoroi (大鎧) | 2026-09-29 | Secrets hardening, sealed engine output, relay-password rotation, operator ergonomics |
 | [v2.1.2.0](RELEASE-v2.1.2.0.md) | Yoroi (鎧) | 2026-09-25 | Generic Podman-first agent-shell sandbox, worker-contract hardening, health system parity, confabulation hardening |
 | [v2.1.1.0](RELEASE-v2.1.1.0.md) | Zanshin (残心) | 2026-09-13 | Memory authenticity + index self-heal, priority-control race fix, coordination-knowledge sharing, Pebble restart parity, Parakeet STT | 
