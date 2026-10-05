@@ -549,7 +549,10 @@ pub const STREAM_STOPPED_REASON: &str = "stopped during LLM stream";
 /// Whether a terminal transition reason marks a host-requested stop rather
 /// than a genuine failure (budget, provider error, …).
 pub fn is_host_stop_reason(reason: Option<&str>) -> bool {
-    matches!(reason, Some(EXECUTION_STOPPED_REASON) | Some(STREAM_STOPPED_REASON))
+    matches!(
+        reason,
+        Some(EXECUTION_STOPPED_REASON) | Some(STREAM_STOPPED_REASON)
+    )
 }
 
 fn metadata_flag(metadata: &serde_json::Value, key: &str) -> bool {
