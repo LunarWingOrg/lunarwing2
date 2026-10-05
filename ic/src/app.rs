@@ -1159,7 +1159,7 @@ impl AppBuilder {
         // Also check ONBOARD_COMPLETED env var — MT tenants set this to skip
         // the setup wizard, and should not get bootstrap seeding either.
         if let Some(ref ws) = workspace {
-            let onboard_env = std::env::var("ONBOARD_COMPLETED")
+            let onboard_env = crate::config::env_or_override("ONBOARD_COMPLETED")
                 .map(|v| v == "true")
                 .unwrap_or(false);
             let toml_path = crate::settings::Settings::default_toml_path();

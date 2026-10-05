@@ -42,25 +42,26 @@ pub use wizard::{SetupConfig, SetupError, SetupWizard};
 ///
 /// Reads environment variables (`DATABASE_URL`, `LIBSQL_PATH`,
 /// `ONBOARD_COMPLETED`, `LUNARWING_CLOUD_API_KEY`) and checks for the default
-/// session file on disk. Not safe to call concurrently with `env::set_var`.
+/// session file on disk. Includes runtime dotenv imports via the config overlay.
+/// Not safe to call concurrently with `env::set_var`.
 #[cfg(any(feature = "postgres", feature = "libsql"))]
 pub fn check_onboard_needed() -> Option<&'static str> {
-    let has_db = std::env::var("DATABASE_URL").is_ok()
-        || std::env::var("LIBSQL_PATH").is_ok()
+    let has_db = crate::config::env_or_override("DATABASE_URL").is_some()
+        || crate::config::env_or_override("LIBSQL_PATH").is_some()
         || crate::config::default_libsql_path().exists();
 
     if !has_db {
         return Some("Database not configured");
     }
 
-    if std::env::var("ONBOARD_COMPLETED")
+    if crate::config::env_or_override("ONBOARD_COMPLETED")
         .map(|v| v == "true")
         .unwrap_or(false)
     {
         return None;
     }
 
-    if std::env::var("LUNARWING_CLOUD_API_KEY").is_err() {
+    if crate::config::env_or_override("LUNARWING_CLOUD_API_KEY").is_none() {
         let session_path = crate::config::default_session_path();
         if !session_path.exists() {
             return Some("First run");

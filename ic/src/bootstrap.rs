@@ -209,9 +209,9 @@ pub fn lunarwing_workspace_template_dir() -> PathBuf {
 /// defaults to `libsql` so cloud instances work out of the box without any
 /// manual configuration.
 ///
-/// Dotenv loading is startup-only: callers outside a Tokio runtime must invoke
-/// this before starting other threads. Runtime calls skip dotenv mutation and
-/// use the thread-safe config overlay for backend autodetection instead.
+/// Process-env mutation is startup-only: callers outside a Tokio runtime must invoke
+/// this before starting other threads. Runtime calls import newly added dotenv
+/// keys into the thread-safe config overlay instead of mutating process env.
 pub fn load_lunarwing_env() {
     let path = lunarwing_env_path();
 
@@ -221,7 +221,11 @@ pub fn load_lunarwing_env() {
     }
 
     let runtime_active = tokio::runtime::Handle::try_current().is_ok();
-    if !runtime_active && path.exists() {
+    if runtime_active {
+        if let Ok(entries) = dotenvy::from_path_iter(&path) {
+            import_runtime_dotenv(entries);
+        }
+    } else if path.exists() {
         let _ = dotenvy::from_path(&path);
     }
 
@@ -245,6 +249,29 @@ pub fn load_lunarwing_env() {
                 unsafe { std::env::set_var("DATABASE_BACKEND", "libsql") };
             }
         }
+    }
+}
+
+/// Load the working-directory dotenv before the instance dotenv. Outside a
+/// runtime this has the same pre-thread-start contract as `load_lunarwing_env`.
+pub(crate) fn load_working_directory_env() {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        if let Ok(entries) = dotenvy::dotenv_iter() {
+            import_runtime_dotenv(entries);
+        }
+    } else {
+        let _ = dotenvy::dotenv();
+    }
+}
+
+fn import_runtime_dotenv(entries: impl Iterator<Item = dotenvy::Result<(String, String)>>) {
+    for entry in entries {
+        let Ok((key, value)) = entry else {
+            // Dotenv errors can contain the source line, including secrets.
+            tracing::warn!("Could not parse dotenv entry; remaining entries were not imported");
+            break;
+        };
+        crate::config::helpers::import_runtime_env(&key, &value);
     }
 }
 
@@ -1053,6 +1080,7 @@ INJECTED="pwned"#;
                 .current_dir(dir.path())
                 .env_clear()
                 .env("LUNARWING_BASE_DIR", &base)
+                .env("WI310_PROCESS", "process")
                 .env("WI310_SCENARIO", scenario);
             if scenario == "process" {
                 child.env("DATABASE_BACKEND", "postgres");
@@ -1083,10 +1111,20 @@ INJECTED="pwned"#;
         } else if scenario == "process" {
             crate::config::set_runtime_env("DATABASE_BACKEND", "libsql");
         }
-        // Simulate dotenv gaining new keys after startup. Both runtime config
-        // entry points must skip mutation, including the instance loader.
-        std::fs::write(lunarwing_env_path(), "WI310_INSTANCE_ADDED=later\n").unwrap();
-        std::fs::write(".env", "WI310_CWD_ADDED=later\n").unwrap();
+        // Simulate dotenv gaining new keys after startup. Import through the
+        // overlay without changing process env; preserve first-loaded values.
+        crate::config::set_runtime_env("WI310_RUNTIME", "runtime");
+        crate::config::inject_single_var("WI310_INJECTED", "injected");
+        std::fs::write(
+            lunarwing_env_path(),
+            "WI310_INSTANCE_ADDED=later\nWI310_INJECTED=file\nDATABASE_SSLMODE=require\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ".env",
+            "WI310_CWD_ADDED=later\nWI310_PROCESS=file\nWI310_RUNTIME=file\n",
+        )
+        .unwrap();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -1095,8 +1133,59 @@ INJECTED="pwned"#;
         runtime.block_on(async {
             crate::config::load_bootstrap_settings(None).unwrap();
             load_lunarwing_env();
+            assert_eq!(
+                crate::config::SslMode::from_env(),
+                crate::config::SslMode::Require
+            );
             assert!(std::env::var("WI310_INSTANCE_ADDED").is_err());
             assert!(std::env::var("WI310_CWD_ADDED").is_err());
+            assert_eq!(
+                crate::config::env_or_override("WI310_PROCESS").as_deref(),
+                Some("process")
+            );
+            assert_eq!(
+                crate::config::env_or_override("WI310_RUNTIME").as_deref(),
+                Some("runtime")
+            );
+            assert_eq!(
+                crate::config::env_or_override("WI310_INJECTED").as_deref(),
+                Some("file")
+            );
+            assert_eq!(
+                crate::config::env_or_override("WI310_INSTANCE_ADDED").as_deref(),
+                Some("later")
+            );
+            assert_eq!(
+                crate::config::env_or_override("WI310_CWD_ADDED").as_deref(),
+                Some("later")
+            );
+            std::fs::write(
+                ".env",
+                "WI310_CWD_ADDED=changed\nWI310_PRIORITY=cwd\nWI310_PRIORITY=duplicate\n",
+            )
+            .unwrap();
+            std::fs::write(
+                lunarwing_env_path(),
+                "WI310_INSTANCE_ADDED=changed\nWI310_PRIORITY=instance\nWI310_NEW_KEY=new\n",
+            )
+            .unwrap();
+            crate::config::load_bootstrap_settings(None).unwrap();
+            assert_eq!(
+                crate::config::env_or_override("WI310_CWD_ADDED").as_deref(),
+                Some("later")
+            );
+            assert_eq!(
+                crate::config::env_or_override("WI310_INSTANCE_ADDED").as_deref(),
+                Some("later")
+            );
+            assert_eq!(
+                crate::config::env_or_override("WI310_PRIORITY").as_deref(),
+                Some("cwd")
+            );
+            assert_eq!(
+                crate::config::env_or_override("WI310_NEW_KEY").as_deref(),
+                Some("new")
+            );
             if scenario == "absent" {
                 assert!(crate::config::env_or_override("DATABASE_BACKEND").is_none());
                 return;

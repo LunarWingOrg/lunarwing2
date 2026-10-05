@@ -54,16 +54,15 @@ pub async fn run_status_command() -> anyhow::Result<()> {
     );
 
     // Database
-    let db_backend = std::env::var("DATABASE_BACKEND")
-        .ok()
+    let db_backend = crate::config::env_or_override("DATABASE_BACKEND")
         .unwrap_or_else(|| "postgres".to_string());
     let db_value = match db_backend.as_str() {
         "libsql" | "turso" | "sqlite" => {
-            let path = std::env::var("LIBSQL_PATH")
+            let path = crate::config::env_or_override("LIBSQL_PATH")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| crate::config::default_libsql_path());
+                .unwrap_or_else(crate::config::default_libsql_path);
             if path.exists() {
-                let turso = if std::env::var("LIBSQL_URL").is_ok() {
+                let turso = if crate::config::env_or_override("LIBSQL_URL").is_some() {
                     " + Turso sync"
                 } else {
                     ""
@@ -74,7 +73,7 @@ pub async fn run_status_command() -> anyhow::Result<()> {
             }
         }
         _ => {
-            if std::env::var("DATABASE_URL").is_ok() {
+            if crate::config::env_or_override("DATABASE_URL").is_some() {
                 match check_database().await {
                     Ok(()) => "connected (PostgreSQL)".to_string(),
                     Err(e) => format!("error ({})", e),
@@ -97,7 +96,7 @@ pub async fn run_status_command() -> anyhow::Result<()> {
 
     // Secrets (auto-detect from env only; skip keychain probe to avoid
     // triggering macOS system password dialogs on a simple status check)
-    let secrets_value = if std::env::var("SECRETS_MASTER_KEY").is_ok() {
+    let secrets_value = if crate::config::env_or_override("SECRETS_MASTER_KEY").is_some() {
         "configured (env)".to_string()
     } else {
         // We don't probe the keychain here because get_generic_password()
@@ -215,7 +214,8 @@ fn summarize_mcp_servers(servers: &crate::tools::mcp::config::McpServersFile) ->
 
 #[cfg(feature = "postgres")]
 async fn check_database() -> anyhow::Result<()> {
-    let url = std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL not set"))?;
+    let url = crate::config::env_or_override("DATABASE_URL")
+        .ok_or_else(|| anyhow::anyhow!("DATABASE_URL not set"))?;
 
     let config: deadpool_postgres::Config = deadpool_postgres::Config {
         url: Some(url),
