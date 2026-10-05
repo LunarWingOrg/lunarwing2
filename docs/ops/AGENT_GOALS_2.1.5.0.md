@@ -143,7 +143,7 @@
 
 ## Phase 5 - Miscellaneous (for goals referencing work items, read comments on work items as well)
 
-23. [ ] take a look at any documentation that should be updated and update necessary documentation - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1406
+23. [ ] take a look at any documentation that should be updated and update necessary documentation - REJECTED: See comments on last attempted MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1417 - OLDER REJECTION: you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1406
 24. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for references)
 25. [x] review all currently open work items - create audit document for 2.1.5.0 in docs/ops - there are similar docs in docs/ops for 2.1.4.0 and earlier releases so you can use those as references
    - DONE 100% (2026-10-04, branch `rarity/kimi-25-20261004-1501`): audit doc `docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md`, modeled on `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` (same header/exec-summary/disposition-table/release-implications/per-item/closed-since-last-pass structure).
