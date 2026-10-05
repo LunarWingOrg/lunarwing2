@@ -4589,14 +4589,18 @@ pub async fn list_engine_missions(
     Ok(missions.iter().map(mission_to_info).collect())
 }
 
-/// List the missions a read-only surface should show `user_id`, resolving
-/// the caller's own project first (WI#278): a non-owner's missions live in
-/// the project `resolve_user_project` would give them, not the engine
-/// default, so scanning only the default reports them as missing.
+/// List the missions a read-only surface should show `user_id` (WI#278): the
+/// union of the engine default project's own+shared missions and the caller's
+/// own project's own+shared missions. Both queries go through
+/// `list_missions_with_shared`'s owner/shared filter, so the union widens
+/// visibility without disclosing anyone's private missions: a non-owner's own
+/// missions live in the project `resolve_user_project` would give them (never
+/// the engine default), while the shared learning missions live in the
+/// default — listing only one side reports the other as missing (review K-1).
 ///
 /// Unlike the chat path this never creates a project — a user with none
-/// falls back to the engine default, whose shared missions are visible to
-/// them anyway.
+/// falls back to the engine default alone, whose shared missions are visible
+/// to them anyway.
 pub async fn list_engine_missions_for_user(user_id: &str) -> Result<Vec<EngineMissionInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
@@ -4606,12 +4610,26 @@ pub async fn list_engine_missions_for_user(user_id: &str) -> Result<Vec<EngineMi
         return Ok(Vec::new());
     };
 
-    let pid = resolve_user_project_readonly(&state.store, user_id, state.default_project_id).await;
-    let missions = state
+    let default_pid = state.default_project_id;
+    let own_pid = resolve_user_project_readonly(&state.store, user_id, default_pid).await;
+    let mut missions = state
         .store
-        .list_missions_with_shared(pid, user_id)
+        .list_missions_with_shared(default_pid, user_id)
         .await
         .map_err(|e| engine_err("list missions", e))?;
+    if own_pid != default_pid {
+        let mut own = state
+            .store
+            .list_missions_with_shared(own_pid, user_id)
+            .await
+            .map_err(|e| engine_err("list missions", e))?;
+        // A mission lives in exactly one project, but dedup by id so a store
+        // quirk can never double-list.
+        let seen: std::collections::HashSet<_> =
+            missions.iter().map(|mission| mission.id).collect();
+        own.retain(|mission| !seen.contains(&mission.id));
+        missions.extend(own);
+    }
 
     Ok(missions.iter().map(mission_to_info).collect())
 }
@@ -7067,6 +7085,120 @@ pub(crate) mod tests {
             mallory.result.get("engine_missions").is_none(),
             "another user's missions stay hidden: {}",
             mallory.result
+        );
+
+        install_test_engine_state(None).await;
+    }
+
+    /// WI#278 review K-1: the listing must not hide the shared learning
+    /// missions from non-owner users. It unions the default project's
+    /// own+shared missions with the caller's own project's own+shared
+    /// missions, so bob sees the shared self-improvement mission AND his own;
+    /// mallory (no project of her own) sees only the shared one; nobody sees
+    /// alice's private mission.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn v1_routine_list_unions_shared_default_and_own_engine_missions() {
+        use crate::tools::Tool;
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let project = lunarwing_engine::ProjectId::new();
+        // Shared learning mission in the engine default project, seeded the
+        // way ensure_learning_missions seeds it.
+        seed_mission_with_runs(&store, project, shared_owner_id(), "self-improvement", "improved")
+            .await;
+        // A private mission in the default project belongs to its owner only.
+        seed_mission_with_runs(&store, project, "alice", "alice-private", "ran").await;
+        // Bob's own missions live in his own "default" project, never the
+        // engine default.
+        let bob_project = lunarwing_engine::Project::new("bob", "default", "Default project");
+        let bob_project_id = bob_project.id;
+        store
+            .save_project(&bob_project)
+            .await
+            .expect("save project");
+        seed_mission_with_runs(&store, bob_project_id, "bob", "digest", "sent").await;
+        // Carol owns the engine default project itself (the fast path in
+        // resolve_user_project_readonly): her own mission lives there too.
+        let mut carol_project = lunarwing_engine::Project::new("carol", "default", "Default");
+        carol_project.id = project;
+        store
+            .save_project(&carol_project)
+            .await
+            .expect("save project");
+        seed_mission_with_runs(&store, project, "carol", "carol-daily", "done").await;
+        let mut state = make_expected_test_state(store.clone());
+        state.default_project_id = project;
+        install_test_engine_state(Some(state)).await;
+
+        let (db, _temp) = crate::testing::test_db().await;
+        let tool = crate::tools::builtin::routine::RoutineListTool::new(db);
+        let mission_names = |result: &serde_json::Value| -> Vec<String> {
+            result["engine_missions"]["missions"]
+                .as_array()
+                .map(|missions| {
+                    missions
+                        .iter()
+                        .filter_map(|mission| mission["name"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let bob = tool
+            .execute(
+                serde_json::json!({}),
+                &crate::context::JobContext::with_user("bob", "list", "list routines"),
+            )
+            .await
+            .expect("routine_list");
+        let bob_names = mission_names(&bob.result);
+        assert_eq!(
+            bob_names.len(),
+            2,
+            "bob sees the shared mission and his own, deduped: {bob_names:?}"
+        );
+        assert!(bob_names.iter().any(|name| name == "self-improvement"));
+        assert!(bob_names.iter().any(|name| name == "digest"));
+        assert!(
+            !bob_names.iter().any(|name| name == "alice-private"),
+            "alice's private mission stays hidden: {bob_names:?}"
+        );
+
+        let mallory = tool
+            .execute(
+                serde_json::json!({}),
+                &crate::context::JobContext::with_user("mallory", "list", "list routines"),
+            )
+            .await
+            .expect("routine_list");
+        let mallory_names = mission_names(&mallory.result);
+        assert_eq!(
+            mallory_names,
+            vec!["self-improvement".to_string()],
+            "mallory sees only the shared mission: {mallory_names:?}"
+        );
+
+        // Carol's own project IS the engine default (owner fast path): one
+        // listing, her own mission plus the shared one, no union pass.
+        let carol = tool
+            .execute(
+                serde_json::json!({}),
+                &crate::context::JobContext::with_user("carol", "list", "list routines"),
+            )
+            .await
+            .expect("routine_list");
+        let carol_names = mission_names(&carol.result);
+        assert_eq!(
+            carol_names.len(),
+            2,
+            "carol sees her own plus the shared mission, deduped: {carol_names:?}"
+        );
+        assert!(carol_names.iter().any(|name| name == "carol-daily"));
+        assert!(carol_names.iter().any(|name| name == "self-improvement"));
+        assert!(
+            !carol_names.iter().any(|name| name == "alice-private"),
+            "the default project's other private missions stay hidden: {carol_names:?}"
         );
 
         install_test_engine_state(None).await;

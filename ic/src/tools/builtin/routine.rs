@@ -1641,9 +1641,10 @@ async fn v1_routine_runs(
 
 /// Read-only listing of the caller's Engine V2 missions for `routine_list`
 /// (WI#278), or `None` when the engine is not running or has none. The
-/// caller's own project is scanned (non-owner missions do not live in the
-/// engine default project). A lookup failure only drops the section — the
-/// v1 listing stays authoritative.
+/// listing unions the engine default project's own+shared missions with the
+/// caller's own project's (WI#278 review K-1): the shared learning missions
+/// live in the default, a non-owner's own missions never do. A lookup failure
+/// only drops the section — the v1 listing stays authoritative.
 async fn engine_missions_listing(user_id: &str) -> Option<serde_json::Value> {
     match crate::bridge::list_engine_missions_for_user(user_id).await {
         Ok(missions) => render_engine_missions(&missions),
