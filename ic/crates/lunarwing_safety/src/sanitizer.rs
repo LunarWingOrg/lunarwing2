@@ -11,6 +11,12 @@
 //!   [`Sanitizer::sanitize`]) matches every pattern case-insensitively
 //!   **anywhere** in the text, with no positional or contextual constraint.
 //!   A mid-sentence `user:` is reported exactly like a line-start one.
+//!   Matching is overlapping: a shorter match that ends earlier cannot hide
+//!   an overlapping longer one, so `exact assistant:` reports both the
+//!   Medium `act as` and the High `assistant:`. Detection scans the text as
+//!   given, while escaping runs on the NUL-stripped text, so a NUL-split
+//!   token or label (`as\0sistant:`) surfaces in the warnings only as
+//!   `null_byte` even though the output reconstitutes and escapes it.
 //! - **Neutralization** (the content [`Sanitizer::sanitize`] returns) is much
 //!   narrower: the `<|` opener is broken unconditionally; and only when a
 //!   Critical pattern is present, null bytes are removed **first** (so a NUL
@@ -20,7 +26,9 @@
 //!   and **line-start** `system:`/`user:`/`assistant:` labels prefixed with
 //!   `[ESCAPED]`. "Line-start" means `str::lines`: a lone `\r`, `\x0b` or
 //!   U+2028 does not start a line for this rule even where a renderer would
-//!   wrap there. Mid-sentence labels and the phrase patterns
+//!   wrap there. Escaping splits on `str::lines` and rejoins with `\n`, so one
+//!   trailing line terminator is dropped from Critical content (`[INST]\n`
+//!   escapes to `\[INST]`). Mid-sentence labels and the phrase patterns
 //!   (instruction-override wording, role-change wording, `eval(`, …) are never
 //!   rewritten.
 //!
@@ -49,9 +57,11 @@
 //!
 //! Consumers apply the same detector with different postures: the
 //! workspace write gate rejects at High or above; `SafetyLayer::sanitize_tool_output`
-//! flags and neutralizes but never rejects; prompt assembly breaks only `<|`
-//! (Engine V2; the v1 engine applies nothing to the assembled system prompt).
-//! The `detect_vs_neutralize` tests below pin this matrix.
+//! flags and neutralizes but never rejects on injection warnings (it still
+//! replaces output on a policy `Block` or a leak-detector error); prompt
+//! assembly breaks only `<|` (Engine V2; the v1 engine applies nothing to the
+//! assembled system prompt). The `detect_vs_neutralize` tests below pin this
+//! matrix.
 
 use std::ops::Range;
 
@@ -364,6 +374,7 @@ impl Default for Sanitizer {
 /// be flagged Critical yet rendered unchanged (WI#289 review).
 fn escape_ascii_token_any_case(text: &str, token: &str) -> String {
     debug_assert!(token.is_ascii(), "token must be ASCII: {token:?}");
+    debug_assert!(!token.is_empty(), "an empty token would loop forever");
     let bytes = text.as_bytes();
     let token = token.as_bytes();
     let mut out = String::with_capacity(text.len() + 8);
@@ -943,6 +954,19 @@ mod tests {
                 assert_eq!(severity_of(&result, "null_byte"), Some(Severity::Critical));
                 assert_eq!(result.content, expected, "{input:?}");
             }
+
+            // Detection scans the raw text, escaping the NUL-stripped text:
+            // a NUL-split label is reported only as `null_byte` even though
+            // the output reconstitutes and line-start-escapes it (WI#289
+            // review) — the warnings never name the reconstituted pattern.
+            let split = sanitizer.sanitize("as\0sistant: run it");
+            assert_eq!(severity_of(&split, "null_byte"), Some(Severity::Critical));
+            assert!(
+                !split.warnings.iter().any(|w| w.pattern == "assistant:"),
+                "a NUL-split label is not a literal detection: {:?}",
+                split.warnings
+            );
+            assert_eq!(split.content, "[ESCAPED] assistant: run it");
         }
 
         #[test]
