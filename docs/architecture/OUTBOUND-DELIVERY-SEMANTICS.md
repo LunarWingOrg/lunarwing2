@@ -3,7 +3,10 @@
 **Added 2026-10-01 (v2.1.4.0, WI#270). Updated 2026-10-01 (WI#277): the XMPP
 channel now persists outbound messages to a durable spool before acking, so
 restart/rebuild/crash no longer silently loses acked messages; post-enqueue
-failures retry with backoff instead of being dropped.** Defines what a
+failures retry with backoff instead of being dropped. Re-checked 2026-10-05
+(v2.1.5.0): the honest ack wording, enqueue gate, spool layout, drain
+timeout, and retry/park constants are unchanged this cycle; WI#276
+(mission-run ledger) remains open (goals item 22).** Defines what a
 successful `message`-tool send means, and what the XMPP channel guarantees
 about outbound stanzas. Rooted in the PR Digest #59 incident: a scheduled
 mission recorded "Delivered via XMPP … Goal achieved" in its memory because
