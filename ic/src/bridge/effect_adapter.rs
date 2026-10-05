@@ -4821,6 +4821,69 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
     }
 
     #[tokio::test]
+    async fn mission_create_dedup_marks_requested_versus_persisted_cadence() {
+        // WI#311 review P-4: re-creating a same-named mission with a
+        // different cadence must not answer a bare "created".
+        let (adapter, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+        // One shared context: dedup is per (project, user, name).
+        let ctx = mission_create_ctx();
+        let create = |cadence: &str| {
+            serde_json::json!({
+                "name": "pr-digest",
+                "goal": "digest",
+                "cadence": cadence,
+            })
+        };
+
+        let first = adapter
+            .handle_mission_call("mission_create", &create("0 10 15 * * *"), &ctx)
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!first.is_error, "{:?}", first.output);
+        assert_eq!(first.output["deduplicated"], false);
+        assert!(first.output["requested_cadence"].is_null());
+        assert!(first.output["created_at"].is_string());
+        assert!(first.output["updated_at"].is_string());
+
+        let second = adapter
+            .handle_mission_call("mission_create", &create("15 10 * * *"), &ctx)
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!second.is_error, "{:?}", second.output);
+        assert_eq!(second.output["mission_id"], first.output["mission_id"]);
+        assert_eq!(second.output["deduplicated"], true);
+        assert_eq!(second.output["requested_cadence"], "15 10 * * *");
+        assert_eq!(
+            second.output["schedule"]["cadence"]["Cron"]["expression"],
+            "0 10 15 * * *",
+            "persisted cadence is unchanged by the deduped re-create"
+        );
+        assert!(
+            second.output["note"]
+                .as_str()
+                .expect("dedup note")
+                .contains("mission_update"),
+            "note must point at mission_update: {:?}",
+            second.output
+        );
+
+        // List exposes the date fields that settle frozen-counter confusion
+        // (WI#311 review P-3).
+        let listed = adapter
+            .handle_mission_call("mission_list", &serde_json::json!({}), &ctx)
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        let row = &listed.output[0];
+        assert!(row["created_at"].is_string());
+        assert!(row["updated_at"].is_string());
+        assert!(row["threads_today_date"].is_string());
+    }
+
+    #[tokio::test]
     async fn mission_update_tool_sets_current_focus_end_to_end() {
         let (adapter, mgr) = adapter_with_mission_manager();
         adapter.set_mission_manager(Arc::clone(&mgr)).await;
