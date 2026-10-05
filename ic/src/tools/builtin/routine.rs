@@ -1190,7 +1190,9 @@ impl Tool for RoutineListTool {
     }
 
     fn description(&self) -> &str {
-        "List all routines with their status, trigger info, and next fire time."
+        "List all routines with their status, trigger info, and next fire time. When the Engine V2 \
+         runtime is active, also lists its missions (e.g. self-improvement) read-only under \
+         engine_missions: they are not routines and the other routine_* tools cannot change them."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1232,10 +1234,16 @@ impl Tool for RoutineListTool {
             })
             .collect();
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "count": list.len(),
             "routines": list,
         });
+        // Engine V2 missions live in a separate registry this tool cannot
+        // manage; list them read-only so an agent never answers "no such
+        // routine" for a live mission such as self-improvement (WI#278).
+        if let Some(missions) = engine_missions_listing(&ctx.user_id).await {
+            result["engine_missions"] = missions;
+        }
 
         Ok(ToolOutput::success(result, start.elapsed()))
     }
@@ -1631,6 +1639,52 @@ async fn v1_routine_runs(
     })))
 }
 
+/// Read-only listing of the caller's Engine V2 missions for `routine_list`
+/// (WI#278), or `None` when the engine is not running or has none. The
+/// listing unions the engine default project's own+shared missions with the
+/// caller's own project's (WI#278 review K-1): the shared learning missions
+/// live in the default, a non-owner's own missions never do. A lookup failure
+/// only drops the section — the v1 listing stays authoritative.
+async fn engine_missions_listing(user_id: &str) -> Option<serde_json::Value> {
+    match crate::bridge::list_engine_missions_for_user(user_id).await {
+        Ok(missions) => render_engine_missions(&missions),
+        Err(error) => {
+            tracing::debug!(%error, "engine mission listing for routine_list failed");
+            None
+        }
+    }
+}
+
+fn render_engine_missions(
+    missions: &[crate::bridge::EngineMissionInfo],
+) -> Option<serde_json::Value> {
+    if missions.is_empty() {
+        return None;
+    }
+    let listed: Vec<serde_json::Value> = missions
+        .iter()
+        .map(|mission| {
+            serde_json::json!({
+                "name": mission.name,
+                "kind": "engine_mission",
+                "status": mission.status,
+                "cadence_type": mission.cadence_type,
+                "runs": mission.thread_count,
+                "last_fired_at": mission.last_fired_at,
+                "never_fired": mission.never_fired,
+            })
+        })
+        .collect();
+    Some(serde_json::json!({
+        "count": listed.len(),
+        "missions": listed,
+        "note": "Engine V2 missions are not routines: routine_update, routine_fire, \
+                 routine_pause and routine_delete cannot change them (they are managed with the \
+                 mission_* functions in Engine V2 conversations). routine_history shows a \
+                 mission's recent runs by name.",
+    }))
+}
+
 /// Engine V2 mission history fallback (WI#265): names that miss the v1
 /// routines registry may name a live mission, whose fires are rendered from
 /// the mission's `thread_history`.
@@ -1818,6 +1872,48 @@ impl Tool for EventEmitTool {
 mod tests {
     use super::*;
     use crate::tools::validate_tool_schema;
+
+    fn engine_mission(name: &str, fired: bool) -> crate::bridge::EngineMissionInfo {
+        crate::bridge::EngineMissionInfo {
+            id: "00000000-0000-0000-0000-000000000001".to_string(),
+            name: name.to_string(),
+            goal: "goal".to_string(),
+            status: "Active".to_string(),
+            cadence_type: "cron".to_string(),
+            thread_count: usize::from(fired) * 4,
+            current_focus: None,
+            threads_today: 0,
+            max_threads_per_day: 30,
+            budget_exhausted: false,
+            last_fired_at: fired.then(|| "2026-10-02T09:00:00Z".to_string()),
+            never_fired: !fired,
+            created_at: "2026-09-01T00:00:00Z".to_string(),
+            updated_at: "2026-10-02T09:00:00Z".to_string(),
+        }
+    }
+
+    /// WI#278: v1 `routine_list` surfaces Engine V2 missions read-only, so a
+    /// v1 agent never reports "no such routine" for a live mission.
+    #[test]
+    fn routine_list_renders_engine_missions_read_only() {
+        assert!(render_engine_missions(&[]).is_none());
+
+        let section = render_engine_missions(&[
+            engine_mission("self-improvement", true),
+            engine_mission("conversation-insights", false),
+        ])
+        .expect("missions section");
+        assert_eq!(section["count"], 2);
+        let first = &section["missions"][0];
+        assert_eq!(first["name"], "self-improvement");
+        assert_eq!(first["kind"], "engine_mission");
+        assert_eq!(first["runs"], 4);
+        assert_eq!(first["last_fired_at"], "2026-10-02T09:00:00Z");
+        assert_eq!(section["missions"][1]["never_fired"], true);
+        let note = section["note"].as_str().expect("note");
+        assert!(note.contains("not routines"), "{note}");
+        assert!(note.contains("routine_history"), "{note}");
+    }
 
     // These tests intentionally use direct assertion macros.
     const ROUTINE_CREATE_LEGACY_ALIASES: &[&str] = &[
