@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-28, again 2026-10-01 for v2.1.4.0)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-28, again 2026-10-01 for v2.1.4.0, again 2026-10-05 for v2.1.5.0)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -149,4 +149,13 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > the release's feature work (WI#191 tool-estimate hints, WI#220 prompt
 > editor, WI#265 `routine_history`) lives in the agent/gateway, not the host
 > health pipeline.
+>
+> **Update (2026-10-05, v2.1.5.0):** the `ORDER` list is unchanged in the
+> 2.1.5.0 cycle (`bash tests/run-all.sh --list` still registers the same 19
+> suites, verified live). One pipeline script changed this cycle: WI#297
+> (goals item 11) added the `retry_reason_empty_total` export to the LLM
+> stream integrity healthpoint (`health-llm-streams.sh`, with matching
+> `test-health-llm-streams.sh` assertions) for the empty-stream discarded
+> usage accounting; no suite registration or detection/remedy structure
+> changed.
 
