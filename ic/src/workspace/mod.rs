@@ -121,6 +121,16 @@ const SYSTEM_PROMPT_FILES: &[&str] = &[
 
 const LOREBOOK_DIR_PREFIX: &str = "lorebooks/";
 
+/// Number of numbered generations retained per daily log in addition to the
+/// rolling `.bak` slot (WI#288 review). Bounds per-day backup storage (each
+/// generation can be up to the 256 KiB write cap) and the cost of probing for
+/// the next free slot. At the cap the first generation stays pinned — it is
+/// the day's first replaced version, the retained evidence the WI#288 repair
+/// path exists to protect — and the second-oldest generation is discarded
+/// instead (with a `lunarwing::safety` audit line carrying its byte count and
+/// blake3 fingerprint) while the rest shift down one slot.
+const MAX_DAILY_LOG_BACKUP_GENERATIONS: u32 = 8;
+
 /// Returns true if `path` (already normalized) is a system-prompt-injected file.
 fn is_system_prompt_file(path: &str) -> bool {
     SYSTEM_PROMPT_FILES
@@ -138,6 +148,30 @@ fn is_system_prompt_file(path: &str) -> bool {
 pub(crate) fn is_daily_log_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.starts_with("daily/") && lower.ends_with(".md")
+}
+
+/// Shadow-backup documents (`backups/<path>.bak` plus numbered daily-log
+/// generations) hold replaced prompt-file versions — which can include
+/// quarantined injection content — and are written only by the shadow-backup
+/// rotation itself. Agent-facing memory lanes and the web memory-write route
+/// reserve the prefix so the retained evidence cannot be overwritten or
+/// erased through them (WI#288 review); direct `Workspace` reads stay
+/// available for operator recovery.
+pub(crate) fn is_backup_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower == "backups" || lower.starts_with("backups/")
+}
+
+/// Quarantined daily logs (`daily/<date>.poisoned-<n>.md`) hold live
+/// injection content moved aside by the append-time quarantine (WI#288). They
+/// are the same class of evidence as the shadow backups: the agent-facing
+/// memory lanes and the web memory-write route reserve them so the poison
+/// cannot be replaced, erased, or re-surfaced to the model through those
+/// lanes (WI#288 review); direct `Workspace` reads stay available for
+/// operator recovery.
+pub(crate) fn is_quarantined_daily_log(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("daily/") && lower.ends_with(".md") && lower.contains(".poisoned-")
 }
 
 fn is_lorebook_json_file(path: &str) -> bool {
@@ -1183,7 +1217,8 @@ impl Workspace {
         // content (the incident that clobbered MEMORY.md). Keep a rolling
         // shadow copy so the previous version is recoverable in-place.
         if is_system_prompt_file(&path) && !doc.content.is_empty() && doc.content != content {
-            self.shadow_backup_prompt_file(&path, &doc.content).await;
+            self.shadow_backup_prompt_file(&self.user_id, &path, &doc.content)
+                .await;
         }
 
         // Compute chunks + embeddings upfront (no DB connections held).
@@ -1199,34 +1234,166 @@ impl Workspace {
         self.storage.get_document_by_id(doc.id).await
     }
 
-    /// Persist a rolling shadow copy of a prompt-visible file's content to
-    /// `backups/<path>.bak` before [`Workspace::write`] replaces it (WI#286).
+    /// Persist a shadow copy of a prompt-visible file's prior content to
+    /// `backups/<path>.bak` in the given scope before [`Workspace::write`] or
+    /// [`Workspace::write_to_layer`] replaces it (WI#286).
     ///
-    /// One slot per file, overwritten on each replace. The backup is stored
+    /// For most prompt-visible files this is one rolling slot per file,
+    /// overwritten on each replace. Daily logs also keep older generations:
+    /// before the slot is overwritten its content rolls aside to a numbered
+    /// `backups/daily/<date>.md.bak.<n>`; at the generation cap the first
+    /// generation of the day stays pinned as evidence and the second-oldest
+    /// is discarded with a fingerprinted audit line, so repeated same-day
+    /// replaces (including the WI#288 repair path) never silently discard a
+    /// version an operator may still need to inspect. The backup is stored
     /// with an empty chunk projection: retrievable by exact-path `read()`,
     /// visible in `list()`, but never search-indexed. Backup content is not
-    /// rescanned (the `backups/` prefix is not prompt-visible), so even a
-    /// previously poisoned file can still be replaced. Failures are logged
-    /// and never block the write itself.
-    async fn shadow_backup_prompt_file(&self, path: &str, prior_content: &str) {
+    /// rescanned
+    /// (the `backups/` prefix is not prompt-visible), so even a previously
+    /// poisoned file can still be replaced. Every backup emits a
+    /// `lunarwing::safety` warn audit line with the path, prior byte count
+    /// and backup path. Backup and rotation failures are logged and never
+    /// block the write; a rotation failure in particular still leaves the
+    /// rolling-slot overwrite to proceed, since that slot holds the
+    /// immediately prior version the WI#288 repair path relies on.
+    async fn shadow_backup_prompt_file(&self, scope: &str, path: &str, prior_content: &str) {
         let backup_path = format!("backups/{path}.bak");
+        if is_daily_log_file(path)
+            && let Err(e) = self
+                .rotate_daily_log_backup(scope, &backup_path, prior_content)
+                .await
+        {
+            tracing::warn!(
+                target: "lunarwing::safety",
+                file = %path,
+                backup = %backup_path,
+                error = %e,
+                "daily-log backup rotation failed; overwriting the rolling slot"
+            );
+        }
         let result: Result<(), WorkspaceError> = async {
             let backup_doc = self
                 .storage
-                .get_or_create_document_by_path(&self.user_id, self.agent_id, &backup_path)
+                .get_or_create_document_by_path(scope, self.agent_id, &backup_path)
                 .await?;
             self.storage
                 .update_document_and_replace_chunks(backup_doc.id, prior_content, &[])
                 .await
         }
         .await;
-        if let Err(e) = result {
-            tracing::warn!(
-                path = %path,
+        match result {
+            // The replace commits after this hook runs, so this line records
+            // only that the prior version was preserved, not the replace.
+            Ok(()) => tracing::warn!(
+                target: "lunarwing::safety",
+                file = %path,
+                backup = %backup_path,
+                prior_bytes = prior_content.len(),
+                "prior version of a prompt-visible file preserved in the shadow backup"
+            ),
+            Err(e) => tracing::warn!(
+                target: "lunarwing::safety",
+                file = %path,
+                backup = %backup_path,
                 error = %e,
                 "prompt-file shadow backup failed; proceeding with write"
-            );
+            ),
         }
+    }
+
+    /// Roll an existing daily-log backup slot aside to a numbered
+    /// `<backup_path>.<n>` generation so the slot can be overwritten without
+    /// losing the previous version (WI#288 review).
+    ///
+    /// No-op when the slot is absent or empty. A slot already holding exactly
+    /// `incoming_prior` is also a no-op: that is a retried replace whose first
+    /// attempt crashed after the backup committed but before the replace did,
+    /// and re-rotating would grow a duplicate generation per retry.
+    async fn rotate_daily_log_backup(
+        &self,
+        scope: &str,
+        backup_path: &str,
+        incoming_prior: &str,
+    ) -> Result<(), WorkspaceError> {
+        let existing = match self
+            .storage
+            .get_document_by_path(scope, self.agent_id, backup_path)
+            .await
+        {
+            Ok(doc) => doc,
+            Err(WorkspaceError::DocumentNotFound { .. }) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if existing.content.is_empty() || existing.content == incoming_prior {
+            return Ok(());
+        }
+        let slot_path = self.next_daily_log_backup_slot(scope, backup_path).await?;
+        let slot_doc = self
+            .storage
+            .get_or_create_document_by_path(scope, self.agent_id, &slot_path)
+            .await?;
+        self.storage
+            .update_document_and_replace_chunks(slot_doc.id, &existing.content, &[])
+            .await
+    }
+
+    /// First free numbered daily-log backup generation slot. At the
+    /// [`MAX_DAILY_LOG_BACKUP_GENERATIONS`] cap, the first generation stays
+    /// pinned — it is the day's first replaced version, the retained evidence
+    /// the WI#288 repair path exists to protect — the second-oldest
+    /// generation is discarded (audited with its byte count and blake3
+    /// fingerprint), every newer generation shifts down one slot, and the
+    /// freed top slot is returned, so both retained storage and this probe
+    /// stay bounded.
+    async fn next_daily_log_backup_slot(
+        &self,
+        scope: &str,
+        backup_path: &str,
+    ) -> Result<String, WorkspaceError> {
+        for n in 1..=MAX_DAILY_LOG_BACKUP_GENERATIONS {
+            let candidate = format!("{backup_path}.{n}");
+            match self
+                .storage
+                .get_document_by_path(scope, self.agent_id, &candidate)
+                .await
+            {
+                Ok(_) => {}
+                Err(WorkspaceError::DocumentNotFound { .. }) => return Ok(candidate),
+                Err(e) => return Err(e),
+            }
+        }
+        // Cap reached: pin `.1` and discard `.2` instead. Evicting the oldest
+        // generation would let a steered agent rotate the day's first replaced
+        // version — e.g. the quarantined poison's predecessor — out of the
+        // only reserved store with a handful of ordinary replaces (WI#288
+        // review J-1).
+        let discarded = self
+            .storage
+            .get_document_by_path(scope, self.agent_id, &format!("{backup_path}.2"))
+            .await?;
+        for n in 2..MAX_DAILY_LOG_BACKUP_GENERATIONS {
+            let newer = self
+                .storage
+                .get_document_by_path(scope, self.agent_id, &format!("{backup_path}.{}", n + 1))
+                .await?;
+            let older = self
+                .storage
+                .get_or_create_document_by_path(scope, self.agent_id, &format!("{backup_path}.{n}"))
+                .await?;
+            self.storage
+                .update_document_and_replace_chunks(older.id, &newer.content, &[])
+                .await?;
+        }
+        tracing::warn!(
+            target: "lunarwing::safety",
+            file = %backup_path,
+            generations = MAX_DAILY_LOG_BACKUP_GENERATIONS,
+            discarded_bytes = discarded.content.len(),
+            discarded_blake3 = %blake3::hash(discarded.content.as_bytes()).to_hex(),
+            "daily-log backup generation cap reached; second-oldest generation \
+             discarded, first generation pinned as evidence"
+        );
+        Ok(format!("{backup_path}.{MAX_DAILY_LOG_BACKUP_GENERATIONS}"))
     }
 
     /// Move a poisoned daily log aside to `daily/<date>.poisoned-<n>.md` and
@@ -1515,6 +1682,14 @@ impl Workspace {
             .storage
             .get_or_create_document_by_path(&scope, self.agent_id, &path)
             .await?;
+
+        // Same WI#286 shadow backup as `write()`: a layer-scoped replace of a
+        // prompt-visible file destroys its prior content just the same, and
+        // the memory_write schema promises the backup on every replace lane.
+        if is_system_prompt_file(&path) && !doc.content.is_empty() && doc.content != content {
+            self.shadow_backup_prompt_file(&scope, &path, &doc.content)
+                .await;
+        }
 
         let prepared = self.prepare_chunks_for_path(&path, content).await;
         self.storage
@@ -4344,6 +4519,186 @@ mod runtime_index_tests {
         assert!(
             results.is_empty(),
             "shadow backup content must not be searchable: {results:?}"
+        );
+    }
+
+    /// WI#288 review (layer bypass): a layer-scoped full replace of a
+    /// prompt-visible file gets the same shadow backup as `write()` — the
+    /// memory_write schema promises the backup on every replace lane.
+    #[tokio::test]
+    async fn layer_replace_of_prompt_file_has_shadow_backup() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let backup_path = "backups/MEMORY.md.bak";
+
+        workspace
+            .write_to_layer("private", paths::MEMORY, "layer version one", false)
+            .await
+            .expect("first layer write");
+        assert!(
+            matches!(
+                workspace.read(backup_path).await,
+                Err(WorkspaceError::DocumentNotFound { .. })
+            ),
+            "first write of an empty document must not create a backup"
+        );
+
+        workspace
+            .write_to_layer("private", paths::MEMORY, "layer version two", false)
+            .await
+            .expect("layer replace");
+        let backup = workspace.read(backup_path).await.expect("read backup");
+        assert_eq!(backup.content, "layer version one");
+        let current = workspace.read(paths::MEMORY).await.expect("read memory");
+        assert_eq!(current.content, "layer version two");
+    }
+
+    /// WI#288 review (S8/B6): repeated same-day replaces of a daily log keep
+    /// every prior generation — the `.bak` slot rolls aside to the first free
+    /// `.bak.<n>` before being overwritten, so a version an operator may still
+    /// need (e.g. quarantined poison's predecessor) is never silently
+    /// discarded.
+    #[tokio::test]
+    async fn daily_log_shadow_backup_rotates_generations() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let day = "daily/2026-10-03.md";
+        let backup_path = "backups/daily/2026-10-03.md.bak";
+
+        for content in ["morning", "midday", "evening"] {
+            workspace.write(day, content).await.expect("write day log");
+        }
+        assert_eq!(
+            workspace
+                .read(backup_path)
+                .await
+                .expect("latest backup")
+                .content,
+            "midday",
+            ".bak always holds the immediately prior version"
+        );
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.1"))
+                .await
+                .expect("first rotated generation")
+                .content,
+            "morning"
+        );
+
+        // A retried write of the current content is a no-op replace: the
+        // backup never fires and no new slot appears.
+        workspace
+            .write(day, "evening")
+            .await
+            .expect("no-op rewrite");
+        assert!(
+            matches!(
+                workspace.read(&format!("{backup_path}.2")).await,
+                Err(WorkspaceError::DocumentNotFound { .. })
+            ),
+            "no-op rewrite must not rotate a new slot"
+        );
+    }
+
+    /// A replace retried after a crash between the backup and the replace
+    /// commit re-backs-up identical content: the rotation guard must keep
+    /// that retry from growing a duplicate generation.
+    #[tokio::test]
+    async fn daily_log_shadow_backup_retry_after_crash_grows_no_slot() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("backup-retry-user", db.clone());
+        let day = "daily/2026-10-03.md";
+        let backup_path = "backups/daily/2026-10-03.md.bak";
+
+        workspace.write(day, "morning").await.expect("first write");
+        workspace.write(day, "midday").await.expect("replace");
+        assert_eq!(
+            workspace.read(backup_path).await.expect("backup").content,
+            "morning"
+        );
+
+        // Simulate the crash window: the backup committed ("morning" is in
+        // .bak) but the replace did not — the live file still holds the
+        // pre-replace content.
+        let doc = db
+            .get_or_create_document_by_path("backup-retry-user", None, day)
+            .await
+            .expect("day file");
+        db.update_document(doc.id, "morning")
+            .await
+            .expect("roll the live file back, as after a crash");
+
+        workspace
+            .write(day, "midday")
+            .await
+            .expect("retried replace");
+        assert_eq!(
+            workspace.read(backup_path).await.expect("backup").content,
+            "morning"
+        );
+        assert!(
+            matches!(
+                workspace.read(&format!("{backup_path}.1")).await,
+                Err(WorkspaceError::DocumentNotFound { .. })
+            ),
+            "a retried replace must not rotate a duplicate generation"
+        );
+    }
+
+    /// WI#288 review (T-3/J-1): retained generations are capped — at the cap
+    /// the first generation of the day stays pinned (it is the repair path's
+    /// retained evidence), the second-oldest generation is discarded and the
+    /// rest shift down, so an injection-steered agent cannot rotate the
+    /// evidence out of the reserved store with ordinary replaces, and the
+    /// free-slot probe stays bounded.
+    #[tokio::test]
+    async fn daily_log_shadow_backup_generation_cap_pins_first_generation() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let day = "daily/2026-10-03.md";
+        let backup_path = "backups/daily/2026-10-03.md.bak";
+        let cap = MAX_DAILY_LOG_BACKUP_GENERATIONS as usize;
+
+        // One initial write plus cap + 3 replaces produce cap + 2 numbered
+        // generations, so the cap is exceeded twice.
+        for version in 0..=(cap + 3) {
+            workspace
+                .write(day, &format!("version {version}"))
+                .await
+                .expect("write day log");
+        }
+
+        assert_eq!(
+            workspace
+                .read(backup_path)
+                .await
+                .expect("latest backup")
+                .content,
+            format!("version {}", cap + 2),
+            ".bak always holds the immediately prior version"
+        );
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.1"))
+                .await
+                .expect("first generation survives the cap")
+                .content,
+            "version 0",
+            "the first generation of the day is pinned as evidence and never evicted"
+        );
+        for n in 2..=cap {
+            let generation = workspace
+                .read(&format!("{backup_path}.{n}"))
+                .await
+                .expect("retained generation");
+            // .2..=.<cap> hold the most recent generations: versions 3..=cap+1
+            // (versions 1 and 2 were discarded by the two shifts at the cap).
+            assert_eq!(generation.content, format!("version {}", n + 1));
+        }
+        assert!(
+            matches!(
+                workspace.read(&format!("{backup_path}.{}", cap + 1)).await,
+                Err(WorkspaceError::DocumentNotFound { .. })
+            ),
+            "generations beyond the cap must not exist"
         );
     }
 
