@@ -301,6 +301,15 @@ pub struct RetryState {
     /// persisted so the sweep and diagnostics can tell attempts apart.
     #[serde(default)]
     pub lineage: Vec<u32>,
+    /// Whether the "retry scheduled" notice for this marker was delivered to
+    /// a notification receiver (WI#276 review): a marker persisted during
+    /// daemon shutdown is written with `false` because the broadcast
+    /// consumer is already gone, so the post-restart sweep re-arms the retry
+    /// AND emits the notice itself, then acknowledges the flag. Markers
+    /// written by older builds deserialize as `false` and get one truthful
+    /// boot-time notice.
+    #[serde(default)]
+    pub notified: bool,
 }
 
 impl RetryState {

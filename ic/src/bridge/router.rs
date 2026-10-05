@@ -1771,6 +1771,22 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         Err(e) => debug!("engine v2: record_restart_interrupted_missions failed: {e}"),
         _ => {}
     }
+    // WI#276: resolve fires whose shutdown stop settled after the watcher's
+    // grace — the mission carries a pending-interruption stamp. Runs after
+    // the WI#301 record pass so restart-stamped threads stay its case.
+    match mission_manager
+        .resolve_pending_shutdown_interruptions()
+        .await
+    {
+        Ok(resolved) if !resolved.is_empty() => {
+            debug!(
+                "engine v2: resolved {} shutdown-interrupted mission fire(s)",
+                resolved.len()
+            );
+        }
+        Err(e) => debug!("engine v2: resolve_pending_shutdown_interruptions failed: {e}"),
+        _ => {}
+    }
     if let Some(budget) = crate::channels::budget::budget_for_channel("darkirc") {
         mission_manager
             .set_channel_context(budget.channel, budget.prompt_guidance())
