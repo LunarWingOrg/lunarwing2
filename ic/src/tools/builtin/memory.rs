@@ -1001,14 +1001,11 @@ struct MemoryTreeBuildState {
 
 fn memory_tree_root_revision(entries: &[crate::workspace::WorkspaceEntry]) -> String {
     let mut hasher = blake3::Hasher::new();
-    for entry in entries
-        .iter()
-        .filter(|entry| {
-            !is_engine_runtime_path(&entry.path)
-                && !is_backup_path(&entry.path)
-                && !is_quarantined_daily_log(&entry.path)
-        })
-    {
+    for entry in entries.iter().filter(|entry| {
+        !is_engine_runtime_path(&entry.path)
+            && !is_backup_path(&entry.path)
+            && !is_quarantined_daily_log(&entry.path)
+    }) {
         hasher.update(&entry.path.len().to_le_bytes());
         hasher.update(entry.path.as_bytes());
         hasher.update(&[u8::from(entry.is_directory)]);
