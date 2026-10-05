@@ -92,6 +92,55 @@ all other prompt-visible files keep the strict raw scan. Rejection errors name
 the offending file and the 1-based line of each rejecting match so an operator
 can repair quickly (WI#288).
 
+Rejections reach the agent as their own error class (WI#290): `memory_write`
+maps `WorkspaceError::InjectionRejected` to `ToolError::ContentRejected`
+(rendered `Content rejected: …`), not the permission-flavored `NotAuthorized`
+that read like a transient gate and invited retrying the identical write. The
+message carries the matched pattern descriptions with line numbers, states that
+the same text is rejected on every retry, tells the agent to rephrase the
+flagged wording, and warns against copying the error into memory — some
+pattern descriptions trip the scan themselves. The echoed list is capped at
+the first ten matches plus a count of the rest, so the remedy always survives
+the tool-output cap (`max_output_length`, 100 KB by default); the HTTP/CLI
+error text and the gateway's live log stream keep the full list, while
+journal/stderr lines are cut at 500 bytes. The inline-quote route is offered
+only for daily logs (the one lane where quoting demotes a match) and names
+the reliable form: one backtick pair on a single line, at most 200 bytes
+(`MAX_QUOTED_SPAN_BYTES`) between them, with no other quote mark left open
+before it on that line (an earlier unbalanced quote swallows the backticks).
+The hint also says that quoting neutralizes nothing: the phrase is stored
+verbatim and stays model-visible in later system prompts — prompt assembly
+escapes nothing on the v1 path and breaks only `<|` under Engine V2 — so
+quote only what the record needs, never text meant to steer the assistant. The guidance and all three agent-facing
+messages (injection rejection, existing-content rejection, daily-log
+quarantine) are pinned scanner-clean with real pattern descriptions by a
+regression test: every scanner hit lies inside the echoed list. Gate
+strictness is unchanged.
+
+An append whose entry passes the scan but whose file already holds content
+that trips the gate on its own (typically `MEMORY.md` text stored through
+`append_memory()` before WI#286 scanned that lane) fails with
+`WorkspaceError::ExistingContentRejected` instead: `append()` on
+prompt-visible files other than default-scope daily logs, `append_memory()`,
+and `append_to_layer()` on any prompt-visible file (layer daily logs are not
+quarantined). Rephrasing the entry cannot help, so `memory_write` maps it to
+`ContentRejected` with escalate-first guidance: tell the user which lines need
+repair; self-repair is allowed only when no layer was passed (`memory_read`
+cannot address a layer, and `memory_write` without `layer` writes the default
+scope), the file is short enough to rewrite exactly in one call, and every
+flagged line is plainly an ordinary note rather than an instruction aimed at
+the assistant — then read it with `memory_read` and replace it with
+`memory_write` and `append: false`, keeping every other line unchanged and
+rewording each flagged line without the flagged wording. A planted injection
+is therefore never laundered past the scanner by "rephrasing the flagged
+lines". The classification runs only after the combined scan has already
+failed and only relabels the error: boundary-split patterns (stored content
+clean on its own) and poisoned entries stay `InjectionRejected`, and the
+append is refused either way. The web `POST /api/memory/write` endpoint
+answers HTTP 422 for injection rejections (matching the prompt editor) and
+HTTP 409 for existing-content rejections and daily-log quarantines, instead
+of 500.
+
 ### Daily-Log Quarantine (WI#288)
 
 An append to a daily log re-scans the full combined candidate, so a day file
@@ -100,14 +149,24 @@ existed) would otherwise reject every subsequent append and freeze the day's
 log with no tool-level recovery. When the combined scan fails but the new
 entry itself is clean and the pre-existing content alone trips the gate,
 `append()` quarantines the day file aside to `daily/YYYY-MM-DD.poisoned-<n>.md`
-(first free slot) and clears the day file; the rejection reason names the
-quarantine path so the caller knows a retry starts a fresh log. The quarantine
-copy is retained with an empty chunk projection — exact-path readable, listed,
-never search-indexed — and is never prompt-injected (daily-log injection reads
-only the exact `daily/YYYY-MM-DD.md` path). Quarantine applies only when the
-poison pre-exists: a poisoned entry, or a pattern split across the append
-boundary, is still a plain rejection with no file movement. Quarantine
-failures are logged and never mask the original rejection.
+(first free slot) and clears the day file. The discovering append is not
+applied and fails with the distinct `WorkspaceError::DailyLogQuarantined`
+(path, quarantine path, and the pre-existing matches) rather than an ordinary
+injection rejection, because the remedy is the opposite one: the new entry was
+clean, so `memory_write` tells the agent to retry it unchanged (a
+retry-inviting `ExecutionFailed`, never `ContentRejected`), and the retry lands
+on the fresh log; the web API answers HTTP 409 (WI#290). The quarantine
+message echoes the pre-existing match descriptions (capped at ten plus a
+count) and, like the rejection messages, warns against copying itself into
+memory. The quarantine copy is retained with an empty chunk projection —
+exact-path readable, listed, never search-indexed — and is never
+prompt-injected (daily-log injection reads only the exact
+`daily/YYYY-MM-DD.md` path). Quarantine applies only when the poison
+pre-exists: a poisoned entry, or a pattern split across the append boundary,
+is still a plain rejection with no file movement. Quarantine failures are
+logged and never mask the rejection; the refused append is then relabelled
+`ExistingContentRejected` (the stored content alone already failed the gate,
+so rephrase advice would blame the clean entry).
 
 ### Prompt-File Shadow Backups (WI#286)
 
