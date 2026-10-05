@@ -128,6 +128,12 @@ fn aliased_env_keys(key: &str) -> (&str, Option<&str>) {
 /// all config resolution that goes through those helpers. This avoids the UB
 /// of `std::env::set_var` in multi-threaded programs.
 pub fn set_runtime_env(key: &str, value: &str) {
+    // A secret-named override (LUNARWING_CLOUD_API_KEY after an interactive
+    // login) is in neither the process environment nor the secrets overlay:
+    // register it with the daemon log scrubber (WI#287 review S4).
+    if crate::tracing_fmt::is_secret_env_name(key) {
+        crate::tracing_fmt::register_log_secret(value);
+    }
     runtime_overrides()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -572,6 +578,46 @@ mod tests {
             Some(val) => unsafe { std::env::set_var("IRONCLAW_OWNER_ID", val) },
             None => unsafe { std::env::remove_var("IRONCLAW_OWNER_ID") },
         }
+    }
+
+    /// WI#287 review S4: every value of the secrets-store overlay is a secret
+    /// that is not in the process environment, so the overlay registers it
+    /// with the daemon log scrubber (both the single and the merge path).
+    #[test]
+    fn injected_secrets_are_scrubbed_from_daemon_logs() {
+        let single = format!("inj-{}", "Zk9".repeat(5));
+        let merged = format!("mrg-{}", "Hb6".repeat(5));
+        crate::config::inject_single_var("LUNARWING_WI287_TEST_INJECTED_API_KEY", &single);
+        crate::config::merge_injected_vars(HashMap::from([(
+            "LUNARWING_WI287_TEST_MERGED_API_KEY".to_string(),
+            merged.clone(),
+        )]));
+        let scrubbed = crate::tracing_fmt::daemon_log_scrubber()
+            .scrub(&format!("x {single} y {merged} z"))
+            .into_owned();
+        crate::config::inject_single_var("LUNARWING_WI287_TEST_INJECTED_API_KEY", "");
+        crate::config::inject_single_var("LUNARWING_WI287_TEST_MERGED_API_KEY", "");
+        assert!(!scrubbed.contains(&single), "{scrubbed}");
+        assert!(!scrubbed.contains(&merged), "{scrubbed}");
+        assert!(scrubbed.ends_with(" z"), "{scrubbed}");
+    }
+
+    /// WI#287 review S4: a secret-named runtime override (the interactive
+    /// LunarWing Cloud login stores its key here) is scrubbed; values of other
+    /// overrides stay visible.
+    #[test]
+    fn runtime_overrides_for_secret_names_are_scrubbed_from_daemon_logs() {
+        let secret = format!("rt-{}", "Wv8".repeat(5));
+        let plain = format!("mode-{}", "plain".repeat(3));
+        set_runtime_env("LUNARWING_WI287_TEST_RUNTIME_API_KEY", &secret);
+        set_runtime_env("LUNARWING_WI287_TEST_RUNTIME_MODE", &plain);
+        let scrubbed = crate::tracing_fmt::daemon_log_scrubber()
+            .scrub(&format!("a {secret} b {plain} c"))
+            .into_owned();
+        set_runtime_env("LUNARWING_WI287_TEST_RUNTIME_API_KEY", "");
+        set_runtime_env("LUNARWING_WI287_TEST_RUNTIME_MODE", "");
+        assert!(!scrubbed.contains(&secret), "{scrubbed}");
+        assert!(scrubbed.contains(&plain), "{scrubbed}");
     }
 
     // --- lock_env poison recovery (regression for env mutex cascade) ---

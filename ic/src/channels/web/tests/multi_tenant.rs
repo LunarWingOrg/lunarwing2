@@ -111,6 +111,24 @@ fn gateway_config() -> GatewayConfig {
     }
 }
 
+/// WI#287 review S4: the gateway token comes from settings or is generated on
+/// single-node installs, never from the environment, so the gateway registers
+/// it with the daemon log scrubber itself.
+#[test]
+fn gateway_auth_token_is_scrubbed_from_daemon_logs() {
+    let token = format!("gw-{}", "Gq4".repeat(6));
+    let config = GatewayConfig {
+        auth_token: Some(token.clone()),
+        ..gateway_config()
+    };
+    let _gateway = GatewayChannel::new(config, "gateway-sender".to_string());
+    let scrubbed = crate::tracing_fmt::daemon_log_scrubber()
+        .scrub(&format!("auth ok token={token} for alice"))
+        .into_owned();
+    assert!(!scrubbed.contains(&token), "{scrubbed}");
+    assert!(scrubbed.contains("for alice"), "{scrubbed}");
+}
+
 #[test]
 fn with_owner_scope_updates_gateway_owner_scope_in_multi_user_mode() {
     let mut gateway = GatewayChannel::new(gateway_config(), "gateway-sender".to_string());

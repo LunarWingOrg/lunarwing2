@@ -71,6 +71,15 @@ For container execution, a file intended for later calls must be in an approved
 persistent workspace (`workspace_write` permits writes there); the ephemeral
 container's `/tmp` does not survive the command.
 
+Sandboxed runs may also carry a read-only `/tenant-logs` (WI#287): the
+daemon's own secret-scrubbed log, `daemon.log` plus the previous rotation
+`daemon.log.1`. It is present only when `SANDBOX_TENANT_LOGS` is not `off` and
+the runtime maps the sandbox user onto the daemon's uid (docker; podman 5+;
+podman 4.3+ when the daemon uid is 1000); the tool description therefore says
+"if /tenant-logs exists". At the default `info` it holds INFO and above, so
+per-tool-call lines (DEBUG) need `SANDBOX_TENANT_LOGS=debug` plus a raised
+runtime level.
+
 Fresh-tenant acceptance steps: [WI#162 verification](../../../docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md).
 
 ### tool_list pagination and completeness (WI#245)

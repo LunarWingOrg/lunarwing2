@@ -384,8 +384,10 @@ fn mask_secret(secret: &str) -> String {
     format!("{}{}{}", prefix, "*".repeat(middle_len.min(8)), suffix)
 }
 
-/// Apply redaction ranges to content.
-fn apply_redactions(content: &str, ranges: &[Range<usize>]) -> String {
+/// Apply redaction ranges to content. Merged first (WI#287 review S5): a
+/// range nested in an earlier one used to move the cursor back and re-emit
+/// the longer secret's tail.
+pub(crate) fn apply_redactions(content: &str, ranges: &[Range<usize>]) -> String {
     if ranges.is_empty() {
         return content.to_string();
     }
@@ -393,7 +395,7 @@ fn apply_redactions(content: &str, ranges: &[Range<usize>]) -> String {
     let mut result = String::with_capacity(content.len());
     let mut last_end = 0;
 
-    for range in ranges {
+    for range in merge_ranges(ranges) {
         if range.start > last_end {
             result.push_str(&content[last_end..range.start]);
         }
@@ -406,6 +408,21 @@ fn apply_redactions(content: &str, ranges: &[Range<usize>]) -> String {
     }
 
     result
+}
+
+/// Sort ranges by start and collapse overlapping, nested and touching ones,
+/// so every redacted span gets one marker and the cursor only moves forward.
+fn merge_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
 }
 
 /// Extract a literal prefix from a regex pattern (if one exists).
@@ -431,7 +448,7 @@ fn extract_literal_prefix(pattern: &str) -> Option<String> {
 }
 
 /// Default leak detection patterns.
-fn default_patterns() -> Vec<LeakPattern> {
+pub(crate) fn default_patterns() -> Vec<LeakPattern> {
     vec![
         // OpenAI API keys
         LeakPattern {
@@ -1386,5 +1403,23 @@ mod tests {
         let leak_match = result.matches.first().expect("custom pattern should match");
 
         assert!(detector.should_emit_warning(leak_match));
+    }
+
+    /// WI#287 review S5: nested, overlapping and touching ranges collapse into
+    /// one marker; a range inside an earlier one never moves the cursor back
+    /// and re-emits the tail of the longer secret.
+    #[test]
+    fn apply_redactions_merges_nested_and_overlapping_ranges() {
+        use crate::leak_detector::apply_redactions;
+
+        let content = "abcdefghij";
+        assert_eq!(apply_redactions(content, &[0..10, 0..4]), "[REDACTED]");
+        assert_eq!(apply_redactions(content, &[0..6, 4..8]), "[REDACTED]ij");
+        assert_eq!(apply_redactions(content, &[0..8, 2..4]), "[REDACTED]ij");
+        assert_eq!(apply_redactions(content, &[0..2, 2..4]), "[REDACTED]efghij");
+        assert_eq!(
+            apply_redactions(content, &[6..8, 1..3]),
+            "a[REDACTED]def[REDACTED]ij"
+        );
     }
 }
