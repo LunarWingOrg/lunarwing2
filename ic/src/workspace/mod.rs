@@ -4633,7 +4633,11 @@ mod runtime_index_tests {
         }
 
         assert_eq!(
-            workspace.read(backup_path).await.expect("latest backup").content,
+            workspace
+                .read(backup_path)
+                .await
+                .expect("latest backup")
+                .content,
             format!("version {}", cap + 2),
             ".bak always holds the immediately prior version"
         );
@@ -4648,9 +4652,7 @@ mod runtime_index_tests {
         }
         assert!(
             matches!(
-                workspace
-                    .read(&format!("{backup_path}.{}", cap + 1))
-                    .await,
+                workspace.read(&format!("{backup_path}.{}", cap + 1)).await,
                 Err(WorkspaceError::DocumentNotFound { .. })
             ),
             "generations beyond the cap must not exist"
