@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built (revalidated against source 2026-09-28, v2.1.3.0; item-40 socket-directory mount; revalidated 2026-10-01, v2.1.4.0 — no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change in the cycle; the WI#265 bridge work touched `router.rs` only, which this doc already notes is independent of the SSH harness)
+**Status:** As-built (revalidated against source 2026-09-28, v2.1.3.0; item-40 socket-directory mount; revalidated 2026-10-01, v2.1.4.0 — no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change in the cycle; the WI#265 bridge work touched `router.rs` only, which this doc already notes is independent of the SSH harness; revalidated 2026-10-05, v2.1.5.0 — again no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change; WI#307 kept `ssh`/`ssh_git`/`create_job` on the shared autonomous denylist (`lunarwing_engine::gate::tool_tier`), so the non-autonomous guarantee in §1 stands)
 **Code:** `ic/src/bridge/ssh*.rs`, `ic/src/config/ssh.rs`
 **Operator guide:** [`docs/ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 **Delivery mechanisms** (how the agent actually runs SSH work — worker mode, the `ssh`/`ssh_git` built-in tools, the WASM `ssh` tool): [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)
