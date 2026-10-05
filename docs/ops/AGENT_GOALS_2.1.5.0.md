@@ -176,7 +176,7 @@
    - Note: TensorZero naming in guides stays correct for this tree — the TensorMoon cutover (bb7db9d3d) is not an ancestor of this branch and arrives with its own MR.
    - Docs-only; no code changed, no cargo gates apply. Commits: 58e466355, 01305cab7, 0eafc408e, 96e79cb29, bfec57ee2, plus this goals commit.
 27. [ ] update all docs in docs/architecture
-28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5176 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
+28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5187 for latest master pipeline run and see if anything is not GREEN (cargo deny has issue now at the least)
 29. [x] come up with ideas for names for 2.1.5.0 - write in a document in docs/ops
 30. [x] Repo housecleaning: 1) get rid of old stuff in docs/ops and move it to history 2) remove docs/ov directory — re-attempt after [!1422 review](https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1422#note_6163).
     - DONE (2026-10-05): re-applied the archive with I-1–I-9 follow-ups: repaired current plain-path citations (including XMPP source comments), removed the empty CI placeholder and redundant memory/DarkIRC pointers, archived the unreferenced screenshot and completed incident, and indexed the remaining current Nanocode/cgroup procedures. Kept cited historical transcripts with an explicit existing-evidence exception; no new transcripts added. `docs/ov` is already absent.
@@ -187,7 +187,7 @@
     - DONE (2026-10-05): re-applied non-bypassable per-call deletion approval, both secrets tools' autonomous opt-outs, and all-owner PostgreSQL/libSQL V28 grant cleanup. H-1: docs now explain that persisted `always_allow` rows are ignored at execution, not refused by a nonexistent settings UI/tool. H-2: guarded libSQL extraction with `json_valid`; malformed target/unrelated rows survive two real migration executions without preventing startup. H-3: added a live PostgreSQL JSONB selectivity/idempotence test, using a session-local table, and wired it into the PostgreSQL integration CI job.
     - H-4: retained the explicit no-persistent-approval override as intentional documentation of the security contract. H-5: documented the non-foreground execution/resume gate in ENGINE-V2. H-6/Y-4: daemon discovery and engine lease planning now share one denylist, including SSH/SSH Git; dynamic per-tool opt-outs remain independently enforced. V28 cleanup is irreversible on downgrade; runtime protection does not depend on cleanup, and generic settings writes can still create inert grant rows.
     - CI job 96673 failed `e2e_builtin_tool_coverage::job_create_status`: the real scheduled worker could consume the foreground trace's next response. The test now isolates the worker's pending completion and forces the worker-first interleaving before advancing the foreground replay. It retains scheduler dispatch, both successful tool calls, UUID forwarding, and in-progress-status assertions; no assertion was weakened.
-    - Verified locally: 96 targeted daemon tests; all 16 tests in the formerly failing libSQL integration target; 14 engine tier/planner tests; 1 live PostgreSQL migration test. All-feature daemon/engine Clippy (`--lib --tests -- -D warnings`), formatting, CI-config validation and diff checks passed. Remote CI has not been rerun for this re-attempt.
+    - Verified locally: 96 targeted daemon tests; all 16 tests in the formerly failing libSQL integration target; 14 engine tier/planner tests; 1 live PostgreSQL migration test. All-feature daemon/engine Clippy (`--lib --tests -- -D warnings`), formatting, CI-config validation and diff checks passed. Remote CI has not been rerun for this re-attempt
 33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/303 - time to update opencode2 again yay
 34. [x] (S) RESERVED4WIs
 35. [x] (S) RESERVED4WIs
@@ -197,7 +197,7 @@
 39. [ ] repass of goal number 25
 40. [x] (S) RESERVED4NVMES
 41. [x] (S) RESERVED
-42. [x] (S) RESERVED
+42. [ ] Clearly something went very very wrong with the work done from the 43rd goal.... See comments on WI 311 and address properly this time....
 43. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/311
     - DONE (2026-10-05, review-corrected): all non-manual missions no longer auto-complete from a run's goal-achieved/mission-complete declaration; their prompt asks about run success. Status and owner checks remain authoritative. Existing parked recurring missions can be recovered with owner-authorized `mission_resume`; automatic revival could unexpectedly resume tools/notifications after the owner accepted a completion report, so no bulk migration is performed. Global bootstrap warns and sends best-effort owner guidance; the recovery verb now explicitly names completed and failed missions.
     - Verification: 133 mission runtime tests passed, including repeated cron ticks across manager restart, repeated channel/system event and webhook delivery, startup recovery guidance, future schedule advancement, explicit terminal-state preservation and owner-scoped recovery; existing manual goal completion coverage passed. Engine Clippy (`--lib --tests -- -D warnings`), formatting and diff checks passed. Lifecycle, recovery and downgrade semantics documented in `docs/architecture/ENGINE-V2.md`
