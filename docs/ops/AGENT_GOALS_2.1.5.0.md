@@ -116,7 +116,7 @@
    - Additional adversarial findings heeded on this branch: B4 (Low) — the `ExistingContentRejected` Display string's ten-space run from a dropped `\` continuation removed (it reached HTTP 409 bodies and the CLI); B8 (Info) — README wording corrected: prompt assembly escapes nothing on the v1 path and breaks only `<|` under Engine V2 (verified `loop_engine.rs:436` vs `agent/dispatcher.rs:91`); the deferred N6 / slice-B partial-coupling remark — `quarantine_daily_log_on_reject`'s storage-failure fallback now routes through `classify_combined_scan_rejection` instead of returning the raw `InjectionRejected`, removing the last path that blamed a clean entry for stored poison (the classifier re-scans with the same daily-log gate the caller used, so the relabel applies exactly when the stored content alone is poisoned); pinned by the new `quarantine_failure_fallback_relabels_daily_log_rejection` unit test; the README quarantine paragraph updated to match. S9 stays at the review-accepted partial: the caveat (one of the two offered fixes) is present and test-pinned; the working-recipe residual is accepted by the WI#280 design.
    - Out of scope here (owned by other goal items): B1 (layer writes skip the WI#286 shadow backup) and B6 (whole-day replace unaudited, single-slot) belong to WI#288 item 19; B2/B3/B5 belong to WI#289 item 18; C-1/L-3 belong to items 21/22. Landing-order note stands: when item 19 lands, its layer-daily-log helper must return `classify_combined_scan_rejection`'s error at its final scan failure, and the "layer daily logs are not quarantined" sentences move with it.
    - Verification on this branch: `cargo check` clean; `cargo test --lib -- workspace::` 244 passed / 0 failed and `tools::builtin::memory` 30 passed / 0 failed; targeted filters (quarantine_failure_fallback, existing_content_rejection, injection_rejection, write_error_status, web memory/prompts handlers) 8 passed / 0 failed including the new regression pin; `cargo clippy -p lunarwing --lib --tests -- -D warnings` clean; `cargo fmt --all -- --check` clean; `cargo check -p lunarwing --tests --no-default-features --features postgres` clean; integration `layered_memory` 17 + `multi_scope_functional` 14 + `e2e_trace_memory` 2 passed / 0 failed; `git diff --check` clean.
-   - WI#290 stays open on GitLab for a maintainer to close after merge.
+   - WI#290 stays open on GitLab for a maintainer to close after merge
    - Commits: replays `67c585096` + `5a72816a2`, review fixes `fd4d11574` + `08d1bcee5`, goals evidence (this commit).
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/289 - REJECTED - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1365 and https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1384 and https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1413 and https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1401 but the comments from the adversarial review must be heeded and the best implementation from the reference MRs can be used
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/288 - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1407
@@ -166,5 +166,11 @@
 40. [x] (S) RESERVED4NVMES
 41. [x] (S) RESERVED
 42. [x] (S) RESERVED
+43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/311
+44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/310
+45. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/309
+46. [x] (S) Reserved
+47. [x] (S) Reserved
+48. [x] (S) Reserved
 
 ---
