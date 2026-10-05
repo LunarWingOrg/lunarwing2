@@ -167,8 +167,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.21** at reviewed full commit
-`8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`; the v2 bridge uses
+**v2.0.23** at reviewed full commit
+`0fd7e2829449b052abf0078666669302923d77af`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -298,6 +298,32 @@ self-test guards the patch contract against a 2.0.17 fixture during the image
 build. Host-side `prepare_reproducible_build_test.py` passed, including the
 untouched-failure contract. Whole-image reproducibility must still pass the CI
 candidate-versus-clean-rebuild gate before promotion.
+
+v2.0.23 bump (2026-10-05): tag SHA `0fd7e2829449b052abf0078666669302923d77af`
+verified against the anomalyco/opencode remote (v2.1.5.0 checklist item #33,
+WI#303 — the WI originally targeted v2.0.22 and was retargeted to v2.0.23 the
+same day, so the lane jumps v2.0.21 straight to v2.0.23). The Dockerfile
+patches the upstream CLI build script at that SHA (exactly one
+`bytecode: true` / `splitting: true` each, so the patch contract holds); the
+`prepare_reproducible_build` self-test fixture moved to 2.0.23 to keep
+guarding the patch contract during the image build. The v2.0.21→v2.0.23 diff
+is additive for this lane's surface: `session.create` (with `permissions`),
+`session.message.list`, `session.permission.reply`, `session.interrupt`,
+`event.subscribe`, `OpenCode.make`, and every event name the bridge matches
+(`session.execution.{succeeded,failed,interrupted}`, `session.idle`,
+`permission.asked`, `session.text.delta`, `session.tool.{success,failed}`)
+are unchanged — the client/protocol/schema diffs are an additive optional
+`parentID` on `session.create` (plus a declared `SessionNotFoundError` on it),
+`LocationNotFoundError` added to the `session.permission.list`/`session.diff`
+error unions, new `server.pair`/`server.connect`/`credential.*` endpoints, a
+`vcs.get`/`vcs.init` split, and removal of the redundant `FileAttachment`
+re-export from `session-event.ts` (still exported from `prompt.ts`; nothing
+imports it from `session-event`). The bridge uses none of the changed parts.
+`packages/client`, `packages/schema`, `packages/protocol`, and the committed
+`bun.lock` are all still present at the pin. Host-side
+`prepare_reproducible_build_test.py` passed (3/3), including the
+untouched-failure contract. Whole-image reproducibility must still pass the
+CI candidate-versus-clean-rebuild gate before promotion.
 
 v2.0.21 bump (2026-10-01): tag SHA `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`
 verified against the anomalyco/opencode remote (v2.1.4.0 checklist item #2
