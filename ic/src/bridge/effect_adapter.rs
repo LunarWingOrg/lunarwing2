@@ -941,7 +941,15 @@ impl EffectBridgeAdapter {
         // (WI#269 for routine_history, WI#278 for the rest). Bundled skills
         // written for v1 still name these tools, so the redirect is what keeps
         // a v2 agent on the working path.
-        if let Some(equivalent) = v2_mission_equivalent(lookup_name) {
+        //
+        // Foreground threads only: autonomous threads (Research/Mission) are
+        // leased the mission verbs, so redirecting a prompt-injected
+        // routine_delete there would rewrite it into a working destructive
+        // mission_delete (WI#278 review). Those threads keep the v1-only
+        // error below, so the routine_* names must stay in is_v1_only_tool.
+        if context.thread_type == lunarwing_engine::ThreadType::Foreground
+            && let Some(equivalent) = v2_mission_equivalent(lookup_name)
+        {
             return Err(EngineError::Effect {
                 reason: format!(
                     "Tool '{action_name}' is not available in engine v2: routines here are \
@@ -1756,22 +1764,29 @@ fn is_v1_only_tool(name: &str) -> bool {
 /// `routine_*` tool. The generic "use the slash command" error would
 /// misdirect for these: the honest answer is the mission equivalent
 /// (WI#269 for history, WI#278 for the rest). `None` for other names.
-fn v2_mission_equivalent(name: &str) -> Option<&'static str> {
+///
+/// `routine_update` also names the host command for a lightweight routine's
+/// tool-round budget: `mission_update` has no such knob and an Engine V2
+/// chat cannot reach `routine_update`, so without the clause a v2 user has
+/// no path to the budget surface (WI#291 review follow-up).
+fn v2_mission_equivalent(name: &str) -> Option<String> {
     Some(match name.replace('-', "_").as_str() {
         "routine_create" => {
             "mission_create(name, goal, cadence) — the routine prompt is the goal; the cron \
              schedule, 'event:<pattern>' or 'webhook:<path>' is the cadence"
+                .to_string()
         }
-        "routine_list" => "mission_list()",
-        "routine_fire" => "mission_fire(id)",
-        "routine_pause" => "mission_pause(id)",
-        "routine_resume" => "mission_resume(id)",
-        "routine_update" => {
+        "routine_list" => "mission_list()".to_string(),
+        "routine_fire" => "mission_fire(id)".to_string(),
+        "routine_pause" => "mission_pause(id)".to_string(),
+        "routine_resume" => "mission_resume(id)".to_string(),
+        "routine_update" => format!(
             "mission_update(id, ...) — goal, cadence, notify_channels, retry policy, \
-             success_criteria"
-        }
-        "routine_delete" => "mission_delete(id)",
-        "routine_history" => "mission_history(name)",
+             success_criteria; a lightweight routine's tool-round budget is a host change: {}",
+            crate::agent::routine_engine::ROUTINES_EDIT_COMMAND
+        ),
+        "routine_delete" => "mission_delete(id)".to_string(),
+        "routine_history" => "mission_history(name)".to_string(),
         _ => return None,
     })
 }
@@ -4820,6 +4835,27 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             assert!(!reason.contains("slash command"), "{tool}: {reason}");
         }
 
+        // WI#291/D-1: the routine_update redirect names the host command for
+        // a lightweight routine's tool-round budget — mission_update has no
+        // such knob and v2 chats cannot reach the v1 routine_update.
+        let err = adapter
+            .execute_resolved_pending_action(
+                "routine_update",
+                serde_json::json!({"name": "daily-digest"}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_budget")),
+                true,
+            )
+            .await
+            .expect_err("routine_update never runs in v2 threads");
+        let EngineError::Effect { reason } = err else {
+            panic!("expected Effect error for routine_update, got {err:?}");
+        };
+        assert!(
+            reason.contains(crate::agent::routine_engine::ROUTINES_EDIT_COMMAND),
+            "{reason}"
+        );
+
         let err = adapter
             .execute_resolved_pending_action(
                 "cancel_job",
@@ -4836,7 +4872,46 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         );
     }
 
-    // ── WI#295: tool_info for engine capability functions ─────────────────
+    /// WI#278 review: autonomous threads are leased the mission verbs, so the
+    /// redirect would rewrite a prompt-injected routine_delete into a working
+    /// mission_delete. Non-foreground threads get the plain v1-only error.
+    #[tokio::test]
+    async fn v1_routine_tools_do_not_redirect_in_autonomous_threads() {
+        let adapter = make_adapter();
+        for thread_type in [
+            lunarwing_engine::ThreadType::Research,
+            lunarwing_engine::ThreadType::Mission,
+        ] {
+            for tool in ["routine_delete", "routine_create", "routine_history"] {
+                let err = adapter
+                    .execute_resolved_pending_action(
+                        tool,
+                        serde_json::json!({"name": "daily-digest"}),
+                        &lease(),
+                        &exec_ctx_for_type(
+                            lunarwing_engine::ThreadId::new(),
+                            Some("call_autonomous"),
+                            thread_type,
+                        ),
+                        true,
+                    )
+                    .await
+                    .expect_err("v1 routine tools never run in v2 threads");
+                let EngineError::Effect { reason } = err else {
+                    panic!("expected Effect error for {tool}/{thread_type:?}, got {err:?}");
+                };
+                assert!(
+                    !reason.contains("mission_"),
+                    "{tool}/{thread_type:?} must not be pointed at a callable mission verb: {reason}"
+                );
+                assert!(
+                    reason.contains("not available in engine v2"),
+                    "{tool}/{thread_type:?}: {reason}"
+                );
+            }
+        }
+    }
+
     // ── WI#295: tool_info for engine capability functions ─────────────────
 
     /// Stand-in for the `web_search` WASM tool (not loadable in unit tests).
