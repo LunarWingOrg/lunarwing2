@@ -32,7 +32,7 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 
 **Engine and gateway.** Engine V2 is the channel-neutral execution path behind the browser gateway and eligible bridged channels, with streamed events, approval gates, and rich tool results. Multi-tenant setups route XMPP, WeeChat, and DarkIRC through it by default; single instances opt in. Details: [Engine V2](docs/architecture/ENGINE-V2.md).
 
-**Live interaction.** `/interrupt` stops an in-flight LLM stream or tool batch, and `/steer <note>` redirects a running turn after its current tool call completes. Both work through the browser gateway, XMPP, WeeChat, and the REPL. See the [cross-channel live verification](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md).
+**Live interaction.** `/interrupt` stops an in-flight LLM stream or tool batch, and `/steer <note>` redirects a running turn after its current tool call completes. Both work through the browser gateway, XMPP, WeeChat, and the REPL. See the [cross-channel live verification](docs/ops/history/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md).
 
 **Channels, tools, and workers.**
 

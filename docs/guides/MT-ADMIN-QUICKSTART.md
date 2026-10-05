@@ -234,7 +234,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh psql ruffles -c 'SELECT ...'
 sudo ic/scripts/lunarwing-mt-admin.sh daemon-pid ruffles
 ```
 
-`psql` runs inside the tenant's own PostgreSQL container and is for SELECTs and fingerprints only — database rows can be secret-bearing. `daemon-pid` prints the PID of the process that actually loaded the tenant env, validated as tenant-owned (on OpenRC it reads OpenRC's `child_pid` record, never the supervise-daemon pidfile); a non-zero exit means the PID could not be resolved and must be treated as *uninspected*, never as evidence. The full operator runbook, including the Engine V2 prompt-overlay audit procedure that motivated these verbs, is [`../ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`](../ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md).
+`psql` runs inside the tenant's own PostgreSQL container and is for SELECTs and fingerprints only — database rows can be secret-bearing. `daemon-pid` prints the PID of the process that actually loaded the tenant env, validated as tenant-owned (on OpenRC it reads OpenRC's `child_pid` record, never the supervise-daemon pidfile); a non-zero exit means the PID could not be resolved and must be treated as *uninspected*, never as evidence. The original operator procedure and Engine V2 prompt-overlay audit that motivated these verbs are in the [v2.1.4.0 audit record](../ops/history/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md).
 
 ## 9. Backup, Restore, Upgrade, and Remove
 

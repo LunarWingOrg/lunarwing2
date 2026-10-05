@@ -20,7 +20,7 @@ under a root daemon (never container root). The `--pids-limit` is pinned to
 256; the runtime's default seccomp filter is the supported contract. The
 cleanup path is the `ContainerCleanupGuard` detached kill/rm plus the
 API-independent bounded CLI sweep. See
-[`v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+[`v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
 
 **`/tenant-logs` (WI#287).** The daemon writes a secret-scrubbed copy of its
 own log to `<base>/logs/sandbox/daemon.log` (MT: `<tenant root>/state/logs/sandbox/`)

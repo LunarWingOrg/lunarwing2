@@ -190,7 +190,7 @@ but unifying it is still a possible follow-up.
 Evidence and detailed threat analysis:
 
 - [`docs/ops/history/v2.0.9.0_GOAL1_TOOL_RESULT_INTEGRITY.md`](docs/ops/history/v2.0.9.0_GOAL1_TOOL_RESULT_INTEGRITY.md)
-- [`docs/ops/ROLE_TOKEN_SMUGGLE.md`](docs/ops/ROLE_TOKEN_SMUGGLE.md)
+- [`docs/ops/history/ROLE_TOKEN_SMUGGLE.md`](docs/ops/history/ROLE_TOKEN_SMUGGLE.md)
 
 ### Self-Repair and Tool Schema Reliability
 

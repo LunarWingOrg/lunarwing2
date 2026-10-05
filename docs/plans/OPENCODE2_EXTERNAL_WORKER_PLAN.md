@@ -1,7 +1,7 @@
 # OpenCode 2 External Worker — Exploration Plan (v2.1.2.0, goals item #17)
 
 Status: **plan only** — no implementation is authorized by this document. It is the
-exploration output for `docs/ops/opencode2extworkerideaandissuesandpotentialplan.md`
+exploration output for `docs/ops/history/opencode2extworkerideaandissuesandpotentialplan.md`
 (the "opencode2 idea/issues/potential plan" note). Audience: whoever picks up the
 implementation (Rarity/AJ per the source note).
 

@@ -186,4 +186,4 @@ rust-test-postgres-integration:
     LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
     CARGO_PROFILE_TEST_DEBUG: "0"
   script:
-    - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features postgres,integration --test workspace_integration -- --test-threads=1
+    - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features postgres,integration --test workspace_integration --test postgres_settings_migrations -- --test-threads=1

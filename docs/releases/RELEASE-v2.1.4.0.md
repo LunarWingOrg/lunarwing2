@@ -253,7 +253,7 @@ Release validation is complete, including remote CI, the published
 worker-image Trivy scan, and the opencode2 candidate-versus-clean rebuild
 digest check.
 See the
-[crate-security audit](docs/ops/v2.1.4.0_CRATE_SECURITY_AUDIT.md).
+[crate-security audit](docs/ops/history/v2.1.4.0_CRATE_SECURITY_AUDIT.md).
 
 ### Pairing Allowlist Preservation
 

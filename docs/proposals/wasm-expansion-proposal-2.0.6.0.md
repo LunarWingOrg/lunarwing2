@@ -96,7 +96,7 @@ generation-safe recovery after terminal traps.
 - Install/auth/activate/remove lifecycle: `ic/src/extensions/manager.rs`;
   catalog/discovery: `ic/src/extensions/{discovery,registry}.rs` and
   `ic/src/registry/`; distribution direction researched in
-  `docs/ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md` (goals item #9).
+  `docs/ops/history/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md` (goals item #9).
 
 ## Findings: Gaps and Expansion Candidates
 
@@ -249,7 +249,7 @@ tools/channels, MCP for external servers. Candidates that fit the WASM lane:
   non-Rust guest templates (E1), streaming/async evaluation (B4). Coordinate
   distribution-side work (signing, digest pinning for tools/channels the way
   MCP-over-WASM already pins) with the marketplace research in
-  `docs/ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md`.
+  `docs/ops/history/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md`.
 
 ## Non-Goals
 
@@ -290,4 +290,4 @@ tools/channels, MCP for external servers. Candidates that fit the WASM lane:
   `docs/proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md`,
   `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`,
   `docs/proposals/GITWASM/README.md`,
-  `docs/ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md`
+  `docs/ops/history/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md`

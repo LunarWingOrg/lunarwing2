@@ -395,9 +395,10 @@ pub trait Tool: Send + Sync {
     /// Whether this tool may execute in autonomous contexts (background jobs,
     /// routines) at all. Distinct from approval tier: interactive approval
     /// behavior is unchanged. Hard exclusions (remote-command tools such as
-    /// `ssh`/`ssh_git`, or WASM tools carrying the SSH capability) override
+    /// `ssh`/`ssh_git`, secrets tools, or WASM tools carrying the SSH capability) override
     /// this to return `false`; `AUTONOMOUS_TOOL_DENYLIST` remains as
-    /// name-based defense-in-depth.
+    /// name-based defense-in-depth. The autonomous catalog, scheduler, job/MCP
+    /// workers and Engine V2 execution adapter enforce this opt-out.
     fn allows_autonomous_execution(&self) -> bool {
         true
     }

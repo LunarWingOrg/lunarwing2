@@ -16,7 +16,7 @@ across the three tenants. Neither is breaking — all tenants are healthy and re
 both are worth resolving before the next phase. This proposal documents the current state and the
 options; nothing here has been applied.
 
-Related docs: [`../ops/MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](../ops/MT-GENTOO-SETUP-AND-CHANGES-MADE.md),
+Related docs: [historical Gentoo setup](../ops/history/MT-GENTOO-SETUP-AND-CHANGES-MADE.md),
 [`../guides/MT-ADMIN-QUICKSTART.md`](../guides/MT-ADMIN-QUICKSTART.md) (WeeChat setup is Part 2).
 
 ---

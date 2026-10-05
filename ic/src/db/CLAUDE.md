@@ -43,6 +43,19 @@ are optional overrides.
   a note here.
 - Do not regress existing libSQL coverage.
 
+## Permission upgrade (V28 / WI#307)
+
+Both backends remove `tool_permissions.secret_delete` rows whose JSON value
+is `"always_allow"`, across every user scope. Disabled/ask settings and other
+tools are retained. Execution rejects these legacy grants independently of the
+migration. This data cleanup is intentionally irreversible: downgrading does
+not restore blanket credential-deletion grants.
+
+libSQL checks `json_valid` before extraction so malformed legacy TEXT rows do
+not abort startup. Live data selectivity and repeat execution are covered by
+the libSQL migration regression and `tests/postgres_settings_migrations.rs`,
+which runs in the PostgreSQL integration CI job against a session-local table.
+
 ## Study-Notes knowledge store (v2.0.6)
 
 The `WorkspaceStore` sub-trait carries three multi-scope knowledge methods

@@ -8,12 +8,85 @@ mod support;
 
 #[cfg(feature = "libsql")]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use lunarwing::agent::routine::{RoutineAction, Trigger};
+    use lunarwing::error::LlmError;
+    use lunarwing::llm::{
+        ChatMessage, CompletionRequest, CompletionResponse, LlmProvider, Role,
+        ToolCompletionRequest, ToolCompletionResponse,
+    };
 
     use crate::support::test_rig::TestRigBuilder;
-    use crate::support::trace_llm::LlmTrace;
+    use crate::support::trace_llm::{LlmTrace, TraceLlm};
+
+    /// Foreground traces and scheduled workers share an LLM in the real agent.
+    /// Keep the worker pending on its own request instead of letting it steal
+    /// the foreground's job_status step from the linear replay sequence.
+    struct ScheduledJobTrace {
+        foreground: TraceLlm,
+        worker_started: tokio::sync::Semaphore,
+    }
+
+    impl ScheduledJobTrace {
+        fn new(trace: LlmTrace) -> Self {
+            Self {
+                foreground: TraceLlm::from_trace(trace),
+                worker_started: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        async fn route(&self, messages: &[ChatMessage]) {
+            if messages.iter().any(|m| {
+                m.role == Role::System
+                    && m.content
+                        .starts_with("You are an autonomous agent working on a job.")
+            }) {
+                self.worker_started.add_permits(1);
+                std::future::pending::<()>().await;
+            }
+            // Force the CI race's ordering: the worker must have called the
+            // provider before foreground replay advances past create_job.
+            if messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("call_cj_1"))
+            {
+                let _permit =
+                    tokio::time::timeout(Duration::from_secs(5), self.worker_started.acquire())
+                        .await
+                        .expect("scheduled worker must request its own completion")
+                        .unwrap();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScheduledJobTrace {
+        fn model_name(&self) -> &str {
+            self.foreground.model_name()
+        }
+
+        fn cost_per_token(&self) -> (rust_decimal::Decimal, rust_decimal::Decimal) {
+            self.foreground.cost_per_token()
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            self.route(&request.messages).await;
+            self.foreground.complete(request).await
+        }
+
+        async fn complete_with_tools(
+            &self,
+            request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            self.route(&request.messages).await;
+            self.foreground.complete_with_tools(request).await
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Test 1: time_parse_and_diff
@@ -592,8 +665,9 @@ mod tests {
         ))
         .expect("failed to load job_create_status.json");
 
+        let llm = Arc::new(ScheduledJobTrace::new(trace.clone()));
         let rig = TestRigBuilder::new()
-            .with_trace(trace.clone())
+            .with_llm(llm.clone())
             .with_auto_approve_tools(true)
             .build()
             .await;
@@ -644,6 +718,13 @@ mod tests {
             "job_status should return the job title: {:?}",
             status_result.1
         );
+
+        assert_eq!(
+            llm.foreground.calls(),
+            3,
+            "only foreground requests consume the trace"
+        );
+        assert!(llm.worker_started.available_permits() > 0);
 
         rig.shutdown();
     }

@@ -42,7 +42,7 @@ and unclassifiable systemd states, absent optional units, and a stale deselected
 OpenRC worker supervisor. This also rechecks the class of omission reported on
 rejected MR !1181.
 
-Details: [Podman namespace repair](../bugs/BUG-workload-scope-podman-userns.md#the-repair-path-kept-for-already-broken-pairings).
+Details: [Podman namespace repair](../../bugs/BUG-workload-scope-podman-userns.md#the-repair-path-kept-for-already-broken-pairings).
 
 ### Startup detection destroyed live Podman metadata
 

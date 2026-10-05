@@ -26,7 +26,7 @@ system need not match the old host's.
 > selected worker containers. PostgreSQL stays up only for `pg_dump`. Export then
 > verifies all writers are quiesced. Plan a per-tenant maintenance window.
 
-> **Validation status.** The [Goal 12 real-web rehearsal](GOAL12_REAL_WEB_ACCEPTANCE.md)
+> **Validation status.** The [Goal 12 real-web rehearsal](history/GOAL12_REAL_WEB_ACCEPTANCE.md)
 > exercised encrypted export, wrong-password rejection, local `pg_restore` with
 > encrypted-secret/workspace verification, encrypted import dry-run, and source
 > restart. Production-script fixtures additionally cover manifest restrictions,
