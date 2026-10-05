@@ -684,11 +684,17 @@ that completion report; revival could unexpectedly run tools and send notificati
 Global startup logs a warning for each such record and sends best-effort recovery
 guidance through its configured notification channels when a last thread exists.
 This repeats at startup until the owner resumes, pauses, or deletes the mission.
-Inspect the history, then use `mission_resume(id=...)` as the owner to recover
-paused, completed or failed missions. Cron recovery computes its next future fire;
-missed occurrences/events are not replayed. Manual, non-managed missions retain
-the standalone goal-declaration completion contract. Downgrading restores the old
-phrase-driven completion behavior for recurring missions; no schema change is needed.
+One caveat before resuming (WI#319): before 2026-07-26, `mission_delete` recorded
+deletions as `Completed` rather than removing or tombstoning the record, so a
+parked Completed mission may be an intentional legacy delete rather than a
+phrase-driven completion. The guidance includes the mission's `created_at` and
+`updated_at`; timestamps before 2026-07-26 are the clue. Rule out an old delete
+first, then inspect the history and use `mission_resume(id=...)` as the owner to
+recover paused, completed or failed missions. Cron recovery computes its next
+future fire; missed occurrences/events are not replayed. Manual, non-managed
+missions retain the standalone goal-declaration completion contract. Downgrading
+restores the old phrase-driven completion behavior for recurring missions; no
+schema change is needed.
 
 `MissionManager::ensure_learning_missions()` provisions two baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement
