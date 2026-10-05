@@ -80,7 +80,7 @@ podman 4.3+ when the daemon uid is 1000); the tool description therefore says
 per-tool-call lines (DEBUG) need `SANDBOX_TENANT_LOGS=debug` plus a raised
 runtime level.
 
-Fresh-tenant acceptance steps: [WI#162 verification](../../../docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md).
+Fresh-tenant acceptance steps: [WI#162 verification](../../../docs/ops/history/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md).
 
 ### tool_list pagination and completeness (WI#245)
 

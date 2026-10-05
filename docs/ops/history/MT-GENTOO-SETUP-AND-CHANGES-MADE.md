@@ -3,7 +3,7 @@
 This document records the setup of a 3-tenant LunarWing multi-tenant deployment on a
 **Gentoo / OpenRC** host using **Podman** (instead of Docker), and every change made along
 the way. It is the experimental counterpart to the validated production path documented in
-[`MULTITENANCY-PRODUCTION.md`](MULTITENANCY-PRODUCTION.md), which assumes systemd + Docker.
+[`MULTITENANCY-PRODUCTION.md`](../MULTITENANCY-PRODUCTION.md), which assumes systemd + Docker.
 
 - **Host:** Gentoo, OpenRC (PID 1 = `init`), no systemd
 - **Container runtime:** Podman 5.8.2 (rootful, run by the admin script as root)

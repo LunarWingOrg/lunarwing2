@@ -208,7 +208,7 @@ registry-aware healthpoint aggregates it by tenant and exports
 `lunarwing_health_llm_streams_repl_argument_corruption_total{provider,tenant}`.
 Old snapshots without the field read as zero. Like other stream-integrity
 signals, this is monitor-only. See the
-[Goal 34 verification record](../ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md).
+[Goal 34 verification record](../ops/history/GOAL34_REPL_ARGUMENT_INTEGRITY.md).
 
 ### Two Execution Tiers
 
@@ -1233,7 +1233,7 @@ overlay storage identity and bridge path, the three gated writers, consumption
 semantics, the existing-thread retention caveat, safe enable/disable, and a
 read-only tenant inspection runbook (`mt-admin daemon-pid` / `mt-admin psql`)
 — is published in
-`docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
+`docs/ops/history/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
 `ORCHESTRATOR_SELF_MODIFY` unset or any value other than `true`/`1` makes
 stored overlays inert regardless of database contents; multi-tenant provisioning
 writes `ORCHESTRATOR_SELF_MODIFY=true` for new tenants while preserving an

@@ -6,7 +6,7 @@
 > compatibility aliases intentionally remain. Do not use this verdict as a
 > current removal-status report; re-run the allowlisted search against the target
 > commit and the archived
-> [`Near-Removal.md`](../specs/history/Near-Removal.md) requirements before
+> [`Near-Removal.md`](../../specs/history/Near-Removal.md) requirements before
 > making release claims.
 
 **Audited:** 2026-07-12
