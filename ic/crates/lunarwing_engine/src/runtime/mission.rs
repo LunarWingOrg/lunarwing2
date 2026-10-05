@@ -226,6 +226,17 @@ pub struct MissionUpdate {
     pub current_focus: Option<Option<String>>,
 }
 
+/// Outcome of [`MissionManager::create_mission_detailed`]: whether a new
+/// mission was persisted or an existing non-terminal same-named mission was
+/// returned (WI#311 review P-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateMissionOutcome {
+    pub id: MissionId,
+    /// True when the create deduped onto an existing mission; its goal,
+    /// cadence and schedule were left unchanged.
+    pub deduplicated: bool,
+}
+
 /// Manages mission lifecycle and thread spawning.
 pub struct MissionManager {
     store: Arc<dyn Store>,
@@ -596,6 +607,32 @@ impl MissionManager {
         cadence: MissionCadence,
         notify_channels: Vec<String>,
     ) -> Result<MissionId, EngineError> {
+        Ok(self
+            .create_mission_detailed(
+                project_id,
+                user_id,
+                name,
+                goal,
+                cadence,
+                notify_channels,
+            )
+            .await?
+            .id)
+    }
+
+    /// `create_mission` with the dedup decision reported: callers can surface
+    /// "returned the existing mission" instead of answering "created"
+    /// unconditionally (WI#311 review P-4 — a re-create with a different
+    /// cadence otherwise silently yields the old schedule).
+    pub async fn create_mission_detailed(
+        &self,
+        project_id: ProjectId,
+        user_id: impl Into<String>,
+        name: impl Into<String>,
+        goal: impl Into<String>,
+        cadence: MissionCadence,
+        notify_channels: Vec<String>,
+    ) -> Result<CreateMissionOutcome, EngineError> {
         validate_webhook_cadence(&cadence)?;
         validate_cadence_event_registration(&cadence)?;
         let user_id = user_id.into();
@@ -627,7 +664,10 @@ impl MissionManager {
                     "mission create deduped onto existing non-terminal mission"
                 );
             }
-            return Ok(existing.id);
+            return Ok(CreateMissionOutcome {
+                id: existing.id,
+                deduplicated: true,
+            });
         }
         // Webhook path ownership: a fire matches every Active mission on the
         // path regardless of owner, so an active path may only have one owner.
@@ -662,7 +702,10 @@ impl MissionManager {
         self.store.save_mission(&mission).await?;
         self.active.write().await.push(id);
         debug!(mission_id = %id, "mission created");
-        Ok(id)
+        Ok(CreateMissionOutcome {
+            id,
+            deduplicated: false,
+        })
     }
 
     /// Update mutable fields on a mission. Only non-None fields are applied.
