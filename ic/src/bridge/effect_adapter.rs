@@ -450,6 +450,10 @@ impl EffectBridgeAdapter {
             "total_runs": mission.thread_history.len(),
             "last_fired_at": mission.last_fired_at.map(|dt| dt.to_rfc3339()),
             "never_fired": !mission.has_fired(),
+            "created_at": mission.created_at.to_rfc3339(),
+            "updated_at": mission.updated_at.to_rfc3339(),
+            "threads_today": mission.threads_today,
+            "threads_today_date": mission.threads_today_date.map(|d| d.to_string()),
             "runs": runs,
         }))
     }
@@ -693,7 +697,7 @@ impl EffectBridgeAdapter {
                     .map(|max| max as u32);
                 match parse_cadence_with_secret(cadence_str, webhook_secret) {
                     Ok(cadence) => match mgr
-                        .create_mission(
+                        .create_mission_detailed(
                             context.project_id,
                             &context.user_id,
                             name,
@@ -703,7 +707,7 @@ impl EffectBridgeAdapter {
                         )
                         .await
                     {
-                        Ok(id) => {
+                        Ok(outcome) => {
                             // Apply the optional daily budget right after
                             // creation; the cron schedule was just set to a
                             // future fire time, so no run can race this.
@@ -713,13 +717,25 @@ impl EffectBridgeAdapter {
                                         max_threads_per_day: Some(max),
                                         ..Default::default()
                                     };
-                                    Some(mgr.update_mission(id, &context.user_id, updates).await)
+                                    Some(
+                                        mgr.update_mission(outcome.id, &context.user_id, updates)
+                                            .await,
+                                    )
                                 }
                                 None => None,
                             };
                             match budget_result {
                                 Some(Err(e)) => Err(e),
-                                _ => mission_created_info(mgr, id, max_threads_per_day).await,
+                                _ => {
+                                    mission_created_info(
+                                        mgr,
+                                        outcome.id,
+                                        max_threads_per_day,
+                                        outcome.deduplicated,
+                                        cadence_str,
+                                    )
+                                    .await
+                                }
                             }
                         }
                         Err(e) => Err(e),
@@ -748,10 +764,13 @@ impl EffectBridgeAdapter {
                                 "current_focus": m.current_focus,
                                 "notify_channels": m.notify_channels,
                                 "threads_today": m.threads_today,
+                                "threads_today_date": m.threads_today_date.map(|d| d.to_string()),
                                 "max_threads_per_day": m.max_threads_per_day,
                                 "budget_exhausted": budget_exhausted,
                                 "last_fired_at": m.last_fired_at.map(|dt| dt.to_rfc3339()),
                                 "never_fired": !m.has_fired(),
+                                "created_at": m.created_at.to_rfc3339(),
+                                "updated_at": m.updated_at.to_rfc3339(),
                             })
                         })
                         .collect();
@@ -1600,6 +1619,8 @@ async fn mission_created_info(
     mgr: &lunarwing_engine::MissionManager,
     id: lunarwing_engine::MissionId,
     max_threads_per_day: Option<u32>,
+    deduplicated: bool,
+    requested_cadence: &str,
 ) -> Result<serde_json::Value, EngineError> {
     let mission = mgr
         .get_mission(id)
@@ -1613,7 +1634,19 @@ async fn mission_created_info(
         "mission_status": format!("{:?}", mission.status),
         "project_id": mission.project_id.to_string(),
         "schedule": mission_schedule_info(&mission),
+        "created_at": mission.created_at.to_rfc3339(),
+        "updated_at": mission.updated_at.to_rfc3339(),
+        "deduplicated": deduplicated,
     });
+    if deduplicated {
+        // A same-named non-terminal mission was returned unchanged (WI#311
+        // review P-4): name the cadence actually requested so a schedule
+        // change attempt is visible next to the persisted schedule.cadence.
+        out["requested_cadence"] = serde_json::json!(requested_cadence);
+        out["note"] = serde_json::json!(
+            "existing non-terminal mission with this name returned unchanged; compare requested_cadence with schedule.cadence and use mission_update to change the schedule"
+        );
+    }
     if let Some(max) = max_threads_per_day {
         out["max_threads_per_day"] = serde_json::json!(max);
     }
