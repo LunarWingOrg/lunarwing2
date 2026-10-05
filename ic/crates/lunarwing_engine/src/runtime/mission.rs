@@ -5357,6 +5357,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_mission_detailed_reports_dedup() {
+        // WI#311 review P-4: a same-name re-create with a different cadence
+        // must be distinguishable from a fresh create.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+        let cadence = || MissionCadence::Cron {
+            expression: "0 10 * * *".into(),
+            timezone: None,
+        };
+
+        let first = mgr
+            .create_mission_detailed(project, "test-user", "digest", "digest", cadence(), vec![])
+            .await
+            .unwrap();
+        assert!(!first.deduplicated);
+        let second = mgr
+            .create_mission_detailed(
+                project,
+                "test-user",
+                "digest",
+                "digest",
+                MissionCadence::Cron {
+                    expression: "15 10 * * *".into(),
+                    timezone: None,
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(second.deduplicated);
+        assert_eq!(first.id, second.id);
+        // The persisted schedule is unchanged by the deduped re-create.
+        let persisted = store.load_mission(first.id).await.unwrap().unwrap();
+        assert_eq!(persisted.cadence, cadence());
+    }
+
+    #[tokio::test]
     async fn concurrent_mission_creates_of_same_name_dedupe_to_one() {
         // MR !876 review: the list/check/save dedupe sequence must be
         // serialized, or two concurrent creates of the same name can both
