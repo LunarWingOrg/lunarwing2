@@ -89,7 +89,10 @@ fn stopped_orchestrator_result(
     // Done downstream and the thread would render (and feed insights) as a
     // success it never achieved.
     if thread.state == ThreadState::Running {
-        thread.transition_to(ThreadState::Failed, Some("execution stopped".into()))?;
+        thread.transition_to(
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON.into()),
+        )?;
     }
     Ok(OrchestratorResult {
         outcome: ThreadOutcome::Stopped,
@@ -483,7 +486,7 @@ pub async fn execute_orchestrator(
                                 if thread.state == ThreadState::Running {
                                     thread.transition_to(
                                         ThreadState::Failed,
-                                        Some("stopped during LLM stream".into()),
+                                        Some(crate::types::thread::STREAM_STOPPED_REASON.into()),
                                     )?;
                                 }
                                 return Ok(OrchestratorResult {

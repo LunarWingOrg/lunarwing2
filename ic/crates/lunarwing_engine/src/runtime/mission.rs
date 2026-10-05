@@ -49,6 +49,26 @@ const RETRY_ATTEMPT_METADATA_KEY: &str = "retry_attempt";
 /// Marker for the debug line recorded when a join handle is lost before any
 /// outcome can be observed (interrupted lineage, WI#188).
 const JOIN_LOST_APPROACH_PREFIX: &str = "INTERRUPTED: thread join handle lost";
+/// Metadata key on a mission recording a fire whose thread had not settled
+/// when the daemon's shutdown wait ended (WI#276 review): the watcher's stop
+/// request landed but the run's own save can outlive the outcome wait, so
+/// the mission-side outcome is recorded immediately and this stamp is left
+/// for the boot sweep, which resolves it against the thread's final
+/// persisted state (`{"thread_id": ..., "recorded_at": ...}`).
+const PENDING_SHUTDOWN_INTERRUPTION_KEY: &str = "pending_shutdown_interruption";
+/// How long a mission run interrupted by daemon shutdown gets to stop and
+/// settle so its real outcome is recorded (WI#276). Kept well inside the
+/// time [`MissionManager::shutdown`] waits, leaving room to persist the
+/// outcome (retry marker, dedup release, mission save) after the stop lands.
+const SHUTDOWN_STOP_GRACE: Duration = Duration::from_secs(3);
+/// Upper bound [`MissionManager::shutdown`] waits for mission background
+/// work: the stop grace plus a margin for the watcher's post-stop database
+/// writes. The mission row (history + dedup release) is saved before the
+/// retry marker, so an abort in that window leaves either no trace (the
+/// clean pre-WI#188 loss) or a mission row without a marker — never a
+/// marker whose dedup release never saved. Markers written in the opposite
+/// order by older builds are healed by the next boot's retry recovery.
+const SHUTDOWN_SETTLE_BUDGET: Duration = Duration::from_secs(8);
 
 const MANAGED_RECURRING_METADATA_KEY: &str = "managed_recurring";
 const MANAGED_DEFINITION_VERSION_KEY: &str = "managed_definition_version";
@@ -397,10 +417,19 @@ impl MissionManager {
     }
 
     /// Stop mission background work and wait for each task to settle.
+    ///
+    /// The wait is sized as the outcome watcher's stop grace plus a margin
+    /// for its post-stop writes (WI#276): a watcher interrupted mid-run
+    /// requests the stop, waits up to [`SHUTDOWN_STOP_GRACE`] for the run to
+    /// settle, then saves the mission row and persists the retry marker as
+    /// the final commit write. A run that outlives the grace is recorded on
+    /// the mission row and stamped for the boot sweep instead, so an abort
+    /// of the watcher can no longer strand a retry marker without its
+    /// mission-side dedup release.
     pub async fn shutdown(&self) {
         self.task_cancel.cancel();
         let handles = std::mem::take(&mut *self.task_handles.lock().await);
-        if tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        if tokio::time::timeout(SHUTDOWN_SETTLE_BUDGET, async {
             while handles.iter().any(|handle| !handle.is_finished()) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -408,7 +437,10 @@ impl MissionManager {
         .await
         .is_err()
         {
-            warn!("mission background tasks did not stop before timeout; aborting them");
+            warn!(
+                "mission background tasks did not stop before timeout; aborting them \
+                 (an aborted outcome watcher is healed by retry recovery at the next boot)"
+            );
             for handle in &handles {
                 handle.abort();
             }
@@ -487,6 +519,10 @@ impl MissionManager {
     /// Legacy Completed recurring missions need an explicit owner decision:
     /// resuming can run tools/send notifications after the owner accepted a
     /// previous completion report. Warn at each boot rather than revive work.
+    /// Before 2026-07-26 `mission_delete` recorded deletions as Completed
+    /// (WI#319), so the guidance includes the mission's created/updated
+    /// timestamps and tells the operator to rule out an intentional legacy
+    /// delete before resuming.
     async fn report_parked_recurring_missions(&self) {
         let missions = match self.store.list_all_missions_global().await {
             Ok(missions) => missions,
@@ -504,8 +540,8 @@ impl MissionManager {
                 continue;
             }
             let response = format!(
-                "Recurring mission is Completed and will not fire. Earlier versions could complete it after a single successful run. Review its history, then call mission_resume(id=\"{}\") to resume future triggers, or mission_pause to keep it stopped. Missed triggers are not replayed.",
-                mission.id
+                "Recurring mission is Completed and will not fire. Earlier versions could complete it after a single successful run. Rule out an old delete before resuming: before 2026-07-26, mission_delete recorded deletions as Completed, and this mission was created {} / last updated {}. Review its history, then call mission_resume(id=\"{}\") to resume future triggers, or mission_pause to keep it stopped. Missed triggers are not replayed.",
+                mission.created_at, mission.updated_at, mission.id
             );
             warn!(mission_id = %mission.id, user_id = %mission.user_id, "{response}");
             if let Some(&thread_id) = mission.thread_history.last() {
@@ -2207,50 +2243,64 @@ impl MissionManager {
         // a Weak never awaits, so the coroutine's opaque type stays flat.
         let retry_mgr = self.weak_self.read().await.clone();
         let handle = tokio::spawn(async move {
-            let outcome = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let _ = tm.stop_thread_system(thread_id).await;
-                    let joined = tm.join_thread(thread_id).await;
-                    if cancel.is_cancelled() {
-                        // Torn down by daemon shutdown: neither record the
-                        // outcome nor schedule a retry — the post-restart
-                        // checkpoint sweep owns anything still resumable.
-                        return;
-                    }
-                    joined
-                },
-                outcome = tm.join_thread(thread_id) => outcome,
-            };
+            // WI#276: the thread stays registered while it runs, so on daemon
+            // shutdown the stop actually lands and the run's real outcome is
+            // processed below. The old watcher joined first — taking the
+            // handle out of the running set — so its shutdown stop missed,
+            // the run was dropped mid-await, and the fire was lost silently.
+            let outcome = tm
+                .wait_thread_or_stop(thread_id, &cancel, SHUTDOWN_STOP_GRACE)
+                .await;
+            let shutting_down = cancel.is_cancelled();
             match outcome {
-                Ok(outcome) => {
+                Ok(Some(outcome)) => {
                     let lock = mission_lock(&fire_locks, mission_id).await;
                     let _guard = lock.lock().await;
+                    // A Stopped outcome records the interruption, releases the
+                    // trigger dedup key and persists the retry marker on the
+                    // now-terminal thread.
                     match process_mission_outcome_and_notify(
                         &store,
                         mission_id,
                         thread_id,
                         &outcome,
                         &notification_tx,
+                        shutting_down,
                     )
                     .await
                     {
                         Err(e) => {
                             debug!(mission_id = %mission_id, "failed to process outcome: {e}");
                         }
+                        Ok(Some(_pending)) if shutting_down => {
+                            // An in-process retry timer would die with the
+                            // daemon; the persisted marker is re-armed by the
+                            // post-restart sweep instead.
+                            debug!(
+                                mission_id = %mission_id,
+                                %thread_id,
+                                "mission fire interrupted by shutdown; retry persisted for restart"
+                            );
+                        }
                         Ok(Some(pending)) => {
                             drop(_guard);
-                            if let Some(mgr) = retry_mgr.as_ref().and_then(Weak::upgrade) {
-                                // `schedule_retry` returns a BoxFuture: the
-                                // type-erased wake keeps the watcher → wake →
-                                // re-fire → watcher opaque-type recursion
-                                // finite (WI#188).
-                                mgr.schedule_retry(pending).await;
-                            } else {
-                                debug!(mission_id = %mission_id, "retry wake unavailable; dropping scheduled retry");
-                            }
+                            wake_scheduled_retry(&retry_mgr, mission_id, pending).await;
                         }
                         Ok(None) => {}
                     }
+                }
+                Ok(None) => {
+                    // Shutdown, and the run did not stop within the grace: its
+                    // own final save can still land during teardown, so the
+                    // thread row is the race and stays off-limits. Record the
+                    // interruption on the mission row only and stamp it for the
+                    // boot sweep, which resolves the stamp against the thread's
+                    // final persisted state (WI#276 review).
+                    record_unsettled_shutdown_fire(&store, &fire_locks, mission_id, thread_id)
+                        .await;
+                }
+                Err(e) if shutting_down => {
+                    debug!(mission_id = %mission_id, %thread_id, "thread join failed during shutdown: {e}");
                 }
                 Err(e) => {
                     // Tri-state (WI#188): a lost join handle is an
@@ -2264,15 +2314,7 @@ impl MissionManager {
                         }
                         Ok(Some(pending)) => {
                             drop(_guard);
-                            if let Some(mgr) = retry_mgr.as_ref().and_then(Weak::upgrade) {
-                                // `schedule_retry` returns a BoxFuture: the
-                                // type-erased wake keeps the watcher → wake →
-                                // re-fire → watcher opaque-type recursion
-                                // finite (WI#188).
-                                mgr.schedule_retry(pending).await;
-                            } else {
-                                debug!(mission_id = %mission_id, "retry wake unavailable; dropping scheduled retry");
-                            }
+                            wake_scheduled_retry(&retry_mgr, mission_id, pending).await;
                         }
                         Ok(None) => {
                             debug!(mission_id = %mission_id, "thread join failed: {e}");
@@ -2410,19 +2452,21 @@ impl MissionManager {
         }
     }
 
-    /// Post-restart sweep: re-arm retries for mission threads that recorded
-    /// a pending retry before the daemon stopped (WI#188). Without this the
-    /// in-memory retry timers vanish with the process.
-    ///
-    /// Call after thread checkpoint recovery: threads still holding a
-    /// `mission_retry` marker are supposed to be terminal — a Suspended row
-    /// means checkpoint recovery already owns its future, so the sweep
-    /// clears the marker instead of double-scheduling.
     #[cfg(test)]
     pub(crate) fn store_arc(&self) -> Arc<dyn Store> {
         Arc::clone(&self.store)
     }
 
+    /// Post-restart sweep: re-arm retries for mission threads that recorded
+    /// a pending retry before the daemon stopped (WI#188). Without this the
+    /// in-memory retry timers vanish with the process. Fires interrupted by a
+    /// graceful shutdown persist their marker too, via the outcome watcher's
+    /// shutdown stop (WI#276).
+    ///
+    /// Call after thread checkpoint recovery: threads still holding a
+    /// `mission_retry` marker are supposed to be terminal — a Suspended row
+    /// means checkpoint recovery already owns its future, so the sweep
+    /// clears the marker instead of double-scheduling.
     pub async fn recover_pending_mission_retries(&self) -> Result<Vec<MissionId>, EngineError> {
         let mut admitted = self.recovered_retries.lock().await;
         let mut scheduled = Vec::new();
@@ -2467,6 +2511,23 @@ impl MissionManager {
                 else {
                     break;
                 };
+                // Shutdown-abort heal (WI#276 review): markers persisted by
+                // older builds were written before the mission's dedup
+                // release, so an abort in between can leave a marker whose
+                // payload is still dedup-recorded — the re-fire would be
+                // suppressed as already processed on every boot. New markers
+                // are the commit write (they imply the release landed), but
+                // the heal stays for the upgrade path.
+                self.release_stale_trigger_key_for_retry(&mission, &pending)
+                    .await;
+                // The retry notice persisted as undelivered (the
+                // shutdown-time broadcast had no live consumer) is owed to
+                // the mission's channels now (WI#276 review): emit it once
+                // and acknowledge it on the marker, the same pattern as
+                // WI#301's restart-loss acknowledgement.
+                if !state.notified {
+                    self.notify_rearmed_retry(&mission, &thread, &state).await;
+                }
                 // Keep the durable marker until the retry actually spawns.
                 // Clearing it at timer admission loses the retry on another boot.
                 self.schedule_retry(pending.with_source_thread(thread.id))
@@ -2477,6 +2538,276 @@ impl MissionManager {
             }
         }
         Ok(scheduled)
+    }
+
+    /// Heal the shutdown abort window for markers persisted by older builds
+    /// (WI#276 review): those were written before the mission's trigger-dedup
+    /// release, so a shutdown abort in between can leave a marker whose
+    /// payload is still dedup-recorded — the re-armed retry would be
+    /// suppressed as already processed, and with the marker kept until spawn
+    /// (WI#301) it would re-arm and be suppressed on every boot. Release the
+    /// stale key before scheduling so the retry can actually fire. Every
+    /// marker-writing path also releases the key, so a recorded key beside a
+    /// live marker on the newest fire is always this inconsistency.
+    async fn release_stale_trigger_key_for_retry(
+        &self,
+        mission: &Mission,
+        pending: &PendingMissionRetry,
+    ) {
+        let Some(key) = pending.payload.as_ref().and_then(trigger_dedup_key) else {
+            return;
+        };
+        if !mission.has_processed_trigger(&key) {
+            return;
+        }
+        // Re-load under the fire lock: the snapshot from the global listing
+        // may be stale, and a concurrent fire must not lose its own key.
+        let lock = mission_lock(&self.fire_locks, mission.id).await;
+        let _guard = lock.lock().await;
+        let Ok(Some(mut current)) = self.store.load_mission(mission.id).await else {
+            return;
+        };
+        if !current.has_processed_trigger(&key) {
+            return;
+        }
+        current.processed_trigger_keys.retain(|k| k != &key);
+        current.updated_at = Utc::now();
+        match self.store.save_mission(&current).await {
+            Ok(()) => {
+                debug!(
+                    mission_id = %mission.id,
+                    dedup_key = %key,
+                    "released stale trigger dedup key during retry recovery (shutdown abort window)"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    mission_id = %mission.id,
+                    dedup_key = %key,
+                    %error,
+                    "failed to release stale trigger dedup key for retry recovery"
+                );
+            }
+        }
+    }
+
+    /// Emit and acknowledge the boot-time notice for a re-armed retry whose
+    /// original notice never reached a receiver (WI#276 review): a marker
+    /// persisted during daemon shutdown is written with `notified: false`
+    /// because the broadcast consumer is already gone. The acknowledgement
+    /// rides the persisted marker itself, so a crash between the notice and
+    /// the save simply repeats the notice at the next boot — the same
+    /// best-effort semantics as WI#301's restart-loss acknowledgement.
+    async fn notify_rearmed_retry(
+        &self,
+        mission: &Mission,
+        thread: &crate::types::thread::Thread,
+        state: &RetryState,
+    ) {
+        if !mission.notify_channels.is_empty() {
+            // Best-effort: ignore send errors (no subscribers = no problem).
+            let _ = self.notification_tx.send(MissionNotification {
+                mission_id: mission.id,
+                mission_name: mission.name.clone(),
+                thread_id: thread.id,
+                user_id: thread.user_id.clone(),
+                notify_channels: mission.notify_channels.clone(),
+                response: Some(format!(
+                    "Mission fire interrupted; retry {} of {} re-armed after daemon restart",
+                    state.attempt, mission.retry_policy.max_retries
+                )),
+                is_error: true,
+            });
+        }
+        let mut acked = state.clone();
+        acked.notified = true;
+        let mut updated = thread.clone();
+        if let serde_json::Value::Object(map) = &mut updated.metadata {
+            map.insert(RetryState::METADATA_KEY.to_string(), acked.to_value());
+        } else {
+            updated.metadata = serde_json::json!({ RetryState::METADATA_KEY: acked.to_value() });
+        }
+        if let Err(e) = self.store.save_thread(&updated).await {
+            debug!(thread_id = %thread.id, %e, "failed to acknowledge retry notice on the marker");
+        }
+    }
+
+    /// Post-restart resolution (WI#276 review): a graceful shutdown whose
+    /// outcome wait expired stamped the mission with a pending shutdown
+    /// interruption. Resolve each stamp against the thread's final persisted
+    /// state — the stopped run's own save lands during teardown, after the
+    /// watcher's grace, and no watcher remains to process it.
+    ///
+    /// - `Failed` with a host-stop reason (the stop landed, just late): plan
+    ///   the retry the watcher would have planned, persist the marker,
+    ///   schedule the wake, and emit the interruption notice.
+    /// - `Failed` by restart (the process died before the run's own save):
+    ///   WI#301's record pass owns the fire — just clear the stamp.
+    /// - `Completed`/`Done`: the run actually finished during teardown —
+    ///   record the resolution; the fire is not retried.
+    /// - `Failed` with any other reason: the run failed on its own during
+    ///   teardown. Record-only: the persisted row does not carry the failure
+    ///   kind, so a retryable failure cannot be told apart from budget
+    ///   exhaustion, and WI#302 forbids retrying the latter.
+    /// - `Suspended`/`Waiting`: checkpoint or gate recovery owns the thread.
+    /// - Anything else (still live, unreadable): leave the stamp for the
+    ///   next boot.
+    ///
+    /// Returns the missions whose stamp was resolved.
+    pub async fn resolve_pending_shutdown_interruptions(
+        &self,
+    ) -> Result<Vec<MissionId>, EngineError> {
+        let mut resolved = Vec::new();
+        for mission in self.store.list_all_missions_global().await? {
+            if stamped_interrupted_thread(&mission).is_none() {
+                continue;
+            }
+            let lock = mission_lock(&self.fire_locks, mission.id).await;
+            let _guard = lock.lock().await;
+            // Re-load under the fire lock: the listing snapshot may be stale,
+            // and a concurrent fire must not interleave with the resolution.
+            let Some(mut current) = self.store.load_mission(mission.id).await? else {
+                continue;
+            };
+            let Some(thread_id) = stamped_interrupted_thread(&current) else {
+                continue;
+            };
+            if self
+                .resolve_stamped_interruption(&mut current, thread_id)
+                .await?
+            {
+                resolved.push(mission.id);
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Resolve one mission's shutdown-interruption stamp against the stamped
+    /// thread's final state (see [`Self::resolve_pending_shutdown_interruptions`]).
+    /// Returns true when the stamp was cleared.
+    async fn resolve_stamped_interruption(
+        &self,
+        mission: &mut Mission,
+        thread_id: ThreadId,
+    ) -> Result<bool, EngineError> {
+        let Some(thread) = self.store.load_thread(thread_id).await? else {
+            // The thread record is gone; nothing left to resolve against.
+            clear_shutdown_interruption_stamp(mission);
+            mission.updated_at = Utc::now();
+            self.store.save_mission(mission).await?;
+            return Ok(true);
+        };
+        match thread.state {
+            ThreadState::Failed if thread.is_failed_by_restart() => {
+                clear_shutdown_interruption_stamp(mission);
+                mission.updated_at = Utc::now();
+                self.store.save_mission(mission).await?;
+                Ok(true)
+            }
+            ThreadState::Failed if is_settled_host_stop(&thread) => {
+                self.resolve_settled_stop(mission, thread_id).await?;
+                Ok(true)
+            }
+            ThreadState::Failed => {
+                let entry = format!(
+                    "SHUTDOWN RESOLUTION: run {thread_id} failed on its own during teardown; \
+                     recorded, not auto-refired"
+                );
+                if !mission.approach_history.contains(&entry) {
+                    mission.record_approach(entry);
+                }
+                clear_shutdown_interruption_stamp(mission);
+                mission.updated_at = Utc::now();
+                self.store.save_mission(mission).await?;
+                Ok(true)
+            }
+            ThreadState::Completed | ThreadState::Done => {
+                let entry = format!(
+                    "SHUTDOWN RESOLUTION: run {thread_id} completed during teardown; \
+                     the fire is not retried"
+                );
+                if !mission.approach_history.contains(&entry) {
+                    mission.record_approach(entry);
+                }
+                clear_shutdown_interruption_stamp(mission);
+                mission.updated_at = Utc::now();
+                self.store.save_mission(mission).await?;
+                Ok(true)
+            }
+            ThreadState::Suspended | ThreadState::Waiting => {
+                // Checkpoint resume or pending-gate reconciliation owns the
+                // thread's future from here.
+                clear_shutdown_interruption_stamp(mission);
+                mission.updated_at = Utc::now();
+                self.store.save_mission(mission).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// The stop request landed but the run's save outlived the watcher's
+    /// grace: plan and persist the retry the watcher would have, schedule
+    /// its wake, and emit the interruption notice at boot (WI#276 review).
+    /// A non-Active mission is only unstamped — its stop was an operator
+    /// decision, not an interruption.
+    async fn resolve_settled_stop(
+        &self,
+        mission: &mut Mission,
+        thread_id: ThreadId,
+    ) -> Result<(), EngineError> {
+        if mission.status == MissionStatus::Active {
+            let pending =
+                plan_outcome_retry(&self.store, mission, thread_id, "shutdown settle").await;
+            let notified = self.notify_shutdown_interruption(mission, thread_id, pending.as_ref());
+            if let Some(pending) = pending {
+                if let Err(e) =
+                    persist_retry_marker(&*self.store, thread_id, &pending, notified).await
+                {
+                    debug!(%thread_id, %e, "failed to persist retry marker");
+                }
+                self.schedule_retry(pending.with_source_thread(thread_id))
+                    .await;
+            }
+        }
+        clear_shutdown_interruption_stamp(mission);
+        mission.updated_at = Utc::now();
+        self.store.save_mission(mission).await?;
+        Ok(())
+    }
+
+    /// Boot-time notice for a fire whose stop settled after the shutdown
+    /// grace: mirrors the Stopped outcome arm's wording. Returns whether the
+    /// notice reached a receiver (or there was nothing to deliver), feeding
+    /// the retry marker's `notified` flag.
+    fn notify_shutdown_interruption(
+        &self,
+        mission: &Mission,
+        thread_id: ThreadId,
+        pending: Option<&PendingMissionRetry>,
+    ) -> bool {
+        if mission.notify_channels.is_empty() {
+            return true;
+        }
+        let response = match pending {
+            Some(p) => format!(
+                "Mission fire interrupted by daemon shutdown; retry {} of {} scheduled",
+                p.attempt, mission.retry_policy.max_retries
+            ),
+            None => "Mission fire interrupted by daemon shutdown; no retries left".to_string(),
+        };
+        // Best-effort: ignore send errors (no subscribers = no problem).
+        self.notification_tx
+            .send(MissionNotification {
+                mission_id: mission.id,
+                mission_name: mission.name.clone(),
+                thread_id,
+                user_id: mission.user_id.clone(),
+                notify_channels: mission.notify_channels.clone(),
+                response: Some(response),
+                is_error: true,
+            })
+            .is_ok()
     }
 
     /// Post-restart bookkeeping (WI#301): for every mission thread the
@@ -2641,6 +2972,9 @@ impl PendingMissionRetry {
             payload: self.payload.clone(),
             not_before: self.not_before,
             lineage: Vec::new(),
+            // Filled in by the marker write, which knows whether the retry
+            // notice reached a receiver (WI#276 review).
+            notified: false,
         }
     }
 }
@@ -2679,6 +3013,102 @@ async fn handle_mission_thread_interrupted(
     mission.updated_at = Utc::now();
     store.save_mission(&mission).await?;
     Ok(pending)
+}
+
+/// Fire a scheduled retry through the manager's weak self-handle. The
+/// type-erased `schedule_retry` BoxFuture keeps the watcher → wake → re-fire
+/// → watcher opaque-type recursion finite (WI#188).
+async fn wake_scheduled_retry(
+    retry_mgr: &Option<Weak<MissionManager>>,
+    mission_id: MissionId,
+    pending: PendingMissionRetry,
+) {
+    if let Some(mgr) = retry_mgr.as_ref().and_then(Weak::upgrade) {
+        mgr.schedule_retry(pending).await;
+    } else {
+        debug!(mission_id = %mission_id, "retry wake unavailable; dropping scheduled retry");
+    }
+}
+
+/// The run did not settle within the shutdown grace: its own final save can
+/// still land during teardown, so only the mission row is written (the
+/// thread row is the race). Records the interruption, releases the trigger
+/// dedup key so a redelivery can re-fire, and stamps the mission for the
+/// boot sweep, which resolves the stamp against the thread's final
+/// persisted state (WI#276 review). Without this the fire was a silent
+/// loss: the stopped run later persists `Failed("execution stopped")` with
+/// no restart stamp, so restart recovery skips it and no retry marker or
+/// dedup release exists.
+async fn record_unsettled_shutdown_fire(
+    store: &Arc<dyn Store>,
+    fire_locks: &MissionLockRegistry,
+    mission_id: MissionId,
+    thread_id: ThreadId,
+) {
+    let lock = mission_lock(fire_locks, mission_id).await;
+    let _guard = lock.lock().await;
+    let mut mission = match store.load_mission(mission_id).await {
+        Ok(Some(mission)) => mission,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(mission_id = %mission_id, %thread_id, "failed to load mission for shutdown interruption record: {e}");
+            return;
+        }
+    };
+    mission.record_approach(format!(
+        "INTERRUPTED: shutdown while the thread was still stopping ({thread_id})"
+    ));
+    release_terminal_trigger_key(&mut mission, &ThreadOutcome::Stopped);
+    let stamp = serde_json::json!({
+        "thread_id": thread_id,
+        "recorded_at": Utc::now().to_rfc3339(),
+    });
+    if let serde_json::Value::Object(map) = &mut mission.metadata {
+        map.insert(PENDING_SHUTDOWN_INTERRUPTION_KEY.to_string(), stamp);
+    } else {
+        mission.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: stamp });
+    }
+    mission.updated_at = Utc::now();
+    if let Err(e) = store.save_mission(&mission).await {
+        warn!(mission_id = %mission_id, %thread_id, "failed to record unsettled shutdown fire: {e}");
+    }
+}
+
+/// The thread id named by a mission's pending-shutdown-interruption stamp
+/// (WI#276 review), if the mission carries a well-formed one.
+fn stamped_interrupted_thread(mission: &Mission) -> Option<ThreadId> {
+    mission
+        .metadata
+        .get(PENDING_SHUTDOWN_INTERRUPTION_KEY)
+        .and_then(|stamp| stamp.get("thread_id"))
+        .and_then(|value| serde_json::from_value::<ThreadId>(value.clone()).ok())
+}
+
+/// Clear the pending-shutdown-interruption stamp once the boot sweep has
+/// resolved it (WI#276 review).
+fn clear_shutdown_interruption_stamp(mission: &mut Mission) {
+    if let serde_json::Value::Object(map) = &mut mission.metadata {
+        map.remove(PENDING_SHUTDOWN_INTERRUPTION_KEY);
+    }
+}
+
+/// Whether the thread's terminal transition records a host-requested stop —
+/// the shutdown stop request landed during teardown, after the watcher's
+/// grace — rather than a genuine failure (WI#276 review).
+fn is_settled_host_stop(thread: &crate::types::thread::Thread) -> bool {
+    thread
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            crate::types::event::EventKind::StateChanged {
+                to: ThreadState::Failed,
+                reason,
+                ..
+            } => Some(crate::types::thread::is_host_stop_reason(reason.as_deref())),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn validate_webhook_cadence(cadence: &MissionCadence) -> Result<(), EngineError> {
@@ -3012,8 +3442,15 @@ async fn process_mission_outcome(
     outcome: &ThreadOutcome,
 ) -> Result<Option<PendingMissionRetry>, EngineError> {
     let (notification_tx, _) = tokio::sync::broadcast::channel(1);
-    process_mission_outcome_and_notify(store, mission_id, thread_id, outcome, &notification_tx)
-        .await
+    process_mission_outcome_and_notify(
+        store,
+        mission_id,
+        thread_id,
+        outcome,
+        &notification_tx,
+        false,
+    )
+    .await
 }
 
 async fn process_mission_outcome_and_notify(
@@ -3022,161 +3459,278 @@ async fn process_mission_outcome_and_notify(
     thread_id: ThreadId,
     outcome: &ThreadOutcome,
     notification_tx: &tokio::sync::broadcast::Sender<MissionNotification>,
+    shutting_down: bool,
 ) -> Result<Option<PendingMissionRetry>, EngineError> {
     let mut mission = match store.load_mission(mission_id).await? {
         Some(m) => m,
         None => return Ok(None),
     };
 
-    // Build notification fields while processing the outcome.
-    let mut notify_response: Option<String> = None;
-    let mut is_error = false;
-    // Populated by the non-completed arms when the mission's retry policy
-    // schedules a re-fire for them (WI#188).
-    let mut pending_retry: Option<PendingMissionRetry> = None;
+    let effects = apply_outcome_to_mission(store, &mut mission, thread_id, outcome).await;
+    release_terminal_trigger_key(&mut mission, outcome);
 
+    // Durable writes are ordered so every crash prefix is self-consistent
+    // (WI#276 review): the mission row (approach history + dedup release)
+    // lands first and the retry marker is the final commit write. An abort
+    // before the marker leaves no marker — the clean pre-WI#188 loss, with
+    // the dedup key already released for redelivery — never a marker whose
+    // mission-side release never saved. Markers written in the opposite
+    // order by older builds are healed by the boot sweep.
+    mission.updated_at = chrono::Utc::now();
+    store.save_mission(&mission).await?;
+
+    let notified = send_outcome_notification(
+        notification_tx,
+        &mission,
+        thread_id,
+        effects.notify_response,
+        effects.is_error,
+        shutting_down,
+    );
+
+    if let Some(pending) = &effects.pending_retry
+        && let Err(e) = persist_retry_marker(&**store, thread_id, pending, notified).await
+    {
+        debug!(%thread_id, %e, "failed to persist retry marker");
+    }
+    Ok(effects.pending_retry)
+}
+
+/// Notification/retry effects of folding a terminal outcome into the mission
+/// record (extracted from the outcome processor so both stay under the
+/// repo's 100-line rule, WI#276 review).
+struct OutcomeEffects {
+    notify_response: Option<String>,
+    is_error: bool,
+    pending_retry: Option<PendingMissionRetry>,
+}
+
+impl OutcomeEffects {
+    fn quiet() -> Self {
+        Self {
+            notify_response: None,
+            is_error: false,
+            pending_retry: None,
+        }
+    }
+}
+
+/// Fold a terminal thread outcome into the mission record, returning the
+/// notification and retry effects of the arm that handled it.
+async fn apply_outcome_to_mission(
+    store: &Arc<dyn Store>,
+    mission: &mut Mission,
+    thread_id: ThreadId,
+    outcome: &ThreadOutcome,
+) -> OutcomeEffects {
     match outcome {
         ThreadOutcome::Completed {
             response: Some(text),
-        } => {
-            // Check if goal achieved — only an explicit line-anchored
-            // declaration counts (see `declares_goal_achieved`).
-            if !keeps_running_after_success(&mission) && declares_goal_achieved(text) {
-                debug!(mission_id = %mission_id, "goal achieved — completing mission");
-                mission.status = MissionStatus::Completed;
-            }
-
-            // Extract next focus (look for "next focus:" pattern)
-            let lower = text.to_lowercase();
-            if !is_conversation_insights_mission(&mission)
-                && let Some(focus_start) = lower.find("next focus:")
-            {
-                let after = &text[focus_start + "next focus:".len()..];
-                let next_focus: String = after.lines().next().unwrap_or("").trim().to_string();
-                if !next_focus.is_empty() {
-                    mission.current_focus = Some(next_focus);
-                }
-            }
-
-            // Record approach (full response — LLM output is never truncated;
-            // the history itself is FIFO-bounded via record_approach)
-            mission.record_approach(text.clone());
-            notify_response = Some(text.clone());
-
-            // If this is a self-improvement mission, process structured output
-            if is_self_improvement_mission(&mission)
-                && let Err(e) = process_self_improvement_output(
-                    store,
-                    &mission,
-                    text,
-                    crate::executor::orchestrator::self_modification_enabled(),
-                )
-                .await
-            {
-                debug!(
-                    mission_id = %mission_id,
-                    "failed to process self-improvement output: {e}"
-                );
-            }
+        } => completed_outcome_effects(store, mission, text).await,
+        ThreadOutcome::Completed { response: None } => OutcomeEffects::quiet(),
+        ThreadOutcome::Stopped if mission.status != MissionStatus::Active => {
+            // Stopped because the mission itself was paused or retired (e.g.
+            // pausing conversation-insights stops its workers): an operator
+            // decision, not an interruption — no retry, no error notice
+            // (WI#276 made these stops land).
+            mission.record_approach(format!(
+                "STOPPED: mission {:?} while the thread ran",
+                mission.status
+            ));
+            OutcomeEffects::quiet()
         }
-        ThreadOutcome::Completed { response: None } => {}
         ThreadOutcome::Stopped => {
             // Tri-state (WI#188): a signal-stopped thread is an interruption,
             // not an empty arm — record it, notify as error, retry.
             mission.record_approach("INTERRUPTED: signal-stopped mid-run".to_string());
-            pending_retry = plan_outcome_retry(store, &mission, thread_id, "interrupted").await;
-            notify_response = Some(match pending_retry.as_ref() {
-                Some(p) => format!(
-                    "Mission thread interrupted (signal-stopped); retry {} of {} scheduled",
-                    p.attempt, mission.retry_policy.max_retries
-                ),
-                None => "Mission thread interrupted (signal-stopped); no retries left".into(),
-            });
-            is_error = true;
-        }
-        ThreadOutcome::Failed { error, kind } => {
-            mission.record_approach(format!("FAILED: {error}"));
-            if matches!(kind, ThreadFailureKind::BudgetExhausted) {
-                // WI#302: budget exhaustion is deliberate work exhaustion,
-                // not a transient failure — auto-retrying would hand each
-                // re-fire a fresh budget (up to 4x the configured spend per
-                // fire). Notify once, like MaxIterations; never auto-retry.
-                notify_response = Some(format!(
-                    "Mission stopped: {error} Not retrying automatically; retry with a narrower scope or a higher budget"
-                ));
-            } else {
-                // WI#188: terminal failures get a retry slot when the policy has
-                // attempts left; the failure kind does not change the contract —
-                // the daily budget and max_retries are the guardrails.
-                pending_retry = plan_outcome_retry(store, &mission, thread_id, "failed").await;
-                notify_response = Some(match pending_retry.as_ref() {
+            let pending_retry = plan_outcome_retry(store, mission, thread_id, "interrupted").await;
+            OutcomeEffects {
+                notify_response: Some(match pending_retry.as_ref() {
                     Some(p) => format!(
-                        "Mission failed: {error} (retry {} of {} scheduled)",
+                        "Mission thread interrupted (signal-stopped); retry {} of {} scheduled",
                         p.attempt, mission.retry_policy.max_retries
                     ),
-                    None => format!("Mission failed: {error}"),
-                });
+                    None => "Mission thread interrupted (signal-stopped); no retries left".into(),
+                }),
+                is_error: true,
+                pending_retry,
             }
-            is_error = true;
+        }
+        ThreadOutcome::Failed { error, kind } => {
+            failed_outcome_effects(store, mission, thread_id, error, kind).await
         }
         ThreadOutcome::MaxIterations => {
             // Deliberate work exhaustion with a model-facing suggestion —
             // notified as an error, never auto-retried (WI#188) so the
             // suggestion is not drowned out by immediate re-runs.
             mission.record_approach("Hit max iterations after final recovery".to_string());
-            notify_response = Some(
-                "Mission hit max iterations after final recovery; retry with narrower scope or a higher iteration limit"
-                    .into(),
-            );
-            is_error = true;
+            OutcomeEffects {
+                notify_response: Some(
+                    "Mission hit max iterations after final recovery; retry with narrower scope or a higher iteration limit"
+                        .into(),
+                ),
+                is_error: true,
+                pending_retry: None,
+            }
         }
-        _ => {}
+        _ => OutcomeEffects::quiet(),
+    }
+}
+
+/// The `Completed { response: Some(text) }` arm: goal declaration, next
+/// focus, approach history, and self-improvement output processing.
+async fn completed_outcome_effects(
+    store: &Arc<dyn Store>,
+    mission: &mut Mission,
+    text: &str,
+) -> OutcomeEffects {
+    // Check if goal achieved — only an explicit line-anchored
+    // declaration counts (see `declares_goal_achieved`).
+    if !keeps_running_after_success(mission) && declares_goal_achieved(text) {
+        debug!(mission_id = %mission.id, "goal achieved — completing mission");
+        mission.status = MissionStatus::Completed;
     }
 
-    // Only terminal non-completions relinquish the trigger. GatePaused still
-    // owns a resumable thread: redelivery during approval must not double-fire.
-    // A retried fire re-records the key when it eventually spawns.
-    if matches!(
+    // Extract next focus (look for "next focus:" pattern)
+    let lower = text.to_lowercase();
+    if !is_conversation_insights_mission(mission)
+        && let Some(focus_start) = lower.find("next focus:")
+    {
+        let after = &text[focus_start + "next focus:".len()..];
+        let next_focus: String = after.lines().next().unwrap_or("").trim().to_string();
+        if !next_focus.is_empty() {
+            mission.current_focus = Some(next_focus);
+        }
+    }
+
+    // Record approach (full response — LLM output is never truncated;
+    // the history itself is FIFO-bounded via record_approach)
+    mission.record_approach(text.to_string());
+
+    // If this is a self-improvement mission, process structured output
+    if is_self_improvement_mission(mission)
+        && let Err(e) = process_self_improvement_output(
+            store,
+            mission,
+            text,
+            crate::executor::orchestrator::self_modification_enabled(),
+        )
+        .await
+    {
+        debug!(
+            mission_id = %mission.id,
+            "failed to process self-improvement output: {e}"
+        );
+    }
+
+    OutcomeEffects {
+        notify_response: Some(text.to_string()),
+        is_error: false,
+        pending_retry: None,
+    }
+}
+
+/// The `Failed` arm: budget exhaustion is recorded and notified but never
+/// retried (WI#302); every other failure gets a retry slot when the policy
+/// has attempts left (WI#188).
+async fn failed_outcome_effects(
+    store: &Arc<dyn Store>,
+    mission: &mut Mission,
+    thread_id: ThreadId,
+    error: &str,
+    kind: &ThreadFailureKind,
+) -> OutcomeEffects {
+    mission.record_approach(format!("FAILED: {error}"));
+    if matches!(kind, ThreadFailureKind::BudgetExhausted) {
+        // WI#302: budget exhaustion is deliberate work exhaustion,
+        // not a transient failure — auto-retrying would hand each
+        // re-fire a fresh budget (up to 4x the configured spend per
+        // fire). Notify once, like MaxIterations; never auto-retry.
+        return OutcomeEffects {
+            notify_response: Some(format!(
+                "Mission stopped: {error} Not retrying automatically; retry with a narrower scope or a higher budget"
+            )),
+            is_error: true,
+            pending_retry: None,
+        };
+    }
+    // WI#188: terminal failures get a retry slot when the policy has
+    // attempts left; the failure kind does not change the contract —
+    // the daily budget and max_retries are the guardrails.
+    let pending_retry = plan_outcome_retry(store, mission, thread_id, "failed").await;
+    OutcomeEffects {
+        notify_response: Some(match pending_retry.as_ref() {
+            Some(p) => format!(
+                "Mission failed: {error} (retry {} of {} scheduled)",
+                p.attempt, mission.retry_policy.max_retries
+            ),
+            None => format!("Mission failed: {error}"),
+        }),
+        is_error: true,
+        pending_retry,
+    }
+}
+
+/// Only terminal non-completions relinquish the trigger. GatePaused still
+/// owns a resumable thread: redelivery during approval must not double-fire.
+/// A retried fire re-records the key when it eventually spawns.
+fn release_terminal_trigger_key(mission: &mut Mission, outcome: &ThreadOutcome) {
+    if !matches!(
         outcome,
         ThreadOutcome::Failed { .. } | ThreadOutcome::Stopped | ThreadOutcome::MaxIterations
-    ) && let Some(key) = mission
+    ) {
+        return;
+    }
+    let Some(key) = mission
         .last_trigger_payload
         .as_ref()
         .and_then(trigger_dedup_key)
-        && mission.has_processed_trigger(&key)
-    {
-        mission
-            .processed_trigger_keys
-            .retain(|candidate| candidate != &key);
-        debug!(mission_id = %mission_id, dedup_key = %key, "released trigger dedup key after terminal non-completion");
+    else {
+        return;
+    };
+    if !mission.has_processed_trigger(&key) {
+        return;
     }
+    mission
+        .processed_trigger_keys
+        .retain(|candidate| candidate != &key);
+    debug!(mission_id = %mission.id, dedup_key = %key, "released trigger dedup key after terminal non-completion");
+}
 
-    // Best-effort metadata marker on the failing thread so the post-restart
-    // sweep can re-arm the pending retry if the daemon dies mid-backoff.
-    if let Some(pending) = &pending_retry
-        && let Err(e) = persist_retry_marker(&**store, thread_id, pending).await
-    {
-        debug!(%thread_id, %e, "failed to persist retry marker");
+/// Broadcast the outcome notice; returns whether it reached a receiver, for
+/// the retry marker's `notified` flag. During daemon shutdown the consumer
+/// is already gone — skip the dead send and report undelivered so the
+/// persisted marker re-notifies at boot (WI#276 review). `true` when there
+/// was nothing to deliver.
+fn send_outcome_notification(
+    notification_tx: &tokio::sync::broadcast::Sender<MissionNotification>,
+    mission: &Mission,
+    thread_id: ThreadId,
+    response: Option<String>,
+    is_error: bool,
+    shutting_down: bool,
+) -> bool {
+    let Some(response) = response else {
+        return true;
+    };
+    if mission.notify_channels.is_empty() {
+        return true;
     }
-
-    // Emit notification if there are channels to notify.
-    if !mission.notify_channels.is_empty() && notify_response.is_some() {
-        let notification = MissionNotification {
-            mission_id,
+    if shutting_down {
+        return false;
+    }
+    // Best-effort: ignore send errors (no subscribers = no problem).
+    notification_tx
+        .send(MissionNotification {
+            mission_id: mission.id,
             mission_name: mission.name.clone(),
             thread_id,
             user_id: mission.user_id.clone(),
             notify_channels: mission.notify_channels.clone(),
-            response: notify_response,
+            response: Some(response),
             is_error,
-        };
-        // Best-effort: ignore send errors (no subscribers = no problem).
-        let _ = notification_tx.send(notification);
-    }
-
-    mission.updated_at = chrono::Utc::now();
-    store.save_mission(&mission).await?;
-    Ok(pending_retry)
+        })
+        .is_ok()
 }
 
 /// Schedule the retry for a non-completed outcome per the mission's policy;
@@ -3231,11 +3785,17 @@ async fn current_attempt(store: &Arc<dyn Store>, thread_id: ThreadId) -> u32 {
 }
 
 /// Persist the pending retry marker onto the failed thread's metadata so a
-/// post-restart sweep can re-arm it (WI#188 retry durability).
+/// post-restart sweep can re-arm it (WI#188 retry durability). This is the
+/// commit write of outcome processing (WI#276 review): it runs only after
+/// the mission row saved, so a persisted marker always implies the approach
+/// history and dedup release landed too. `notified` records whether the
+/// retry notice reached a receiver — `false` during daemon shutdown, where
+/// the boot sweep owes the notice.
 async fn persist_retry_marker(
     store: &dyn Store,
     thread_id: ThreadId,
     pending: &PendingMissionRetry,
+    notified: bool,
 ) -> Result<(), EngineError> {
     let Some(mut thread) = store.load_thread(thread_id).await? else {
         return Ok(());
@@ -3243,14 +3803,13 @@ async fn persist_retry_marker(
     if !thread.state.is_terminal() {
         return Ok(());
     }
+    let mut state = pending.to_retry_state();
+    state.notified = notified;
     if let serde_json::Value::Object(map) = &mut thread.metadata {
-        map.insert(
-            RetryState::METADATA_KEY.to_string(),
-            pending.to_retry_state().to_value(),
-        );
+        map.insert(RetryState::METADATA_KEY.to_string(), state.to_value());
     } else {
         thread.metadata = serde_json::json!({
-            RetryState::METADATA_KEY: pending.to_retry_state().to_value(),
+            RetryState::METADATA_KEY: state.to_value(),
         });
     }
     store.save_thread(&thread).await
@@ -3566,6 +4125,7 @@ mod tests {
         mission_load_delay: Duration,
         failing_mission_loads: tokio::sync::RwLock<Vec<MissionId>>,
         failing_mission_saves: tokio::sync::RwLock<Vec<MissionId>>,
+        failing_thread_saves: tokio::sync::RwLock<Vec<ThreadId>>,
     }
 
     impl TestStore {
@@ -3577,6 +4137,7 @@ mod tests {
                 mission_load_delay: Duration::ZERO,
                 failing_mission_loads: tokio::sync::RwLock::new(Vec::new()),
                 failing_mission_saves: tokio::sync::RwLock::new(Vec::new()),
+                failing_thread_saves: tokio::sync::RwLock::new(Vec::new()),
             }
         }
 
@@ -3592,6 +4153,14 @@ mod tests {
     impl Store for TestStore {
         // ── Thread (minimal — save/load needed by ThreadManager) ──
         async fn save_thread(&self, thread: &Thread) -> Result<(), EngineError> {
+            let mut failing = self.failing_thread_saves.write().await;
+            if let Some(index) = failing.iter().position(|id| *id == thread.id) {
+                failing.swap_remove(index);
+                return Err(EngineError::Store {
+                    reason: format!("injected thread save failure for {}", thread.id),
+                });
+            }
+            drop(failing);
             self.threads.write().await.insert(thread.id, thread.clone());
             Ok(())
         }
@@ -6557,10 +7126,17 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             assert!(expected.contains(&notification.mission_id));
             assert_eq!(notification.user_id, "owner");
             assert_eq!(notification.notify_channels, vec!["gateway"]);
-            assert!(notification.response.unwrap().contains(&format!(
+            let response = notification.response.unwrap();
+            assert!(response.contains(&format!(
                 "mission_resume(id=\"{}\")",
                 notification.mission_id
             )));
+            // WI#319: the guidance must carry the legacy-delete caveat and the
+            // created/updated timestamps operators use to rule one out.
+            assert!(response.contains("2026-07-26"));
+            assert!(response.contains("mission_delete recorded deletions as Completed"));
+            assert!(response.contains("created"));
+            assert!(response.contains("last updated"));
             assert_eq!(
                 store
                     .load_mission(notification.mission_id)
@@ -9691,6 +10267,754 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             .is_none(),
             "redelivery while approval is pending must not spawn another thread"
         );
+    }
+
+    /// WI#276 follow-on: now that stop requests reach watched threads,
+    /// pausing a mission (which stops its conversation-insights workers) ends
+    /// them `Stopped`. That is an operator decision, not an interruption: no
+    /// retry is planned, nothing is notified as an error, and no marker is
+    /// left for a later restart to re-arm.
+    #[tokio::test]
+    async fn stopped_outcome_of_a_paused_mission_is_not_retried() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(store.clone() as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "pausable",
+                "goal",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let thread_id = mgr
+            .fire_mission(id, "test-user", None)
+            .await
+            .unwrap()
+            .expect("fire spawns");
+        wait_for_done(&mgr.store_arc(), thread_id).await;
+        mgr.pause_mission(id, "test-user").await.unwrap();
+
+        let store: Arc<dyn Store> = mgr.store_arc();
+        let pending = process_mission_outcome(&store, id, thread_id, &ThreadOutcome::Stopped)
+            .await
+            .unwrap();
+        assert!(pending.is_none(), "a paused mission's stop must not retry");
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry == "STOPPED: mission Paused while the thread ran"),
+            "{:?}",
+            mission.approach_history
+        );
+        assert!(
+            !mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.starts_with("INTERRUPTED")),
+            "{:?}",
+            mission.approach_history
+        );
+        let thread = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&thread.metadata).is_none());
+    }
+
+    /// LLM whose completion never resolves, so a mission run stays mid-call
+    /// until something stops it.
+    struct HangingLlm {
+        opened: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for HangingLlm {
+        async fn complete(
+            &self,
+            _: &[crate::types::message::ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            self.opened.notify_one();
+            futures::future::pending().await
+        }
+
+        fn model_name(&self) -> &str {
+            "hanging"
+        }
+    }
+
+    /// WI#276: daemon shutdown while a mission thread is mid-run used to lose
+    /// the fire silently — the watcher's own join had taken the handle out of
+    /// the running set, so its shutdown stop missed, the run was dropped
+    /// mid-await, and nothing was recorded. Now the stop lands, the
+    /// interruption is recorded, and the retry marker is persisted on the
+    /// terminal thread, so the post-restart sweep re-fires the mission.
+    #[tokio::test]
+    async fn shutdown_mid_run_persists_retry_for_restart_recovery() {
+        let store = Arc::new(TestStore::new());
+        let opened = Arc::new(tokio::sync::Notify::new());
+        let thread_manager = Arc::new(ThreadManager::new(
+            Arc::new(HangingLlm {
+                opened: Arc::clone(&opened),
+            }),
+            Arc::new(MockEffects),
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let mgr = Arc::new(MissionManager::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::clone(&thread_manager),
+        ));
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "nightly-digest",
+                "send the digest",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let thread_id = mgr
+            .fire_mission(id, "test-user", None)
+            .await
+            .unwrap()
+            .expect("the fire spawns a thread");
+        opened.notified().await;
+        assert!(
+            thread_manager.is_running(thread_id).await,
+            "a watched mission thread must stay registered, and so stoppable"
+        );
+
+        mgr.shutdown().await;
+
+        let thread = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert!(thread.state.is_terminal(), "{:?}", thread.state);
+        let marker = RetryState::from_metadata(&thread.metadata).expect("retry marker persisted");
+        assert_eq!(marker.attempt, 1);
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry == "INTERRUPTED: signal-stopped mid-run"),
+            "{:?}",
+            mission.approach_history
+        );
+
+        // Restart: the sweep finds the marker and re-arms the retry.
+        let restarted = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        restarted.arm_retry_wake().await;
+        assert_eq!(
+            restarted.recover_pending_mission_retries().await.unwrap(),
+            vec![id]
+        );
+        restarted.shutdown().await;
+    }
+
+    /// WI#276 review heal (shutdown abort window): the outcome processor
+    /// persists the retry marker before saving the mission's dedup release,
+    /// so an abort in between leaves a marker whose payload is still
+    /// dedup-recorded — the re-armed retry would be suppressed as already
+    /// processed on every boot. Recovery must release the stale key first.
+    #[tokio::test]
+    async fn retry_recovery_releases_stale_trigger_dedup_key() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "webhook-mission",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let payload = serde_json::json!({"source_thread_id": "source-9"});
+        let key = trigger_dedup_key(&payload).expect("payload carries a dedup key");
+        mission.last_trigger_payload = Some(payload.clone());
+        mission.record_processed_trigger(key.clone());
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Failed;
+        let pending = PendingMissionRetry::new(
+            mission.id,
+            "test-user",
+            1,
+            Some(payload.clone()),
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        thread.metadata = serde_json::json!({RetryState::METADATA_KEY: pending.to_retry_state()});
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        assert_eq!(
+            mgr.recover_pending_mission_retries().await.unwrap(),
+            vec![mission.id]
+        );
+        let healed = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            !healed.has_processed_trigger(&key),
+            "the stale dedup key must be released so the re-armed retry can fire"
+        );
+        // The review's scenario end-to-end: a redelivery of the interrupted
+        // payload is no longer suppressed as already processed.
+        assert!(
+            mgr.fire_mission(mission.id, "test-user", Some(payload))
+                .await
+                .unwrap()
+                .is_some(),
+            "the re-fire must spawn after the heal"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#276 review: the retry marker is the commit write of outcome
+    /// processing. A store that fails the marker (thread) write must still
+    /// leave a complete mission row — history and dedup release — with no
+    /// half-written marker beside it.
+    #[tokio::test]
+    async fn outcome_processing_persists_mission_row_before_the_retry_marker() {
+        let store = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "webhook-mission",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let payload = serde_json::json!({"source_thread_id": "source-4"});
+        let key = trigger_dedup_key(&payload).expect("payload carries a dedup key");
+        mission.last_trigger_payload = Some(payload);
+        mission.record_processed_trigger(key.clone());
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Failed;
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        store.failing_thread_saves.write().await.push(thread.id);
+
+        let failed = ThreadOutcome::Failed {
+            kind: ThreadFailureKind::Unknown,
+            error: "provider cut".into(),
+        };
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        let pending = process_mission_outcome(&store_dyn, mission.id, thread.id, &failed)
+            .await
+            .expect("a marker-write failure is best-effort, not a processing error");
+        assert!(pending.is_some(), "the retry is still planned");
+
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            saved_mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.starts_with("FAILED: provider cut")),
+            "the mission row must hold the history entry: {:?}",
+            saved_mission.approach_history
+        );
+        assert!(
+            !saved_mission.has_processed_trigger(&key),
+            "the dedup release must be persisted before the marker write"
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved_thread.metadata).is_none(),
+            "no marker may exist without its mission row"
+        );
+    }
+
+    /// WI#276 review: an abort at the mission save leaves the clean
+    /// pre-WI#188 loss — no retry marker, key still recorded — never a
+    /// marker without its mission-side release.
+    #[tokio::test]
+    async fn outcome_processing_writes_no_marker_when_the_mission_save_fails() {
+        let store = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "webhook-mission",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let payload = serde_json::json!({"source_thread_id": "source-5"});
+        let key = trigger_dedup_key(&payload).expect("payload carries a dedup key");
+        mission.last_trigger_payload = Some(payload);
+        mission.record_processed_trigger(key.clone());
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Failed;
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        store.failing_mission_saves.write().await.push(mission.id);
+
+        let failed = ThreadOutcome::Failed {
+            kind: ThreadFailureKind::Unknown,
+            error: "provider cut".into(),
+        };
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        let result = process_mission_outcome(&store_dyn, mission.id, thread.id, &failed).await;
+        assert!(result.is_err(), "the mission save failure propagates");
+
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved_thread.metadata).is_none(),
+            "the marker write never runs when the mission save failed"
+        );
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            saved_mission.has_processed_trigger(&key),
+            "the old row still holds the key — the release never saved"
+        );
+    }
+
+    /// WI#276 review: a restart-stamped thread that also carries a retry
+    /// marker is restart recovery's case — the sweep clears the marker and
+    /// does not re-arm.
+    #[tokio::test]
+    async fn retry_recovery_clears_marker_on_restart_stamped_thread_without_rearming() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (mission, thread) = restart_failed_mission_fixture(&store, Vec::new()).await;
+        let pending = PendingMissionRetry::new(
+            mission.id,
+            "test-user",
+            1,
+            None,
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        let mut marked = thread.clone();
+        if let serde_json::Value::Object(map) = &mut marked.metadata {
+            map.insert(
+                RetryState::METADATA_KEY.to_string(),
+                pending.to_retry_state().to_value(),
+            );
+        }
+        store.save_thread(&marked).await.unwrap();
+
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a restart-stamped thread must not be re-armed"
+        );
+        let saved = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved.metadata).is_none(),
+            "the marker must be cleared"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#276 review: a marker whose retry notice never reached a receiver
+    /// (`notified: false` — the shutdown case) is owed the notice at boot;
+    /// the acknowledgement on the marker suppresses repeats on later boots.
+    #[tokio::test]
+    async fn retry_recovery_notifies_once_for_an_undelivered_retry_notice() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "interruptible",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.notify_channels = vec!["darkirc".into()];
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Failed;
+        let pending = PendingMissionRetry::new(
+            mission.id,
+            "test-user",
+            1,
+            None,
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        thread.metadata = serde_json::json!({RetryState::METADATA_KEY: pending.to_retry_state()});
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        assert_eq!(
+            mgr.recover_pending_mission_retries().await.unwrap(),
+            vec![mission.id]
+        );
+        let notif = rx
+            .try_recv()
+            .expect("the undelivered retry notice is owed at boot");
+        assert!(notif.is_error);
+        assert!(
+            notif
+                .response
+                .as_deref()
+                .is_some_and(|r| r.contains("re-armed after daemon restart")),
+            "{:?}",
+            notif.response
+        );
+        let saved = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved.metadata)
+                .expect("the marker is kept until spawn")
+                .notified,
+            "the acknowledgement rides the persisted marker"
+        );
+
+        // A later boot re-arms the still-unconsumed retry but stays silent.
+        let rebooted = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        rebooted.arm_retry_wake().await;
+        let mut rx2 = rebooted.subscribe_notifications();
+        assert_eq!(
+            rebooted.recover_pending_mission_retries().await.unwrap(),
+            vec![mission.id]
+        );
+        assert!(
+            rx2.try_recv().is_err(),
+            "the acknowledged notice must not repeat"
+        );
+        mgr.shutdown().await;
+        rebooted.shutdown().await;
+    }
+
+    /// Seed the post-shutdown state the WI#276 review sweep resolves: an
+    /// Active mission carrying the watcher's pending-interruption stamp and
+    /// approach entry, plus the stamped thread in `thread_state` — with
+    /// transition events when `terminal_reason` is given.
+    async fn shutdown_stamped_fixture(
+        store: &Arc<TestStore>,
+        notify_channels: Vec<String>,
+        thread_state: ThreadState,
+        terminal_reason: Option<&str>,
+    ) -> (Mission, Thread) {
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "interruptible",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.notify_channels = notify_channels;
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        if let Some(reason) = terminal_reason {
+            thread
+                .transition_to(ThreadState::Running, None)
+                .expect("created -> running");
+            thread
+                .transition_to(thread_state, Some(reason.to_string()))
+                .expect("running -> terminal");
+        } else {
+            thread.state = thread_state;
+        }
+        mission.thread_history.push(thread.id);
+        mission.record_approach(format!(
+            "INTERRUPTED: shutdown while the thread was still stopping ({})",
+            thread.id
+        ));
+        let stamp = serde_json::json!({
+            "thread_id": thread.id,
+            "recorded_at": Utc::now().to_rfc3339(),
+        });
+        mission.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: stamp });
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        (mission, thread)
+    }
+
+    /// WI#276 review: the watcher's grace-expired arm records the
+    /// interruption on the mission row only — approach entry, dedup release,
+    /// and the stamp the boot sweep resolves.
+    #[tokio::test]
+    async fn unsettled_shutdown_fire_is_recorded_and_stamped_on_the_mission() {
+        let store = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "webhook-mission",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let payload = serde_json::json!({"source_thread_id": "source-7"});
+        let key = trigger_dedup_key(&payload).expect("payload carries a dedup key");
+        mission.last_trigger_payload = Some(payload);
+        mission.record_processed_trigger(key.clone());
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        let fire_locks = MissionLockRegistry::default();
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        record_unsettled_shutdown_fire(&store_dyn, &fire_locks, mission.id, thread.id).await;
+
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            saved.approach_history.iter().any(|entry| entry
+                == &format!(
+                    "INTERRUPTED: shutdown while the thread was still stopping ({})",
+                    thread.id
+                )),
+            "{:?}",
+            saved.approach_history
+        );
+        assert!(
+            !saved.has_processed_trigger(&key),
+            "the dedup key is released for redelivery"
+        );
+        assert_eq!(stamped_interrupted_thread(&saved), Some(thread.id));
+    }
+
+    /// WI#276 review, the reported scenario end-to-end: the stop request
+    /// landed but the run's save outlived the grace and completed during
+    /// teardown. The boot sweep resolves the stamp into the retry the
+    /// watcher would have planned — marker, wake, and notice.
+    #[tokio::test]
+    async fn boot_resolution_retries_a_fire_whose_stop_settled_after_the_grace() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        let marker = RetryState::from_metadata(&saved_thread.metadata)
+            .expect("the settled stop earns the watcher's retry marker");
+        assert_eq!(marker.attempt, 1);
+        assert!(marker.notified, "the boot notice reached the subscriber");
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            stamped_interrupted_thread(&saved_mission).is_none(),
+            "the stamp is resolved"
+        );
+        let notif = rx
+            .try_recv()
+            .expect("the interruption notice is owed at boot");
+        assert!(notif.is_error);
+        assert!(
+            notif
+                .response
+                .as_deref()
+                .is_some_and(|r| r.contains("interrupted by daemon shutdown")),
+            "{:?}",
+            notif.response
+        );
+        mgr.shutdown().await;
+    }
+
+    /// A stop arriving mid-stream persists the stream-stop reason; it is the
+    /// same settled-stop class for the boot resolution.
+    #[tokio::test]
+    async fn boot_resolution_treats_a_stream_stop_as_a_settled_stop() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            Vec::new(),
+            ThreadState::Failed,
+            Some(crate::types::thread::STREAM_STOPPED_REASON),
+        )
+        .await;
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved_thread.metadata).is_some(),
+            "the stream-stop settle earns the retry marker"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// A run that finished during teardown needs no retry: the resolution is
+    /// recorded and the stamp cleared.
+    #[tokio::test]
+    async fn boot_resolution_records_a_completed_settlement_without_retry() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (mission, thread) =
+            shutdown_stamped_fixture(&store, Vec::new(), ThreadState::Completed, Some("finished"))
+                .await;
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(
+            saved_mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains("completed during teardown")),
+            "{:?}",
+            saved_mission.approach_history
+        );
+        mgr.shutdown().await;
+    }
+
+    /// A thread the boot sweep stamped as failed-by-restart is WI#301's
+    /// record case; the resolution only clears the stamp.
+    #[tokio::test]
+    async fn boot_resolution_leaves_restart_stamped_threads_to_wi301() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) =
+            shutdown_stamped_fixture(&store, vec!["darkirc".into()], ThreadState::Failed, None)
+                .await;
+        let mut restart_stamped = thread.clone();
+        restart_stamped.mark_failed_by_restart();
+        store.save_thread(&restart_stamped).await.unwrap();
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "WI#301's record pass owns the restart-lost notice"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// A run that failed on its own during teardown is record-only: the
+    /// persisted row does not carry the failure kind, so a retryable failure
+    /// cannot be told apart from budget exhaustion (WI#302).
+    #[tokio::test]
+    async fn boot_resolution_records_a_genuine_teardown_failure_without_retry() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            Vec::new(),
+            ThreadState::Failed,
+            Some("provider cut"),
+        )
+        .await;
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            saved_mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains("failed on its own during teardown")),
+            "{:?}",
+            saved_mission.approach_history
+        );
+        mgr.shutdown().await;
+    }
+
+    /// A non-Active mission's unsettled thread is only unstamped — its stop
+    /// was an operator decision, not an interruption.
+    #[tokio::test]
+    async fn boot_resolution_does_not_retry_a_paused_mission() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            Vec::new(),
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        let mut paused = mission.clone();
+        paused.status = MissionStatus::Paused;
+        store.save_mission(&paused).await.unwrap();
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        mgr.shutdown().await;
     }
 
     #[tokio::test]
