@@ -934,21 +934,21 @@ impl EffectBridgeAdapter {
             });
         }
 
-        // routine_history answers against the v1 routines registry; in a v2
-        // thread the same name can shadow a live mission and return the wrong
-        // object's history, so it must error honestly toward mission_history
-        // instead of falling through to the v1 store (WI#269).
-        if is_routine_history_tool(lookup_name) {
-            return Err(EngineError::Effect {
-                reason: format!(
-                    "Tool '{}' is not available in engine v2. \
-                     Use mission_history instead (mission names come from mission_list).",
-                    action_name
-                ),
-            });
+        // The routine_* tools address the v1 routines registry; in a v2 thread
+        // routines are Engine V2 missions, and a same-named v1 routine could
+        // shadow a live mission. Each one errors honestly toward its mission_*
+        // equivalent instead of the generic slash-command advice below
+        // (WI#269 for routine_history, WI#278 for the rest). Bundled skills
+        // written for v1 still name these tools, so the redirect is what keeps
+        // a v2 agent on the working path. gate_name canonicalizes the caller's
+        // hyphens once so an aliased spelling (routine-delete) takes the same
+        // gate as the registered underscore name (WI#278 review).
+        let gate_name = lookup_name.replace('-', "_");
+        if let Some(redirect) = v1_routine_redirect(action_name, &gate_name, context.thread_type) {
+            return Err(redirect);
         }
 
-        if is_v1_only_tool(lookup_name) {
+        if is_v1_only_tool(&gate_name) {
             return Err(EngineError::Effect {
                 reason: format!(
                     "Tool '{}' is not available in engine v2. \
@@ -1756,12 +1756,76 @@ fn is_v1_only_tool(name: &str) -> bool {
     )
 }
 
-/// v1-only tools whose v2 replacement is a mission tool. The generic
-/// "use the slash command" error would misdirect here: the honest answer is
-/// `mission_history` for history and the other `mission_*` verbs for
-/// lifecycle (WI#269).
-fn is_routine_history_tool(name: &str) -> bool {
-    matches!(name, "routine_history" | "routine-history")
+/// The redirect error for a v1 `routine_*` tool in an engine-v2 thread, or
+/// `None` when the name is not a routine tool or this thread type keeps the
+/// plain v1-only error (WI#278). Split out of `execute_action_internal` so
+/// the gate stays small.
+///
+/// Read-only verbs (`routine_history`, `routine_list`) redirect in every
+/// thread type: `mission_history`/`mission_list` leak nothing an autonomous
+/// thread is not already leased to see, and the generic slash-command advice
+/// is unusable in a thread with no user (WI#278 review K-2). Mutating verbs
+/// redirect in Foreground threads only — autonomous threads (Research/
+/// Mission) are leased the mission verbs, so redirecting a prompt-injected
+/// `routine_delete` there would rewrite it into a working destructive
+/// `mission_delete` (WI#278 review R5). The routine_* names stay in
+/// `is_v1_only_tool` so the plain error still answers for them.
+fn v1_routine_redirect(
+    action_name: &str,
+    gate_name: &str,
+    thread_type: lunarwing_engine::ThreadType,
+) -> Option<EngineError> {
+    let equivalent = v2_mission_equivalent(gate_name)?;
+    if thread_type != lunarwing_engine::ThreadType::Foreground
+        && !is_readonly_v1_routine_tool(gate_name)
+    {
+        return None;
+    }
+    Some(EngineError::Effect {
+        reason: format!(
+            "Tool '{action_name}' is not available in engine v2: routines here are \
+             Engine V2 missions. Use {equivalent} instead (mission ids and names \
+             come from mission_list)."
+        ),
+    })
+}
+
+/// The v1 routine tools that only read: their redirects are safe for
+/// autonomous threads (WI#278 review K-2).
+fn is_readonly_v1_routine_tool(gate_name: &str) -> bool {
+    matches!(gate_name, "routine_history" | "routine_list")
+}
+
+/// The Engine V2 mission function, with its call shape, that replaces a v1
+/// `routine_*` tool. The generic "use the slash command" error would
+/// misdirect for these: the honest answer is the mission equivalent
+/// (WI#269 for history, WI#278 for the rest). Takes the canonical
+/// underscore name (callers normalize hyphens once); `None` for other names.
+///
+/// `routine_update` also names the host command for a lightweight routine's
+/// tool-round budget: `mission_update` has no such knob and an Engine V2
+/// chat cannot reach `routine_update`, so without the clause a v2 user has
+/// no path to the budget surface (WI#291 review follow-up).
+fn v2_mission_equivalent(gate_name: &str) -> Option<String> {
+    Some(match gate_name {
+        "routine_create" => {
+            "mission_create(name, goal, cadence) — the routine prompt is the goal; the cron \
+             schedule, 'event:<pattern>' or 'webhook:<path>' is the cadence"
+                .to_string()
+        }
+        "routine_list" => "mission_list()".to_string(),
+        "routine_fire" => "mission_fire(id)".to_string(),
+        "routine_pause" => "mission_pause(id)".to_string(),
+        "routine_resume" => "mission_resume(id)".to_string(),
+        "routine_update" => format!(
+            "mission_update(id, ...) — goal, cadence, notify_channels, retry policy, \
+             success_criteria; a lightweight routine's tool-round budget is a host change: {}",
+            crate::agent::routine_engine::ROUTINES_EDIT_COMMAND
+        ),
+        "routine_delete" => "mission_delete(id)".to_string(),
+        "routine_history" => "mission_history(name)".to_string(),
+        _ => return None,
+    })
 }
 
 /// Auth management tools from v1 that are now kernel-internal in v2.
@@ -4887,6 +4951,220 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             }
             other => panic!("expected Effect error, got {other:?}"),
         }
+    }
+
+    /// WI#278: every v1 routine tool in a v2 thread points at its mission_*
+    /// equivalent (bundled v1 skills still name these tools), never at the
+    /// slash-command advice reserved for the remaining v1-only tools.
+    #[tokio::test]
+    async fn v1_routine_tools_redirect_to_their_mission_equivalents_in_v2() {
+        let adapter = make_adapter();
+        for (tool, equivalent) in [
+            ("routine_create", "mission_create(name, goal, cadence)"),
+            ("routine_list", "mission_list()"),
+            ("routine_fire", "mission_fire(id)"),
+            ("routine_pause", "mission_pause(id)"),
+            ("routine_resume", "mission_resume(id)"),
+            ("routine_update", "mission_update(id, ...)"),
+            ("routine_delete", "mission_delete(id)"),
+            ("routine_history", "mission_history(name)"),
+            ("routine-create", "mission_create(name, goal, cadence)"),
+        ] {
+            let err = adapter
+                .execute_resolved_pending_action(
+                    tool,
+                    serde_json::json!({"name": "daily-digest"}),
+                    &lease(),
+                    &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_redirect")),
+                    true,
+                )
+                .await
+                .expect_err("v1 routine tools never run in v2 threads");
+            let EngineError::Effect { reason } = err else {
+                panic!("expected Effect error for {tool}, got {err:?}");
+            };
+            assert!(reason.contains(equivalent), "{tool}: {reason}");
+            assert!(
+                reason.contains("not available in engine v2"),
+                "{tool}: {reason}"
+            );
+            assert!(!reason.contains("slash command"), "{tool}: {reason}");
+        }
+
+        // WI#291/D-1: the routine_update redirect names the host command for
+        // a lightweight routine's tool-round budget — mission_update has no
+        // such knob and v2 chats cannot reach the v1 routine_update.
+        let err = adapter
+            .execute_resolved_pending_action(
+                "routine_update",
+                serde_json::json!({"name": "daily-digest"}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_budget")),
+                true,
+            )
+            .await
+            .expect_err("routine_update never runs in v2 threads");
+        let EngineError::Effect { reason } = err else {
+            panic!("expected Effect error for routine_update, got {err:?}");
+        };
+        assert!(
+            reason.contains(crate::agent::routine_engine::ROUTINES_EDIT_COMMAND),
+            "{reason}"
+        );
+
+        let err = adapter
+            .execute_resolved_pending_action(
+                "cancel_job",
+                serde_json::json!({}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_cancel")),
+                true,
+            )
+            .await
+            .expect_err("cancel_job stays v1-only");
+        assert!(
+            matches!(err, EngineError::Effect { ref reason } if reason.contains("slash command")),
+            "{err:?}"
+        );
+    }
+
+    /// WI#278 review: autonomous threads are leased the mission verbs, so
+    /// redirecting a mutating routine_* call would rewrite a prompt-injected
+    /// routine_delete into a working mission_delete. Mutating verbs keep the
+    /// plain v1-only error in non-foreground threads.
+    #[tokio::test]
+    async fn mutating_v1_routine_tools_do_not_redirect_in_autonomous_threads() {
+        let adapter = make_adapter();
+        for thread_type in [
+            lunarwing_engine::ThreadType::Research,
+            lunarwing_engine::ThreadType::Mission,
+        ] {
+            for tool in [
+                "routine_delete",
+                "routine_create",
+                "routine_fire",
+                "routine_pause",
+                "routine_resume",
+                "routine_update",
+            ] {
+                let err = adapter
+                    .execute_resolved_pending_action(
+                        tool,
+                        serde_json::json!({"name": "daily-digest"}),
+                        &lease(),
+                        &exec_ctx_for_type(
+                            lunarwing_engine::ThreadId::new(),
+                            Some("call_autonomous"),
+                            thread_type,
+                        ),
+                        true,
+                    )
+                    .await
+                    .expect_err("v1 routine tools never run in v2 threads");
+                let EngineError::Effect { reason } = err else {
+                    panic!("expected Effect error for {tool}/{thread_type:?}, got {err:?}");
+                };
+                assert!(
+                    !reason.contains("mission_"),
+                    "{tool}/{thread_type:?} must not be pointed at a callable mission verb: {reason}"
+                );
+                assert!(
+                    reason.contains("not available in engine v2"),
+                    "{tool}/{thread_type:?}: {reason}"
+                );
+            }
+        }
+    }
+
+    /// WI#278 review K-2: the read-only verbs redirect in every thread type.
+    /// mission_history/mission_list leak nothing an autonomous thread is not
+    /// already leased to see, and "tell the user to run /routine" is unusable
+    /// advice in a thread with no user.
+    #[tokio::test]
+    async fn readonly_v1_routine_tools_redirect_in_autonomous_threads() {
+        let adapter = make_adapter();
+        for thread_type in [
+            lunarwing_engine::ThreadType::Research,
+            lunarwing_engine::ThreadType::Mission,
+        ] {
+            for (tool, equivalent) in [
+                ("routine_history", "mission_history(name)"),
+                ("routine_list", "mission_list()"),
+            ] {
+                let err = adapter
+                    .execute_resolved_pending_action(
+                        tool,
+                        serde_json::json!({"name": "daily-digest"}),
+                        &lease(),
+                        &exec_ctx_for_type(
+                            lunarwing_engine::ThreadId::new(),
+                            Some("call_readonly"),
+                            thread_type,
+                        ),
+                        true,
+                    )
+                    .await
+                    .expect_err("v1 routine tools never run in v2 threads");
+                let EngineError::Effect { reason } = err else {
+                    panic!("expected Effect error for {tool}/{thread_type:?}, got {err:?}");
+                };
+                assert!(
+                    reason.contains(equivalent),
+                    "{tool}/{thread_type:?} must point at {equivalent}: {reason}"
+                );
+                assert!(
+                    !reason.contains("slash command"),
+                    "{tool}/{thread_type:?}: {reason}"
+                );
+            }
+        }
+    }
+
+    /// WI#278 review K-3: hyphenated aliases take the same gate as the
+    /// registered underscore names — a Mission thread's `routine-delete` gets
+    /// the honest v1-only error and `routine-history` the read-only redirect,
+    /// never a generic registry NotFound.
+    #[tokio::test]
+    async fn hyphenated_v1_routine_aliases_take_the_same_gate() {
+        let adapter = make_adapter();
+        let mission_ctx = || {
+            exec_ctx_for_type(
+                lunarwing_engine::ThreadId::new(),
+                Some("call_alias"),
+                lunarwing_engine::ThreadType::Mission,
+            )
+        };
+
+        let err = adapter
+            .execute_resolved_pending_action(
+                "routine-delete",
+                serde_json::json!({"name": "daily-digest"}),
+                &lease(),
+                &mission_ctx(),
+                true,
+            )
+            .await
+            .expect_err("routine-delete never runs in v2 threads");
+        let EngineError::Effect { reason } = err else {
+            panic!("expected Effect error for routine-delete, got {err:?}");
+        };
+        assert!(reason.contains("not available in engine v2"), "{reason}");
+        assert!(!reason.contains("mission_"), "{reason}");
+
+        let err = adapter
+            .execute_resolved_pending_action(
+                "routine-history",
+                serde_json::json!({"name": "daily-digest"}),
+                &lease(),
+                &mission_ctx(),
+                true,
+            )
+            .await
+            .expect_err("routine-history never runs in v2 threads");
+        let EngineError::Effect { reason } = err else {
+            panic!("expected Effect error for routine-history, got {err:?}");
+        };
+        assert!(reason.contains("mission_history(name)"), "{reason}");
     }
 
     // ── WI#295: tool_info for engine capability functions ─────────────────

@@ -722,6 +722,37 @@ list, so a v2 thread that asks for a name which shadows both registries
 gets an honest "use mission_history" error instead of silently returning
 the v1 object's history for a same-named routine.
 
+The two registries stay separate by design (WI#278); what crossed the
+boundary was v1 vocabulary. In a v2 **foreground** thread **every**
+`routine_*` tool now errors toward its mission equivalent with the call
+shape (`routine_create` → `mission_create(name, goal, cadence)` with the
+routine prompt as the goal and the schedule/`event:`/`webhook:` form as the
+cadence, `routine_list` → `mission_list()`,
+`routine_fire`/`pause`/`resume`/`delete` → the `mission_*(id)` verbs,
+`routine_update` → `mission_update(id, ...)` plus the host command
+`lunarwing routines edit --name <routine> --max-tool-rounds <n>` for a
+lightweight routine's tool-round budget, `routine_history` →
+`mission_history(name)`), instead of the slash-command advice the remaining
+v1-only tools (`cancel_job`, `build_software`) keep — bundled skills written
+for v1 (`routine-advisor`, `delegation`, `lunarwing-workflow-orchestrator`)
+still name the routine tools, so the redirect is what keeps a v2 agent on
+the working path. Autonomous threads (Research/Mission) hold leases for the
+mission verbs, so the **mutating** `routine_*` verbs are **not** redirected
+there — a prompt-injected `routine_delete` must not become a working
+`mission_delete`; those get the plain v1-only error. The read-only pair
+(`routine_history`, `routine_list`) redirects in every thread type:
+`mission_history`/`mission_list` leak nothing an autonomous thread is not
+already leased to see, and slash-command advice is unusable in a thread
+with no user (WI#278 review). Hyphenated aliases (`routine-delete`) take the
+same gate as the registered underscore names. In the other direction, v1
+`routine_list` appends the caller's Engine V2 missions read-only under
+`engine_missions` — the union of the engine default project's own+shared
+missions and the caller's own project's own+shared missions (both queries
+owner/shared-filtered, so nobody else's private missions appear) — with a
+note that they are not routines and that `routine_history` shows their runs,
+so a v1 agent no longer reports a live `self-improvement` mission as
+missing, owner or not.
+
 The `mission_*` functions are capability actions, not registry tools: the
 eight definitions live in `mission_action_defs()` beside
 `EffectBridgeAdapter::handle_mission_call`, and the router registers them as
