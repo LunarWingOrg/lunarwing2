@@ -1410,13 +1410,14 @@ mod memory_write_route {
     async fn setup() -> (Router, tempfile::TempDir) {
         let (db, dir) = test_db().await;
         let mut state = build_state(Some(db.clone()), None);
-        Arc::get_mut(&mut state).unwrap().workspace_pool = Some(Arc::new(WorkspacePool::new(
+        let pool = WorkspacePool::new(
             db,
             None,
             Default::default(),
             Default::default(),
             Default::default(),
-        )));
+        );
+        Arc::get_mut(&mut state).unwrap().workspace_pool = Some(Arc::new(pool)); // safety: test-only
         (memory_router(state, two_user_auth()), dir)
     }
 
@@ -1427,7 +1428,7 @@ mod memory_write_route {
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .body(Body::from(body.to_string()))
-            .unwrap()
+            .unwrap() // safety: test-only request builder
     }
 
     /// The write route reserves the shadow-backup prefix and quarantined
