@@ -1014,6 +1014,16 @@ CREATE INDEX IF NOT EXISTS idx_memory_documents_stale_index
     WHERE indexed_at IS NULL;
 "#,
     ),
+    (
+        28,
+        "revoke_secret_delete_always_grants",
+        // Same all-owner cleanup as PostgreSQL V28. Retain disabled/ask rows.
+        r#"
+DELETE FROM settings
+WHERE key = 'tool_permissions.secret_delete'
+  AND json_extract(value, '$') = 'always_allow';
+"#,
+    ),
 ];
 
 /// Migrations whose ADD COLUMN should be skipped when the column already
@@ -1294,6 +1304,88 @@ mod tests {
         assert_eq!(row.get::<i64>(3).expect("migration count"), 1);
         assert_eq!(fts_count(&conn, "legacyruntime").await, 0);
         assert_eq!(fts_count(&conn, "ordinarymemory").await, 1);
+    }
+
+    #[tokio::test]
+    async fn secret_delete_grant_cleanup_is_all_owner_and_selective() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("grants.db"))
+            .await
+            .unwrap();
+        backend.run_migrations().await.unwrap();
+        let conn = backend.connect().await.unwrap();
+        for (user, key, value) in [
+            (
+                "alice",
+                "tool_permissions.secret_delete",
+                "\"always_allow\"",
+            ),
+            (
+                "bob",
+                "tool_permissions.secret_delete",
+                " \"always_allow\" ",
+            ),
+            ("carol", "tool_permissions.secret_delete", "\"disabled\""),
+            (
+                "dave",
+                "tool_permissions.secret_delete",
+                "\"ask_each_time\"",
+            ),
+            ("alice", "tool_permissions.secret_list", "\"always_allow\""),
+            ("bob", "tool_permissions.ssh", "\"always_allow\""),
+        ] {
+            conn.execute(
+                "INSERT INTO settings (user_id, key, value) VALUES (?1, ?2, ?3)",
+                libsql::params![user, key, value],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute("DELETE FROM _migrations WHERE version = 28", ())
+            .await
+            .unwrap();
+        run_incremental(&conn).await.unwrap();
+        run_incremental(&conn).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT user_id, key, value FROM settings ORDER BY user_id, key",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut saved = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            saved.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<String>(2).unwrap(),
+            ));
+        }
+        assert_eq!(
+            saved,
+            vec![
+                (
+                    "alice".into(),
+                    "tool_permissions.secret_list".into(),
+                    "\"always_allow\"".into()
+                ),
+                (
+                    "bob".into(),
+                    "tool_permissions.ssh".into(),
+                    "\"always_allow\"".into()
+                ),
+                (
+                    "carol".into(),
+                    "tool_permissions.secret_delete".into(),
+                    "\"disabled\"".into()
+                ),
+                (
+                    "dave".into(),
+                    "tool_permissions.secret_delete".into(),
+                    "\"ask_each_time\"".into()
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
