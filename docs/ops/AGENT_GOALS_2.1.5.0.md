@@ -218,7 +218,7 @@
 34. [x] (S) RESERVED4WIs
 35. [x] (S) RESERVED4WIs
 36. [x] (S) RESERVED4WIs
-37. [x] (S) RESERVED4WIs
+37. [x] (S) ipv6
 38. [x] (S) HRDR
 39. [ ] repass of goal number 25
 40. [x] (S) RESERVED4NVMES
