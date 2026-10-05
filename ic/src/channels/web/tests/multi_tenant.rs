@@ -1390,3 +1390,86 @@ mod auth_enforcement {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Memory write route reservations (WI#288 review J-2/J-4)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "libsql")]
+mod memory_write_route {
+    use super::*;
+    use crate::channels::web::handlers::memory::memory_write_handler;
+
+    fn memory_router(state: Arc<GatewayState>, auth: MultiAuthState) -> Router {
+        Router::new()
+            .route("/api/memory/write", post(memory_write_handler))
+            .layer(middleware::from_fn_with_state(auth.into(), auth_middleware))
+            .with_state(state)
+    }
+
+    async fn setup() -> (Router, tempfile::TempDir) {
+        let (db, dir) = test_db().await;
+        let mut state = build_state(Some(db.clone()), None);
+        Arc::get_mut(&mut state).unwrap().workspace_pool = Some(Arc::new(WorkspacePool::new(
+            db,
+            None,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )));
+        (memory_router(state, two_user_auth()), dir)
+    }
+
+    fn write_request(token: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/memory/write")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// The write route reserves the shadow-backup prefix and quarantined
+    /// daily logs (both hold injection evidence) with 403, while a path that
+    /// merely normalizes out of the reserved prefix writes normally.
+    #[tokio::test]
+    async fn memory_write_reserves_backups_and_quarantined_daily_logs() {
+        let (app, _dir) = setup().await;
+
+        for path in [
+            "backups/MEMORY.md.bak",
+            "./Backups//daily/2026-10-05.md.bak.1",
+            "daily/2026-10-05.poisoned-1.md",
+            "Daily/2026-10-05.Poisoned-2.MD",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(write_request(
+                    "tok-alice",
+                    serde_json::json!({
+                        "path": path,
+                        "content": "overwrite the evidence",
+                        "append": false,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+
+        // `backups/../MEMORY.md` normalizes to MEMORY.md, an ordinary write.
+        let resp = app
+            .oneshot(write_request(
+                "tok-alice",
+                serde_json::json!({
+                    "path": "backups/../MEMORY.md",
+                    "content": "ordinary memory note",
+                    "append": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
