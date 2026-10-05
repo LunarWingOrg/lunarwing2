@@ -92,7 +92,7 @@ previous compatibility baseline.
 | WASM runtime | Wasmtime/WASI 36.0.17; matching Cranelift family 0.123.17, unchanged |
 | Channel registry | darkirc 0.1.11, multica 0.1.14, weechat 0.2.12, xmpp 0.1.17 |
 | Tool registry | cavepony-tool 0.4.5, gitlab 0.1.8, gotify 0.1.2, llm-context 0.1.3, multica-bridge 0.1.4, ssh 0.1.3, vision-analyze 0.1.5, voice-transcribe 0.1.3, web-search 0.2.4 |
-| External workers | opencode2 `v2.0.21`; kimi-code `2.1.1`, opencode `v1.18.25`, and Pebble `2d0f3786…`, all unchanged from v2.1.4.0 |
+| External workers | opencode2 `v2.0.23` (advanced from `v2.0.21`, WI#303); kimi-code `2.1.1`, opencode `v1.18.25`, and Pebble `2d0f3786…` unchanged from v2.1.4.0 |
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
@@ -386,10 +386,14 @@ full-validation job and a `lockfile-only-advisory-guard` that fails on
 stale entries and queries the same widened graph. The yanked-crate gate is
 verifiably enforced with no index-failure masking.
 
-The opencode2 worker remains at v2.0.21 (pin re-verified live against the
-upstream tag); other worker pins are unchanged from v2.1.4.0. The opencode2
-v2.0.22 bump is tracked separately as WI#303 and is **not** in this
-release.
+The opencode2 worker advances from v2.0.21 to **v2.0.23** (WI#303), pinned at
+`0fd7e2829449b052abf0078666669302923d77af` (tag verified live against the
+upstream remote). The v2.0.21→v2.0.23 diff is additive for the lane's bridge
+surface — every endpoint and event name the bridge consumes is unchanged; the
+reproducible-build patch contract (exactly one `bytecode: true` /
+`splitting: true` in the upstream CLI build script) holds at the new pin. See
+[docs/ops/WORKER-CONTAINERS.md](docs/ops/WORKER-CONTAINERS.md) for the full
+bump record. Other worker pins are unchanged from v2.1.4.0.
 
 ### Documentation and Repository Maintenance
 
@@ -421,9 +425,11 @@ inbound links repaired and a per-file archive index.
    and installed WASM channels and tools; rebuild/reinstall all four
    channel and nine tool registry updates through the normal deployment
    path.
-4. **Worker images unchanged.** opencode2 remains v2.0.21, kimi-code 2.1.1,
-   opencode v1.18.25, Pebble `2d0f3786…`; no worker rebuild is required for
-   this release unless your pins drifted.
+4. **Refresh the opencode2 worker image.** opencode2 advances to v2.0.23 —
+   rebuild its image through the normal CI candidate/scan/promote path (the
+   candidate-versus-clean-rebuild reproducibility gate must pass before
+   promotion). kimi-code 2.1.1, opencode v1.18.25, and Pebble `2d0f3786…`
+   are unchanged and need no rebuild unless your pins drifted.
 5. **Choose tenant settings.** New multi-tenant tenants render
    `ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=6` (a ceiling, not a default budget)
    and `SANDBOX_TENANT_LOGS=info`; both are preserved on re-render and not
@@ -452,8 +458,7 @@ inbound links repaired and a per-file archive index.
 
 **Carried known issues.** The daily-log gate follow-up work (WI#288) and
 the mission graceful-shutdown retry seam (WI#276) remain open with merge
-requests in flight and are not in this release. The opencode2 v2.0.22 bump
-(WI#303) is likewise pending. See
+requests in flight and are not in this release. See
 [the open-items audit](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md) for the
 full disposition table, including items deferred to v2.1.6.0 and v2.1.8.0.
 
