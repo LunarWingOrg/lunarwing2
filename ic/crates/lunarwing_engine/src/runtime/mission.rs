@@ -487,6 +487,10 @@ impl MissionManager {
     /// Legacy Completed recurring missions need an explicit owner decision:
     /// resuming can run tools/send notifications after the owner accepted a
     /// previous completion report. Warn at each boot rather than revive work.
+    /// Before 2026-07-26 `mission_delete` recorded deletions as Completed
+    /// (WI#319), so the guidance includes the mission's created/updated
+    /// timestamps and tells the operator to rule out an intentional legacy
+    /// delete before resuming.
     async fn report_parked_recurring_missions(&self) {
         let missions = match self.store.list_all_missions_global().await {
             Ok(missions) => missions,
@@ -504,8 +508,8 @@ impl MissionManager {
                 continue;
             }
             let response = format!(
-                "Recurring mission is Completed and will not fire. Earlier versions could complete it after a single successful run. Review its history, then call mission_resume(id=\"{}\") to resume future triggers, or mission_pause to keep it stopped. Missed triggers are not replayed.",
-                mission.id
+                "Recurring mission is Completed and will not fire. Earlier versions could complete it after a single successful run. Rule out an old delete before resuming: before 2026-07-26, mission_delete recorded deletions as Completed, and this mission was created {} / last updated {}. Review its history, then call mission_resume(id=\"{}\") to resume future triggers, or mission_pause to keep it stopped. Missed triggers are not replayed.",
+                mission.created_at, mission.updated_at, mission.id
             );
             warn!(mission_id = %mission.id, user_id = %mission.user_id, "{response}");
             if let Some(&thread_id) = mission.thread_history.last() {
@@ -6557,10 +6561,17 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             assert!(expected.contains(&notification.mission_id));
             assert_eq!(notification.user_id, "owner");
             assert_eq!(notification.notify_channels, vec!["gateway"]);
-            assert!(notification.response.unwrap().contains(&format!(
+            let response = notification.response.unwrap();
+            assert!(response.contains(&format!(
                 "mission_resume(id=\"{}\")",
                 notification.mission_id
             )));
+            // WI#319: the guidance must carry the legacy-delete caveat and the
+            // created/updated timestamps operators use to rule one out.
+            assert!(response.contains("2026-07-26"));
+            assert!(response.contains("mission_delete recorded deletions as Completed"));
+            assert!(response.contains("created"));
+            assert!(response.contains("last updated"));
             assert_eq!(
                 store
                     .load_mission(notification.mission_id)
