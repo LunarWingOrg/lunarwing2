@@ -87,7 +87,9 @@ async fn run_import_openclaw(
         .map_err(|e| anyhow::anyhow!("Failed to initialize database: {}", e))?;
 
     // Initialize secrets store with master key from env or keychain
-    let secrets_crypto = if let Ok(master_key_hex) = std::env::var("SECRETS_MASTER_KEY") {
+    let secrets_crypto = if let Some(master_key_hex) =
+        crate::config::env_or_override("SECRETS_MASTER_KEY")
+    {
         Arc::new(
             crate::secrets::SecretsCrypto::new(SecretString::from(master_key_hex))
                 .map_err(|e| anyhow::anyhow!("Failed to initialize secrets: {}", e))?,

@@ -7,12 +7,15 @@ fuzz_target!(|data: &[u8]| {
         // Exercise Sanitizer: detect and neutralize prompt injection attempts.
         let sanitizer = Sanitizer::new();
         let sanitized = sanitizer.sanitize(input);
-        // The sanitized content must never be empty when input is non-empty,
-        // because sanitization wraps/escapes rather than deleting.
-        if !input.is_empty() {
-            assert!(
-                !sanitized.content.is_empty(),
-                "sanitize() produced empty content for non-empty input"
+        // WI#289: sanitization may legitimately empty its input — null-byte
+        // removal deletes bytes, and escape_content's str::lines().join("\n")
+        // drops one trailing line terminator, so NULs plus at most one
+        // trailing "\n"/"\r\n" (e.g. "\0\n", "\n\0", "\0\r\n") sanitize to "".
+        if !input.is_empty() && sanitized.content.is_empty() {
+            let residue = input.replace('\0', "");
+            assert!( // safety: fuzz harness — panicking is the oracle
+                residue.is_empty() || residue == "\n" || residue == "\r\n",
+                "sanitize() produced empty content for input with non-NUL residue: {residue:?}"
             );
         }
         // If no modification occurred, content must equal input.

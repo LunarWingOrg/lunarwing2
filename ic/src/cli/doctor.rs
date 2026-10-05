@@ -294,15 +294,14 @@ fn check_llm_config(settings: &Settings) -> CheckResult {
 // ── Database ────────────────────────────────────────────────
 
 async fn check_database() -> CheckResult {
-    let backend = std::env::var("DATABASE_BACKEND")
-        .ok()
-        .unwrap_or_else(|| "postgres".into());
+    let backend =
+        crate::config::env_or_override("DATABASE_BACKEND").unwrap_or_else(|| "postgres".into());
 
     match backend.as_str() {
         "libsql" | "turso" | "sqlite" => {
-            let path = std::env::var("LIBSQL_PATH")
+            let path = crate::config::env_or_override("LIBSQL_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| crate::config::default_libsql_path());
+                .unwrap_or_else(crate::config::default_libsql_path);
 
             if path.exists() {
                 CheckResult::Pass(format!("libSQL database exists ({})", path.display()))
@@ -314,7 +313,7 @@ async fn check_database() -> CheckResult {
             }
         }
         _ => {
-            if std::env::var("DATABASE_URL").is_ok() {
+            if crate::config::env_or_override("DATABASE_URL").is_some() {
                 // Try to connect
                 match try_pg_connect().await {
                     Ok(()) => CheckResult::Pass("PostgreSQL connected".into()),
@@ -329,7 +328,8 @@ async fn check_database() -> CheckResult {
 
 #[cfg(feature = "postgres")]
 async fn try_pg_connect() -> Result<(), String> {
-    let url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL not set".to_string())?;
+    let url = crate::config::env_or_override("DATABASE_URL")
+        .ok_or_else(|| "DATABASE_URL not set".to_string())?;
 
     let config = deadpool_postgres::Config {
         url: Some(url),
@@ -709,7 +709,7 @@ fn check_secrets(settings: &Settings) -> CheckResult {
             CheckResult::Pass("master key source: OS keychain".into())
         }
         crate::settings::KeySource::Env => {
-            if std::env::var("SECRETS_MASTER_KEY").is_ok() {
+            if crate::config::env_or_override("SECRETS_MASTER_KEY").is_some() {
                 CheckResult::Pass("master key source: env var (set)".into())
             } else {
                 CheckResult::Fail(

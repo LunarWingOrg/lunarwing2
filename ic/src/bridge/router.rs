@@ -1678,6 +1678,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
 
     // Wire every mission consumer before recovery or background work can run.
     // Recovered threads may immediately call mission_* or emit an outcome.
+    // WI#309: resume lease refresh also needs this wiring to include mission_*.
     effect_adapter
         .set_mission_manager(Arc::clone(&mission_manager))
         .await;

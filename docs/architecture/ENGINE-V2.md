@@ -644,6 +644,25 @@ needed. Downgrading restores the older completion/recovery behavior and does
 not reconstruct interrupted work. Operators should inspect interrupted fires
 before manually refiring tasks with external side effects.
 
+All non-manual missions (cron, channel events, system events and webhooks)
+remain active after successful runs (WI#311), even if a final
+response declares `Goal achieved: yes` or `Mission complete`. Their prompt asks
+about this run's success rather than overall goal completion, and names
+`mission_pause` as the way to stop future runs. Only Active missions dispatch;
+cadence does not override persisted status. User-facing intentional stops are
+pause or deletion; the completion APIs have no production callers today.
+Older user recurring missions parked in Completed were subject to phrase-driven
+completion. They are not automatically revived because the owner may have accepted
+that completion report; revival could unexpectedly run tools and send notifications.
+Global startup logs a warning for each such record and sends best-effort recovery
+guidance through its configured notification channels when a last thread exists.
+This repeats at startup until the owner resumes, pauses, or deletes the mission.
+Inspect the history, then use `mission_resume(id=...)` as the owner to recover
+paused, completed or failed missions. Cron recovery computes its next future fire;
+missed occurrences/events are not replayed. Manual, non-managed missions retain
+the standalone goal-declaration completion contract. Downgrading restores the old
+phrase-driven completion behavior for recurring missions; no schema change is needed.
+
 `MissionManager::ensure_learning_missions()` provisions two baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.
@@ -723,11 +742,20 @@ capability — whether the asking thread holds the lease to call the function
 preflight and is true only while that thread holds a valid lease covering
 the function in `MissionManager::leases()`, the thread manager's lease set
 that preflight consults. A thread without one gets the same definition with
-`callable: false` and a note saying a call from it would be refused. Today
-that means threads resumed after a daemon restart (the lease manager is
-in-memory and never rehydrated, and `refresh_resumed_thread_leases` re-grants
-registry tools only — a known gap left over from WI#186/WI#169), threads
-whose lease was revoked or narrowed, and any future denylist entry.
+`callable: false` and a note saying a call from it would be refused, including
+threads whose lease is currently revoked or narrowed. Resume refresh re-grants
+missing actions under the current planner, including on same-process approval
+resumes; it does not preserve a separate per-thread revocation policy (none is
+currently exposed in production). Persistent revocation/narrowing would need its
+own recovery contract before being exposed.
+On restart resume (WI#309), the bridge's unscoped `registered_actions` catalog
+includes the same eight mission definitions when a mission manager is wired.
+`refresh_resumed_thread_leases` restores missing grants through the ordinary
+thread-type lease planner, alongside live registry tools; it does not revive
+persisted lease IDs or grant a wildcard. Owner validation happens before this
+refresh, and failed resume persistence rolls back newly granted leases. The
+scoped model-visible catalog and `tool_list` remain registry-only. No schema
+change is needed; older binaries lose these mission grants again on restart.
 `rlm_query` children run on a private copy of their parent's leases that the
 host cannot see, so a thread the host holds no leases for is answered `true`
 rather than a false "not callable". The answer is static definition text,
