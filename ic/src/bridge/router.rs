@@ -7105,8 +7105,14 @@ pub(crate) mod tests {
         let project = lunarwing_engine::ProjectId::new();
         // Shared learning mission in the engine default project, seeded the
         // way ensure_learning_missions seeds it.
-        seed_mission_with_runs(&store, project, shared_owner_id(), "self-improvement", "improved")
-            .await;
+        seed_mission_with_runs(
+            &store,
+            project,
+            shared_owner_id(),
+            "self-improvement",
+            "improved",
+        )
+        .await;
         // A private mission in the default project belongs to its owner only.
         seed_mission_with_runs(&store, project, "alice", "alice-private", "ran").await;
         // Bob's own missions live in his own "default" project, never the

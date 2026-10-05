@@ -944,8 +944,7 @@ impl EffectBridgeAdapter {
         // hyphens once so an aliased spelling (routine-delete) takes the same
         // gate as the registered underscore name (WI#278 review).
         let gate_name = lookup_name.replace('-', "_");
-        if let Some(redirect) = v1_routine_redirect(action_name, &gate_name, context.thread_type)
-        {
+        if let Some(redirect) = v1_routine_redirect(action_name, &gate_name, context.thread_type) {
             return Err(redirect);
         }
 
