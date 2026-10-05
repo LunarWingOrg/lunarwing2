@@ -2,7 +2,7 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-05 (v2.1.5.0 item-23 tiers).**
 Referenced ops runbook,
 `ic/scripts/release-test.sh`, and the channel/worker/multi-tenant tiers were
 re-checked against the current tree. Added the v2.1.2.0 durable cross-channel
@@ -16,7 +16,9 @@ below (rendered env defaults + tenant rootless store + recovery verb). The
 2026-10-01 repass added v2.1.4.0 tiers below: the tenant system-prompt
 editor (WI#220), opt-in tool runtime-estimate hints (WI#191),
 `routine_history` over Engine V2 missions (WI#265), and the mt-admin
-read-only diagnostics verbs (WI#268).
+read-only diagnostics verbs (WI#268). The 2026-10-05 repass added v2.1.5.0
+tiers: the lightweight routine tool-round budget (WI#291) and the
+pending-gates corrupt-file quarantine (WI#299).
 
 Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
@@ -91,6 +93,7 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] Create a cron routine and verify one scheduled execution.
 - [ ] Trigger an event-driven routine with `event_emit`.
 - [ ] Run a lightweight routine that uses a harmless tool.
+- [ ] **Lightweight routine tool-round budget** (v2.1.5.0, WI#291) — a tool-enabled lightweight routine gets exactly `max_tool_rounds` tool-calling rounds plus one final text-only reply (previously N−1). With the default 3, confirm up to four model calls per run; confirm a provider-recovery retry does not spend a round; raise one routine with `lunarwing routines edit --name <routine> --max-tool-rounds <n>` (values 1–10, refused not clamped) and confirm the limit reply names the knob(s) that bounded the run — both when the routine's value ties the `ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS` cap (the reply must say both must rise) and when only one knob binds (the reply names only that knob) (see `../ops/TENANT-CONFIGURATION.md`).
 - [ ] Run a full-job routine through a configured supported worker.
 - [ ] Verify cooldown, duplicate-fire prevention, failure recording, and notification routing.
 
@@ -124,6 +127,7 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Verify sandbox and full-access double opt-in behavior.
 - [ ] Restore the database backup or execute the documented rollback in staging.
 - [ ] Confirm watchdog/self-heal alerts and restart limits behave as documented.
+- [ ] **Pending-gates corrupt-file quarantine** (v2.1.5.0, WI#299) — with a gate paused in `pending-gates.json`, corrupt the file and restart the engine: the unreadable file is renamed to `pending-gates.json.corrupt-<ts>` (warn-level log naming both paths), saves proceed against fresh empty state, and the orphaned Waiting threads fail at boot reconciliation. Also confirm temp/lock files are created `0600` and a save replaces the live inode atomically (see `../architecture/ENGINE-V2.md`).
 
 ## Cleanup and Sign-Off
 
