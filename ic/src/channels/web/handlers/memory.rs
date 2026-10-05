@@ -143,6 +143,17 @@ pub async fn memory_write_handler(
 ) -> Result<Json<MemoryWriteResponse>, (StatusCode, String)> {
     let workspace = resolve_workspace(&state, &user).await?;
 
+    // Shadow backup files (backups/) are written only by the shadow-backup
+    // rotation itself; they can hold quarantined injection content, so this
+    // route must not overwrite or erase them (WI#288 review T-2). Reads stay
+    // open for operator recovery.
+    if crate::workspace::is_backup_path(&crate::workspace::normalize_path(&req.path)) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "backups/ paths are reserved for the shadow-backup rotation".to_string(),
+        ));
+    }
+
     // Route through layer-aware methods when a layer is specified.
     //
     // Note: unlike MemoryWriteTool, this endpoint does NOT block writes to
