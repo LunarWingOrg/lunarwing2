@@ -14,6 +14,7 @@ every **active** file is listed below. Archived material lives under
 * Updated on September 14th, 2026 for the v2.1.2.0 pre-release pass: release index now points at v2.1.1.0 as latest.*
 * Updated on September 27th, 2026 for the v2.1.3.0 pre-release pass: release index now points at v2.1.2.0 as latest; new v2.1.3.0 ops docs (cargo-deny audit, half-broken tenant troubleshooting) indexed.*
 * Updated on October 1st, 2026 for the v2.1.4.0 pre-release pass: indexed the new tenant system-prompts guide (WI#220); release index now points at v2.1.3.0 as latest.*
+* Updated on October 5th, 2026 for the v2.1.5.0 pre-release pass: release index now points at v2.1.4.0 as latest.*
 
 ## Companion applications
 
@@ -360,7 +361,7 @@ Dated implementation plans and design specs produced by the superpowers agentic 
 
 ### 📦 [`releases/`](releases/)
 
-Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v2.1.3.0, latest: RELEASE-v2.1.3.0.md).
+Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v2.1.4.0, latest: RELEASE-v2.1.4.0.md).
 
 ---
 
