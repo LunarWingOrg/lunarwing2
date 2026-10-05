@@ -4,7 +4,7 @@ How LunarWing connects to IRC through WeeChat: the components, the end-to-end me
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
 
-**Revalidated against source 2026-10-01 (v2.1.4.0).** All component paths,
+**Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-05 (v2.1.5.0).** All component paths,
 limits, and fix statuses below were re-checked against the current tree; the only change
 is the `dm_policy` default note in §4 (see below). The 2.1.2.0 release bumped the
 channel crate and its registry entry (`ic/registry/channels/weechat.json`) to
@@ -13,7 +13,10 @@ release again only bumped the channel crate/registry version to 0.2.10; no
 component paths, limits, or fix statuses changed. The 2.1.4.0 release bumped
 the registry entry to 0.2.11 and the channel crates (including the
 `lunarwing_weechat_wss/weechat_relay` mirror crate) to workspace version
-2.1.4; no component paths, limits, or fix statuses changed.
+2.1.4; no component paths, limits, or fix statuses changed. The 2.1.5.0
+release bumped the registry entry to 0.2.12 and the channel crates
+(including the mirror crate) to workspace version 2.1.5; no component
+paths, limits, or fix statuses changed.
 
 > **Why this doc exists.** A multi-hour debugging session upgrading the `sunburst` tenant
 > showed that message delivery through this channel has several independent, *invisible*
