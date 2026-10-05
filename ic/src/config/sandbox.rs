@@ -44,6 +44,11 @@ pub struct SandboxModeConfig {
     pub reaper_interval_secs: u64,
     /// Containers older than this with no active job are reaped (seconds). Default: 600 (10 min).
     pub orphan_threshold_secs: u64,
+    /// The sandbox-visible daemon log copy and its `/tenant-logs` mount
+    /// (WI#287): `SANDBOX_TENANT_LOGS=off|info|debug`, default `info`. Env
+    /// only (read before the database is up, by tracing init), strictly
+    /// parsed.
+    pub tenant_logs: crate::sandbox::TenantLogsMode,
 }
 
 impl Default for SandboxModeConfig {
@@ -63,6 +68,7 @@ impl Default for SandboxModeConfig {
             extra_allowed_domains: Vec::new(),
             reaper_interval_secs: 300,
             orphan_threshold_secs: 600,
+            tenant_logs: crate::sandbox::TenantLogsMode::Info,
         }
     }
 }
@@ -117,6 +123,11 @@ impl SandboxModeConfig {
             extra_allowed_domains: extra_domains,
             reaper_interval_secs,
             orphan_threshold_secs,
+            // No Settings counterpart: env > default only.
+            tenant_logs: parse_optional_env(
+                "SANDBOX_TENANT_LOGS",
+                crate::sandbox::TenantLogsMode::Info,
+            )?,
         })
     }
 
@@ -176,6 +187,7 @@ impl SandboxModeConfig {
             runtime,
             network,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
+            tenant_logs: self.tenant_logs,
         }
     }
 }
@@ -351,6 +363,7 @@ mod tests {
             reaper_interval_secs: 300,
             orphan_threshold_secs: 600,
             allow_full_access: false,
+            tenant_logs: crate::sandbox::TenantLogsMode::Info,
         };
         assert!(!cfg.enabled);
         assert_eq!(cfg.policy, "full_access");
@@ -382,6 +395,7 @@ mod tests {
             orphan_threshold_secs: 600,
             allow_full_access: false,
             enforce: false,
+            tenant_logs: crate::sandbox::TenantLogsMode::Off,
         };
         let sc = mode.to_sandbox_config();
         assert!(sc.enabled);
@@ -393,6 +407,7 @@ mod tests {
         assert!(!sc.auto_pull_image);
         assert_eq!(sc.runtime, crate::sandbox::SandboxRuntime::Docker);
         assert_eq!(sc.network, crate::sandbox::SandboxNetworkMode::None);
+        assert_eq!(sc.tenant_logs, crate::sandbox::TenantLogsMode::Off);
         // extra domain should be in the allowlist
         assert!(
             sc.network_allowlist
@@ -457,6 +472,37 @@ mod tests {
         // No env override for network: settings win.
         assert_eq!(cfg.network, "none");
         assert!(cfg.enforce);
+    }
+
+    /// WI#287 review S7: SANDBOX_TENANT_LOGS selects the mode (default info)
+    /// and a typo is a config error rather than a silent fallback.
+    #[test]
+    fn sandbox_tenant_logs_env_selects_mode_and_rejects_typos() {
+        use crate::sandbox::TenantLogsMode;
+
+        let _guard = crate::config::helpers::lock_env();
+        let settings = crate::settings::Settings::default();
+
+        // SAFETY: Under ENV_MUTEX (restored on drop), no concurrent env access.
+        unsafe { std::env::remove_var("SANDBOX_TENANT_LOGS") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve default");
+        assert_eq!(cfg.tenant_logs, TenantLogsMode::Info);
+
+        unsafe { std::env::set_var("SANDBOX_TENANT_LOGS", "off") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve off");
+        assert_eq!(cfg.tenant_logs, TenantLogsMode::Off);
+        assert_eq!(cfg.to_sandbox_config().tenant_logs, TenantLogsMode::Off);
+
+        unsafe { std::env::set_var("SANDBOX_TENANT_LOGS", "debug") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve debug");
+        assert_eq!(cfg.tenant_logs, TenantLogsMode::Debug);
+
+        unsafe { std::env::set_var("SANDBOX_TENANT_LOGS", "offf") };
+        match SandboxModeConfig::resolve(&settings) {
+            Err(ConfigError::InvalidValue { key, .. }) => assert_eq!(key, "SANDBOX_TENANT_LOGS"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        unsafe { std::env::remove_var("SANDBOX_TENANT_LOGS") };
     }
 
     #[test]

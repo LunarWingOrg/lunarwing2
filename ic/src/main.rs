@@ -372,8 +372,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Initialize tracing with a reloadable EnvFilter so the gateway can switch
     // log levels at runtime without restarting.
-    let log_level_handle =
-        lunarwing::channels::web::log_layer::init_tracing(Arc::clone(&log_broadcaster));
+    let log_level_handle = lunarwing::channels::web::log_layer::init_tracing(
+        Arc::clone(&log_broadcaster),
+        config.sandbox.tenant_logs,
+    );
 
     tracing::debug!("Starting LunarWing...");
     tracing::debug!("Loaded configuration for agent: {}", config.agent.name);

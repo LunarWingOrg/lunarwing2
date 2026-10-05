@@ -243,6 +243,12 @@ pub enum LlmStreamObservation {
         provider: String,
         attempts: u32,
         reason: StreamFailureReason,
+        /// Sum of token usage from billed-but-empty attempts the retry and
+        /// failover layers discarded before this stream finally produced
+        /// content (WI#297, MR !1395 F-2). `None` when no discarded attempt
+        /// reported usage. The engine adds this to the successful call's
+        /// usage so cost accounting sees every billed call.
+        discarded_usage: Option<TokenUsage>,
     },
     Aborted {
         provider: String,
@@ -462,7 +468,7 @@ pub struct ModelMetadata {
 }
 
 /// Token usage from a single LLM call.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -475,6 +481,21 @@ pub struct TokenUsage {
 impl TokenUsage {
     pub fn total(&self) -> u32 {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Field-wise saturating sum, used to fold the usage of billed-but-empty
+    /// stream attempts into one accounting total (WI#297).
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(rhs.cache_read_input_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(rhs.cache_creation_input_tokens),
+        }
     }
 }
 
@@ -494,7 +515,10 @@ pub trait LlmProvider: Send + Sync {
     ///
     /// Providers that do not support native streaming inherit a safe fallback
     /// that performs the existing blocking completion and emits one text delta
-    /// followed by terminal metadata.
+    /// followed by terminal metadata. An empty completion emits no text delta
+    /// at all (matching `complete_with_tools_stream`), so the WI#297
+    /// empty-stream detection in the retry/failover layers sees the
+    /// `Done`-first shape regardless of provider.
     async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
         let response = self.complete(request).await?;
         let usage = TokenUsage {
@@ -503,13 +527,14 @@ pub trait LlmProvider: Send + Sync {
             cache_read_input_tokens: response.cache_read_input_tokens,
             cache_creation_input_tokens: response.cache_creation_input_tokens,
         };
-        let chunks = vec![
-            Ok(LlmStreamChunk::TextDelta(response.content)),
-            Ok(LlmStreamChunk::Done {
-                usage: Some(usage),
-                finish_reason: response.finish_reason.as_str().to_string(),
-            }),
-        ];
+        let mut chunks = Vec::new();
+        if !response.content.is_empty() {
+            chunks.push(Ok(LlmStreamChunk::TextDelta(response.content)));
+        }
+        chunks.push(Ok(LlmStreamChunk::Done {
+            usage: Some(usage),
+            finish_reason: response.finish_reason.as_str().to_string(),
+        }));
         Ok(stream::iter(chunks).boxed())
     }
 

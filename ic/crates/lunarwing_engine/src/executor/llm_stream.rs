@@ -20,6 +20,10 @@ struct StreamAccumulator {
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     observations: Vec<ProviderStreamObservation>,
     usage: TokenUsage,
+    /// Tokens providers billed for empty attempts discarded before this
+    /// stream produced content (WI#297, MR !1395 F-2). Folded into `usage`
+    /// when the terminal `Done` arrives.
+    discarded_usage: TokenUsage,
     finish_reason: String,
     saw_done: bool,
 }
@@ -77,6 +81,12 @@ impl StreamAccumulator {
                 call.arguments.push_str(&args_delta);
             }
             LlmStreamChunk::ProviderObservation(observation) => {
+                if let ProviderStreamObservation::Retried {
+                    discarded_usage: Some(usage),
+                } = &observation
+                {
+                    self.discarded_usage = self.discarded_usage.saturating_add(*usage);
+                }
                 if !self.observations.contains(&observation) {
                     self.observations.push(observation);
                 }
@@ -85,7 +95,9 @@ impl StreamAccumulator {
                 usage,
                 finish_reason,
             } => {
-                self.usage = usage.unwrap_or_default();
+                self.usage = usage
+                    .unwrap_or_default()
+                    .saturating_add(self.discarded_usage);
                 self.finish_reason = finish_reason;
                 self.saw_done = true;
             }
@@ -235,10 +247,14 @@ mod tests {
         let stream = stream::iter([
             Ok(LlmStreamChunk::TextDelta("clean output".to_string())),
             Ok(LlmStreamChunk::ProviderObservation(
-                ProviderStreamObservation::Retried,
+                ProviderStreamObservation::Retried {
+                    discarded_usage: None,
+                },
             )),
             Ok(LlmStreamChunk::ProviderObservation(
-                ProviderStreamObservation::Retried,
+                ProviderStreamObservation::Retried {
+                    discarded_usage: None,
+                },
             )),
             done(None),
         ])
@@ -251,8 +267,57 @@ mod tests {
         ));
         assert_eq!(
             collection.observations,
-            vec![ProviderStreamObservation::Retried]
+            vec![ProviderStreamObservation::Retried {
+                discarded_usage: None
+            }]
         );
+    }
+
+    // WI#297 (MR !1395 F-2): billed-but-empty usage riding a `Retried`
+    // observation is folded into the call's recorded usage so cost accounting
+    // sees every billed attempt.
+    #[tokio::test]
+    async fn retried_discarded_usage_folds_into_terminal_usage() {
+        let stream = stream::iter([
+            Ok(LlmStreamChunk::TextDelta("clean output".to_string())),
+            Ok(LlmStreamChunk::ProviderObservation(
+                ProviderStreamObservation::Retried {
+                    discarded_usage: Some(TokenUsage {
+                        input_tokens: 900,
+                        output_tokens: 0,
+                        cache_read_tokens: 100,
+                        cache_write_tokens: 0,
+                        cost_usd: 0.0,
+                    }),
+                },
+            )),
+            Ok(LlmStreamChunk::ProviderObservation(
+                ProviderStreamObservation::Retried {
+                    discarded_usage: Some(TokenUsage {
+                        input_tokens: 1100,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: 0.0,
+                    }),
+                },
+            )),
+            done(Some(TokenUsage {
+                input_tokens: 2100,
+                output_tokens: 12,
+                ..TokenUsage::default()
+            })),
+        ])
+        .boxed();
+        let collection = collect_llm_stream(stream, |_| {}).await;
+
+        let output = collection.result.expect("stream should collect");
+        assert_eq!(output.usage.input_tokens, 4100);
+        assert_eq!(output.usage.output_tokens, 12);
+        assert_eq!(output.usage.cache_read_tokens, 100);
+        // Distinct discard payloads are not deduplicated — each discarded
+        // attempt's usage is accounted exactly once.
+        assert_eq!(collection.observations.len(), 2);
     }
 
     #[tokio::test]

@@ -44,9 +44,16 @@ pub struct LlmOutput {
 }
 
 /// Provider recovery or integrity facts safe to add to model context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProviderStreamObservation {
-    Retried,
+    Retried {
+        /// Tokens the provider billed for successful-but-empty attempts the
+        /// host retry/failover layers discarded before this stream produced
+        /// content (WI#297, MR !1395 F-2). The stream accumulator adds them
+        /// to the call's recorded usage so cost accounting sees every billed
+        /// call. `None` when no discarded attempt reported usage.
+        discarded_usage: Option<TokenUsage>,
+    },
     Aborted,
     Corrupted,
 }
@@ -54,7 +61,7 @@ pub enum ProviderStreamObservation {
 impl ProviderStreamObservation {
     pub(crate) const fn context_line(self) -> &'static str {
         match self {
-            Self::Retried => {
+            Self::Retried { .. } => {
                 "Provider stream observation: this turn required an upstream retry before output completed. Attribute any discontinuity to the provider, not to your own state."
             }
             Self::Aborted => {

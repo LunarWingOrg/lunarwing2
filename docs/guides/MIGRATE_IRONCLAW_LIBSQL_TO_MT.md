@@ -2,7 +2,7 @@
 
 There is currently **no maintained, production-safe cross-backend importer** from an arbitrary IronClaw/libSQL database into LunarWing's multi-tenant PostgreSQL schema.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0) and 2026-10-01 (v2.1.4.0).** The archived guide,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** The archived guide,
 the three legacy helper scripts, and the recommended fresh-tenant/ETL paths
 were re-checked; the unsupported status and all referenced paths are current.
 

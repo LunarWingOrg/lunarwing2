@@ -103,17 +103,28 @@ heartbeat hygiene); its SQL `LIKE` patterns mirror `is_mission_path`.
 
 ### System-Prompt Write Guard
 
-Default-scope `Workspace::write()` and `Workspace::append()` scan files injected
-into the system prompt (`SOUL.md`, `AGENTS.md`, `USER.md`, `IDENTITY.md`,
-`MEMORY.md`, `TOOLS.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`, assistant directives,
-and profile data) with the shared safety `Sanitizer`. High-severity prompt
-injection patterns return `WorkspaceError::InjectionRejected`; the memory tool
-maps that to a not-authorized error.
+Default-scope `Workspace::write()`, `append()` and `append_memory()` scan files
+injected into the system prompt (`SOUL.md`, `AGENTS.md`, `USER.md`,
+`IDENTITY.md`, `MEMORY.md`, `TOOLS.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`,
+assistant directives, profile data, `lorebooks/` and `daily/*.md`) with the
+shared safety `Sanitizer`. High-severity prompt injection patterns return
+`WorkspaceError::InjectionRejected`, which `memory_write` surfaces as
+`ToolError::ContentRejected` with rephrase guidance (WI#290). An append refused
+only because content already stored in the file trips the gate returns
+`WorkspaceError::ExistingContentRejected` (escalate-first repair guidance: the
+entry was clean, so rephrasing it cannot help); a default-scope daily log in
+that state is quarantined instead (`WorkspaceError::DailyLogQuarantined`, retry
+the same entry unchanged, WI#288). The workspace README's "Prompt-Injection
+Write Scanning" section covers the daily-log quoting route and the HTTP
+statuses (422 for injection rejections, 409 for existing-content rejections
+and quarantines).
 
 Layer-aware `write_to_layer()` and `append_to_layer()` apply layer
 permissions and privacy classification, and run the same system-prompt
 injection guard as the default-scope path (appends to prompt-visible files
-re-validate the concatenated content).
+re-validate the concatenated content). A layer append refused only because of
+stored content returns `ExistingContentRejected` as well; layer daily logs are
+not quarantined.
 
 ### Step 2: Document Chunking
 

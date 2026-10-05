@@ -30,6 +30,8 @@ use crate::llm::provider::{
     CompletionRequest, CompletionResponse, FinishReason, LlmProvider, LlmStream, LlmStreamChunk,
     ModelMetadata, Role, ToolCompletionRequest, ToolCompletionResponse,
 };
+use crate::llm::stream_telemetry::StreamTelemetry;
+use crate::llm::streaming::empty_stream_usage;
 
 // ---------------------------------------------------------------------------
 // Complexity tiers & scoring
@@ -738,6 +740,16 @@ async fn buffer_completion_stream(
     })
 }
 
+/// Outcome of opening a cheap-model stream with transient-empty escalation
+/// (WI#297, MR !1395 F-3).
+enum CheapStreamOutcome<'a> {
+    /// The cheap leg produced a stream.
+    Cheap(LlmStream<'a>),
+    /// The cheap leg returned a transient empty stream, so the primary's
+    /// stream was opened instead (counted as a cascade escalation).
+    Escalated(LlmStream<'a>),
+}
+
 /// Smart routing provider that classifies task complexity and routes to the appropriate model.
 ///
 /// - `complete()` — scores complexity across 13 dimensions, checks pattern overrides, then
@@ -751,6 +763,7 @@ pub struct SmartRoutingProvider {
     /// Pre-compiled domain regex (built once at construction time).
     domain_regex: Regex,
     stats: SmartRoutingStats,
+    telemetry: Option<Arc<StreamTelemetry>>,
 }
 
 impl SmartRoutingProvider {
@@ -778,7 +791,13 @@ impl SmartRoutingProvider {
             scorer_config,
             domain_regex,
             stats: SmartRoutingStats::new(),
+            telemetry: None,
         }
+    }
+
+    pub(crate) fn with_telemetry(mut self, telemetry: Arc<StreamTelemetry>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     /// Get a snapshot of routing statistics.
@@ -788,6 +807,52 @@ impl SmartRoutingProvider {
             cheap_requests: self.stats.cheap_requests.load(Ordering::Relaxed),
             primary_requests: self.stats.primary_requests.load(Ordering::Relaxed),
             cascade_escalations: self.stats.cascade_escalations.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Open a stream on the cheap model, escalating to the primary when the
+    /// cheap leg returns a transient empty stream (WI#297, MR !1395 F-3).
+    ///
+    /// The retry layer surfaces an empty-but-successful cheap stream as a
+    /// typed error; accepting it would charge the failure to the enclosing
+    /// failover leg's cooldown and eventually bypass the primary for *all*
+    /// traffic. Escalating matches the pre-existing "uncertain response"
+    /// cascade on every cheap-routed arm, not just the Moderate-with-cascade
+    /// one. Deterministic empties (`length`/`content_filter`) propagate.
+    ///
+    /// The billed usage of the discarded cheap attempt is recorded in stream
+    /// telemetry and logged; it is not forwarded at thread level because the
+    /// escalated stream is opened fresh (there is no content chunk yet to
+    /// attach an observation to).
+    async fn cheap_stream_escalating_on_empty(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CheapStreamOutcome<'_>, LlmError> {
+        match self.cheap.complete_stream(request.clone()).await {
+            Ok(stream) => Ok(CheapStreamOutcome::Cheap(stream)),
+            Err(error) if crate::llm::streaming::is_transient_empty_stream(&error) => {
+                self.stats
+                    .cascade_escalations
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
+                let usage = empty_stream_usage(&error);
+                if let (Some(usage), Some(telemetry)) = (usage, &self.telemetry) {
+                    telemetry
+                        .record_discarded_empty_usage(self.cheap.model_name(), usage)
+                        .await;
+                }
+                tracing::info!(
+                    cheap_model = %self.cheap.model_name(),
+                    primary_model = %self.primary.model_name(),
+                    empty_attempt_input_tokens = usage.map_or(0, |u| u.input_tokens),
+                    empty_attempt_output_tokens = usage.map_or(0, |u| u.output_tokens),
+                    "Smart routing: Escalating stream to primary (cheap model returned an empty stream)"
+                );
+                Ok(CheapStreamOutcome::Escalated(
+                    self.primary.complete_stream(request).await?,
+                ))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -985,7 +1050,13 @@ impl LlmProvider for SmartRoutingProvider {
                     "Smart routing: Simple stream -> cheap model"
                 );
                 self.stats.cheap_requests.fetch_add(1, Ordering::Relaxed);
-                self.cheap.complete_stream(request).await
+                // WI#297 (MR !1395 F-3): a transient empty cheap stream
+                // escalates to the primary on every cheap-routed arm.
+                match self.cheap_stream_escalating_on_empty(request).await? {
+                    CheapStreamOutcome::Cheap(stream) | CheapStreamOutcome::Escalated(stream) => {
+                        Ok(stream)
+                    }
+                }
             }
             TaskComplexity::Complex => {
                 tracing::trace!(
@@ -1001,7 +1072,11 @@ impl LlmProvider for SmartRoutingProvider {
                     "Smart routing: Moderate stream -> cheap model (cascade disabled)"
                 );
                 self.stats.cheap_requests.fetch_add(1, Ordering::Relaxed);
-                self.cheap.complete_stream(request).await
+                match self.cheap_stream_escalating_on_empty(request).await? {
+                    CheapStreamOutcome::Cheap(stream) | CheapStreamOutcome::Escalated(stream) => {
+                        Ok(stream)
+                    }
+                }
             }
             TaskComplexity::Moderate => {
                 tracing::trace!(
@@ -1009,7 +1084,18 @@ impl LlmProvider for SmartRoutingProvider {
                     "Smart routing: Moderate stream -> cheap model (cascade enabled)"
                 );
                 self.stats.cheap_requests.fetch_add(1, Ordering::Relaxed);
-                let cheap_stream = self.cheap.complete_stream(request.clone()).await?;
+                // WI#297 F4: the retry layer now surfaces an empty cheap
+                // stream as a typed error instead of an empty success.
+                // Restore the pre-existing cascade behavior — an empty
+                // cheap answer was judged uncertain and escalated — rather
+                // than propagating past the primary straight to failover.
+                let cheap_stream = match self
+                    .cheap_stream_escalating_on_empty(request.clone())
+                    .await?
+                {
+                    CheapStreamOutcome::Cheap(stream) => stream,
+                    CheapStreamOutcome::Escalated(stream) => return Ok(stream),
+                };
                 let buffered =
                     buffer_completion_stream(self.cheap.model_name(), cheap_stream).await?;
 
@@ -1843,6 +1929,246 @@ mod tests {
         assert_eq!(stats.cheap_requests, 1);
         assert_eq!(stats.primary_requests, 1);
         assert_eq!(stats.cascade_escalations, 1);
+    }
+
+    // WI#297 F4: with the retry layer converting an empty cheap stream into a
+    // typed error, the cascade must still escalate to the primary instead of
+    // propagating the error past it into the failover layer.
+    #[tokio::test]
+    async fn moderate_cascade_escalates_when_cheap_stream_is_empty() {
+        use crate::llm::retry::{RetryConfig, RetryProvider};
+
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary-", "answer"])],
+            vec![],
+        ));
+        let cheap_inner = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![StreamScript::Items(vec![])],
+            vec![],
+        ));
+        let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
+            cheap_inner.clone(),
+            RetryConfig { max_retries: 0 },
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config());
+
+        let chunks = router
+            .complete_stream(make_request("Deploy this to production"))
+            .await
+            .expect("primary stream should open after empty-cheap escalation")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [LlmStreamChunk::TextDelta(first), LlmStreamChunk::TextDelta(second), LlmStreamChunk::Done { .. }]
+                if first == "primary-" && second == "answer"
+        ));
+        assert_eq!(cheap_inner.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 1);
+        let stats = router.stats();
+        assert_eq!(stats.cheap_requests, 1);
+        assert_eq!(stats.primary_requests, 1);
+        assert_eq!(stats.cascade_escalations, 1);
+    }
+
+    // WI#297 F4: deterministic empties (`length`) are request-specific — they
+    // propagate honestly instead of escalating to the primary.
+    #[tokio::test]
+    async fn moderate_cascade_propagates_deterministic_empty_without_escalating() {
+        use crate::llm::retry::{RetryConfig, RetryProvider};
+
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary"])],
+            vec![],
+        ));
+        let cheap_inner = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "length".to_string(),
+            })])],
+            vec![],
+        ));
+        let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
+            cheap_inner.clone(),
+            RetryConfig { max_retries: 0 },
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config());
+
+        let result = router
+            .complete_stream(make_request("Deploy this to production"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::EmptyStream {
+                finish: FinishReason::Length,
+                ..
+            })
+        ));
+        assert_eq!(cheap_inner.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 0);
+        assert_eq!(router.stats().cascade_escalations, 0);
+    }
+
+    // MR !1395 F-3: the transient-empty escalation covers every cheap-routed
+    // arm, not just Moderate-with-cascade — otherwise repeated empty cheap
+    // answers charge the enclosing failover leg's cooldown and eventually
+    // bypass the primary for all traffic.
+    #[tokio::test]
+    async fn simple_arm_escalates_transient_empty_to_primary() {
+        use crate::llm::retry::{RetryConfig, RetryProvider};
+
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary-", "answer"])],
+            vec![],
+        ));
+        let cheap_inner = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![StreamScript::Items(vec![])],
+            vec![],
+        ));
+        let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
+            cheap_inner.clone(),
+            RetryConfig { max_retries: 0 },
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config());
+
+        let chunks = router
+            .complete_stream(make_request("Hi"))
+            .await
+            .expect("primary stream should open after empty-cheap escalation")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [LlmStreamChunk::TextDelta(first), LlmStreamChunk::TextDelta(second), LlmStreamChunk::Done { .. }]
+                if first == "primary-" && second == "answer"
+        ));
+        assert_eq!(cheap_inner.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 1);
+        let stats = router.stats();
+        assert_eq!(stats.cheap_requests, 1);
+        assert_eq!(stats.primary_requests, 1);
+        assert_eq!(stats.cascade_escalations, 1);
+    }
+
+    // MR !1395 F-3: same coverage for the Moderate arm with cascade disabled.
+    #[tokio::test]
+    async fn moderate_without_cascade_escalates_transient_empty_to_primary() {
+        use crate::llm::retry::{RetryConfig, RetryProvider};
+
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary-", "answer"])],
+            vec![],
+        ));
+        let cheap_inner = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![StreamScript::Items(vec![])],
+            vec![],
+        ));
+        let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
+            cheap_inner.clone(),
+            RetryConfig { max_retries: 0 },
+        ));
+        let router = SmartRoutingProvider::new(
+            primary.clone(),
+            cheap,
+            SmartRoutingConfig {
+                cascade_enabled: false,
+                ..SmartRoutingConfig::default()
+            },
+        );
+
+        let chunks = router
+            .complete_stream(make_request("Deploy this to production"))
+            .await
+            .expect("primary stream should open after empty-cheap escalation")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [LlmStreamChunk::TextDelta(first), LlmStreamChunk::TextDelta(second), LlmStreamChunk::Done { .. }]
+                if first == "primary-" && second == "answer"
+        ));
+        assert_eq!(cheap_inner.plain_calls(), 1);
+        assert_eq!(primary.plain_calls(), 1);
+        let stats = router.stats();
+        assert_eq!(stats.cheap_requests, 1);
+        assert_eq!(stats.primary_requests, 1);
+        assert_eq!(stats.cascade_escalations, 1);
+    }
+
+    // MR !1395 F-2: the billed usage of a cheap attempt discarded by the
+    // escalation is recorded in stream telemetry.
+    #[tokio::test]
+    async fn empty_escalation_records_discarded_usage_in_telemetry() {
+        use crate::llm::retry::{RetryConfig, RetryProvider};
+        use crate::llm::stream_telemetry::StreamTelemetry;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let telemetry_path = directory.path().join("metrics.json");
+        let telemetry = Arc::new(StreamTelemetry::new(telemetry_path.clone()));
+
+        let primary = Arc::new(ScriptedStreamingProvider::new(
+            "primary",
+            vec![text_stream(&["primary"])],
+            vec![],
+        ));
+        let cheap_inner = Arc::new(ScriptedStreamingProvider::new(
+            "cheap",
+            vec![StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
+                usage: Some(crate::llm::TokenUsage {
+                    input_tokens: 1500,
+                    output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+                finish_reason: "stop".to_string(),
+            })])],
+            vec![],
+        ));
+        let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
+            cheap_inner.clone(),
+            RetryConfig { max_retries: 0 },
+        ));
+        let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config())
+            .with_telemetry(telemetry);
+
+        let _chunks = router
+            .complete_stream(make_request("Hi"))
+            .await
+            .expect("primary stream should open after empty-cheap escalation")
+            .collect::<Vec<_>>()
+            .await;
+
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(telemetry_path)
+                .await
+                .expect("telemetry snapshot"),
+        )
+        .expect("valid telemetry JSON");
+        assert_eq!(
+            snapshot["providers"]["cheap"]["empty_stream_discarded_input_tokens_total"],
+            serde_json::json!(1500)
+        );
     }
 
     #[tokio::test]

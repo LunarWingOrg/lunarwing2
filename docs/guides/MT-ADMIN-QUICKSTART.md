@@ -4,7 +4,7 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), and 2026-10-01 (v2.1.4.0).**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).**
 Every referenced mt-admin
 subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 `patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,

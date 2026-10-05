@@ -12,6 +12,12 @@ lunarwing_group="lunarwing"
 lunarwing_workdir="/var/lib/lunarwing"
 lunarwing_state_dir="/var/lib/lunarwing"
 lunarwing_runtime_dir="/run/lunarwing"
+# Raw daemon stdout/stderr (unscrubbed; stdout can carry the gateway URL
+# banner). The init script hands these directories to the daemon as
+# LUNARWING_SERVICE_LOG_DIRS, so the shell sandbox can never mount them (WI#287);
+# the agent reads a scrubbed copy at /tenant-logs instead. Keep other services'
+# raw logs (xmpp-bridge) in this directory, or add their directory to
+# SANDBOX_PROTECTED_PATHS in the env file.
 lunarwing_log_dir="/var/log/lunarwing"
 lunarwing_output_log="/var/log/lunarwing/lunarwing.log"
 lunarwing_error_log="/var/log/lunarwing/lunarwing.err"

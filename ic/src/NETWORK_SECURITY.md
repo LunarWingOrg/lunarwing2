@@ -438,6 +438,7 @@ Containers that the generic sandbox spawns (`podman run`/`docker run`) are confi
 | Stop grace | `--stop-timeout 10` so kill/rm terminates PID 1 instead of orphaning | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Seccomp | Runtime default profile (podman/docker default seccomp) — **supported contract**, no custom profile | this document |
 | Workspace mount | Policy-selected `ro`/`rw` + SELinux relabel (`,z`) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Daemon log mount | `/tenant-logs`, **always `ro`**: the daemon's own secret-scrubbed log copy (`<base>/logs/sandbox/`), daemon-chosen and vetted to expose no protected path (WI#287). Mounted only when `SANDBOX_TENANT_LOGS` is not `off` and the runtime maps the sandbox user onto the daemon uid (docker; podman ≥ 5; podman 4.3+ when the daemon uid is 1000). The copy is capped at INFO, or at DEBUG with `SANDBOX_TENANT_LOGS=debug` | `src/sandbox/mount_guard.rs` — `tenant_logs_mount_source()`; `src/sandbox/cli_runner.rs` — `daemon_owned_mounts_readable()`; `src/tracing_fmt.rs` — `SandboxLogWriter`, `sandbox_log_cap()` |
 | Network | Proxy mode (allowlist) or `none` | `src/sandbox/cli_runner.rs`, this document above |
 | Tmpfs | `/tmp` (512 MB), `/home/sandbox/.cargo/registry` (1 GB) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Auto-remove | `--rm` + kill-by-name on timeout **and on cancellation** (drop guard) + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `ContainerCleanupGuard`; `src/orchestrator/reaper.rs` |
@@ -492,7 +493,107 @@ WASM tools execute HTTP requests through the host runtime, subject to:
 3. **Leak detection** — `LeakDetector` scans both outbound requests and inbound responses for secret patterns
    - Runs at two points: before sending and after receiving
    - Uses Aho-Corasick for fast multi-pattern matching
-   - **Reference:** `src/safety/leak_detector.rs`
+   - **Reference:** `crates/lunarwing_safety/src/leak_detector.rs`
+
+### Daemon Log Scrubbing and `/tenant-logs` (WI#287)
+
+**Decision: scrub at write time (option A), and give the sandbox only the
+scrubbed copy.** Every daemon log sink goes through one `LogScrubber`
+(`crates/lunarwing_safety/src/log_scrubber.rs`, built by
+`tracing_fmt::daemon_log_scrubber`):
+
+- process stderr, which lands in the journal on systemd (single-node and
+  multi-tenant), in `<base>/logs/daemon.stderr.log` under
+  `lunarwing service install` on OpenRC and launchd, in
+  `/var/log/lunarwing/lunarwing.err` under the committed OpenRC template
+  (`systemd/lunarwing.openrc`), and in `<tenant root>/logs/lunarwing.err` on
+  multi-tenant OpenRC. It is scrubbed before the 500-byte terminal cut;
+- the SSE log stream (`/api/logs/events` and its history);
+- `<base>/logs/sandbox/daemon.log`, the copy the sandbox sees.
+
+What is masked:
+
+- **Shapes:** the default leak shapes, with the 64-hex heuristic promoted from
+  warn to redact for logs because it is the gateway token's own shape. Any
+  standalone 64-hex value, SHA-256 digests included, therefore shows as
+  `[REDACTED]` in daemon logs. Log-only shapes add credentials in URLs
+  (`scheme://user:password@`), secret-named query parameters (`?token=`,
+  `&client_secret=`, `&password=`, `&pwd=`, `X-Amz-Signature=`, ...), and
+  `Authorization:`/`Bearer` values containing `+`, `/`, `=` or `%`, also inside
+  quoted header-map dumps. The log-only shapes do not change tool-output or
+  outbound-HTTP scanning.
+- **Known values** of at least 12 bytes: the values of secret-named
+  environment variables (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*PASSWD*`,
+  `*API_KEY*`, `*PRIVATE_KEY*`, `*MASTER_KEY*`; `*_FILE`, `*_PATH` and `*_DIR`
+  names point at secrets and are skipped), and the password of any URL-valued
+  environment variable such as `DATABASE_URL`, as written and percent-decoded.
+  Values learned after startup are registered through
+  `tracing_fmt::register_log_secret`: the gateway token in
+  `GatewayChannel::new` (generated, or loaded from DB settings on single-node
+  installs, so never in the environment there), every value of the
+  secrets-store overlay (`config::inject_single_var`, `merge_injected_vars`:
+  LLM keys, `HTTP_WEBHOOK_SECRET`, `SECRETS_MASTER_KEY`, wizard keys), and
+  secret-named runtime overrides (`config::set_runtime_env`, e.g.
+  `LUNARWING_CLOUD_API_KEY` after an interactive login).
+
+Every occurrence of every known value is found, overlapping ones included,
+and all ranges (known values and shapes, in the original record's
+coordinates) are merged before one masking pass. `LeakDetector`'s own
+redaction merges nested and overlapping ranges the same way, so no
+combination of matches re-emits the tail of a secret. Block-class records are
+replaced whole; redact-class matches are masked in place. The stderr layer
+colors field names, so stderr events are scrubbed with their color (SGR)
+sequences stripped: a clean event keeps its colors, a redacted one is written
+plain. Only SGR sequences are stripped, so a stray escape in a field value
+cannot swallow the first characters of a token and hide it.
+
+**Raw logs are never mounted, and the agent cannot reach them as a
+`workdir`.** systemd hosts have no log files (journal). The committed OpenRC
+template exports its log directories as `LUNARWING_SERVICE_LOG_DIRS`, which
+`mount_guard::resolve_protected_paths` adds to `SANDBOX_PROTECTED_PATHS`. It
+never exports `SANDBOX_PROTECTED_PATHS` itself: the daemon loads `./.env` and
+`<base>/.env` without overriding the environment, so an exported value would
+silently shadow an operator's setting there. `lunarwing service install`
+(OpenRC and launchd) logs inside `<base>`, which is protected; the multi-tenant
+`<root>/logs` directory, which also holds other services' raw logs (proxy,
+xmpp-bridge, weechat, darkirc, babysitters), is protected by the
+`add_mt_tenant_siblings` rule and the mt-admin `SANDBOX_PROTECTED_PATHS`
+render, and the harness layout (`TEST_ROOT/{logs,state}`) by the same sibling
+rule. A custom redirect elsewhere belongs in `SANDBOX_PROTECTED_PATHS`. The
+boot banner prints the gateway URL with `?token=` on every start when the CLI
+channel is enabled; when stdout is not a terminal (a redirect into one of
+these files) the token is replaced by
+`<hidden: GATEWAY_AUTH_TOKEN, or lunarwing config get channels.gateway_auth_token>`.
+
+**The mount.** The shell sandbox mounts `<base>/logs/sandbox/` read-only at
+`/tenant-logs` (`daemon.log`, rotated to `daemon.log.1` at 8 MiB; 4 KiB per
+event). `SANDBOX_TENANT_LOGS` selects what the copy holds: `info` (default,
+also rendered by mt-admin) caps it at INFO whatever the runtime level; `debug`
+follows the runtime level up to DEBUG, where the per-tool-call lines are, and
+never TRACE; `off` writes no copy and mounts nothing (for a single-node daemon
+shared by several users, whose agents would otherwise all read one copy). The
+mount stays for `--network none` runs: that is the multi-tenant default, and
+with no egress the only channel out is tool output to the same agent. The
+file is `0600` in a `0700` directory owned by the daemon, so it is mounted
+only where the runtime maps the sandbox user onto the daemon's uid
+(`cli_runner::daemon_owned_mounts_readable`): docker (rootful runs as the
+daemon's euid, rootless maps container root onto the host user), podman ≥ 5
+(`keep-id:uid=1000`), or podman 4.3+ (`keep-id`) when the daemon uid is 1000.
+Older podman and other uids get no mount, and the shell tool's description
+only says the logs are there "if /tenant-logs exists".
+
+Limits: only tracing output of the daemon is scrubbed. Raw
+`println!`/`eprintln!` and panic output, and other processes (CLI commands,
+workers, bridges, which use plain `fmt` subscribers), are not. A secret is
+recognized only by a shape or a known value; values under 12 bytes are never
+matched literally; URL userinfo whose password holds an unencoded `/` or `@`
+is not matched by shape. Credentials decrypted on demand from the secrets
+store (channel, MCP and OAuth credentials) are deliberately not registered:
+`DecryptedSecret` zeroizes after use, and registering every decrypt would keep
+the plaintext for the process lifetime, so they are caught by shape only.
+Docker `userns-remap` is not detected (the copy is then unreadable, not
+exposed). Log lines the agent reads are still untrusted text and pass through
+the usual tool-output sanitization.
 
 ### LunarVision Service Clients
 

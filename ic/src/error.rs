@@ -330,6 +330,39 @@ pub enum WorkspaceError {
     #[error("Write rejected for '{path}': prompt injection detected ({reason})")]
     InjectionRejected { path: String, reason: String },
 
+    /// An append to a daily log found unquoted injection content already in
+    /// the day file, quarantined that content aside, and cleared the log
+    /// (WI#288). The new entry itself passed the scan but was not written;
+    /// retrying it unchanged lands on the fresh log.
+    #[error(
+        "Append to '{path}' not applied: content already in the log matched prompt-injection \
+         patterns ({reason}); it was quarantined to '{quarantine_path}' and the log restarted"
+    )]
+    DailyLogQuarantined {
+        path: String,
+        quarantine_path: String,
+        reason: String,
+    },
+
+    /// An append to a prompt-visible file was refused only because the
+    /// content already stored in the file trips the injection gate on its
+    /// own; the new entry passed the entry scan (WI#290). Rephrasing or
+    /// resending the entry cannot help — every append to the file fails
+    /// until the stored content is repaired — so the caller is told to
+    /// escalate or repair rather than retry. Classification only: the gate
+    /// and the refusal are unchanged, and `reason` is the combined-scan match
+    /// list (its line numbers all fall inside the stored file). Default-scope
+    /// daily logs in this state are quarantined instead
+    /// ([`WorkspaceError::DailyLogQuarantined`]); layer daily logs are not
+    /// quarantined and get this classification like any other prompt-visible
+    /// file. Boundary splits (stored content clean on its own) and poisoned
+    /// entries stay [`WorkspaceError::InjectionRejected`].
+    #[error(
+        "Append to '{path}' not applied: content already in the file matched prompt-injection \
+         patterns ({reason}); the new entry itself passed the scan"
+    )]
+    ExistingContentRejected { path: String, reason: String },
+
     #[error("Invalid lorebook document '{path}': {reason}")]
     InvalidLorebook { path: String, reason: String },
 

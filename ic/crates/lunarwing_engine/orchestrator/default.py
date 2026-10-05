@@ -45,7 +45,10 @@ RECOVERY_CONTEXT_MAX_CHARS = 24000
 # recovery context budget per attempt. Kinds absent here — and unknown kinds —
 # get no engine recovery attempt: authentication/request_rejected fail fast by
 # design, and rate_limited is owned by the provider layer's Retry-After
-# handling, so the engine must not re-hammer.
+# handling, so the engine must not re-hammer. content_filtered and
+# output_budget_exhausted (WI#297) are deterministic provider empties — a
+# refusal or an output-budget truncation — so re-sending the identical request
+# cannot succeed and they get no engine recovery attempt either.
 MODEL_RECOVERY_POLICY = {
     "context_overflow": {"max_attempts": 2, "shrink": [0.60, 0.35]},
     "transient": {"max_attempts": 2},
@@ -55,6 +58,8 @@ MODEL_RECOVERY_POLICY = {
     "unavailable": {"max_attempts": 1},
     "authentication": {"max_attempts": 0},
     "request_rejected": {"max_attempts": 0},
+    "content_filtered": {"max_attempts": 0},
+    "output_budget_exhausted": {"max_attempts": 0},
     "internal": {"max_attempts": 1},
 }
 

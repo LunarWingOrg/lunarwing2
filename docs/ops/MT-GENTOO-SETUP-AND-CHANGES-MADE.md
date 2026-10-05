@@ -186,6 +186,11 @@ The startup banner (with the `http://127.0.0.1:PORT/?token=...` URL) is written 
 `logs/lunarwing.log` only on the **first** boot and is **not** rewritten on restart. An old token
 can therefore linger in the log and look authoritative.
 
+Since 2.1.5.0 (WI#287) the banner masks the token whenever stdout is not a terminal, as under
+OpenRC where stdout goes to `logs/lunarwing.log`: new banner lines show
+`?token=<hidden: GATEWAY_AUTH_TOKEN, or lunarwing config get channels.gateway_auth_token>`.
+Lines written before the upgrade can still carry a stale token.
+
 **The authoritative gateway token is `GATEWAY_AUTH_TOKEN` in `lunarwing.env`**, which is exactly
 what `lunarwing-mt-admin.sh tokens <t>` reports. Verified: the env token authenticates
 (`GET /api/gateway/status` → HTTP 200) while the stale log token is rejected (401). Auth is via

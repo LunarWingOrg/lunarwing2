@@ -231,7 +231,8 @@ candidate job — the scan can only succeed after a candidate publishes
   context since goals 2.1.1.0 item 23.
 - The changed-line panic policy (`panic-policy` job) checks `ic/src` and
   `ic/crates` only; test bodies are excluded via the `#[test]`-attribute and
-  `mod tests` walk in `ic/scripts/check_no_panics.py`.
+  `mod tests` walk in `ic/scripts/check_no_panics.py`, and cargo-fuzz targets
+  under `fuzz/fuzz_targets/` are skipped outright as test-only harness code.
 - `standalone-deliverables` verifies locked Cargo metadata for every unit
   selected for that job in `.gitlab/deliverables.json`. Every non-vendor
   lockfile must be classified: Cargo roots belong in `deliverables`, while
