@@ -231,7 +231,7 @@ impl Config {
         user_id: &str,
         toml_path: Option<&std::path::Path>,
     ) -> Result<Self, ConfigError> {
-        let _ = dotenvy::dotenv();
+        crate::bootstrap::load_working_directory_env();
         crate::bootstrap::load_lunarwing_env();
 
         // Load all settings from DB into a Settings struct
@@ -255,8 +255,9 @@ impl Config {
     /// and by CLI commands that don't have DB access.
     /// Falls back to legacy `settings.json` on disk if present.
     ///
-    /// Loads both `./.env` (standard, higher priority) and `~/.lunarwing/.env`
-    /// (lower priority) via dotenvy, which never overwrites existing vars.
+    /// Loads both working-directory dotenv (higher priority) and `<base_dir>/.env`
+    /// (lower priority). In a runtime, new keys enter the thread-safe overlay;
+    /// existing process values and runtime overrides are never overwritten.
     pub async fn from_env() -> Result<Self, ConfigError> {
         Self::from_env_with_toml(None).await
     }
@@ -385,7 +386,8 @@ impl Config {
             search: WorkspaceSearchConfig::resolve()?,
             workspace,
             observability: crate::observability::ObservabilityConfig {
-                backend: std::env::var("OBSERVABILITY_BACKEND").unwrap_or_else(|_| "none".into()),
+                backend: helpers::env_or_override("OBSERVABILITY_BACKEND")
+                    .unwrap_or_else(|| "none".into()),
             },
             oauth: OAuthConfig::resolve()?,
         })
@@ -395,7 +397,7 @@ impl Config {
 pub(crate) fn load_bootstrap_settings(
     toml_path: Option<&std::path::Path>,
 ) -> Result<Settings, ConfigError> {
-    let _ = dotenvy::dotenv();
+    crate::bootstrap::load_working_directory_env();
     crate::bootstrap::load_lunarwing_env();
 
     let mut settings = Settings::load();

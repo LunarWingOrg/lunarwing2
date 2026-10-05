@@ -140,6 +140,23 @@ pub fn set_runtime_env(key: &str, value: &str) {
         .insert(key.to_string(), value.to_string());
 }
 
+/// Dotenv's first-value-wins import, without mutating the process environment.
+/// Preserve explicit process values (including empty/non-Unicode values) and
+/// existing runtime overrides. Imported values still outrank injected secrets.
+pub(crate) fn import_runtime_env(key: &str, value: &str) {
+    if std::env::var_os(key).is_some() {
+        return;
+    }
+    if crate::tracing_fmt::is_secret_env_name(key) {
+        crate::tracing_fmt::register_log_secret(value);
+    }
+    runtime_overrides()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key.to_string())
+        .or_insert_with(|| value.to_string());
+}
+
 /// Read an env var, checking the real environment first, then runtime overrides.
 ///
 /// Priority: real env vars > runtime overrides > `INJECTED_VARS`.
@@ -299,7 +316,7 @@ pub(crate) fn parse_string_env(
 /// This is intended for config-time validation of base URLs like
 /// `OLLAMA_BASE_URL`, `EMBEDDING_BASE_URL`, `LUNARWING_CLOUD_BASE_URL`, etc.
 pub(crate) fn validate_base_url(url: &str, field_name: &str) -> Result<(), ConfigError> {
-    if std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() == Some("1") {
+    if env_or_override("ALLOW_PRIVATE_IPS").as_deref() == Some("1") {
         // Just validate it's a parseable http/https URL
         let p = reqwest::Url::parse(url).map_err(|e| ConfigError::InvalidValue {
             key: field_name.to_string(),

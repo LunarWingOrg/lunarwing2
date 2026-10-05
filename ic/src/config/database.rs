@@ -218,8 +218,7 @@ impl SslMode {
     /// Used by lightweight CLI tools (status, doctor) that don't run the
     /// full config pipeline.
     pub fn from_env() -> Self {
-        std::env::var("DATABASE_SSLMODE")
-            .ok()
+        crate::config::env_or_override("DATABASE_SSLMODE")
             .and_then(|s| s.parse().ok())
             .unwrap_or_default()
     }

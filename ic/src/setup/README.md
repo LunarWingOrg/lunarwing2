@@ -56,10 +56,10 @@ worker. Verification failure fails the onboarding job/CLI exit.
 ## Startup Sequence (main.rs)
 
 ```
-1. Parse CLI args
-2. If Command::Onboard  → load .env, run wizard, exit
+1. Load .env files before starting the Tokio runtime (all commands)
+2. Start runtime, parse CLI args; if Command::Onboard → run wizard, exit
 3. If Command::Run or no command:
-   a. Load .env files (dotenvy::dotenv() then load_lunarwing_env())
+   a. Read bootstrap configuration
    b. check_onboard_needed() → run wizard if needed
    c. Config::from_env()     → build config from env vars
    d. Create SessionManager  → load session token
@@ -67,9 +67,22 @@ worker. Verification failure fails the onboarding job/CLI exit.
    f. ... rest of agent startup
 ```
 
-**Critical ordering:** `.env` files must be loaded (step 3a) before
+**Critical ordering:** `.env` files must be loaded (step 1) before
 `Config::from_env()` (step 3c) because bootstrap vars like
 `DATABASE_BACKEND` live in `~/.lunarwing/.env`.
+
+Dotenv loading initially happens before the Tokio runtime is started. Runtime
+config loads import newly added keys from the working-directory and instance
+dotenv files into the thread-safe runtime overlay (WI#310), including bootstrap
+keys just written by an in-process quick wizard. Process env is never mutated.
+Existing process values and runtime overrides are retained: reload picks up new
+keys, not edits to already-loaded values. Working-directory dotenv wins over
+instance dotenv for new keys; restart to apply edits/removals of loaded values.
+Both outrank the injected-secrets layer. Bootstrap
+consumers (wizard, onboarding detection, status and doctor) use the same layers.
+Backend autodetection considers process env, runtime overrides and injected
+secrets; only if all are unset and `<base_dir>/ironclaw.db` exists does it select
+libSQL. Empty backend values count as unset, consistently with config resolution.
 
 ---
 

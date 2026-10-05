@@ -113,15 +113,13 @@ pub fn create_secrets_store(
 /// Try to resolve an existing master key from env var or OS keychain.
 ///
 /// Resolution order:
-/// 1. `SECRETS_MASTER_KEY` environment variable (hex-encoded)
+/// 1. `SECRETS_MASTER_KEY` config layers (process env, runtime overlay, injected secrets)
 /// 2. OS keychain (macOS Keychain / Linux secret-service)
 ///
 /// Returns `None` if no key is available (caller should generate one).
 pub async fn resolve_master_key() -> Option<String> {
-    // 1. Check env var
-    if let Ok(env_key) = std::env::var("SECRETS_MASTER_KEY")
-        && !env_key.is_empty()
-    {
+    // 1. Include bootstrap keys imported after in-process onboarding.
+    if let Some(env_key) = crate::config::env_or_override("SECRETS_MASTER_KEY") {
         return Some(env_key);
     }
 

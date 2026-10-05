@@ -104,8 +104,10 @@ pub trait EffectExecutor: Send + Sync {
 
     /// List every action currently registered with the executor.
     ///
-    /// This unscoped catalog is used only to provision leases for actions that
-    /// were registered after a thread was created. Execution prompts must use
+    /// This unscoped catalog provisions leases for newly registered actions and
+    /// restores live action leases when persisted threads resume after restart.
+    /// Include executable host capabilities as well as registry tools.
+    /// Execution prompts must use
     /// [`EffectExecutor::available_actions`] instead.
     async fn registered_actions(&self) -> Result<Vec<ActionDef>, EngineError> {
         self.available_actions(&[]).await

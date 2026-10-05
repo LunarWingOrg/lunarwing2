@@ -577,7 +577,8 @@ impl SetupWizard {
     /// previously saved configuration.
     async fn reconnect_existing_db(&mut self) -> Result<(), SetupError> {
         // Determine backend from env (set by bootstrap .env loaded in main).
-        let backend = std::env::var("DATABASE_BACKEND").unwrap_or_else(|_| "postgres".to_string());
+        let backend = crate::config::env_or_override("DATABASE_BACKEND")
+            .unwrap_or_else(|| "postgres".to_string());
 
         // Try libsql first if that's the configured backend.
         #[cfg(feature = "libsql")]
@@ -601,7 +602,7 @@ impl SetupWizard {
     /// Reconnect to an existing PostgreSQL database and load settings.
     #[cfg(feature = "postgres")]
     async fn reconnect_postgres(&mut self) -> Result<(), SetupError> {
-        let url = std::env::var("DATABASE_URL").map_err(|_| {
+        let url = crate::config::env_or_override("DATABASE_URL").ok_or_else(|| {
             SetupError::Database(
                 "DATABASE_URL not set. Run full setup first (lunarwing onboard).".to_string(),
             )
@@ -628,13 +629,13 @@ impl SetupWizard {
     /// Reconnect to an existing libSQL database and load settings.
     #[cfg(feature = "libsql")]
     async fn reconnect_libsql(&mut self) -> Result<(), SetupError> {
-        let path = std::env::var("LIBSQL_PATH").unwrap_or_else(|_| {
+        let path = crate::config::env_or_override("LIBSQL_PATH").unwrap_or_else(|| {
             crate::config::default_libsql_path()
                 .to_string_lossy()
                 .to_string()
         });
-        let turso_url = std::env::var("LIBSQL_URL").ok();
-        let turso_token = std::env::var("LIBSQL_AUTH_TOKEN").ok();
+        let turso_url = crate::config::env_or_override("LIBSQL_URL");
+        let turso_token = crate::config::env_or_override("LIBSQL_AUTH_TOKEN");
 
         self.test_database_connection_libsql(&path, turso_url.as_deref(), turso_token.as_deref())
             .await?;
@@ -669,7 +670,7 @@ impl SetupWizard {
         #[cfg(all(feature = "postgres", feature = "libsql"))]
         {
             // Check if a backend is already pinned via env var
-            let env_backend = std::env::var("DATABASE_BACKEND").ok();
+            let env_backend = crate::config::env_or_override("DATABASE_BACKEND");
 
             if let Some(ref backend) = env_backend {
                 if backend == "libsql" || backend == "turso" || backend == "sqlite" {
@@ -732,8 +733,7 @@ impl SetupWizard {
     async fn step_database_postgres(&mut self) -> Result<(), SetupError> {
         self.settings.database_backend = Some("postgres".to_string());
 
-        let existing_url = std::env::var("DATABASE_URL")
-            .ok()
+        let existing_url = crate::config::env_or_override("DATABASE_URL")
             .or_else(|| self.settings.database_url.clone());
 
         if let Some(ref url) = existing_url {
@@ -798,17 +798,15 @@ impl SetupWizard {
         let default_path_str = default_path.to_string_lossy().to_string();
 
         // Check for existing configuration
-        let existing_path = std::env::var("LIBSQL_PATH")
-            .ok()
+        let existing_path = crate::config::env_or_override("LIBSQL_PATH")
             .or_else(|| self.settings.libsql_path.clone());
 
         if let Some(ref path) = existing_path {
             print_info(&format!("Existing database path: {}", path));
             if confirm("Use this database?", true).map_err(SetupError::Io)? {
-                let turso_url = std::env::var("LIBSQL_URL")
-                    .ok()
+                let turso_url = crate::config::env_or_override("LIBSQL_URL")
                     .or_else(|| self.settings.libsql_url.clone());
-                let turso_token = std::env::var("LIBSQL_AUTH_TOKEN").ok();
+                let turso_token = crate::config::env_or_override("LIBSQL_AUTH_TOKEN");
 
                 match self
                     .test_database_connection_libsql(
@@ -1052,7 +1050,7 @@ impl SetupWizard {
     /// Step 2: Security (secrets master key).
     async fn step_security(&mut self) -> Result<(), SetupError> {
         // Check current configuration
-        let env_key_exists = std::env::var("SECRETS_MASTER_KEY").is_ok();
+        let env_key_exists = crate::config::env_or_override("SECRETS_MASTER_KEY").is_some();
 
         if env_key_exists {
             print_info("Secrets master key found in SECRETS_MASTER_KEY environment variable.");
@@ -1185,13 +1183,13 @@ impl SetupWizard {
     async fn auto_setup_database(&mut self) -> Result<(), SetupError> {
         // If DATABASE_URL or LIBSQL_PATH already set, respect existing config
         #[cfg(feature = "postgres")]
-        let env_backend = std::env::var("DATABASE_BACKEND").ok();
+        let env_backend = crate::config::env_or_override("DATABASE_BACKEND");
 
         #[cfg(feature = "postgres")]
         if let Some(ref backend) = env_backend
             && (backend == "postgres" || backend == "postgresql")
         {
-            if let Ok(url) = std::env::var("DATABASE_URL") {
+            if let Some(url) = crate::config::env_or_override("DATABASE_URL") {
                 print_info("Using existing PostgreSQL configuration");
                 self.settings.database_backend = Some("postgres".to_string());
                 self.settings.database_url = Some(url);
@@ -1202,7 +1200,7 @@ impl SetupWizard {
         }
 
         #[cfg(feature = "postgres")]
-        if let Ok(url) = std::env::var("DATABASE_URL") {
+        if let Some(url) = crate::config::env_or_override("DATABASE_URL") {
             print_info("Using existing PostgreSQL configuration");
             self.settings.database_backend = Some("postgres".to_string());
             self.settings.database_url = Some(url);
@@ -1214,8 +1212,7 @@ impl SetupWizard {
         {
             self.settings.database_backend = Some("libsql".to_string());
 
-            let existing_path = std::env::var("LIBSQL_PATH")
-                .ok()
+            let existing_path = crate::config::env_or_override("LIBSQL_PATH")
                 .or_else(|| self.settings.libsql_path.clone());
 
             let db_path = existing_path.unwrap_or_else(|| {
@@ -1224,8 +1221,8 @@ impl SetupWizard {
                     .to_string()
             });
 
-            let turso_url = std::env::var("LIBSQL_URL").ok();
-            let turso_token = std::env::var("LIBSQL_AUTH_TOKEN").ok();
+            let turso_url = crate::config::env_or_override("LIBSQL_URL");
+            let turso_token = crate::config::env_or_override("LIBSQL_AUTH_TOKEN");
 
             self.test_database_connection_libsql(
                 &db_path,
@@ -1259,7 +1256,7 @@ impl SetupWizard {
     /// (keychain on macOS, env var fallback).
     async fn auto_setup_security(&mut self) -> Result<(), SetupError> {
         // Check env var first
-        if std::env::var("SECRETS_MASTER_KEY").is_ok() {
+        if crate::config::env_or_override("SECRETS_MASTER_KEY").is_some() {
             self.settings.secrets_master_key_source = KeySource::Env;
             print_success("Security configured (env var)");
             return Ok(());
@@ -2058,7 +2055,7 @@ impl SetupWizard {
             Arc::clone(c)
         } else {
             // Try to load master key from keychain or env
-            let key = if let Ok(env_key) = std::env::var("SECRETS_MASTER_KEY") {
+            let key = if let Some(env_key) = crate::config::env_or_override("SECRETS_MASTER_KEY") {
                 env_key
             } else if let Ok(keychain_key) = crate::secrets::keychain::get_master_key().await {
                 keychain_key.iter().map(|b| format!("{:02x}", b)).collect()
@@ -2142,7 +2139,7 @@ impl SetupWizard {
                 .settings
                 .database_url
                 .clone()
-                .or_else(|| std::env::var("DATABASE_URL").ok());
+                .or_else(|| crate::config::env_or_override("DATABASE_URL"));
 
             if let Some(url) = url {
                 self.test_database_connection_postgres(&url).await?;
@@ -3512,6 +3509,146 @@ mod tests {
 
     use super::*;
     use crate::config::helpers::lock_env;
+
+    #[test]
+    #[cfg(feature = "libsql")]
+    fn reconnect_uses_autodetected_runtime_backend() {
+        if std::env::var_os("WI310_WIZARD_CHILD").is_none() {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join("ironclaw.db"), "").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "setup::wizard::tests::reconnect_uses_autodetected_runtime_backend",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env("WI310_WIZARD_CHILD", "1")
+                .env("LUNARWING_BASE_DIR", dir.path())
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                crate::bootstrap::load_lunarwing_env();
+                assert!(std::env::var("DATABASE_BACKEND").is_err());
+                let mut wizard = SetupWizard::new();
+                wizard.reconnect_existing_db().await.unwrap();
+                assert_eq!(wizard.settings.database_backend.as_deref(), Some("libsql"));
+                // The DB-backed config reload path must not re-import changed
+                // dotenv files either; full config may lack unrelated settings.
+                std::fs::write(".env", "WI310_RELOAD_ADDED=later\n").unwrap();
+                let _ =
+                    crate::config::Config::from_db(wizard.db_backend.as_ref().unwrap(), "default")
+                        .await;
+                assert!(std::env::var("WI310_RELOAD_ADDED").is_err());
+                assert_eq!(
+                    crate::config::env_or_override("WI310_RELOAD_ADDED").as_deref(),
+                    Some("later")
+                );
+            });
+    }
+
+    #[test]
+    #[cfg(feature = "libsql")]
+    fn quick_database_setup_then_continue_in_same_process() {
+        if std::env::var_os("WI310_QUICK_CHILD").is_none() {
+            let dir = tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "setup::wizard::tests::quick_database_setup_then_continue_in_same_process",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env("WI310_QUICK_CHILD", "1")
+                .env("LUNARWING_BASE_DIR", dir.path())
+                .env("HOME", dir.path())
+                // Isolate the database bootstrap from interactive LLM selection.
+                .env("LLM_BACKEND", "ollama")
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                assert_eq!(
+                    crate::setup::check_onboard_needed(),
+                    Some("Database not configured")
+                );
+                let mut wizard = SetupWizard::with_config(SetupConfig {
+                    quick: true,
+                    ..Default::default()
+                });
+                wizard.auto_setup_database().await.unwrap();
+                wizard.settings.onboard_completed = true;
+                wizard.settings.secrets_master_key_hex = Some("ab".repeat(32));
+                wizard.write_bootstrap_env().unwrap();
+                assert!(
+                    !crate::bootstrap::lunarwing_base_dir()
+                        .join("ironclaw.db")
+                        .exists()
+                );
+                assert!(crate::config::default_libsql_path().exists());
+                let config = crate::config::Config::from_env_with_toml(None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    config.database.backend,
+                    crate::config::DatabaseBackend::LibSql
+                );
+                assert_eq!(
+                    config.database.libsql_path,
+                    Some(crate::config::default_libsql_path())
+                );
+                assert_eq!(crate::setup::check_onboard_needed(), None);
+                assert!(
+                    crate::secrets::resolve_master_key().await.as_deref()
+                        == Some("ab".repeat(32).as_str()),
+                    "runtime master key must be used without falling back to the keychain"
+                );
+                for key in [
+                    "DATABASE_BACKEND",
+                    "LIBSQL_PATH",
+                    "ONBOARD_COMPLETED",
+                    "SECRETS_MASTER_KEY",
+                ] {
+                    assert!(
+                        std::env::var_os(key).is_none(),
+                        "process env was mutated: {key}"
+                    );
+                }
+                let mut reconnect = SetupWizard::new();
+                reconnect.reconnect_existing_db().await.unwrap();
+                assert_eq!(
+                    reconnect.settings.database_backend.as_deref(),
+                    Some("libsql")
+                );
+            });
+    }
 
     #[test]
     fn test_wizard_creation() {
