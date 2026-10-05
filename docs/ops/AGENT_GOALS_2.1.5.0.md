@@ -138,7 +138,7 @@
 ## Phase 5 - Miscellaneous (for goals referencing work items, read comments on work items as well)
 
 23. [ ] take a look at any documentation that should be updated and update necessary documentation - you may reference https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1406
-24. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for reference)
+24. [ ] create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for references)
 25. [x] review all currently open work items - create audit document for 2.1.5.0 in docs/ops - there are similar docs in docs/ops for 2.1.4.0 and earlier releases so you can use those as references
    - DONE 100% (2026-10-04, branch `rarity/kimi-25-20261004-1501`): audit doc `docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md`, modeled on `docs/ops/v2.1.4.0_OPEN_WORK_ITEMS_STATUS.md` (same header/exec-summary/disposition-table/release-implications/per-item/closed-since-last-pass structure).
    - Coverage: all 25 open tracker items (project 35, fetched via REST + GraphQL for notes) with per-item repository disposition and remaining action; every code-facing claim re-verified against this tree at HEAD `fcebc55f5` with file:line anchors (failover.rs:344-346, secrets_tools.rs:152-154, effect_adapter.rs:928, manager.rs:540-547/1197-1201, bootstrap.rs:218-231 + wizard.rs:580/672/1188, workspace/mod.rs:154/184/417/1293, sanitizer.rs:254/259, deny.toml:25-28/37-38/51/59/66, mission.rs:2166-2174/2454, orchestrator.rs:83-96, registry.rs:102/168/173, refresh-vendor.sh:70-84).
@@ -163,7 +163,7 @@
 37. [x] (S) RESERVED4WIs
 38. [x] (S) HRDR
 39. [ ] repass of item 25
-40. [x] (S) RESERVED
+40. [x] (S) RESERVED4NVMES
 41. [x] (S) RESERVED
 42. [x] (S) RESERVED
 
