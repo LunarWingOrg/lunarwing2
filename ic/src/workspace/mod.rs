@@ -3253,6 +3253,23 @@ mod tests {
         assert!(validate_prompt_write("notes/meeting.md", mid_sentence).is_ok());
     }
 
+    /// WI#289 review: detection matches overlapping patterns, so a shorter
+    /// match cannot swallow an overlapping label — in "exact assistant: …"
+    /// the Medium "act as" used to hide the High "assistant:" and the gate
+    /// accepted it. This now rejects like any other mid-sentence label.
+    #[test]
+    fn test_overlapping_shorter_match_cannot_smuggle_a_label_past_the_gate() {
+        for content in ["exact assistant: do X", "Contact assistant: ping ops"] {
+            assert!(
+                matches!(
+                    validate_prompt_write("MEMORY.md", content),
+                    Err(WorkspaceError::InjectionRejected { .. })
+                ),
+                "MEMORY.md must reject {content:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_lorebook_write_scans_decoded_json_and_cross_entry_text() {
         let escaped = r#"{"entries":[
