@@ -217,6 +217,6 @@
     - Verification: 267 bridge-filter tests and 31 engine thread-manager tests passed. New real-manager/CodeAct coverage resumes Waiting and Suspended threads with stale persisted IDs and an empty in-memory lease manager across all three thread types; proves explicit mission grants, truthful tool_info, owner-filtered listing and successful mission_update, and rejects another owner's resume before granting leases. Unwired-executor and unleased-catalog checks passed. Combined-tree daemon Clippy, PostgreSQL-only/libSQL-only compile checks, formatting and diff checks passed.
 46. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/319
 47. [x] (S) Reserved
-48. [x] (S) Reserved
+48. [x] (S) Reserved for REPASS OF GOAL 24
 
 ---
