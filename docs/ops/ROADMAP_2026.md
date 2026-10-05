@@ -25,3 +25,4 @@
 | OpenAI API Compatible Responses Support, with or without a custom websocket implementation | v2.2.6.0 |
 | LunarHub (extension marketplace/decentralized binary distribution) — phased rollout starting with foundation repairs (unified verified installer, atomic WASM update/rollback, bounded MCP discovery), then binary/artifact distribution, signed catalog + CAS lifecycle, and finally hosted catalog/deep links | v2.2.8.0 |
 | Wayland Desktop Computer Use Capability with upgraded multimodal capable MCP server | v2.3.0.0 |
+| Revamped v3 of TUI utilizing OpenTUI | v2.3.0.0 |
