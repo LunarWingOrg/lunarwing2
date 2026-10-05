@@ -72,6 +72,7 @@ add_snapshot() {
           retry_reason_rate_limited_total: (.value.retry_reasons.rate_limited // 0),
           retry_reason_timeout_total: (.value.retry_reasons.timeout // 0),
           retry_reason_transport_total: (.value.retry_reasons.transport // 0),
+          retry_reason_empty_total: (.value.retry_reasons.empty // 0),
           abort_reason_decode_total: (.value.abort_reasons.decode // 0),
           abort_reason_timeout_total: (.value.abort_reasons.timeout // 0),
           abort_reason_transport_total: (.value.abort_reasons.transport // 0),

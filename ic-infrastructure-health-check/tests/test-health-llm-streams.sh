@@ -38,7 +38,7 @@ write_snapshot() {
       "ttfc_max_ms": 400,
       "ttfc_last_ms": 125,
       "last_issue_unix_seconds": $last_issue,
-      "retry_reasons": {"decode": 2, "rate_limited": 1},
+      "retry_reasons": {"decode": 2, "rate_limited": 1, "empty": 5},
       "abort_reasons": {"decode": 2},
       "corruption_signatures": {"repeated_phrase": 1}
     }
@@ -65,6 +65,7 @@ run_check HEALTH_LLM_STREAMS_FILE="$snapshot" HEALTH_LLM_STREAMS_TENANT=alpha HE
 assert_eq "$RC" "0" "S2: old issue exits healthy"
 assert_eq "$(jq -r '.metrics.providers[0].provider' <<<"$OUT")" "tensorzero::function_name::FrontierTEE/P" "S2: provider retained as data"
 assert_eq "$(jq -r '.metrics.providers[0].retry_reason_decode_total' <<<"$OUT")" "2" "S2: retry reason exposed"
+assert_eq "$(jq -r '.metrics.providers[0].retry_reason_empty_total' <<<"$OUT")" "5" "S2: empty retry reason exposed (WI#297)"
 assert_eq "$(jq -r '.metrics.providers[0].ttfc_last_ms' <<<"$OUT")" "125" "S2: time-to-first-chunk exposed"
 
 recent="$(date +%s)"
@@ -97,6 +98,7 @@ HEALTH_REPORT_DIR="$report_dir" HEALTH_METRICS_OUTPUT="$ROOT/metrics.prom" \
     "$EXPORTER" >/dev/null 2>&1
 exposition="$(cat "$ROOT/metrics.prom")"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_retries_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 3' "S5: retries export with provider and tenant labels"
+assert_contains "$exposition" 'lunarwing_health_llm_streams_retry_reason_empty_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 5' "S5: empty retry reason exports (WI#297)"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_decode_failures_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 2' "S5: decode failures export"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_corruption_repeated_phrase_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 1' "S5: corruption signature exports"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_repl_argument_corruption_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 4' "S5: REPL corruption exports with tenant and provider labels"

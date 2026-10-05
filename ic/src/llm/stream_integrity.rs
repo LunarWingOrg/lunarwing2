@@ -102,6 +102,7 @@ fn error_provider(error: &LlmError) -> Option<&str> {
         LlmError::RequestFailed { provider, .. }
         | LlmError::RateLimited { provider, .. }
         | LlmError::InvalidResponse { provider, .. }
+        | LlmError::EmptyStream { provider, .. }
         | LlmError::ReplArgumentCorruption { provider, .. }
         | LlmError::ModelNotAvailable { provider, .. }
         | LlmError::AuthFailed { provider }

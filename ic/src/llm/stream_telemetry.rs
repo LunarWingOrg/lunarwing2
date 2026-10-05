@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::llm::error::LlmError;
-use crate::llm::provider::{OutputCorruptionKind, StreamFailureReason};
+use crate::llm::provider::{OutputCorruptionKind, StreamFailureReason, TokenUsage};
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
 const MAX_PROVIDER_CHARS: usize = 128;
@@ -44,6 +44,15 @@ struct ProviderStreamMetrics {
     corruption_total: u64,
     #[serde(default)]
     repl_argument_corruption_total: u64,
+    /// Tokens providers billed for successful-but-empty stream attempts that
+    /// a decorator discarded and recovered past (WI#297, MR !1395 F-2).
+    /// Recorded when the discarded usage is forwarded on a `Retried`
+    /// observation or an escalation, so the counters measure recovered waste
+    /// exactly once per discarded attempt.
+    #[serde(default)]
+    empty_stream_discarded_input_tokens_total: u64,
+    #[serde(default)]
+    empty_stream_discarded_output_tokens_total: u64,
     ttfc_samples_total: u64,
     ttfc_sum_ms: u64,
     ttfc_max_ms: u64,
@@ -142,6 +151,25 @@ impl StreamTelemetry {
         self.persist(&snapshot).await;
     }
 
+    /// Record tokens a provider billed for an empty stream attempt that a
+    /// decorator discarded and recovered past (WI#297, MR !1395 F-2).
+    pub(crate) async fn record_discarded_empty_usage(&self, provider: &str, usage: TokenUsage) {
+        if usage.total() == 0 {
+            return;
+        }
+        let mut snapshot = self.snapshot.lock().await;
+        let metrics = provider_metrics(&mut snapshot, provider);
+        metrics.empty_stream_discarded_input_tokens_total = metrics
+            .empty_stream_discarded_input_tokens_total
+            .saturating_add(u64::from(usage.input_tokens));
+        metrics.empty_stream_discarded_output_tokens_total = metrics
+            .empty_stream_discarded_output_tokens_total
+            .saturating_add(u64::from(usage.output_tokens));
+        metrics.last_issue_unix_seconds = unix_timestamp();
+        snapshot.updated_at_unix_seconds = unix_timestamp();
+        self.persist(&snapshot).await;
+    }
+
     async fn persist(&self, snapshot: &StreamTelemetrySnapshot) {
         if let Err(error) = persist_snapshot(&self.path, snapshot).await {
             tracing::warn!(
@@ -229,6 +257,7 @@ pub(crate) fn classify_stream_failure(error: &LlmError) -> StreamFailureReason {
 
     match error {
         LlmError::RateLimited { .. } => StreamFailureReason::RateLimited,
+        LlmError::EmptyStream { .. } => StreamFailureReason::Empty,
         LlmError::InvalidResponse { .. } | LlmError::Json(_) => StreamFailureReason::InvalidOutput,
         LlmError::ReplArgumentCorruption { .. } => StreamFailureReason::InvalidOutput,
         LlmError::RequestFailed { .. } | LlmError::Http(_) | LlmError::Io(_) => {
@@ -261,6 +290,26 @@ mod tests {
                 reason: "turn deadline elapsed".into(),
             }),
             StreamFailureReason::Timeout
+        );
+    }
+
+    // WI#297: typed empty-stream errors classify as Empty without relying on
+    // message substrings.
+    #[test]
+    fn classifies_empty_stream_failures_as_empty() {
+        assert_eq!(
+            classify_stream_failure(&crate::llm::streaming::empty_stream_error(
+                "test", None, None
+            )),
+            StreamFailureReason::Empty
+        );
+        assert_eq!(
+            classify_stream_failure(&crate::llm::streaming::empty_stream_error(
+                "test",
+                Some("stop"),
+                None
+            )),
+            StreamFailureReason::Empty
         );
     }
 
