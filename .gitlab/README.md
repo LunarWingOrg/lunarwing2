@@ -262,6 +262,21 @@ candidate job — the scan can only succeed after a candidate publishes
   verdict. The wrapper hides inclusion graphs and fails the job on any
   `index-failure` diagnostic, so the gate can never be silently skipped;
   `validate_config.py` rejects a cargo-deny job that bypasses it.
+- The cargo-deny gate queries `--workspace --all-features` (a superset of
+  every CI compile graph — the `--workspace` lib-test job plus the
+  root-package `--all-features` check/clippy jobs — including the vendored
+  libsignal path deps); a root-package default query misses crates such as
+  openssl and `lunarwing_health_metrics`. Two companion full-validation jobs
+  complete the advisory surface (see `docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md`):
+  `satellite-advisory-sweep` runs
+  `.gitlab/scripts/check-satellite-advisories.sh`, which discovers every
+  tracked `Cargo.lock` via `git ls-files` and applies the pinned cargo-deny
+  `check advisories` with the shared `ic/deny.toml` policy to each manifest
+  root (bans/licenses/sources stay owned by the ic workspace gate), and
+  `lockfile-only-advisory-guard` runs
+  `.gitlab/scripts/check-lockfile-only-advisories.sh` for pins cargo-deny
+  cannot see (per-entry `absent`/`no-dev` modes; an entry whose crate leaves
+  the lockfile fails as stale).
 - Rust concurrency is host-managed: memory-constrained runners restrict eligible
   jobs and concurrent compiles; larger hosts can accept parallel work.
 - CI parallelism is intentional: `-j2` (libSQL `-j1`) caps peak memory within
