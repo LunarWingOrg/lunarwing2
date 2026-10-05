@@ -124,9 +124,11 @@ const LOREBOOK_DIR_PREFIX: &str = "lorebooks/";
 /// Number of numbered generations retained per daily log in addition to the
 /// rolling `.bak` slot (WI#288 review). Bounds per-day backup storage (each
 /// generation can be up to the 256 KiB write cap) and the cost of probing for
-/// the next free slot. At the cap the oldest retained generation is discarded
-/// (with a `lunarwing::safety` audit line) and the rest shift down one slot,
-/// so the retained set is always the most recent versions.
+/// the next free slot. At the cap the first generation stays pinned — it is
+/// the day's first replaced version, the retained evidence the WI#288 repair
+/// path exists to protect — and the second-oldest generation is discarded
+/// instead (with a `lunarwing::safety` audit line carrying its byte count and
+/// blake3 fingerprint) while the rest shift down one slot.
 const MAX_DAILY_LOG_BACKUP_GENERATIONS: u32 = 8;
 
 /// Returns true if `path` (already normalized) is a system-prompt-injected file.
@@ -158,6 +160,18 @@ pub(crate) fn is_daily_log_file(path: &str) -> bool {
 pub(crate) fn is_backup_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower == "backups" || lower.starts_with("backups/")
+}
+
+/// Quarantined daily logs (`daily/<date>.poisoned-<n>.md`) hold live
+/// injection content moved aside by the append-time quarantine (WI#288). They
+/// are the same class of evidence as the shadow backups: the agent-facing
+/// memory lanes and the web memory-write route reserve them so the poison
+/// cannot be replaced, erased, or re-surfaced to the model through those
+/// lanes (WI#288 review); direct `Workspace` reads stay available for
+/// operator recovery.
+pub(crate) fn is_quarantined_daily_log(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("daily/") && lower.ends_with(".md") && lower.contains(".poisoned-")
 }
 
 fn is_lorebook_json_file(path: &str) -> bool {
@@ -1227,11 +1241,14 @@ impl Workspace {
     /// For most prompt-visible files this is one rolling slot per file,
     /// overwritten on each replace. Daily logs also keep older generations:
     /// before the slot is overwritten its content rolls aside to a numbered
-    /// `backups/daily/<date>.md.bak.<n>`, so repeated same-day replaces
-    /// (including the WI#288 repair path) never silently discard a version an
-    /// operator may still need to inspect. The backup is stored with an empty
-    /// chunk projection: retrievable by exact-path `read()`, visible in
-    /// `list()`, but never search-indexed. Backup content is not rescanned
+    /// `backups/daily/<date>.md.bak.<n>`; at the generation cap the first
+    /// generation of the day stays pinned as evidence and the second-oldest
+    /// is discarded with a fingerprinted audit line, so repeated same-day
+    /// replaces (including the WI#288 repair path) never silently discard a
+    /// version an operator may still need to inspect. The backup is stored
+    /// with an empty chunk projection: retrievable by exact-path `read()`,
+    /// visible in `list()`, but never search-indexed. Backup content is not
+    /// rescanned
     /// (the `backups/` prefix is not prompt-visible), so even a previously
     /// poisoned file can still be replaced. Every backup emits a
     /// `lunarwing::safety` warn audit line with the path, prior byte count
@@ -1321,8 +1338,11 @@ impl Workspace {
     }
 
     /// First free numbered daily-log backup generation slot. At the
-    /// [`MAX_DAILY_LOG_BACKUP_GENERATIONS`] cap, the oldest generation is
-    /// discarded, every remaining generation shifts down one slot, and the
+    /// [`MAX_DAILY_LOG_BACKUP_GENERATIONS`] cap, the first generation stays
+    /// pinned — it is the day's first replaced version, the retained evidence
+    /// the WI#288 repair path exists to protect — the second-oldest
+    /// generation is discarded (audited with its byte count and blake3
+    /// fingerprint), every newer generation shifts down one slot, and the
     /// freed top slot is returned, so both retained storage and this probe
     /// stay bounded.
     async fn next_daily_log_backup_slot(
@@ -1342,7 +1362,16 @@ impl Workspace {
                 Err(e) => return Err(e),
             }
         }
-        for n in 1..MAX_DAILY_LOG_BACKUP_GENERATIONS {
+        // Cap reached: pin `.1` and discard `.2` instead. Evicting the oldest
+        // generation would let a steered agent rotate the day's first replaced
+        // version — e.g. the quarantined poison's predecessor — out of the
+        // only reserved store with a handful of ordinary replaces (WI#288
+        // review J-1).
+        let discarded = self
+            .storage
+            .get_document_by_path(scope, self.agent_id, &format!("{backup_path}.2"))
+            .await?;
+        for n in 2..MAX_DAILY_LOG_BACKUP_GENERATIONS {
             let newer = self
                 .storage
                 .get_document_by_path(scope, self.agent_id, &format!("{backup_path}.{}", n + 1))
@@ -1359,7 +1388,10 @@ impl Workspace {
             target: "lunarwing::safety",
             file = %backup_path,
             generations = MAX_DAILY_LOG_BACKUP_GENERATIONS,
-            "daily-log backup generation cap reached; oldest generation discarded"
+            discarded_bytes = discarded.content.len(),
+            discarded_blake3 = %blake3::hash(discarded.content.as_bytes()).to_hex(),
+            "daily-log backup generation cap reached; second-oldest generation \
+             discarded, first generation pinned as evidence"
         );
         Ok(format!("{backup_path}.{MAX_DAILY_LOG_BACKUP_GENERATIONS}"))
     }
@@ -4612,12 +4644,14 @@ mod runtime_index_tests {
         );
     }
 
-    /// WI#288 review (T-3): retained generations are capped — at the cap the
-    /// oldest generation is discarded and the rest shift down, so the
-    /// retained set is always the most recent versions and the free-slot
-    /// probe stays bounded.
+    /// WI#288 review (T-3/J-1): retained generations are capped — at the cap
+    /// the first generation of the day stays pinned (it is the repair path's
+    /// retained evidence), the second-oldest generation is discarded and the
+    /// rest shift down, so an injection-steered agent cannot rotate the
+    /// evidence out of the reserved store with ordinary replaces, and the
+    /// free-slot probe stays bounded.
     #[tokio::test]
-    async fn daily_log_shadow_backup_generation_cap_discards_oldest() {
+    async fn daily_log_shadow_backup_generation_cap_pins_first_generation() {
         let (workspace, _temp_dir) = create_test_workspace().await;
         let day = "daily/2026-10-03.md";
         let backup_path = "backups/daily/2026-10-03.md.bak";
@@ -4637,13 +4671,22 @@ mod runtime_index_tests {
             format!("version {}", cap + 2),
             ".bak always holds the immediately prior version"
         );
-        for n in 1..=cap {
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.1"))
+                .await
+                .expect("first generation survives the cap")
+                .content,
+            "version 0",
+            "the first generation of the day is pinned as evidence and never evicted"
+        );
+        for n in 2..=cap {
             let generation = workspace
                 .read(&format!("{backup_path}.{n}"))
                 .await
                 .expect("retained generation");
-            // .1 is the oldest retained, .<cap> the newest: versions 2..=cap+1
-            // (versions 0 and 1 were discarded by the two shifts at the cap).
+            // .2..=.<cap> hold the most recent generations: versions 3..=cap+1
+            // (versions 1 and 2 were discarded by the two shifts at the cap).
             assert_eq!(generation.content, format!("version {}", n + 1));
         }
         assert!(
