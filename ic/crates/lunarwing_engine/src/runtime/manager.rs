@@ -903,7 +903,10 @@ impl ThreadManager {
         // WI#302: an externally stopped thread did not finish its work —
         // record Failed with the stop reason rather than Completed → Done,
         // which listed the thread as a success and made it insight-eligible.
-        thread.transition_to(ThreadState::Failed, Some("execution stopped".into()))?;
+        thread.transition_to(
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON.into()),
+        )?;
         if let Some(metadata) = thread.metadata.as_object_mut() {
             metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
             metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);

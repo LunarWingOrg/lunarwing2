@@ -535,6 +535,23 @@ pub const RESTART_FAILURE_METADATA_KEY: &str = "restart_failure";
 /// the mission's approach history and notified to its channels (WI#301).
 pub const RESTART_FAILURE_RECORDED_METADATA_KEY: &str = "restart_failure_recorded";
 
+/// State-transition reason recorded when a run is stopped by host policy
+/// (signal stop, daemon shutdown) rather than failing on its own (WI#302).
+/// The mission recovery sweeps read the terminal event's reason to tell a
+/// settled stop apart from a genuine failure, so the literal must stay
+/// shared by every writer (orchestrator stop paths) and reader.
+pub const EXECUTION_STOPPED_REASON: &str = "execution stopped";
+
+/// Variant of [`EXECUTION_STOPPED_REASON`] for a stop that arrived while a
+/// provider stream was in flight.
+pub const STREAM_STOPPED_REASON: &str = "stopped during LLM stream";
+
+/// Whether a terminal transition reason marks a host-requested stop rather
+/// than a genuine failure (budget, provider error, …).
+pub fn is_host_stop_reason(reason: Option<&str>) -> bool {
+    matches!(reason, Some(EXECUTION_STOPPED_REASON) | Some(STREAM_STOPPED_REASON))
+}
+
 fn metadata_flag(metadata: &serde_json::Value, key: &str) -> bool {
     metadata
         .get(key)

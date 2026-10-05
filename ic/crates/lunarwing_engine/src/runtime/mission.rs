@@ -2743,6 +2743,9 @@ impl PendingMissionRetry {
             payload: self.payload.clone(),
             not_before: self.not_before,
             lineage: Vec::new(),
+            // Filled in by the marker write, which knows whether the retry
+            // notice reached a receiver (WI#276 review).
+            notified: false,
         }
     }
 }
