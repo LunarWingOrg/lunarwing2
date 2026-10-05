@@ -231,7 +231,11 @@ impl Config {
         user_id: &str,
         toml_path: Option<&std::path::Path>,
     ) -> Result<Self, ConfigError> {
-        let _ = dotenvy::dotenv();
+        // main loads dotenv before starting threads; runtime reloads must not
+        // mutate the process environment when an env file gains a new key.
+        if tokio::runtime::Handle::try_current().is_err() {
+            let _ = dotenvy::dotenv();
+        }
         crate::bootstrap::load_lunarwing_env();
 
         // Load all settings from DB into a Settings struct
@@ -395,7 +399,9 @@ impl Config {
 pub(crate) fn load_bootstrap_settings(
     toml_path: Option<&std::path::Path>,
 ) -> Result<Settings, ConfigError> {
-    let _ = dotenvy::dotenv();
+    if tokio::runtime::Handle::try_current().is_err() {
+        let _ = dotenvy::dotenv();
+    }
     crate::bootstrap::load_lunarwing_env();
 
     let mut settings = Settings::load();

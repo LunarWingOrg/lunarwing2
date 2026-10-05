@@ -577,7 +577,8 @@ impl SetupWizard {
     /// previously saved configuration.
     async fn reconnect_existing_db(&mut self) -> Result<(), SetupError> {
         // Determine backend from env (set by bootstrap .env loaded in main).
-        let backend = std::env::var("DATABASE_BACKEND").unwrap_or_else(|_| "postgres".to_string());
+        let backend = crate::config::env_or_override("DATABASE_BACKEND")
+            .unwrap_or_else(|| "postgres".to_string());
 
         // Try libsql first if that's the configured backend.
         #[cfg(feature = "libsql")]
@@ -669,7 +670,7 @@ impl SetupWizard {
         #[cfg(all(feature = "postgres", feature = "libsql"))]
         {
             // Check if a backend is already pinned via env var
-            let env_backend = std::env::var("DATABASE_BACKEND").ok();
+            let env_backend = crate::config::env_or_override("DATABASE_BACKEND");
 
             if let Some(ref backend) = env_backend {
                 if backend == "libsql" || backend == "turso" || backend == "sqlite" {
@@ -1185,7 +1186,7 @@ impl SetupWizard {
     async fn auto_setup_database(&mut self) -> Result<(), SetupError> {
         // If DATABASE_URL or LIBSQL_PATH already set, respect existing config
         #[cfg(feature = "postgres")]
-        let env_backend = std::env::var("DATABASE_BACKEND").ok();
+        let env_backend = crate::config::env_or_override("DATABASE_BACKEND");
 
         #[cfg(feature = "postgres")]
         if let Some(ref backend) = env_backend
@@ -3512,6 +3513,53 @@ mod tests {
 
     use super::*;
     use crate::config::helpers::lock_env;
+
+    #[test]
+    #[cfg(feature = "libsql")]
+    fn reconnect_uses_autodetected_runtime_backend() {
+        if std::env::var_os("WI310_WIZARD_CHILD").is_none() {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join("ironclaw.db"), "").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "setup::wizard::tests::reconnect_uses_autodetected_runtime_backend",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env("WI310_WIZARD_CHILD", "1")
+                .env("LUNARWING_BASE_DIR", dir.path())
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                crate::bootstrap::load_lunarwing_env();
+                assert!(std::env::var("DATABASE_BACKEND").is_err());
+                let mut wizard = SetupWizard::new();
+                wizard.reconnect_existing_db().await.unwrap();
+                assert_eq!(wizard.settings.database_backend.as_deref(), Some("libsql"));
+                // The DB-backed config reload path must not re-import changed
+                // dotenv files either; full config may lack unrelated settings.
+                std::fs::write(".env", "WI310_RELOAD_ADDED=later\n").unwrap();
+                let _ =
+                    crate::config::Config::from_db(wizard.db_backend.as_ref().unwrap(), "default")
+                        .await;
+                assert!(std::env::var("WI310_RELOAD_ADDED").is_err());
+            });
+    }
 
     #[test]
     fn test_wizard_creation() {

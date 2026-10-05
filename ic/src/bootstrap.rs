@@ -208,6 +208,10 @@ pub fn lunarwing_workspace_template_dir() -> PathBuf {
 /// `DATABASE_BACKEND` is still unset and `<base_dir>/ironclaw.db` exists,
 /// defaults to `libsql` so cloud instances work out of the box without any
 /// manual configuration.
+///
+/// Dotenv loading is startup-only: callers outside a Tokio runtime must invoke
+/// this before starting other threads. Runtime calls skip dotenv mutation and
+/// use the thread-safe config overlay for backend autodetection instead.
 pub fn load_lunarwing_env() {
     let path = lunarwing_env_path();
 
@@ -216,7 +220,8 @@ pub fn load_lunarwing_env() {
         migrate_bootstrap_json_to_env(&path);
     }
 
-    if path.exists() {
+    let runtime_active = tokio::runtime::Handle::try_current().is_ok();
+    if !runtime_active && path.exists() {
         let _ = dotenvy::from_path(&path);
     }
 
@@ -224,10 +229,10 @@ pub fn load_lunarwing_env() {
     // all env files, and the local SQLite DB exists, default to libsql.
     // This avoids the chicken-and-egg problem on cloud instances where no
     // DATABASE_URL is configured but ironclaw.db is already present.
-    if std::env::var("DATABASE_BACKEND").is_err() {
+    if crate::config::env_or_override("DATABASE_BACKEND").is_none() {
         let default_db = lunarwing_base_dir().join("ironclaw.db");
         if default_db.exists() {
-            if tokio::runtime::Handle::try_current().is_ok() {
+            if runtime_active {
                 // Tokio runtime is active (multi-threaded); std::env::set_var is UB here.
                 // Fall back to the thread-safe runtime overlay so the value is always set.
                 tracing::warn!(
@@ -236,7 +241,7 @@ pub fn load_lunarwing_env() {
                 );
                 crate::config::set_runtime_env("DATABASE_BACKEND", "libsql");
             } else {
-                // SAFETY: No Tokio runtime = no other threads = safe to call set_var.
+                // SAFETY: Startup-only branch; callers must run before starting threads.
                 unsafe { std::env::set_var("DATABASE_BACKEND", "libsql") };
             }
         }
@@ -1027,38 +1032,89 @@ INJECTED="pwned"#;
 
     #[test]
     fn test_libsql_autodetect_sets_backend_when_db_exists() {
-        let _guard = lock_env();
-        let old_val = std::env::var("DATABASE_BACKEND").ok();
-        // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
-        unsafe { std::env::remove_var("DATABASE_BACKEND") };
-
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("ironclaw.db");
-
-        // No DB file — auto-detect guard should not trigger.
-        assert!(!db_path.exists());
-        let would_trigger = std::env::var("DATABASE_BACKEND").is_err() && db_path.exists();
-        assert!(
-            !would_trigger,
-            "should not auto-detect when db file is absent"
-        );
-
-        // Create the DB file — guard should now trigger.
-        std::fs::write(&db_path, "").unwrap();
-        assert!(db_path.exists());
-
-        // Simulate the detection logic (DATABASE_BACKEND unset + db exists).
-        let detected = std::env::var("DATABASE_BACKEND").is_err() && db_path.exists();
-        assert!(
-            detected,
-            "should detect libsql when db file is present and backend unset"
-        );
-
-        // Restore.
-        if let Some(val) = old_val {
-            // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
-            unsafe { std::env::set_var("DATABASE_BACKEND", val) };
+        // Isolate both the LazyLock base dir and the process-global overlay.
+        for scenario in ["absent", "autodetect", "overlay", "process", "startup"] {
+            let dir = tempdir().unwrap();
+            let base = dir.path().join("instance");
+            std::fs::create_dir(&base).unwrap();
+            if scenario != "absent" {
+                std::fs::write(base.join("ironclaw.db"), "").unwrap();
+            }
+            std::fs::write(base.join(".env"), "WI310_INSTANCE_KEY=initial\n").unwrap();
+            std::fs::write(dir.path().join(".env"), "WI310_CWD_KEY=initial\n").unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "bootstrap::tests::bootstrap_env_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(dir.path())
+                .env_clear()
+                .env("LUNARWING_BASE_DIR", &base)
+                .env("WI310_SCENARIO", scenario);
+            if scenario == "process" {
+                child.env("DATABASE_BACKEND", "postgres");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
+    }
+
+    #[test]
+    fn bootstrap_env_child() {
+        let Ok(scenario) = std::env::var("WI310_SCENARIO") else {
+            return;
+        };
+        if scenario == "startup" {
+            crate::config::load_bootstrap_settings(None).unwrap();
+            assert_eq!(std::env::var("WI310_INSTANCE_KEY").unwrap(), "initial");
+            assert_eq!(std::env::var("WI310_CWD_KEY").unwrap(), "initial");
+            assert_eq!(std::env::var("DATABASE_BACKEND").unwrap(), "libsql");
+        }
+        if scenario == "overlay" {
+            crate::config::set_runtime_env("DATABASE_BACKEND", "postgres");
+        } else if scenario == "process" {
+            crate::config::set_runtime_env("DATABASE_BACKEND", "libsql");
+        }
+        // Simulate dotenv gaining new keys after startup. Both runtime config
+        // entry points must skip mutation, including the instance loader.
+        std::fs::write(lunarwing_env_path(), "WI310_INSTANCE_ADDED=later\n").unwrap();
+        std::fs::write(".env", "WI310_CWD_ADDED=later\n").unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            crate::config::load_bootstrap_settings(None).unwrap();
+            load_lunarwing_env();
+            assert!(std::env::var("WI310_INSTANCE_ADDED").is_err());
+            assert!(std::env::var("WI310_CWD_ADDED").is_err());
+            if scenario == "absent" {
+                assert!(crate::config::env_or_override("DATABASE_BACKEND").is_none());
+                return;
+            }
+            let expected = if matches!(scenario.as_str(), "overlay" | "process") {
+                crate::config::DatabaseBackend::Postgres
+            } else {
+                crate::config::DatabaseBackend::LibSql
+            };
+            crate::config::set_runtime_env("DATABASE_URL", "postgres://localhost/unused");
+            assert_eq!(
+                crate::config::DatabaseConfig::resolve().unwrap().backend,
+                expected
+            );
+            if scenario != "process" && scenario != "startup" {
+                assert!(std::env::var("DATABASE_BACKEND").is_err());
+            }
+        });
     }
 
     // === QA Plan P1 - 1.2: Bootstrap .env round-trip tests ===

@@ -71,6 +71,15 @@ worker. Verification failure fails the onboarding job/CLI exit.
 `Config::from_env()` (step 3c) because bootstrap vars like
 `DATABASE_BACKEND` live in `~/.lunarwing/.env`.
 
+Dotenv loading happens before the Tokio runtime is started. Config reloads
+inside the runtime skip both the working-directory and instance dotenv loaders:
+adding a key to either file must never mutate the process environment while
+threads are running (WI#310). Restart to apply dotenv edits. Backend autodetection
+can still populate the thread-safe runtime overlay if no backend is configured
+and `<base_dir>/ironclaw.db` exists. The wizard's reconnect, interactive, and quick
+paths read that overlay too; explicit process env values take precedence, and
+autodetection does not replace a configured overlay value.
+
 ---
 
 ## Quick Mode

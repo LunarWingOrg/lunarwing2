@@ -169,7 +169,9 @@
 43. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/311
     - DONE (2026-10-05): cron missions no longer auto-complete from a run's goal-achieved/mission-complete declaration; their prompt asks about run success. Explicit terminal states and owner checks remain authoritative. Existing parked cron missions can be recovered with owner-authorized `mission_resume`; automatic resurrection would also revive intentional stops, so no bulk migration is performed.
     - Verification: 129 mission runtime tests passed, including repeated cron ticks across manager restart, future schedule advancement, explicit terminal-state preservation and owner-scoped recovery; existing manual goal completion coverage passed. Engine Clippy (`--lib --tests -- -D warnings`), formatting and diff checks passed. Lifecycle, recovery and downgrade semantics documented in `docs/architecture/ENGINE-V2.md`.
-44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/310
+44. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/310
+    - DONE (2026-10-05): wizard reconnect/interactive/quick backend reads now honor the runtime overlay. Backend autodetection respects already-configured overlay values. Runtime config loading skips both instance and working-directory dotenv mutation; startup loading and process-env precedence are preserved. Dotenv edits require restart, documented in `ic/src/setup/README.md`.
+    - Verification: 344 targeted config/setup/bootstrap tests passed; subprocess regressions exercise real backend resolution, absent/existing DB files, explicit env versus overlay, startup loading, dotenv additions during runtime and actual wizard libSQL reconnect plus DB-backed reload. Daemon Clippy (`--lib --tests -- -D warnings`), PostgreSQL-only and libSQL-only `cargo check --lib --tests`, formatting and diff checks passed.
 45. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/309
 46. [x] (S) Reserved
 47. [x] (S) Reserved
