@@ -107,6 +107,12 @@ fn mission_context(
     }
 }
 
+/// A cron occurrence completing is not the scheduled mission completing.
+/// Managed learning missions have the same contract for event-driven runs.
+fn keeps_running_after_success(mission: &Mission) -> bool {
+    matches!(mission.cadence, MissionCadence::Cron { .. }) || is_recurring_learning_mission(mission)
+}
+
 fn is_recurring_learning_mission(mission: &Mission) -> bool {
     mission
         .metadata
@@ -2916,14 +2922,14 @@ fn build_meta_prompt(
         mission.thread_history.len() + 1
     ));
 
-    // Instructions. System-managed learning missions are recurring workers;
+    // Instructions. Cron and system-managed learning missions are recurring workers;
     // completing one event must not imply that the mission itself is terminal.
     let next_focus_instruction = if insights {
         "2. Which source evidence supports each saved insight; if none, report no new insights"
     } else {
         "2. What the next focus should be (for the next thread)"
     };
-    let completion_instruction = if is_recurring_learning_mission(mission) {
+    let completion_instruction = if keeps_running_after_success(mission) {
         "3. Whether this event/run was handled successfully (yes/no)".to_string()
     } else {
         // The status line must stand alone: goal #30 observed an honest
@@ -2996,7 +3002,7 @@ async fn process_mission_outcome_and_notify(
         } => {
             // Check if goal achieved — only an explicit line-anchored
             // declaration counts (see `declares_goal_achieved`).
-            if !is_recurring_learning_mission(&mission) && declares_goal_achieved(text) {
+            if !keeps_running_after_success(&mission) && declares_goal_achieved(text) {
                 debug!(mission_id = %mission_id, "goal achieved — completing mission");
                 mission.status = MissionStatus::Completed;
             }
@@ -6363,6 +6369,102 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             MissionStatus::Completed,
             "mission should be completed when goal is achieved"
         );
+    }
+
+    #[tokio::test]
+    async fn cron_completion_keeps_firing_across_restart() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let response = "FINAL(\"Goal achieved: yes\\nMission complete\")";
+        let mut mgr = make_mission_manager_with_response(store.clone(), response);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "daily digest",
+                "deliver each day's digest",
+                MissionCadence::Cron {
+                    expression: "0 10 * * *".into(),
+                    timezone: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        for run in 1..=2 {
+            let mut mission = store.load_mission(id).await.unwrap().unwrap();
+            assert!(
+                build_meta_prompt(&mission, &[], &None)
+                    .contains("3. Whether this event/run was handled successfully (yes/no)")
+            );
+            mission.next_fire_at = Some(Utc::now() - chrono::Duration::minutes(1));
+            store.save_mission(&mission).await.unwrap();
+            assert_eq!(mgr.tick("test-user").await.unwrap().len(), 1);
+            // Wait for the outcome watcher, not merely the thread's terminal state.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let saved = store.load_mission(id).await.unwrap().unwrap();
+                    if saved.approach_history.len() == run {
+                        assert_eq!(saved.status, MissionStatus::Active);
+                        assert!(saved.approach_history[run - 1].contains("Goal achieved: yes"));
+                        assert!(saved.next_fire_at.unwrap() > Utc::now());
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(mgr.tick("test-user").await.unwrap().is_empty());
+            // Rebuild all in-memory scheduling state against the persisted mission.
+            mgr = make_mission_manager_with_response(store.clone(), response);
+            assert_eq!(mgr.bootstrap_all_projects().await.unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_terminal_states_require_explicit_owner_resume() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(store.clone());
+        for status in [
+            MissionStatus::Paused,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+        ] {
+            let mut mission = Mission::new(
+                ProjectId::new(),
+                "test-user",
+                "stopped cron",
+                "digest",
+                MissionCadence::Cron {
+                    expression: "0 10 * * *".into(),
+                    timezone: None,
+                },
+            );
+            mission.status = status;
+            mission.next_fire_at = Some(Utc::now() - chrono::Duration::minutes(1));
+            let id = mission.id;
+            store.save_mission(&mission).await.unwrap();
+            assert_eq!(mgr.bootstrap_all_projects().await.unwrap(), 0);
+            assert!(mgr.tick("test-user").await.unwrap().is_empty());
+            assert!(mgr.resume_mission(id, "other-user").await.is_err());
+            assert_eq!(
+                store.load_mission(id).await.unwrap().unwrap().status,
+                status
+            );
+            mgr.resume_mission(id, "test-user").await.unwrap();
+            let resumed = store.load_mission(id).await.unwrap().unwrap();
+            assert_eq!(resumed.status, MissionStatus::Active);
+            assert!(resumed.next_fire_at.unwrap() > Utc::now());
+            mgr.complete_mission_with_owner(id, "test-user")
+                .await
+                .unwrap();
+            assert!(mgr.tick("test-user").await.unwrap().is_empty());
+            assert_eq!(
+                store.load_mission(id).await.unwrap().unwrap().status,
+                MissionStatus::Completed
+            );
+        }
     }
 
     #[tokio::test]

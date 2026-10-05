@@ -644,6 +644,18 @@ needed. Downgrading restores the older completion/recovery behavior and does
 not reconstruct interrupted work. Operators should inspect interrupted fires
 before manually refiring tasks with external side effects.
 
+Cron missions remain active after successful runs (WI#311), even if a final
+response declares `Goal achieved: yes` or `Mission complete`. Their prompt asks
+about this run's success rather than overall goal completion. Explicit completion,
+pause, and failure still stop scheduling; a cron cadence does not override status.
+Older user cron missions already parked in Completed are not auto-reactivated,
+because persisted records cannot distinguish phrase-driven completion from an
+intentional stop. Inspect their history, then use `mission_resume(id=...)`
+as the owner to restore the existing mission and compute its next future fire.
+Missed occurrences are not replayed. Non-cron, non-managed missions retain the
+standalone goal-declaration completion contract. Downgrading restores the old
+phrase-driven completion behavior for cron missions; no schema change is needed.
+
 `MissionManager::ensure_learning_missions()` provisions two baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.

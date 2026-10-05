@@ -166,7 +166,9 @@
 40. [x] (S) RESERVED4NVMES
 41. [x] (S) RESERVED
 42. [x] (S) RESERVED
-43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/311
+43. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/311
+    - DONE (2026-10-05): cron missions no longer auto-complete from a run's goal-achieved/mission-complete declaration; their prompt asks about run success. Explicit terminal states and owner checks remain authoritative. Existing parked cron missions can be recovered with owner-authorized `mission_resume`; automatic resurrection would also revive intentional stops, so no bulk migration is performed.
+    - Verification: 129 mission runtime tests passed, including repeated cron ticks across manager restart, future schedule advancement, explicit terminal-state preservation and owner-scoped recovery; existing manual goal completion coverage passed. Engine Clippy (`--lib --tests -- -D warnings`), formatting and diff checks passed. Lifecycle, recovery and downgrade semantics documented in `docs/architecture/ENGINE-V2.md`.
 44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/310
 45. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/309
 46. [x] (S) Reserved
