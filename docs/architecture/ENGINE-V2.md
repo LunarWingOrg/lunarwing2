@@ -543,6 +543,24 @@ accept `manual`, `hourly`, `daily`, minute intervals such as `30m`, hour
 intervals such as `6h`, and 5-7 field cron expressions whose seconds field is
 zero. Invalid cadence values fail instead of silently becoming manual missions.
 
+Five-field cron is `minute hour day-of-month month day-of-week`; six fields
+prepend seconds and seven append year. The mission tools use UTC: daily 10:15
+is `15 10 * * *` or `0 15 10 * * *`, whereas `0 10 15 * * *` is **15:10 UTC**.
+Creation, listing and history responses include `project_id` and `schedule`
+(cadence, effective timezone, cron field order, and the persisted
+`next_fire_at`). Creation also returns the actual `mission_status`, including
+when name deduplication returns an existing mission. The next-fire timestamp
+is not recomputed for display: an overdue value remains visible. It describes
+the stored schedule, not proof that the ticker is healthy. Webhook secrets are
+excluded from these diagnostics.
+
+`never_fired` means neither a last-fire timestamp nor thread history exists.
+Older persisted missions may have history but lack `last_fired_at`; they report
+`never_fired=false` without fabricating a timestamp. A terminal status plus a
+missing timestamp alone does not establish that a mission was born terminal.
+Tool listings remain project- and owner-scoped (including shared missions),
+so absence from another project's list does not establish deletion.
+
 Cron missions receive `next_fire_at` when created, updated, or resumed. Startup
 repairs older valid cron missions missing this value. Scheduler fires advance
 the next occurrence even when the daily thread budget blocks a run; manual
@@ -565,6 +583,15 @@ whose `project.json` is missing or unparseable still loads while its project
 does not. Project-derived listings dropped such missions from the active
 index entirely — no rollover, no dispatch, and a `threads_today_date` pinned
 at its creation date (WI#243 recurrence, v2.1.4.0).
+
+At daemon startup, `HybridStore::load_state_from_workspace` reconstructs its
+mission map from persisted workspace records; `bootstrap_project` and
+`bootstrap_all_projects` rebuild the manager's active index. Ticks iterate that
+index and reload each mission from the store, rather than rescanning workspace
+files on every minute. Creation and resume register missions in the same
+manager. A foreground conversation/session change does not own or recreate
+this scheduler. Goal 42's [investigation](../ops/v2.1.5.0_GOAL42_MISSION_DIAGNOSTICS.md)
+records the build and cron interpretation behind the WI#311 follow-up reports.
 
 The daily thread budget (`max_threads_per_day`,
 default 30 via `DEFAULT_MAX_THREADS_PER_DAY` since work item #189, 0 =

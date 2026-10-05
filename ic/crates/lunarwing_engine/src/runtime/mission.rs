@@ -4805,6 +4805,23 @@ mod tests {
         assert!(repaired.next_fire_at.is_some());
     }
 
+    #[test]
+    fn wi311_reported_cron_is_1510_not_1015_utc() {
+        let after = "2026-10-05T10:31:00Z".parse::<DateTime<Utc>>().unwrap();
+        for (expression, expected) in [
+            ("0 10 15 * * *", "2026-10-05T15:10:00Z"),
+            ("0 15 10 * * *", "2026-10-06T10:15:00Z"),
+            ("15 10 * * *", "2026-10-06T10:15:00Z"),
+        ] {
+            let cadence = MissionCadence::Cron {
+                expression: expression.into(),
+                timezone: None,
+            };
+            let next = next_fire_for_cadence(&cadence, after).unwrap().unwrap();
+            assert_eq!(next, expected.parse::<DateTime<Utc>>().unwrap());
+        }
+    }
+
     #[tokio::test]
     async fn cadence_update_recomputes_next_fire_at() {
         let store = Arc::new(TestStore::new());
