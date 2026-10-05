@@ -28,7 +28,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-10-04, target release 2.1.5.0):**
+**Current state (updated 2026-10-05, target release 2.1.5.0):**
 
 - v2.1.4.0 (Kabuto) shipped 2026-10-03: engine recovery and reliability,
   dependency security, tenant system-prompt editing, and an XMPP durable
@@ -36,11 +36,13 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   but `ic/src/agent/`, `ic/src/db/`, `ic/src/secrets/`, gateway, sandboxing,
   and approvals are still Tier 3 by default (§3).
 - The v2.1.5.0 pre-release checklist is being worked through
-  (`docs/ops/AGENT_GOALS_2.1.5.0.md`). Areas under active change include the
-  crate/pin state (all LunarWing crates bumped to 2.1.5 per checklist
-  item #1; kimi worker 2.1.1; opencode2 v2.0.21), engine-v2 boot/recovery
-  hardening, and the open work-item audit. Check the checklist before
-  opening MRs there.
+  (`docs/ops/AGENT_GOALS_2.1.5.0.md`). The crate/pin state already moved
+  (all LunarWing crates at 2.1.5 per checklist item #1; kimi worker 2.1.1;
+  opencode2 v2.0.21). Areas still under active change include the workspace
+  memory daily-log gate (WI#288), the routine/mission history registry
+  split (WI#278), the mission graceful-shutdown retry seam (WI#276), the
+  secrets-tool approval tier (WI#307), and the opencode2 worker bump to
+  v2.0.22 (WI#303). Check the checklist before opening MRs there.
 - **Kawarimi export testing under OpenRC** is being re-worked due to an open-write detection
   difference vs systemd. OpenRC contributors *with kawarimi export expertise* are welcome →
   ask in `#lunarwing`.
@@ -136,4 +138,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-10-04 (v2.1.5.0 freeze status). Update §2 whenever freeze status changes.*
+*Last updated: 2026-10-05 (v2.1.5.0 freeze status). Update §2 whenever freeze status changes.*

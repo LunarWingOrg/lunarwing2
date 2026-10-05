@@ -208,7 +208,7 @@ registry-aware healthpoint aggregates it by tenant and exports
 `lunarwing_health_llm_streams_repl_argument_corruption_total{provider,tenant}`.
 Old snapshots without the field read as zero. Like other stream-integrity
 signals, this is monitor-only. See the
-[Goal 34 verification record](../ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md).
+[Goal 34 verification record](../ops/history/GOAL34_REPL_ARGUMENT_INTEGRITY.md).
 
 ### Two Execution Tiers
 
@@ -969,6 +969,12 @@ Wraps tool execution and safety layer as `EffectExecutor`:
   resumed thread may gain. In particular, mission leases exclude administrative
   and autonomous-denylisted actions such as `create_job`; foreground leases keep
   them behind their normal interactive gates.
+- Before executing a registry tool, including an approval resume, the adapter
+  rejects non-foreground calls when `allows_autonomous_execution()` is false.
+  Both secrets tools opt out; `secret_delete` additionally requires approval
+  for each foreground deletion and ignores persistent `always_allow` grants.
+  Daemon discovery and engine lease planning share the autonomous denylist,
+  including `ssh`/`ssh_git`; per-tool opt-outs are independently rechecked.
 
 ### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
@@ -1233,7 +1239,7 @@ overlay storage identity and bridge path, the three gated writers, consumption
 semantics, the existing-thread retention caveat, safe enable/disable, and a
 read-only tenant inspection runbook (`mt-admin daemon-pid` / `mt-admin psql`)
 — is published in
-`docs/ops/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
+`docs/ops/history/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md`. Key operator facts:
 `ORCHESTRATOR_SELF_MODIFY` unset or any value other than `true`/`1` makes
 stored overlays inert regardless of database contents; multi-tenant provisioning
 writes `ORCHESTRATOR_SELF_MODIFY=true` for new tenants while preserving an

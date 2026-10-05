@@ -252,7 +252,7 @@ existing unconfigured setups are safe. Existing explicit `proxy` or
 need sandboxed web access select `SANDBOX_NETWORK=proxy-enforced` after
 checking the local Linux runtime and a Python-3-equipped image; legacy `proxy`
 remains advisory. See [`NETWORK_SECURITY.md` §5](../NETWORK_SECURITY.md#5-sandbox-http-proxy)
-and the [item-26 rollout record](../../../docs/ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+and the [item-26 rollout record](../../../docs/ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
 
 **Personal onboarding** happens conversationally during the user's first interaction
 with the running assistant (not during the wizard). The `## First-Run Bootstrap` block in

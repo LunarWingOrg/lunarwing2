@@ -250,7 +250,7 @@ The external-worker bearer token is now `Option<SecretString>` at every layer (`
 
 ## References
 
-- DarkIRC MT flag changelog: `docs/ops/DARKIRC-MULTITENANT-CHANGES-JUN23-FLAG-INFO.md`
+- DarkIRC MT flag changelog: `docs/ops/history/DARKIRC-MULTITENANT-CHANGES-JUN23-FLAG-INFO.md`
 - DarkIRC MT runbook: `docs/ops/DARKIRC-MULTITENANT.md`
 - EWE plan: `docs/proposals/EXTERNAL-WORKER-PLAN-UPGRADES.md`
 - EWE progress: `docs/proposals/EXTERNAL-WORKER-UPGRADES-PROGRESS.md`

@@ -81,6 +81,10 @@ impl Tool for SecretListTool {
 
         Ok(ToolOutput::success(output, start.elapsed()))
     }
+
+    fn allows_autonomous_execution(&self) -> bool {
+        false
+    }
 }
 
 // ── secret_delete ─────────────────────────────────────────────────────────────
@@ -150,7 +154,17 @@ impl Tool for SecretDeleteTool {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
+        ApprovalRequirement::Always
+    }
+
+    fn allows_always_approval(&self, _params: &serde_json::Value) -> bool {
+        // A tool-wide grant would authorize deleting every credential, not
+        // just the name shown in the current approval prompt (WI#307).
+        false
+    }
+
+    fn allows_autonomous_execution(&self) -> bool {
+        false
     }
 }
 
@@ -169,6 +183,31 @@ mod tests {
 
     fn test_ctx() -> JobContext {
         JobContext::new("test", "test job")
+    }
+
+    #[test]
+    fn secret_delete_requires_each_approval_even_with_stale_grants() {
+        let tool = SecretDeleteTool::new(test_store());
+        let params = serde_json::json!({"name": "credential"});
+        for global in [false, true] {
+            for user_grant in [false, true] {
+                assert!(
+                    tool.requires_approval(&params)
+                        .needs_prompt_with_user_grant(
+                            global,
+                            user_grant,
+                            tool.allows_always_approval(&params),
+                        )
+                );
+            }
+        }
+        assert!(crate::tools::permissions::tool_permission_locked(&tool));
+    }
+
+    #[test]
+    fn secrets_family_is_interactive_only() {
+        assert!(!SecretListTool::new(test_store()).allows_autonomous_execution());
+        assert!(!SecretDeleteTool::new(test_store()).allows_autonomous_execution());
     }
 
     #[tokio::test]

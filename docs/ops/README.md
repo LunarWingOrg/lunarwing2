@@ -46,9 +46,12 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 - [`SSH-HARNESS-SETUP.md`](SSH-HARNESS-SETUP.md)
 - [`PRE-RELEASE-TESTING.md`](PRE-RELEASE-TESTING.md)
 - [`TEST-SCRIPTS-STATUS.md`](TEST-SCRIPTS-STATUS.md)
-- [`TEST-PLAN-UPGRADED-TENANT-1.1.9.md`](TEST-PLAN-UPGRADED-TENANT-1.1.9.md)
+- Historical [1.1.9 upgrade acceptance](history/TEST-PLAN-UPGRADED-TENANT-1.1.9.md)
 
 ## Component operations
+
+- [Nanocode removal and migration](NANOCODE-REMOVAL.md)
+- [Predelegated subtree cgroups](PREDELEGATED_SUBTREE_CGROUPS.md)
 
 - Workers: [`WORKER-CONTAINERS.md`](WORKER-CONTAINERS.md),
   [`PEBBLE-WORKER.md`](PEBBLE-WORKER.md), and
@@ -58,7 +61,7 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 - WeeChat: [`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md).
 - XMPP: [`XMPP_TRANSFERS.md`](XMPP_TRANSFERS.md),
   [`XMPP_KNOWN_ISSUES.md`](XMPP_KNOWN_ISSUES.md), and
-  [`XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md`](XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md).
+  the resolved [body-limit review](history/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md).
 - MCP: [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md) and
   [`MCP_ADDITIONS.md`](MCP_ADDITIONS.md).
 - SSH: [`SSH_KEY_LOG_EXPOSURE_KAGEHO.md`](SSH_KEY_LOG_EXPOSURE_KAGEHO.md)
@@ -67,6 +70,11 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 ## Planning and active ledgers
 
 - The current `AGENT_GOALS_*.md` file is the active pre-release checklist.
+- Current v2.1.5.0 release evidence:
+  [`v2.1.5.0_CARGO_DENY_AUDIT.md`](v2.1.5.0_CARGO_DENY_AUDIT.md) (dependency
+  advisory audit and accepted-findings dispositions) and
+  [`v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md`](v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md)
+  (open work-item audit with per-item repository disposition).
 - [`ROADMAP_2026.md`](ROADMAP_2026.md) and
   [`RELEASE_CADENCE.md`](RELEASE_CADENCE.md) define forward planning.
 - [`SUNBURST_BUG_LIST.md`](SUNBURST_BUG_LIST.md),
@@ -78,6 +86,7 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 
 Completed release evidence, superseded roadmaps, review snapshots, and old
 checklists are in [`history/`](history/README.md). Versioned release notes live
-in [`../releases/`](../releases/). Raw CI transcripts, assistant session output,
-and one-line placeholders are not documentation and should not be committed;
-use the CI job or Git history as the source of record.
+in [`../releases/`](../releases/). Do not add new raw CI transcripts, assistant
+session output, or one-line placeholders; use the CI job or Git history as the
+source of record. Previously committed, cited excerpts in the archive are
+retained only as historical evidence.

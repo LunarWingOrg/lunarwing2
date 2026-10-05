@@ -2,7 +2,7 @@
 
 > **Current status (2026-07-29): IMPLEMENTED + REPAIRED.** The complete
 > propose, review, approve/reject, version-history, metric-reset, API, and web UI
-> flow is in tree. Goals item #41 (2026-07-29, see `docs/ops/SIS_FIX_PROPOSAL.md`)
+> flow is in tree. Goals item #41 (2026-07-29, see `docs/ops/history/SIS_FIX_PROPOSAL.md`)
 > repaired four runtime breaks in this machinery: terminal `StateChanged` was
 > never broadcast, `trigger_payload` was never seeded into mission state, a
 > permanent-lease leak, and the missing mission write path for skill docs (why
