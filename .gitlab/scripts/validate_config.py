@@ -549,9 +549,23 @@ def extract_arg_default(text: str, arg: str) -> str | None:
     return match.group(1) if match else None
 
 
+def worker_case_blocks(build_script: str) -> dict[str, str]:
+    """Extract each worker's case block from build-worker-image.sh so pin
+    checks bind to the right lane — opencode and opencode2 share the
+    OPENCODE_REF/OPENCODE_VERSION arg names, so a whole-script search can be
+    satisfied by the wrong lane's value (WI#303 review)."""
+    blocks: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?ms)^    (pebble|opencode2|opencode|kimi)\)\n(.*?)^        ;;", build_script
+    ):
+        blocks[match.group(1)] = match.group(2)
+    return blocks
+
+
 def validate_worker_versions(errors: list[str]) -> None:
     """Cross-check worker version pins: Dockerfile ARG defaults, the build
-    script's build_args, and Kimi's committed npm lockfile must agree."""
+    script's per-worker build_args and source_ref, and Kimi's committed npm
+    lockfile must agree."""
     build_script = WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
     pebble_text = PEBBLE_DOCKERFILE.read_text(encoding="utf-8")
     opencode_text = OPENCODE_DOCKERFILE.read_text(encoding="utf-8")
@@ -565,25 +579,45 @@ def validate_worker_versions(errors: list[str]) -> None:
     elif not lock_path.is_file() or hashlib.sha256(lock_path.read_bytes()).hexdigest() != lock_digest:
         errors.append("Pebble upstream Cargo.lock differs from the Dockerfile's reviewed SHA256")
 
+    blocks = worker_case_blocks(build_script)
     canonical_pins = (
-        ("PEBBLE_REF", pebble_text, "PEBBLE_REF"),
-        ("OPENCODE_REF", opencode_text, "OPENCODE_REF"),
-        ("OPENCODE_VERSION", opencode_text, "OPENCODE_VERSION"),
-        ("OPENCODE2_REF", opencode2_text, "OPENCODE_REF"),
-        ("OPENCODE2_VERSION", opencode2_text, "OPENCODE_VERSION"),
-        ("KIMI_CODE_VERSION", kimi_text, "KIMI_CODE_VERSION"),
+        ("pebble", "PEBBLE_REF", pebble_text, "PEBBLE_REF"),
+        ("opencode", "OPENCODE_REF", opencode_text, "OPENCODE_REF"),
+        ("opencode", "OPENCODE_VERSION", opencode_text, "OPENCODE_VERSION"),
+        ("opencode2", "OPENCODE2_REF", opencode2_text, "OPENCODE_REF"),
+        ("opencode2", "OPENCODE2_VERSION", opencode2_text, "OPENCODE_VERSION"),
+        ("kimi", "KIMI_CODE_VERSION", kimi_text, "KIMI_CODE_VERSION"),
     )
-    for label, dockerfile_text, arg_name in canonical_pins:
+    for worker, label, dockerfile_text, arg_name in canonical_pins:
         value = extract_arg_default(dockerfile_text, arg_name)
+        block = blocks.get(worker)
         if not value:
             errors.append(f"worker Dockerfiles missing canonical {label} default")
-        elif not re.search(rf"{arg_name}={re.escape(value)}\b", build_script):
+        elif block is None:
+            errors.append(f"build-worker-image.sh has no case block for worker {worker!r}")
+        elif not re.search(rf"{arg_name}={re.escape(value)}\b", block):
             errors.append(
-                f"build-worker-image.sh {arg_name}={value!r} differs from the "
+                f"build-worker-image.sh {worker} block {arg_name}={value!r} differs from the "
                 f"Dockerfile {label} canonical declaration"
             )
 
-    for label, dockerfile_text, arg_name in canonical_pins:
+    # The provenance-recording source_ref must match the reviewed pin too —
+    # it lands in worker-inputs.sha256 but was historically never checked.
+    for worker, label, dockerfile_text, arg_name in canonical_pins:
+        if arg_name not in ("PEBBLE_REF", "OPENCODE_REF", "KIMI_CODE_VERSION"):
+            continue
+        value = extract_arg_default(dockerfile_text, arg_name) or ""
+        block = blocks.get(worker) or ""
+        match = re.search(r"(?m)^        source_ref=(\S+)$", block)
+        if match is None:
+            errors.append(f"build-worker-image.sh {worker} block must declare a source_ref")
+        elif value and match.group(1) != value:
+            errors.append(
+                f"build-worker-image.sh {worker} source_ref {match.group(1)!r} differs from the "
+                f"Dockerfile {label} canonical declaration"
+            )
+
+    for worker, label, dockerfile_text, arg_name in canonical_pins:
         if arg_name not in ("OPENCODE_REF", "PEBBLE_REF"):
             continue
         value = extract_arg_default(dockerfile_text, arg_name) or ""
