@@ -307,7 +307,7 @@ export async function executeTask(
           const requestID = (event.data as { id?: unknown } | undefined)?.id
           if (typeof requestID === "string") {
             await waitForStop(
-              sdk.session.permission.reply(
+              sdk.permission.reply(
                 {
                   sessionID,
                   requestID,
@@ -470,13 +470,33 @@ export async function executeTask(
 // After execution settles, pull the session's assistant messages for the
 // canonical output. v2 keeps final assistant text in session messages rather
 // than the prompt response (the prompt API returns an inbox receipt).
+//
+// The v2 promise client lists session messages at the TOP level —
+// client.message.list(input) calls GET /api/session/:sessionID/message and
+// returns a paginated { data, cursor } envelope. There is NO
+// session.message.list (session.message only has get); the previous call path
+// threw TypeError at runtime (WI#320 finding F7). Permission replies likewise
+// live at client.permission.reply, not session.permission.reply. Pages are
+// followed with the same server-side type filter, bounded by
+// MESSAGE_LIST_MAX_PAGES.
+const MESSAGE_LIST_PAGE_SIZE = 200 // upstream maximum per page
+const MESSAGE_LIST_MAX_PAGES = 5
+
 async function fetchAssistantText(sdk: OpenCodeClient, sessionID: string): Promise<string> {
   try {
-    const messages = await sdk.session.message.list(
-      { sessionID },
-      { signal: AbortSignal.timeout(10_000) },
-    )
-    if (!Array.isArray(messages)) return ""
+    const messages: Array<{ type?: unknown; content?: unknown }> = []
+    let cursor: string | undefined
+    for (let page = 0; page < MESSAGE_LIST_MAX_PAGES; page++) {
+      const response = await sdk.message.list(
+        { sessionID, type: "assistant", limit: MESSAGE_LIST_PAGE_SIZE, order: "asc", cursor },
+        { signal: AbortSignal.timeout(10_000) },
+      )
+      if (!response || !Array.isArray(response.data)) break
+      messages.push(...response.data)
+      const next = response.cursor?.next
+      if (typeof next !== "string" || next.length === 0) break
+      cursor = next
+    }
     return messages
       .filter((message) => message?.type === "assistant")
       .flatMap((message) => (Array.isArray(message.content) ? message.content : []))

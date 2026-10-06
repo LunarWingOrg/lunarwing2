@@ -15,6 +15,7 @@ interface MockOptions {
   pendingPermissionReply?: boolean
   pendingInterrupt?: boolean
   messages?: unknown[]
+  messagePages?: Array<{ data: unknown[]; next?: string }>
   promptError?: Error
   executionErrors?: Array<string | undefined>
 }
@@ -22,6 +23,8 @@ interface MockOptions {
 function makeSdk(options: MockOptions = {}) {
   let interruptCount = 0
   let permissionReplies = 0
+  let messageListCalls = 0
+  const messageListArgs: unknown[] = []
   const promptArgs: unknown[] = []
   const signals: AbortSignal[] = []
   const captureSignal = (args: unknown[]) => {
@@ -40,6 +43,10 @@ function makeSdk(options: MockOptions = {}) {
     if (options.pendingAfterEvents) await new Promise(() => {})
   }
 
+  // Mirrors the v2 promise client's real shape: message listing and
+  // permission replies are TOP-LEVEL groups (message.list returns a
+  // paginated { data, cursor } envelope); session.message only has get and
+  // there is no session.permission at all (WI#320 F7 / WI#303).
   const sdk = {
     session: {
       create: async (...args: unknown[]) => {
@@ -60,19 +67,23 @@ function makeSdk(options: MockOptions = {}) {
         if (options.pendingInterrupt) await new Promise(() => {})
         return { data: true }
       },
-      message: {
-        list: async (...args: unknown[]) => {
-          captureSignal(args)
-          return options.messages ?? []
-        },
+    },
+    permission: {
+      reply: async (...args: unknown[]) => {
+        permissionReplies++
+        captureSignal(args)
+        if (options.pendingPermissionReply) await new Promise(() => {})
+        return { data: true }
       },
-      permission: {
-        reply: async (...args: unknown[]) => {
-          permissionReplies++
-          captureSignal(args)
-          if (options.pendingPermissionReply) await new Promise(() => {})
-          return { data: true }
-        },
+    },
+    message: {
+      list: async (...args: unknown[]) => {
+        captureSignal(args)
+        messageListArgs.push(args)
+        const pages = options.messagePages ?? [{ data: options.messages ?? [] }]
+        const page = pages[Math.min(messageListCalls, pages.length - 1)]!
+        messageListCalls++
+        return { data: page.data, cursor: page.next ? { next: page.next } : {} }
       },
     },
     event: {
@@ -87,6 +98,8 @@ function makeSdk(options: MockOptions = {}) {
     sdk,
     interruptCount: () => interruptCount,
     permissionReplyCount: () => permissionReplies,
+    messageListCount: () => messageListCalls,
+    messageListArgs,
     signals,
     promptArgs,
   }
@@ -113,18 +126,42 @@ async function runTask(sdk: OpenCodeClient, request?: TaskRequest) {
   return results[0]!
 }
 
-const canonical = await runTask(
+const canonicalSdk = makeSdk({
+  messages: [
+    {
+      type: "assistant",
+      content: [{ type: "text", text: " canonical output " }],
+    },
+  ],
+})
+const canonical = await runTask(canonicalSdk.sdk)
+assert.equal(canonical.status, "success")
+assert.equal(canonical.output, "canonical output")
+// The canonical fetch must use the top-level message.list with the
+// server-side assistant filter (WI#320 F7: session.message.list is not a
+// function on the real client).
+assert.equal(canonicalSdk.messageListCount(), 1)
+assert.deepEqual(canonicalSdk.messageListArgs[0]?.[0], {
+  sessionID: "session-1",
+  type: "assistant",
+  limit: 200,
+  order: "asc",
+  cursor: undefined,
+})
+
+const paginated = await runTask(
   makeSdk({
-    messages: [
+    messagePages: [
       {
-        type: "assistant",
-        content: [{ type: "text", text: " canonical output " }],
+        data: [{ type: "assistant", content: [{ type: "text", text: "page one" }] }],
+        next: "cursor-2",
       },
+      { data: [{ type: "assistant", content: [{ type: "text", text: "page two" }] }] },
     ],
   }).sdk,
 )
-assert.equal(canonical.status, "success")
-assert.equal(canonical.output, "canonical output")
+assert.equal(paginated.status, "success")
+assert.equal(paginated.output, "page one\npage two")
 
 const streamed = await runTask(
   makeSdk({
