@@ -1835,15 +1835,21 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     // Migrate v1 skills to v2 MemoryDocs (skill selection happens in the
     // Python orchestrator at runtime via __list_skills__).
     if let Some(registry) = agent.deps.skill_registry.as_ref() {
-        let skills_snapshot = {
-            let guard = registry
-                .read()
-                .map_err(|e| engine_err("skill registry", format!("lock poisoned: {e}")))?;
-            guard
+        // Non-fatal by design (WI#311 review AH-7): this runs after the cron
+        // ticker and event listener started, so a `?` here would abort init
+        // and let the next message build a second manager and ticker. A
+        // poisoned lock degrades to an empty snapshot, like every other
+        // recoverable step in this region.
+        let skills_snapshot = match registry.read() {
+            Ok(guard) => guard
                 .skills()
                 .iter()
                 .map(local_skill_to_v2)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!(error = %e, "engine v2: skill registry lock poisoned, skipping v1 skill migration");
+                Vec::new()
+            }
         };
         if !skills_snapshot.is_empty() {
             match crate::bridge::skill_migration::migrate_v1_skill_list(

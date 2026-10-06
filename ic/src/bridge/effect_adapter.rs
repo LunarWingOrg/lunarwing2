@@ -4740,6 +4740,7 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             .unwrap()
             .unwrap();
         assert_eq!(own.output[0]["id"], id.to_string());
+        let before_fire = chrono::Utc::now();
         let spawned = mgr.tick("wrong-fallback-owner").await.unwrap();
         assert_eq!(spawned.len(), 1);
         let notification =
@@ -4754,7 +4755,14 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert_eq!(persisted.thread_history, spawned);
         assert!(persisted.has_fired());
         assert_eq!(persisted.user_id, ctx.user_id);
-        assert!(persisted.next_fire_at.unwrap() > chrono::Utc::now());
+        // The spawned thread is owned by the mission's user, not by the
+        // fallback id passed to tick (WI#311 review P-10).
+        let spawned_thread = reloaded.load_thread(spawned[0]).await.unwrap().unwrap();
+        assert_eq!(spawned_thread.user_id, ctx.user_id);
+        // Compared against the pre-fire instant, not the post-fire one, so
+        // the assertion has no flake window at the 15:10:00Z cron boundary
+        // (WI#311 review P-10).
+        assert!(persisted.next_fire_at.unwrap() >= before_fire);
         assert!(mgr.tick("fallback").await.unwrap().is_empty());
         mgr.shutdown().await;
     }
