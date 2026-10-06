@@ -4,8 +4,9 @@
 
 **Open TODOs (v2.1.5.0) — To be done before release**
 
-### Rares = odd (1, 3, 5, 7, ...)
-### AJ = even (2, 4, 6, 8, ...)
+~~Old parity~~
+~~Rares = odd (1, 3, 5, 7, ...)~~
+~~AJ = even (2, 4, 6, 8, ...)~~
 
 #### Please check off item before the final commit/push. You may add a note to the item to say if it was completed 100%, failed, or other kind of status
 #### DONE-trail convention: record evidence as indented sub-bullets under the item — never inline on the checkbox line.
