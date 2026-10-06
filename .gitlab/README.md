@@ -200,6 +200,39 @@ free space on that host (prune dangling images/build cache), then re-run the
 candidate job — the scan can only succeed after a candidate publishes
 `worker-image.env`.
 
+## container-build runner memory (OOM / no_updates_running / exit 137)
+
+Symptom — heavy `worker-*-candidate` / `worker-*-scan` jobs die mid-run with
+no build or scan diagnostic of their own:
+
+- a candidate's trace simply stops mid-build and the job is only marked failed
+  about 40 minutes later with the `no_updates_running` failure reason (the
+  runner stopped receiving log updates from the job pod), or
+- a scan fails within a minute with `Job failed: exit code 137` (SIGKILL)
+  partway through a `trivy` report/SBOM step, sometimes with the artifact
+  uploader itself `Terminated` in the same window.
+
+This is **host memory exhaustion on the `container-build` runner**, not a code
+or pipeline defect: several heavyweight container jobs (concurrent BuildKit
+image builds and trivy image analyses) shared one host and the kernel OOM
+killer / pod eviction reaped them together. Evidence: pipeline #5263
+(2026-10-06). Five prior master pipelines (#5176-#5245) ran all eight worker
+jobs green; on #5263 `worker-opencode2-candidate`, `worker-kimi-candidate`,
+and `worker-opencode-scan` all died in the same ~90-second window
+(09:34:43-09:36:12Z) on one runner host, and the two `worker-*-scan` jobs
+depending on the dead candidates then failed fast on the explicit
+`worker-image.env is missing` guard, as designed.
+
+Recovery: wait until host contention subsides (no other heavy candidate or
+scan running), then retry the failed `worker-*-candidate` job(s); retry each
+matching `worker-*-scan` only after its candidate has published
+`worker-image.env`. Candidates and promotions deliberately keep `retry: 0`
+(enforced by `validate_config.py` — no automatic retry after a timeout or
+partial push), so the re-run is always an operator action. If OOMs recur,
+inspect that host's eligible jobs and aggregate concurrency, exactly as with
+the Rust runner memory budget above; candidate builds peak during the
+dependency-install and BuildKit export phases.
+
 ## Required jobs
 
 - CI composition, shell syntax, shellcheck, Python syntax, registry JSON, version
