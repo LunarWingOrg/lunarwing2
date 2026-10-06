@@ -5248,9 +5248,9 @@ function renderMissionsList(missions) {
 
   empty.style.display = 'none';
   tbody.innerHTML = missions.map((m) => {
-    const today = m.max_threads_per_day > 0
+    const today = (m.max_threads_per_day > 0
       ? m.threads_today + ' / ' + m.max_threads_per_day
-      : String(m.threads_today);
+      : String(m.threads_today)) + (m.threads_today_date ? ' (' + m.threads_today_date + ')' : '');
     return '<tr class="routine-row" data-action="open-mission" data-id="' + escapeAttr(m.id) + '">'
       + '<td>' + escapeHtml(m.name) + '</td>'
       + '<td>' + escapeHtml(m.cadence_type) + '</td>'
@@ -5303,7 +5303,7 @@ function renderMissionDetail(mission) {
     + metaItem('Mission ID', mission.id)
     + metaItem(I18n.t('missions.cadence'), mission.cadence_type)
     + metaItem(I18n.t('missions.threads'), mission.thread_count)
-    + metaItem(I18n.t('missions.threadsToday'), mission.threads_today)
+    + metaItem(I18n.t('missions.threadsToday'), mission.threads_today + (mission.threads_today_date ? ' (' + mission.threads_today_date + ')' : ''))
     + metaItem(I18n.t('missions.dailyBudget'), mission.max_threads_per_day > 0 ? mission.max_threads_per_day : I18n.t('missions.unlimited'))
     + metaItem(I18n.t('missions.lastFired'), formatDate(mission.last_fired_at))
     + metaItem(I18n.t('missions.nextFire'), formatDate(mission.next_fire_at))

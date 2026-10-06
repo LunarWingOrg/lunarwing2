@@ -4259,9 +4259,16 @@ pub struct EngineMissionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_focus: Option<String>,
     pub threads_today: u32,
+    /// UTC date the `threads_today` counter belongs to (WI#311 review AH-5):
+    /// the counter is frozen on non-Active missions, so it must travel with
+    /// its date to avoid being read as "fired today".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads_today_date: Option<String>,
     pub max_threads_per_day: u32,
     /// True when today's daily thread budget is spent; the mission stays
-    /// Active and resumes spawning at the next UTC day.
+    /// Active and resumes spawning at the next UTC day. Computed only when
+    /// the counter's date is today — a frozen counter from an earlier day is
+    /// not an exhausted budget.
     pub budget_exhausted: bool,
     /// Last thread spawn time (RFC 3339). Registry honesty (work item #143):
     /// an "Active" mission that has never fired surfaces as `never_fired`.
@@ -4358,6 +4365,7 @@ fn thread_to_info(t: &lunarwing_engine::Thread) -> EngineThreadInfo {
 }
 
 fn mission_to_info(m: &lunarwing_engine::types::mission::Mission) -> EngineMissionInfo {
+    let today = chrono::Utc::now().date_naive();
     EngineMissionInfo {
         id: m.id.to_string(),
         name: m.name.clone(),
@@ -4367,8 +4375,11 @@ fn mission_to_info(m: &lunarwing_engine::types::mission::Mission) -> EngineMissi
         thread_count: m.thread_history.len(),
         current_focus: m.current_focus.clone(),
         threads_today: m.threads_today,
+        threads_today_date: m.threads_today_date.map(|d| d.to_string()),
         max_threads_per_day: m.max_threads_per_day,
-        budget_exhausted: m.max_threads_per_day > 0 && m.threads_today >= m.max_threads_per_day,
+        budget_exhausted: m.max_threads_per_day > 0
+            && m.threads_today_date == Some(today)
+            && m.threads_today >= m.max_threads_per_day,
         last_fired_at: m.last_fired_at.map(|dt| dt.to_rfc3339()),
         never_fired: !m.has_fired(),
         created_at: m.created_at.to_rfc3339(),
@@ -4392,6 +4403,40 @@ fn legacy_mission_listing_uses_history_when_timestamp_is_missing() {
         .push(lunarwing_engine::ThreadId::new());
     assert!(!mission_to_info(&mission).never_fired);
     assert!(mission_to_info(&mission).last_fired_at.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn mission_info_gates_budget_exhausted_on_the_counter_date() {
+    // WI#311 review AH-5: threads_today is frozen on non-Active missions, so
+    // a stale counter from an earlier day must not read as an exhausted
+    // budget, and the date must travel with the counter.
+    let mut mission = lunarwing_engine::Mission::new(
+        lunarwing_engine::ProjectId::new(),
+        "owner",
+        "frozen",
+        "goal",
+        lunarwing_engine::MissionCadence::Manual,
+    );
+    mission.max_threads_per_day = 1;
+    mission.threads_today = 1;
+
+    mission.threads_today_date = Some(chrono::Utc::now().date_naive());
+    let info = mission_to_info(&mission);
+    assert!(info.budget_exhausted);
+    assert_eq!(
+        info.threads_today_date.as_deref(),
+        Some(chrono::Utc::now().date_naive().to_string().as_str())
+    );
+
+    // Same numbers one day stale: frozen counter, not an exhausted budget.
+    mission.threads_today_date =
+        Some(chrono::Utc::now().date_naive() - chrono::Duration::days(1));
+    assert!(!mission_to_info(&mission).budget_exhausted);
+
+    // Legacy record with no counter date at all: never "exhausted".
+    mission.threads_today_date = None;
+    assert!(!mission_to_info(&mission).budget_exhausted);
 }
 
 /// List engine threads, optionally filtered by project.

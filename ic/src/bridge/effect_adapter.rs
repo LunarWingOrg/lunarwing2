@@ -753,10 +753,15 @@ impl EffectBridgeAdapter {
                 .await
             {
                 Ok(missions) => {
+                    let today = chrono::Utc::now().date_naive();
                     let list: Vec<serde_json::Value> = missions
                         .iter()
                         .map(|m| {
+                            // threads_today is frozen on non-Active missions
+                            // (WI#311 review AH-5): only a counter dated today
+                            // can mean an exhausted budget.
                             let budget_exhausted = m.max_threads_per_day > 0
+                                && m.threads_today_date == Some(today)
                                 && m.threads_today >= m.max_threads_per_day;
                             serde_json::json!({
                                 "id": m.id.to_string(),
@@ -805,6 +810,8 @@ impl EffectBridgeAdapter {
                                 }
                                 Ok(Some(m))
                                     if m.max_threads_per_day > 0
+                                        && m.threads_today_date
+                                            == Some(chrono::Utc::now().date_naive())
                                         && m.threads_today >= m.max_threads_per_day =>
                                 {
                                     format!(
