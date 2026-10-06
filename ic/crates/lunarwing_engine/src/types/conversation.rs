@@ -126,6 +126,18 @@ impl ConversationEntry {
 /// Maximum steer notes retained for the next foreground turn.
 pub const MAX_PENDING_STEER_NOTES: usize = 4;
 
+/// Maximum entries retained per conversation. Every new foreground thread is
+/// seeded with the conversation's prior user/agent entries, so an unbounded
+/// surface grows the prompt of every later turn until the model degrades.
+/// Older entries are evicted FIFO on `add_entry`.
+pub const MAX_CONVERSATION_ENTRIES: usize = 400;
+
+/// Maximum total entry content retained per conversation, in bytes (about
+/// 24k tokens at the orchestrator's four-chars-per-token estimate). Evicted
+/// FIFO together with [`MAX_CONVERSATION_ENTRIES`]; the newest entry is
+/// always kept.
+pub const MAX_CONVERSATION_HISTORY_BYTES: usize = 96_000;
+
 /// A conversation surface — the UI-facing view of a chat.
 ///
 /// Conversations are NOT execution boundaries. They are streams of entries
@@ -168,10 +180,31 @@ impl ConversationSurface {
         }
     }
 
-    /// Add an entry and update the timestamp.
+    /// Add an entry, evict the oldest entries past the retention bounds, and
+    /// update the timestamp.
     pub fn add_entry(&mut self, entry: ConversationEntry) {
         self.entries.push(entry);
+        self.evict_overflow();
         self.updated_at = Utc::now();
+    }
+
+    /// Drop the oldest entries until the surface fits
+    /// [`MAX_CONVERSATION_ENTRIES`] and [`MAX_CONVERSATION_HISTORY_BYTES`].
+    /// The newest entry is always kept, even when it alone exceeds the byte
+    /// bound.
+    fn evict_overflow(&mut self) {
+        let mut bytes: usize = self.entries.iter().map(|e| e.content.len()).sum();
+        let mut evict = 0;
+        while self.entries.len() - evict > 1
+            && (self.entries.len() - evict > MAX_CONVERSATION_ENTRIES
+                || bytes > MAX_CONVERSATION_HISTORY_BYTES)
+        {
+            bytes -= self.entries[evict].content.len();
+            evict += 1;
+        }
+        if evict > 0 {
+            self.entries.drain(..evict);
+        }
     }
 
     /// Register a thread as active in this conversation.
@@ -285,6 +318,61 @@ mod tests {
         conv.track_thread(tid);
         conv.track_thread(tid);
         assert_eq!(conv.active_threads.len(), 1);
+    }
+
+    #[test]
+    fn add_entry_evicts_the_oldest_entries_beyond_the_entry_cap() {
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        for index in 0..MAX_CONVERSATION_ENTRIES + 5 {
+            conv.add_entry(ConversationEntry::user(format!("message {index}")));
+        }
+        assert_eq!(conv.entries.len(), MAX_CONVERSATION_ENTRIES);
+        assert_eq!(conv.entries[0].content, "message 5");
+        let newest = format!("message {}", MAX_CONVERSATION_ENTRIES + 4);
+        assert_eq!(
+            conv.last_entry().map(|e| e.content.as_str()),
+            Some(newest.as_str())
+        );
+    }
+
+    #[test]
+    fn add_entry_evicts_the_oldest_entries_beyond_the_byte_budget() {
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        let chunk = "x".repeat(10_000);
+        let count = MAX_CONVERSATION_HISTORY_BYTES / chunk.len() + 3;
+        for index in 0..count {
+            conv.add_entry(ConversationEntry::agent(
+                ThreadId::new(),
+                format!("{index}:{chunk}"),
+            ));
+        }
+        let bytes: usize = conv.entries.iter().map(|e| e.content.len()).sum();
+        assert!(
+            bytes <= MAX_CONVERSATION_HISTORY_BYTES,
+            "retained {bytes} bytes"
+        );
+        assert!(conv.entries.len() < count);
+        let oldest_retained = format!("{}:", count - conv.entries.len());
+        assert!(conv.entries[0].content.starts_with(&oldest_retained));
+        let newest = format!("{}:", count - 1);
+        assert!(
+            conv.last_entry()
+                .is_some_and(|e| e.content.starts_with(&newest))
+        );
+    }
+
+    #[test]
+    fn add_entry_keeps_the_newest_entry_even_when_it_exceeds_the_byte_budget() {
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        conv.add_entry(ConversationEntry::user("earlier"));
+        conv.add_entry(ConversationEntry::user(
+            "y".repeat(MAX_CONVERSATION_HISTORY_BYTES + 1),
+        ));
+        assert_eq!(conv.entries.len(), 1);
+        assert_eq!(
+            conv.entries[0].content.len(),
+            MAX_CONVERSATION_HISTORY_BYTES + 1
+        );
     }
 
     #[test]

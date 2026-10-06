@@ -1313,6 +1313,16 @@ workspace search chunks no longer contain the credential.
 in-memory cache entries to bound RAM; workspace files remain. `load_thread()`,
 `load_steps()`, and `load_events()` reload persisted files on a cache miss.
 
+The conversation surface is the one bounded record. Every new foreground
+thread is seeded with the conversation's prior user/agent entries
+(`build_history_from_entries`), so `ConversationSurface::add_entry` evicts the
+oldest entries FIFO past `MAX_CONVERSATION_ENTRIES` (400) or
+`MAX_CONVERSATION_HISTORY_BYTES` (96,000 bytes, roughly 24k tokens), always
+keeping the newest entry. An oversized pre-upgrade surface is trimmed by the
+first `add_entry` after the upgrade — which runs before the next seed — so no
+migration is needed. Thread messages, steps, and events are unaffected; the
+relational dual-write keeps the full V1-compatible history.
+
 ## Event Sourcing
 
 Threads persist significant lifecycle and execution events via `ThreadEvent`.

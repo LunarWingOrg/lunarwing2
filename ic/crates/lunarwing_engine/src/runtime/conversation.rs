@@ -656,6 +656,24 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    #[test]
+    fn new_thread_history_is_seeded_from_the_retained_entries_only() {
+        use crate::types::conversation::{ConversationEntry, MAX_CONVERSATION_ENTRIES};
+
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        for index in 0..MAX_CONVERSATION_ENTRIES + 10 {
+            conv.add_entry(ConversationEntry::user(format!("message {index}")));
+        }
+
+        let history = build_history_from_entries(&conv.entries);
+
+        // The last entry is the current user message, which the caller adds
+        // itself; everything evicted from the surface is gone from the seed.
+        assert_eq!(history.len(), MAX_CONVERSATION_ENTRIES - 1);
+        assert_eq!(history[0].content, "message 10");
+        assert!(history.iter().all(|message| message.content != "message 9"));
+    }
+
     // ── Mocks (same as manager tests) ───────────────────────
 
     struct MockLlm(Mutex<Vec<LlmOutput>>);
