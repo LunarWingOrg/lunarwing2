@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built (revalidated against source 2026-09-28, v2.1.3.0; item-40 socket-directory mount; revalidated 2026-10-01, v2.1.4.0 — no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change in the cycle; the WI#265 bridge work touched `router.rs` only, which this doc already notes is independent of the SSH harness)
+**Status:** As-built (revalidated against source 2026-09-28, v2.1.3.0; item-40 socket-directory mount; revalidated 2026-10-01, v2.1.4.0 — no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change in the cycle; the WI#265 bridge work touched `router.rs` only, which this doc already notes is independent of the SSH harness; revalidated 2026-10-06, v2.1.5.0 — again no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change in the cycle; WI#307 made daemon discovery and engine lease planning share one autonomous denylist, but `ssh`/`ssh_git`/`create_job` were already in it, so the exclusion this doc describes is unchanged. Component map, socket path, two-keystore note, API table, and test counts (38) re-verified against source. Substantive fix this pass: the §1 diagram still listed `kimi` among the socket-mounting workers although WI#206 removed that lane — corrected to match the prose (pebble, opencode, opencode2 only))
 **Code:** `ic/src/bridge/ssh*.rs`, `ic/src/config/ssh.rs`
 **Operator guide:** [`docs/ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 **Delivery mechanisms** (how the agent actually runs SSH work — worker mode, the `ssh`/`ssh_git` built-in tools, the WASM `ssh` tool): [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)
@@ -63,7 +63,7 @@ provisioning may have different disk behavior.
                                          ▼
                         ┌──────────── worker container ────────────┐
                         │  git / ssh  ──►  SSH_AUTH_SOCK  ──►  sign │
-                        │  (pebble, opencode, kimi, opencode2)     │
+                        │  (pebble, opencode, opencode2)           │
                         └──────────────────────────────────────────┘
 ```
 
