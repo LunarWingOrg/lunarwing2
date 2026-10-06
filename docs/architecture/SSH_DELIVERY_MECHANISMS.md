@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-09-28 (v2.1.3.0; item-40 socket-directory mount), and again 2026-10-01 (v2.1.4.0 — no SSH harness/tool change this cycle; opencode2 worker image only moved pins 2.0.18 → 2.0.20, which does not affect the mount or socket contract).
+**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-09-28 (v2.1.3.0; item-40 socket-directory mount), and again 2026-10-01 (v2.1.4.0 — no SSH harness/tool change this cycle; opencode2 worker image only moved pins 2.0.18 → 2.0.20, which does not affect the mount or socket contract), and again 2026-10-06 (v2.1.5.0 — no SSH harness/tool change this cycle; opencode2 worker pins stayed at v2.0.21 and the `ssh` registry package only bumped 0.1.2 → 0.1.3 with no contract change; WI#307's shared autonomous denylist already contained `ssh`/`ssh_git`, so the documented non-foreground denial is unchanged. Substantive fix this pass: the at-a-glance table still listed the kimi worker lane for SSH jobs although WI#206 removed its socket mount — corrected to match Mechanism 1).
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
@@ -25,7 +25,7 @@ and how to enable it.
 
 | | **Worker mode** (Option 1) | **`ssh` / `ssh_git` tools** (Option 2) | **WASM `ssh` tool** (Option 3) |
 |---|---|---|---|
-| How the agent invokes it | `create_job(mode="pebble"/"opencode"/"kimi"/"opencode2"…)` with SSH commands | the `ssh` / `ssh_git` built-in tools | the `ssh` WASM tool |
+| How the agent invokes it | `create_job(mode="pebble"/"opencode"/"opencode2")` with SSH commands (the kimi lane no longer mounts the socket — WI#206) | the `ssh` / `ssh_git` built-in tools | the `ssh` WASM tool |
 | Runs where | worker **container** | **gateway process** (in-process) | gateway process (host fn) |
 | Transport | worker's own `git`/`ssh` via `SSH_AUTH_SOCK` | `ssh`: in-process russh; `ssh_git`: shell-out `git` | host fn reuses the in-process russh client |
 | Isolation of the SSH op | **High** (container) | Low (gateway process) | Low (russh runs host-side) |

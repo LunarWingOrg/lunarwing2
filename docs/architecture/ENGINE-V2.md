@@ -2,7 +2,8 @@
 
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
-**Revalidated against source 2026-10-01 (v2.1.4.0).** Module map, gate types,
+**Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
+(v2.1.5.0).** Module map, gate types,
 mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
 re-checked against the current tree, including the landed WI#227 sealed step
 records; updates for 2.1.1.0 include the
@@ -26,7 +27,23 @@ stay bootstrapped, dispatched, and rollover-swept), the WI#244 bounded
 mid-stream recovery (documented under Failure Recovery), the WI#265
 `routine_history` Engine V2 mission-name fallback, the WI#268 prompt-overlay
 audit cross-link, and the WI#282 new-tenant
-`ORCHESTRATOR_SELF_MODIFY=true` default.
+`ORCHESTRATOR_SELF_MODIFY=true` default. Updates for 2.1.5.0 include the
+WI#301 global boot recovery (orphan-project threads, preserved Waiting
+approvals and resumable checkpoints, restart-lost mission fires recorded and
+notified without replaying side effects), the WI#302 terminal-accounting
+hardening (malformed orchestrator outcomes fail loud, budget exhaustion stops
+without fresh-budget retries, stopped threads persist Failed/Cancelled), the
+WI#299 pending-gates atomic persistence and corrupt-file quarantine layout
+(documented under gate resolution), the WI#297 `ContentFiltered` /
+`OutputBudgetExhausted` terminal kinds with empty-stream discarded-usage
+accounting, the WI#298 context-overflow clamp exemption, the WI#295 mission
+`tool_info` engine-capability answers, the WI#278 v1 `routine_*` redirect and
+union mission listing, the WI#276 grace-expired shutdown stamp plus boot-sweep
+resolution (the stop is non-cooperative; re-fire is at-least-once), the
+WI#307 non-foreground execution/resume gate and shared discovery/lease
+denylist, the WI#309 resume-lease mission catalog, the WI#311 no-auto-complete
+rule for non-manual missions, and the WI#319 pre-2026-07-26
+`Completed`-as-delete caveat in recovery guidance.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
