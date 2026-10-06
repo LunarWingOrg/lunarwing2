@@ -325,10 +325,19 @@ because they checked protocol/OpenAPI identifier strings, not the client the
 bridge imports — the method did not exist at v2.0.21 either, where the runtime
 logged `sdk.session.message.list is not a function` and the executor silently
 fell back to streamed deltas. `opencode_task_executor.ts` now calls
-`client.message.list` (unwraps `.data`, follows `cursor.next`, bounded at 5
-pages of 200 with `type: "assistant"`) and `client.permission.reply`; the
-self-test mock mirrors the real client shape so the stale paths fail the
-suite, and the image build now constructs the client and asserts `typeof`
+`client.message.list` (unwraps `.data`, `type: "assistant"`, bounded at 5
+pages of 200) and `client.permission.reply`. Paging follows the server
+contract (`packages/server/src/handlers/message.ts`): `order` is sent on the
+first page only (`desc`, so the bound keeps the newest messages), cursor pages
+carry no `order` — the server rejects cursor+order with 400
+`InvalidCursorError` — and a short page ends the listing because `cursor.next`
+is returned for every non-empty page; the pages are reversed into
+chronological order and a later-page failure keeps the pages already fetched.
+The self-test mock mirrors the real client shape and that server contract, so
+the stale paths and a cursor+order request both fail the suite (the first
+re-attempt sent `order` on every page and lost the canonical output on every
+real session; !1452 review AL-1), and the image build now constructs the
+client and asserts `typeof`
 for every method path the bridge calls (`session.create/prompt/interrupt`,
 `permission.reply`, `event.subscribe`, `message.list`), so this drift class
 fails the build instead of the runtime.
@@ -337,6 +346,13 @@ Verified host-side with bun: the executor self-test passes against the real
 client shape and fails with the pre-fix executor; the build-time assertion
 snippet ran against the real pinned v2.0.23 promise source (all six paths
 present, both stale paths absent) and fails closed against a drifted stub.
+Paging fix verified 2026-10-06 on a local `podman build` of this lane at
+v2.0.23 (`WITH_TOOLCHAINS=false`; every build-time self-test green) by a smoke
+inside that image against a live `opencode serve` and a loopback fake
+OpenAI-compatible model: the executor returns the canonical text from one
+`message.list` call, cursor pages without `order` are accepted, newest-first
+paging matches the server's chronological order, and the pre-fix executor's
+cursor+order page is rejected with `InvalidCursorError` on the real server.
 **Not yet executed:** no pipeline can build the v2.0.23 image before merge
 (candidate jobs exist only on protected refs), so before promotion the
 `worker-opencode2-candidate` job on the first protected pipeline containing
