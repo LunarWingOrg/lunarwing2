@@ -97,7 +97,9 @@ pub use executor::prompt::PlatformInfo;
 pub use runtime::conversation::ConversationManager;
 pub use runtime::manager::ThreadManager;
 pub use runtime::messaging::{ThreadFailureKind, ThreadOutcome};
-pub use runtime::mission::{MissionManager, MissionNotification, MissionUpdate};
+pub use runtime::mission::{
+    CreateMissionOutcome, MissionManager, MissionNotification, MissionUpdate,
+};
 pub use runtime::tree::ThreadTree;
 
 pub use types::conversation::{
