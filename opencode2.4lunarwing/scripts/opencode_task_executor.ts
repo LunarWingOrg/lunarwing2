@@ -307,7 +307,7 @@ export async function executeTask(
           const requestID = (event.data as { id?: unknown } | undefined)?.id
           if (typeof requestID === "string") {
             await waitForStop(
-              sdk.session.permission.reply(
+              sdk.permission.reply(
                 {
                   sessionID,
                   requestID,
@@ -470,28 +470,61 @@ export async function executeTask(
 // After execution settles, pull the session's assistant messages for the
 // canonical output. v2 keeps final assistant text in session messages rather
 // than the prompt response (the prompt API returns an inbox receipt).
+//
+// The v2 promise client lists session messages at the TOP level —
+// client.message.list(input) calls GET /api/session/:sessionID/message and
+// returns a paginated { data, cursor } envelope. There is NO
+// session.message.list (session.message only has get); the previous call path
+// threw TypeError at runtime (WI#320 finding F7). Permission replies likewise
+// live at client.permission.reply, not session.permission.reply.
+//
+// Paging follows the server contract (packages/server/src/handlers/message.ts):
+// `order` applies to the FIRST page only — a request carrying both `cursor`
+// and `order` is rejected with 400 InvalidCursorError — and `cursor.next` is
+// returned for every non-empty page, so a short page is the end signal. The
+// first page asks for newest-first, so the MESSAGE_LIST_MAX_PAGES bound keeps
+// the newest assistant messages (the final answer), and the collected pages
+// are reversed back into chronological order. A failure on a later page keeps
+// the pages already fetched.
+const MESSAGE_LIST_PAGE_SIZE = 200 // upstream maximum per page
+const MESSAGE_LIST_MAX_PAGES = 5
+
 async function fetchAssistantText(sdk: OpenCodeClient, sessionID: string): Promise<string> {
+  const newestFirst: Array<{ type?: unknown; content?: unknown }> = []
+  let cursor: string | undefined
   try {
-    const messages = await sdk.session.message.list(
-      { sessionID },
-      { signal: AbortSignal.timeout(10_000) },
-    )
-    if (!Array.isArray(messages)) return ""
-    return messages
-      .filter((message) => message?.type === "assistant")
-      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
-      .filter(
-        (part) =>
-          part?.type === "text" &&
-          typeof (part as { text?: unknown }).text === "string" &&
-          ((part as { text: string }).text ?? "").trim().length > 0,
+    for (let page = 0; page < MESSAGE_LIST_MAX_PAGES; page++) {
+      const response = await sdk.message.list(
+        cursor === undefined
+          ? { sessionID, type: "assistant", limit: MESSAGE_LIST_PAGE_SIZE, order: "desc" }
+          : { sessionID, type: "assistant", limit: MESSAGE_LIST_PAGE_SIZE, cursor },
+        { signal: AbortSignal.timeout(10_000) },
       )
-      .map((part) => ((part as { text: string }).text ?? "").trim())
-      .join("\n")
+      if (!response || !Array.isArray(response.data)) {
+        console.warn("[opencode_task_executor] message.list returned an unexpected response shape")
+        break
+      }
+      newestFirst.push(...response.data)
+      if (response.data.length < MESSAGE_LIST_PAGE_SIZE) break
+      const next = response.cursor?.next
+      if (typeof next !== "string" || next.length === 0) break
+      cursor = next
+    }
   } catch (err) {
     console.warn("[opencode_task_executor] failed to list session messages:", err)
-    return ""
   }
+  return newestFirst
+    .reverse()
+    .filter((message) => message?.type === "assistant")
+    .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+    .filter(
+      (part) =>
+        part?.type === "text" &&
+        typeof (part as { text?: unknown }).text === "string" &&
+        ((part as { text: string }).text ?? "").trim().length > 0,
+    )
+    .map((part) => ((part as { text: string }).text ?? "").trim())
+    .join("\n")
 }
 
 export function resolveWorkDir(path: string): string {

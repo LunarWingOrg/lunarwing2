@@ -15,6 +15,7 @@ interface MockOptions {
   pendingPermissionReply?: boolean
   pendingInterrupt?: boolean
   messages?: unknown[]
+  messageListFailOnCall?: number
   promptError?: Error
   executionErrors?: Array<string | undefined>
 }
@@ -22,6 +23,8 @@ interface MockOptions {
 function makeSdk(options: MockOptions = {}) {
   let interruptCount = 0
   let permissionReplies = 0
+  let messageListCalls = 0
+  const messageListArgs: unknown[] = []
   const promptArgs: unknown[] = []
   const signals: AbortSignal[] = []
   const captureSignal = (args: unknown[]) => {
@@ -40,6 +43,10 @@ function makeSdk(options: MockOptions = {}) {
     if (options.pendingAfterEvents) await new Promise(() => {})
   }
 
+  // Mirrors the v2 promise client's real shape: message listing and
+  // permission replies are TOP-LEVEL groups (message.list returns a
+  // paginated { data, cursor } envelope); session.message only has get and
+  // there is no session.permission at all (WI#320 F7 / WI#303).
   const sdk = {
     session: {
       create: async (...args: unknown[]) => {
@@ -60,19 +67,61 @@ function makeSdk(options: MockOptions = {}) {
         if (options.pendingInterrupt) await new Promise(() => {})
         return { data: true }
       },
-      message: {
-        list: async (...args: unknown[]) => {
-          captureSignal(args)
-          return options.messages ?? []
-        },
+    },
+    permission: {
+      reply: async (...args: unknown[]) => {
+        permissionReplies++
+        captureSignal(args)
+        if (options.pendingPermissionReply) await new Promise(() => {})
+        return { data: true }
       },
-      permission: {
-        reply: async (...args: unknown[]) => {
-          permissionReplies++
-          captureSignal(args)
-          if (options.pendingPermissionReply) await new Promise(() => {})
-          return { data: true }
-        },
+    },
+    message: {
+      // Mirrors the server contract of GET /api/session/:sessionID/message
+      // (packages/server/src/handlers/message.ts at the pinned tag), not just
+      // the client shape: cursor + order is rejected (400 InvalidCursorError),
+      // the default order is newest-first, the type filter applies before
+      // paging, limit is 1..200, and cursor.next/previous are present on every
+      // non-empty page. A mock without these rules let a cursor+order request
+      // pass review while the real server rejected it.
+      list: async (...args: unknown[]) => {
+        captureSignal(args)
+        messageListArgs.push(args)
+        messageListCalls++
+        if (options.messageListFailOnCall === messageListCalls) {
+          throw new Error("simulated message.list transport failure")
+        }
+        const input = args[0] as {
+          cursor?: string
+          order?: "asc" | "desc"
+          limit?: number
+          type?: string
+        }
+        if (input.cursor !== undefined && input.order !== undefined) {
+          throw Object.assign(new Error("Cursor cannot be combined with order"), {
+            _tag: "InvalidCursorError",
+          })
+        }
+        const limit = input.limit ?? 50
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+          throw new Error(`invalid limit ${limit}`)
+        }
+        const decoded = input.cursor
+          ? (JSON.parse(input.cursor) as { index: number; order: "asc" | "desc" })
+          : undefined
+        const order = decoded?.order ?? input.order ?? "desc"
+        const matching = ((options.messages ?? []) as Array<{ type?: unknown }>)
+          .map((message, index) => ({ message, index }))
+          .filter(({ message }) => !input.type || message.type === input.type)
+        const ordered = order === "asc" ? matching : [...matching].reverse()
+        const start = decoded ? ordered.findIndex(({ index }) => index === decoded.index) + 1 : 0
+        const page = ordered.slice(start, start + limit)
+        const cursorFor = (entry: { index: number } | undefined) =>
+          entry ? JSON.stringify({ index: entry.index, order }) : undefined
+        return {
+          data: page.map(({ message }) => message),
+          cursor: { previous: cursorFor(page[0]), next: cursorFor(page.at(-1)) },
+        }
       },
     },
     event: {
@@ -87,6 +136,8 @@ function makeSdk(options: MockOptions = {}) {
     sdk,
     interruptCount: () => interruptCount,
     permissionReplyCount: () => permissionReplies,
+    messageListCount: () => messageListCalls,
+    messageListArgs,
     signals,
     promptArgs,
   }
@@ -113,18 +164,83 @@ async function runTask(sdk: OpenCodeClient, request?: TaskRequest) {
   return results[0]!
 }
 
-const canonical = await runTask(
-  makeSdk({
-    messages: [
-      {
-        type: "assistant",
-        content: [{ type: "text", text: " canonical output " }],
-      },
-    ],
-  }).sdk,
-)
+const canonicalSdk = makeSdk({
+  messages: [
+    {
+      type: "assistant",
+      content: [{ type: "text", text: " canonical output " }],
+    },
+  ],
+})
+const canonical = await runTask(canonicalSdk.sdk)
 assert.equal(canonical.status, "success")
 assert.equal(canonical.output, "canonical output")
+// The canonical fetch must use the top-level message.list with the
+// server-side assistant filter (WI#320 F7: session.message.list is not a
+// function on the real client).
+// A short first page ends the listing even though the server still returns
+// cursor.next for it.
+assert.equal(canonicalSdk.messageListCount(), 1)
+assert.deepEqual(canonicalSdk.messageListArgs[0]?.[0], {
+  sessionID: "session-1",
+  type: "assistant",
+  limit: 200,
+  order: "desc",
+})
+
+const assistantMessages = (count: number) =>
+  Array.from({ length: count }, (_, index) => ({
+    type: "assistant",
+    content: [{ type: "text", text: `a${index}` }],
+  }))
+const assistantRange = (from: number, to: number) =>
+  Array.from({ length: to - from }, (_, offset) => `a${from + offset}`).join("\n")
+const assertCursorPaging = (args: unknown[]) => {
+  args.forEach((call, index) => {
+    const input = (call as unknown[])[0] as { cursor?: string; order?: string }
+    if (index === 0) {
+      assert.equal(input.cursor, undefined)
+      assert.equal(input.order, "desc")
+    } else {
+      assert.equal(typeof input.cursor, "string")
+      assert.equal(input.order, undefined, "cursor pages must not carry order")
+    }
+  })
+}
+
+// Multiple pages, with non-assistant messages filtered server-side, come back
+// in chronological order.
+const pagedSdk = makeSdk({
+  messages: [
+    { type: "user", content: [{ type: "text", text: "prompt" }] },
+    ...assistantMessages(450),
+  ],
+})
+const paged = await runTask(pagedSdk.sdk)
+assert.equal(paged.status, "success")
+assert.equal(paged.output, assistantRange(0, 450))
+assert.equal(pagedSdk.messageListCount(), 3)
+assertCursorPaging(pagedSdk.messageListArgs)
+
+// An exactly-full last page is followed by one empty cursor page.
+const fullPageSdk = makeSdk({ messages: assistantMessages(200) })
+const fullPage = await runTask(fullPageSdk.sdk)
+assert.equal(fullPage.output, assistantRange(0, 200))
+assert.equal(fullPageSdk.messageListCount(), 2)
+assertCursorPaging(fullPageSdk.messageListArgs)
+
+// The page bound keeps the NEWEST assistant messages (the final answer).
+const cappedSdk = makeSdk({ messages: assistantMessages(1200) })
+const capped = await runTask(cappedSdk.sdk)
+assert.equal(capped.output, assistantRange(200, 1200))
+assert.equal(cappedSdk.messageListCount(), 5)
+assertCursorPaging(cappedSdk.messageListArgs)
+
+// A failure on a later page keeps the pages already fetched.
+const laterPageFailureSdk = makeSdk({ messages: assistantMessages(450), messageListFailOnCall: 2 })
+const laterPageFailure = await runTask(laterPageFailureSdk.sdk)
+assert.equal(laterPageFailure.status, "success")
+assert.equal(laterPageFailure.output, assistantRange(250, 450))
 
 const streamed = await runTask(
   makeSdk({
