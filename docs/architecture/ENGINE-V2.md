@@ -393,10 +393,21 @@ that safe class and fixed recovery text, never provider-supplied diagnostics.
   text names the operator action required. The same fail-fast rule covers the
   two deterministic provider-empty kinds (WI#297): `content_filtered` (the
   provider refused; rephrase or switch models) and `output_budget_exhausted`
-  (the model spent its whole output budget before visible text; raise the
-  output token limit or switch models). Both are produced by the host
-  retry/failover empty-stream detection and reach the engine as their own
-  kinds, never as the generic rejected-request text.
+  (the model spent its whole output budget before visible text). Both are
+  produced by the host retry/failover empty-stream detection and reach the
+  engine as their own kinds, never as the generic rejected-request text.
+  The output budget is the host adapter's per-call `max_tokens`:
+  `ENGINE_V2_MAX_OUTPUT_TOKENS` (default 8192; a fixed 4096 before 2.1.5.0)
+  unless the orchestrator's call config sets one. Thinking models count their
+  reasoning against it, so the adapter retries an exhausted budget once at
+  twice the budget before the kind reaches the engine — surfaced to the model
+  as a `Retried` provider observation that carries the discarded billed usage
+  — and only a second exhaustion ends the turn with the terminal text (raise
+  `ENGINE_V2_MAX_OUTPUT_TOKENS`, 16384 or more for thinking models, or switch
+  models). A stream that produced visible text before hitting the budget is
+  not an empty stream and is delivered as-is; the adapter only logs that
+  truncation at `warn` (model, budget, token counts) so it is visible in the
+  daemon log.
 - Reaching `max_iterations` schedules one final tool-capable model request before
   returning `ThreadOutcome::MaxIterations`.
 - Three consecutive code steps or structured action batches with no successful
