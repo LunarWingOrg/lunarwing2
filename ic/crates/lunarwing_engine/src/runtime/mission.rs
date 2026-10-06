@@ -255,6 +255,16 @@ pub struct CreateMissionOutcome {
     /// True when the create deduped onto an existing mission; its goal,
     /// cadence and schedule were left unchanged.
     pub deduplicated: bool,
+    /// On a dedup hit: the existing mission's goal differs from the requested
+    /// one. Always false for a fresh create.
+    pub goal_differs: bool,
+    /// On a dedup hit: the existing mission's cadence differs from the
+    /// requested one. Always false for a fresh create.
+    pub cadence_differs: bool,
+    /// On a dedup hit: the existing record is a soft-deleted tombstone
+    /// (`deleted_at` set), so "non-terminal mission" wording would mislead
+    /// (WI#311 review AH-8). Always false for a fresh create.
+    pub existing_deleted: bool,
 }
 
 /// Manages mission lifecycle and thread spawning.
@@ -682,7 +692,9 @@ impl MissionManager {
             })
         {
             let goal = goal.into();
-            if existing.goal != goal || existing.cadence != cadence {
+            let goal_differs = existing.goal != goal;
+            let cadence_differs = existing.cadence != cadence;
+            if goal_differs || cadence_differs {
                 warn!(
                     mission_id = %existing.id,
                     "mission create deduped onto existing non-terminal mission with a different goal or cadence"
@@ -696,6 +708,9 @@ impl MissionManager {
             return Ok(CreateMissionOutcome {
                 id: existing.id,
                 deduplicated: true,
+                goal_differs,
+                cadence_differs,
+                existing_deleted: existing.deleted_at.is_some(),
             });
         }
         // Webhook path ownership: a fire matches every Active mission on the
@@ -714,13 +729,13 @@ impl MissionManager {
                             MissionCadence::Webhook { path: other, .. } if other == path
                         )
                 });
-            if let Some(holder) = claimed_by {
+            if claimed_by.is_some() {
                 return Err(EngineError::AccessDenied {
                     user_id: user_id.clone(),
-                    entity: format!(
-                        "webhook path '{path}' is owned by active mission {}",
-                        holder.id
-                    ),
+                    // Do not name the holding mission's UUID: that would
+                    // disclose another owner's mission id (WI#311 review
+                    // AH-7). The conflict is re-checked on fire/history.
+                    entity: format!("webhook path '{path}' is owned by another user's active mission"),
                 });
             }
         }
@@ -734,6 +749,9 @@ impl MissionManager {
         Ok(CreateMissionOutcome {
             id,
             deduplicated: false,
+            goal_differs: false,
+            cadence_differs: false,
+            existing_deleted: false,
         })
     }
 
@@ -5951,9 +5969,23 @@ mod tests {
             .unwrap();
         assert!(second.deduplicated);
         assert_eq!(first.id, second.id);
+        // The engine computes the diff flags so callers never have to diff a
+        // raw string against the serde cadence enum (WI#311 review AH-6).
+        assert!(!second.goal_differs);
+        assert!(second.cadence_differs);
+        assert!(!second.existing_deleted);
         // The persisted schedule is unchanged by the deduped re-create.
         let persisted = store.load_mission(first.id).await.unwrap().unwrap();
         assert_eq!(persisted.cadence, cadence());
+
+        // A same-name, same-everything re-create reports no diffs.
+        let third = mgr
+            .create_mission_detailed(project, "test-user", "digest", "digest", cadence(), vec![])
+            .await
+            .unwrap();
+        assert!(third.deduplicated);
+        assert!(!third.goal_differs);
+        assert!(!third.cadence_differs);
     }
 
     #[tokio::test]

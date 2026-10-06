@@ -708,11 +708,16 @@ impl EffectBridgeAdapter {
                         .await
                     {
                         Ok(outcome) => {
-                            // Apply the optional daily budget right after
-                            // creation; the cron schedule was just set to a
-                            // future fire time, so no run can race this.
+                            // Apply the optional daily budget only to a
+                            // freshly created mission. On a dedup hit the
+                            // existing mission is returned unchanged (WI#311
+                            // review AH-1): re-budgeting it here would
+                            // silently overwrite a live mission's limit while
+                            // the response says it was returned unchanged.
+                            let budget_applied =
+                                max_threads_per_day.is_some() && !outcome.deduplicated;
                             let budget_result = match max_threads_per_day {
-                                Some(max) => {
+                                Some(max) if !outcome.deduplicated => {
                                     let updates = lunarwing_engine::MissionUpdate {
                                         max_threads_per_day: Some(max),
                                         ..Default::default()
@@ -722,16 +727,16 @@ impl EffectBridgeAdapter {
                                             .await,
                                     )
                                 }
-                                None => None,
+                                _ => None,
                             };
                             match budget_result {
                                 Some(Err(e)) => Err(e),
                                 _ => {
                                     mission_created_info(
                                         mgr,
-                                        outcome.id,
+                                        &outcome,
                                         max_threads_per_day,
-                                        outcome.deduplicated,
+                                        budget_applied,
                                         cadence_str,
                                     )
                                     .await
@@ -1602,7 +1607,8 @@ fn mission_schedule_info(mission: &lunarwing_engine::Mission) -> serde_json::Val
             Some(match expression.split_whitespace().count() {
                 5 => "minute hour day-of-month month day-of-week",
                 6 => "second minute hour day-of-month month day-of-week",
-                _ => "second minute hour day-of-month month day-of-week year",
+                7 => "second minute hour day-of-month month day-of-week year",
+                _ => "unrecognized field count (not a 5/6/7-field cron expression)",
             }),
         ),
         _ => (None, None),
@@ -1617,38 +1623,55 @@ fn mission_schedule_info(mission: &lunarwing_engine::Mission) -> serde_json::Val
 
 async fn mission_created_info(
     mgr: &lunarwing_engine::MissionManager,
-    id: lunarwing_engine::MissionId,
-    max_threads_per_day: Option<u32>,
-    deduplicated: bool,
+    outcome: &lunarwing_engine::CreateMissionOutcome,
+    requested_budget: Option<u32>,
+    budget_applied: bool,
     requested_cadence: &str,
 ) -> Result<serde_json::Value, EngineError> {
     let mission = mgr
-        .get_mission(id)
+        .get_mission(outcome.id)
         .await?
         .ok_or_else(|| EngineError::Store {
-            reason: format!("created mission {id} is missing"),
+            reason: format!("created mission {} is missing", outcome.id),
         })?;
     let mut out = serde_json::json!({
-        "mission_id": id.to_string(),
-        "status": "created",
+        "mission_id": outcome.id.to_string(),
+        "status": if outcome.deduplicated { "existing" } else { "created" },
         "mission_status": format!("{:?}", mission.status),
         "project_id": mission.project_id.to_string(),
         "schedule": mission_schedule_info(&mission),
         "created_at": mission.created_at.to_rfc3339(),
         "updated_at": mission.updated_at.to_rfc3339(),
-        "deduplicated": deduplicated,
+        "deduplicated": outcome.deduplicated,
+        // Always the persisted value, so the response cannot claim a budget
+        // the mission does not have.
+        "max_threads_per_day": mission.max_threads_per_day,
     });
-    if deduplicated {
-        // A same-named non-terminal mission was returned unchanged (WI#311
-        // review P-4): name the cadence actually requested so a schedule
-        // change attempt is visible next to the persisted schedule.cadence.
+    if outcome.deduplicated {
+        // A same-named mission was returned unchanged (WI#311 review P-4):
+        // name the cadence actually requested and let the engine-computed
+        // diff flags say whether the persisted record matches it, so the
+        // caller does not have to diff a raw string against the serde enum.
         out["requested_cadence"] = serde_json::json!(requested_cadence);
-        out["note"] = serde_json::json!(
-            "existing non-terminal mission with this name returned unchanged; compare requested_cadence with schedule.cadence and use mission_update to change the schedule"
-        );
+        out["cadence_differs"] = serde_json::json!(outcome.cadence_differs);
+        out["goal_differs"] = serde_json::json!(outcome.goal_differs);
+        out["note"] = if outcome.existing_deleted {
+            serde_json::json!(
+                "matched your own previously deleted mission record with this name; it was returned unchanged (cadence_differs/goal_differs show whether it matches the request) — use mission_update to change it, or create under a different name for a fresh mission"
+            )
+        } else {
+            serde_json::json!(
+                "existing non-terminal mission with this name returned unchanged; cadence_differs/goal_differs show whether it matches the request — use mission_update to change the schedule"
+            )
+        };
     }
-    if let Some(max) = max_threads_per_day {
-        out["max_threads_per_day"] = serde_json::json!(max);
+    if requested_budget.is_some() {
+        out["budget_applied"] = serde_json::json!(budget_applied);
+        if !budget_applied {
+            out["budget_note"] = serde_json::json!(
+                "requested max_threads_per_day was not applied to the existing mission; use mission_update to change its budget"
+            );
+        }
     }
     Ok(out)
 }
@@ -1656,7 +1679,7 @@ async fn mission_created_info(
 fn mission_create_def() -> ActionDef {
     ActionDef {
         name: "mission_create".into(),
-        description: "Create a new mission (routine). Use when the user wants to set up a recurring task, scheduled check, or periodic routine. Results are delivered to the current channel by default.".into(),
+        description: "Create a new mission (routine). Use when the user wants to set up a recurring task, scheduled check, or periodic routine. Results are delivered to the current channel by default. Creating with the name of an existing non-terminal mission returns that mission unchanged (\"deduplicated\": true, \"status\": \"existing\") with cadence_differs/goal_differs flags; use mission_update to change it.".into(),
         parameters_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -4880,6 +4903,77 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert!(row["created_at"].is_string());
         assert!(row["updated_at"].is_string());
         assert!(row["threads_today_date"].is_string());
+    }
+
+    #[tokio::test]
+    async fn mission_create_dedup_does_not_rebudget_existing_mission() {
+        // WI#311 review AH-1: a deduped re-create that passes
+        // max_threads_per_day must leave the existing mission's budget
+        // untouched, and the response must say the budget was not applied.
+        let (adapter, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+        let ctx = mission_create_ctx();
+
+        let first = adapter
+            .handle_mission_call(
+                "mission_create",
+                &serde_json::json!({
+                    "name": "pr-digest",
+                    "goal": "digest",
+                    "cadence": "15 10 * * *",
+                    "max_threads_per_day": 5,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!first.is_error, "{:?}", first.output);
+        assert_eq!(first.output["deduplicated"], false);
+        assert_eq!(first.output["status"], "created");
+        assert_eq!(first.output["budget_applied"], true);
+        assert_eq!(first.output["max_threads_per_day"], 5);
+
+        let second = adapter
+            .handle_mission_call(
+                "mission_create",
+                &serde_json::json!({
+                    "name": "pr-digest",
+                    "goal": "digest",
+                    "cadence": "0 12 * * *",
+                    "max_threads_per_day": 1,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!second.is_error, "{:?}", second.output);
+        assert_eq!(second.output["mission_id"], first.output["mission_id"]);
+        assert_eq!(second.output["deduplicated"], true);
+        assert_eq!(second.output["status"], "existing");
+        assert_eq!(second.output["budget_applied"], false);
+        assert!(
+            second.output["budget_note"].is_string(),
+            "an unapplied requested budget must be explained: {:?}",
+            second.output
+        );
+        assert_eq!(
+            second.output["max_threads_per_day"], 5,
+            "response must report the persisted budget, not the requested one"
+        );
+        assert_eq!(second.output["cadence_differs"], true);
+        assert_eq!(second.output["goal_differs"], false);
+
+        let id = lunarwing_engine::MissionId(
+            uuid::Uuid::parse_str(first.output["mission_id"].as_str().expect("mission_id"))
+                .expect("uuid"),
+        );
+        let persisted = mgr.get_mission(id).await.expect("load").expect("mission");
+        assert_eq!(
+            persisted.max_threads_per_day, 5,
+            "deduped re-create must not overwrite the stored budget"
+        );
     }
 
     #[tokio::test]
