@@ -38,11 +38,11 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 - The v2.1.5.0 pre-release checklist is being worked through
   (`docs/ops/AGENT_GOALS_2.1.5.0.md`). The crate/pin state already moved
   (all LunarWing crates at 2.1.5 per checklist item #1; kimi worker 2.1.1;
-  opencode2 v2.0.21). Areas still under active change include the workspace
+  opencode2 v2.0.23). Areas still under active change include the workspace
   memory daily-log gate (WI#288), the routine/mission history registry
-  split (WI#278), the mission graceful-shutdown retry seam (WI#276), the
-  secrets-tool approval tier (WI#307), and the opencode2 worker bump to
-  v2.0.22 (WI#303). Check the checklist before opening MRs there.
+  split (WI#278), the mission graceful-shutdown retry seam (WI#276), and the
+  secrets-tool approval tier (WI#307). Check the checklist before opening
+  MRs there.
 - **Kawarimi export testing under OpenRC** is being re-worked due to an open-write detection
   difference vs systemd. OpenRC contributors *with kawarimi export expertise* are welcome →
   ask in `#lunarwing`.
