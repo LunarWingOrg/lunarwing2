@@ -219,7 +219,7 @@
     - CI job 96673 failed `e2e_builtin_tool_coverage::job_create_status`: the real scheduled worker could consume the foreground trace's next response. The test now isolates the worker's pending completion and forces the worker-first interleaving before advancing the foreground replay. It retains scheduler dispatch, both successful tool calls, UUID forwarding, and in-progress-status assertions; no assertion was weakened.
     - Verified locally: 96 targeted daemon tests; all 16 tests in the formerly failing libSQL integration target; 14 engine tier/planner tests; 1 live PostgreSQL migration test. All-feature daemon/engine Clippy (`--lib --tests -- -D warnings`), formatting, CI-config validation and diff checks passed. Remote CI has not been rerun for this re-attempt
 33. [x] (S) Reserved
-34. [x] (S) RESERVED4WIs
+34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/319
 35. [x] (S) RESERVED4WIs
 36. [x] (S) RESERVED4WIs
 37. [x] (S) ipv6
@@ -255,7 +255,7 @@
 46. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/319
     - DONE (2026-10-05): WI#319 (P-9) — recovery guidance could resurrect user deletions. Before 2026-07-26, `mission_delete` recorded deletions as `Completed`, so the !1416 boot warning and recovery docs could nag operators into resuming an intentional legacy delete. The `report_parked_recurring_missions` boot warning/notification (`ic/crates/lunarwing_engine/src/runtime/mission.rs`) now includes the mission's `created_at`/`updated_at` and tells operators to rule out an old delete before resuming; the function doc comment records the legacy semantics. `docs/architecture/ENGINE-V2.md` recovery section and the goal-42 diagnostics runbook (`docs/ops/v2.1.5.0_GOAL42_MISSION_DIAGNOSTICS.md`, the "owner-approved Completed" recovery step) now state the pre-2026-07-26 `Completed`-as-delete caveat and the `created_at`/`updated_at` clue. No behavior/suppression change — guidance-only per the work item.
     - Verification: 134 engine mission-runtime tests passed, including the extended `bootstrap_warns_owner_about_parked_recurring_missions_without_reviving` asserting the warning carries the 2026-07-26 legacy-delete caveat and created/updated timestamps. Engine Clippy (`--lib --tests -- -D warnings`) and `cargo fmt -p lunarwing_engine -- --check` passed; `cargo check -p lunarwing_engine --lib --tests` clean
-47. [x] (S) Reserved
+47. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/308 properly
 48. [ ] REPASS OF GOAL 24
 
 ---
