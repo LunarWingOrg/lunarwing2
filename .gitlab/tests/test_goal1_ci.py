@@ -2,6 +2,7 @@
 """Regression checks for the required gates that failed in pipeline #4679."""
 
 import copy
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -129,6 +130,142 @@ class FullValidationTests(unittest.TestCase):
                         self.assertIn('CI_COMMIT_REF_PROTECTED == "true"', condition)
                         self.assertIn('CI_PIPELINE_SOURCE == "push"', condition)
                         self.assertNotIn("LUNARWING_CI_FULL_VALIDATION", condition)
+
+
+class WorkerVersionPinTests(unittest.TestCase):
+    """The worker pin cross-check must bind values to each worker's own case
+    block (opencode and opencode2 share the OPENCODE_REF/OPENCODE_VERSION arg
+    names) and must also verify the provenance source_ref, not just the
+    build_args lines (WI#303 review)."""
+
+    PEBBLE_REF = "1" * 40
+    OPENCODE_REF = "2" * 40
+    OPENCODE2_REF = "3" * 40
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.build_script = self.root / "build-worker-image.sh"
+        self.dockerfiles = {
+            "PEBBLE_DOCKERFILE": self.root / "pebble.Dockerfile",
+            "OPENCODE_DOCKERFILE": self.root / "opencode.Dockerfile",
+            "OPENCODE2_DOCKERFILE": self.root / "opencode2.Dockerfile",
+            "KIMI_DOCKERFILE": self.root / "kimi.Dockerfile",
+        }
+        lock = self.root / "pebble4lunarwing/upstream/Cargo.lock"
+        lock.parent.mkdir(parents=True)
+        lock.write_text('version = 4\n[[package]]\nname = "worker"\n', encoding="utf-8")
+        lock_digest = hashlib.sha256(lock.read_bytes()).hexdigest()
+        self.dockerfiles["PEBBLE_DOCKERFILE"].write_text(
+            f"ARG PEBBLE_REF={self.PEBBLE_REF}\nARG PEBBLE_LOCK_SHA256={lock_digest}\n",
+            encoding="utf-8",
+        )
+        self.dockerfiles["OPENCODE_DOCKERFILE"].write_text(
+            f"ARG OPENCODE_VERSION=v1.18.25\nARG OPENCODE_REF={self.OPENCODE_REF}\n",
+            encoding="utf-8",
+        )
+        self.dockerfiles["OPENCODE2_DOCKERFILE"].write_text(
+            f"ARG OPENCODE_VERSION=v2.0.23\nARG OPENCODE_REF={self.OPENCODE2_REF}\n",
+            encoding="utf-8",
+        )
+        self.dockerfiles["KIMI_DOCKERFILE"].write_text(
+            "ARG KIMI_CODE_VERSION=2.1.1\n", encoding="utf-8"
+        )
+        kimi_lock = self.root / "kimi-cli/package-lock.json"
+        kimi_lock.parent.mkdir(parents=True)
+        kimi_lock.write_text(
+            json.dumps({"packages": {"": {"dependencies": {"@moonshot-ai/kimi-code": "2.1.1"}}}}),
+            encoding="utf-8",
+        )
+        self.kimi_lock = kimi_lock
+        self.write_build_script(
+            pebble_ref=self.PEBBLE_REF,
+            opencode_ref=self.OPENCODE_REF,
+            opencode2_ref=self.OPENCODE2_REF,
+            opencode2_version="v2.0.23",
+            kimi_version="2.1.1",
+        )
+
+    def write_build_script(self, *, pebble_ref, opencode_ref, opencode2_ref, opencode2_version, kimi_version):
+        self.build_script.write_text(
+            "case \"$1\" in\n"
+            "    pebble)\n"
+            f"        source_ref={pebble_ref}\n"
+            f"        build_args=\"PEBBLE_REF={pebble_ref}\n"
+            "SOURCE_REVISION=$CI_COMMIT_SHA\"\n"
+            "        ;;\n"
+            "    opencode)\n"
+            f"        source_ref={opencode_ref}\n"
+            "        build_args=\"OPENCODE_VERSION=v1.18.25\n"
+            f"OPENCODE_REF={opencode_ref}\n"
+            "SOURCE_REVISION=$CI_COMMIT_SHA\"\n"
+            "        ;;\n"
+            "    opencode2)\n"
+            f"        source_ref={opencode2_ref}\n"
+            f"        build_args=\"OPENCODE_VERSION={opencode2_version}\n"
+            f"OPENCODE_REF={opencode2_ref}\n"
+            "SOURCE_REVISION=$CI_COMMIT_SHA\"\n"
+            "        ;;\n"
+            "    kimi)\n"
+            f"        source_ref={kimi_version}\n"
+            f"        build_args=\"KIMI_CODE_VERSION={kimi_version}\n"
+            "SOURCE_REVISION=$CI_COMMIT_SHA\"\n"
+            "        ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+
+    def errors(self):
+        errors = []
+        with mock.patch.multiple(
+            config,
+            WORKER_BUILD_SCRIPT=self.build_script,
+            KIMI_CLI_LOCK=self.kimi_lock,
+            ROOT=self.root,
+            **self.dockerfiles,
+        ):
+            config.validate_worker_versions(errors)
+        return errors
+
+    def test_consistent_pins_pass(self):
+        self.assertEqual(self.errors(), [])
+
+    def test_cross_lane_ref_swap_is_caught(self):
+        # opencode2's build_args REF swapped to the v1 lane's SHA: a
+        # whole-script search would still find a match in the opencode block.
+        self.write_build_script(
+            pebble_ref=self.PEBBLE_REF,
+            opencode_ref=self.OPENCODE_REF,
+            opencode2_ref=self.OPENCODE_REF,
+            opencode2_version="v2.0.23",
+            kimi_version="2.1.1",
+        )
+        self.assertTrue(any("opencode2" in error for error in self.errors()))
+
+    def test_stale_source_ref_is_caught(self):
+        # The build_args match the Dockerfile but the provenance source_ref
+        # still points at the previous pin.
+        self.write_build_script(
+            pebble_ref=self.PEBBLE_REF,
+            opencode_ref=self.OPENCODE_REF,
+            opencode2_ref=self.OPENCODE2_REF,
+            opencode2_version="v2.0.23",
+            kimi_version="2.1.1",
+        )
+        text = self.build_script.read_text(encoding="utf-8").replace(
+            f"        source_ref={self.OPENCODE2_REF}", f"        source_ref={self.OPENCODE_REF}"
+        )
+        self.build_script.write_text(text, encoding="utf-8")
+        errors = self.errors()
+        self.assertTrue(any("source_ref" in error and "opencode2" in error for error in errors))
+
+    def test_missing_worker_block_is_caught(self):
+        text = self.build_script.read_text(encoding="utf-8")
+        start = text.index("    kimi)\n")
+        end = text.index("        ;;\n", start) + len("        ;;\n")
+        self.build_script.write_text(text[:start] + text[end:], encoding="utf-8")
+        self.assertTrue(any("kimi" in error for error in self.errors()))
 
 
 if __name__ == "__main__":

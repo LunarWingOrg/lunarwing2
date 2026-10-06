@@ -1,11 +1,11 @@
-# v2.0.21 resolves to this reviewed commit. Both must move together.
+# v2.0.23 resolves to this reviewed commit. Both must move together.
 # OpenCode 2 is beta in practice (upstream's own migration doc: "server and
 # plugin APIs may continue to change"). This lane is deliberately SEPARATE
 # from the proven v1 worker (opencode4lunarwing, pinned v1.18.25) so tenants
 # opt into v2 explicitly — see docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
 # Re-bump only after re-verifying the bridge against the v2 server API.
-ARG OPENCODE_VERSION=v2.0.21
-ARG OPENCODE_REF=8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72
+ARG OPENCODE_VERSION=v2.0.23
+ARG OPENCODE_REF=0fd7e2829449b052abf0078666669302923d77af
 ARG DEBIAN_SNAPSHOT=20260906T000000Z
 ARG SOURCE_REVISION=unknown
 
@@ -229,7 +229,11 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
 # resolve — the client build above is best-effort, so verify the exact import
-# the worker depends on.
+# the worker depends on. Beyond OpenCode.make, construct a client (pure
+# construction — no server contact) and assert every method path the bridge
+# calls, so upstream SDK drift like WI#320 F7 (session.message.list /
+# session.permission.reply do not exist; both are top-level groups) fails the
+# image build instead of dying at runtime (WI#303).
 #
 # Build-time self-tests run under a throwaway HOME rooted in the trap-cleaned
 # TMPDIR: OpenCode 2 appends a timestamped, randomly-IDed line to
@@ -248,7 +252,7 @@ RUN set -eu; \
            XDG_STATE_HOME="$HOME/.local/state"; \
     mkdir -p "$HOME"; \
     trap 'rm -rf /tmp/opencode2-build-tests' EXIT; \
-    cd /app && bun -e 'import("@opencode/client/promise").then(m => { if (typeof m.OpenCode?.make !== "function") { console.error("FATAL: @opencode/client/promise resolved but is missing OpenCode.make"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode/client/promise —", e.message); process.exit(1) })'
+    cd /app && bun -e 'import("@opencode/client/promise").then(m => { if (typeof m.OpenCode?.make !== "function") { console.error("FATAL: @opencode/client/promise resolved but is missing OpenCode.make"); process.exit(1) } const client = m.OpenCode.make({ baseUrl: "http://127.0.0.1:4096" }); const required = [["session.create", client.session?.create], ["session.prompt", client.session?.prompt], ["session.interrupt", client.session?.interrupt], ["permission.reply", client.permission?.reply], ["event.subscribe", client.event?.subscribe], ["message.list", client.message?.list]]; for (const [name, fn] of required) { if (typeof fn !== "function") { console.error(`FATAL: pinned @opencode/client is missing client.${name}() — the bridge calls it (WI#303)`); process.exit(1) } } }).catch(e => { console.error("FATAL: cannot import @opencode/client/promise —", e.message); process.exit(1) })'
 # `opencode --version` prints "opencode v<semver>" (name + v + version baked
 # in at build time above). Compare against exactly that, and LOG the actual
 # value on mismatch — a bare `test` fails this step with zero output, which

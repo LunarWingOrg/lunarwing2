@@ -3,7 +3,7 @@
 ## What This Is
 
 Persistent container worker for upstream OpenCode **2** (the `v2` line, pinned
-v2.0.21). This is a separate worker lane from `opencode4lunarwing/` (the proven
+v2.0.23). This is a separate worker lane from `opencode4lunarwing/` (the proven
 v1 worker, pinned v1.18.25) per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. Tenants opt in explicitly; v1
 stays the default until v2 earns trust. The WebSocket bridge is
@@ -33,10 +33,18 @@ workers.
   exist in v2.
 - Prompt completion settles via `session.execution.{succeeded,failed,
   interrupted}` / `session.idle` events; canonical assistant output is read
-  from `session.message.list`.
+  from the top-level `message.list` (`GET /api/session/:sessionID/message`,
+  paginated `{ data, cursor }`). The promise client has NO
+  `session.message.list` — `session.message` only exposes `get`.
 - Cancellation uses `session.interrupt` (v2 dropped `session.abort`).
 - The v2 config file is `opencode2.json`, kept deliberately separate from the
-  v1 worker's `opencode.json`.
+  v1 worker's `opencode.json`. opencode v2 only auto-discovers
+  `opencode.json`/`opencode.jsonc`, so `entrypoint.sh` exports
+  `OPENCODE_CONFIG` pointing at the materialized
+  `$WORKSPACE_ROOT/.opencode/opencode2.json`; without it the server silently
+  ignores the lane config. Provider `package` is the plain npm name
+  (`@ai-sdk/openai-compatible`, mapped to v2's bundled provider) — an `ai:`
+  prefix fails with `Unsupported URL Type "ai:"`.
 - v1 plugins are NOT ported yet. Re-add deliberately after the lane proves
   itself.
 

@@ -7,7 +7,7 @@
 | LunarVision Polish | v2.1.7.0 |
 | Further Podman Sandbox refinements, improvements, and proper tunnel networking support | v2.1.8.0 |
 | Part two of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.1.8.0 |
-| Introduction of new external worker | v2.1.8.0 |
+| Introduction of new external worker, LunarDepth | v2.1.8.0 |
 | Beta for Desktop/Mobile companion applications for LunarWing (first alpha version should be available by 2.1.6.0) | v2.1.8.0 |
 | Lightweight external workers and external worker loops with timers | v2.1.8.0 |
 | DarkIRC key manager & DarkIRC Channel Polishing | v2.2.0.0 |

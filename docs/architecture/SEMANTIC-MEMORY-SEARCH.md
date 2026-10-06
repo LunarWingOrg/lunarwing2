@@ -2,10 +2,16 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
-**Revalidated against source 2026-10-01 (v2.1.4.0).** Pipeline structure,
-limits, tools, schema/migrations (V27 remains the latest migration), and env
+**Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
+(v2.1.5.0).** Pipeline structure,
+limits, tools, schema/migrations, and env
 vars were re-checked; no search/indexing changes were made in the 2.1.4.0
-cycle. The additive
+cycle. The 2.1.5.0 cycle added migration V28
+(`V28__revoke_secret_delete_always_grants.sql`, WI#307) — a secrets-grant
+cleanup that does not touch the memory/search schema, so the pipeline below
+is unchanged; the write-guard paragraph already reflects this cycle's
+WI#290 rejection taxonomy, and WI#288/289 left the chunking and search
+paths untouched. The additive
 knowledge refresh cadence (item 6/WI#121) is now documented in Step 6, the
 WI#132 memory-index outbox (`indexed_at`, V27, repair sweep) is documented in
 Step 1, and the mission-subtree index exclusion (WI#135/WI#136) is documented

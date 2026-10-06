@@ -167,8 +167,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.21** at reviewed full commit
-`8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`; the v2 bridge uses
+**v2.0.23** at reviewed full commit
+`0fd7e2829449b052abf0078666669302923d77af`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -196,8 +196,9 @@ image through `.gitlab/scripts/build-worker-image.sh opencode2` (same
 reproducible-candidate + clean-rebuild digest contract), `worker-opencode2-scan`
 runs the Trivy CRITICAL gate + SBOM, and `worker-opencode2-promote` publishes
 the immutable `$CI_COMMIT_TAG-opencode2` tag. `ci-config` cross-checks the
-`OPENCODE_VERSION`/`OPENCODE_REF` ARG defaults against the build script and
-the Rust toolchain pin.
+`OPENCODE_VERSION`/`OPENCODE_REF` ARG defaults against the build script's
+opencode2 case block — including its provenance `source_ref` — and the Rust
+toolchain pin.
 
 The opencode2 worker applies a checked build-profile patch to the pinned
 upstream CLI script: `splitting: false` and `bytecode: false`. This avoids
@@ -299,6 +300,66 @@ build. Host-side `prepare_reproducible_build_test.py` passed, including the
 untouched-failure contract. Whole-image reproducibility must still pass the CI
 candidate-versus-clean-rebuild gate before promotion.
 
+v2.0.23 bump (2026-10-06, WI#303, re-attempt of the rejected MR !1438): tag
+SHA `0fd7e2829449b052abf0078666669302923d77af` verified live against the
+anomalyco/opencode remote (`git ls-remote`, this date). The `oven/bun` base
+digest and `DEBIAN_SNAPSHOT` were reconsidered and stay unchanged. The
+build-profile patch contract was **executed** host-side against the pinned
+`packages/cli/script/build.ts` fetched at that SHA: exactly one
+`bytecode: true` / `splitting: true` each, `prepare()` flips both, and a
+double-apply is rejected. The `prepare_reproducible_build` self-test fixture
+string moved to 2.0.23 — note the fixture is synthetic: the self-test never
+reads upstream `build.ts`, so it guards the patch logic, not the pin (the
+executed fetch-and-patch check above is what covers the pin).
+
+Bridge call-path correction (WI#320 finding F7, fixed in this bump): the
+generated promise client has **no** `session.message.list` and **no**
+`session.permission.reply` — verified against the pinned tree
+(`packages/client/src/promise/generated/client.ts`): `session.message`
+exposes only `get`; session message listing is the top-level
+`client.message.list` (`GET /api/session/:sessionID/message`, a paginated
+`{ data, cursor }` envelope with an optional server-side `type` filter), and
+permission replies are the top-level `client.permission.reply`. Earlier bump
+entries (and MR !1438) claimed `session.message.list` was "present/unchanged"
+because they checked protocol/OpenAPI identifier strings, not the client the
+bridge imports — the method did not exist at v2.0.21 either, where the runtime
+logged `sdk.session.message.list is not a function` and the executor silently
+fell back to streamed deltas. `opencode_task_executor.ts` now calls
+`client.message.list` (unwraps `.data`, `type: "assistant"`, bounded at 5
+pages of 200) and `client.permission.reply`. Paging follows the server
+contract (`packages/server/src/handlers/message.ts`): `order` is sent on the
+first page only (`desc`, so the bound keeps the newest messages), cursor pages
+carry no `order` — the server rejects cursor+order with 400
+`InvalidCursorError` — and a short page ends the listing because `cursor.next`
+is returned for every non-empty page; the pages are reversed into
+chronological order and a later-page failure keeps the pages already fetched.
+The self-test mock mirrors the real client shape and that server contract, so
+the stale paths and a cursor+order request both fail the suite (the first
+re-attempt sent `order` on every page and lost the canonical output on every
+real session; !1452 review AL-1), and the image build now constructs the
+client and asserts `typeof`
+for every method path the bridge calls (`session.create/prompt/interrupt`,
+`permission.reply`, `event.subscribe`, `message.list`), so this drift class
+fails the build instead of the runtime.
+
+Verified host-side with bun: the executor self-test passes against the real
+client shape and fails with the pre-fix executor; the build-time assertion
+snippet ran against the real pinned v2.0.23 promise source (all six paths
+present, both stale paths absent) and fails closed against a drifted stub.
+Paging fix verified 2026-10-06 on a local `podman build` of this lane at
+v2.0.23 (`WITH_TOOLCHAINS=false`; every build-time self-test green) by a smoke
+inside that image against a live `opencode serve` and a loopback fake
+OpenAI-compatible model: the executor returns the canonical text from one
+`message.list` call, cursor pages without `order` are accepted, newest-first
+paging matches the server's chronological order, and the pre-fix executor's
+cursor+order page is rejected with `InvalidCursorError` on the real server.
+**Not yet executed:** no pipeline can build the v2.0.23 image before merge
+(candidate jobs exist only on protected refs), so before promotion the
+`worker-opencode2-candidate` job on the first protected pipeline containing
+this pin must run green and be cited on WI#303, and a WI#320-style runtime
+smoke against the candidate image should re-confirm the corrected executor
+paths end-to-end.
+
 v2.0.21 bump (2026-10-01): tag SHA `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`
 verified against the anomalyco/opencode remote (v2.1.4.0 checklist item #2
 repass). The Dockerfile patches the upstream CLI build script at that SHA
@@ -317,6 +378,11 @@ diffs are an additive optional `message` query param on `session.form.cancel`
 does not use. Host-side `prepare_reproducible_build_test.py` passed (3/3),
 including the untouched-failure contract. Whole-image reproducibility must
 still pass the CI candidate-versus-clean-rebuild gate before promotion.
+(2026-10-06 correction: this entry's `session.message.list` /
+`session.permission.reply` "unchanged" claim was checked against protocol
+identifier strings, not the promise client the bridge imports; neither
+method existed at v2.0.21 — WI#320 F7 observed the runtime TypeError. Both
+call paths were corrected in the v2.0.23 bump above.)
 
 v2.0.20 bump (2026-09-30): tag SHA `84c9be93a56304a108f1a22df0c5d62c26d5b6ca`
 verified against the anomalyco/opencode remote (v2.1.4.0 checklist item #2).
