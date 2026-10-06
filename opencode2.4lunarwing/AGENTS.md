@@ -38,7 +38,13 @@ workers.
   `session.message.list` — `session.message` only exposes `get`.
 - Cancellation uses `session.interrupt` (v2 dropped `session.abort`).
 - The v2 config file is `opencode2.json`, kept deliberately separate from the
-  v1 worker's `opencode.json`.
+  v1 worker's `opencode.json`. opencode v2 only auto-discovers
+  `opencode.json`/`opencode.jsonc`, so `entrypoint.sh` exports
+  `OPENCODE_CONFIG` pointing at the materialized
+  `$WORKSPACE_ROOT/.opencode/opencode2.json`; without it the server silently
+  ignores the lane config. Provider `package` is the plain npm name
+  (`@ai-sdk/openai-compatible`, mapped to v2's bundled provider) — an `ai:`
+  prefix fails with `Unsupported URL Type "ai:"`.
 - v1 plugins are NOT ported yet. Re-add deliberately after the lane proves
   itself.
 

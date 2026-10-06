@@ -133,6 +133,14 @@ PY
   else
     log "Config linked: /app/config/opencode2.json -> $WORKSPACE_ROOT/.opencode/opencode2.json"
   fi
+  # opencode v2 only auto-discovers opencode.json/opencode.jsonc (project dirs,
+  # .opencode/, the global config dir) and never reads .opencode/opencode2.json,
+  # so without this the server ignores the lane config and falls back to its
+  # default provider. OPENCODE_CONFIG is the CLI's explicit config-file path; an
+  # operator-set value wins.
+  : "${OPENCODE_CONFIG:=$WORKSPACE_ROOT/.opencode/opencode2.json}"
+  export OPENCODE_CONFIG
+  log "OPENCODE_CONFIG=$OPENCODE_CONFIG"
 fi
 
 # ── optional Paseo MCP integration ────────────────────────────────────────────
