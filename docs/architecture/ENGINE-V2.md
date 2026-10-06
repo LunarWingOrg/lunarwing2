@@ -781,7 +781,13 @@ One caveat before resuming (WI#319): before 2026-07-26, `mission_delete` recorde
 deletions as `Completed` rather than removing or tombstoning the record, so a
 parked Completed mission may be an intentional legacy delete rather than a
 phrase-driven completion. The guidance includes the mission's `created_at` and
-`updated_at`; timestamps before 2026-07-26 are the clue. Rule out an old delete
+`updated_at`; an `updated_at` before 2026-07-26 is the clue (the legacy delete
+went through `update_mission_status`, which stamps `updated_at`). `created_at`
+alone does not discriminate — any mission created before that date and
+phrase-completed in September satisfies it — and the restart recorder can
+re-stamp `updated_at` on rows holding an unrecorded restart-failed thread, so
+for such rows the last history thread's `created_at` is the robust check. Rule
+out an old delete
 first, then inspect the history and use `mission_resume(id=...)` as the owner to
 recover paused, completed or failed missions. Cron recovery computes its next
 future fire; missed occurrences/events are not replayed. Manual, non-managed
