@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-09-28, v2.1.3.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics; revalidated 2026-10-01, v2.1.4.0 — pipeline wiring, scheduling ownership, and role mappings unchanged this cycle)
+**Date:** 2026-06-13 (revalidated 2026-09-28, v2.1.3.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics; revalidated 2026-10-01, v2.1.4.0 — pipeline wiring, scheduling ownership, and role mappings unchanged this cycle; revalidated 2026-10-06, v2.1.5.0 — `ensure_health_pipeline()` still lives in `mt-admin-lib/12-health-pipeline.sh` and is still invoked from `add_tenant()`; writer-quiescence stop path and watchdog installer ownership unchanged; the only pipeline-script change this cycle is the `health-llm-streams.sh` `retry_reason_empty_total` export (WI#297), which does not touch this wiring)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
