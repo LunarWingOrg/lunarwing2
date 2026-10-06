@@ -330,13 +330,22 @@ anything under `state/`.
 ### Engine V2 timeouts and model recovery
 
 These optional overrides go in `env/lunarwing.env`. `lunarwing-mt-admin.sh
-add-tenant` writes `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2` and
-`ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=2` on the first render (WI#239) and
-preserves whatever value is already there on re-render; the timeout is not
-written. The daemon reads them from its process environment at startup, so
-restart the tenant after adding or changing them.
+add-tenant` writes `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2`,
+`ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=2` (WI#239) and
+`ENGINE_V2_MAX_OUTPUT_TOKENS=8192` on the first render and preserves whatever
+value is already there on re-render; the timeout is not written. The daemon
+reads them from its process environment at startup, so restart the tenant
+after adding or changing them.
 
 ```bash
+ENGINE_V2_MAX_OUTPUT_TOKENS=8192        # Per-call output budget (max_tokens) for every Engine V2
+                                        # model request; a fixed 4096 before 2.1.5.0. Thinking
+                                        # models count their reasoning against it: if turns end
+                                        # with "used its entire output budget before producing
+                                        # visible text", raise it to 16384 or more. The adapter
+                                        # retries an exhausted budget once at twice this value
+                                        # before reporting that error. Values below 256 fall
+                                        # back to the default.
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future cap for a deferred tool or LLM call
                                         # awaited during an Engine V2 ResolveFutures round.
                                         # When the task exceeds this timeout it is aborted

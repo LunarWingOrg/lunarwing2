@@ -1087,6 +1087,8 @@ write_tenant_lunarwing_env() {
   engine_v2_model_recovery_attempts="${engine_v2_model_recovery_attempts:-2}"
   engine_v2_model_recovery_total_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)"
   engine_v2_model_recovery_total_attempts="${engine_v2_model_recovery_total_attempts:-2}"
+  engine_v2_max_output_tokens="$(_env_existing "$path" ENGINE_V2_MAX_OUTPUT_TOKENS)"
+  engine_v2_max_output_tokens="${engine_v2_max_output_tokens:-8192}"
   engine_v2_tool_async_timeout_secs="$(_env_existing "$path" ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS)"
   engine_v2_tool_async_timeout_secs="${engine_v2_tool_async_timeout_secs:-7999}"
   skill_self_improvement="$(_env_existing "$path" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
@@ -1232,6 +1234,11 @@ ORCHESTRATOR_SELF_MODIFY=$orchestrator_self_modify
 ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=$engine_v2_model_recovery_attempts
 ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=$engine_v2_model_recovery_total_attempts
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=$engine_v2_tool_async_timeout_secs
+# Per-call output budget (max_tokens) for Engine V2 model requests. Thinking
+# models count their reasoning against it; raise to 16384+ if turns end with
+# "used its entire output budget before producing visible text". Preserved on
+# re-render.
+ENGINE_V2_MAX_OUTPUT_TOKENS=$engine_v2_max_output_tokens
 
 # Generic sandbox egress (WI#154): none by default on multi-tenant hosts —
 # the advisory proxy mode would let a sandboxed process reach host-loopback

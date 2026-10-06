@@ -24,7 +24,7 @@ use crate::bridge::auth_manager::AuthManager;
 use crate::bridge::effect_adapter::{
     EffectBridgeAdapter, MISSIONS_CAPABILITY, mission_action_defs,
 };
-use crate::bridge::llm_adapter::LlmBridgeAdapter;
+use crate::bridge::llm_adapter::{DEFAULT_MAX_OUTPUT_TOKENS, LlmBridgeAdapter};
 use crate::bridge::store_adapter::HybridStore;
 use crate::channels::web::sse::SseManager;
 use crate::channels::{IncomingMessage, OutgoingResponse, StatusUpdate};
@@ -92,6 +92,36 @@ fn engine_v2_channel_allowed(
 pub fn should_route_to_engine_v2(channel: &str) -> bool {
     let configured = std::env::var("ENGINE_V2_CHANNELS").ok();
     engine_v2_channel_allowed(is_engine_v2_enabled(), configured.as_deref(), channel)
+}
+
+/// Floor for `ENGINE_V2_MAX_OUTPUT_TOKENS`: anything smaller cannot hold a
+/// `repl` block and is treated as a misconfiguration.
+const MIN_ENGINE_OUTPUT_TOKENS: u32 = 256;
+
+/// Per-call output budget (`max_tokens`) for Engine V2 model requests, from
+/// `ENGINE_V2_MAX_OUTPUT_TOKENS` through the runtime env overlay (WI#310).
+/// Unset, unparsable or sub-floor values fall back to the adapter default.
+pub fn engine_max_output_tokens() -> u32 {
+    parse_engine_max_output_tokens(
+        crate::config::env_or_override("ENGINE_V2_MAX_OUTPUT_TOKENS").as_deref(),
+    )
+}
+
+fn parse_engine_max_output_tokens(raw: Option<&str>) -> u32 {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return DEFAULT_MAX_OUTPUT_TOKENS;
+    };
+    match raw.parse::<u32>() {
+        Ok(value) if value >= MIN_ENGINE_OUTPUT_TOKENS => value,
+        _ => {
+            tracing::warn!(
+                value = raw,
+                default = DEFAULT_MAX_OUTPUT_TOKENS,
+                "ENGINE_V2_MAX_OUTPUT_TOKENS is not a whole number >= {MIN_ENGINE_OUTPUT_TOKENS}; using the default"
+            );
+            DEFAULT_MAX_OUTPUT_TOKENS
+        }
+    }
 }
 
 /// Build the scoped engine conversation key for a message.
@@ -1497,10 +1527,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
 
     debug!("engine v2: initializing engine state");
 
-    let llm_adapter = Arc::new(LlmBridgeAdapter::new(
-        agent.llm().clone(),
-        Some(agent.cheap_llm().clone()),
-    ));
+    let llm_adapter = Arc::new(
+        LlmBridgeAdapter::new(agent.llm().clone(), Some(agent.cheap_llm().clone()))
+            .with_default_max_tokens(engine_max_output_tokens()),
+    );
 
     let effect_adapter = Arc::new(
         EffectBridgeAdapter::new(
@@ -5920,6 +5950,25 @@ pub(crate) mod tests {
     pub(crate) async fn reset_engine_state_for_tests() {
         let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
         *lock.write().await = None;
+    }
+
+    #[test]
+    fn engine_max_output_tokens_falls_back_to_the_default_for_bad_values() {
+        let cases = [
+            (None, DEFAULT_MAX_OUTPUT_TOKENS),
+            (Some(""), DEFAULT_MAX_OUTPUT_TOKENS),
+            (Some("abc"), DEFAULT_MAX_OUTPUT_TOKENS),
+            (Some("0"), DEFAULT_MAX_OUTPUT_TOKENS),
+            (Some("255"), DEFAULT_MAX_OUTPUT_TOKENS),
+            (Some(" 16384 "), 16384),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                parse_engine_max_output_tokens(raw),
+                expected,
+                "{raw:?} should resolve to {expected}"
+            );
+        }
     }
 
     #[test]

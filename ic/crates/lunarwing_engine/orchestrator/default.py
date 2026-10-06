@@ -48,7 +48,9 @@ RECOVERY_CONTEXT_MAX_CHARS = 24000
 # handling, so the engine must not re-hammer. content_filtered and
 # output_budget_exhausted (WI#297) are deterministic provider empties — a
 # refusal or an output-budget truncation — so re-sending the identical request
-# cannot succeed and they get no engine recovery attempt either.
+# cannot succeed and they get no engine recovery attempt either. (The host
+# adapter already retried an exhausted output budget once at twice
+# ENGINE_V2_MAX_OUTPUT_TOKENS before that kind reached the engine.)
 MODEL_RECOVERY_POLICY = {
     "context_overflow": {"max_attempts": 2, "shrink": [0.60, 0.35]},
     "transient": {"max_attempts": 2},
