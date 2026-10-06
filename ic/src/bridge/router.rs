@@ -4436,8 +4436,7 @@ fn mission_info_gates_budget_exhausted_on_the_counter_date() {
     );
 
     // Same numbers one day stale: frozen counter, not an exhausted budget.
-    mission.threads_today_date =
-        Some(chrono::Utc::now().date_naive() - chrono::Duration::days(1));
+    mission.threads_today_date = Some(chrono::Utc::now().date_naive() - chrono::Duration::days(1));
     assert!(!mission_to_info(&mission).budget_exhausted);
 
     // Legacy record with no counter date at all: never "exhausted".

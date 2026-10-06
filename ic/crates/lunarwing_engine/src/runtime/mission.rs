@@ -735,7 +735,9 @@ impl MissionManager {
                     // Do not name the holding mission's UUID: that would
                     // disclose another owner's mission id (WI#311 review
                     // AH-7). The conflict is re-checked on fire/history.
-                    entity: format!("webhook path '{path}' is owned by another user's active mission"),
+                    entity: format!(
+                        "webhook path '{path}' is owned by another user's active mission"
+                    ),
                 });
             }
         }
