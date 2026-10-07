@@ -24,12 +24,30 @@
 #      lunarwing_health_metrics workspace member (MR !1371 review A4).
 #   5. Prints the advisory-db commit that judged the tree so the CI trace
 #      records exactly which RustSec database revision produced the verdict.
+#   6. Retries the audit up to three times (5s/10s backoff, like
+#      ensure-rust-components.sh) when a run fails on transient network
+#      diagnostics — an index-failure storm (crates.io 429s from a shared
+#      runner egress IP) or a stuck/failed advisory-db fetch — instead of
+#      failing the pipeline on a flake (pipeline #5294's cargo-deny job
+#      failed on a tree identical to the green MR pipeline minutes earlier).
+#      Only a completed run with zero index-failure diagnostics is accepted,
+#      a run that reached a real audit verdict (error[...] diagnostic) is
+#      never retried, and the deterministic vendored-context
+#      misconfiguration fails every attempt identically — so the yanked and
+#      advisory gates keep their semantics. `timeout` bounds a stuck
+#      advisory-db git fetch to 10 minutes per attempt instead of the
+#      2-hour job timeout.
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
 
 if ! command -v taskset >/dev/null 2>&1; then
     echo "ERROR: taskset is required for bounded Cargo execution" >&2
+    exit 1
+fi
+
+if ! command -v timeout >/dev/null 2>&1; then
+    echo "ERROR: timeout is required to bound the advisory-db fetch" >&2
     exit 1
 fi
 
@@ -46,12 +64,37 @@ trap 'rm -f "$log"' EXIT
 
 # Run from the repo root: ic/.cargo/config.toml only applies at or below ic/,
 # so this keeps the real registry index in play for the yanked check.
+#
+# tee truncates the log at each attempt, so the classification below and the
+# final index-failure guard always see the decisive attempt's output; every
+# attempt's diagnostics still land in the job trace via tee's stdout copy.
 status=0
-(cd "$repo_root" && taskset -c 0-11 "$deny_bin" deny \
-    --manifest-path "$manifest" \
-    --config "$config_file" \
-    --workspace --all-features \
-    check --hide-inclusion-graph 2>&1) | tee "$log" || status=1
+for attempt in 1 2 3; do
+    attempt_status=0
+    (cd "$repo_root" && taskset -c 0-11 timeout 600 "$deny_bin" deny \
+        --manifest-path "$manifest" \
+        --config "$config_file" \
+        --workspace --all-features \
+        check --hide-inclusion-graph 2>&1) | tee "$log" || attempt_status=1
+
+    # Accept only a completed run with no index-failure diagnostics: the
+    # yanked gate was verifiably enforced for every locked crate.
+    if (( attempt_status == 0 )) && ! grep -q "index-failure" "$log"; then
+        break
+    fi
+    # A real audit verdict (advisory/ban/license/yanked diagnostic) is
+    # deterministic — fail as-is instead of retrying it three times.
+    if grep -q "error\[" "$log"; then
+        status=1
+        break
+    fi
+    if (( attempt == 3 )); then
+        status=1
+        break
+    fi
+    echo "cargo-deny attempt $attempt/3 was inconclusive (index-failure diagnostics or advisory-db fetch failure); retrying in $((attempt * 5))s" >&2
+    sleep "$((attempt * 5))"
+done
 
 # Record which RustSec advisory-db revision produced the verdict above.
 db_dir=$(find "${CARGO_HOME:-$HOME/.cargo}"/advisory-dbs -maxdepth 1 -mindepth 1 \
