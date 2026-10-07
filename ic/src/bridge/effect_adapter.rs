@@ -616,7 +616,113 @@ impl EffectBridgeAdapter {
         .await
     }
 
+    /// Gate a `mission_*` capability call before dispatch (WI#308).
+    ///
+    /// The mission verbs are capability actions dispatched by
+    /// [`Self::handle_mission_call`] before the registry-tool gate stack in
+    /// [`Self::execute_action_internal`], so the gates keyed on a registry
+    /// tool handle (permission state, supervision, approval tiers, rate
+    /// limiting, hooks) never ran for them. This is the mission-specific
+    /// subset, in the registry stack's order:
+    ///
+    /// - persisted `tool_permissions.<verb>` = disabled denies the call;
+    /// - supervised mode pauses for human approval — every action, regardless
+    ///   of tier, like the registry gate. `allow_always` stays false: a
+    ///   capability action has no registry tool for
+    ///   `persist_always_allow` to key a grant on, so the dialog must not
+    ///   offer a persistence that cannot happen. An approved call resumes
+    ///   with `approval_already_granted` and skips this pause;
+    /// - a per-user per-verb rate limit applies;
+    /// - `ToolCall` hooks run with [`MISSION_SENSITIVE_PARAMS`] redacted.
+    ///
+    /// The approval-tier gates deliberately do not map: mission verbs carry
+    /// `ApprovalRequirement::Never` semantics (their `ActionDef`s declare
+    /// `requires_approval: false`) because autonomous Mission threads must
+    /// steer their own missions and routines are created from shared channels
+    /// by design, so the shared-conversation, non-Foreground-`Always` and
+    /// needs-prompt gates stay off. The pre-flight auth gate is a no-op for
+    /// capability actions (they hold no credential registrations).
+    ///
+    /// Returns `Some(error)` when a gate trips, `None` to proceed — including
+    /// for non-mission calls and when no mission manager is wired (the call
+    /// then falls through to the registry path, as before).
+    async fn gate_mission_call(
+        &self,
+        action_name: &str,
+        parameters: &serde_json::Value,
+        context: &ThreadExecutionContext,
+        approval_already_granted: bool,
+    ) -> Option<EngineError> {
+        if !is_mission_action_name(action_name) || self.mission_manager.read().await.is_none() {
+            return None;
+        }
+
+        if self
+            .tool_permission_state(&context.user_id, action_name)
+            .await
+            == Some(PermissionState::Disabled)
+        {
+            return Some(EngineError::LeaseDenied {
+                reason: format!(
+                    "Tool '{action_name}' is disabled for this user in tool permissions."
+                ),
+            });
+        }
+
+        if context.supervised_mode && !approval_already_granted {
+            return Some(Self::gate_paused(
+                "approval",
+                action_name,
+                context.current_call_id.as_deref(),
+                parameters.clone(),
+                lunarwing_engine::ResumeKind::Approval {
+                    allow_always: false,
+                },
+                None,
+            ));
+        }
+
+        if let crate::tools::rate_limiter::RateLimitResult::Limited { retry_after, .. } = self
+            .rate_limiter
+            .check_and_record(&context.user_id, action_name, &mission_rate_limit_config())
+            .await
+        {
+            return Some(EngineError::Effect {
+                reason: format!(
+                    "Tool '{action_name}' is rate limited. Try again in {:.0}s.",
+                    retry_after.as_secs_f64()
+                ),
+            });
+        }
+
+        let hook_event = HookEvent::ToolCall {
+            tool_name: action_name.to_string(),
+            parameters: crate::tools::redact_params(parameters, MISSION_SENSITIVE_PARAMS),
+            user_id: context.user_id.clone(),
+            context: format!("engine_v2:{}", context.thread_id),
+        };
+        match self.hooks.run(&hook_event).await {
+            Ok(HookOutcome::Reject { reason }) => {
+                return Some(EngineError::LeaseDenied {
+                    reason: format!("Tool '{action_name}' blocked by hook: {reason}"),
+                });
+            }
+            Err(crate::hooks::HookError::Rejected { reason }) => {
+                return Some(EngineError::LeaseDenied {
+                    reason: format!("Tool '{action_name}' blocked by hook: {reason}"),
+                });
+            }
+            Err(e) => {
+                debug!(tool = action_name, error = %e, "hook error (fail-open)");
+            }
+            Ok(HookOutcome::Continue { .. }) => {}
+        }
+        None
+    }
+
     /// Handle mission_* function calls. Returns None if not a mission call.
+    /// Callers must run [`Self::gate_mission_call`] first (WI#308);
+    /// `execute_action_internal` does.
     async fn handle_mission_call(
         &self,
         action_name: &str,
@@ -949,6 +1055,20 @@ impl EffectBridgeAdapter {
 
         let resolved_name = self.tools.resolve_name(action_name).await;
         let lookup_name = resolved_name.as_deref().unwrap_or(action_name);
+
+        // The mission_* verbs are capability actions dispatched by
+        // `handle_mission_call` below, before the registry-tool gate stack —
+        // so they carry their own gate subset (permission, supervision, rate
+        // limit, hooks; WI#308). Runs only when the call will actually
+        // dispatch as a mission call (a mission manager is wired and the name
+        // is a mission verb); anything else falls through to the registry
+        // gates unchanged.
+        if let Some(gate_error) = self
+            .gate_mission_call(action_name, &parameters, context, approval_already_granted)
+            .await
+        {
+            return Err(gate_error);
+        }
 
         if let Some(result) = self
             .handle_mission_call(action_name, &parameters, context)
@@ -1583,6 +1703,40 @@ fn extract_credential_name(error_msg: &str) -> Option<String> {
 
 /// Capability name the `mission_*` functions are registered under.
 pub(crate) const MISSIONS_CAPABILITY: &str = "missions";
+
+/// The `mission_*` verb names dispatched by
+/// [`EffectBridgeAdapter::handle_mission_call`]. The WI#308 gate subset keys
+/// off this set; `mission_action_defs` builds the advertised definitions from
+/// one function per verb, and `mission_action_names_cover_the_defs` keeps the
+/// two listings in agreement.
+pub(crate) const MISSION_ACTION_NAMES: &[&str] = &[
+    "mission_create",
+    "mission_list",
+    "mission_fire",
+    "mission_pause",
+    "mission_resume",
+    "mission_update",
+    "mission_history",
+    "mission_delete",
+];
+
+/// Whether `name` is a dispatched `mission_*` verb.
+pub(crate) fn is_mission_action_name(name: &str) -> bool {
+    MISSION_ACTION_NAMES.contains(&name)
+}
+
+/// Mission parameters that must never reach a hook payload or an approval
+/// prompt: `webhook_secret` (accepted by `mission_create`/`mission_update`)
+/// is a shared-secret credential. [`crate::tools::redact_params`] no-ops on
+/// verbs whose parameters do not contain the key.
+pub(crate) const MISSION_SENSITIVE_PARAMS: &[&str] = &["webhook_secret"];
+
+/// Per-user rate limit applied to each mission verb (WI#308). Mission calls
+/// had no rate limit before; the budget matches `memory_write`'s (a cheap
+/// state operation) and is keyed per verb, so listing cannot starve firing.
+fn mission_rate_limit_config() -> crate::tools::ToolRateLimitConfig {
+    crate::tools::ToolRateLimitConfig::new(20, 200)
+}
 
 /// Definitions of the `mission_*` capability functions dispatched by
 /// [`EffectBridgeAdapter::handle_mission_call`]. The router registers them so
