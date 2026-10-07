@@ -3,7 +3,7 @@
 ## What This Is
 
 Persistent container worker for upstream OpenCode **2** (the `v2` line, pinned
-v2.0.23). This is a separate worker lane from `opencode4lunarwing/` (the proven
+v2.0.24). This is a separate worker lane from `opencode4lunarwing/` (the proven
 v1 worker, pinned v1.18.25) per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. Tenants opt in explicitly; v1
 stays the default until v2 earns trust. The WebSocket bridge is
