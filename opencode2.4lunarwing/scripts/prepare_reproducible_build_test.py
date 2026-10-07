@@ -9,7 +9,7 @@ class ReproducibleBuildTests(unittest.TestCase):
     bytecode: true,
     splitting: true,
     compile: { outfile: "opencode" },
-    define: { OPENCODE_VERSION: "2.0.23" },
+    define: { OPENCODE_VERSION: "2.0.24" },
   })
   await verifyArtifact(outdir)
 """

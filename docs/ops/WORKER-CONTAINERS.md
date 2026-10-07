@@ -167,8 +167,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.23** at reviewed full commit
-`0fd7e2829449b052abf0078666669302923d77af`; the v2 bridge uses
+**v2.0.24** at reviewed full commit
+`e7a34f09bfd9134dfade5a8ddb843f7030bc9a69`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -359,6 +359,53 @@ cursor+order page is rejected with `InvalidCursorError` on the real server.
 this pin must run green and be cited on WI#303, and a WI#320-style runtime
 smoke against the candidate image should re-confirm the corrected executor
 paths end-to-end.
+
+v2.0.24 bump (2026-10-07, v2.1.5.0 checklist item #2): tag SHA
+`e7a34f09bfd9134dfade5a8ddb843f7030bc9a69` verified live against the
+anomalyco/opencode remote (`git ls-remote`, this date; a lightweight tag
+resolving directly to the commit, same as v2.0.23). The `oven/bun` base
+digest and `DEBIAN_SNAPSHOT` were reconsidered and stay unchanged. The
+v2.0.23→v2.0.24 upstream diff is large (~1036 files) but the lane's surface
+is unchanged, re-verified against the pinned tree itself (not protocol
+identifier strings): the generated promise client still has all six bridge
+call paths (`session.create/prompt/interrupt`, `permission.reply`,
+`event.subscribe`, top-level `message.list`); `session.message` still
+exposes only `get` and there is still no `session.permission.reply`;
+`message.list`'s query shape and envelope are unchanged (`limit` capped at
+200 by the `SessionMessagesQuery` schema, `order`/`cursor`, the server-side
+`type` filter including `assistant`, `{ data, cursor: { previous?, next? } }`),
+and the server handler still rejects cursor+order with 400
+`InvalidCursorError`; every event name the bridge matches
+(`session.execution.{succeeded,failed,interrupted}`, `session.idle`,
+`permission.asked`, `session.text.delta`, `session.tool.{success,failed}`)
+is unchanged; `SessionCreateInput` still takes `{ title, permissions }`,
+`SessionPromptInput` `{ sessionID, text }`, and `SessionCreateOutput` still
+unwraps `.data`; `OPENCODE_CONFIG` is still honored
+(`packages/cli/src/server-process.ts`); and the `@opencode/client` exports
+map (`./promise` → `src/promise/index.ts`) plus the promise `make` shape
+(raw groups spread, `event` wrapped by `SharedEvents` whose
+`subscribe({ signal })` the executor uses) are unchanged. The visible
+upstream drift is internal to the lane: a promise service-discovery
+refactor (`service-probe.ts` new, `service-contender.ts` and
+`promise/service.ts` reworked — the bridge constructs the client with an
+explicit `baseUrl` and never calls `ensure`/`discover`) and an ACP-mode
+internals rework (the lane runs websocket mode). `packages/cli/script/build.ts`
+is byte-identical between the two tags; the build-profile patch contract was
+still executed host-side against the pinned file (exactly one
+`bytecode: true` / `splitting: true` each, `prepare()` flips both, a
+double-apply is rejected), and the moved upstream `bun.lock` is consumed by
+the Dockerfile's `bun install --frozen-lockfile` from the tag itself. The
+`prepare_reproducible_build` self-test fixture string moved to 2.0.24 — the
+fixture is synthetic (it guards the patch logic, not the pin; the executed
+fetch-and-patch check above covers the pin). Host-side
+`prepare_reproducible_build_test.py` passed (3/3) and the ci-config
+`WorkerVersionPinTests` passed (15/15) against the new pins. **Not yet
+executed:** no pipeline can build the v2.0.24 image before merge (candidate
+jobs exist only on protected refs), so before promotion the
+`worker-opencode2-candidate` job on the first protected pipeline containing
+this pin must run green (whole-image candidate-versus-clean-rebuild digest
+gate), and a runtime smoke against the candidate image should re-confirm
+the executor paths end-to-end.
 
 v2.0.21 bump (2026-10-01): tag SHA `8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`
 verified against the anomalyco/opencode remote (v2.1.4.0 checklist item #2
