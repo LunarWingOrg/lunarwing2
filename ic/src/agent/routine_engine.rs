@@ -2461,7 +2461,10 @@ fn truncate(s: &str, max: usize) -> String {
 fn truncate_tool_output_middle(content: &str, max_bytes: usize) -> String {
     debug_assert!(content.len() > max_bytes);
     let marker = format!("\n... [output truncated to {max_bytes} chars, middle elided] ...\n");
-    let Some(keep) = max_bytes.checked_sub(marker.len()).filter(|keep| *keep >= 2) else {
+    let Some(keep) = max_bytes
+        .checked_sub(marker.len())
+        .filter(|keep| *keep >= 2)
+    else {
         return marker.chars().take(max_bytes).collect();
     };
     let head_bytes = keep / 2;
@@ -3182,7 +3185,11 @@ mod tests {
         );
         let out = super::truncate_tool_output_middle(&envelope, 8192);
         assert!(out.len() <= 8192, "bounded: {}", out.len());
-        assert!(out.contains("CURSOR-789"), "cursor lost: {}", &out[out.len().saturating_sub(200)..]);
+        assert!(
+            out.contains("CURSOR-789"),
+            "cursor lost: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
         assert!(out.contains("\"truncated\": true"));
         assert!(out.contains("\"complete\": false"));
         assert!(out.starts_with("{\"items\":"));
