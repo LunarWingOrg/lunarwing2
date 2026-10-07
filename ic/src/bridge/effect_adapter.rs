@@ -2700,7 +2700,9 @@ FINAL(echoed + "|" + http_result["error"])"#,
             .output
             .as_str()
             .expect("modified output should cross the engine boundary as bounded text");
-        assert!(bounded.contains("truncated: showing 128/"));
+        // Secret-safe cuts remove the entire token-like x run, retaining only
+        // the JSON framing (12-byte prefix and 2-byte suffix).
+        assert!(bounded.contains("truncated: showing 14/4110 bytes"));
         assert!(
             bounded.len() < 512,
             "bounded output was {} bytes",

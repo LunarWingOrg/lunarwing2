@@ -249,17 +249,30 @@ pagination/completion metadata (`next_cursor`, `truncated`, `complete`,
 the model never saw truncation state or a real cursor and improvised one
 (WI#344 GitLab 500s). The kept budget splits evenly between head and tail: a
 pagination block needs only ~100-300 chars of tail, while head-heavy outputs
-(HTTP bodies, file reads) still keep the front half. Every upstream cap has
-the same head+tail shape, so the tail survives the whole path at any size:
+(HTTP bodies, file reads) still keep the front half. The Tier-0 string caps
+and the routine cap use head+tail truncation:
 the safety layer's `sanitize_tool_output` size cut
 (`SAFETY_MAX_OUTPUT_LENGTH`, 100 KB default) covers the v1 agent live loop,
 the v1 routine loop, and the engine effect bridge (the v1 live loop is capped
 there, not uncapped as WI#349 stated), and the v1 routine tool loop adds its
-own 8192-byte cap (`ic/src/agent/routine_engine.rs`). Follow-ups that still
+own 8192-byte cap (`ic/src/agent/routine_engine.rs`). Safety truncation scans
+fixed 2 KiB windows around both cuts, removes crossing secrets/token runs,
+and drops a retained side if the window cannot establish a safe boundary.
+The final retained text is still leak-scanned; PEM BEGIN and END markers block.
+Thus secret protection can reduce the retained payload below its budget.
+WASM (10 MB), MCP (4 MiB), and built-in HTTP (5 MiB) size limits reject the
+call rather than truncate; tail preservation is not an end-to-end guarantee.
+Follow-ups that still
 cut head-only: `shrink_context_for_model_recovery`'s per-message cut after a
 context_overflow recovery (the model again sees `{items: [...` with no
-cursor), the stored-result preview in `ic/src/bridge/thread_ops.rs`, and the
-sandbox stdout/stderr caps; `MAX_ACTION_OUTPUT_CHARS` also still has no
+cursor), the stored-result preview in `ic/src/agent/thread_ops.rs:999-1009`,
+the Engine v2 500-byte preview in `ic/src/bridge/router.rs:3751-3772` built
+from the 1000-byte event preview in `lunarwing_engine/src/types/event.rs:74-87`,
+shell capture (64 KiB), SSH capture (1 MiB), and sandbox stdout/stderr caps.
+Also follow up the v1 earlier-turn 1000-byte tool-result cut in
+`ic/src/agent/session.rs:533-545` ([WI#351](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351): a later
+"next page" turn can lose its cursor), and CodeAct's 500-character
+`format_output` action previews in `default.py`. `MAX_ACTION_OUTPUT_CHARS` still has no
 ThreadConfig/env knob.
 
 **Tier 1 -- CodeAct / Python via Monty** (`executor/scripting.rs`):
