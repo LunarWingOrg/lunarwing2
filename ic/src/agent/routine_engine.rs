@@ -2455,12 +2455,13 @@ fn truncate(s: &str, max: usize) -> String {
 /// `truncated`, `complete`, `resume_page`) at the very end, and a head-only
 /// cut amputated it (WI#349 — the model then improvised cursors). The marker
 /// always separates the halves. Byte-budgeted and char-boundary safe; the
-/// result never exceeds `max_bytes`.
-///
-/// Caller precondition: `content.len() > max_bytes` (only worth eliding then).
+/// result never exceeds `max_bytes`. Total: content already within budget
+/// passes through unchanged.
 fn truncate_tool_output_middle(content: &str, max_bytes: usize) -> String {
-    debug_assert!(content.len() > max_bytes);
-    let marker = format!("\n... [output truncated to {max_bytes} chars, middle elided] ...\n");
+    if content.len() <= max_bytes {
+        return content.to_owned();
+    }
+    let marker = format!("\n... [output truncated to {max_bytes} bytes, middle elided] ...\n");
     let Some(keep) = max_bytes
         .checked_sub(marker.len())
         .filter(|keep| *keep >= 2)
@@ -2471,7 +2472,7 @@ fn truncate_tool_output_middle(content: &str, max_bytes: usize) -> String {
     let tail_bytes = keep - head_bytes;
     let head_end = content.floor_char_boundary(head_bytes.min(content.len()));
     let tail_start = content.ceil_char_boundary(content.len().saturating_sub(tail_bytes));
-    let mut output = String::with_capacity(max_bytes + marker.len());
+    let mut output = String::with_capacity(max_bytes);
     output.push_str(&content[..head_end]);
     output.push_str(&marker);
     output.push_str(&content[tail_start..]);
@@ -3209,6 +3210,25 @@ mod tests {
         let wide = super::truncate_tool_output_middle(&"é".repeat(9000), 8192);
         assert!(wide.len() <= 8192);
         assert!(wide.contains("middle elided"));
+    }
+
+    #[test]
+    fn test_truncate_tool_output_middle_odd_budget_exercises_ceil_boundary() {
+        // At an odd budget both cut points land mid-'é' (2-byte): floor
+        // moves the head cut AND ceil moves the tail cut — the 8192 case
+        // only exercises floor.
+        let odd = super::truncate_tool_output_middle(&"é".repeat(9000), 8191);
+        assert!(odd.len() <= 8191, "bounded: {}", odd.len());
+        assert!(odd.ends_with('é'));
+        assert!(odd.contains("middle elided"));
+    }
+
+    #[test]
+    fn test_truncate_tool_output_middle_within_budget_passes_through() {
+        // The helper is total: content within budget is returned unchanged
+        // rather than elided (or, historically, duplicated around the marker).
+        assert_eq!(super::truncate_tool_output_middle("short", 8192), "short");
+        assert_eq!(super::truncate_tool_output_middle("", 0), "");
     }
 
     #[test]
