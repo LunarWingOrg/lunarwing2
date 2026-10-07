@@ -4891,7 +4891,11 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             def_names, gate_names,
             "the gate set and the dispatched definitions disagree"
         );
-        assert!(MISSION_ACTION_NAMES.iter().all(|name| is_mission_action_name(name)));
+        assert!(
+            MISSION_ACTION_NAMES
+                .iter()
+                .all(|name| is_mission_action_name(name))
+        );
         assert!(!is_mission_action_name("mission_createx"));
         assert!(!is_mission_action_name("tool_info"));
     }
@@ -4921,7 +4925,9 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                     assert!(
                         matches!(
                             *resume_kind,
-                            lunarwing_engine::ResumeKind::Approval { allow_always: false }
+                            lunarwing_engine::ResumeKind::Approval {
+                                allow_always: false
+                            }
                         ),
                         "mission gates must not offer an always-grant that cannot persist"
                     );
