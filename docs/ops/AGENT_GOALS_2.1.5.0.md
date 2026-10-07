@@ -7,6 +7,8 @@
 ~~Old parity~~
 ~~Rares = odd (1, 3, 5, 7, ...)~~
 ~~AJ = even (2, 4, 6, 8, ...)~~
+### mod-3 lanes (2026-10-04): Rares = 1 mod 3, AJ = 2 mod 3, Sweetiebot = 0 mod 3
+
 
 #### Please check off item before the final commit/push. You may add a note to the item to say if it was completed 100%, failed, or other kind of status
 #### DONE-trail convention: record evidence as indented sub-bullets under the item — never inline on the checkbox line.
