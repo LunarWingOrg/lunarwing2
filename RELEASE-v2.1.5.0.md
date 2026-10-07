@@ -571,18 +571,25 @@ inbound links repaired and a per-file archive index.
    and Pebble `2d0f3786…` are unchanged and need no rebuild unless your pins
    drifted.
 5. **Choose tenant settings.** New multi-tenant tenants render
-   `ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=6` (a ceiling, not a default budget)
-   and `SANDBOX_TENANT_LOGS=info`; both are preserved on re-render and not
-   added to existing tenants by upgrade paths. Set `SANDBOX_TENANT_LOGS=off`
+   `ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=6` (a ceiling, not a default budget),
+   `ENGINE_V2_MAX_OUTPUT_TOKENS=8192`, and `SANDBOX_TENANT_LOGS=info`; all
+   are preserved on re-render and not added to existing tenants by upgrade
+   paths. Set `SANDBOX_TENANT_LOGS=off`
    to disable the `/tenant-logs` mount, or `debug` with a raised log level
    for per-tool-call lines.
 6. **Apply the updated tool contracts.** In Engine V2 threads use
    `mission_*` tools (the v1 `routine_*` tools redirect with call shapes);
    use `mission_list`/`mission_history` for listings. Recover parked
    recurring missions with owner-authorized `mission_resume` — none are
-   revived automatically. Expect `memory_write` injection rejections to
+   revived automatically, and rule out a pre-2026-07-26 legacy delete
+   (recorded as `Completed`) before resuming. Expect `mission_create` on an
+   existing mission to answer `"status": "existing"` without re-applying a
+   requested daily budget (use `mission_update` for that). Expect
+   `memory_write` injection rejections to
    name the matched patterns; rephrase, or use the single-line ≤200-byte
-   inline-quote route for daily logs. Raise a routine's budget with
+   inline-quote route for daily logs. `memory_write(target:"daily_log",
+   append:false)` is now a real replace — the repair path for a quarantined
+   log. Raise a routine's budget with
    `routine_update` (v1 chats) or
    `lunarwing routines edit --name <routine> --max-tool-rounds <n>` on the
    host. Note that `max_tool_rounds: N` now buys N tool rounds plus one
@@ -591,22 +598,29 @@ inbound links repaired and a per-file archive index.
 7. **Expect honest failures after interrupted restarts.** Boot recovery now
    fails `Waiting` threads orphaned by a quarantined pending-gates file
    (inspect `pending-gates.json.corrupt-<ts>`), records restart-lost mission
-   fires for owner review instead of replaying them, and persists stopped
-   threads as `Failed`/`Cancelled` rather than leaving them limbo.
+   fires for owner review instead of replaying them, re-arms retries for
+   fires interrupted by a graceful shutdown (one boot-time notice), and
+   persists stopped threads as `Failed`/`Cancelled` rather than leaving
+   them limbo. Oversized pre-upgrade conversation surfaces are trimmed to
+   the new 400-entry/96 KB bound automatically by the first write after the
+   upgrade; daily-log shadow backups under `backups/` appear from the first
+   write on, with the first generation pinned at the eight-generation cap.
 
 ### Security, Deployment, and Release Limitations
 
-**Carried known issues.** The daily-log gate follow-up work (WI#288) and
-the mission graceful-shutdown retry seam (WI#276) remain open with merge
-requests in flight and are not in this release. The opencode2 executor
-correction shipped with the v2.0.23 bump (WI#303) is source-verified but not
-yet runtime-verified against a live v2.0.23 server — a green
-`worker-opencode2-candidate` build and a smoke test on the first protected
-pipeline are the remaining evidence before promotion (see
+**Carried known issues.** The daily-log gate follow-up (WI#288) and the
+mission graceful-shutdown retry seam (WI#276) — carried from v2.1.3.0 —
+both land in this release. Still open: WI#308 (the security-labeled WI#295
+residual on mission tool surface) has no fix in this release, and the
+opencode2 executor corrections shipped with the v2.0.23 bump (WI#303) are
+source-verified and runtime-verified host-side (local podman build smoke,
+2026-10-06) but still need a green `worker-opencode2-candidate` build on the
+first protected pipeline before image promotion (see
 `docs/ops/WORKER-CONTAINERS.md`). See
 [the open-items audit](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md) — a
 point-in-time snapshot dated 2026-10-04, with the #303 entry updated
-2026-10-06 — for the disposition table, including items deferred to v2.1.6.0
+2026-10-06 (a full audit repass is pending) — for the disposition table,
+including items deferred to v2.1.6.0
 and v2.1.8.0.
 
 **Accepted advisories.** Eight vulnerability advisories and one
