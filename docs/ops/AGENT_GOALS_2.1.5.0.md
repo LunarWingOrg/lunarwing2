@@ -236,7 +236,7 @@
 36. [x] (S) RESERVED4WIs
 37. [x] (S) ipv6
 38. [x] (S) HRDR
-39. [ ] repass of goal number 25
+39. [ ] repass of goal number 25 - last attempt was rejected and the state has been updated anyway so needs retry: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1469
 40. [x] (S) RESERVED4NVMES
 41. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/303 - REJECTED - see previous attempt's closed MR (which has comments on what needs to be changed for a re-attempt): https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1438
    - DONE (2026-10-06, branch `aj/kimi-41-20261006-0601`): opencode2 worker bumped v2.0.21 -> v2.0.23 (tag SHA `0fd7e2829449b052abf0078666669302923d77af`, verified live via `git ls-remote`) on every pin surface — Dockerfile ARG pair, `build-worker-image.sh` opencode2 case block (`source_ref` + both build args), lane AGENTS.md/README, `prepare_reproducible_build_test.py` fixture, CONTRIBUTOR-ONBOARDING, WORKER-CONTAINERS, RELEASE-v2.1.5.0, and the open-items audit's #303 entry.
