@@ -2,7 +2,7 @@
 
 ## Codename: Bungei Fukkō (文芸復興): The Renaissance
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-05)
+**Release date:** 2026-10-XX (not yet released; first draft 2026-10-05, repass 2026-10-07)
 
 > Ink long dried wakes;  
 > old letters learn new light —  
@@ -29,9 +29,17 @@ configuration. Mission tooling gains real discovery (`tool_info` for engine
 capabilities), truthful resume leases across restarts, and a completion
 contract that no longer accepts a run's self-declared success at face value.
 
-Workspace memory writes return actionable rejection errors, the safety
-sanitizer's detect-versus-neutralize contract is documented and pinned, and
-tenants gain a read-only, secret-scrubbed `/tenant-logs` view of the daemon
+Workspace memory writes return actionable rejection errors, and the daily
+log gains real evidence retention: scope-aware shadow backups, capped
+generations that pin the first, and quarantine artifacts reserved from tool
+writes. Mission fires interrupted by a graceful shutdown are recorded and
+retried at boot instead of being lost with a stuck dedup key, and
+`mission_create` dedup hits are self-describing. Long-lived conversations no
+longer grow every later turn's prompt without ceiling, and Engine V2's
+output budget is configurable with one automatic retry at twice the budget
+before a truncation goes terminal. The safety sanitizer's
+detect-versus-neutralize contract is documented and pinned, and tenants
+gain a read-only, secret-scrubbed `/tenant-logs` view of the daemon
 log. Secrets deletion gains non-bypassable per-call approval with a V28
 grant-cleanup migration. The cycle closes with the usual dependency sweep
 (2.1.4 → 2.1.5 across all owned packages, refreshed registry versions,
@@ -67,10 +75,25 @@ previous compatibility baseline.
   `callable`; restart resume re-grants mission action leases from the
   canonical definitions; and non-manual missions no longer auto-complete on
   a run's goal-achieved declaration — parked recurring missions recover via
-  owner-authorized `mission_resume`.
+  owner-authorized `mission_resume`. `mission_create` dedup hits are now
+  self-describing (`"status": "existing"`, no silent re-budget) and the
+  daily-thread counter travels with its date.
+- **Shutdown-interrupted mission fires are retried (WI#276).** A fire whose
+  thread is stopped by a graceful shutdown is recorded, its dedup key
+  released, and its retry re-armed at boot with one truthful owner notice —
+  even when the stop outlasts the settle grace.
 - **Actionable memory-write rejections (WI#290).** Injection rejections
   carry matched-pattern descriptions, rephrase guidance, and a narrowly
   scoped inline-quote route; the API answers 422/409 instead of 500.
+- **Daily-log evidence retention (WI#288).** `memory_write` on the daily
+  log honors `append:false` as a real replace; writes keep scope-aware
+  shadow backups with a generation cap that pins the first generation;
+  quarantined logs and `backups/` are reserved from tool and web writes.
+- **Bounded conversation surface and output budget.** Foreground threads no
+  longer inherit unbounded history (400 entries / ~24k tokens, FIFO), and
+  `ENGINE_V2_MAX_OUTPUT_TOKENS` (default 8192) sets the per-call output
+  budget with one automatic retry at twice the budget on a length-empty
+  stream.
 - **Real lightweight-routine budgets (WI#291).** `max_tool_rounds: N` buys N
   tool rounds plus one text-only reply; the decorative nominal limit of 20
   is replaced by a single hard limit of 10, and new multi-tenant tenants get
