@@ -515,18 +515,31 @@ SHA `0fd7e2829449b052abf0078666669302923d77af` verified live). The bump also
 corrects the executor's canonical-output and permission-reply call paths for
 the v2 promise client (WI#320 finding F7: `session.message.list` and
 `session.permission.reply` never existed — both are top-level client groups),
-and the image build now asserts every method path the bridge calls. The
-correction is source-verified (executor self-test plus construction of the
-pinned client); runtime re-verification against a live v2.0.23 server awaits
-the candidate image build on the first protected pipeline (see
-`docs/ops/WORKER-CONTAINERS.md`). Other worker pins are unchanged from
-v2.1.4.0.
+and the image build now asserts every method path the bridge calls. Two
+further lane fixes landed on top: the executor now pages `message.list` per
+the server contract (WI#329 — the v2.0.23 server rejects a cursor request
+that also carries `order`, which had silently discarded the fetched first
+page), and the entrypoint exports `OPENCODE_CONFIG` with the bundled
+openai-compatible provider package so the lane config (TensorZero provider,
+model, `configure-opencode2` overrides) is actually loaded instead of
+falling back to opencode.ai. The corrections are source-verified (executor
+self-test against the real client shape, construction of the pinned client
+at image build) **and** runtime-verified host-side on 2026-10-06 (local
+podman build of the lane at v2.0.23, smoke inside the image against a live
+`opencode serve` with a loopback fake model); the remaining promotion gate
+is a green `worker-opencode2-candidate` build on the first protected
+pipeline (see `docs/ops/WORKER-CONTAINERS.md`). Other worker pins are
+unchanged from v2.1.4.0.
 
 ### Documentation and Repository Maintenance
 
 All 32 active guides were re-validated against the v2.1.5.0 tree and carry
 a 2026-10-04 revalidation stamp; contributor onboarding's freeze notice now
-names the work items still open at release time. Operator references, the
+names the work items still open at release time. All 11 architecture
+documents were re-validated on 2026-10-06, correcting the stale V27-latest
+migration claim and the removed kimi SSH-socket lane, with ENGINE-V2
+carrying this cycle's recovery, gate, mission, and output-budget semantics.
+Operator references, the
 testing guide, release indexes, and the CI README were synchronized with
 the cargo-deny gate changes, the WI#299 quarantine behavior, and the WI#291
 budget semantics. An audit of all 25 open tracker items with per-item
