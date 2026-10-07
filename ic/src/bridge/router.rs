@@ -454,6 +454,14 @@ async fn persist_and_notify_thread_gate(
 
     let redacted_params = if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
         crate::tools::redact_params(&parameters, tool.sensitive_params())
+    } else if crate::bridge::effect_adapter::is_mission_action_name(&action_name) {
+        // Capability actions (WI#308 mission gates) have no registry tool to
+        // supply sensitive_params; a mission approval prompt must not display
+        // the webhook_secret it carries for execution.
+        crate::tools::redact_params(
+            &parameters,
+            crate::bridge::effect_adapter::MISSION_SENSITIVE_PARAMS,
+        )
     } else {
         parameters.clone()
     };
