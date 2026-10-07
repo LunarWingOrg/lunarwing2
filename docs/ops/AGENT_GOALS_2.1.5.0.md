@@ -220,7 +220,11 @@
     - CI job 96673 failed `e2e_builtin_tool_coverage::job_create_status`: the real scheduled worker could consume the foreground trace's next response. The test now isolates the worker's pending completion and forces the worker-first interleaving before advancing the foreground replay. It retains scheduler dispatch, both successful tool calls, UUID forwarding, and in-progress-status assertions; no assertion was weakened.
     - Verified locally: 96 targeted daemon tests; all 16 tests in the formerly failing libSQL integration target; 14 engine tier/planner tests; 1 live PostgreSQL migration test. All-feature daemon/engine Clippy (`--lib --tests -- -D warnings`), formatting, CI-config validation and diff checks passed. Remote CI has not been rerun for this re-attempt
 33. [x] (S) Reserved
-34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/319
+34. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/319
+   - DONE (2026-10-07, branch `rarity/kimi-34-20261007-0600`): duplicate assignment of WI#319 — the work was already completed under item 46 and is fully present on this branch; this pass re-verified it end to end.
+   - Landed commits (all ancestors of HEAD): `c48f855e6` (fix — `report_parked_recurring_missions` in `ic/crates/lunarwing_engine/src/runtime/mission.rs` carries the pre-2026-07-26 `mission_delete`-as-`Completed` legacy-delete caveat plus the mission's `created_at`/`updated_at` in the boot warning and notification), `5e336736d` (docs — `docs/architecture/ENGINE-V2.md` recovery section + `docs/ops/v2.1.5.0_GOAL42_MISSION_DIAGNOSTICS.md` recovery step), `38d7f90a5` (item-46 goals checkoff). Item 42's AH-4 later refined the clue wording to `updated_at` (with the restart-recorder re-stamp caveat), also present.
+   - WI#319 tracker state checked 2026-10-07: still open, no human review comments — only system mention notes (commits `faa169b35`/`fe98b207c`, MRs !1436/!1439/!1455, all incidental docs/audit mentions). No outstanding feedback to heed. Per convention it stays open for a maintainer to close after merge.
+   - Re-verified on this branch: `cargo test -p lunarwing_engine --lib runtime::mission::` — 149 passed / 0 failed, including `bootstrap_warns_owner_about_parked_recurring_missions_without_reviving` which pins the 2026-07-26 caveat and the created/updated timestamps in the guidance text. Guidance-only change per the work item; no behavior/suppression change.
 35. [x] (S) RESERVED4WIs
 36. [x] (S) RESERVED4WIs
 37. [x] (S) ipv6
