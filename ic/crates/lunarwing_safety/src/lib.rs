@@ -62,20 +62,36 @@ impl SafetyLayer {
         // token escaping). Content past the cut never reaches the LLM.
         let (mut content, mut warnings, mut was_modified) =
             if output.len() > self.config.max_output_length {
-                // Find a safe truncation point on a char boundary
-                let mut cut = self.config.max_output_length;
-                while cut > 0 && !output.is_char_boundary(cut) {
-                    cut -= 1;
+                // Keep head AND tail, eliding the middle (WI#349): list-tool
+                // envelopes (e.g. the GitLab guest) serialize
+                // pagination/completion metadata (next_cursor, truncated,
+                // complete, resume_page) at the very tail, and a head-only
+                // cut amputated it before the engine's own head+tail
+                // bounding ever ran — the model then improvised cursors
+                // (WI#344 GitLab 500s). The notice always separates the
+                // halves. Both cut points walk to char boundaries, and the
+                // shown payload stays within max_output_length, so the scan
+                // pipeline below remains bounded as before.
+                let half = self.config.max_output_length / 2;
+                let mut head_end = half;
+                while head_end > 0 && !output.is_char_boundary(head_end) {
+                    head_end -= 1;
                 }
-                let truncated = &output[..cut];
+                // len > max >= max - half, so tail_start > head_end: no overlap.
+                let mut tail_start = output.len() - (self.config.max_output_length - half);
+                while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+                    tail_start += 1;
+                }
+                let shown = head_end + (output.len() - tail_start);
                 let notice = format!(
-                    "\n\n[... truncated: showing {}/{} bytes. Use the json tool with \
-                     source_tool_call_id to query the full output.]",
-                    cut,
-                    output.len()
+                    "\n\n[... truncated: showing {}/{} bytes (head and tail, {} middle bytes \
+                     elided). Use the json tool with source_tool_call_id to query the full output.]",
+                    shown,
+                    output.len(),
+                    tail_start - head_end
                 );
                 (
-                    format!("{}{}", truncated, notice),
+                    format!("{}{}{}", &output[..head_end], notice, &output[tail_start..]),
                     vec![InjectionWarning {
                         pattern: "output_too_large".to_string(),
                         severity: Severity::Low,
@@ -532,6 +548,47 @@ mod tests {
         }
     }
 
+    /// WI#349: the size cut keeps head AND tail — list-tool envelopes carry
+    /// pagination metadata (next_cursor/truncated/complete/resume_page) at
+    /// the very tail, and the earlier head-only cut amputated it before the
+    /// engine's own head+tail bounding ever ran (WI#344 cursor 500s).
+    #[test]
+    fn test_sanitize_tool_output_oversized_keeps_pagination_tail() {
+        let config = SafetyConfig {
+            max_output_length: 1_000,
+            injection_check_enabled: true,
+        };
+        let safety = SafetyLayer::new(&config);
+
+        let tail = r#""pagination":{"next_cursor":"CURSOR-789","truncated":true,"complete":false}}"#;
+        let payload = format!("{{\"items\":[\"{}\"],{}", "x".repeat(5_000), tail);
+        let result = safety.sanitize_tool_output("gitlab", &payload);
+
+        assert!(result.was_modified);
+        assert!(
+            result.content.starts_with("{\"items\":"),
+            "head lost: {}",
+            &result.content[..100.min(result.content.len())]
+        );
+        assert!(
+            result.content.ends_with(tail),
+            "pagination tail lost: {}",
+            &result.content[result.content.len().saturating_sub(300)..]
+        );
+        assert!(result.content.contains("middle bytes elided"));
+        // Exact shown/elided counts (all-ASCII payload: no boundary walks).
+        let expected_notice = format!(
+            "truncated: showing 1000/{} bytes (head and tail, {} middle bytes elided)",
+            payload.len(),
+            payload.len() - 1000
+        );
+        assert!(
+            result.content.contains(&expected_notice),
+            "notice mismatch: {}",
+            result.content
+        );
+    }
+
     /// Work item #75: oversized output must still pass through injection
     /// scanning and leak detection — previously the truncation branch
     /// early-returned before any scanning ran.
@@ -781,14 +838,15 @@ mod tests {
 
         #[test]
         fn exact_boundary_does_not_corrupt() {
-            // max_output_length exactly at a char boundary
-            let input = "ab🔑cd";
-            // 'a'=1, 'b'=2, '🔑'=6, 'c'=7, 'd'=8
-            let safety = safety_with_max_len(6);
-            let result = safety.sanitize_tool_output("test", input);
+            // Head cut lands exactly on a char boundary: 'a'=1, 'b'=2, '🔑'=6,
+            // then 100 x 'c'. max=12 → head half = 6, exactly after '🔑' (no
+            // boundary walk), tail half = 6 x 'c'.
+            let input = format!("ab🔑{}", "c".repeat(100));
+            let safety = safety_with_max_len(12);
+            let result = safety.sanitize_tool_output("test", &input);
             assert!(result.was_modified);
-            // Cut at byte 6 is exactly after '🔑' — valid boundary
             assert!(result.content.contains("ab🔑"));
+            assert!(result.content.ends_with("cccccc"));
         }
     }
 }
