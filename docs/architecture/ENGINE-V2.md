@@ -953,6 +953,11 @@ channels by design — the shared-conversation, non-Foreground-`Always` and
 needs-prompt gates stay off, and the pre-flight auth gate is a no-op for
 capability actions, which hold no credential registrations. The coordination
 gate (a disabled agent executes nothing) applies to mission calls as before.
+One related seam remains by design: the structured-tier policy preflight
+(`executor/structured.rs`) evaluates policy from `available_actions`, which
+stays registry-only so the model-visible catalog does not duplicate the
+verbs — a policy `Deny` for the `missions` capability would be consulted at
+lease grant, not per call.
 
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
