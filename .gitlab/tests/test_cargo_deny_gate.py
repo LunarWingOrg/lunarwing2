@@ -6,10 +6,18 @@ the yanked = "deny" policy degraded to per-crate warning[index-failure] and
 the job still exited 0 — pipeline 4811's trace even lost its verdict to the
 4 MB log cap those diagnostics caused. These tests pin the unvendored
 wrapper contract so the gate cannot silently regress.
+
+CargoDenyRetryTests pin the pipeline #5294 hardening: transient network
+diagnostics (index-failure storms from a shared runner egress IP, or a
+failed advisory-db fetch) are retried, a run is accepted only when it
+completes with zero index-failure diagnostics, and a run that reached a
+real audit verdict (error[...]) is never retried.
 """
 
 import importlib.util
+import os
 import pathlib
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -80,6 +88,129 @@ class CargoDenyGateTests(unittest.TestCase):
 
 
 SWEEP = ROOT / ".gitlab/scripts/check-satellite-advisories.sh"
+
+
+class CargoDenyRetryTests(unittest.TestCase):
+    """Pipeline #5294 hardening: the wrapper retries transient network
+    diagnostics but never weakens the yanked/advisory verdicts.
+
+    The wrapper is executed for real against PATH stubs: git/taskset/timeout
+    passthroughs and a cargo-deny stub whose per-attempt behavior is scripted
+    through a modes file (one line per attempt).
+    """
+
+    CARGO_DENY_STUB = """#!/bin/sh
+state_dir=$STUB_STATE
+count_file="$state_dir/count"
+n=1
+if [ -f "$count_file" ]; then
+    n=$(( $(cat "$count_file") + 1 ))
+fi
+printf '%s\\n' "$n" > "$count_file"
+behavior=$(sed -n "${n}p" "$state_dir/modes")
+case "$behavior" in
+    ok)
+        echo "advisories ok, bans ok, licenses ok, sources ok"
+        exit 0
+        ;;
+    indexfail)
+        echo "warning[index-failure]: could not reach index.crates.io"
+        echo "advisories ok, bans ok, licenses ok, sources ok"
+        exit 0
+        ;;
+    advisory)
+        echo "error[vulnerability]: RUSTSEC-0000-0000 test vulnerability"
+        exit 1
+        ;;
+    fetchfail)
+        echo "ERROR: unable to fetch advisory database"
+        exit 1
+        ;;
+    *)
+        echo "unexpected stub behavior on attempt $n" >&2
+        exit 2
+        ;;
+esac
+"""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = pathlib.Path(temporary.name)
+        self.fake_root = self.base / "repo"
+        self.fake_root.mkdir()
+        self.stub_bin = self.base / "bin"
+        self.stub_bin.mkdir()
+        self.state = self.base / "state"
+        self.state.mkdir()
+        self._stub(
+            "git",
+            '#!/bin/sh\nif [ "$1" = "rev-parse" ]; then printf "%s\\n" "$FAKE_ROOT"; fi\nexit 0\n',
+        )
+        self._stub("taskset", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self._stub("timeout", '#!/bin/sh\nshift\nexec "$@"\n')
+        self._stub("cargo-deny", self.CARGO_DENY_STUB)
+
+    def _stub(self, name, text):
+        path = self.stub_bin / name
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o755)
+
+    def run_wrapper(self, modes):
+        (self.state / "count").write_text("0\n", encoding="utf-8")
+        (self.state / "modes").write_text("\n".join(modes) + "\n", encoding="utf-8")
+        env = dict(os.environ)
+        env.update(
+            {
+                "PATH": f"{self.stub_bin}:{os.environ['PATH']}",
+                "FAKE_ROOT": str(self.fake_root),
+                "STUB_STATE": str(self.state),
+                # No advisory-dbs here, so the wrapper skips its db-commit line.
+                "CARGO_HOME": str(self.base / "cargo"),
+            }
+        )
+        return subprocess.run(
+            ["bash", str(WRAPPER)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    def attempts(self):
+        return int((self.state / "count").read_text(encoding="utf-8"))
+
+    def test_transient_index_failure_then_clean_run_is_accepted(self):
+        result = self.run_wrapper(["indexfail", "ok"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("was inconclusive", result.stderr)
+        self.assertIn("advisories ok", result.stdout)
+        self.assertEqual(self.attempts(), 2)
+
+    def test_persistent_index_failure_still_fails(self):
+        result = self.run_wrapper(["indexfail", "indexfail", "indexfail"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("yanked-crate check was skipped", result.stderr)
+        self.assertEqual(self.attempts(), 3)
+
+    def test_real_verdict_is_never_retried(self):
+        result = self.run_wrapper(["advisory"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("error[vulnerability]", result.stdout)
+        self.assertNotIn("was inconclusive", result.stderr)
+        self.assertEqual(self.attempts(), 1)
+
+    def test_fetch_failure_then_clean_run_is_accepted(self):
+        result = self.run_wrapper(["fetchfail", "ok"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("was inconclusive", result.stderr)
+        self.assertEqual(self.attempts(), 2)
+
+    def test_clean_run_needs_no_retry(self):
+        result = self.run_wrapper(["ok"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("was inconclusive", result.stderr)
+        self.assertEqual(self.attempts(), 1)
 
 
 class SatelliteAdvisorySweepTests(unittest.TestCase):

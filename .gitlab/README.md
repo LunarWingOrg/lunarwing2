@@ -262,6 +262,17 @@ candidate job — the scan can only succeed after a candidate publishes
   verdict. The wrapper hides inclusion graphs and fails the job on any
   `index-failure` diagnostic, so the gate can never be silently skipped;
   `validate_config.py` rejects a cargo-deny job that bypasses it.
+- The cargo-deny wrapper and installer tolerate transient runner egress
+  flakes (pipeline #5294's cargo-deny job went red on a tree identical to
+  the green MR pipeline minutes earlier). `install-cargo-deny.sh` retries
+  the checksum-pinned GitHub release download three times (5s/10s backoff,
+  checksum verified outside the retry loop), and `cargo-deny-check.sh`
+  retries the audit up to three times with a 600s `timeout` per attempt —
+  but accepts only a completed run with zero `index-failure` diagnostics,
+  and never retries a run that reached a real verdict (`error[...]`), so
+  the yanked and advisory gates keep their semantics. The retry contract
+  is pinned by hermetic stubbed tests in
+  `.gitlab/tests/test_cargo_deny_gate.py` (`CargoDenyRetryTests`).
 - The cargo-deny gate queries `--workspace --all-features` (a superset of
   every CI compile graph — the `--workspace` lib-test job plus the
   root-package `--all-features` check/clippy jobs — including the vendored
