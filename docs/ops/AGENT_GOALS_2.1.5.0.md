@@ -226,7 +226,7 @@
 33. [x] (S) Reserved
 34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/319 - last attempt has some issues that needs to be addressed (seet comments of MR) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1463
 35. [x] (S) RESERVED4WIs
-36. [x] (S) RESERVED4WIs
+36. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/349
 37. [x] (S) ipv6
 38. [x] (S) HRDR
 39. [ ] repass of goal number 25 - last attempt was rejected and the state has been updated anyway so needs retry: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1469
