@@ -3102,8 +3102,14 @@ mod tests {
         assert!(eval_python_bool(&format!(
             r#""CURSOR-789" in format_action_output({envelope})"#
         )));
+        // JSON-key form: the bare word "truncated" also appears in the
+        // elision marker itself, so only the keyed form pins the tail.
         assert!(eval_python_bool(&format!(
-            r#""truncated" in format_action_output({envelope}) and "complete" in format_action_output({envelope})"#
+            r#""\"truncated\": True" in format_action_output({envelope}) and "\"complete\": False" in format_action_output({envelope})"#
+        )));
+        // The tail is a true suffix of the original envelope.
+        assert!(eval_python_bool(&format!(
+            r#"format_action_output({envelope}).endswith("\"complete\": False}}}}")"#
         )));
         assert!(eval_python_bool(&format!(
             r#"format_action_output({envelope}).startswith('{{"items":')"#
@@ -3111,9 +3117,15 @@ mod tests {
         assert!(eval_python_bool(&format!(
             r#""middle chars elided" in format_action_output({envelope})"#
         )));
-        // Head-only content still keeps its head.
+        // Head-only content keeps head AND tail, with the exact elided count.
         assert!(eval_python_bool(
             r#"format_action_output("x" * 9000).startswith("x" * 100)"#
+        ));
+        assert!(eval_python_bool(
+            r#"format_action_output("x" * 9000).endswith("x" * 100)"#
+        ));
+        assert!(eval_python_bool(
+            r#""1059 middle chars elided" in format_action_output("x" * 9000)"#
         ));
         // Already-bounded output passes through unchanged (idempotent).
         assert!(eval_python_bool(&format!(
@@ -3128,11 +3140,21 @@ mod tests {
     #[test]
     fn persisted_action_output_sanitize_preserves_pagination_tail() {
         // WI#349: the history-repair path (sanitize_action_results) goes
-        // through the same head+tail bound, so persisted oversized results
-        // also keep their pagination tail on the next sanitize pass.
+        // through the same head+tail bound, so a persisted RAW oversized
+        // result keeps its pagination tail on the next sanitize pass.
         let envelope = r#"'{"items": ["' + "x" * 9000 + '"], "pagination": {"next_cursor": "CURSOR-789", "truncated": True, "complete": False}}'"#;
+        let sanitized = format!(
+            r#"sanitize_action_results([{{"role": "ActionResult", "content": {envelope}}}])[0]["content"]"#
+        );
+        assert!(eval_python_bool(&format!(r#""CURSOR-789" in {sanitized}"#)));
         assert!(eval_python_bool(&format!(
-            r#""CURSOR-789" in sanitize_action_results([{{"role": "ActionResult", "content": format_action_output({envelope}) + "y" * 100}}])[0]["content"]"#
+            r#""middle chars elided" in {sanitized}"#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#"len({sanitized}) == MAX_ACTION_OUTPUT_CHARS"#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#"{sanitized}.endswith("\"complete\": False}}}}")"#
         )));
     }
 
