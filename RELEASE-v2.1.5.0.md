@@ -179,7 +179,8 @@ guidance: `ContentFiltered` (the provider refused; rephrase or switch
 models) and `OutputBudgetExhausted` (the model spent its entire output
 budget; raise the output token limit). The bridge maps
 `EmptyStream{ContentFilter|Length}` to these instead of a generic rejected
-request.
+request — for the length case only after one automatic retry at twice the
+budget, see the output-budget section below.
 
 `LlmError::EmptyStream` now carries the token usage intercepted from the
 `Done`-first chunk. Retry and failover sum discarded empty-attempt usage and
@@ -211,6 +212,35 @@ by the per-kind policy cap (2) and the lifetime
 `ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS`), and
 `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=0` still disables engine recovery
 entirely.
+
+### Bounded Conversation Surface and Configurable Output Budget
+
+Two prompt-size failures observed on real tenants are fixed. First, every
+new foreground thread was seeded with the conversation's whole prior
+history, so a long-lived conversation grew every later turn's prompt with
+no ceiling (63k–77k input tokens per call on the maintainer's tenant, where
+the hosted models collapse into empty streams and repetition). The
+conversation surface now evicts its oldest entries FIFO past 400 entries or
+96,000 bytes (roughly 24k tokens), always keeping the newest entry; the
+bound is durable on the next save, an oversized pre-upgrade surface is
+trimmed automatically by the first write after the upgrade, and thread
+messages, steps, and events are unaffected.
+
+Second, Engine V2 sent every model request with a fixed `max_tokens` of
+4096, and WI#297 turned a length-empty stream into a terminal
+output-budget failure with zero recovery — a thinking model that spent its
+budget on reasoning ended the turn where it used to be nudged and retried.
+`ENGINE_V2_MAX_OUTPUT_TOKENS` (default 8192, floor 256, resolved through the
+WI#310 runtime env overlay) now sets the per-call output budget; an explicit
+`max_tokens` in the orchestrator's call config still wins. The bridge
+adapter retries a length-empty stream **once at twice the budget** on both
+call shapes before the failure kind reaches the engine — a successful retry
+is reported as the existing `Retried` observation carrying the first
+attempt's billed usage (the WI#297 accounting), and a second exhaustion is
+still terminal. A reply truncated after producing visible text is still
+delivered, and the adapter now warn-logs that truncation instead of leaving
+no trace. mt-admin renders `ENGINE_V2_MAX_OUTPUT_TOKENS=8192` for new
+tenants.
 
 ### Mission Capability Discovery and Resume Leases (WI#295, WI#309)
 
