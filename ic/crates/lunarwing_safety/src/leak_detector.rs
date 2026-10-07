@@ -502,14 +502,15 @@ pub(crate) fn default_patterns() -> Vec<LeakPattern> {
         // PEM private keys
         LeakPattern {
             name: "pem_private_key".to_string(),
-            regex: Regex::new(r"-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----").unwrap(), // safety: hardcoded literal
+            regex: Regex::new(r"-----(?:BEGIN|END)\s+(?:RSA\s+)?PRIVATE\s+KEY-----").unwrap(), // safety: hardcoded literal
             severity: LeakSeverity::Critical,
             action: LeakAction::Block,
         },
         // SSH private keys
         LeakPattern {
             name: "ssh_private_key".to_string(),
-            regex: Regex::new(r"-----BEGIN\s+(?:OPENSSH|EC|DSA)\s+PRIVATE\s+KEY-----").unwrap(), // safety: hardcoded literal
+            regex: Regex::new(r"-----(?:BEGIN|END)\s+(?:OPENSSH|EC|DSA)\s+PRIVATE\s+KEY-----")
+                .unwrap(), // safety: hardcoded literal
             severity: LeakSeverity::Critical,
             action: LeakAction::Block,
         },

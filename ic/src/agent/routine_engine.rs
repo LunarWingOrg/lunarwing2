@@ -3218,7 +3218,7 @@ mod tests {
         // moves the head cut AND ceil moves the tail cut — the 8192 case
         // only exercises floor.
         let odd = super::truncate_tool_output_middle(&"é".repeat(9000), 8191);
-        assert!(odd.len() <= 8191, "bounded: {}", odd.len());
+        assert_eq!(odd.len(), 8189);
         assert!(odd.ends_with('é'));
         assert!(odd.contains("middle elided"));
     }

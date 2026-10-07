@@ -52,6 +52,42 @@ impl SafetyLayer {
         }
     }
 
+    /// Move a cut outward across detected secrets and token-like runs. Scan a
+    /// fixed window once per cut, then reach a fixpoint over those matches.
+    /// If the window cannot establish a safe boundary, discard that retained
+    /// side rather than expose an unrecognized suffix. Work stays bounded.
+    fn secret_safe_cut(&self, output: &str, mut cut: usize, tail: bool) -> usize {
+        const WINDOW: usize = 1024;
+        let start = output.ceil_char_boundary(cut.saturating_sub(WINDOW));
+        let end = output.floor_char_boundary(cut.saturating_add(WINDOW).min(output.len()));
+        let matches = self.leak_detector.scan(&output[start..end]).matches;
+        let bytes = output.as_bytes();
+        let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.-".contains(&b);
+        loop {
+            let previous = cut;
+            for found in &matches {
+                let left = start + found.location.start;
+                let right = start + found.location.end;
+                if left < cut && cut < right {
+                    cut = if tail { right } else { left };
+                }
+            }
+            while cut > start && cut < end && token(bytes[cut - 1]) && token(bytes[cut]) {
+                if tail {
+                    cut += 1;
+                } else {
+                    cut -= 1;
+                }
+            }
+            if (tail && cut == end && end < output.len()) || (!tail && cut == start && start > 0) {
+                return if tail { output.len() } else { 0 };
+            }
+            if cut == previous {
+                return cut;
+            }
+        }
+    }
+
     /// Sanitize tool output before it reaches the LLM.
     pub fn sanitize_tool_output(&self, tool_name: &str, output: &str) -> SanitizedOutput {
         // Length limiting happens FIRST so the scan pipeline below is bounded
@@ -59,7 +95,7 @@ impl SafetyLayer {
         // leak detection, policy enforcement, and injection scanning (work
         // item #75: a "wall of text" result previously early-returned here,
         // skipping every check below, including secret redaction and role
-        // token escaping). Content past the cut never reaches the LLM.
+        // token escaping). The elided middle never reaches the LLM.
         let (mut content, mut warnings, mut was_modified) = if output.len()
             > self.config.max_output_length
         {
@@ -78,11 +114,13 @@ impl SafetyLayer {
             while head_end > 0 && !output.is_char_boundary(head_end) {
                 head_end -= 1;
             }
-            // len > max >= max - half, so tail_start > head_end: no overlap.
+            // tail_start >= len - ceil(max/2) > half >= head_end: no overlap.
             let mut tail_start = output.len() - (self.config.max_output_length - half);
             while tail_start < output.len() && !output.is_char_boundary(tail_start) {
                 tail_start += 1;
             }
+            head_end = self.secret_safe_cut(output, head_end, false);
+            tail_start = self.secret_safe_cut(output, tail_start, true);
             let shown = head_end + (output.len() - tail_start);
             let notice = format!(
                 "\n\n[... truncated: showing {}/{} bytes (head and tail, {} middle bytes \
@@ -578,11 +616,12 @@ mod tests {
             &result.content[result.content.len().saturating_sub(300)..]
         );
         assert!(result.content.contains("middle bytes elided"));
-        // Exact shown/elided counts (all-ASCII payload: no boundary walks).
+        // Both cuts snap outward to the ends of the 5000-byte token-like run.
+        // The structural prefix and pagination suffix still survive.
         let expected_notice = format!(
-            "truncated: showing 1000/{} bytes (head and tail, {} middle bytes elided)",
+            "truncated: showing {}/{} bytes (head and tail, 5000 middle bytes elided)",
+            payload.len() - 5000,
             payload.len(),
-            payload.len() - 1000
         );
         assert!(
             result.content.contains(&expected_notice),
@@ -771,14 +810,13 @@ mod tests {
 
         #[test]
         fn truncate_in_middle_of_4byte_emoji() {
-            // 🔑 is 4 bytes (F0 9F 94 91). Place max_output_length to land
-            // in the middle of this emoji (e.g. at byte offset 2 into the emoji).
+            // Half of the 8-byte budget lands at byte 4, inside the emoji.
             let prefix = "aa"; // 2 bytes
             let input = format!("{prefix}🔑bbbb");
-            // max_output_length = 4 → lands at byte 4, which is in the middle
+            // head budget = 4 → lands at byte 4, which is in the middle
             // of the emoji (bytes 2..6). is_char_boundary(4) is false,
             // so truncation backs up to byte 2.
-            let safety = safety_with_max_len(4);
+            let safety = safety_with_max_len(8);
             let result = safety.sanitize_tool_output("test", &input);
             assert!(result.was_modified);
             // Content should NOT contain invalid UTF-8 — Rust strings guarantee this.
@@ -794,9 +832,9 @@ mod tests {
             // '中' is 3 bytes (E4 B8 AD).
             let prefix = "a"; // 1 byte
             let input = format!("{prefix}中bbb");
-            // max_output_length = 2 → lands at byte 2, in the middle of '中'
+            // Half of max_output_length = 4 lands at byte 2, inside '中'
             // (bytes 1..4). backs up to byte 1.
-            let safety = safety_with_max_len(2);
+            let safety = safety_with_max_len(4);
             let result = safety.sanitize_tool_output("test", &input);
             assert!(result.was_modified);
             assert!(
@@ -809,15 +847,15 @@ mod tests {
         fn truncate_in_middle_of_2byte_char() {
             // 'ñ' is 2 bytes (C3 B1).
             let input = "ñbbbb";
-            // max_output_length = 1 → lands at byte 1, in the middle of 'ñ'
+            // Half of max_output_length = 2 lands at byte 1, inside 'ñ'
             // (bytes 0..2). backs up to byte 0.
-            let safety = safety_with_max_len(1);
+            let safety = safety_with_max_len(2);
             let result = safety.sanitize_tool_output("test", input);
             assert!(result.was_modified);
             // The truncated content should have cut = 0, so only the notice remains.
             assert!(
                 !result.content.contains('ñ'),
-                "2-byte char should be cut entirely when max_len = 1"
+                "2-byte char should be cut entirely when head budget = 1"
             );
         }
 
@@ -840,15 +878,123 @@ mod tests {
 
         #[test]
         fn exact_boundary_does_not_corrupt() {
-            // Head cut lands exactly on a char boundary: 'a'=1, 'b'=2, '🔑'=6,
-            // then 100 x 'c'. max=12 → head half = 6, exactly after '🔑' (no
-            // boundary walk), tail half = 6 x 'c'.
-            let input = format!("ab🔑{}", "c".repeat(100));
-            let safety = safety_with_max_len(12);
-            let result = safety.sanitize_tool_output("test", &input);
+            // Both raw cuts (3 and 5) lie inside the emoji at bytes 2..6.
+            let safety = safety_with_max_len(6);
+            let result = safety.sanitize_tool_output("test", "ab🔑cd");
             assert!(result.was_modified);
-            assert!(result.content.contains("ab🔑"));
-            assert!(result.content.ends_with("cccccc"));
+            assert!(result.content.starts_with("ab\n\n["));
+            assert!(result.content.ends_with("]cd"));
+            assert!(result.content.contains("showing 4/8 bytes"));
+            assert!(result.content.contains("4 middle bytes elided"));
+        }
+
+        #[test]
+        fn tail_walk_moves_forward_not_backward() {
+            let safety = safety_with_max_len(8);
+            // Test the UTF-8 walk independently of token-run snapping: head
+            // padding uses spaces, so the four retained bytes are safe.
+            let result = safety.sanitize_tool_output("test", "          🔑bbb");
+            assert!(result.content.starts_with("    \n\n["));
+            assert!(result.content.ends_with("]bbb"));
+            assert!(result.content.contains("showing 7/17 bytes"));
+            assert!(result.content.contains("10 middle bytes elided"));
+        }
+
+        #[test]
+        fn secrets_straddling_either_cut_are_not_disclosed() {
+            let safety = safety_with_max_len(4096);
+            let body = "Q".repeat(120);
+            let secrets = [
+                format!("ghp_{}", &body[..36]),
+                format!("AKIA{}", &body[..16]),
+                format!("sk-{body}"),
+                format!("sk-ant-api{body}"),
+                format!("github_pat_{body}"),
+                format!("sk_live_{body}"),
+                format!("sess_{body}"),
+                format!("AIza{body}"),
+                format!("xoxb-{body}"),
+                format!("SG.{}.{}", &body[..22], &body[..43]),
+                format!("glpat-{body}"),
+                format!("{body}.{body}.{body}"),
+                format!("Authorization: Bearer {body}"),
+                format!(
+                    "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
+                    "QQQQQQQQQQQ=\n".repeat(120)
+                ),
+                format!(
+                    "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+                    "QQQQQQQQQQQ=\n".repeat(120)
+                ),
+            ];
+            for secret in secrets {
+                for offset in 1..secret.len() {
+                    let suffix = secret.len() - offset;
+                    let input = format!(
+                        "{}{}{}",
+                        " ".repeat(5000),
+                        secret,
+                        " ".repeat(2048 - suffix)
+                    );
+                    let head_input = format!(
+                        "{}{}{}",
+                        " ".repeat(2048 - offset),
+                        secret,
+                        " ".repeat(5000)
+                    );
+                    for input in [input, head_input] {
+                        let result = safety.sanitize_tool_output("test", &input);
+                        assert!(
+                            !result.content.contains('Q'),
+                            "body leaked at offset {offset}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn unknown_long_token_cut_discards_side_with_bounded_work() {
+            let safety = safety_with_max_len(100);
+            let input = "Z".repeat(100_000);
+            let result = safety.sanitize_tool_output("test", &input);
+            assert!(!result.content.contains('Z'));
+            assert!(result.content.contains("showing 0/100000 bytes"));
+        }
+
+        #[test]
+        fn all_private_key_end_markers_block_without_begin_header() {
+            let safety = safety_with_max_len(4096);
+            for kind in ["", "RSA ", "OPENSSH ", "EC ", "DSA "] {
+                let input = format!("QQQQQQ==\n-----END {kind}PRIVATE KEY-----");
+                let result = safety.sanitize_tool_output("test", &input);
+                assert_eq!(
+                    result.content,
+                    "[Output blocked due to potential secret leakage]"
+                );
+            }
+        }
+
+        #[test]
+        fn twilio_hex_body_straddles_both_cuts() {
+            let safety = safety_with_max_len(128);
+            let secret = format!("SK{}", "f".repeat(32));
+            for offset in 1..secret.len() {
+                let head = format!("{}{}{}", " ".repeat(64 - offset), secret, " ".repeat(200));
+                let tail = format!(
+                    "{}{}{}",
+                    " ".repeat(200),
+                    secret,
+                    " ".repeat(64 - (secret.len() - offset))
+                );
+                for input in [head, tail] {
+                    let result = safety.sanitize_tool_output("test", &input);
+                    // The run is entirely elided, not merely shortened below
+                    // the detector's fixed 32-hex minimum.
+                    assert!(result.content.trim().starts_with("[... truncated:"));
+                    assert!(result.content.trim().ends_with("query the full output.]"));
+                }
+            }
         }
     }
 }
