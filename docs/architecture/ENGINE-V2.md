@@ -238,6 +238,17 @@ Standard tool/function calling. The LLM returns structured `ActionCall` objects.
 4. Execute via `EffectExecutor`
 5. Record the `ActionResult`
 
+`ActionResult` content is role-token-neutralized and bounded to
+`MAX_ACTION_OUTPUT_CHARS` (8000) by the orchestrator's
+`format_action_output` before entering LLM history. The bound keeps head AND
+tail and elides the middle (WI#349): list-tool envelopes serialize
+pagination/completion metadata (`next_cursor`, `truncated`, `complete`,
+`resume_page`) at the very tail, and the earlier head-only cut amputated it —
+the model never saw truncation state or a real cursor and improvised one
+(WI#344 GitLab 500s). The v1 routine tool loop
+(`ic/src/agent/routine_engine.rs`, 8192-byte cap) truncates with the same
+head+tail shape.
+
 **Tier 1 -- CodeAct / Python via Monty** (`executor/scripting.rs`):
 
 Embedded Python execution following the RLM (Recursive Language Model) pattern. The LLM generates Python code that the Monty interpreter executes.
