@@ -4815,6 +4815,327 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert!(info["timezone"].is_null());
     }
 
+    // ── WI#308: mission verb gates ──────────────────────────────
+    //
+    // The mission_* capability actions dispatch before the registry-tool gate
+    // stack, so `gate_mission_call` applies their own subset: persisted
+    // permission state, supervised mode, per-verb rate limit, and ToolCall
+    // hooks (with webhook_secret redacted).
+
+    /// Captures every ToolCall payload it sees; rejects when armed.
+    #[derive(Default)]
+    struct MissionHookProbe {
+        seen: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        reject: Option<String>,
+    }
+
+    #[async_trait]
+    impl crate::hooks::Hook for MissionHookProbe {
+        fn name(&self) -> &str {
+            "mission-probe"
+        }
+
+        fn hook_points(&self) -> &[crate::hooks::HookPoint] {
+            &[crate::hooks::HookPoint::BeforeToolCall]
+        }
+
+        async fn execute(
+            &self,
+            event: &HookEvent,
+            _ctx: &crate::hooks::HookContext,
+        ) -> Result<HookOutcome, crate::hooks::HookError> {
+            if let HookEvent::ToolCall {
+                tool_name,
+                parameters,
+                ..
+            } = event
+            {
+                self.seen
+                    .lock()
+                    .expect("probe lock")
+                    .push((tool_name.clone(), parameters.clone()));
+            }
+            match &self.reject {
+                Some(reason) => Ok(HookOutcome::reject(reason.clone())),
+                None => Ok(HookOutcome::ok()),
+            }
+        }
+    }
+
+    /// An adapter wired to a mission manager with a known hook registry.
+    async fn mission_adapter_with_hooks(
+        hooks: Arc<HookRegistry>,
+    ) -> (EffectBridgeAdapter, Arc<MissionManager>) {
+        use lunarwing_safety::SafetyConfig;
+        let adapter = EffectBridgeAdapter::new(
+            Arc::new(ToolRegistry::new()),
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            hooks,
+        );
+        let (mgr, _leases, _store) = mission_manager_with_leases();
+        adapter.set_mission_manager(mgr.clone()).await;
+        (adapter, mgr)
+    }
+
+    #[test]
+    fn mission_action_names_cover_the_defs() {
+        let defs = mission_action_defs();
+        let def_names: std::collections::BTreeSet<&str> =
+            defs.iter().map(|def| def.name.as_str()).collect();
+        let gate_names: std::collections::BTreeSet<&str> =
+            MISSION_ACTION_NAMES.iter().copied().collect();
+        assert_eq!(
+            def_names, gate_names,
+            "the gate set and the dispatched definitions disagree"
+        );
+        assert!(MISSION_ACTION_NAMES.iter().all(|name| is_mission_action_name(name)));
+        assert!(!is_mission_action_name("mission_createx"));
+        assert!(!is_mission_action_name("tool_info"));
+    }
+
+    #[tokio::test]
+    async fn supervised_mode_gates_every_mission_verb() {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_supervised_mission".to_string());
+        for verb in MISSION_ACTION_NAMES {
+            let result = adapter
+                .execute_action(verb, serde_json::json!({}), &lease(), &ctx)
+                .await;
+            match result {
+                Err(EngineError::GatePaused {
+                    gate_name,
+                    action_name,
+                    call_id,
+                    resume_kind,
+                    ..
+                }) => {
+                    assert_eq!(gate_name, "approval");
+                    assert_eq!(action_name, *verb);
+                    assert_eq!(call_id, "call_supervised_mission");
+                    assert!(
+                        matches!(
+                            *resume_kind,
+                            lunarwing_engine::ResumeKind::Approval { allow_always: false }
+                        ),
+                        "mission gates must not offer an always-grant that cannot persist"
+                    );
+                }
+                other => panic!("expected GatePaused for supervised {verb}, got {other:?}"),
+            }
+        }
+        // Nothing dispatched: no mission was created behind the gates.
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_mission_gate_resume_executes() {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_mission_create_resume".to_string());
+        let params = serde_json::json!({"name": "digest", "goal": "summarize the day"});
+
+        let gated = adapter
+            .execute_action("mission_create", params.clone(), &lease(), &ctx)
+            .await;
+        assert!(matches!(gated, Err(EngineError::GatePaused { .. })));
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty(),
+            "a gated mission_create must not dispatch"
+        );
+
+        // The approval resolution re-enters with approval_already_granted.
+        let resumed = adapter
+            .execute_resolved_pending_action("mission_create", params, &lease(), &ctx, true)
+            .await
+            .expect("approved resume executes");
+        assert!(!resumed.is_error);
+        assert_eq!(resumed.output["status"], "created");
+        assert_eq!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_mission_permission_denies_dispatch() {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test-user",
+                "tool_permissions.mission_list",
+                &serde_json::json!("disabled"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        let denied = adapter
+            .execute_action(
+                "mission_list",
+                serde_json::json!({}),
+                &lease(),
+                &mission_create_ctx(),
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(EngineError::LeaseDenied { .. })),
+            "a disabled mission verb must be denied, got {denied:?}"
+        );
+
+        // A verb without a Disabled record still dispatches (the unknown
+        // mission name errors inside the call, not at the gate).
+        let other = adapter
+            .execute_action(
+                "mission_history",
+                serde_json::json!({"name": "no-such-mission"}),
+                &lease(),
+                &mission_create_ctx(),
+            )
+            .await;
+        assert!(
+            !matches!(other, Err(EngineError::LeaseDenied { .. })),
+            "mission_history has no Disabled record and must not be lease-denied: {other:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_calls_are_rate_limited_per_verb() {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let ctx = mission_create_ctx();
+        for attempt in 0..20 {
+            let result = adapter
+                .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+                .await
+                .expect("mission_list executes");
+            assert!(!result.is_error, "call {attempt} should succeed");
+        }
+        let limited = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await;
+        match limited {
+            Err(EngineError::Effect { reason }) => {
+                assert!(reason.contains("rate limited"), "got: {reason}");
+            }
+            other => panic!("expected a rate-limit error on the 21st call, got {other:?}"),
+        }
+        // The limit is per verb: mission_history still answers.
+        let other = adapter
+            .execute_action(
+                "mission_history",
+                serde_json::json!({"name": "no-such-mission"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        assert!(
+            !matches!(&other, Err(EngineError::Effect { reason }) if reason.contains("rate limited")),
+            "mission_history has its own bucket: {other:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_hooks_run_with_webhook_secret_redacted() {
+        let hooks = Arc::new(HookRegistry::default());
+        let probe = Arc::new(MissionHookProbe::default());
+        hooks.register(probe.clone()).await;
+        let (adapter, _mgr) = mission_adapter_with_hooks(hooks).await;
+
+        let params = serde_json::json!({
+            "name": "hooky",
+            "goal": "report on events",
+            "cadence": "webhook:events",
+            "webhook_secret": "super-secret-value",
+        });
+        let result = adapter
+            .execute_action("mission_create", params, &lease(), &mission_create_ctx())
+            .await
+            .expect("mission_create executes");
+        assert!(!result.is_error);
+
+        let seen = probe.seen.lock().expect("probe lock");
+        let (tool_name, hook_params) = seen
+            .iter()
+            .find(|(name, _)| name == "mission_create")
+            .expect("the hook saw the mission_create call");
+        assert_eq!(tool_name, "mission_create");
+        assert_eq!(hook_params["webhook_secret"], "[REDACTED]");
+        assert!(!hook_params.to_string().contains("super-secret-value"));
+        assert_eq!(hook_params["name"], "hooky");
+    }
+
+    #[tokio::test]
+    async fn mission_hook_rejection_blocks_dispatch() {
+        let hooks = Arc::new(HookRegistry::default());
+        let probe = Arc::new(MissionHookProbe {
+            reject: Some("policy says no".to_string()),
+            ..Default::default()
+        });
+        hooks.register(probe).await;
+        let (adapter, mgr) = mission_adapter_with_hooks(hooks).await;
+        let ctx = mission_create_ctx();
+
+        let result = adapter
+            .execute_action(
+                "mission_create",
+                serde_json::json!({"name": "blocked", "goal": "never runs"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        match result {
+            Err(EngineError::LeaseDenied { reason }) => {
+                assert!(reason.contains("policy says no"), "got: {reason}");
+            }
+            other => panic!("expected hook rejection to deny the call, got {other:?}"),
+        }
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty(),
+            "a hook-rejected mission_create must not dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_gate_inert_without_mission_manager() {
+        // Without a wired manager nothing dispatches as a mission call, so the
+        // mission gate (including supervised mode) must not fire: the call
+        // falls through to the registry path and reports the unknown tool.
+        let adapter = make_adapter();
+        let mut ctx = mission_create_ctx();
+        ctx.supervised_mode = true;
+        let result = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await
+            .expect("falls through to the registry path");
+        assert!(result.is_error);
+    }
+
     #[cfg(feature = "libsql")]
     async fn persisted_mission_adapter(
         store: Arc<dyn lunarwing_engine::Store>,
