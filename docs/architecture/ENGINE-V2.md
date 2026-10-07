@@ -42,8 +42,9 @@ union mission listing, the WI#276 grace-expired shutdown stamp plus boot-sweep
 resolution (the stop is non-cooperative; re-fire is at-least-once), the
 WI#307 non-foreground execution/resume gate and shared discovery/lease
 denylist, the WI#309 resume-lease mission catalog, the WI#311 no-auto-complete
-rule for non-manual missions, and the WI#319 pre-2026-07-26
-`Completed`-as-delete caveat in recovery guidance.
+rule for non-manual missions, the WI#319 pre-2026-07-26
+`Completed`-as-delete caveat in recovery guidance, and the WI#308 mission-verb
+dispatch gate subset (permission, supervision, rate limit, hooks).
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
@@ -933,6 +934,25 @@ sandbox builtins that `tool_list`/`tool_info` never describe; the preamble
 tells the model to call them directly. `tool_info` also accepts CodeAct's
 positional form (`tool_info("x")`) and resolves legacy hyphen/underscore
 tool aliases like dispatch does.
+
+Dispatch of the eight verbs carries its own gate subset at the adapter
+(WI#308), because `handle_mission_call` returns before the registry-tool
+gate stack that a registry tool handle keys. In the registry stack's order:
+a persisted `tool_permissions.<verb>` = disabled denies the call; supervised
+mode pauses every verb for human approval with `allow_always: false` (a
+capability action has no always-approval grant to persist, so the dialog
+does not offer one) and an approved resume re-enters with the grant and
+executes; a per-user per-verb rate limit (20/minute, 200/hour) applies; and
+`ToolCall` hooks run with `webhook_secret` redacted (the approval prompt's
+display parameters are redacted the same way, while the persisted gate keeps
+the real parameters for execution). The approval-tier gates deliberately do
+not map: the verbs carry `ApprovalRequirement::Never` semantics (their
+definitions declare `requires_approval: false`), because autonomous Mission
+threads must steer their own missions and routines are created from shared
+channels by design — the shared-conversation, non-Foreground-`Always` and
+needs-prompt gates stay off, and the pre-flight auth gate is a no-op for
+capability actions, which hold no credential registrations. The coordination
+gate (a disabled agent executes nothing) applies to mission calls as before.
 
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
