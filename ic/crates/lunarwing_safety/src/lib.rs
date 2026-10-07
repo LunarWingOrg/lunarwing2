@@ -60,52 +60,53 @@ impl SafetyLayer {
         // item #75: a "wall of text" result previously early-returned here,
         // skipping every check below, including secret redaction and role
         // token escaping). Content past the cut never reaches the LLM.
-        let (mut content, mut warnings, mut was_modified) =
-            if output.len() > self.config.max_output_length {
-                // Keep head AND tail, eliding the middle (WI#349): list-tool
-                // envelopes (e.g. the GitLab guest) serialize
-                // pagination/completion metadata (next_cursor, truncated,
-                // complete, resume_page) at the very tail, and a head-only
-                // cut amputated it before the engine's own head+tail
-                // bounding ever ran — the model then improvised cursors
-                // (WI#344 GitLab 500s). The notice always separates the
-                // halves. Both cut points walk to char boundaries, and the
-                // shown payload stays within max_output_length, so the scan
-                // pipeline below remains bounded as before.
-                let half = self.config.max_output_length / 2;
-                let mut head_end = half;
-                while head_end > 0 && !output.is_char_boundary(head_end) {
-                    head_end -= 1;
-                }
-                // len > max >= max - half, so tail_start > head_end: no overlap.
-                let mut tail_start = output.len() - (self.config.max_output_length - half);
-                while tail_start < output.len() && !output.is_char_boundary(tail_start) {
-                    tail_start += 1;
-                }
-                let shown = head_end + (output.len() - tail_start);
-                let notice = format!(
-                    "\n\n[... truncated: showing {}/{} bytes (head and tail, {} middle bytes \
+        let (mut content, mut warnings, mut was_modified) = if output.len()
+            > self.config.max_output_length
+        {
+            // Keep head AND tail, eliding the middle (WI#349): list-tool
+            // envelopes (e.g. the GitLab guest) serialize
+            // pagination/completion metadata (next_cursor, truncated,
+            // complete, resume_page) at the very tail, and a head-only
+            // cut amputated it before the engine's own head+tail
+            // bounding ever ran — the model then improvised cursors
+            // (WI#344 GitLab 500s). The notice always separates the
+            // halves. Both cut points walk to char boundaries, and the
+            // shown payload stays within max_output_length, so the scan
+            // pipeline below remains bounded as before.
+            let half = self.config.max_output_length / 2;
+            let mut head_end = half;
+            while head_end > 0 && !output.is_char_boundary(head_end) {
+                head_end -= 1;
+            }
+            // len > max >= max - half, so tail_start > head_end: no overlap.
+            let mut tail_start = output.len() - (self.config.max_output_length - half);
+            while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            let shown = head_end + (output.len() - tail_start);
+            let notice = format!(
+                "\n\n[... truncated: showing {}/{} bytes (head and tail, {} middle bytes \
                      elided). Use the json tool with source_tool_call_id to query the full output.]",
-                    shown,
-                    output.len(),
-                    tail_start - head_end
-                );
-                (
-                    format!("{}{}{}", &output[..head_end], notice, &output[tail_start..]),
-                    vec![InjectionWarning {
-                        pattern: "output_too_large".to_string(),
-                        severity: Severity::Low,
-                        location: 0..output.len(),
-                        description: format!(
-                            "Output from tool '{}' was truncated due to size",
-                            tool_name
-                        ),
-                    }],
-                    true,
-                )
-            } else {
-                (output.to_string(), Vec::new(), false)
-            };
+                shown,
+                output.len(),
+                tail_start - head_end
+            );
+            (
+                format!("{}{}{}", &output[..head_end], notice, &output[tail_start..]),
+                vec![InjectionWarning {
+                    pattern: "output_too_large".to_string(),
+                    severity: Severity::Low,
+                    location: 0..output.len(),
+                    description: format!(
+                        "Output from tool '{}' was truncated due to size",
+                        tool_name
+                    ),
+                }],
+                true,
+            )
+        } else {
+            (output.to_string(), Vec::new(), false)
+        };
 
         // Leak detection and redaction
         match self.leak_detector.scan_and_clean(&content) {
@@ -560,7 +561,8 @@ mod tests {
         };
         let safety = SafetyLayer::new(&config);
 
-        let tail = r#""pagination":{"next_cursor":"CURSOR-789","truncated":true,"complete":false}}"#;
+        let tail =
+            r#""pagination":{"next_cursor":"CURSOR-789","truncated":true,"complete":false}}"#;
         let payload = format!("{{\"items\":[\"{}\"],{}", "x".repeat(5_000), tail);
         let result = safety.sanitize_tool_output("gitlab", &payload);
 
