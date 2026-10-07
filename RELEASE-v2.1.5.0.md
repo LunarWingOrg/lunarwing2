@@ -245,6 +245,53 @@ a completion report. Global bootstrap warns and sends best-effort owner
 guidance, and the recovery verb explicitly names completed and failed
 missions. **No bulk migration is performed** — see Upgrade Notes.
 
+### Mission Fires Interrupted by Shutdown (WI#276)
+
+A mission fire whose thread is stopped by a graceful shutdown is no longer
+lost with a stuck trigger-dedup key. The outcome watcher now waits with
+`wait_thread_or_stop` — the thread stays registered and stoppable until it
+finishes — so a stop landing inside the 8-second settle budget records the
+interruption, releases the dedup key, and persists the retry marker for the
+boot sweep.
+
+When the stop outlasts the grace, the watcher records the fire as
+interrupted on the mission row (approach history, dedup release, and a
+`pending_shutdown_interruption` stamp) instead of waiting forever. A new
+boot sweep resolves the stamp against the thread's final persisted state: a
+settled host stop earns the retry the watcher would have planned — marker,
+wake, and one boot-time owner notice; a restart-failed thread stays the
+WI#301 record case; a completed thread is recorded without retry; anything
+still live keeps its stamp for the next boot. Outcome processing saves the
+mission row first and persists the retry marker as the final write, so no
+crash prefix can leave a marker whose dedup release was never saved.
+Pre-upgrade retry markers are treated as undelivered and get exactly one
+truthful boot notice. Re-firing remains at-least-once under the WI#188
+contract; the stop itself is non-cooperative.
+
+### Mission Create Dedup and Diagnostics (WI#311 follow-up, WI#319)
+
+`mission_create` dedup hits are now self-describing. Re-creating an existing
+mission answers `"status": "existing"` (a hit against the caller's own
+soft-deleted tombstone answers `"existing_deleted"`), no longer re-applies a
+requested `max_threads_per_day` budget to the existing mission, and reports
+`budget_applied` with a `budget_note` pointing at `mission_update` when a
+requested budget was not applied. The dedup decision is recorded on the
+mission, and `mission_create`'s tool description mentions the dedup marker.
+
+The daily-thread counter now travels with its date: `EngineMissionInfo`
+carries `threads_today_date`, `budget_exhausted` is computed only when the
+counter's date is today (on the bridge's list and fire-reason paths and the
+host path), and the web list and detail views render the counter with its
+date. Engine bootstrap no longer fails when the skill-registry lock is
+poisoned after the cron ticker starts.
+
+Boot recovery guidance can no longer nag operators into resurrecting an
+intentional legacy delete (WI#319): before 2026-07-26 `mission_delete`
+recorded deletions as `Completed`, so the parked-mission boot warning now
+carries each mission's `created_at`/`updated_at` and tells operators to rule
+out an old delete before resuming (`updated_at` before 2026-07-26 is the
+clue, with the restart-recorder re-stamp caveat).
+
 ### Routine/Mission Registry Split (WI#278)
 
 In Engine V2 threads, the eight v1 `routine_*` tools now error honestly
@@ -309,6 +356,30 @@ classifier, so a clean entry is never blamed for stored poison. The web API
 answers **422** for injection rejections and **409** for quarantine and
 existing-content cases instead of 500. Gate strictness is unchanged — the
 detector itself is untouched.
+
+### Daily-Log Evidence Retention (WI#288)
+
+The daily-log gate follow-up lands in this release after all.
+`memory_write(target:"daily_log", append:false)` now honors the replace
+through `Workspace::write` — it used to append silently while reporting a
+replace — giving operators a real tool-level repair path when a log is
+quarantined or poisoned.
+
+Every workspace `write()` and `write_to_layer()` keeps a scope-aware shadow
+backup under `backups/`, and daily logs keep dated backup generations with
+a cap of eight. At the cap the first generation (`.1` — the day's first
+replaced version, e.g. the quarantined poison's predecessor) stays pinned
+and the second-oldest is discarded instead; the discard emits a
+`lunarwing::safety` audit line carrying `discarded_bytes` and a blake3
+fingerprint so forensics can say what was lost. Every backup, rotation,
+discard, and quarantine event emits such an audit line.
+
+`backups/` and quarantined daily logs (`daily/*.poisoned-*.md`) are now
+reserved paths: the memory tool write/read/tree lanes and the web
+`POST /api/memory/write` route refuse them (403), keeping evidence
+untouchable by model-driven writes; operator recovery via direct workspace
+reads, the web read route, and the CLI stays open. The append-time
+quarantine machinery from WI#290 is unchanged.
 
 ### Safety Sanitizer Detection Contract (WI#289)
 
