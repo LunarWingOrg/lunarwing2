@@ -377,6 +377,34 @@ async fn mission_lock(locks: &MissionLockRegistry, id: MissionId) -> Arc<Mission
     lock
 }
 
+/// Operator guidance for a parked (Completed) recurring mission, emitted by
+/// [`MissionManager::report_parked_recurring_missions`] at each boot (WI#319).
+/// `updated_at` is named as the legacy-delete discriminator with its re-stamp
+/// caveats (the restart recorder and the legacy user-id migration both re-save
+/// missions); `last_thread_created_at` carries the last history thread's
+/// `created_at` when it could be loaded — the robust check for re-stamped
+/// rows. Confirmed legacy deletes are directed to `mission_delete` (a
+/// tombstone the boot report skips), not `mission_pause` — pausing re-stamps
+/// `updated_at` and erases the discriminator.
+fn parked_recovery_guidance(
+    mission: &Mission,
+    last_thread_created_at: Option<DateTime<Utc>>,
+) -> String {
+    let last_thread_check = match (mission.thread_history.last(), last_thread_created_at) {
+        (Some(thread_id), Some(created_at)) => {
+            format!("its last history thread is {thread_id} (created {created_at})")
+        }
+        (Some(thread_id), None) => {
+            format!("its last history thread is {thread_id}; load it and check its created_at")
+        }
+        (None, _) => "it has no recorded history threads".to_string(),
+    };
+    format!(
+        "Recurring mission is Completed and will not fire. Earlier versions could complete it after a single successful run. Rule out an old delete before resuming: before 2026-07-26, mission_delete recorded deletions as Completed. The discriminator is an updated_at before 2026-07-26 (a legacy delete went through update_mission_status, which stamps updated_at); created_at alone proves nothing, since any mission created before that date and completed normally satisfies it. updated_at can be re-stamped by the restart recorder or the legacy user-id migration, so for such rows the last history thread's created_at is the robust check: {last_thread_check}. This mission was created {} and last updated {}. Review its history, then call mission_resume(id=\"{}\") to resume future triggers, or mission_pause to keep it stopped. If the review confirms an intentional legacy delete, call mission_delete(id=\"{}\") instead: deletion is now a tombstone this warning skips, whereas mission_pause re-stamps updated_at and erases the discriminator. Missed triggers are not replayed.",
+        mission.created_at, mission.updated_at, mission.id, mission.id
+    )
+}
+
 impl MissionManager {
     pub fn new(store: Arc<dyn Store>, thread_manager: Arc<ThreadManager>) -> Self {
         let (notification_tx, _) = tokio::sync::broadcast::channel(64);
@@ -541,9 +569,11 @@ impl MissionManager {
     /// resuming can run tools/send notifications after the owner accepted a
     /// previous completion report. Warn at each boot rather than revive work.
     /// Before 2026-07-26 `mission_delete` recorded deletions as Completed
-    /// (WI#319), so the guidance includes the mission's created/updated
-    /// timestamps and tells the operator to rule out an intentional legacy
-    /// delete before resuming.
+    /// (WI#319), so the guidance names `updated_at` as the discriminator (with
+    /// its re-stamp caveats) and includes the last history thread's
+    /// `created_at` — the robust check when a re-stamp is possible. Confirmed
+    /// legacy deletes are pointed at `mission_delete`: deletion is now a
+    /// tombstone, and this report skips tombstoned records.
     async fn report_parked_recurring_missions(&self) {
         let missions = match self.store.list_all_missions_global().await {
             Ok(missions) => missions,
@@ -560,10 +590,17 @@ impl MissionManager {
             {
                 continue;
             }
-            let response = format!(
-                "Recurring mission is Completed and will not fire. Earlier versions could complete it after a single successful run. Rule out an old delete before resuming: before 2026-07-26, mission_delete recorded deletions as Completed, and this mission was created {} / last updated {}. Review its history, then call mission_resume(id=\"{}\") to resume future triggers, or mission_pause to keep it stopped. Missed triggers are not replayed.",
-                mission.created_at, mission.updated_at, mission.id
-            );
+            let last_thread_created_at = match mission.thread_history.last() {
+                Some(thread_id) => self
+                    .store
+                    .load_thread(*thread_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|thread| thread.created_at),
+                None => None,
+            };
+            let response = parked_recovery_guidance(&mission, last_thread_created_at);
             warn!(mission_id = %mission.id, user_id = %mission.user_id, "{response}");
             if let Some(&thread_id) = mission.thread_history.last() {
                 let _ = self.notification_tx.send(MissionNotification {
@@ -7209,7 +7246,10 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             },
             MissionCadence::Manual,
         ];
-        let mut expected = Vec::new();
+        // (mission, last history thread, thread created_at when persisted).
+        // The Cron entry's last thread is deliberately not persisted so the
+        // guidance's unloaded-thread fallback wording is pinned too.
+        let mut expected: Vec<(MissionId, ThreadId, Option<DateTime<Utc>>)> = Vec::new();
         for cadence in cadences {
             for status in [
                 MissionStatus::Completed,
@@ -7219,11 +7259,27 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                 let mut mission =
                     Mission::new(ProjectId::new(), "owner", "parked", "goal", cadence.clone());
                 mission.status = status;
-                mission.thread_history.push(ThreadId::new());
+                let persist_thread = !matches!(cadence, MissionCadence::Cron { .. });
+                let thread = Thread::new(
+                    "parked run",
+                    ThreadType::Mission,
+                    mission.project_id,
+                    "owner",
+                    ThreadConfig::default(),
+                );
+                let thread_id = thread.id;
+                mission.thread_history.push(thread_id);
                 mission.notify_channels = vec!["gateway".into()];
                 if status == MissionStatus::Completed && !matches!(cadence, MissionCadence::Manual)
                 {
-                    expected.push(mission.id);
+                    expected.push((
+                        mission.id,
+                        thread_id,
+                        persist_thread.then_some(thread.created_at),
+                    ));
+                }
+                if persist_thread {
+                    store.save_thread(&thread).await.unwrap();
                 }
                 store.save_mission(&mission).await.unwrap();
             }
@@ -7231,20 +7287,41 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         assert_eq!(mgr.bootstrap_all_projects().await.unwrap(), 0);
         for _ in 0..expected.len() {
             let notification = notifications.try_recv().unwrap();
-            assert!(expected.contains(&notification.mission_id));
+            let (mission_id, thread_id, thread_created_at) = expected
+                .iter()
+                .copied()
+                .find(|(id, ..)| *id == notification.mission_id)
+                .unwrap();
             assert_eq!(notification.user_id, "owner");
             assert_eq!(notification.notify_channels, vec!["gateway"]);
             let response = notification.response.unwrap();
-            assert!(response.contains(&format!(
-                "mission_resume(id=\"{}\")",
-                notification.mission_id
-            )));
+            assert!(response.contains(&format!("mission_resume(id=\"{mission_id}\")")));
             // WI#319: the guidance must carry the legacy-delete caveat and the
             // created/updated timestamps operators use to rule one out.
             assert!(response.contains("2026-07-26"));
             assert!(response.contains("mission_delete recorded deletions as Completed"));
             assert!(response.contains("created"));
             assert!(response.contains("last updated"));
+            // WI#319 review (MR !1463 AU-1): the guidance names updated_at as
+            // the discriminator with its re-stamp caveat, carries the last
+            // history thread id (and its created_at when the thread loads),
+            // and points confirmed legacy deletes at mission_delete rather
+            // than mission_pause — pausing re-stamps updated_at.
+            assert!(response.contains("updated_at before 2026-07-26"));
+            assert!(response.contains(
+                "updated_at can be re-stamped by the restart recorder or the legacy user-id migration"
+            ));
+            match thread_created_at {
+                Some(created_at) => assert!(response.contains(&format!(
+                    "its last history thread is {thread_id} (created {created_at})"
+                ))),
+                None => assert!(response.contains(&format!(
+                    "its last history thread is {thread_id}; load it and check its created_at"
+                ))),
+            }
+            assert!(response.contains(&format!("mission_delete(id=\"{mission_id}\")")));
+            assert!(response.contains("deletion is now a tombstone this warning skips"));
+            assert!(response.contains("mission_pause re-stamps updated_at"));
             assert_eq!(
                 store
                     .load_mission(notification.mission_id)
@@ -7256,7 +7333,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             );
         }
         assert!(notifications.try_recv().is_err());
-        for id in expected {
+        for (id, ..) in expected {
             assert!(mgr.resume_mission(id, "other").await.is_err());
             mgr.resume_mission(id, "owner").await.unwrap();
             assert_eq!(
