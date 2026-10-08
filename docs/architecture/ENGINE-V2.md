@@ -906,7 +906,11 @@ capability — whether the asking thread holds the lease to call the function
 — not guidance on whether it should: it mirrors the executor's lease
 preflight and is true only while that thread holds a valid lease covering
 the function in `MissionManager::leases()`, the thread manager's lease set
-that preflight consults. A thread without one gets the same definition with
+that preflight consults. WI#308 intersects the dispatch gate's categorical
+refusal: a Research thread holding the lease is still answered
+`callable: false` for the six mutating verbs, because the gate would refuse
+the call (and an executor-time refusal fails the whole code step). A thread
+without one gets the same definition with
 `callable: false` and a note saying a call from it would be refused, including
 threads whose lease is currently revoked or narrowed. Resume refresh re-grants
 missing actions under the current planner, including on same-process approval

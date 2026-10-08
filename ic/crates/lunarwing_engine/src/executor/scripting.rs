@@ -4845,4 +4845,36 @@ FINAL("unexpected")
             "the child's execution context must inherit the parent's supervision posture"
         );
     }
+
+    #[tokio::test]
+    async fn executor_error_from_action_call_fails_the_step_even_in_try_except() {
+        // Contract pin relied on by the WI#308 Research refusal tests: an
+        // executor-time EngineError (post-suspension, unlike a preflight
+        // denial) raises at the await point in a way in-sandbox try/except
+        // does NOT catch — the whole code step fails. Sandbox code must
+        // therefore check `tool_info`'s `callable` before attempting a
+        // mutating mission verb on a Research thread.
+        let effects = Arc::new(MockEffects::new(
+            vec![test_action("boom")],
+            vec![Err(EngineError::LeaseDenied {
+                reason: "denied by the mission gate".into(),
+            })],
+        ));
+        let thread = make_test_thread();
+        let code = r#"
+try:
+    await boom()
+    FINAL("not caught")
+except Exception as e:
+    FINAL("caught:" + str(e))
+"#;
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(result.had_error, "executor errors abort the step");
+        assert!(result.final_answer.is_none());
+        assert!(
+            result.stdout.contains("lease denied: denied by the mission gate"),
+            "stdout: {}",
+            result.stdout
+        );
+    }
 }
