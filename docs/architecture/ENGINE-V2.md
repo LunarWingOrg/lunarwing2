@@ -786,7 +786,11 @@ went through `update_mission_status`, which stamps `updated_at`). `created_at`
 alone does not discriminate — any mission created before that date and
 phrase-completed in September satisfies it — and the restart recorder can
 re-stamp `updated_at` on rows holding an unrecorded restart-failed thread, so
-for such rows the last history thread's `created_at` is the robust check. Rule
+for such rows the last history thread's `created_at` is the robust check. The
+boot warning names that discriminator, carries the last history thread's id
+and `created_at` (loaded best-effort), and points a confirmed legacy delete at
+`mission_delete` — now a tombstone the report skips — rather than
+`mission_pause`, which re-stamps `updated_at` and erases the clue. Rule
 out an old delete
 first, then inspect the history and use `mission_resume(id=...)` as the owner to
 recover paused, completed or failed missions. Cron recovery computes its next
