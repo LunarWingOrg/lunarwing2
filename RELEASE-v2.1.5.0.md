@@ -409,8 +409,8 @@ a 2026-10-04 revalidation stamp; contributor onboarding's freeze notice now
 names the work items still open at release time. Operator references, the
 testing guide, release indexes, and the CI README were synchronized with
 the cargo-deny gate changes, the WI#299 quarantine behavior, and the WI#291
-budget semantics. An audit of all 25 open tracker items with per-item
-repository disposition lives at
+budget semantics. An audit of all open tracker items (43 at the 2026-10-08
+repass) with per-item repository disposition lives at
 [docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md).
 Stale versioned operations documents moved to `docs/ops/history/` with
 inbound links repaired and a per-file archive index.
@@ -464,18 +464,20 @@ inbound links repaired and a per-file archive index.
 
 ### Security, Deployment, and Release Limitations
 
-**Carried known issues.** The daily-log gate follow-up work (WI#288) and
-the mission graceful-shutdown retry seam (WI#276) remain open with merge
-requests in flight and are not in this release. The opencode2 executor
+**Carried known issues.** Three 2.1.5.0-labeled tracker items remain open
+with goals items still in flight at this draft: the mission-verb
+supervised-mode/approval bypass (WI#308, goals item 47), the boot-warning
+legacy-delete clue mismatch (WI#319, goals item 34), and the engine-v2
+action-output pagination amputation root-caused in WI#349 (goals item 36;
+the head+tail fix is in review as !1474). The opencode2 executor
 correction shipped with the v2.0.23 step of the v2.0.24 bump (WI#303) is
-source-verified but not yet runtime-verified against a live v2.0.24 server —
-a green `worker-opencode2-candidate` build and a smoke test on the first
-protected pipeline are the remaining evidence before promotion (see
-`docs/ops/WORKER-CONTAINERS.md`). See
+source-verified and its candidate image built green on master pipeline
+5308, but it is not yet runtime-verified against a live v2.0.24 server —
+the WI#320-style smoke tracked by #345 is the remaining evidence before
+promotion (see `docs/ops/WORKER-CONTAINERS.md`). See
 [the open-items audit](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md) — a
-point-in-time snapshot dated 2026-10-04, with the #303 entry updated
-2026-10-06 and 2026-10-07 — for the disposition table, including items
-deferred to v2.1.6.0 and v2.1.8.0.
+point-in-time snapshot re-audited 2026-10-08 — for the disposition table,
+including items deferred to v2.1.6.0 and v2.1.8.0.
 
 **Accepted advisories.** Eight vulnerability advisories and one
 informational notice ship with recorded exposure; none is unaccounted for
