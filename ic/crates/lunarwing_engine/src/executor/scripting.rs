@@ -4872,7 +4872,9 @@ except Exception as e:
         assert!(result.had_error, "executor errors abort the step");
         assert!(result.final_answer.is_none());
         assert!(
-            result.stdout.contains("lease denied: denied by the mission gate"),
+            result
+                .stdout
+                .contains("lease denied: denied by the mission gate"),
             "stdout: {}",
             result.stdout
         );
