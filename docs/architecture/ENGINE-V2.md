@@ -258,6 +258,16 @@ fixed 2 KiB windows around both cuts, removes crossing secrets/token runs,
 and drops a retained side if the window cannot establish a safe boundary.
 The final retained text is still leak-scanned; PEM BEGIN and END markers block.
 Thus secret protection can reduce the retained payload below its budget.
+In particular, a long base64/hex run crossing a cut can exhaust the window:
+discarding the tail also discards its pagination block, and discarding both
+sides can remove all metadata. This fail-closed tradeoff is tracked in
+[WI#355](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/355), including
+the proposed byte-walk plus second bounded scan. The notice separates itself
+from retained text with blank lines and describes "retained edges", since
+either edge can be empty. Remaining detector gaps are tracked separately:
+[WI#353](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/353) for uncut
+GitLab PAT/Bearer tokens and [WI#354](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/354)
+for END-less PEM tails and encrypted/PGP private keys.
 WASM (10 MB), MCP (4 MiB), and built-in HTTP (5 MiB) size limits reject the
 call rather than truncate; tail preservation is not an end-to-end guarantee.
 Follow-ups that still

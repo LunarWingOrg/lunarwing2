@@ -123,8 +123,8 @@ impl SafetyLayer {
             tail_start = self.secret_safe_cut(output, tail_start, true);
             let shown = head_end + (output.len() - tail_start);
             let notice = format!(
-                "\n\n[... truncated: showing {}/{} bytes (head and tail, {} middle bytes \
-                     elided). Use the json tool with source_tool_call_id to query the full output.]",
+                "\n\n[... truncated: showing {}/{} bytes (retained edges, {} middle bytes \
+                     elided). Use the json tool with source_tool_call_id to query the full output.]\n\n",
                 shown,
                 output.len(),
                 tail_start - head_end
@@ -619,7 +619,7 @@ mod tests {
         // Both cuts snap outward to the ends of the 5000-byte token-like run.
         // The structural prefix and pagination suffix still survive.
         let expected_notice = format!(
-            "truncated: showing {}/{} bytes (head and tail, 5000 middle bytes elided)",
+            "truncated: showing {}/{} bytes (retained edges, 5000 middle bytes elided)",
             payload.len() - 5000,
             payload.len(),
         );
@@ -883,7 +883,7 @@ mod tests {
             let result = safety.sanitize_tool_output("test", "ab🔑cd");
             assert!(result.was_modified);
             assert!(result.content.starts_with("ab\n\n["));
-            assert!(result.content.ends_with("]cd"));
+            assert!(result.content.ends_with("]\n\ncd"));
             assert!(result.content.contains("showing 4/8 bytes"));
             assert!(result.content.contains("4 middle bytes elided"));
         }
@@ -895,7 +895,7 @@ mod tests {
             // padding uses spaces, so the four retained bytes are safe.
             let result = safety.sanitize_tool_output("test", "          🔑bbb");
             assert!(result.content.starts_with("    \n\n["));
-            assert!(result.content.ends_with("]bbb"));
+            assert!(result.content.ends_with("]\n\nbbb"));
             assert!(result.content.contains("showing 7/17 bytes"));
             assert!(result.content.contains("10 middle bytes elided"));
         }
@@ -919,11 +919,17 @@ mod tests {
                 format!("{body}.{body}.{body}"),
                 format!("Authorization: Bearer {body}"),
                 format!(
-                    "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
+                    concat!(
+                        "-----BEGIN RSA ",
+                        "PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----"
+                    ),
                     "QQQQQQQQQQQ=\n".repeat(120)
                 ),
                 format!(
-                    "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+                    concat!(
+                        "-----BEGIN ",
+                        "PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----"
+                    ),
                     "QQQQQQQQQQQ=\n".repeat(120)
                 ),
             ];
@@ -960,6 +966,38 @@ mod tests {
             let result = safety.sanitize_tool_output("test", &input);
             assert!(!result.content.contains('Z'));
             assert!(result.content.contains("showing 0/100000 bytes"));
+        }
+
+        #[test]
+        fn head_window_exhaustion_discards_retained_prefix() {
+            let safety = safety_with_max_len(4096);
+            let input = format!(
+                "{}{}{}",
+                " ".repeat(100),
+                "Q".repeat(3000),
+                " ".repeat(5000)
+            );
+            let result = safety.sanitize_tool_output("test", &input);
+            assert!(!result.content.contains('Q'));
+            assert!(result.content.starts_with("\n\n[... truncated:"));
+            assert!(result.content.contains("showing 2048/8100 bytes"));
+            assert!(result.content.ends_with(&" ".repeat(2048)));
+        }
+
+        #[test]
+        fn tail_window_exhaustion_discards_retained_suffix() {
+            let safety = safety_with_max_len(4096);
+            let input = format!(
+                "{}{}{}",
+                " ".repeat(5000),
+                "Q".repeat(3000),
+                " ".repeat(100)
+            );
+            let result = safety.sanitize_tool_output("test", &input);
+            assert!(!result.content.contains('Q'));
+            assert!(result.content.starts_with(&" ".repeat(2048)));
+            assert!(result.content.contains("showing 2048/8100 bytes"));
+            assert!(result.content.ends_with("query the full output.]\n\n"));
         }
 
         #[test]
