@@ -1,8 +1,8 @@
 # Release Notes for LunarWing v2.1.5.0
 
-## Codename: Bungei Fukkō (文芸復興): The Renaissance
+## Codename: Bungei Fukkō (文芸復興, ぶんげいふっこう): The Renaissance
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-05)
+**Release date:** 2026-10-XX (not yet released; first draft 2026-10-05, repass 2026-10-08)
 
 > Ink long dried wakes;  
 > old letters learn new light —  
@@ -37,6 +37,15 @@ grant-cleanup migration. The cycle closes with the usual dependency sweep
 (2.1.4 → 2.1.5 across all owned packages, refreshed registry versions,
 regenerated vendor tree) and a full crate-security re-audit.
 
+The repass adds two more reliability pillars. The workspace daily-log gate
+now heals itself: a poisoned daily log no longer blocks the day's appends —
+the stored poison is quarantined aside, tool-level replace is honored, and
+every step is backed by scope-aware shadow backups with pinned
+first-generation evidence. And the mission graceful-shutdown seam is
+closed: a fire caught by a graceful daemon stop is recorded, its dedup key
+released, and its retry resolved at the next boot against the thread's
+final persisted state, instead of slipping away silently with a stuck key.
+
 See the [v2.1.4.0 release notes](docs/releases/RELEASE-v2.1.4.0.md) for the
 previous compatibility baseline.
 
@@ -68,6 +77,19 @@ previous compatibility baseline.
   canonical definitions; and non-manual missions no longer auto-complete on
   a run's goal-achieved declaration — parked recurring missions recover via
   owner-authorized `mission_resume`.
+- **Daily-log gate self-healing (WI#288).** `memory_write` on
+  `target: "daily_log"` now honors `append: false` as a real replace, and an
+  append refused because already-stored content trips the gate quarantines
+  the poisoned log and retries against a fresh one — the day's appends are
+  no longer blocked. Scope-aware shadow backups keep generational evidence
+  (the first generation stays pinned at the cap, discards are
+  fingerprinted), and the `backups/` and `daily/*.poisoned-*.md` artifacts
+  are reserved from tool and web writes.
+- **Mission graceful-shutdown retry seam (WI#276).** A mission fire caught
+  by a graceful daemon shutdown is recorded as interrupted with its dedup
+  key released, and the next boot resolves the pending stamp against the
+  thread's final state — a settled host stop earns the planned retry marker
+  and a boot-time notice instead of vanishing with a stuck dedup key.
 - **Actionable memory-write rejections (WI#290).** Injection rejections
   carry matched-pattern descriptions, rephrase guidance, and a narrowly
   scoped inline-quote route; the API answers 422/409 instead of 500.
@@ -222,6 +244,50 @@ a completion report. Global bootstrap warns and sends best-effort owner
 guidance, and the recovery verb explicitly names completed and failed
 missions. **No bulk migration is performed** — see Upgrade Notes.
 
+Follow-up hardening in the same cycle: `mission_create` deduplication no
+longer re-budgets the existing mission — `max_threads_per_day` applies only
+to genuinely new creates, and deduped calls answer `"status": "existing"`
+(`"existing_deleted"` against the caller's own soft-deleted tombstone) with
+the persisted budget echoed and a `budget_note` when a requested budget was
+not applied. `EngineMissionInfo` carries `threads_today_date`, and
+`budget_exhausted` is computed only when the counter's date is today, so
+the web list/detail views and `mission_fire` reasons no longer report stale
+exhaustion. The mission preamble documents the dedup marker, the `existing`
+status, and the engine-computed cadence/goal comparison fields, and
+`init_engine` treats a poisoned skill-registry lock after the cron ticker
+starts as non-fatal. An operator runbook for the acceptance scenario lives
+at `docs/ops/v2.1.5.0_GOAL42_MISSION_DIAGNOSTICS.md`.
+
+Recovery guidance is also delete-aware (WI#319): before 2026-07-26,
+`mission_delete` recorded deletions as `Completed`, so the boot warning for
+parked recurring missions now carries each mission's
+`created_at`/`updated_at` and tells operators to rule out an intentional
+legacy delete before resuming — guidance only, with no behavior or
+suppression change.
+
+### Mission Graceful-Shutdown Retry Seam (WI#276)
+
+The mission outcome watcher now waits with `wait_thread_or_stop` — the
+thread stays registered and stoppable through the 8-second settle budget —
+and a stop that lands is recorded as an interruption with the dedup key
+released and the retry marker persisted for the boot sweep. The
+previously-silent case is closed: when the grace expires with the thread
+still stopping, `record_unsettled_shutdown_fire` writes the mission-history
+row (`INTERRUPTED: shutdown while the thread was still stopping`), releases
+the trigger-dedup key, and stamps `pending_shutdown_interruption`.
+
+At the next boot, `resolve_pending_shutdown_interruptions` settles the
+stamp under the fire lock against the thread's final persisted state: a
+settled host stop earns the retry the watcher would have planned (marker,
+wake, boot-time notice); a restart-failed thread stays WI#301's record
+case; a completed one is recorded without retry; checkpoint/gate states
+stay with their own recovery; and a thread still live keeps the stamp for
+the following boot. Outcome processing now saves the mission row first and
+persists the retry marker as the final commit write, so no crash prefix can
+leave a marker whose dedup release was never saved. `RetryState.notified`
+gives pre-upgrade markers exactly one truthful boot notice, and
+`release_stale_trigger_key_for_retry` heals stale dedup pairs at boot.
+
 ### Routine/Mission Registry Split (WI#278)
 
 In Engine V2 threads, the eight v1 `routine_*` tools now error honestly
@@ -286,6 +352,31 @@ classifier, so a clean entry is never blamed for stored poison. The web API
 answers **422** for injection rejections and **409** for quarantine and
 existing-content cases instead of 500. Gate strictness is unchanged — the
 detector itself is untouched.
+
+### Daily-Log Gate Self-Healing and Shadow Backups (WI#288)
+
+`memory_write(target: "daily_log", append: false)` now honors a real
+replace through `Workspace::write` — it used to append silently while
+reporting a replace — giving operators a tool-level repair path when a
+daily log is poisoned. Appends refused only because already-stored content
+trips the gate quarantine the poisoned log aside and retry against a fresh
+log, so the day's appends eventually succeed (the WI#290 quarantine
+machinery, retained unchanged; layer daily logs stay un-quarantined as
+documented in the workspace README).
+
+Both `write()` and `write_to_layer()` now take scope-aware shadow backups,
+and daily-log backups are generational: at the eight-generation cap the
+day's first replaced version (`.1`) stays pinned as retained evidence while
+the second-oldest is discarded, with the discard audit line carrying
+`discarded_bytes` and a blake3 fingerprint so forensics can say what was
+lost. Every backup, rotation, discard, and quarantine event emits a
+`lunarwing::safety` audit line.
+
+The evidence classes are reserved from the model-facing write lanes:
+`backups/` paths and `daily/*.poisoned-*.md` quarantine artifacts are
+rejected on the memory tool write/read/tree lanes and answered **403** by
+`POST /api/memory/write` before the layer branch. Operator recovery via
+direct workspace reads, the web read route, and the CLI stays open.
 
 ### Safety Sanitizer Detection Contract (WI#289)
 
@@ -384,7 +475,10 @@ unmaintained rental). No unaccounted advisory exists in any committed
 lockfile. New CI gates enforce this: the `satellite-advisory-sweep`
 full-validation job and a `lockfile-only-advisory-guard` that fails on
 stale entries and queries the same widened graph. The yanked-crate gate is
-verifiably enforced with no index-failure masking.
+verifiably enforced with no index-failure masking. The cargo-deny CI job
+itself was hardened against egress flakes: the release download retries
+with backoff and the audit retries only on transient network diagnostics,
+with hermetic stubbed tests pinning the retry contract.
 
 The opencode2 worker bumps from v2.0.21 to **v2.0.24** (via v2.0.23: WI#303,
 tag SHA `0fd7e2829449b052abf0078666669302923d77af`; then v2.0.24, tag SHA
@@ -406,7 +500,11 @@ Other worker pins are unchanged from v2.1.4.0.
 
 All 32 active guides were re-validated against the v2.1.5.0 tree and carry
 a 2026-10-04 revalidation stamp; contributor onboarding's freeze notice now
-names the work items still open at release time. Operator references, the
+names the work items still open at release time. All 11 active architecture
+documents were likewise re-validated and carry a 2026-10-06 stamp, with
+corrections to the semantic-memory-search migration claim (V28 is now
+latest), the SSH harness/delivery worker lanes (kimi no longer mounts the
+agent socket), and the self-heal coverage audit's per-release note. Operator references, the
 testing guide, release indexes, and the CI README were synchronized with
 the cargo-deny gate changes, the WI#299 quarantine behavior, and the WI#291
 budget semantics. An audit of all 25 open tracker items with per-item
@@ -460,22 +558,32 @@ inbound links repaired and a per-file archive index.
    fails `Waiting` threads orphaned by a quarantined pending-gates file
    (inspect `pending-gates.json.corrupt-<ts>`), records restart-lost mission
    fires for owner review instead of replaying them, and persists stopped
-   threads as `Failed`/`Cancelled` rather than leaving them limbo.
+   threads as `Failed`/`Cancelled` rather than leaving them limbo. A
+   mission fire interrupted by a graceful shutdown is recorded in mission
+   history and its retry resolved automatically at the next boot — expect
+   one boot-time notice per pre-upgrade retry marker.
 
 ### Security, Deployment, and Release Limitations
 
-**Carried known issues.** The daily-log gate follow-up work (WI#288) and
-the mission graceful-shutdown retry seam (WI#276) remain open with merge
-requests in flight and are not in this release. The opencode2 executor
-correction shipped with the v2.0.23 step of the v2.0.24 bump (WI#303) is
-source-verified but not yet runtime-verified against a live v2.0.24 server —
-a green `worker-opencode2-candidate` build and a smoke test on the first
-protected pipeline are the remaining evidence before promotion (see
-`docs/ops/WORKER-CONTAINERS.md`). See
+**Carried known issues.** Three engine items remain open at this repass
+(2026-10-08) and are not in this release: **WI#308** (mission verbs bypass
+the supervised-mode/approval/permission/rate-limit gate stack — the WI#295
+residual, security-labeled), the remaining **WI#319** follow-up work, and
+**WI#349** (Engine V2's 8000-character action-output cap amputates
+pagination envelopes such as the GitLab tool's `next_cursor`, so the model
+improvises cursors — the WI#344 root cause). The daily-log gate self-healing
+(WI#288) and the mission graceful-shutdown retry seam (WI#276) were carried
+at the first draft and have since **landed in this release**. The opencode2
+executor correction shipped with the v2.0.23 step of the v2.0.24 bump
+(WI#303) is source-verified but not yet runtime-verified against a live
+v2.0.24 server — a green `worker-opencode2-candidate` build and a smoke
+test on the first protected pipeline are the remaining evidence before
+promotion (see `docs/ops/WORKER-CONTAINERS.md`). See
 [the open-items audit](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md) — a
 point-in-time snapshot dated 2026-10-04, with the #303 entry updated
-2026-10-06 and 2026-10-07 — for the disposition table, including items
-deferred to v2.1.6.0 and v2.1.8.0.
+2026-10-06 and 2026-10-07; it predates the WI#288/WI#276 merges and
+WI#349's filing, and its own repass is checklist item 39 — for the
+disposition table, including items deferred to v2.1.6.0 and v2.1.8.0.
 
 **Accepted advisories.** Eight vulnerability advisories and one
 informational notice ship with recorded exposure; none is unaccounted for
