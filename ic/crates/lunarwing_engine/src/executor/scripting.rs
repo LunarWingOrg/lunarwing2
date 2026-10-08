@@ -1701,6 +1701,13 @@ async fn handle_rlm_query(
         max_duration: parent_thread.config.max_duration,
         depth: current_depth + 1,
         max_depth,
+        // WI#308: inherit the supervision posture so a supervised parent's
+        // rlm child does not silently drop the approval gates the parent's
+        // effect context enforces (the child's execution context is built
+        // from these config fields).
+        supervised_mode: parent_thread.config.supervised_mode,
+        shared_conversation: parent_thread.config.shared_conversation,
+        supervised_timeout_secs: parent_thread.config.supervised_timeout_secs,
         ..crate::types::thread::ThreadConfig::default()
     };
 
@@ -4709,6 +4716,133 @@ FINAL("unexpected")
         assert!(
             !rendered.contains(RAW_PROVIDER_SENTINEL),
             "rlm_query result must not expose provider diagnostics to the sandbox: {rendered}"
+        );
+    }
+
+    // ── WI#308: rlm_query child supervision inheritance (run-33 AQ-1) ──
+
+    /// Records the supervision posture of every execution context it sees,
+    /// so the rlm_query child's config inheritance is observable.
+    struct SupervisionProbeEffects {
+        contexts: Mutex<Vec<(bool, bool, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for SupervisionProbeEffects {
+        async fn execute_action(
+            &self,
+            name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.contexts.lock().unwrap().push((
+                ctx.supervised_mode,
+                ctx.shared_conversation,
+                ctx.supervised_timeout_secs,
+            ));
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: name.into(),
+                output: serde_json::json!({"result": "ok"}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action("probe_tool")])
+        }
+    }
+
+    /// Returns one CodeAct step calling `probe_tool`, then plain text, so the
+    /// rlm_query child loop executes exactly one action and terminates.
+    struct CodeOnceLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for CodeOnceLlm {
+        fn model_name(&self) -> &str {
+            "code-once"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[crate::types::message::ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &crate::traits::llm::LlmCallConfig,
+        ) -> Result<crate::traits::llm::LlmOutput, EngineError> {
+            let response = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                crate::types::step::LlmResponse::Code {
+                    code: "result = await probe_tool()\nFINAL(result)".into(),
+                    content: None,
+                }
+            } else {
+                crate::types::step::LlmResponse::Text("done".into())
+            };
+            Ok(crate::traits::llm::LlmOutput {
+                response,
+                usage: crate::types::step::TokenUsage::default(),
+                finish_reason: "stop".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rlm_query_child_inherits_parent_supervision_posture() {
+        // WI#308 (run-33 AQ-1): the rlm child used to be built from
+        // `ThreadConfig::default()`, silently dropping the parent's
+        // supervised mode — a supervised tenant's mission verbs (and
+        // Never-tier registry tools) then ran ungated in the child. The
+        // child's execution context is built from its config, so the
+        // posture must be inherited for the child's gates to fail closed.
+        let mut thread = make_test_thread();
+        thread.config.supervised_mode = true;
+        thread.config.shared_conversation = true;
+        thread.config.supervised_timeout_secs = 42;
+        let effects = Arc::new(SupervisionProbeEffects {
+            contexts: Mutex::new(Vec::new()),
+        });
+        let llm: Arc<dyn crate::traits::llm::LlmBackend> = Arc::new(CodeOnceLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let leases = LeaseManager::new();
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let policy = PolicyEngine::new();
+        let mut recursive_tokens = TokenUsage::default();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            handle_rlm_query(
+                &[MontyObject::String("child task".into())],
+                &[],
+                &thread,
+                &llm,
+                &(effects.clone() as Arc<dyn EffectExecutor>),
+                &leases,
+                &policy,
+                &mut recursive_tokens,
+            ),
+        )
+        .await
+        .expect("child loop must terminate");
+
+        assert!(
+            matches!(result, ExtFunctionResult::Return(_)),
+            "child should complete, got {result:?}"
+        );
+        let contexts = effects.contexts.lock().unwrap();
+        assert_eq!(
+            contexts.as_slice(),
+            &[(true, true, 42)],
+            "the child's execution context must inherit the parent's supervision posture"
         );
     }
 }
