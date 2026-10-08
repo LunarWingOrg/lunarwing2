@@ -452,18 +452,40 @@ async fn persist_and_notify_thread_gate(
         )));
     }
 
-    let redacted_params = if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
-        crate::tools::redact_params(&parameters, tool.sensitive_params())
-    } else if crate::bridge::effect_adapter::is_mission_action_name(&action_name) {
+    let redacted_params = if crate::bridge::effect_adapter::is_mission_action_name(&action_name) {
         // Capability actions (WI#308 mission gates) have no registry tool to
         // supply sensitive_params; a mission approval prompt must not display
-        // the webhook_secret it carries for execution.
+        // the webhook_secret it carries for execution. This branch is checked
+        // first because dispatch routes these names to the mission handler
+        // even when a dynamic MCP/WASM tool registers the same name (run-33
+        // AQ-10): the display redaction must match the dispatch path.
         crate::tools::redact_params(
             &parameters,
             crate::bridge::effect_adapter::MISSION_SENSITIVE_PARAMS,
         )
+    } else if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
+        crate::tools::redact_params(&parameters, tool.sensitive_params())
     } else {
         parameters.clone()
+    };
+
+    // WI#308 (run-33 AQ-2): mission runs execute unsupervised by
+    // construction, so the prompt approving a run-spawning verb must say
+    // what the human is really authorizing.
+    let description = if crate::bridge::effect_adapter::MISSION_RUN_SPAWNING_ACTION_NAMES
+        .contains(&action_name.as_str())
+    {
+        format!(
+            "Tool '{}' requires {} (gate: {gate_name}). Approved mission runs execute unsupervised: the spawned mission threads do not pause for approval.",
+            action_name,
+            resume_kind.kind_name()
+        )
+    } else {
+        format!(
+            "Tool '{}' requires {} (gate: {gate_name})",
+            action_name,
+            resume_kind.kind_name()
+        )
     };
 
     let pending = PendingGate {
@@ -477,11 +499,7 @@ async fn persist_and_notify_thread_gate(
         call_id,
         parameters,
         display_parameters: Some(redacted_params),
-        description: format!(
-            "Tool '{}' requires {} (gate: {gate_name})",
-            action_name,
-            resume_kind.kind_name()
-        ),
+        description,
         resume_kind,
         created_at: chrono::Utc::now(),
         expires_at: chrono::Utc::now() + state.pending_gate_expiry,
@@ -8772,6 +8790,110 @@ pub(crate) mod tests {
         let captured = statuses.lock().expect("poisoned");
         assert_eq!(captured.len(), 1);
         assert!(matches!(captured[0], StatusUpdate::ApprovalNeeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn mission_gate_prompt_redacts_webhook_secret() {
+        // WI#308 (run-33 AQ-2/AQ-9): every display surface of a mission
+        // approval prompt is redacted while the persisted gate keeps the real
+        // parameters for execution, and a run-spawning verb's prompt discloses
+        // that mission runs execute unsupervised.
+        use crate::testing::StubChannel;
+        use futures::StreamExt;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("xmpp");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let store = Arc::new(TestStore::new());
+        let mut state = make_expected_test_state(store);
+        let sse = Arc::new(SseManager::new());
+        let mut events = sse
+            .subscribe_raw(Some("alice".to_string()))
+            .expect("SSE subscription should be available");
+        state.sse = Some(sse);
+
+        let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+        let conversation_id = lunarwing_engine::ConversationId::new();
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let secret = "whsec-live-signing-key";
+        let outcome = ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "mission_create".into(),
+            call_id: "call-mission-create".into(),
+            parameters: serde_json::json!({
+                "name": "digest",
+                "goal": "summarize the day",
+                "cadence": "webhook:events",
+                "webhook_secret": secret,
+            }),
+            resume_kind: lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+            resume_output: None,
+        };
+
+        let result = persist_and_notify_thread_gate(
+            &manager,
+            &state,
+            &message,
+            conversation_id,
+            thread_id,
+            outcome,
+        )
+        .await
+        .expect("mission gate should be persisted and announced");
+        assert_eq!(result, Some(String::new()));
+
+        let pending = state.pending_gates.list_for_user("alice").await;
+        assert_eq!(pending.len(), 1);
+        // The persisted gate keeps the real parameters for execution…
+        assert_eq!(pending[0].parameters["webhook_secret"], secret);
+        // …while every display surface is redacted.
+        let display = pending[0]
+            .display_parameters
+            .clone()
+            .expect("display parameters");
+        assert_eq!(display["webhook_secret"], "[REDACTED]");
+        assert_eq!(display["name"], "digest");
+        assert!(
+            pending[0].description.contains("unsupervised"),
+            "run-spawning approvals must disclose unsupervised runs: {}",
+            pending[0].description
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("GateRequired should be broadcast")
+            .expect("SSE stream should remain open");
+        match event {
+            crate::channels::web::types::SseEvent::GateRequired {
+                ref parameters,
+                ref tool_name,
+                ..
+            } => {
+                assert_eq!(tool_name, "mission_create");
+                assert!(parameters.contains("[REDACTED]"), "{parameters}");
+                assert!(!parameters.contains(secret), "{parameters}");
+            }
+            other => panic!("expected GateRequired, got {other:?}"),
+        }
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            StatusUpdate::ApprovalNeeded {
+                parameters,
+                allow_always,
+                ..
+            } => {
+                assert_eq!(parameters["webhook_secret"], "[REDACTED]");
+                assert!(!parameters.to_string().contains(secret));
+                assert!(!allow_always);
+            }
+            other => panic!("expected ApprovalNeeded, got {other:?}"),
+        }
     }
 
     // ── Phase 5: scoped control routing ──────────────────────────
