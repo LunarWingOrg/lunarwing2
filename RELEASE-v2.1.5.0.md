@@ -84,12 +84,21 @@ previous compatibility baseline.
   capability functions dispatch before the registry-tool gate stack, so they
   previously skipped the permission check, supervised-mode approval pause,
   rate limiting, and hooks every registered tool honors. They now run a
-  mission-specific gate subset before dispatch: a persisted
-  `tool_permissions.<verb>` = disabled denies the call, supervised mode
-  pauses every verb for human approval (one-shot; no always-grant is
-  offered, since capability actions have no grant to persist), each verb is
-  rate-limited per user (20/minute, 200/hour), and `ToolCall` hooks run with
-  `webhook_secret` redacted from hook payloads and approval prompts.
+  mission-specific gate subset before dispatch: Research threads — every
+  `rlm_query` child included — are refused the six mutating verbs outright,
+  closing a supervision bypass through recursive sub-agents (whose configs
+  now also inherit the parent's supervision posture); a persisted
+  `tool_permissions.<verb>` = disabled denies the call, with settings-store
+  read errors failing closed for the mutating verbs; supervised mode pauses
+  every verb for human approval (one-shot; no always-grant is offered, since
+  capability actions have no grant to persist); each verb is rate-limited
+  per user (20/minute, 200/hour); and `ToolCall` hooks run with
+  `webhook_secret` redacted from hook payloads and approval prompts. The
+  remaining scope is documented rather than claimed closed (see
+  `docs/architecture/ENGINE-V2.md`): mission-spawned threads run
+  unsupervised by construction — approval prompts for run-spawning verbs
+  say so — and the verbs steer any of the owner's missions, not just the
+  calling thread's own.
 
 ## Compatibility
 

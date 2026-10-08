@@ -44,7 +44,8 @@ WI#307 non-foreground execution/resume gate and shared discovery/lease
 denylist, the WI#309 resume-lease mission catalog, the WI#311 no-auto-complete
 rule for non-manual missions, the WI#319 pre-2026-07-26
 `Completed`-as-delete caveat in recovery guidance, and the WI#308 mission-verb
-dispatch gate subset (permission, supervision, rate limit, hooks).
+dispatch gate subset (Research-thread refusal, permission, supervision, rate
+limit, hooks) with its documented unsupervised-mission-run scope.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
@@ -938,26 +939,53 @@ tool aliases like dispatch does.
 Dispatch of the eight verbs carries its own gate subset at the adapter
 (WI#308), because `handle_mission_call` returns before the registry-tool
 gate stack that a registry tool handle keys. In the registry stack's order:
-a persisted `tool_permissions.<verb>` = disabled denies the call; supervised
-mode pauses every verb for human approval with `allow_always: false` (a
+Research threads — every `rlm_query` child included — are refused the six
+mutating verbs outright (create, fire, pause, resume, update, delete); a
+persisted `tool_permissions.<verb>` = disabled denies the call, and a
+settings-store read error fails closed for the mutating verbs (read-only
+verbs keep the registry path's deny-the-grant fallback); supervised mode
+pauses every verb for human approval with `allow_always: false` (a
 capability action has no always-approval grant to persist, so the dialog
 does not offer one) and an approved resume re-enters with the grant and
 executes; a per-user per-verb rate limit (20/minute, 200/hour) applies; and
 `ToolCall` hooks run with `webhook_secret` redacted (the approval prompt's
 display parameters are redacted the same way, while the persisted gate keeps
 the real parameters for execution). The approval-tier gates deliberately do
-not map: the verbs carry `ApprovalRequirement::Never` semantics (their
-definitions declare `requires_approval: false`), because autonomous Mission
-threads must steer their own missions and routines are created from shared
-channels by design — the shared-conversation, non-Foreground-`Always` and
-needs-prompt gates stay off, and the pre-flight auth gate is a no-op for
-capability actions, which hold no credential registrations. The coordination
-gate (a disabled agent executes nothing) applies to mission calls as before.
-One related seam remains by design: the structured-tier policy preflight
+not map: the verbs carry `ApprovalRequirement::Never` semantics by this
+gate's own choice — every v2 `ActionDef` declares `requires_approval: false`
+by construction, so the flag itself says nothing about the tier — because
+autonomous Mission threads must steer their own missions and routines are
+created from shared channels by design; the shared-conversation,
+non-Foreground-`Always` and needs-prompt gates stay off, and the pre-flight
+auth gate is a no-op for capability actions, which hold no credential
+registrations. The coordination gate (a disabled agent executes nothing)
+applies to mission calls as before.
+
+Two scope properties follow and are stated deliberately (WI#308 asked for
+the supervised-mode consequence, not just the gate ordering). First,
+supervision does not propagate into mission-spawned threads: mission
+threads are built from `ThreadConfig::default()`, which is unsupervised,
+and `AGENT_SUPERVISED_MODE` is applied only to foreground message threads —
+one approved `mission_create`/`mission_fire`/`mission_resume` (cron or
+webhook cadence) starts an autonomous, unsupervised agent whose own mission
+calls are limited only by the rate limit and hooks. The approval
+description for the run-spawning verbs (create, fire, resume, update) says
+so. `rlm_query` children, by contrast, inherit the parent's
+`supervised_mode`/`shared_conversation`/`supervised_timeout_secs` into
+their config, so a supervised parent's child gates fail closed. Second, the
+mission verbs are owner-scoped, not thread-scoped: any Foreground or
+Mission thread may create, re-target (goal, cadence, notify channels,
+webhook secret), fire or delete *any* of the owner's missions by name or
+UUID (`resolve_mission_id` carries no thread scoping), and the planner
+grants the verbs to every thread type under the Stateful tier. The v1
+equivalents (`routine_create`/`update`/`delete`/`fire`) sit on the
+autonomous-execution denylist; the v2 verbs do not — the Research-thread
+refusal above is the bound placed on them today. One related seam remains
+by design: the structured-tier policy preflight
 (`executor/structured.rs`) evaluates policy from `available_actions`, which
 stays registry-only so the model-visible catalog does not duplicate the
-verbs — a policy `Deny` for the `missions` capability would be consulted at
-lease grant, not per call.
+verbs — policy is therefore not consulted for the mission verbs, neither
+per call nor at lease grant.
 
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
