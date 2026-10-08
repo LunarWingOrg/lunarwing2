@@ -80,6 +80,25 @@ previous compatibility baseline.
 - **Non-bypassable secrets deletion approval (WI#307).** Per-call approval
   for secret deletion cannot be pre-granted; migration V28 revokes stale
   `always_allow` delete grants on both database backends.
+- **Mission verbs honor supervision (WI#308).** The eight `mission_*`
+  capability functions dispatch before the registry-tool gate stack, so they
+  previously skipped the permission check, supervised-mode approval pause,
+  rate limiting, and hooks every registered tool honors. They now run a
+  mission-specific gate subset before dispatch: Research threads — every
+  `rlm_query` child included — are refused the six mutating verbs outright,
+  closing a supervision bypass through recursive sub-agents (whose configs
+  now also inherit the parent's supervision posture); a persisted
+  `tool_permissions.<verb>` = disabled denies the call, with settings-store
+  read errors failing closed for the mutating verbs; supervised mode pauses
+  every verb for human approval (one-shot; no always-grant is offered, since
+  capability actions have no grant to persist); each verb is rate-limited
+  per user (20/minute, 200/hour); and `ToolCall` hooks run with
+  `webhook_secret` redacted from hook payloads and approval prompts. The
+  remaining scope is documented rather than claimed closed (see
+  `docs/architecture/ENGINE-V2.md`): mission-spawned threads run
+  unsupervised by construction — approval prompts for run-spawning verbs
+  say so — and the verbs steer any of the owner's missions, not just the
+  calling thread's own.
 
 ## Compatibility
 
@@ -474,8 +493,9 @@ protected pipeline are the remaining evidence before promotion (see
 `docs/ops/WORKER-CONTAINERS.md`). See
 [the open-items audit](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md) — a
 point-in-time snapshot dated 2026-10-04, with the #303 entry updated
-2026-10-06 and 2026-10-07 — for the disposition table, including items
-deferred to v2.1.6.0 and v2.1.8.0.
+2026-10-06, 2026-10-07 and the #308 entry updated 2026-10-08 — for the
+disposition table, including items deferred to v2.1.6.0
+and v2.1.8.0.
 
 **Accepted advisories.** Eight vulnerability advisories and one
 informational notice ship with recorded exposure; none is unaccounted for

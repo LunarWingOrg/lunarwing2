@@ -197,6 +197,32 @@ impl EffectBridgeAdapter {
         user_id: &str,
         lookup_name: &str,
     ) -> Option<PermissionState> {
+        match self
+            .tool_permission_state_checked(user_id, lookup_name)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    tool = lookup_name,
+                    %error,
+                    "engine v2: failed to read persisted tool permission; denying grant"
+                );
+                None
+            }
+        }
+    }
+
+    /// Error-propagating variant of [`Self::tool_permission_state`]. Callers
+    /// that must not fail open on a settings-store read error (the WI#308
+    /// mission gate) use this; the registry gate keeps the wrapper's
+    /// deny-the-grant fallback.
+    async fn tool_permission_state_checked(
+        &self,
+        user_id: &str,
+        lookup_name: &str,
+    ) -> Result<Option<PermissionState>, crate::error::DatabaseError> {
         let alias_conflict = matches!(lookup_name, "gitlab_tool" | "gitlab-tool")
             && crate::tools::permissions::gitlab_permission_alias_conflict(&self.tools).await;
         let mut persisted = None;
@@ -222,24 +248,18 @@ impl EffectBridgeAdapter {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        tracing::warn!(
-                            user_id,
-                            tool = lookup_name,
-                            %error,
-                            "engine v2: failed to read persisted tool permission; denying grant"
-                        );
-                        return None;
+                        return Err(error);
                     }
                 }
             }
 
             // Configured settings storage is authoritative. A deleted grant
             // revokes any process-lifetime cache entry immediately.
-            return persisted;
+            return Ok(persisted);
         }
 
         if alias_conflict {
-            return None;
+            return Ok(None);
         }
 
         if self
@@ -248,9 +268,9 @@ impl EffectBridgeAdapter {
             .await
             .contains(&(user_id.to_string(), lookup_name.to_string()))
         {
-            return Some(PermissionState::AlwaysAllow);
+            return Ok(Some(PermissionState::AlwaysAllow));
         }
-        None
+        Ok(None)
     }
 
     fn coerce_to_u64(v: &serde_json::Value) -> Option<u64> {
@@ -538,6 +558,10 @@ impl EffectBridgeAdapter {
     /// preflight consults): a thread holding no lease for the function — one
     /// resumed after a restart, or whose lease was revoked or narrowed — is
     /// told so instead of being promised a call preflight refuses (review R8).
+    /// WI#308 adds the dispatch gate's categorical refusal: a Research thread
+    /// is answered `callable: false` for the mutating verbs even while it
+    /// holds the lease, because [`Self::gate_mission_call`] would refuse the
+    /// call.
     ///
     /// The answer is static definition text, so it skips
     /// `execute_tool_with_safety` (parameter validation, per-tool timeout):
@@ -562,8 +586,13 @@ impl EffectBridgeAdapter {
             .find(|action| action.name == requested)?;
         // Clone the handle so the read guard is gone before the awaits below.
         let mission_manager = self.mission_manager.read().await.as_ref().cloned()?;
-        let callable =
-            thread_may_call(mission_manager.leases(), context.thread_id, &action.name).await;
+        // WI#308: `callable` must not promise a call the dispatch gate
+        // refuses — a Research thread holding the missions lease is still
+        // refused the mutating verbs (run-33 AQ-1).
+        let callable = thread_may_call(mission_manager.leases(), context.thread_id, &action.name)
+            .await
+            && !(context.thread_type == lunarwing_engine::ThreadType::Research
+                && MISSION_MUTATING_ACTION_NAMES.contains(&action.name.as_str()));
 
         let failed = |reason: String| -> crate::error::Error {
             crate::error::ToolError::ExecutionFailed {
@@ -616,7 +645,158 @@ impl EffectBridgeAdapter {
         .await
     }
 
+    /// Gate a `mission_*` capability call before dispatch (WI#308).
+    ///
+    /// The mission verbs are capability actions dispatched by
+    /// [`Self::handle_mission_call`] before the registry-tool gate stack in
+    /// [`Self::execute_action_internal`], so the gates keyed on a registry
+    /// tool handle (permission state, supervision, approval tiers, rate
+    /// limiting, hooks) never ran for them. This is the mission-specific
+    /// subset, in the registry stack's order:
+    ///
+    /// - Research threads — every `rlm_query` child included — are refused
+    ///   the mutating verbs outright (see [`MISSION_MUTATING_ACTION_NAMES`]);
+    /// - persisted `tool_permissions.<verb>` = disabled denies the call, and
+    ///   a settings-store read error fails closed for the mutating verbs
+    ///   (read-only verbs keep the registry path's deny-the-grant fallback);
+    /// - supervised mode pauses for human approval — every action, regardless
+    ///   of tier, like the registry gate. `allow_always` stays false: a
+    ///   capability action has no registry tool for
+    ///   `persist_always_allow` to key a grant on, so the dialog must not
+    ///   offer a persistence that cannot happen. An approved call resumes
+    ///   with `approval_already_granted` and skips this pause;
+    /// - a per-user per-verb rate limit applies;
+    /// - `ToolCall` hooks run with [`MISSION_SENSITIVE_PARAMS`] redacted.
+    ///
+    /// The approval-tier gates deliberately do not map: mission verbs carry
+    /// `ApprovalRequirement::Never` semantics by this gate's own choice —
+    /// every v2 `ActionDef` declares `requires_approval: false` by
+    /// construction, so the flag itself says nothing about the tier.
+    /// Autonomous Mission threads must steer their own missions and routines
+    /// are created from shared channels by design, so the
+    /// shared-conversation, non-Foreground-`Always` and needs-prompt gates
+    /// stay off. The pre-flight auth gate is a no-op for capability actions
+    /// (they hold no credential registrations). Note the scope this leaves
+    /// open: any Foreground or Mission thread may steer *any* of the owner's
+    /// missions by name or UUID, not just the mission it belongs to.
+    ///
+    /// Returns `Some(error)` when a gate trips, `None` to proceed — including
+    /// for non-mission calls and when no mission manager is wired (the call
+    /// then falls through to the registry path, as before).
+    async fn gate_mission_call(
+        &self,
+        action_name: &str,
+        parameters: &serde_json::Value,
+        context: &ThreadExecutionContext,
+        approval_already_granted: bool,
+    ) -> Option<EngineError> {
+        if !is_mission_action_name(action_name) || self.mission_manager.read().await.is_none() {
+            return None;
+        }
+
+        // Categorical refusal first (WI#308): Research threads — every
+        // `rlm_query` child included — never mutate missions. This must
+        // precede the supervision pause: an unsatisfiable approval prompt
+        // for a verb that is refused outright would only confuse.
+        if context.thread_type == lunarwing_engine::ThreadType::Research
+            && MISSION_MUTATING_ACTION_NAMES.contains(&action_name)
+        {
+            return Some(EngineError::LeaseDenied {
+                reason: format!(
+                    "Tool '{action_name}' is not available on Research threads; \
+                     mission changes must come from the foreground conversation \
+                     or the mission's own thread."
+                ),
+            });
+        }
+
+        match self
+            .tool_permission_state_checked(&context.user_id, action_name)
+            .await
+        {
+            Ok(Some(PermissionState::Disabled)) => {
+                return Some(EngineError::LeaseDenied {
+                    reason: format!(
+                        "Tool '{action_name}' is disabled for this user in tool permissions."
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // WI#308: fail closed for mutating verbs — an unreadable
+                // store may be hiding a persisted `disabled`. Read-only
+                // verbs keep the registry path's deny-the-grant fallback.
+                tracing::warn!(
+                    user_id = %context.user_id,
+                    tool = action_name,
+                    %error,
+                    "engine v2: failed to read persisted mission permission"
+                );
+                if MISSION_MUTATING_ACTION_NAMES.contains(&action_name) {
+                    return Some(EngineError::LeaseDenied {
+                        reason: format!(
+                            "Tool '{action_name}' is unavailable: tool permissions could not \
+                             be read. Retry once the settings store is healthy."
+                        ),
+                    });
+                }
+            }
+        }
+
+        if context.supervised_mode && !approval_already_granted {
+            return Some(Self::gate_paused(
+                "approval",
+                action_name,
+                context.current_call_id.as_deref(),
+                parameters.clone(),
+                lunarwing_engine::ResumeKind::Approval {
+                    allow_always: false,
+                },
+                None,
+            ));
+        }
+
+        if let crate::tools::rate_limiter::RateLimitResult::Limited { retry_after, .. } = self
+            .rate_limiter
+            .check_and_record(&context.user_id, action_name, &mission_rate_limit_config())
+            .await
+        {
+            return Some(EngineError::Effect {
+                reason: format!(
+                    "Tool '{action_name}' is rate limited. Try again in {:.0}s.",
+                    retry_after.as_secs_f64()
+                ),
+            });
+        }
+
+        let hook_event = HookEvent::ToolCall {
+            tool_name: action_name.to_string(),
+            parameters: crate::tools::redact_params(parameters, MISSION_SENSITIVE_PARAMS),
+            user_id: context.user_id.clone(),
+            context: format!("engine_v2:{}", context.thread_id),
+        };
+        match self.hooks.run(&hook_event).await {
+            Ok(HookOutcome::Reject { reason }) => {
+                return Some(EngineError::LeaseDenied {
+                    reason: format!("Tool '{action_name}' blocked by hook: {reason}"),
+                });
+            }
+            Err(crate::hooks::HookError::Rejected { reason }) => {
+                return Some(EngineError::LeaseDenied {
+                    reason: format!("Tool '{action_name}' blocked by hook: {reason}"),
+                });
+            }
+            Err(e) => {
+                debug!(tool = action_name, error = %e, "hook error (fail-open)");
+            }
+            Ok(HookOutcome::Continue { .. }) => {}
+        }
+        None
+    }
+
     /// Handle mission_* function calls. Returns None if not a mission call.
+    /// Callers must run [`Self::gate_mission_call`] first (WI#308);
+    /// `execute_action_internal` does.
     async fn handle_mission_call(
         &self,
         action_name: &str,
@@ -949,6 +1129,20 @@ impl EffectBridgeAdapter {
 
         let resolved_name = self.tools.resolve_name(action_name).await;
         let lookup_name = resolved_name.as_deref().unwrap_or(action_name);
+
+        // The mission_* verbs are capability actions dispatched by
+        // `handle_mission_call` below, before the registry-tool gate stack —
+        // so they carry their own gate subset (permission, supervision, rate
+        // limit, hooks; WI#308). Runs only when the call will actually
+        // dispatch as a mission call (a mission manager is wired and the name
+        // is a mission verb); anything else falls through to the registry
+        // gates unchanged.
+        if let Some(gate_error) = self
+            .gate_mission_call(action_name, &parameters, context, approval_already_granted)
+            .await
+        {
+            return Err(gate_error);
+        }
 
         if let Some(result) = self
             .handle_mission_call(action_name, &parameters, context)
@@ -1583,6 +1777,67 @@ fn extract_credential_name(error_msg: &str) -> Option<String> {
 
 /// Capability name the `mission_*` functions are registered under.
 pub(crate) const MISSIONS_CAPABILITY: &str = "missions";
+
+/// The `mission_*` verb names dispatched by
+/// [`EffectBridgeAdapter::handle_mission_call`]. The WI#308 gate subset keys
+/// off this set; `mission_action_defs` builds the advertised definitions from
+/// one function per verb, and `mission_action_names_cover_the_defs` keeps the
+/// two listings in agreement.
+pub(crate) const MISSION_ACTION_NAMES: &[&str] = &[
+    "mission_create",
+    "mission_list",
+    "mission_fire",
+    "mission_pause",
+    "mission_resume",
+    "mission_update",
+    "mission_history",
+    "mission_delete",
+];
+
+/// The mutating `mission_*` verbs (WI#308). Research threads — including
+/// every `rlm_query` child — may inspect missions but must not change them:
+/// a child spawned under a supervised parent would otherwise escape the
+/// approval pause through its copied `missions` lease. Mission threads keep
+/// the full verb set (they must steer their own missions), and Foreground
+/// threads stay subject to the supervision gate.
+pub(crate) const MISSION_MUTATING_ACTION_NAMES: &[&str] = &[
+    "mission_create",
+    "mission_fire",
+    "mission_pause",
+    "mission_resume",
+    "mission_update",
+    "mission_delete",
+];
+
+/// The verbs whose approval starts or reshapes autonomous mission runs
+/// (WI#308, run-33 AQ-2). Mission-spawned threads are unsupervised by
+/// construction (`ThreadConfig::default()`; `AGENT_SUPERVISED_MODE` applies
+/// only to foreground message threads), so the approval prompt for these
+/// verbs must say the resulting runs execute unsupervised.
+pub(crate) const MISSION_RUN_SPAWNING_ACTION_NAMES: &[&str] = &[
+    "mission_create",
+    "mission_fire",
+    "mission_resume",
+    "mission_update",
+];
+
+/// Whether `name` is a dispatched `mission_*` verb.
+pub(crate) fn is_mission_action_name(name: &str) -> bool {
+    MISSION_ACTION_NAMES.contains(&name)
+}
+
+/// Mission parameters that must never reach a hook payload or an approval
+/// prompt: `webhook_secret` (accepted by `mission_create`/`mission_update`)
+/// is a shared-secret credential. [`crate::tools::redact_params`] no-ops on
+/// verbs whose parameters do not contain the key.
+pub(crate) const MISSION_SENSITIVE_PARAMS: &[&str] = &["webhook_secret"];
+
+/// Per-user rate limit applied to each mission verb (WI#308). Mission calls
+/// had no rate limit before; the budget matches `memory_write`'s (a cheap
+/// state operation) and is keyed per verb, so listing cannot starve firing.
+fn mission_rate_limit_config() -> crate::tools::ToolRateLimitConfig {
+    crate::tools::ToolRateLimitConfig::new(20, 200)
+}
 
 /// Definitions of the `mission_*` capability functions dispatched by
 /// [`EffectBridgeAdapter::handle_mission_call`]. The router registers them so
@@ -2951,6 +3206,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
     #[derive(Default)]
     struct TestSettingsStore {
         values: RwLock<HashMap<String, HashMap<String, serde_json::Value>>>,
+        fail_reads: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -2960,6 +3216,11 @@ FINAL(echoed + "|" + http_result["error"])"#,
             user_id: &str,
             key: &str,
         ) -> Result<Option<serde_json::Value>, crate::error::DatabaseError> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::error::DatabaseError::Pool(
+                    "injected read failure".to_string(),
+                ));
+            }
             Ok(self
                 .values
                 .read()
@@ -4391,6 +4652,11 @@ FINAL(echoed + "|" + http_result["error"])"#,
     struct ResumedMissionLlm {
         leases: Arc<LeaseManager>,
         thread_id: lunarwing_engine::ThreadId,
+        /// Whether the script attempts the mutating `mission_update`.
+        /// WI#308: Research threads are refused the mutating verbs and an
+        /// executor-time refusal fails the whole code step, so the Research
+        /// variant stops at discovery.
+        mutate: bool,
     }
 
     #[async_trait]
@@ -4423,13 +4689,26 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 l.granted_actions,
                 lunarwing_engine::GrantedActions::Specific(_)
             )));
-            Ok(lunarwing_engine::LlmOutput {
-                response: lunarwing_engine::LlmResponse::Text(r#"```repl
+            // WI#308: a Research thread is refused the mutating verbs at the
+            // dispatch gate, and an executor-time refusal fails the whole code
+            // step (try/except does not catch it), so the Research variant
+            // proves discovery only and never attempts the update.
+            let script = if self.mutate {
+                r#"```repl
 info = await tool_info("mission_update")
 missions = await mission_list()
 await mission_update(id=missions[0]["id"], current_focus="resumed successfully")
 FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["name"] + "|" + str(len(missions)))
-```"#.into()),
+```"#
+            } else {
+                r#"```repl
+info = await tool_info("mission_update")
+missions = await mission_list()
+FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["name"] + "|" + str(len(missions)))
+```"#
+            };
+            Ok(lunarwing_engine::LlmOutput {
+                response: lunarwing_engine::LlmResponse::Text(script.into()),
                 usage: lunarwing_engine::TokenUsage::default(),
                 finish_reason: "stop".into(),
             })
@@ -4498,6 +4777,7 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             Arc::new(ResumedMissionLlm {
                 leases: leases.clone(),
                 thread_id: thread.id,
+                mutate: thread_type != lunarwing_engine::ThreadType::Research,
             }),
             adapter.clone(),
             store.clone(),
@@ -4522,11 +4802,24 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(
-            matches!(outcome, lunarwing_engine::ThreadOutcome::Completed { response: Some(ref text) }
-            if text == "callable|own|1"),
-            "{thread_type:?}/{state:?}: {outcome:?}"
-        );
+        let is_research = thread_type == lunarwing_engine::ThreadType::Research;
+        if is_research {
+            // WI#308: the dispatch gate refuses mutating verbs to Research
+            // threads, so discovery honestly reports the verb not-callable
+            // and the script stops at discovery (an executor-time refusal
+            // would fail the whole code step).
+            assert!(
+                matches!(outcome, lunarwing_engine::ThreadOutcome::Completed { response: Some(ref text) }
+                if text == "not-callable|own|1"),
+                "{thread_type:?}/{state:?}: {outcome:?}"
+            );
+        } else {
+            assert!(
+                matches!(outcome, lunarwing_engine::ThreadOutcome::Completed { response: Some(ref text) }
+                if text == "callable|own|1"),
+                "{thread_type:?}/{state:?}: {outcome:?}"
+            );
+        }
         assert_eq!(
             store
                 .load_mission(own.id)
@@ -4535,7 +4828,12 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 .unwrap()
                 .current_focus
                 .as_deref(),
-            Some("resumed successfully")
+            if is_research {
+                None
+            } else {
+                Some("resumed successfully")
+            },
+            "{thread_type:?}/{state:?}: mutation must match the gate"
         );
         assert!(
             store
@@ -4659,6 +4957,483 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert!(!info.to_string().contains("private-webhook-key"));
         assert_eq!(info["cadence"]["Webhook"]["path"], "events");
         assert!(info["timezone"].is_null());
+    }
+
+    // ── WI#308: mission verb gates ──────────────────────────────
+    //
+    // The mission_* capability actions dispatch before the registry-tool gate
+    // stack, so `gate_mission_call` applies their own subset: persisted
+    // permission state, supervised mode, per-verb rate limit, and ToolCall
+    // hooks (with webhook_secret redacted).
+
+    /// Captures every ToolCall payload it sees; rejects when armed.
+    #[derive(Default)]
+    struct MissionHookProbe {
+        seen: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        reject: Option<String>,
+    }
+
+    #[async_trait]
+    impl crate::hooks::Hook for MissionHookProbe {
+        fn name(&self) -> &str {
+            "mission-probe"
+        }
+
+        fn hook_points(&self) -> &[crate::hooks::HookPoint] {
+            &[crate::hooks::HookPoint::BeforeToolCall]
+        }
+
+        async fn execute(
+            &self,
+            event: &HookEvent,
+            _ctx: &crate::hooks::HookContext,
+        ) -> Result<HookOutcome, crate::hooks::HookError> {
+            if let HookEvent::ToolCall {
+                tool_name,
+                parameters,
+                ..
+            } = event
+            {
+                self.seen
+                    .lock()
+                    .expect("probe lock")
+                    .push((tool_name.clone(), parameters.clone()));
+            }
+            match &self.reject {
+                Some(reason) => Ok(HookOutcome::reject(reason.clone())),
+                None => Ok(HookOutcome::ok()),
+            }
+        }
+    }
+
+    /// An adapter wired to a mission manager with a known hook registry.
+    async fn mission_adapter_with_hooks(
+        hooks: Arc<HookRegistry>,
+    ) -> (EffectBridgeAdapter, Arc<MissionManager>) {
+        use lunarwing_safety::SafetyConfig;
+        let adapter = EffectBridgeAdapter::new(
+            Arc::new(ToolRegistry::new()),
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            hooks,
+        );
+        let (mgr, _leases, _store) = mission_manager_with_leases();
+        adapter.set_mission_manager(mgr.clone()).await;
+        (adapter, mgr)
+    }
+
+    #[test]
+    fn mission_action_names_cover_the_defs() {
+        let defs = mission_action_defs();
+        let def_names: std::collections::BTreeSet<&str> =
+            defs.iter().map(|def| def.name.as_str()).collect();
+        let gate_names: std::collections::BTreeSet<&str> =
+            MISSION_ACTION_NAMES.iter().copied().collect();
+        assert_eq!(
+            def_names, gate_names,
+            "the gate set and the dispatched definitions disagree"
+        );
+        assert!(
+            MISSION_ACTION_NAMES
+                .iter()
+                .all(|name| is_mission_action_name(name))
+        );
+        assert!(!is_mission_action_name("mission_createx"));
+        assert!(!is_mission_action_name("tool_info"));
+    }
+
+    #[tokio::test]
+    async fn supervised_mode_gates_every_mission_verb() {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_supervised_mission".to_string());
+        for verb in MISSION_ACTION_NAMES {
+            let result = adapter
+                .execute_action(verb, serde_json::json!({}), &lease(), &ctx)
+                .await;
+            match result {
+                Err(EngineError::GatePaused {
+                    gate_name,
+                    action_name,
+                    call_id,
+                    resume_kind,
+                    ..
+                }) => {
+                    assert_eq!(gate_name, "approval");
+                    assert_eq!(action_name, *verb);
+                    assert_eq!(call_id, "call_supervised_mission");
+                    assert!(
+                        matches!(
+                            *resume_kind,
+                            lunarwing_engine::ResumeKind::Approval {
+                                allow_always: false
+                            }
+                        ),
+                        "mission gates must not offer an always-grant that cannot persist"
+                    );
+                }
+                other => panic!("expected GatePaused for supervised {verb}, got {other:?}"),
+            }
+        }
+        // Nothing dispatched: no mission was created behind the gates.
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_mission_gate_resume_executes() {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_mission_create_resume".to_string());
+        let params = serde_json::json!({"name": "digest", "goal": "summarize the day"});
+
+        let gated = adapter
+            .execute_action("mission_create", params.clone(), &lease(), &ctx)
+            .await;
+        assert!(matches!(gated, Err(EngineError::GatePaused { .. })));
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty(),
+            "a gated mission_create must not dispatch"
+        );
+
+        // The approval resolution re-enters with approval_already_granted.
+        let resumed = adapter
+            .execute_resolved_pending_action("mission_create", params, &lease(), &ctx, true)
+            .await
+            .expect("approved resume executes");
+        assert!(!resumed.is_error);
+        assert_eq!(resumed.output["status"], "created");
+        assert_eq!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_webhook_mission_resume_executes_with_real_secret() {
+        // WI#308 (run-33 AQ-9): an approved webhook mission_create executes
+        // once with the REAL webhook_secret reaching the mission cadence —
+        // the redacted display copy must never leak into execution — and a
+        // denied gate (no resume) persists nothing.
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_webhook_mission".to_string());
+        let secret = "whsec-real-signing-key";
+        let params = serde_json::json!({
+            "name": "hook-digest",
+            "goal": "summarize webhook events",
+            "cadence": "webhook:events",
+            "webhook_secret": secret,
+        });
+
+        let gated = adapter
+            .execute_action("mission_create", params.clone(), &lease(), &ctx)
+            .await;
+        assert!(matches!(gated, Err(EngineError::GatePaused { .. })));
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty(),
+            "a denied gate (no resume) must persist nothing"
+        );
+
+        let resumed = adapter
+            .execute_resolved_pending_action("mission_create", params, &lease(), &ctx, true)
+            .await
+            .expect("approved resume executes");
+        assert!(!resumed.is_error, "{:?}", resumed.output);
+        assert_eq!(resumed.output["status"], "created");
+
+        let missions = mgr
+            .list_missions(ctx.project_id, &ctx.user_id)
+            .await
+            .expect("list missions");
+        assert_eq!(missions.len(), 1);
+        match &missions[0].cadence {
+            lunarwing_engine::MissionCadence::Webhook {
+                path,
+                secret: stored,
+            } => {
+                assert_eq!(path, "events");
+                assert_eq!(stored.as_deref(), Some(secret));
+            }
+            other => panic!("expected webhook cadence, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_mission_permission_denies_dispatch() {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test-user",
+                "tool_permissions.mission_list",
+                &serde_json::json!("disabled"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        let denied = adapter
+            .execute_action(
+                "mission_list",
+                serde_json::json!({}),
+                &lease(),
+                &mission_create_ctx(),
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(EngineError::LeaseDenied { .. })),
+            "a disabled mission verb must be denied, got {denied:?}"
+        );
+
+        // A verb without a Disabled record still dispatches (the unknown
+        // mission name errors inside the call, not at the gate).
+        let other = adapter
+            .execute_action(
+                "mission_history",
+                serde_json::json!({"name": "no-such-mission"}),
+                &lease(),
+                &mission_create_ctx(),
+            )
+            .await;
+        assert!(
+            !matches!(other, Err(EngineError::LeaseDenied { .. })),
+            "mission_history has no Disabled record and must not be lease-denied: {other:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_calls_are_rate_limited_per_verb() {
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let ctx = mission_create_ctx();
+        for attempt in 0..20 {
+            let result = adapter
+                .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+                .await
+                .expect("mission_list executes");
+            assert!(!result.is_error, "call {attempt} should succeed");
+        }
+        let limited = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await;
+        match limited {
+            Err(EngineError::Effect { reason }) => {
+                assert!(reason.contains("rate limited"), "got: {reason}");
+            }
+            other => panic!("expected a rate-limit error on the 21st call, got {other:?}"),
+        }
+        // The limit is per verb: mission_history still answers.
+        let other = adapter
+            .execute_action(
+                "mission_history",
+                serde_json::json!({"name": "no-such-mission"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        assert!(
+            !matches!(&other, Err(EngineError::Effect { reason }) if reason.contains("rate limited")),
+            "mission_history has its own bucket: {other:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_hooks_run_with_webhook_secret_redacted() {
+        let hooks = Arc::new(HookRegistry::default());
+        let probe = Arc::new(MissionHookProbe::default());
+        hooks.register(probe.clone()).await;
+        let (adapter, _mgr) = mission_adapter_with_hooks(hooks).await;
+
+        let params = serde_json::json!({
+            "name": "hooky",
+            "goal": "report on events",
+            "cadence": "webhook:events",
+            "webhook_secret": "super-secret-value",
+        });
+        let result = adapter
+            .execute_action("mission_create", params, &lease(), &mission_create_ctx())
+            .await
+            .expect("mission_create executes");
+        assert!(!result.is_error);
+
+        let seen = probe.seen.lock().expect("probe lock");
+        let (tool_name, hook_params) = seen
+            .iter()
+            .find(|(name, _)| name == "mission_create")
+            .expect("the hook saw the mission_create call");
+        assert_eq!(tool_name, "mission_create");
+        assert_eq!(hook_params["webhook_secret"], "[REDACTED]");
+        assert!(!hook_params.to_string().contains("super-secret-value"));
+        assert_eq!(hook_params["name"], "hooky");
+    }
+
+    #[tokio::test]
+    async fn mission_hook_rejection_blocks_dispatch() {
+        let hooks = Arc::new(HookRegistry::default());
+        let probe = Arc::new(MissionHookProbe {
+            reject: Some("policy says no".to_string()),
+            ..Default::default()
+        });
+        hooks.register(probe).await;
+        let (adapter, mgr) = mission_adapter_with_hooks(hooks).await;
+        let ctx = mission_create_ctx();
+
+        let result = adapter
+            .execute_action(
+                "mission_create",
+                serde_json::json!({"name": "blocked", "goal": "never runs"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        match result {
+            Err(EngineError::LeaseDenied { reason }) => {
+                assert!(reason.contains("policy says no"), "got: {reason}");
+            }
+            other => panic!("expected hook rejection to deny the call, got {other:?}"),
+        }
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty(),
+            "a hook-rejected mission_create must not dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn research_threads_cannot_mutate_missions() {
+        // WI#308 (run-33 AQ-1): every rlm_query child is a Research thread
+        // holding a copy of the parent's leases. Without this refusal a
+        // supervised parent's child could mutate missions with no approval.
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.thread_type = lunarwing_engine::ThreadType::Research;
+
+        for verb in MISSION_MUTATING_ACTION_NAMES {
+            let denied = adapter
+                .execute_action(verb, serde_json::json!({}), &lease(), &ctx)
+                .await;
+            match denied {
+                Err(EngineError::LeaseDenied { reason }) => {
+                    assert!(
+                        reason.contains("Research threads"),
+                        "unexpected refusal wording for {verb}: {reason}"
+                    );
+                }
+                other => panic!("expected LeaseDenied for Research {verb}, got {other:?}"),
+            }
+        }
+
+        // Read-only verbs still pass the gate: mission_list dispatches.
+        let listed = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await
+            .expect("mission_list executes on a Research thread");
+        assert!(!listed.is_error);
+
+        // The refusal precedes the supervision pause: a supervised Research
+        // thread is refused outright rather than paused for an approval
+        // prompt nobody can answer.
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_research_supervised".to_string());
+        let denied = adapter
+            .execute_action("mission_create", serde_json::json!({}), &lease(), &ctx)
+            .await;
+        assert!(
+            matches!(denied, Err(EngineError::LeaseDenied { .. })),
+            "Research refusal must precede the supervision pause, got {denied:?}"
+        );
+
+        // Nothing dispatched behind the refusals.
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_permission_read_error_fails_closed_for_mutating_verbs() {
+        // WI#308 (run-33 AQ-6): an unreadable settings store may be hiding a
+        // persisted `disabled`, so mutating verbs fail closed while
+        // read-only verbs keep the registry path's deny-the-grant fallback.
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .fail_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+        let ctx = mission_create_ctx();
+
+        let denied = adapter
+            .execute_action(
+                "mission_create",
+                serde_json::json!({"name": "digest", "goal": "summarize"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        match denied {
+            Err(EngineError::LeaseDenied { reason }) => {
+                assert!(
+                    reason.contains("could not be read"),
+                    "unexpected fail-closed wording: {reason}"
+                );
+            }
+            other => panic!("expected fail-closed LeaseDenied, got {other:?}"),
+        }
+
+        let listed = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await
+            .expect("mission_list executes despite the read error");
+        assert!(!listed.is_error);
+    }
+
+    #[tokio::test]
+    async fn mission_gate_inert_without_mission_manager() {
+        // Without a wired manager nothing dispatches as a mission call, so the
+        // mission gate (including supervised mode) must not fire: the call
+        // falls through to the registry path and reports the unknown tool.
+        let adapter = make_adapter();
+        let mut ctx = mission_create_ctx();
+        ctx.supervised_mode = true;
+        let result = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await
+            .expect("falls through to the registry path");
+        assert!(result.is_error);
     }
 
     #[cfg(feature = "libsql")]
