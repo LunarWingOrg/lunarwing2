@@ -558,6 +558,10 @@ impl EffectBridgeAdapter {
     /// preflight consults): a thread holding no lease for the function — one
     /// resumed after a restart, or whose lease was revoked or narrowed — is
     /// told so instead of being promised a call preflight refuses (review R8).
+    /// WI#308 adds the dispatch gate's categorical refusal: a Research thread
+    /// is answered `callable: false` for the mutating verbs even while it
+    /// holds the lease, because [`Self::gate_mission_call`] would refuse the
+    /// call.
     ///
     /// The answer is static definition text, so it skips
     /// `execute_tool_with_safety` (parameter validation, per-tool timeout):
@@ -582,8 +586,13 @@ impl EffectBridgeAdapter {
             .find(|action| action.name == requested)?;
         // Clone the handle so the read guard is gone before the awaits below.
         let mission_manager = self.mission_manager.read().await.as_ref().cloned()?;
-        let callable =
-            thread_may_call(mission_manager.leases(), context.thread_id, &action.name).await;
+        // WI#308: `callable` must not promise a call the dispatch gate
+        // refuses — a Research thread holding the missions lease is still
+        // refused the mutating verbs (run-33 AQ-1).
+        let callable = thread_may_call(mission_manager.leases(), context.thread_id, &action.name)
+            .await
+            && !(context.thread_type == lunarwing_engine::ThreadType::Research
+                && MISSION_MUTATING_ACTION_NAMES.contains(&action.name.as_str()));
 
         let failed = |reason: String| -> crate::error::Error {
             crate::error::ToolError::ExecutionFailed {
@@ -4643,6 +4652,11 @@ FINAL(echoed + "|" + http_result["error"])"#,
     struct ResumedMissionLlm {
         leases: Arc<LeaseManager>,
         thread_id: lunarwing_engine::ThreadId,
+        /// Whether the script attempts the mutating `mission_update`.
+        /// WI#308: Research threads are refused the mutating verbs and an
+        /// executor-time refusal fails the whole code step, so the Research
+        /// variant stops at discovery.
+        mutate: bool,
     }
 
     #[async_trait]
@@ -4675,13 +4689,26 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 l.granted_actions,
                 lunarwing_engine::GrantedActions::Specific(_)
             )));
-            Ok(lunarwing_engine::LlmOutput {
-                response: lunarwing_engine::LlmResponse::Text(r#"```repl
+            // WI#308: a Research thread is refused the mutating verbs at the
+            // dispatch gate, and an executor-time refusal fails the whole code
+            // step (try/except does not catch it), so the Research variant
+            // proves discovery only and never attempts the update.
+            let script = if self.mutate {
+                r#"```repl
 info = await tool_info("mission_update")
 missions = await mission_list()
 await mission_update(id=missions[0]["id"], current_focus="resumed successfully")
 FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["name"] + "|" + str(len(missions)))
-```"#.into()),
+```"#
+            } else {
+                r#"```repl
+info = await tool_info("mission_update")
+missions = await mission_list()
+FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["name"] + "|" + str(len(missions)))
+```"#
+            };
+            Ok(lunarwing_engine::LlmOutput {
+                response: lunarwing_engine::LlmResponse::Text(script.into()),
                 usage: lunarwing_engine::TokenUsage::default(),
                 finish_reason: "stop".into(),
             })
@@ -4750,6 +4777,7 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             Arc::new(ResumedMissionLlm {
                 leases: leases.clone(),
                 thread_id: thread.id,
+                mutate: thread_type != lunarwing_engine::ThreadType::Research,
             }),
             adapter.clone(),
             store.clone(),
@@ -4774,11 +4802,24 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(
-            matches!(outcome, lunarwing_engine::ThreadOutcome::Completed { response: Some(ref text) }
-            if text == "callable|own|1"),
-            "{thread_type:?}/{state:?}: {outcome:?}"
-        );
+        let is_research = thread_type == lunarwing_engine::ThreadType::Research;
+        if is_research {
+            // WI#308: the dispatch gate refuses mutating verbs to Research
+            // threads, so discovery honestly reports the verb not-callable
+            // and the script stops at discovery (an executor-time refusal
+            // would fail the whole code step).
+            assert!(
+                matches!(outcome, lunarwing_engine::ThreadOutcome::Completed { response: Some(ref text) }
+                if text == "not-callable|own|1"),
+                "{thread_type:?}/{state:?}: {outcome:?}"
+            );
+        } else {
+            assert!(
+                matches!(outcome, lunarwing_engine::ThreadOutcome::Completed { response: Some(ref text) }
+                if text == "callable|own|1"),
+                "{thread_type:?}/{state:?}: {outcome:?}"
+            );
+        }
         assert_eq!(
             store
                 .load_mission(own.id)
@@ -4787,7 +4828,12 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 .unwrap()
                 .current_focus
                 .as_deref(),
-            Some("resumed successfully")
+            if is_research {
+                None
+            } else {
+                Some("resumed successfully")
+            },
+            "{thread_type:?}/{state:?}: mutation must match the gate"
         );
         assert!(
             store
