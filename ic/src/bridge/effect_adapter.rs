@@ -197,6 +197,32 @@ impl EffectBridgeAdapter {
         user_id: &str,
         lookup_name: &str,
     ) -> Option<PermissionState> {
+        match self
+            .tool_permission_state_checked(user_id, lookup_name)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    tool = lookup_name,
+                    %error,
+                    "engine v2: failed to read persisted tool permission; denying grant"
+                );
+                None
+            }
+        }
+    }
+
+    /// Error-propagating variant of [`Self::tool_permission_state`]. Callers
+    /// that must not fail open on a settings-store read error (the WI#308
+    /// mission gate) use this; the registry gate keeps the wrapper's
+    /// deny-the-grant fallback.
+    async fn tool_permission_state_checked(
+        &self,
+        user_id: &str,
+        lookup_name: &str,
+    ) -> Result<Option<PermissionState>, crate::error::DatabaseError> {
         let alias_conflict = matches!(lookup_name, "gitlab_tool" | "gitlab-tool")
             && crate::tools::permissions::gitlab_permission_alias_conflict(&self.tools).await;
         let mut persisted = None;
@@ -222,24 +248,18 @@ impl EffectBridgeAdapter {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        tracing::warn!(
-                            user_id,
-                            tool = lookup_name,
-                            %error,
-                            "engine v2: failed to read persisted tool permission; denying grant"
-                        );
-                        return None;
+                        return Err(error);
                     }
                 }
             }
 
             // Configured settings storage is authoritative. A deleted grant
             // revokes any process-lifetime cache entry immediately.
-            return persisted;
+            return Ok(persisted);
         }
 
         if alias_conflict {
-            return None;
+            return Ok(None);
         }
 
         if self
@@ -248,9 +268,9 @@ impl EffectBridgeAdapter {
             .await
             .contains(&(user_id.to_string(), lookup_name.to_string()))
         {
-            return Some(PermissionState::AlwaysAllow);
+            return Ok(Some(PermissionState::AlwaysAllow));
         }
-        None
+        Ok(None)
     }
 
     fn coerce_to_u64(v: &serde_json::Value) -> Option<u64> {
@@ -625,7 +645,11 @@ impl EffectBridgeAdapter {
     /// limiting, hooks) never ran for them. This is the mission-specific
     /// subset, in the registry stack's order:
     ///
-    /// - persisted `tool_permissions.<verb>` = disabled denies the call;
+    /// - Research threads — every `rlm_query` child included — are refused
+    ///   the mutating verbs outright (see [`MISSION_MUTATING_ACTION_NAMES`]);
+    /// - persisted `tool_permissions.<verb>` = disabled denies the call, and
+    ///   a settings-store read error fails closed for the mutating verbs
+    ///   (read-only verbs keep the registry path's deny-the-grant fallback);
     /// - supervised mode pauses for human approval — every action, regardless
     ///   of tier, like the registry gate. `allow_always` stays false: a
     ///   capability action has no registry tool for
@@ -636,12 +660,16 @@ impl EffectBridgeAdapter {
     /// - `ToolCall` hooks run with [`MISSION_SENSITIVE_PARAMS`] redacted.
     ///
     /// The approval-tier gates deliberately do not map: mission verbs carry
-    /// `ApprovalRequirement::Never` semantics (their `ActionDef`s declare
-    /// `requires_approval: false`) because autonomous Mission threads must
-    /// steer their own missions and routines are created from shared channels
-    /// by design, so the shared-conversation, non-Foreground-`Always` and
-    /// needs-prompt gates stay off. The pre-flight auth gate is a no-op for
-    /// capability actions (they hold no credential registrations).
+    /// `ApprovalRequirement::Never` semantics by this gate's own choice —
+    /// every v2 `ActionDef` declares `requires_approval: false` by
+    /// construction, so the flag itself says nothing about the tier.
+    /// Autonomous Mission threads must steer their own missions and routines
+    /// are created from shared channels by design, so the
+    /// shared-conversation, non-Foreground-`Always` and needs-prompt gates
+    /// stay off. The pre-flight auth gate is a no-op for capability actions
+    /// (they hold no credential registrations). Note the scope this leaves
+    /// open: any Foreground or Mission thread may steer *any* of the owner's
+    /// missions by name or UUID, not just the mission it belongs to.
     ///
     /// Returns `Some(error)` when a gate trips, `None` to proceed — including
     /// for non-mission calls and when no mission manager is wired (the call
@@ -657,16 +685,53 @@ impl EffectBridgeAdapter {
             return None;
         }
 
-        if self
-            .tool_permission_state(&context.user_id, action_name)
-            .await
-            == Some(PermissionState::Disabled)
+        // Categorical refusal first (WI#308): Research threads — every
+        // `rlm_query` child included — never mutate missions. This must
+        // precede the supervision pause: an unsatisfiable approval prompt
+        // for a verb that is refused outright would only confuse.
+        if context.thread_type == lunarwing_engine::ThreadType::Research
+            && MISSION_MUTATING_ACTION_NAMES.contains(&action_name)
         {
             return Some(EngineError::LeaseDenied {
                 reason: format!(
-                    "Tool '{action_name}' is disabled for this user in tool permissions."
+                    "Tool '{action_name}' is not available on Research threads; \
+                     mission changes must come from the foreground conversation \
+                     or the mission's own thread."
                 ),
             });
+        }
+
+        match self
+            .tool_permission_state_checked(&context.user_id, action_name)
+            .await
+        {
+            Ok(Some(PermissionState::Disabled)) => {
+                return Some(EngineError::LeaseDenied {
+                    reason: format!(
+                        "Tool '{action_name}' is disabled for this user in tool permissions."
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // WI#308: fail closed for mutating verbs — an unreadable
+                // store may be hiding a persisted `disabled`. Read-only
+                // verbs keep the registry path's deny-the-grant fallback.
+                tracing::warn!(
+                    user_id = %context.user_id,
+                    tool = action_name,
+                    %error,
+                    "engine v2: failed to read persisted mission permission"
+                );
+                if MISSION_MUTATING_ACTION_NAMES.contains(&action_name) {
+                    return Some(EngineError::LeaseDenied {
+                        reason: format!(
+                            "Tool '{action_name}' is unavailable: tool permissions could not \
+                             be read. Retry once the settings store is healthy."
+                        ),
+                    });
+                }
+            }
         }
 
         if context.supervised_mode && !approval_already_granted {
@@ -1718,6 +1783,33 @@ pub(crate) const MISSION_ACTION_NAMES: &[&str] = &[
     "mission_update",
     "mission_history",
     "mission_delete",
+];
+
+/// The mutating `mission_*` verbs (WI#308). Research threads — including
+/// every `rlm_query` child — may inspect missions but must not change them:
+/// a child spawned under a supervised parent would otherwise escape the
+/// approval pause through its copied `missions` lease. Mission threads keep
+/// the full verb set (they must steer their own missions), and Foreground
+/// threads stay subject to the supervision gate.
+pub(crate) const MISSION_MUTATING_ACTION_NAMES: &[&str] = &[
+    "mission_create",
+    "mission_fire",
+    "mission_pause",
+    "mission_resume",
+    "mission_update",
+    "mission_delete",
+];
+
+/// The verbs whose approval starts or reshapes autonomous mission runs
+/// (WI#308, run-33 AQ-2). Mission-spawned threads are unsupervised by
+/// construction (`ThreadConfig::default()`; `AGENT_SUPERVISED_MODE` applies
+/// only to foreground message threads), so the approval prompt for these
+/// verbs must say the resulting runs execute unsupervised.
+pub(crate) const MISSION_RUN_SPAWNING_ACTION_NAMES: &[&str] = &[
+    "mission_create",
+    "mission_fire",
+    "mission_resume",
+    "mission_update",
 ];
 
 /// Whether `name` is a dispatched `mission_*` verb.
@@ -3105,6 +3197,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
     #[derive(Default)]
     struct TestSettingsStore {
         values: RwLock<HashMap<String, HashMap<String, serde_json::Value>>>,
+        fail_reads: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -3114,6 +3207,11 @@ FINAL(echoed + "|" + http_result["error"])"#,
             user_id: &str,
             key: &str,
         ) -> Result<Option<serde_json::Value>, crate::error::DatabaseError> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::error::DatabaseError::Pool(
+                    "injected read failure".to_string(),
+                ));
+            }
             Ok(self
                 .values
                 .read()
@@ -4982,6 +5080,61 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
     }
 
     #[tokio::test]
+    async fn approved_webhook_mission_resume_executes_with_real_secret() {
+        // WI#308 (run-33 AQ-9): an approved webhook mission_create executes
+        // once with the REAL webhook_secret reaching the mission cadence —
+        // the redacted display copy must never leak into execution — and a
+        // denied gate (no resume) persists nothing.
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_webhook_mission".to_string());
+        let secret = "whsec-real-signing-key";
+        let params = serde_json::json!({
+            "name": "hook-digest",
+            "goal": "summarize webhook events",
+            "cadence": "webhook:events",
+            "webhook_secret": secret,
+        });
+
+        let gated = adapter
+            .execute_action("mission_create", params.clone(), &lease(), &ctx)
+            .await;
+        assert!(matches!(gated, Err(EngineError::GatePaused { .. })));
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty(),
+            "a denied gate (no resume) must persist nothing"
+        );
+
+        let resumed = adapter
+            .execute_resolved_pending_action("mission_create", params, &lease(), &ctx, true)
+            .await
+            .expect("approved resume executes");
+        assert!(!resumed.is_error, "{:?}", resumed.output);
+        assert_eq!(resumed.output["status"], "created");
+
+        let missions = mgr
+            .list_missions(ctx.project_id, &ctx.user_id)
+            .await
+            .expect("list missions");
+        assert_eq!(missions.len(), 1);
+        match &missions[0].cadence {
+            lunarwing_engine::MissionCadence::Webhook {
+                path,
+                secret: stored,
+            } => {
+                assert_eq!(path, "events");
+                assert_eq!(stored.as_deref(), Some(secret));
+            }
+            other => panic!("expected webhook cadence, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn disabled_mission_permission_denies_dispatch() {
         let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
         adapter.set_mission_manager(mgr).await;
@@ -5125,6 +5278,101 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 .is_empty(),
             "a hook-rejected mission_create must not dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn research_threads_cannot_mutate_missions() {
+        // WI#308 (run-33 AQ-1): every rlm_query child is a Research thread
+        // holding a copy of the parent's leases. Without this refusal a
+        // supervised parent's child could mutate missions with no approval.
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.thread_type = lunarwing_engine::ThreadType::Research;
+
+        for verb in MISSION_MUTATING_ACTION_NAMES {
+            let denied = adapter
+                .execute_action(verb, serde_json::json!({}), &lease(), &ctx)
+                .await;
+            match denied {
+                Err(EngineError::LeaseDenied { reason }) => {
+                    assert!(
+                        reason.contains("Research threads"),
+                        "unexpected refusal wording for {verb}: {reason}"
+                    );
+                }
+                other => panic!("expected LeaseDenied for Research {verb}, got {other:?}"),
+            }
+        }
+
+        // Read-only verbs still pass the gate: mission_list dispatches.
+        let listed = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await
+            .expect("mission_list executes on a Research thread");
+        assert!(!listed.is_error);
+
+        // The refusal precedes the supervision pause: a supervised Research
+        // thread is refused outright rather than paused for an approval
+        // prompt nobody can answer.
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_research_supervised".to_string());
+        let denied = adapter
+            .execute_action("mission_create", serde_json::json!({}), &lease(), &ctx)
+            .await;
+        assert!(
+            matches!(denied, Err(EngineError::LeaseDenied { .. })),
+            "Research refusal must precede the supervision pause, got {denied:?}"
+        );
+
+        // Nothing dispatched behind the refusals.
+        assert!(
+            mgr.list_missions(ctx.project_id, &ctx.user_id)
+                .await
+                .expect("list missions")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_permission_read_error_fails_closed_for_mutating_verbs() {
+        // WI#308 (run-33 AQ-6): an unreadable settings store may be hiding a
+        // persisted `disabled`, so mutating verbs fail closed while
+        // read-only verbs keep the registry path's deny-the-grant fallback.
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .fail_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+        let ctx = mission_create_ctx();
+
+        let denied = adapter
+            .execute_action(
+                "mission_create",
+                serde_json::json!({"name": "digest", "goal": "summarize"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        match denied {
+            Err(EngineError::LeaseDenied { reason }) => {
+                assert!(
+                    reason.contains("could not be read"),
+                    "unexpected fail-closed wording: {reason}"
+                );
+            }
+            other => panic!("expected fail-closed LeaseDenied, got {other:?}"),
+        }
+
+        let listed = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await
+            .expect("mission_list executes despite the read error");
+        assert!(!listed.is_error);
     }
 
     #[tokio::test]
