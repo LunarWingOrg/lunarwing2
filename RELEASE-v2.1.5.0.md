@@ -111,7 +111,7 @@ previous compatibility baseline.
 | WASM runtime | Wasmtime/WASI 36.0.17; matching Cranelift family 0.123.17, unchanged |
 | Channel registry | darkirc 0.1.11, multica 0.1.14, weechat 0.2.12, xmpp 0.1.17 |
 | Tool registry | cavepony-tool 0.4.5, gitlab 0.1.8, gotify 0.1.2, llm-context 0.1.3, multica-bridge 0.1.4, ssh 0.1.3, vision-analyze 0.1.5, voice-transcribe 0.1.3, web-search 0.2.4 |
-| External workers | opencode2 `v2.0.24` (bumped from v2.0.21 via v2.0.23, WI#303 + checklist item #2); kimi-code `2.1.1`, opencode `v1.18.25`, and Pebble `2d0f3786…`, unchanged from v2.1.4.0 |
+| External workers | opencode2 `v2.0.26` (bumped from v2.0.21 via v2.0.23/v2.0.24, WI#303 + checklist item #2); kimi-code `2.1.1`, opencode `v1.18.25`, and Pebble `2d0f3786…`, unchanged from v2.1.4.0 |
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
@@ -405,20 +405,22 @@ full-validation job and a `lockfile-only-advisory-guard` that fails on
 stale entries and queries the same widened graph. The yanked-crate gate is
 verifiably enforced with no index-failure masking.
 
-The opencode2 worker bumps from v2.0.21 to **v2.0.24** (via v2.0.23: WI#303,
-tag SHA `0fd7e2829449b052abf0078666669302923d77af`; then v2.0.24, tag SHA
-`e7a34f09bfd9134dfade5a8ddb843f7030bc9a69` — both verified live). The v2.0.23
+The opencode2 worker bumps from v2.0.21 to **v2.0.26** (via v2.0.23: WI#303,
+tag SHA `0fd7e2829449b052abf0078666669302923d77af`; v2.0.24, tag SHA
+`e7a34f09bfd9134dfade5a8ddb843f7030bc9a69`; then v2.0.26, tag SHA
+`9b4ec5714d481559990db0a816d5dec19541a814` — all verified live). The v2.0.23
 step also corrected the executor's canonical-output and permission-reply call
 paths for the v2 promise client (WI#320 finding F7: `session.message.list` and
 `session.permission.reply` never existed — both are top-level client groups),
 and the image build now asserts every method path the bridge calls. The
-v2.0.24 step re-verified the whole bridge surface against the pinned tree
-(call paths, the `message.list` paging contract, event names, config/env
-surface, and the executed build-script patch contract) — the lane's surface
-is unchanged between the two tags. The corrections are source-verified
-(executor self-test plus construction of the pinned client); runtime
-re-verification against a live v2.0.24 server awaits the candidate image
-build on the first protected pipeline (see `docs/ops/WORKER-CONTAINERS.md`).
+v2.0.24 and v2.0.26 steps each re-verified the whole bridge surface against
+the pinned tree (call paths, the `message.list` paging contract, event names,
+config/env surface, and the executed build-script patch contract) — the
+lane's surface is unchanged across the tags. The corrections are
+source-verified (executor self-test plus construction of the pinned client);
+runtime re-verification against a live v2.0.26 server awaits the candidate
+image build on the first protected pipeline (see
+`docs/ops/WORKER-CONTAINERS.md`).
 Other worker pins are unchanged from v2.1.4.0.
 
 ### Documentation and Repository Maintenance
@@ -451,7 +453,7 @@ inbound links repaired and a per-file archive index.
    and installed WASM channels and tools; rebuild/reinstall all four
    channel and nine tool registry updates through the normal deployment
    path.
-4. **Worker images.** opencode2 bumps to v2.0.24 (WI#303 + checklist item
+4. **Worker images.** opencode2 bumps to v2.0.26 (WI#303 + checklist item
    #2) — promote the rebuilt image through the normal
    `worker-opencode2-candidate` → scan →
    promotion path before tenants use it; kimi-code 2.1.1, opencode v1.18.25,
@@ -486,8 +488,8 @@ inbound links repaired and a per-file archive index.
 **Carried known issues.** The daily-log gate follow-up work (WI#288) and
 the mission graceful-shutdown retry seam (WI#276) remain open with merge
 requests in flight and are not in this release. The opencode2 executor
-correction shipped with the v2.0.23 step of the v2.0.24 bump (WI#303) is
-source-verified but not yet runtime-verified against a live v2.0.24 server —
+correction shipped with the v2.0.23 step of the v2.0.26 bump (WI#303) is
+source-verified but not yet runtime-verified against a live v2.0.26 server —
 a green `worker-opencode2-candidate` build and a smoke test on the first
 protected pipeline are the remaining evidence before promotion (see
 `docs/ops/WORKER-CONTAINERS.md`). See
