@@ -2,7 +2,7 @@
 
 ## Codename: Bungei Fukkō (文芸復興, ぶんげいふっこう): The Renaissance
 
-**Release date:** 2026-10-XX (not yet released; first draft 2026-10-05, repass 2026-10-09)
+**Release date:** 2026-10-09
 
 > Ink long dried wakes;  
 > old letters learn new light —  
@@ -679,54 +679,6 @@ inbound links repaired and a per-file archive index.
    one boot-time notice per pre-upgrade retry marker.
 
 ### Security, Deployment, and Release Limitations
-
-**Carried known issues.** As of this repass (2026-10-09), three
-2.1.5.0-labeled items remain open: **#345** (runtime smoke of the corrected
-opencode2 executor against a live v2.0.24 server — the candidate image
-built green on master pipeline 5308, job 100055; the smoke is the remaining
-promotion evidence), **#319** (recovery-guidance legacy-delete caveat — the
-corrected guidance merged in this release via checklist item 34 (!1484);
-tracker close pending), and **#357** (external-worker self-exposure policy,
-filed 2026-10-09 — it gates the opencode2 v2.0.26 bump, checklist item 2,
-until its controls land). The daily-log gate self-healing (WI#288) and the
-mission graceful-shutdown retry seam (WI#276) were carried as open at the
-first draft and have since **landed in this release**. See
-[the open-items audit](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md) — a
-point-in-time snapshot dated 2026-10-04 (25 items), with later per-entry
-updates; the audit's own repass is checklist item 39 — for the disposition
-table, including items deferred to v2.1.6.0 and v2.1.8.0.
-
-**Known residuals (deferred, all filed).** So these notes stay honest about
-what this release does not close: **#352 / #356** — mission-verb gate
-follow-ups (`summarize_params` can surface a `webhook_secret` in channel
-status, `ApprovalRequested` stores raw params, no aggregate mission-call
-cap, and an approved mission thread holds the full owner-scoped mutating
-verb set, unsupervised by construction). **#351 / #353 / #354 / #355** —
-output-truncation follow-ups (the v1 per-turn 1000-byte head-only context
-rebuild, GitLab PAT/JWT detector gaps, END-less/encrypted PEM tails, and
-preserving pagination when a secret straddles an entire scan window).
-**#335 / #336** — daily-log backup evidence retention is positional (the
-pinned `.1` generation may predate the poison) and a successful generation
-roll-aside emits no audit line. **#337 / #338 / #339 / #341** —
-graceful-shutdown seam residuals (boot resolution is not idempotent, the
-boot sweep trusts the stamp's thread id without revalidation, a single-slot
-stamp shadows overlapping fires, and docs/tests wording). **#322** —
-`memory_write` can forge engine mission records under `engine/projects/**`
-(security).
-
-**Accepted advisories.** Six vulnerability advisories, one unsound notice,
-and two unmaintained notices ship with recorded exposure; none is
-unaccounted for in any committed lockfile. The audit does not cover the
-Python requirements files, the kimicode4lunarwing npm lockfiles, or the
-digest-pinned container images (Trivy-scanned separately) — see the audit
-document's scope section.
-
-**Engine behavior.** Engine V2 consumes system-prompt edits as
-initialization snapshots; activation still requires a tenant restart and a
-new conversation. `tool_info`'s describe path does not surface the
-routine→mission redirect (the execution-time error does). Existing parked
-recurring missions require explicit owner-authorized `mission_resume`; no
-bulk migration is performed by design.
 
 **Tenant logs.** `/tenant-logs` is unavailable when the container runtime
 cannot map the sandbox user onto the daemon uid; the log copy holds INFO
