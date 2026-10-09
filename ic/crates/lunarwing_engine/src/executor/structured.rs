@@ -194,7 +194,9 @@ pub async fn execute_action_calls(
                     early_events.push(EventKind::ApprovalRequested {
                         action_name: call.action_name.clone(),
                         call_id: call.id.clone(),
-                        parameters: Some(call.parameters.clone()),
+                        parameters: Some(crate::types::event::redact_event_params(
+                            &call.parameters,
+                        )),
                         description: None,
                         allow_always: None,
                         gate_name: None,
@@ -444,7 +446,10 @@ fn classify_exec_result(
             let event = EventKind::ApprovalRequested {
                 action_name,
                 call_id,
-                parameters: Some((*parameters).clone()),
+                // WI#352 (run-33 AQ-4): the persisted event history is a
+                // display record, not the resume path — store the redacted
+                // copy so a webhook_secret cannot sit at rest in it.
+                parameters: Some(crate::types::event::redact_event_params(&parameters)),
                 description: None,
                 allow_always: match *resume_kind {
                     crate::gate::ResumeKind::Approval { allow_always } => Some(allow_always),
