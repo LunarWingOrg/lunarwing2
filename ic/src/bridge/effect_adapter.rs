@@ -665,7 +665,8 @@ impl EffectBridgeAdapter {
     ///   `persist_always_allow` to key a grant on, so the dialog must not
     ///   offer a persistence that cannot happen. An approved call resumes
     ///   with `approval_already_granted` and skips this pause;
-    /// - a per-user per-verb rate limit applies;
+    /// - a per-user per-verb rate limit applies, plus an aggregate per-user
+    ///   bucket across the mutating verbs (WI#352, run-33 AQ-12);
     /// - `ToolCall` hooks run with [`MISSION_SENSITIVE_PARAMS`] redacted.
     ///
     /// The approval-tier gates deliberately do not map: mission verbs carry
@@ -764,6 +765,27 @@ impl EffectBridgeAdapter {
             return Some(EngineError::Effect {
                 reason: format!(
                     "Tool '{action_name}' is rate limited. Try again in {:.0}s.",
+                    retry_after.as_secs_f64()
+                ),
+            });
+        }
+
+        // WI#352 (run-33 AQ-12): an aggregate per-user bucket over the
+        // mutating verbs, so the per-verb budgets cannot sum to 160 calls/min
+        // across the verb set.
+        if MISSION_MUTATING_ACTION_NAMES.contains(&action_name)
+            && let crate::tools::rate_limiter::RateLimitResult::Limited { retry_after, .. } = self
+                .rate_limiter
+                .check_and_record(
+                    &context.user_id,
+                    MISSION_AGGREGATE_RATE_KEY,
+                    &mission_aggregate_rate_limit_config(),
+                )
+                .await
+        {
+            return Some(EngineError::Effect {
+                reason: format!(
+                    "Mission changes are rate limited across all mission verbs. Try again in {:.0}s.",
                     retry_after.as_secs_f64()
                 ),
             });
@@ -1837,6 +1859,20 @@ pub(crate) const MISSION_SENSITIVE_PARAMS: &[&str] = &["webhook_secret"];
 /// state operation) and is keyed per verb, so listing cannot starve firing.
 fn mission_rate_limit_config() -> crate::tools::ToolRateLimitConfig {
     crate::tools::ToolRateLimitConfig::new(20, 200)
+}
+
+/// Synthetic rate-limiter key for the aggregate mutation bucket (WI#352,
+/// run-33 AQ-12). `*` is not a valid tool-name character, so this cannot
+/// collide with a registry tool or a real verb.
+const MISSION_AGGREGATE_RATE_KEY: &str = "mission_*";
+
+/// Aggregate per-user rate limit across the mutating mission verbs (WI#352,
+/// run-33 AQ-12). The per-verb budget alone sums to 6 x 20/min and
+/// 6 x 200/h across the mutating verbs; this bucket caps total mutations at
+/// 60/min and 600/h regardless of verb mix. Read-only verbs (list, history)
+/// stay per-verb only so inspection cannot starve a mutation budget.
+fn mission_aggregate_rate_limit_config() -> crate::tools::ToolRateLimitConfig {
+    crate::tools::ToolRateLimitConfig::new(60, 600)
 }
 
 /// Definitions of the `mission_*` capability functions dispatched by
@@ -5263,6 +5299,55 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert!(
             !matches!(&other, Err(EngineError::Effect { reason }) if reason.contains("rate limited")),
             "mission_history has its own bucket: {other:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_mission_calls_share_an_aggregate_rate_limit() {
+        // WI#352 (run-33 AQ-12): per-verb budgets alone sum to 6 x 20/min
+        // across the mutating verbs. The aggregate bucket caps total
+        // mutations at 60/min, so spreading calls across verbs cannot exceed
+        // it. Dispatch of a bogus mission name fails AFTER the gate as an
+        // is_error result, so every Ok below proves the gate passed.
+        let (adapter, mgr, _store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let ctx = mission_create_ctx();
+
+        let bogus = serde_json::json!({"name": "no-such-mission"});
+        for verb in ["mission_pause", "mission_resume", "mission_update"] {
+            for attempt in 0..20 {
+                let result = adapter
+                    .execute_action(verb, bogus.clone(), &lease(), &ctx)
+                    .await;
+                match result {
+                    Ok(_) => {}
+                    Err(EngineError::Effect { reason }) if reason.contains("rate limited") => {
+                        panic!("{verb} call {attempt} hit a rate limit before the aggregate budget")
+                    }
+                    Err(other) => panic!("{verb} call {attempt} failed unexpectedly: {other:?}"),
+                }
+            }
+        }
+
+        // 60 mutating calls consumed the aggregate budget; the 61st is
+        // limited even though mission_delete's own per-verb count is 0.
+        let limited = adapter
+            .execute_action("mission_delete", bogus.clone(), &lease(), &ctx)
+            .await;
+        match limited {
+            Err(EngineError::Effect { reason }) => {
+                assert!(reason.contains("rate limited"), "got: {reason}");
+            }
+            other => panic!("expected an aggregate rate-limit error, got {other:?}"),
+        }
+
+        // Read-only verbs are not charged to the mutation bucket.
+        let listed = adapter
+            .execute_action("mission_list", serde_json::json!({}), &lease(), &ctx)
+            .await;
+        assert!(
+            !matches!(&listed, Err(EngineError::Effect { reason }) if reason.contains("rate limited")),
+            "mission_list stays per-verb only: {listed:?}"
         );
     }
 
