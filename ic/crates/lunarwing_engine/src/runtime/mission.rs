@@ -7317,9 +7317,10 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             // proof — with its re-stamp caveat; the last history thread id
             // (and its created_at when the thread loads) is the robust check;
             // the fallback and the review instruction name mission_history.
-            assert!(response.contains(
-                "An updated_at before 2026-07-26 is consistent with a legacy delete"
-            ));
+            assert!(
+                response
+                    .contains("An updated_at before 2026-07-26 is consistent with a legacy delete")
+            );
             assert!(response.contains("but is not proof"));
             assert!(response.contains(
                 "updated_at can also be re-stamped by the restart recorder or the legacy user-id migration"
