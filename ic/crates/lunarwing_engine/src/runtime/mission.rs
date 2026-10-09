@@ -740,7 +740,10 @@ impl MissionManager {
         {
             let goal = goal.into();
             let goal_differs = existing.goal != goal;
-            let cadence_differs = existing.cadence != cadence;
+            // WI#352 (AO-7): webhook cadences compare by path only — the
+            // secret is a runtime credential, so a dedup probe carrying a
+            // different secret is not a schedule change.
+            let cadence_differs = existing.cadence.schedule_differs(&cadence);
             if goal_differs || cadence_differs {
                 warn!(
                     mission_id = %existing.id,
@@ -6035,6 +6038,80 @@ mod tests {
         assert!(third.deduplicated);
         assert!(!third.goal_differs);
         assert!(!third.cadence_differs);
+    }
+
+    #[tokio::test]
+    async fn webhook_dedup_compares_cadence_by_path_only() {
+        // WI#352 (AO-7): the webhook secret is a runtime credential, not part
+        // of the schedule — a same-name re-create on the same path with a
+        // different secret must not report a cadence difference.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        let first = mgr
+            .create_mission_detailed(
+                project,
+                "test-user",
+                "hook",
+                "goal",
+                MissionCadence::Webhook {
+                    path: "events".into(),
+                    secret: Some("first-secret".into()),
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(!first.deduplicated);
+
+        let second = mgr
+            .create_mission_detailed(
+                project,
+                "test-user",
+                "hook",
+                "goal",
+                MissionCadence::Webhook {
+                    path: "events".into(),
+                    secret: Some("rotated-secret".into()),
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(second.deduplicated);
+        assert_eq!(first.id, second.id);
+        assert!(!second.goal_differs);
+        assert!(
+            !second.cadence_differs,
+            "a secret-only difference is not a cadence difference"
+        );
+        // The stored secret is unchanged: dedup returns the existing mission
+        // rather than applying the probe's parameters.
+        let persisted = store.load_mission(first.id).await.unwrap().unwrap();
+        assert!(matches!(
+            persisted.cadence,
+            MissionCadence::Webhook { ref path, ref secret }
+                if path == "events" && secret.as_deref() == Some("first-secret")
+        ));
+
+        // A different path IS a cadence difference.
+        let third = mgr
+            .create_mission_detailed(
+                project,
+                "test-user",
+                "hook",
+                "goal",
+                MissionCadence::Webhook {
+                    path: "other-events".into(),
+                    secret: Some("first-secret".into()),
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(third.deduplicated);
+        assert!(third.cadence_differs);
     }
 
     #[tokio::test]
