@@ -487,7 +487,7 @@ inbound links repaired and a per-file archive index.
 **Carried known issues.** Four 2.1.5.0-labeled tracker items remain open
 at this draft, two of them tied to goals items still in flight: the
 boot-warning legacy-delete clue mismatch (WI#319, goals item 34 — its
-!1479 attempt closed unmerged), and the maintainer punch list #347 (goals
+!1479 attempt closed unmerged, successor !1484 in review), and the maintainer punch list #347 (goals
 item 28's verify passes do not cover its runner-host concurrency point,
 which has no dedicated owner). The other two are the v2.0.24 opencode2
 runtime smoke (#345) and WI#349, whose head+tail truncation fix merged via
