@@ -1222,7 +1222,7 @@ async fn handle_execute_action(
                     EventKind::ApprovalRequested {
                         action_name: name.clone(),
                         call_id: call_id.clone(),
-                        parameters: Some(params.clone()),
+                        parameters: Some(crate::types::event::redact_event_params(&params)),
                         description: None,
                         allow_always: None,
                         gate_name: None,
@@ -1327,7 +1327,7 @@ async fn handle_execute_action(
                 EventKind::ApprovalRequested {
                     action_name: name.clone(),
                     call_id: call_id.clone(),
-                    parameters: Some((*parameters).clone()),
+                    parameters: Some(crate::types::event::redact_event_params(&parameters)),
                     description: None,
                     allow_always: match resume_kind.as_ref() {
                         crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),
@@ -1583,7 +1583,7 @@ async fn handle_execute_actions_parallel(
                         EventKind::ApprovalRequested {
                             action_name: pc.name.clone(),
                             call_id: pc.call_id.clone(),
-                            parameters: Some(pc.params.clone()),
+                            parameters: Some(crate::types::event::redact_event_params(&pc.params)),
                             description: None,
                             allow_always: None,
                             gate_name: None,
@@ -1865,7 +1865,10 @@ async fn execute_single_action(
             let event = EventKind::ApprovalRequested {
                 action_name: name.to_string(),
                 call_id: call_id.to_string(),
-                parameters: Some((*parameters).clone()),
+                // WI#352 (run-33 AQ-4): the persisted event history is a
+                // display record, not the resume path — store the redacted
+                // copy so a webhook_secret cannot sit at rest in it.
+                parameters: Some(crate::types::event::redact_event_params(&parameters)),
                 description: None,
                 allow_always: match resume_kind.as_ref() {
                     crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),

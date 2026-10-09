@@ -9,11 +9,29 @@ use uuid::Uuid;
 
 use crate::types::capability::LeaseId;
 
+/// Parameter keys whose values must never appear in a human-readable summary
+/// or a persisted event payload (WI#352, run-33 AQ-4/AQ-5). Exact match on the
+/// top-level object key. `webhook_secret` is the `mission_create` /
+/// `mission_update` shared-secret credential; the rest are common credential
+/// key names an LLM may supply verbatim on a freeform tool call.
+pub(crate) const SENSITIVE_PARAM_KEYS: &[&str] = &[
+    "api_key",
+    "auth_token",
+    "password",
+    "secret",
+    "token",
+    "webhook_secret",
+];
+
 /// Generate a short human-readable summary of tool parameters for display.
 ///
 /// For `http`: shows the URL. For `web_search`: shows the query.
 /// For other tools: shows the first string argument, truncated.
 /// Returns `None` for empty or unrecognizable params.
+///
+/// The generic fallback skips values keyed under [`SENSITIVE_PARAM_KEYS`] so a
+/// credential (e.g. a `mission_create` `webhook_secret`) cannot ride the
+/// summary into a channel status line or a persisted event (WI#352, AQ-5).
 pub fn summarize_params(action_name: &str, params: &serde_json::Value) -> Option<String> {
     let summary = match action_name {
         "http" | "web_fetch" => params
@@ -45,10 +63,12 @@ pub fn summarize_params(action_name: &str, params: &serde_json::Value) -> Option
             .and_then(|v| v.as_str())
             .map(|c| truncate(c, 40)),
         _ => {
-            // Generic: show first string value
+            // Generic: show the first string value whose key is not on the
+            // sensitive-key deny list (WI#352, AQ-5).
             if let Some(obj) = params.as_object() {
-                obj.values()
-                    .find_map(|v| v.as_str())
+                obj.iter()
+                    .filter(|(key, _)| !SENSITIVE_PARAM_KEYS.contains(&key.as_str()))
+                    .find_map(|(_, v)| v.as_str())
                     .map(|s| truncate(s, 50))
             } else {
                 None
@@ -56,6 +76,28 @@ pub fn summarize_params(action_name: &str, params: &serde_json::Value) -> Option
         }
     };
     summary.filter(|s| !s.is_empty())
+}
+
+/// Return a display copy of `params` with every [`SENSITIVE_PARAM_KEYS`] value
+/// replaced by `"[REDACTED]"` (WI#352, run-33 AQ-4).
+///
+/// Used when a gated call's parameters are persisted in an
+/// [`EventKind::ApprovalRequested`] event: the event history is an at-rest
+/// record, not the resume path, so it keeps only the redacted copy. The
+/// pending gate holds the raw parameters for the actual resume.
+pub fn redact_event_params(params: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = params.clone();
+    if let Some(obj) = redacted.as_object_mut() {
+        for key in SENSITIVE_PARAM_KEYS {
+            if obj.contains_key(*key) {
+                obj.insert(
+                    (*key).to_string(),
+                    serde_json::Value::String("[REDACTED]".into()),
+                );
+            }
+        }
+    }
+    redacted
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -211,6 +253,13 @@ pub enum EventKind {
     ApprovalRequested {
         action_name: String,
         call_id: String,
+        /// Display copy of the gated call's parameters with
+        /// [`SENSITIVE_PARAM_KEYS`] values redacted (WI#352, run-33 AQ-4):
+        /// this event is persisted in the thread's event history, which is an
+        /// at-rest record, not the resume path. The raw parameters live on
+        /// the host's pending gate (unredacted, needed to resume) and in the
+        /// thread transcript's action arguments (a pre-existing at-rest
+        /// class).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parameters: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,8 +301,63 @@ pub enum EventKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventKind, ThreadEvent, preview_from_output};
+    use super::{EventKind, ThreadEvent, preview_from_output, redact_event_params, summarize_params};
     use crate::types::thread::ThreadId;
+
+    #[test]
+    fn summarize_params_never_surfaces_sensitive_values() {
+        // WI#352 (run-33 AQ-5): a CodeAct mission_create carrying a webhook
+        // secret must not put the secret into the channel status summary,
+        // even when it is the only (or first) string value.
+        let secret_only = serde_json::json!({"webhook_secret": "super-secret-value"});
+        assert_eq!(summarize_params("mission_create", &secret_only), None);
+
+        let with_benign = serde_json::json!({
+            "webhook_secret": "super-secret-value",
+            "goal": "report on events",
+        });
+        let summary = summarize_params("mission_create", &with_benign)
+            .expect("a non-sensitive string value still summarizes");
+        assert!(!summary.contains("super-secret-value"));
+
+        // A secret that is not the first string value is still skipped.
+        let trailing_secret = serde_json::json!({
+            "name": "n",
+            "webhook_secret": "super-secret-value",
+        });
+        let summary = summarize_params("mission_update", &trailing_secret)
+            .expect("name summarizes");
+        assert_eq!(summary, "n");
+
+        for key in ["api_key", "auth_token", "password", "secret", "token"] {
+            let params = serde_json::json!({key: "super-secret-value"});
+            assert_eq!(
+                summarize_params("some_custom_tool", &params),
+                None,
+                "{key} must be deny-listed"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_event_params_replaces_only_sensitive_values() {
+        let params = serde_json::json!({
+            "name": "digest",
+            "webhook_secret": "super-secret-value",
+            "max_threads_per_day": 5,
+        });
+        let redacted = redact_event_params(&params);
+        assert_eq!(redacted["webhook_secret"], "[REDACTED]");
+        assert_eq!(redacted["name"], "digest");
+        assert_eq!(redacted["max_threads_per_day"], 5);
+        assert!(!redacted.to_string().contains("super-secret-value"));
+        // The input is untouched.
+        assert_eq!(params["webhook_secret"], "super-secret-value");
+
+        // Non-object params pass through unchanged.
+        let scalar = serde_json::json!("webhook_secret");
+        assert_eq!(redact_event_params(&scalar), scalar);
+    }
 
     #[test]
     fn response_delta_round_trips_through_serde() {
