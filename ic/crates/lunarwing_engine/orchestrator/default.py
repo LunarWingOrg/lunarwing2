@@ -404,12 +404,31 @@ def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
     # Break every ChatML-family token opener before persistence so re-tokenizing
     # history cannot turn tool data into a forged role boundary.
     text = neutralize_role_token_openers(output)
-    marker = "\n... (tool output truncated)"
     if len(text) <= max_chars:
         return text
-    if max_chars <= len(marker):
-        return marker[:max_chars]
-    return text[:max_chars - len(marker)] + marker
+    # WI#349: keep head AND tail, eliding the middle. List-tool envelopes
+    # (e.g. the GitLab guest) serialize pagination/completion metadata —
+    # next_cursor, truncated, complete, resume_page — at the very tail; a
+    # head-only cut amputated it, so the model never saw truncation state or a
+    # real cursor and improvised one (GitLab 500s, WI#344). The marker always
+    # separates the halves, so the cut can never fuse the two sides of a
+    # neutralized role-token opener back into "<|". The marker prints the
+    # elided count, whose digit count feeds the budget; settle that fixed
+    # point (converges immediately for real sizes).
+    elided = len(text) - max_chars
+    for _ in range(3):
+        marker = ("\n... (tool output truncated, " + str(elided) +
+                  " middle chars elided) ...\n")
+        keep = max_chars - len(marker)
+        if keep < 2:
+            return marker[:max_chars]
+        next_elided = len(text) - keep
+        if next_elided == elided:
+            break
+        elided = next_elided
+    head_chars = keep // 2
+    tail_chars = keep - head_chars
+    return text[:head_chars] + marker + text[len(text) - tail_chars:]
 
 
 def sanitize_action_results(messages):

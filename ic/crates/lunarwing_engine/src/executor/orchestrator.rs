@@ -3088,6 +3088,76 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn structured_action_output_preserves_pagination_tail() {
+        // WI#349: list-tool envelopes (e.g. the GitLab guest) serialize
+        // pagination/completion metadata at the very tail. Truncation must
+        // keep head AND tail so the model always sees the real truncation
+        // state and next_cursor — the head-only cut amputated them and the
+        // model improvised cursors (WI#344 GitLab 500s).
+        let envelope = r#"'{"items": ["' + "x" * 9000 + '"], "pagination": {"next_cursor": "CURSOR-789", "truncated": True, "complete": False}}'"#;
+        assert!(eval_python_bool(&format!(
+            r#"len(format_action_output({envelope})) == MAX_ACTION_OUTPUT_CHARS"#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#""CURSOR-789" in format_action_output({envelope})"#
+        )));
+        // JSON-key form: the bare word "truncated" also appears in the
+        // elision marker itself, so only the keyed form pins the tail.
+        assert!(eval_python_bool(&format!(
+            r#""\"truncated\": True" in format_action_output({envelope}) and "\"complete\": False" in format_action_output({envelope})"#
+        )));
+        // The tail is a true suffix of the original envelope.
+        assert!(eval_python_bool(&format!(
+            r#"format_action_output({envelope}).endswith("\"complete\": False}}}}")"#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#"format_action_output({envelope}).startswith('{{"items":')"#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#""middle chars elided" in format_action_output({envelope})"#
+        )));
+        // Head-only content keeps head AND tail, with the exact elided count.
+        assert!(eval_python_bool(
+            r#"format_action_output("x" * 9000).startswith("x" * 100)"#
+        ));
+        assert!(eval_python_bool(
+            r#"format_action_output("x" * 9000).endswith("x" * 100)"#
+        ));
+        assert!(eval_python_bool(
+            r#""1059 middle chars elided" in format_action_output("x" * 9000)"#
+        ));
+        // Already-bounded output passes through unchanged (idempotent).
+        assert!(eval_python_bool(&format!(
+            r#"format_action_output(format_action_output({envelope})) == format_action_output({envelope})"#
+        )));
+        // Tiny budgets still bound the result.
+        assert!(eval_python_bool(
+            r#"len(format_action_output("x" * 100, 20)) <= 20"#
+        ));
+    }
+
+    #[test]
+    fn persisted_action_output_sanitize_preserves_pagination_tail() {
+        // WI#349: the history-repair path (sanitize_action_results) goes
+        // through the same head+tail bound, so a persisted RAW oversized
+        // result keeps its pagination tail on the next sanitize pass.
+        let envelope = r#"'{"items": ["' + "x" * 9000 + '"], "pagination": {"next_cursor": "CURSOR-789", "truncated": True, "complete": False}}'"#;
+        let sanitized = format!(
+            r#"sanitize_action_results([{{"role": "ActionResult", "content": {envelope}}}])[0]["content"]"#
+        );
+        assert!(eval_python_bool(&format!(r#""CURSOR-789" in {sanitized}"#)));
+        assert!(eval_python_bool(&format!(
+            r#""middle chars elided" in {sanitized}"#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#"len({sanitized}) == MAX_ACTION_OUTPUT_CHARS"#
+        )));
+        assert!(eval_python_bool(&format!(
+            r#"{sanitized}.endswith("\"complete\": False}}}}")"#
+        )));
+    }
+
     #[tokio::test]
     async fn retrieve_docs_neutralizes_content_and_labels_provenance() {
         // WI#132 item 1: __retrieve_docs__ is the LIVE retrieval path for

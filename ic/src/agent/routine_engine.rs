@@ -2158,12 +2158,13 @@ async fn execute_lightweight_with_tools(
 
                 // Truncate oversized tool output to prevent unbounded context growth.
                 // Routine tool loops are lightweight and should not accumulate
-                // large payloads across iterations.
+                // large payloads across iterations. Keep head AND tail (WI#349):
+                // list-tool envelopes serialize pagination/completion metadata
+                // (next_cursor, truncated, complete, resume_page) at the very
+                // end, and a head-only cut amputates it.
                 const MAX_TOOL_OUTPUT_CHARS: usize = 8192;
                 let result_content = if result_content.len() > MAX_TOOL_OUTPUT_CHARS {
-                    let truncated = &result_content
-                        [..result_content.floor_char_boundary(MAX_TOOL_OUTPUT_CHARS)];
-                    format!("{truncated}\n... [output truncated to {MAX_TOOL_OUTPUT_CHARS} chars]")
+                    truncate_tool_output_middle(&result_content, MAX_TOOL_OUTPUT_CHARS)
                 } else {
                     result_content
                 };
@@ -2447,6 +2448,35 @@ fn truncate(s: &str, max: usize) -> String {
         let end = crate::util::floor_char_boundary(s, max);
         format!("{}...", &s[..end])
     }
+}
+
+/// Bound tool output while keeping both the head and the tail: list-tool
+/// envelopes serialize pagination/completion metadata (`next_cursor`,
+/// `truncated`, `complete`, `resume_page`) at the very end, and a head-only
+/// cut amputated it (WI#349 — the model then improvised cursors). The marker
+/// always separates the halves. Byte-budgeted and char-boundary safe; the
+/// result never exceeds `max_bytes`. Total: content already within budget
+/// passes through unchanged.
+fn truncate_tool_output_middle(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_owned();
+    }
+    let marker = format!("\n... [output truncated to {max_bytes} bytes, middle elided] ...\n");
+    let Some(keep) = max_bytes
+        .checked_sub(marker.len())
+        .filter(|keep| *keep >= 2)
+    else {
+        return marker.chars().take(max_bytes).collect();
+    };
+    let head_bytes = keep / 2;
+    let tail_bytes = keep - head_bytes;
+    let head_end = content.floor_char_boundary(head_bytes.min(content.len()));
+    let tail_start = content.ceil_char_boundary(content.len().saturating_sub(tail_bytes));
+    let mut output = String::with_capacity(max_bytes);
+    output.push_str(&content[..head_end]);
+    output.push_str(&marker);
+    output.push_str(&content[tail_start..]);
+    output
 }
 
 /// Sanitize a summary string from job transitions before using in notifications.
@@ -3143,6 +3173,62 @@ mod tests {
         let input = "abcdefghijk";
         let out = super::truncate(input, 5);
         assert_eq!(out, "abcde...");
+    }
+
+    #[test]
+    fn test_truncate_tool_output_middle_preserves_head_and_pagination_tail() {
+        // WI#349: list-tool envelopes carry pagination metadata at the very
+        // tail; truncation must keep head AND tail so routine loops also see
+        // the real next_cursor and truncation state.
+        let envelope = format!(
+            "{{\"items\": [\"{}\"], \"pagination\": {{\"next_cursor\": \"CURSOR-789\", \"truncated\": true, \"complete\": false}}}}",
+            "x".repeat(9000)
+        );
+        let out = super::truncate_tool_output_middle(&envelope, 8192);
+        assert!(out.len() <= 8192, "bounded: {}", out.len());
+        assert!(
+            out.contains("CURSOR-789"),
+            "cursor lost: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
+        assert!(out.contains("\"truncated\": true"));
+        assert!(out.contains("\"complete\": false"));
+        assert!(out.starts_with("{\"items\":"));
+        assert!(out.contains("middle elided"));
+    }
+
+    #[test]
+    fn test_truncate_tool_output_middle_keeps_tail_of_plain_output() {
+        let out = super::truncate_tool_output_middle(&"y".repeat(9000), 8192);
+        assert!(out.len() <= 8192);
+        assert!(out.starts_with(&"y".repeat(100)));
+        assert!(out.ends_with(&"y".repeat(100)));
+        // Bounded even for tiny budgets (marker fallback).
+        let tiny = super::truncate_tool_output_middle(&"z".repeat(500), 10);
+        assert!(tiny.chars().count() <= 10);
+        // Multibyte content: never splits a char, stays in budget.
+        let wide = super::truncate_tool_output_middle(&"é".repeat(9000), 8192);
+        assert!(wide.len() <= 8192);
+        assert!(wide.contains("middle elided"));
+    }
+
+    #[test]
+    fn test_truncate_tool_output_middle_odd_budget_exercises_ceil_boundary() {
+        // At an odd budget both cut points land mid-'é' (2-byte): floor
+        // moves the head cut AND ceil moves the tail cut — the 8192 case
+        // only exercises floor.
+        let odd = super::truncate_tool_output_middle(&"é".repeat(9000), 8191);
+        assert_eq!(odd.len(), 8189);
+        assert!(odd.ends_with('é'));
+        assert!(odd.contains("middle elided"));
+    }
+
+    #[test]
+    fn test_truncate_tool_output_middle_within_budget_passes_through() {
+        // The helper is total: content within budget is returned unchanged
+        // rather than elided (or, historically, duplicated around the marker).
+        assert_eq!(super::truncate_tool_output_middle("short", 8192), "short");
+        assert_eq!(super::truncate_tool_output_middle("", 0), "");
     }
 
     #[test]

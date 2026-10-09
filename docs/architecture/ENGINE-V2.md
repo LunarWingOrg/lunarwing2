@@ -240,6 +240,51 @@ Standard tool/function calling. The LLM returns structured `ActionCall` objects.
 4. Execute via `EffectExecutor`
 5. Record the `ActionResult`
 
+`ActionResult` content is role-token-neutralized and bounded to
+`MAX_ACTION_OUTPUT_CHARS` (8000) by the orchestrator's
+`format_action_output` before entering LLM history. The bound keeps head AND
+tail and elides the middle (WI#349): list-tool envelopes serialize
+pagination/completion metadata (`next_cursor`, `truncated`, `complete`,
+`resume_page`) at the very tail, and the earlier head-only cut amputated it —
+the model never saw truncation state or a real cursor and improvised one
+(WI#344 GitLab 500s). The kept budget splits evenly between head and tail: a
+pagination block needs only ~100-300 chars of tail, while head-heavy outputs
+(HTTP bodies, file reads) still keep the front half. The Tier-0 string caps
+and the routine cap use head+tail truncation:
+the safety layer's `sanitize_tool_output` size cut
+(`SAFETY_MAX_OUTPUT_LENGTH`, 100 KB default) covers the v1 agent live loop,
+the v1 routine loop, and the engine effect bridge (the v1 live loop is capped
+there, not uncapped as WI#349 stated), and the v1 routine tool loop adds its
+own 8192-byte cap (`ic/src/agent/routine_engine.rs`). Safety truncation scans
+fixed 2 KiB windows around both cuts, removes crossing secrets/token runs,
+and drops a retained side if the window cannot establish a safe boundary.
+The final retained text is still leak-scanned; PEM BEGIN and END markers block.
+Thus secret protection can reduce the retained payload below its budget.
+In particular, a long base64/hex run crossing a cut can exhaust the window:
+discarding the tail also discards its pagination block, and discarding both
+sides can remove all metadata. This fail-closed tradeoff is tracked in
+[WI#355](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/355), including
+the proposed byte-walk plus second bounded scan. The notice separates itself
+from retained text with blank lines and describes "retained edges", since
+either edge can be empty. Remaining detector gaps are tracked separately:
+[WI#353](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/353) for uncut
+GitLab PAT/Bearer tokens and [WI#354](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/354)
+for END-less PEM tails and encrypted/PGP private keys.
+WASM (10 MB), MCP (4 MiB), and built-in HTTP (5 MiB) size limits reject the
+call rather than truncate; tail preservation is not an end-to-end guarantee.
+Follow-ups that still
+cut head-only: `shrink_context_for_model_recovery`'s per-message cut after a
+context_overflow recovery (the model again sees `{items: [...` with no
+cursor), the stored-result preview in `ic/src/agent/thread_ops.rs:999-1009`,
+the Engine v2 500-byte preview in `ic/src/bridge/router.rs:3751-3772` built
+from the 1000-byte event preview in `lunarwing_engine/src/types/event.rs:74-87`,
+shell capture (64 KiB), SSH capture (1 MiB), and sandbox stdout/stderr caps.
+Also follow up the v1 earlier-turn 1000-byte tool-result cut in
+`ic/src/agent/session.rs:533-545` ([WI#351](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351): a later
+"next page" turn can lose its cursor), and CodeAct's 500-character
+`format_output` action previews in `default.py`. `MAX_ACTION_OUTPUT_CHARS` still has no
+ThreadConfig/env knob.
+
 **Tier 1 -- CodeAct / Python via Monty** (`executor/scripting.rs`):
 
 Embedded Python execution following the RLM (Recursive Language Model) pattern. The LLM generates Python code that the Monty interpreter executes.
@@ -782,16 +827,24 @@ This repeats at startup until the owner resumes, pauses, or deletes the mission.
 One caveat before resuming (WI#319): before 2026-07-26, `mission_delete` recorded
 deletions as `Completed` rather than removing or tombstoning the record, so a
 parked Completed mission may be an intentional legacy delete rather than a
-phrase-driven completion. The guidance includes the mission's `created_at` and
-`updated_at`; an `updated_at` before 2026-07-26 is the clue (the legacy delete
-went through `update_mission_status`, which stamps `updated_at`). `created_at`
-alone does not discriminate — any mission created before that date and
-phrase-completed in September satisfies it — and the restart recorder can
-re-stamp `updated_at` on rows holding an unrecorded restart-failed thread, so
-for such rows the last history thread's `created_at` is the robust check. Rule
-out an old delete
-first, then inspect the history and use `mission_resume(id=...)` as the owner to
-recover paused, completed or failed missions. Cron recovery computes its next
+phrase-driven completion. The boot warning names an `updated_at` before
+2026-07-26 as consistent with a legacy delete (the legacy delete went through
+`update_mission_status`, which stamps `updated_at`) — a clue, not proof, since
+a phrase completion before that date stamps `updated_at` the same way, and
+`created_at` alone does not discriminate either (any mission created before
+that date and phrase-completed in September satisfies it). The restart
+recorder and the legacy user-id migration can re-stamp `updated_at`, so for
+such rows the last history thread's `created_at` is the robust check; the
+warning carries that thread's id and `created_at` (loaded best-effort,
+otherwise pointing the operator at `mission_history` to read it). Rule out an
+old delete first, then inspect the history via `mission_history` and use
+`mission_resume(id=...)` as the owner to recover paused, completed or failed
+missions. If the review confirms an intentional legacy delete, call
+`mission_delete(id=...)` instead: for the missions this warning reaches that
+is a hard delete — the record is removed and `mission_resume` cannot restore
+it (only conversation-insights missions get a `deleted_at` tombstone, and they
+never reach this warning) — whereas `mission_pause` keeps the record but
+re-stamps `updated_at` and erases the clue. Cron recovery computes its next
 future fire; missed occurrences/events are not replayed. Manual, non-managed
 missions retain the standalone goal-declaration completion contract. Downgrading
 restores the old phrase-driven completion behavior for recurring missions; no
