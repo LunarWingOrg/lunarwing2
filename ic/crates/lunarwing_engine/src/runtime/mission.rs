@@ -766,30 +766,8 @@ impl MissionManager {
         // Webhook path ownership: a fire matches every Active mission on the
         // path regardless of owner, so an active path may only have one owner.
         if let MissionCadence::Webhook { path, .. } = &cadence {
-            let claimed_by = self
-                .store
-                .list_all_missions(project_id)
-                .await?
-                .into_iter()
-                .find(|mission| {
-                    mission.user_id != user_id
-                        && !mission.is_terminal()
-                        && matches!(
-                            &mission.cadence,
-                            MissionCadence::Webhook { path: other, .. } if other == path
-                        )
-                });
-            if claimed_by.is_some() {
-                return Err(EngineError::AccessDenied {
-                    user_id: user_id.clone(),
-                    // Do not name the holding mission's UUID: that would
-                    // disclose another owner's mission id (WI#311 review
-                    // AH-7). The conflict is re-checked on fire/history.
-                    entity: format!(
-                        "webhook path '{path}' is owned by another user's active mission"
-                    ),
-                });
-            }
+            self.ensure_webhook_path_unclaimed(project_id, path, &user_id, None)
+                .await?;
         }
         let mut mission = Mission::new(project_id, user_id, name, goal, cadence);
         mission.notify_channels = notify_channels;
@@ -805,6 +783,47 @@ impl MissionManager {
             cadence_differs: false,
             existing_deleted: false,
         })
+    }
+
+    /// Enforce the webhook single-owner rule: a fire matches every Active
+    /// mission on the path regardless of owner, so an active path may only
+    /// have one owner. Enforced at every transition that can create or
+    /// reactivate a claim — create, cadence update, and resume (WI#352,
+    /// AO-1); a paused mission still holds its claim (`Paused` is not
+    /// terminal). `exclude` skips the mission being updated or resumed: it
+    /// is its own owner, not a conflict.
+    async fn ensure_webhook_path_unclaimed(
+        &self,
+        project_id: ProjectId,
+        path: &str,
+        owner_id: &str,
+        exclude: Option<MissionId>,
+    ) -> Result<(), EngineError> {
+        let claimed_by = self
+            .store
+            .list_all_missions(project_id)
+            .await?
+            .into_iter()
+            .find(|mission| {
+                Some(mission.id) != exclude
+                    && mission.user_id != owner_id
+                    && !mission.is_terminal()
+                    && matches!(
+                        &mission.cadence,
+                        MissionCadence::Webhook { path: other, .. } if other == path
+                    )
+            });
+        if claimed_by.is_some() {
+            return Err(EngineError::AccessDenied {
+                user_id: owner_id.to_string(),
+                // Do not name the holding mission's UUID: that would
+                // disclose another owner's mission id (WI#311 review AH-7).
+                entity: format!(
+                    "webhook path '{path}' is owned by another user's active mission"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Update mutable fields on a mission. Only non-None fields are applied.
@@ -866,6 +885,18 @@ impl MissionManager {
             *mission_secret = Some(secret);
         }
         validate_webhook_cadence(&mission.cadence)?;
+        // WI#352 (AO-1): the webhook single-owner rule applies here too — an
+        // update must not move the mission onto a path another user's
+        // non-terminal mission already claims.
+        if let MissionCadence::Webhook { path, .. } = &mission.cadence {
+            self.ensure_webhook_path_unclaimed(
+                mission.project_id,
+                path,
+                &mission.user_id,
+                Some(mission.id),
+            )
+            .await?;
+        }
         if let Some(channels) = updates.notify_channels {
             mission.notify_channels = channels;
         }
@@ -960,6 +991,18 @@ impl MissionManager {
             return Err(EngineError::Effect {
                 reason: "skill self-improvement is disabled; re-enable SKILL_SELF_IMPROVEMENT to resume this mission".into(),
             });
+        }
+        // WI#352 (AO-1): re-check the webhook single-owner rule before
+        // reactivating — legacy data or a pre-rule conflict could leave two
+        // owners on the path, and a fire matches every Active mission on it.
+        if let MissionCadence::Webhook { path, .. } = &mission.cadence {
+            self.ensure_webhook_path_unclaimed(
+                mission.project_id,
+                path,
+                &mission.user_id,
+                Some(mission.id),
+            )
+            .await?;
         }
         mission.status = MissionStatus::Active;
         mission.updated_at = Utc::now();
@@ -6112,6 +6155,137 @@ mod tests {
             .unwrap();
         assert!(third.deduplicated);
         assert!(third.cadence_differs);
+    }
+
+    #[tokio::test]
+    async fn update_mission_enforces_webhook_single_owner() {
+        // WI#352 (AO-1): an update must not move a mission onto a webhook
+        // path another user's non-terminal mission already claims — a fire
+        // matches every Active mission on the path regardless of owner.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        mgr.create_mission(
+            project,
+            "user-a",
+            "a-hook",
+            "goal",
+            MissionCadence::Webhook {
+                path: "events".into(),
+                secret: Some("a-secret".into()),
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
+        let b_id = mgr
+            .create_mission(project, "user-b", "b-manual", "goal", MissionCadence::Manual, vec![])
+            .await
+            .unwrap();
+
+        // Moving B's mission onto A's path is denied and names no UUIDs.
+        let moved = mgr
+            .update_mission(
+                b_id,
+                "user-b",
+                MissionUpdate {
+                    cadence: Some(MissionCadence::Webhook {
+                        path: "events".into(),
+                        secret: Some("b-secret".into()),
+                    }),
+                    ..MissionUpdate::default()
+                },
+            )
+            .await;
+        match moved {
+            Err(EngineError::AccessDenied { entity, .. }) => {
+                assert!(entity.contains("events"), "got: {entity}");
+                assert!(!entity.contains('-'), "must not leak a UUID: {entity}");
+            }
+            other => panic!("expected AccessDenied, got {other:?}"),
+        }
+        // The denied update left the cadence untouched.
+        assert!(matches!(
+            store.load_mission(b_id).await.unwrap().unwrap().cadence,
+            MissionCadence::Manual
+        ));
+
+        // A free path is fine.
+        mgr.update_mission(
+            b_id,
+            "user-b",
+            MissionUpdate {
+                cadence: Some(MissionCadence::Webhook {
+                    path: "b-events".into(),
+                    secret: Some("b-secret".into()),
+                }),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // A same-owner second mission on the same path stays allowed, and an
+        // owner updating its own webhook mission (secret rotation) is not a
+        // self-conflict.
+        let a_id = store
+            .list_missions(project, "user-a")
+            .await
+            .unwrap()
+            .first()
+            .map(|m| m.id)
+            .unwrap();
+        mgr.update_mission(
+            a_id,
+            "user-a",
+            MissionUpdate {
+                webhook_secret: Some("rotated".into()),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_mission_enforces_webhook_single_owner() {
+        // WI#352 (AO-1): resume re-checks the rule — legacy data or a pre-rule
+        // conflict could leave two owners on one path. Create blocks the
+        // conflict today, so stage it directly in the store.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        let cadence = || MissionCadence::Webhook {
+            path: "events".into(),
+            secret: Some("secret".into()),
+        };
+        let active = Mission::new(project, "user-a", "a-hook", "goal", cadence());
+        let mut paused = Mission::new(project, "user-b", "b-hook", "goal", cadence());
+        paused.status = MissionStatus::Paused;
+        let paused_id = paused.id;
+        store.save_mission(&active).await.unwrap();
+        store.save_mission(&paused).await.unwrap();
+
+        let resumed = mgr.resume_mission(paused_id, "user-b").await;
+        assert!(
+            matches!(resumed, Err(EngineError::AccessDenied { .. })),
+            "resume onto a claimed path must be denied, got {resumed:?}"
+        );
+        assert_eq!(
+            store.load_mission(paused_id).await.unwrap().unwrap().status,
+            MissionStatus::Paused,
+            "a denied resume must not reactivate the mission"
+        );
+
+        // Once the conflicting mission completes, the path is free to reclaim.
+        mgr.complete_mission(active.id).await.unwrap();
+        mgr.resume_mission(paused_id, "user-b").await.unwrap();
+        assert_eq!(
+            store.load_mission(paused_id).await.unwrap().unwrap().status,
+            MissionStatus::Active
+        );
     }
 
     #[tokio::test]
