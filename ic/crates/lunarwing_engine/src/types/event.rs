@@ -301,7 +301,9 @@ pub enum EventKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventKind, ThreadEvent, preview_from_output, redact_event_params, summarize_params};
+    use super::{
+        EventKind, ThreadEvent, preview_from_output, redact_event_params, summarize_params,
+    };
     use crate::types::thread::ThreadId;
 
     #[test]
@@ -325,8 +327,8 @@ mod tests {
             "name": "n",
             "webhook_secret": "super-secret-value",
         });
-        let summary = summarize_params("mission_update", &trailing_secret)
-            .expect("name summarizes");
+        let summary =
+            summarize_params("mission_update", &trailing_secret).expect("name summarizes");
         assert_eq!(summary, "n");
 
         for key in ["api_key", "auth_token", "password", "secret", "token"] {

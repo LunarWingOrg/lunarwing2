@@ -818,9 +818,7 @@ impl MissionManager {
                 user_id: owner_id.to_string(),
                 // Do not name the holding mission's UUID: that would
                 // disclose another owner's mission id (WI#311 review AH-7).
-                entity: format!(
-                    "webhook path '{path}' is owned by another user's active mission"
-                ),
+                entity: format!("webhook path '{path}' is owned by another user's active mission"),
             });
         }
         Ok(())
@@ -6180,7 +6178,14 @@ mod tests {
         .await
         .unwrap();
         let b_id = mgr
-            .create_mission(project, "user-b", "b-manual", "goal", MissionCadence::Manual, vec![])
+            .create_mission(
+                project,
+                "user-b",
+                "b-manual",
+                "goal",
+                MissionCadence::Manual,
+                vec![],
+            )
             .await
             .unwrap();
 
