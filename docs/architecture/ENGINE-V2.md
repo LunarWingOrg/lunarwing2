@@ -827,16 +827,24 @@ This repeats at startup until the owner resumes, pauses, or deletes the mission.
 One caveat before resuming (WI#319): before 2026-07-26, `mission_delete` recorded
 deletions as `Completed` rather than removing or tombstoning the record, so a
 parked Completed mission may be an intentional legacy delete rather than a
-phrase-driven completion. The guidance includes the mission's `created_at` and
-`updated_at`; an `updated_at` before 2026-07-26 is the clue (the legacy delete
-went through `update_mission_status`, which stamps `updated_at`). `created_at`
-alone does not discriminate — any mission created before that date and
-phrase-completed in September satisfies it — and the restart recorder can
-re-stamp `updated_at` on rows holding an unrecorded restart-failed thread, so
-for such rows the last history thread's `created_at` is the robust check. Rule
-out an old delete
-first, then inspect the history and use `mission_resume(id=...)` as the owner to
-recover paused, completed or failed missions. Cron recovery computes its next
+phrase-driven completion. The boot warning names an `updated_at` before
+2026-07-26 as consistent with a legacy delete (the legacy delete went through
+`update_mission_status`, which stamps `updated_at`) — a clue, not proof, since
+a phrase completion before that date stamps `updated_at` the same way, and
+`created_at` alone does not discriminate either (any mission created before
+that date and phrase-completed in September satisfies it). The restart
+recorder and the legacy user-id migration can re-stamp `updated_at`, so for
+such rows the last history thread's `created_at` is the robust check; the
+warning carries that thread's id and `created_at` (loaded best-effort,
+otherwise pointing the operator at `mission_history` to read it). Rule out an
+old delete first, then inspect the history via `mission_history` and use
+`mission_resume(id=...)` as the owner to recover paused, completed or failed
+missions. If the review confirms an intentional legacy delete, call
+`mission_delete(id=...)` instead: for the missions this warning reaches that
+is a hard delete — the record is removed and `mission_resume` cannot restore
+it (only conversation-insights missions get a `deleted_at` tombstone, and they
+never reach this warning) — whereas `mission_pause` keeps the record but
+re-stamps `updated_at` and erases the clue. Cron recovery computes its next
 future fire; missed occurrences/events are not replayed. Manual, non-managed
 missions retain the standalone goal-declaration completion contract. Downgrading
 restores the old phrase-driven completion behavior for recurring missions; no
