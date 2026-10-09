@@ -2,7 +2,7 @@
 
 ## Codename: Bungei Fukkō (文芸復興, ぶんげいふっこう): The Renaissance
 
-**Release date:** 2026-10-09
+**Release date:** 2026-10-10
 
 > Ink long dried wakes;  
 > old letters learn new light —  
@@ -152,7 +152,7 @@ previous compatibility baseline.
 Registry version bumps require rebuilding/reinstalling the affected WASM
 extensions. The channel version bumps themselves do not introduce protocol
 changes. The V28 migration runs automatically at startup on PostgreSQL and
-libSQL; see Upgrade Notes for its downgrade implication.
+libSQL; see Upgrade Notes for its downgrade implication
 
 ## Changes
 
@@ -340,7 +340,7 @@ persisted for the boot sweep. The previously-silent case is closed: when
 the grace expires with the thread still stopping,
 `record_unsettled_shutdown_fire` writes the mission-history row
 (`INTERRUPTED: shutdown while the thread was still stopping`), releases the
-trigger-dedup key, and stamps `pending_shutdown_interruption`.
+trigger-dedup key, and stamps `pending_shutdown_interruption`
 
 At the next boot, `resolve_pending_shutdown_interruptions` settles the
 stamp under the fire lock against the thread's final persisted state: a
