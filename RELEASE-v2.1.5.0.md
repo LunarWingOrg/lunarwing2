@@ -41,7 +41,8 @@ The repass adds three more reliability pillars. The workspace daily-log
 gate now heals itself: a poisoned daily log no longer blocks the day's
 appends — the stored poison is quarantined aside, tool-level replace is
 honored, and every replaced prompt file is backed by scope-aware shadow
-backups with pinned first-generation evidence. The mission
+backups — generational, with pinned first-generation evidence, for daily
+logs. The mission
 graceful-shutdown seam is closed: a fire caught by a graceful daemon stop
 is recorded, its dedup key released, and its retry resolved at the next
 boot against the thread's final persisted state, instead of slipping away
@@ -84,7 +85,8 @@ previous compatibility baseline.
 - **Daily-log gate self-healing (WI#288).** `memory_write` on
   `target: "daily_log"` now honors `append: false` as a real replace, and
   an append refused because already-stored content trips the gate
-  quarantines the poisoned log and retries against a fresh one — the day's
+  quarantines the poisoned log aside and asks for one unchanged retry,
+  which lands on the fresh log — the day's
   appends are no longer blocked. Replaces of prompt-visible files take
   scope-aware shadow backups with generational evidence for daily logs, and
   the `backups/` and `daily/*.poisoned-*.md` artifacts are reserved from
@@ -99,8 +101,9 @@ previous compatibility baseline.
   Engine V2 orchestrator (8000 characters), the v1 routine loop (8192
   bytes), and the safety layer's own 100 KB cut, so list-tool envelopes
   keep their `next_cursor` and the model no longer improvises cursors (the
-  WI#344 root cause). Truncation cuts scan for secrets straddling the
-  boundary and move outward across them.
+  WI#344 root cause). The safety layer's cut also scans for secrets
+  straddling the boundary and moves outward across them; the other two cuts
+  run on already-redacted text.
 - **Actionable memory-write rejections (WI#290).** Injection rejections
   carry matched-pattern descriptions, rephrase guidance, and a narrowly
   scoped inline-quote route; the API answers 422/409 instead of 500.
@@ -317,8 +320,13 @@ Recovery guidance is also delete-aware (WI#319): before 2026-07-26,
 parked recurring missions now carries each mission's
 `created_at`/`updated_at` and tells operators to rule out an intentional
 legacy delete before resuming — guidance only, with no behavior or
-suppression change. Further WI#319 follow-up is still in review (checklist
-item 34); re-check this paragraph at the final pass.
+suppression change. A review follow-up (checklist item 34, landed via
+!1484) made the guidance exact: `mission_delete(id=...)` removes the record
+entirely and irreversibly (`mission_resume` cannot restore it), while
+`mission_pause` keeps the record but re-stamps `updated_at` and erases the
+clue; an `updated_at` before 2026-07-26 is described as *consistent with* a
+legacy delete rather than proof of one, with `mission_history` named as the
+way to read the last run.
 
 ### Mission Graceful-Shutdown Retry Seam (WI#276)
 
@@ -337,7 +345,10 @@ At the next boot, `resolve_pending_shutdown_interruptions` settles the
 stamp under the fire lock against the thread's final persisted state: a
 settled host stop earns the retry the watcher would have planned (marker,
 wake, boot-time notice); a restart-failed thread stays WI#301's record
-case; a completed one is recorded without retry; checkpoint/gate states
+case; a completed one is recorded without retry; a thread that failed for
+any other reason during teardown is recorded without retry (the persisted
+row cannot distinguish a retryable failure from budget exhaustion; WI#302);
+checkpoint/gate states
 stay with their own recovery; and a thread still live keeps the stamp for
 the following boot. Outcome processing now saves the mission row first and
 persists the retry marker as the final commit write, so no crash prefix can
@@ -417,7 +428,9 @@ detector itself is untouched.
 replace through `Workspace::write` — it used to append silently while
 reporting a replace — giving operators a tool-level repair path when a
 daily log is poisoned. Appends refused only because already-stored content
-trips the gate quarantine the poisoned log aside and retry against a fresh
+trips the gate quarantine the poisoned log aside without writing the
+refused entry; the tool asks for one unchanged retry, which then lands on
+the fresh
 log, so the day's appends eventually succeed (the WI#290 quarantine
 machinery, retained unchanged; layer daily logs stay un-quarantined as
 documented in the workspace README).
@@ -584,7 +597,9 @@ lane config: the entrypoint exports `OPENCODE_CONFIG` pointing at the
 materialized `opencode2.json`, which v2 does not auto-discover — so the
 lane's baked default `baseURL` finally takes effect, and a tenant overrides
 it with `configure-opencode2 <tenant> --base-url <url>` (the image-level
-default endpoint remains #330). Other worker pins are unchanged from
+default endpoint remains #330). The follow-on bump to v2.0.26 (checklist
+item 2) is held until the external-worker self-exposure controls tracked as
+#357 land. Other worker pins are unchanged from
 v2.1.4.0.
 
 ### Documentation and Repository Maintenance
@@ -656,7 +671,9 @@ inbound links repaired and a per-file archive index.
    thinking models set 16384 or more — their reasoning counts against the
    budget — and keep the value at or below half the provider's per-call
    output cap, because the one budget-exhaustion retry doubles it. A daemon
-   restart applies a changed environment value.
+   restart applies a changed environment value; the orchestrator's call
+   config can still override it per call, and multi-tenant env files carry
+   the key and preserve it on re-render.
 8. **Expect honest failures after interrupted restarts.** Boot recovery now
    fails `Waiting` threads orphaned by a quarantined pending-gates file
    (inspect `pending-gates.json.corrupt-<ts>`), records restart-lost mission
@@ -672,19 +689,23 @@ inbound links repaired and a per-file archive index.
 2.1.5.0-labeled items remain open: **#345** (runtime smoke of the corrected
 opencode2 executor against a live v2.0.24 server — the candidate image
 built green on master pipeline 5308, job 100055; the smoke is the remaining
-promotion evidence), **#347** (the maintainer's release punch list), and
-**#319** (recovery-guidance legacy-delete caveat — the guidance-only fix is
-in this release; further follow-up is in review as checklist item 34). The
-daily-log gate self-healing (WI#288), the mission graceful-shutdown retry
-seam (WI#276), the mission-verb supervision gate (WI#308), and the
-pagination-safe output truncation (WI#349) were carried as open at the
-first draft and have since **landed in this release**. See
+promotion evidence), **#319** (recovery-guidance legacy-delete caveat — the
+corrected guidance-only fix is in this release via checklist item 34 /
+!1484; tracker close is pending), and **#357** (external-worker
+self-exposure policy — holds the opencode2 v2.0.26 bump, checklist item 2 /
+!1490, until egress and self-exposure controls land). **#347** (the
+maintainer's release punch list) was re-labeled to v2.1.6.0 during this
+cycle. The daily-log gate self-healing (WI#288), the mission
+graceful-shutdown retry seam (WI#276), the mission-verb supervision gate
+(WI#308), and the pagination-safe output truncation (WI#349 — its fix
+landed and the item was tracker-closed on 2026-10-09) were carried as open
+at the first draft and have since **landed in this release**. See
 [the open-items audit](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md) — a
 point-in-time snapshot dated 2026-10-04 (25 items), with the #303 entry
 updated 2026-10-06 and 2026-10-07 and the #308 entry updated 2026-10-08;
 the open-item count has since grown and the audit's own repass is checklist
-item 39 — for the disposition table, including items deferred to v2.1.6.0
-and v2.1.8.0.
+item 39 (in review as !1491) — for the disposition table, including items
+deferred to v2.1.6.0 and v2.1.8.0.
 
 **Known residuals (deferred, all filed).** So these notes stay honest about
 what this release does not close: **#352 / #356** — mission-verb gate
