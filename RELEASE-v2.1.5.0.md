@@ -416,9 +416,10 @@ v2.0.24 step re-verified the whole bridge surface against the pinned tree
 (call paths, the `message.list` paging contract, event names, config/env
 surface, and the executed build-script patch contract) — the lane's surface
 is unchanged between the two tags. The corrections are source-verified
-(executor self-test plus construction of the pinned client); runtime
-re-verification against a live v2.0.24 server awaits the candidate image
-build on the first protected pipeline (see `docs/ops/WORKER-CONTAINERS.md`).
+(executor self-test plus construction of the pinned client), and the
+candidate image built green on master pipeline 5308; the remaining evidence
+is the runtime smoke against a live v2.0.24 server tracked by #345 (see
+`docs/ops/WORKER-CONTAINERS.md`).
 Other worker pins are unchanged from v2.1.4.0.
 
 ### Documentation and Repository Maintenance
@@ -428,8 +429,8 @@ a 2026-10-04 revalidation stamp; contributor onboarding's freeze notice now
 names the work items still open at release time. Operator references, the
 testing guide, release indexes, and the CI README were synchronized with
 the cargo-deny gate changes, the WI#299 quarantine behavior, and the WI#291
-budget semantics. An audit of all 25 open tracker items with per-item
-repository disposition lives at
+budget semantics. An audit of all open tracker items (47 at the 2026-10-09
+repass) with per-item repository disposition lives at
 [docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md).
 Stale versioned operations documents moved to `docs/ops/history/` with
 inbound links repaired and a per-file archive index.
@@ -483,17 +484,23 @@ inbound links repaired and a per-file archive index.
 
 ### Security, Deployment, and Release Limitations
 
-**Carried known issues.** The daily-log gate follow-up work (WI#288) and
-the mission graceful-shutdown retry seam (WI#276) remain open with merge
-requests in flight and are not in this release. The opencode2 executor
+**Carried known issues.** Four 2.1.5.0-labeled tracker items remain open
+at this draft, two of them tied to goals items still in flight: the
+boot-warning legacy-delete clue mismatch (WI#319, goals item 34 — its
+!1479 attempt closed unmerged), and the maintainer punch list #347 (goals
+item 28's verify passes do not cover its runner-host concurrency point,
+which has no dedicated owner). The other two are the v2.0.24 opencode2
+runtime smoke (#345) and WI#349, whose head+tail truncation fix merged via
+!1483 and awaits the maintainer's tracker close. WI#308's mission-verb
+gate fix merged via !1477 and the item closed 2026-10-08; its residuals
+are tracked as #352 and #356. The opencode2 executor
 correction shipped with the v2.0.23 step of the v2.0.24 bump (WI#303) is
-source-verified but not yet runtime-verified against a live v2.0.24 server —
-a green `worker-opencode2-candidate` build and a smoke test on the first
-protected pipeline are the remaining evidence before promotion (see
-`docs/ops/WORKER-CONTAINERS.md`). See
+source-verified and its candidate image built green on master pipeline
+5308, but it is not yet runtime-verified against a live v2.0.24 server —
+the WI#320-style smoke tracked by #345 is the remaining evidence before
+promotion (see `docs/ops/WORKER-CONTAINERS.md`). See
 [the open-items audit](docs/ops/v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md) — a
-point-in-time snapshot dated 2026-10-04, with the #303 entry updated
-2026-10-06, 2026-10-07 and the #308 entry updated 2026-10-08 — for the
+point-in-time snapshot re-audited 2026-10-09 — for the
 disposition table, including items deferred to v2.1.6.0
 and v2.1.8.0.
 
