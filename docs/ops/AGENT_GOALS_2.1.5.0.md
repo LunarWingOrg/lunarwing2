@@ -244,7 +244,7 @@
    - Commits: replays `13a5335f1`/`167bea7bc`/`6dd2e8a65`/`6bf0277da`/`aab696859`/`78d1a4e92`/`458a5caa3`/`db6097ac1`/`5ae71d08a`/`57b7aa677` (of !1474's `63e232233`..`cceee0bed`), security fixes `66a0c9be9`/`c6c945245` (of `4eca1d6cd`/`07292d90`), goals evidence (this commit).
 37. [x] (S) ipv6
 38. [x] (S) HRDR
-39. [ ] repass of goal number 25 - last attempt was rejected and the state has been updated anyway so needs retry (changes have been requested): https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1476
+39. [ ] repass of goal number 25 - last attempt was rejected and the state has been updated anyway so needs retry (changes have been requested; see comments on closed MR): https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1485
 40. [x] (S) RESERVED4NVMES
 41. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/303 - REJECTED - see previous attempt's closed MR (which has comments on what needs to be changed for a re-attempt): https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1438
    - DONE (2026-10-06, branch `aj/kimi-41-20261006-0601`): opencode2 worker bumped v2.0.21 -> v2.0.23 (tag SHA `0fd7e2829449b052abf0078666669302923d77af`, verified live via `git ls-remote`) on every pin surface — Dockerfile ARG pair, `build-worker-image.sh` opencode2 case block (`source_ref` + both build args), lane AGENTS.md/README, `prepare_reproducible_build_test.py` fixture, CONTRIBUTOR-ONBOARDING, WORKER-CONTAINERS, RELEASE-v2.1.5.0, and the open-items audit's #303 entry.
@@ -290,6 +290,6 @@
    - Verified on this branch: `cargo check -p lunarwing_engine -p lunarwing --lib --tests` clean; `cargo test -p lunarwing --lib -- bridge::` 303 passed / 0 failed (incl. all new gate/router tests and the repaired WI#309 test); `cargo test -p lunarwing_engine --lib -- executor::scripting` 54 passed / 0 failed (incl. both new pins); `cargo test -p lunarwing --lib -- mission routine permissions` 277 passed / 0 failed; `cargo clippy -p lunarwing_engine -p lunarwing --lib --tests -- -D warnings` clean (exit verified via PIPESTATUS); `cargo fmt --all -- --check` clean; `python3 ic/scripts/check_no_panics.py --base 258bf3cb0 --head HEAD` OK
    - WI#308 stays open on GitLab for a maintainer to close after merge
    - Commits: replays `ba668d56d`/`0e01b8d25`/`9e08017e7`/`e754688b2`/`5b892b63f`/`383943df1`, AQ-1 `f140173d6`, gate hardening `891a88059`, router `a68ca3cdc`, docs `57fe71cd3`, callable/test repair `0ddaaa5cc`, engine pin + doc `d813168c6`, fmt `ca176aaf3`, goals evidence (this commit)
-48. [ ] REPASS OF GOAL 24 - see top of goals doc for release codename to include - last attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1478 - nothing too wrong with it; just out of date now - see comments on closed MR for other requested changes
+48. [ ] REPASS OF GOAL 24 - see top of goals doc for release codename to include - last attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1486 - nothing too wrong with it; just out of date now - see comments on closed MR for other requested changes
 
 ---
