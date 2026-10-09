@@ -1004,7 +1004,10 @@ verbs keep the registry path's deny-the-grant fallback); supervised mode
 pauses every verb for human approval with `allow_always: false` (a
 capability action has no always-approval grant to persist, so the dialog
 does not offer one) and an approved resume re-enters with the grant and
-executes; a per-user per-verb rate limit (20/minute, 200/hour) applies; and
+executes; a per-user per-verb rate limit (20/minute, 200/hour) applies,
+plus an aggregate per-user bucket across the six mutating verbs (60/minute,
+600/hour — WI#352 AQ-12) so the per-verb budgets cannot sum to 160
+mutations/minute; and
 `ToolCall` hooks run with `webhook_secret` redacted (the approval prompt's
 display parameters are redacted the same way, while the persisted gate keeps
 the real parameters for execution). The approval-tier gates deliberately do
@@ -1017,6 +1020,21 @@ non-Foreground-`Always` and needs-prompt gates stay off, and the pre-flight
 auth gate is a no-op for capability actions, which hold no credential
 registrations. The coordination gate (a disabled agent executes nothing)
 applies to mission calls as before.
+
+Related secret-handling and webhook-ownership rules (WI#352, the !1462
+run-33 residual): `summarize_params` skips values under a sensitive-key
+deny list (`webhook_secret`, `api_key`, `auth_token`, `password`, `secret`,
+`token`), so a verb's `webhook_secret` cannot surface in the
+ToolStarted/ToolCompleted channel status summary (AQ-5); the persisted
+`ApprovalRequested` thread event stores display parameters with the same
+deny list redacted rather than the raw call parameters — the pending gate
+still holds the raw copy for resume, and the thread transcript's action
+arguments remain a pre-existing at-rest class (AQ-4); the webhook
+single-owner rule (a fire matches every Active mission on a path, so an
+active path may only have one owner) is enforced on cadence update and
+resume, not just create (AO-1); and create-dedup compares webhook cadences
+by path only, so a rotated secret is not a spurious cadence difference
+(AO-7).
 
 Two scope properties follow and are stated deliberately (WI#308 asked for
 the supervised-mode consequence, not just the gate ordering). First,
