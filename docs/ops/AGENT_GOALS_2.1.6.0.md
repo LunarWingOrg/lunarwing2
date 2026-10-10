@@ -36,7 +36,11 @@
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/334
-14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/337
+14. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/337
+    - DONE (100%): boot resolution of shutdown-interrupted fires is now idempotent — `ic/crates/lunarwing_engine/src/runtime/mission.rs`
+    - `resolve_stamped_interruption`: clear-only when the stamped thread already carries a retry marker, is `Running` (resumed by checkpoint recovery, watcher-owned), or is superseded by a newer fire; stamps older than `MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE` (24h) resolve record-only
+    - `resolve_settled_stop`: Q-4 write order (mission row/stamp-clear saved before the retry marker), armed thread admitted into `recovered_retries`
+    - 4 regression tests added (double-arm via marker, resumed Running thread, stale stamp, superseded stamp); `cargo test -p lunarwing_engine --lib runtime::mission` 159/159 green, clippy `-D warnings` clean
 15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/338
 16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/339
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/341
