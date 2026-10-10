@@ -629,12 +629,7 @@ pub fn cron_min_fire_gap_secs(
     };
     let gap = fires
         .windows(2)
-        .map(|pair| {
-            pair[1]
-                .signed_duration_since(pair[0])
-                .num_seconds()
-                .max(0) as u64
-        })
+        .map(|pair| pair[1].signed_duration_since(pair[0]).num_seconds().max(0) as u64)
         .min();
     Ok(gap)
 }

@@ -2007,7 +2007,8 @@ fn spawn_cron_manager(
     let context_manager = Arc::new(ContextManager::new(16));
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
     let mgr = Arc::new(
-        ExternalWorkerManager::new(vec![config]).with_event_deps(event_tx, Arc::clone(&context_manager)),
+        ExternalWorkerManager::new(vec![config])
+            .with_event_deps(event_tx, Arc::clone(&context_manager)),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
@@ -2102,7 +2103,10 @@ async fn cron_manual_fire_rejects_task_mode_worker() {
         .fire_cron_tick_now("mock", "owner-1")
         .await
         .expect_err("task-mode worker must reject cron fire");
-    assert!(matches!(err, OrchestratorError::ExternalWorkerNotCron { .. }));
+    assert!(matches!(
+        err,
+        OrchestratorError::ExternalWorkerNotCron { .. }
+    ));
 }
 
 /// A cron-mode worker whose supervisor never started (e.g. invalid config)
@@ -2115,7 +2119,9 @@ async fn cron_manual_fire_without_supervisor_reports_not_running() {
     })
     .await;
     // Cron-mode config but spawn_cron_supervisors never called.
-    let mgr = Arc::new(ExternalWorkerManager::new(vec![cron_config_for(&url, 10, 0)]));
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![cron_config_for(
+        &url, 10, 0,
+    )]));
 
     let err = mgr
         .fire_cron_tick_now("mock", "owner-1")
@@ -2214,7 +2220,9 @@ async fn cron_shutdown_mid_tick_cancels_running_job() {
         "cancel reason must name the shutdown, got: {reason}"
     );
     assert!(
-        timeout(Duration::from_secs(3), request_rx.recv()).await.is_err(),
+        timeout(Duration::from_secs(3), request_rx.recv())
+            .await
+            .is_err(),
         "no further dispatch may follow a shutdown"
     );
 }

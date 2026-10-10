@@ -677,7 +677,8 @@ impl ExternalWorkerManager {
 
     /// Cancel an active external worker task.
     pub async fn cancel_task(&self, job_id: Uuid) -> bool {
-        self.cancel_task_with_reason(job_id, CancelReason::User).await
+        self.cancel_task_with_reason(job_id, CancelReason::User)
+            .await
     }
 
     /// Cancel with an explicit reason (WI#325): the persisted record and

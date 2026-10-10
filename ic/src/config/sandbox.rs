@@ -353,7 +353,8 @@ impl CronWorkerConfig {
     }
 
     fn validate_heartbeat(&self) -> Result<(), String> {
-        if self.heartbeat_timeout() < std::time::Duration::from_secs(Self::MIN_HEARTBEAT_TIMEOUT_SECS)
+        if self.heartbeat_timeout()
+            < std::time::Duration::from_secs(Self::MIN_HEARTBEAT_TIMEOUT_SECS)
         {
             return Err(format!(
                 "cron.heartbeat_timeout_secs below the {}s floor",
@@ -1143,12 +1144,16 @@ mode = "cron"
     #[test]
     fn heartbeat_below_floor_is_rejected() {
         assert!(
-            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nheartbeat_timeout_secs = 0")
-                .is_none()
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nheartbeat_timeout_secs = 0"
+            )
+            .is_none()
         );
         assert!(
-            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nheartbeat_timeout_secs = 4")
-                .is_none()
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nheartbeat_timeout_secs = 4"
+            )
+            .is_none()
         );
     }
 

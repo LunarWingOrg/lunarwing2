@@ -304,9 +304,11 @@ impl ExternalWorkerManager {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_cron_command(worker_name, owner_id, CronCommand::Status(reply_tx))
             .await?;
-        reply_rx.await.map_err(|_| OrchestratorError::CronSupervisorNotRunning {
-            worker_name: worker_name.to_string(),
-        })
+        reply_rx
+            .await
+            .map_err(|_| OrchestratorError::CronSupervisorNotRunning {
+                worker_name: worker_name.to_string(),
+            })
     }
 
     /// Owner-gated command dispatch to a running mission supervisor. The
@@ -593,13 +595,18 @@ async fn run_tick(
             return None;
         };
 
-        if let Some(end) = resolve_terminal(ctx, tick_index, chain_index, job_id, &outcome).await
-        {
+        if let Some(end) = resolve_terminal(ctx, tick_index, chain_index, job_id, &outcome).await {
             return Some(end);
         }
-        if let Some(action) =
-            handle_busy_rejection(ctx, tick_index, chain_index, job_id, &outcome, &mut busy_retries)
-                .await
+        if let Some(action) = handle_busy_rejection(
+            ctx,
+            tick_index,
+            chain_index,
+            job_id,
+            &outcome,
+            &mut busy_retries,
+        )
+        .await
         {
             match action {
                 BusyAction::Retry => {
@@ -611,7 +618,16 @@ async fn run_tick(
                 BusyAction::Abandon(end) => return Some(end),
             }
         }
-        match prepare_reentry(ctx, tick_index, chain_index, job_id, &outcome, max_reentries).await {
+        match prepare_reentry(
+            ctx,
+            tick_index,
+            chain_index,
+            job_id,
+            &outcome,
+            max_reentries,
+        )
+        .await
+        {
             Reentry::Redispatch => {
                 chain_index += 1;
                 if !backoff_sleep(chain_index, shutdown_rx).await {
@@ -738,10 +754,11 @@ async fn prepare_reentry(
     if let TickOutcome::Failed(reason) = outcome
         && is_non_retryable(reason)
     {
-        let reason = format!("non-retryable dispatch rejection: {}", describe_outcome(outcome));
-        return Reentry::Abandon(
-            abandon_tick(ctx, tick_index, chain_index, job_id, reason).await,
+        let reason = format!(
+            "non-retryable dispatch rejection: {}",
+            describe_outcome(outcome)
         );
+        return Reentry::Abandon(abandon_tick(ctx, tick_index, chain_index, job_id, reason).await);
     }
     if !outcome.is_retryable() || chain_index >= max_reentries {
         return Reentry::Abandon(
@@ -1228,7 +1245,11 @@ async fn persist_paused(
         return;
     };
     if let Err(error) = db
-        .set_setting(owner_id, &paused_key(mission_id), &serde_json::json!(paused))
+        .set_setting(
+            owner_id,
+            &paused_key(mission_id),
+            &serde_json::json!(paused),
+        )
         .await
     {
         tracing::warn!(%mission_id, "Failed to persist cron pause flag: {error}");
