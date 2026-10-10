@@ -2638,7 +2638,7 @@ mod tests {
 
     // ── WI#328 runtime control channel ──────────────────────────────
 
-    use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+    use crate::config::ExternalWorkerConfig;
 
     fn control_test_manager() -> ExternalWorkerManager {
         ExternalWorkerManager::new(vec![ExternalWorkerConfig {
