@@ -22,7 +22,7 @@
 
 ## Phase 2 — Features & Polish (for goals referencing work items, read comments on work items as well)
 
-3. [x] audit all crates and ensure there are no security vulnerabilities
+3. [ ] audit all crates and ensure there are no security vulnerabilities
 4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298 - Brightdawn confirmed close now
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
@@ -50,7 +50,7 @@
 25. [x] (S) (H MR) release alpha of droid and desk repo projs
 26. [x] (S) RESERVED
 27. [x] (S) RESERVED
-28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5375 for latest master pipeline run and see if anything is not GREEN
+28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5397 for latest master pipeline run and see if anything is not GREEN
 29. [x] (S) RESERVED
 30. [x] (S) RESERVED
 31. [x] (S) RESERVED
