@@ -603,6 +603,42 @@ pub fn normalize_cron_expression(schedule: &str) -> String {
     }
 }
 
+/// Minimum gap in seconds among the next few fire times of a cron schedule.
+///
+/// Used by the cron worker mode (WI#325) to enforce a schedule floor: a
+/// per-second cron expression would otherwise dispatch thousands of worker
+/// jobs per day. Returns `None` when the schedule yields fewer than two
+/// upcoming fire times (a one-shot or never-again schedule has no interval
+/// to floor). Errors when the expression does not parse.
+pub fn cron_min_fire_gap_secs(
+    schedule: &str,
+    timezone: Option<&str>,
+) -> Result<Option<u64>, RoutineError> {
+    let normalized = normalize_cron_expression(schedule);
+    let cron_schedule =
+        cron::Schedule::from_str(&normalized).map_err(|e| RoutineError::InvalidCron {
+            reason: e.to_string(),
+        })?;
+    let fires: Vec<DateTime<Utc>> = match timezone.and_then(crate::timezone::parse_timezone) {
+        Some(tz) => cron_schedule
+            .upcoming(tz)
+            .take(4)
+            .map(|dt| dt.with_timezone(&Utc))
+            .collect(),
+        None => cron_schedule.upcoming(Utc).take(4).collect(),
+    };
+    let gap = fires
+        .windows(2)
+        .map(|pair| {
+            pair[1]
+                .signed_duration_since(pair[0])
+                .num_seconds()
+                .max(0) as u64
+        })
+        .min();
+    Ok(gap)
+}
+
 /// Parse a cron expression and compute the next fire time from now.
 ///
 /// Accepts standard 5-field, 6-field, or 7-field cron expressions (auto-normalized).
@@ -794,8 +830,29 @@ pub fn describe_cron(schedule: &str, timezone: Option<&str>) -> String {
 mod tests {
     use crate::agent::routine::{
         MAX_TOOL_ROUNDS_LIMIT, RoutineAction, RoutineGuardrails, RunStatus, Trigger, content_hash,
-        describe_cron, next_cron_fire, normalize_cron_expression,
+        cron_min_fire_gap_secs, describe_cron, next_cron_fire, normalize_cron_expression,
     };
+
+    #[test]
+    fn cron_min_fire_gap_secs_measures_subminute_and_daily() {
+        // Per-second schedule: 1s gap.
+        assert_eq!(
+            cron_min_fire_gap_secs("* * * * * *", None).expect("parses"),
+            Some(1)
+        );
+        // Every 5 minutes: 300s gap.
+        assert_eq!(
+            cron_min_fire_gap_secs("*/5 * * * *", None).expect("parses"),
+            Some(300)
+        );
+        // Daily: 86400s gap.
+        assert_eq!(
+            cron_min_fire_gap_secs("0 15 10 * * *", None).expect("parses"),
+            Some(86400)
+        );
+        // Unparseable expression errors.
+        assert!(cron_min_fire_gap_secs("not a schedule", None).is_err());
+    }
 
     #[test]
     fn test_trigger_roundtrip() {
