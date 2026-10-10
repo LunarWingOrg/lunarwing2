@@ -230,7 +230,10 @@ pub struct ExternalWorkerConfig {
     pub prompt_context: PromptContextLimits,
     /// Per-worker tool capability allowlist for the proxied tool path
     /// (WI#324). Deny-by-default: empty means every `tool_call` frame from
-    /// this worker is rejected. `"*"` opts in to all registered tools.
+    /// this worker is rejected. Exact tool names only — there is no
+    /// wildcard; `ExternalWorkerManager` drops `"*"`, autonomous-denylisted,
+    /// and non-identifier entries at load, and strips the whole list when
+    /// the worker is reached over cleartext `ws://` on a non-loopback host.
     pub tool_allowlist: Vec<String>,
 }
 
@@ -280,15 +283,6 @@ impl ExternalWorkerConfig {
                 weight: None,
             }]
         }
-    }
-
-    /// Whether this worker may invoke `tool_name` over the proxied tool path
-    /// (WI#324). Deny-by-default: an empty allowlist rejects everything;
-    /// `"*"` opts in to all tools; otherwise exact name match.
-    pub fn allows_tool(&self, tool_name: &str) -> bool {
-        self.tool_allowlist
-            .iter()
-            .any(|entry| entry == "*" || entry == tool_name)
     }
 }
 
