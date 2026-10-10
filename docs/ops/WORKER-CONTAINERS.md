@@ -267,6 +267,12 @@ above applies unchanged; client/schema/protocol SDK changes in
 `session.execution.{succeeded,failed,interrupted}`, `session.idle`,
 `session.message.list`, and `session.text.delta` all confirmed present.
 Whole-image reproducibility remains CI-verified per revision.
+(2026-10-10 correction, WI#329: this entry's `session.message.list`
+"confirmed present" claim was checked against protocol/OpenAPI identifier
+strings, not the generated promise client the bridge imports — `session.message`
+exposes only `get`, so the method never existed at v2.0.11 (WI#320 F7 observed
+the runtime TypeError at v2.0.21). The call path was corrected in the v2.0.23
+entry below.)
 
 v2.0.14 bump (2026-09-22): tag SHA `08462140ec0de1e4b17d4a353d8d5827f53cf7b0`
 verified against both anomalyco/opencode and sst/opencode remotes. Upstream
@@ -280,6 +286,12 @@ usage (`OpenCode.make`, `session.create/prompt/interrupt`, `session.message.list
 `session.permission.reply`, `session.execution.*`, `session.idle`,
 `session.text.delta` all present at v2.0.14). The promise exports map is
 unchanged. Whole-image reproducibility remains CI-verified per revision.
+(2026-10-10 correction, WI#329: this entry's `session.message.list` /
+`session.permission.reply` "present at v2.0.14" claim was checked against
+protocol identifier strings, not the generated promise client the bridge
+imports; neither method existed — `session.message` exposes only `get` and
+there is no `session.permission` group at all (WI#320 F7). Both call paths
+were corrected in the v2.0.23 entry below.)
 
 v2.0.15 bump (2026-09-23): tag SHA `6f3639d82ed0760091792189b78f8eeb44f699b1`
 verified against anomalyco/opencode. The upstream CLI build script and
@@ -340,7 +352,12 @@ real session; !1452 review AL-1), and the image build now constructs the
 client and asserts `typeof`
 for every method path the bridge calls (`session.create/prompt/interrupt`,
 `permission.reply`, `event.subscribe`, `message.list`), so this drift class
-fails the build instead of the runtime.
+fails the build instead of the runtime. (WI#329 follow-up, 2026-10-10: the
+asserted paths now come from the single committed list
+`opencode2.4lunarwing/scripts/sdk_surface.ts`, which the build gate runs as
+`scripts/sdk_surface_assert.ts` and which also drives the executor
+self-test's mock-parity check, so the two gates cannot diverge; the stale
+v2.0.11/v2.0.14/v2.0.20 bump entries carry dated WI#329 corrections.)
 
 Verified host-side with bun: the executor self-test passes against the real
 client shape and fails with the pre-fix executor; the build-time assertion
@@ -448,6 +465,11 @@ additive generated-type fields (e.g. `SessionStructuredError.response`,
 `prepare_reproducible_build_test.py` passed (3/3), including the
 untouched-failure contract. Whole-image reproducibility must still pass the CI
 candidate-versus-clean-rebuild gate before promotion.
+(2026-10-10 correction, WI#329: this entry's `session.message.list` /
+`session.permission.reply` "unchanged" claim was checked against protocol
+identifier strings, not the generated promise client the bridge imports;
+neither method existed at v2.0.20 (WI#320 F7 observed the runtime TypeError at
+v2.0.21). Both call paths were corrected in the v2.0.23 entry above.)
 
 v2.0.18 bump (2026-09-27): tag SHA `cd9a14a6b688d4021bee381dfd39d2cef9c0f862`
 verified against the anomalyco/opencode remote (v2.1.3.0 checklist item #2).

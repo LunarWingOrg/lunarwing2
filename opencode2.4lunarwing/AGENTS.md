@@ -14,6 +14,7 @@ internal opencode headless server.
 
 - `scripts/lunarwing_bridge.ts` — The WebSocket server/client. Changes here affect protocol behavior.
 - `scripts/opencode_task_executor.ts` — Task execution via the v2 client SDK. Controls session creation, permissions, event streaming.
+- `scripts/sdk_surface.ts` — Canonical list of the `@opencode/client` method paths the bridge calls (WI#329). It drives the image-build gate (`scripts/sdk_surface_assert.ts`, run from the Dockerfile) and the executor self-test's mock-parity check — add a path here whenever the bridge calls a new client method.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
 - `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp.
 - `config/opencode2.json` — Mounted into container; controls LLM provider, MCP servers. v2 config shape (`providers`, `settings.baseURL`, `package`).
