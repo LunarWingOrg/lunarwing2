@@ -314,22 +314,34 @@ mod tests {
         let secret_only = serde_json::json!({"webhook_secret": "super-secret-value"});
         assert_eq!(summarize_params("mission_create", &secret_only), None);
 
-        let with_benign = serde_json::json!({
+        // Run-51 CJ-8: serde_json is built without preserve_order, so keys
+        // sort — the sensitive key must sort BEFORE the benign one or the
+        // pre-fix code (first string value wins) would pass this test too.
+        // "webhook_secret" < "zzz" and "auth_token" < "name" alphabetically.
+        let secret_sorts_first = serde_json::json!({
             "webhook_secret": "super-secret-value",
-            "goal": "report on events",
+            "zzz": "benign-tail",
         });
-        let summary = summarize_params("mission_create", &with_benign)
-            .expect("a non-sensitive string value still summarizes");
+        let summary = summarize_params("mission_create", &secret_sorts_first)
+            .expect("the benign value still summarizes");
+        assert_eq!(summary, "benign-tail");
         assert!(!summary.contains("super-secret-value"));
 
-        // A secret that is not the first string value is still skipped.
-        let trailing_secret = serde_json::json!({
+        let token_sorts_first = serde_json::json!({
+            "auth_token": "super-secret-value",
             "name": "n",
-            "webhook_secret": "super-secret-value",
         });
         let summary =
-            summarize_params("mission_update", &trailing_secret).expect("name summarizes");
+            summarize_params("mission_update", &token_sorts_first).expect("name summarizes");
         assert_eq!(summary, "n");
+
+        // The CodeAct call shape from the work item: `_args` is an array
+        // (never a string), so the only string value is the deny-listed one.
+        let codeact = serde_json::json!({
+            "_args": ["digest", "report on events"],
+            "webhook_secret": "super-secret-value",
+        });
+        assert_eq!(summarize_params("mission_create", &codeact), None);
 
         for key in ["api_key", "auth_token", "password", "secret", "token"] {
             let params = serde_json::json!({key: "super-secret-value"});

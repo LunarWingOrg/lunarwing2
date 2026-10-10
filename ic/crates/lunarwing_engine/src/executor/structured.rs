@@ -448,7 +448,9 @@ fn classify_exec_result(
                 call_id,
                 // WI#352 (run-33 AQ-4): the persisted event history is a
                 // display record, not the resume path — store the redacted
-                // copy so a webhook_secret cannot sit at rest in it.
+                // copy so ApprovalRequested.parameters no longer holds a
+                // webhook_secret (scoped so, run-51 CJ-9: message previews
+                // and thread transcripts are separate at-rest classes).
                 parameters: Some(crate::types::event::redact_event_params(&parameters)),
                 description: None,
                 allow_always: match *resume_kind {
@@ -965,6 +967,66 @@ mod tests {
             leases.check(lease.id).await.unwrap().uses_remaining,
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn approval_requested_event_redacts_sensitive_params_but_gate_keeps_raw() {
+        // Run-51 CJ-8 (structured tier): the ApprovalRequested construction
+        // site must persist only the redacted display copy, while the
+        // returned GatePaused keeps the raw parameters for resume.
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![approval_action("mission_create")],
+            Vec::new(),
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let calls = vec![ActionCall {
+            id: "call_1".into(),
+            action_name: "mission_create".into(),
+            parameters: serde_json::json!({
+                "name": "digest",
+                "webhook_secret": "super-secret-value",
+            }),
+        }];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        // The gate pause carries the raw parameters — resume needs them.
+        match &result.need_approval {
+            Some(ThreadOutcome::GatePaused { parameters, .. }) => {
+                assert_eq!(parameters["webhook_secret"], "super-secret-value");
+            }
+            other => panic!("expected GatePaused, got {other:?}"),
+        }
+        // The persisted event holds only the redacted display copy.
+        let redacted = result
+            .events
+            .iter()
+            .find_map(|event| match event {
+                EventKind::ApprovalRequested {
+                    parameters: Some(parameters),
+                    ..
+                } => Some(parameters),
+                _ => None,
+            })
+            .expect("an ApprovalRequested event");
+        assert_eq!(redacted["webhook_secret"], "[REDACTED]");
+        assert_eq!(redacted["name"], "digest");
+        assert!(!redacted.to_string().contains("super-secret-value"));
     }
 
     #[tokio::test]
