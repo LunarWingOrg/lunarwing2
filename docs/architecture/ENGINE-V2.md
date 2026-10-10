@@ -1008,11 +1008,16 @@ executes; a per-user per-verb rate limit (20/minute, 200/hour) applies,
 plus an aggregate per-user bucket across the four run-spawning verbs
 (create, fire, resume, update — 60/minute, 600/hour; WI#352 AQ-12) so
 their per-verb budgets cannot sum to 80 run-spawning mutations/minute.
-The stop verbs pause/delete stay per-verb only, so a runaway mission
-thread cannot drain the budget its owner needs to stop it, and the
-read-only verbs stay per-verb only so inspection cannot starve a
-mutation budget; total dispatches are bounded at 140/minute (60
-aggregate + 20 each for pause, delete, list, history). Both limiters
+The stop verbs pause/delete use per-verb **caller-class** buckets: Mission
+threads cannot spend Foreground stop tokens, while each class still has a
+20/minute, 200/hour cap for each stop verb. Caller class comes from the host
+execution context, not tool parameters. Read-only verbs stay per-verb only
+so inspection cannot starve a mutation budget. Per user, total dispatches
+are bounded at 180/minute (60 aggregate + 40 stop calls per permitted caller
+class, Foreground and Mission + 20 each for list/history); with only one
+caller class the bound remains 140/minute. Multi-bucket admission checks
+and records under one write lock: a refused call spends no tokens in any
+bucket, and concurrent batches cannot overshoot either cap. Both limiters
 use fixed windows (a window boundary can briefly admit up to 2x the
 minute budget) and reset on restart. AQ-12 deliberately leaves open:
 `mission_create` alone still allows 200 creates/hour (its per-verb
@@ -1043,7 +1048,8 @@ for resume, and the thread transcript's action arguments remain a
 pre-existing at-rest class (AQ-4); the webhook single-owner rule (a fire
 matches every Active mission on a path, so an active path may only have
 one owner) is enforced — per project, not globally — on create, on an
-update that sets a Webhook cadence or changes the path, and on resume
+update that sets a Webhook cadence, changes the path, or adds a nonempty
+secret to a dormant secret-less claim, and on resume
 (AO-1); updates that leave the claim untouched are not re-checked, so
 under a legacy two-owner conflict either owner can still rotate a leaked
 secret or lower a budget; and create-dedup compares webhook cadences by

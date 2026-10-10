@@ -4433,6 +4433,40 @@ mod tests {
         executions: AtomicUsize,
     }
 
+    struct MissionGateEffects {
+        preflight: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for MissionGateEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            parameters: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            Err(EngineError::GatePaused {
+                gate_name: "approval".into(),
+                action_name: action_name.into(),
+                call_id: "call_1".into(),
+                parameters: Box::new(parameters),
+                resume_kind: Box::new(crate::gate::ResumeKind::Approval { allow_always: true }),
+                resume_output: None,
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![ActionDef {
+                requires_approval: self.preflight,
+                ..test_action_def("mission_create")
+            }])
+        }
+    }
+
     struct ExhaustLeaseEffects {
         leases: Arc<LeaseManager>,
         executions: AtomicUsize,
@@ -4800,6 +4834,86 @@ mod tests {
         assert!(thread.events.iter().any(|event| {
             matches!(event.kind, EventKind::ActionFailed { ref call_id, .. } if call_id == "echo-call")
         }));
+    }
+
+    #[tokio::test]
+    async fn mission_gate_redacts_events_in_single_and_parallel_paths() {
+        for preflight in [true, false] {
+            for parallel in [false, true] {
+                let mut thread = Thread::new(
+                    "goal",
+                    ThreadType::Foreground,
+                    ProjectId::new(),
+                    "user",
+                    ThreadConfig::default(),
+                );
+                let effects: Arc<dyn EffectExecutor> = Arc::new(MissionGateEffects { preflight });
+                let leases = Arc::new(LeaseManager::new());
+                leases
+                    .grant(thread.id, "tools", GrantedActions::All, None, None)
+                    .await
+                    .unwrap();
+                let params =
+                    serde_json::json!({"name":"digest", "webhook_secret":"super-secret-value"});
+                let policy = Arc::new(PolicyEngine::new());
+                let mut count = 0;
+                let returned = if parallel {
+                    let args = vec![json_to_monty(
+                        &serde_json::json!([{"name":"mission_create", "params":params, "call_id":"call_1"}]),
+                    )];
+                    handle_execute_actions_parallel(
+                        &args,
+                        &mut thread,
+                        &effects,
+                        &leases,
+                        &policy,
+                        &mut count,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                } else {
+                    let args = vec![
+                        MontyObject::String("mission_create".into()),
+                        json_to_monty(&params),
+                    ];
+                    handle_execute_action(
+                        HostCallArguments {
+                            args: &args,
+                            kwargs: &[],
+                        },
+                        &mut thread,
+                        &effects,
+                        &leases,
+                        &policy,
+                        &mut count,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                };
+                let ExtFunctionResult::Return(value) = returned else {
+                    panic!("expected gate result")
+                };
+                let raw = monty_to_json(&value);
+                let raw = if parallel { &raw[0] } else { &raw };
+                assert_eq!(raw["parameters"]["webhook_secret"], "super-secret-value");
+                let display = thread
+                    .events
+                    .iter()
+                    .find_map(|event| match &event.kind {
+                        EventKind::ApprovalRequested {
+                            parameters: Some(parameters),
+                            ..
+                        } => Some(parameters),
+                        _ => None,
+                    })
+                    .expect("approval event");
+                assert_eq!(display["webhook_secret"], "[REDACTED]");
+                assert_eq!(display["name"], "digest");
+                assert!(!display.to_string().contains("super-secret-value"));
+            }
+        }
     }
 
     #[tokio::test]

@@ -860,9 +860,13 @@ impl MissionManager {
 
         // Run-51 CJ-6: capture the current claim before applying updates so
         // the single-owner rule below can tell a new/changed claim from an
-        // untouched one.
+        // untouched one. Secret-less legacy rows are dormant: adding a usable
+        // secret creates a claim even if the path itself does not change.
         let old_webhook_path = match &mission.cadence {
-            MissionCadence::Webhook { path, .. } => Some(path.clone()),
+            MissionCadence::Webhook {
+                path,
+                secret: Some(secret),
+            } if !secret.is_empty() => Some(path.clone()),
             _ => None,
         };
         if let Some(name) = updates.name {
@@ -6371,6 +6375,65 @@ mod tests {
                 assert!(entity.contains("non-terminal"), "got: {entity}");
             }
             other => panic!("expected AccessDenied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_secretless_webhook_requires_new_claim_check() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(store.clone() as Arc<dyn Store>);
+        let project = ProjectId::new();
+        let a = Mission::new(
+            project,
+            "user-a",
+            "a-hook",
+            "goal",
+            MissionCadence::Webhook {
+                path: "events".into(),
+                secret: Some("a-secret".into()),
+            },
+        );
+        store.save_mission(&a).await.unwrap();
+        for secret in [None, Some(String::new())] {
+            let b = Mission::new(
+                project,
+                "user-b",
+                "b-hook",
+                "goal",
+                MissionCadence::Webhook {
+                    path: "events".into(),
+                    secret: secret.clone(),
+                },
+            );
+            store.save_mission(&b).await.unwrap();
+            let result = mgr
+                .update_mission(
+                    b.id,
+                    "user-b",
+                    MissionUpdate {
+                        webhook_secret: Some("new-secret".into()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(matches!(result, Err(EngineError::AccessDenied { .. })));
+            assert!(
+                matches!(store.load_mission(b.id).await.unwrap().unwrap().cadence,
+                MissionCadence::Webhook { secret: stored, .. } if stored == secret)
+            );
+            mgr.update_mission(
+                b.id,
+                "user-b",
+                MissionUpdate {
+                    cadence: Some(MissionCadence::Webhook {
+                        path: "free".into(),
+                        secret: Some("new-secret".into()),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         }
     }
 

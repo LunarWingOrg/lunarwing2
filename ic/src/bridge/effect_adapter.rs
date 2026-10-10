@@ -761,7 +761,7 @@ impl EffectBridgeAdapter {
         }
 
         if let Some(error) = self
-            .check_mission_rate_limits(action_name, &context.user_id)
+            .check_mission_rate_limits(action_name, &context.user_id, context.thread_type)
             .await
         {
             return Some(error);
@@ -793,11 +793,11 @@ impl EffectBridgeAdapter {
     }
 
     /// Check the per-verb and aggregate mission rate limits (WI#308, WI#352
-    /// run-33 AQ-12). Both budgets are *checked* before either is recorded,
+    /// run-33 AQ-12). Both budgets are atomically checked and recorded,
     /// so a call the aggregate refuses has not already spent a per-verb
     /// token (run-51 CJ-2). The aggregate bucket charges only the
     /// run-spawning verbs — the stop verbs `mission_pause`/`mission_delete`
-    /// keep purely per-verb budgets so a runaway mission thread can never
+    /// keep per-verb, caller-class budgets so a runaway mission thread cannot
     /// drain the budget its owner needs to stop it (run-51 CJ-1).
     ///
     /// Returns `Some(error)` when a limit trips, `None` after recording.
@@ -805,54 +805,37 @@ impl EffectBridgeAdapter {
         &self,
         action_name: &str,
         user_id: &str,
+        thread_type: lunarwing_engine::ThreadType,
     ) -> Option<EngineError> {
         use crate::tools::rate_limiter::RateLimitResult;
 
         let run_spawning = MISSION_RUN_SPAWNING_ACTION_NAMES.contains(&action_name);
-        if let RateLimitResult::Limited { retry_after, .. } = self
+        let verb_key = if matches!(action_name, "mission_pause" | "mission_delete") {
+            format!("{action_name}@{thread_type:?}")
+        } else {
+            action_name.to_string()
+        };
+        let per_verb = mission_rate_limit_config();
+        let aggregate = mission_aggregate_rate_limit_config();
+        let mut buckets = vec![(verb_key.as_str(), &per_verb)];
+        if run_spawning {
+            buckets.push((MISSION_AGGREGATE_RATE_KEY, &aggregate));
+        }
+        if let Err((index, RateLimitResult::Limited { retry_after, .. })) = self
             .rate_limiter
-            .check(user_id, action_name, &mission_rate_limit_config())
+            .check_and_record_all(user_id, &buckets)
             .await
         {
+            let scope = if index == 0 {
+                format!("Tool '{action_name}' is rate limited.")
+            } else {
+                "Mission run-spawning calls (create/fire/resume/update) are rate limited across those verbs. Pause/delete remain available under their caller-class limits.".into()
+            };
             return Some(EngineError::Effect {
-                reason: format!(
-                    "Tool '{action_name}' is rate limited. Try again in {:.0}s.",
-                    retry_after.as_secs_f64()
-                ),
-            });
-        }
-        if run_spawning
-            && let RateLimitResult::Limited { retry_after, .. } = self
-                .rate_limiter
-                .check(
-                    user_id,
-                    MISSION_AGGREGATE_RATE_KEY,
-                    &mission_aggregate_rate_limit_config(),
-                )
-                .await
-        {
-            return Some(EngineError::Effect {
-                reason: format!(
-                    "Mission run-spawning calls are rate limited across those verbs. \
-                     Try again in {:.0}s.",
-                    retry_after.as_secs_f64()
-                ),
+                reason: format!("{scope} Try again in {:.0}s.", retry_after.as_secs_f64()),
             });
         }
 
-        // Both budgets allow the call; record against each.
-        self.rate_limiter
-            .check_and_record(user_id, action_name, &mission_rate_limit_config())
-            .await;
-        if run_spawning {
-            self.rate_limiter
-                .check_and_record(
-                    user_id,
-                    MISSION_AGGREGATE_RATE_KEY,
-                    &mission_aggregate_rate_limit_config(),
-                )
-                .await;
-        }
         None
     }
 
@@ -1879,6 +1862,7 @@ pub(crate) const MISSION_MUTATING_ACTION_NAMES: &[&str] = &[
 /// construction (`ThreadConfig::default()`; `AGENT_SUPERVISED_MODE` applies
 /// only to foreground message threads), so the approval prompt for these
 /// verbs must say the resulting runs execute unsupervised.
+/// This list also defines membership in the aggregate run-spawning rate bucket.
 pub(crate) const MISSION_RUN_SPAWNING_ACTION_NAMES: &[&str] = &[
     "mission_create",
     "mission_fire",
@@ -1914,9 +1898,9 @@ const MISSION_AGGREGATE_RATE_KEY: &str = "mission_*";
 /// 4 x 20/min and 4 x 200/h across create/fire/resume/update; this bucket
 /// caps run-spawning mutations at 60/min and 600/h regardless of verb mix.
 /// The stop verbs (pause/delete) and the read-only verbs (list, history)
-/// stay per-verb only: a runaway mission thread must never be able to drain
-/// the budget its owner would use to pause or delete it, and inspection
-/// cannot starve a mutation budget.
+/// do not use this bucket. Stop verbs additionally partition their per-verb
+/// budget by host caller class, protecting Foreground tokens from Mission
+/// threads; read-only inspection cannot starve a mutation budget.
 fn mission_aggregate_rate_limit_config() -> crate::tools::ToolRateLimitConfig {
     crate::tools::ToolRateLimitConfig::new(60, 600)
 }
@@ -5360,6 +5344,83 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             !matches!(&other, Err(EngineError::Effect { reason }) if reason.contains("rate limited")),
             "mission_history has its own bucket: {other:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mission_calls_cannot_overshoot_budget() {
+        let (adapter, mgr, _) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let adapter = Arc::new(adapter);
+        let barrier = Arc::new(tokio::sync::Barrier::new(50));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                adapter
+                    .execute_action(
+                        "mission_fire",
+                        serde_json::json!({"name":"missing"}),
+                        &lease(),
+                        &mission_create_ctx(),
+                    )
+                    .await
+            });
+        }
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(_) => admitted += 1,
+                Err(EngineError::Effect { reason }) => assert!(reason.contains("rate limited")),
+                other => panic!("unexpected gate result: {other:?}"),
+            }
+        }
+        assert_eq!(admitted, 20);
+        let user = mission_create_ctx().user_id;
+        assert_eq!(
+            adapter.rate_limiter.get_usage(&user, "mission_fire").await,
+            Some((20, 20))
+        );
+        assert_eq!(
+            adapter
+                .rate_limiter
+                .get_usage(&user, MISSION_AGGREGATE_RATE_KEY)
+                .await,
+            Some((20, 20))
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_threads_cannot_drain_foreground_stop_budgets() {
+        let (adapter, mgr, _) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let foreground = mission_create_ctx();
+        let mut background = foreground.clone();
+        background.thread_type = lunarwing_engine::ThreadType::Mission;
+        for verb in ["mission_pause", "mission_delete"] {
+            for ctx in [&background, &foreground] {
+                for _ in 0..20 {
+                    assert!(
+                        adapter
+                            .execute_action(
+                                verb,
+                                serde_json::json!({"name":"missing"}),
+                                &lease(),
+                                ctx
+                            )
+                            .await
+                            .is_ok()
+                    );
+                }
+                let result = adapter
+                    .execute_action(verb, serde_json::json!({"name":"missing"}), &lease(), ctx)
+                    .await;
+                assert!(
+                    matches!(result, Err(EngineError::Effect { reason }) if reason.contains("rate limited"))
+                );
+            }
+        }
     }
 
     #[tokio::test]
