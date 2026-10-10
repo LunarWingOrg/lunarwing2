@@ -22,7 +22,13 @@
 
 ## Phase 2 — Features & Polish (for goals referencing work items, read comments on work items as well)
 
-3. [ ] audit all crates and ensure there are no security vulnerabilities
+3. [x] audit all crates and ensure there are no security vulnerabilities
+   - DONE (2026-10-10, branch `sweetiebot/kimi-3-20261010-0605`): audit doc `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`; RustSec advisory-db `7eebec6` (2026-10-09); v2.1.5.0 audit archived to `docs/ops/history/`
+   - Main cargo-deny gate clean (advisories/bans/licenses/sources, `yanked = "deny"` verifiably enforced); satellite sweep 26/26 manifest roots ok (1 manifest-less lock gated by verify_upstream_lock.py); lockfile-only advisory guard ok (pyo3 absent, atty no-dev)
+   - New this cycle: cargo-audit 0.22.2 full-lockfile sweep over all 27 committed locks (no resolve-graph filtering) — 25 fully clean; `ic` + `ic/bridges/xmpp-bridge` report exactly the accepted set, nothing hiding in uncompiled pins beyond guarded pyo3/atty
+   - Accepted advisories (6 vuln + 1 unsound + 2 unmaintained: rustls-webpki 0.102.8 x4 and h2 0.3.27 via the libsql 0.6.0 legacy chain, rsa 0.10.0-rc.18 via russh, failure x2 + rental via the vendored libsignal OMEMO wrapper) re-verified upstream 2026-10-10 — libsql 0.9.30/0.10.0-pre.4 still pull hyper-rustls ^0.25, RUSTSEC-2023-0071 still `patched = []` (rc.19 also affected), russh 0.64.1 still pins rsa =0.10.0-rc.18, failure 0.1.8 final, rental 0.5.6 newest; deny.toml re-verification stamps updated
+   - Advisory-db delta 2026-10-03 → 2026-10-09: 8 new advisories (all crates unpinned here), 1 modified (wasmtime RUSTSEC-2026-0223, unaffected <46.0.0; locked 36.0.17)
+   - `.gitlab` tests 60/60 OK (need exec-able TMPDIR + PyYAML 6.0.3 on this VM); `validate_config.py` green
 4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298 - Brightdawn confirmed close now
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
