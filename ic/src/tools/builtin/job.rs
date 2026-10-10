@@ -2081,6 +2081,108 @@ impl Tool for CancelJobTool {
     }
 }
 
+/// Tool for driving cron-mode external worker missions at runtime (WI#325).
+///
+/// `cancel_job` ends only the currently-running tick job — the mission fires
+/// again at the next schedule. This tool pauses/resumes the mission itself
+/// (persisted, so a pause survives restarts) and reports its status. The
+/// ownership gate mirrors `cancel_job`: only the mission's owning user may
+/// drive it.
+pub struct CronMissionTool {
+    external_worker_manager: Arc<ExternalWorkerManager>,
+}
+
+impl CronMissionTool {
+    pub fn new(mgr: Arc<ExternalWorkerManager>) -> Self {
+        Self {
+            external_worker_manager: mgr,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CronMissionTool {
+    fn name(&self) -> &str {
+        "cron_mission"
+    }
+
+    fn description(&self) -> &str {
+        "Pause, resume, or inspect a cron-mode external worker mission. Pausing stops future \
+         scheduled ticks (and survives restarts) until resumed; the currently running tick job \
+         is not cancelled — use cancel_job for that. Works only on workers configured with \
+         mode = \"cron\"."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["pause", "resume", "status"],
+                    "description": "pause: stop future ticks until resumed; resume: clear the pause and reset the circuit breaker; status: report mission state"
+                },
+                "worker": {
+                    "type": "string",
+                    "description": "Name of the cron-mode external worker hosting the mission"
+                }
+            },
+            "required": ["action", "worker"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+        let action = require_str(&params, "action")?;
+        let worker = require_str(&params, "worker")?;
+        let manager = &self.external_worker_manager;
+        let as_tool_error = |e: crate::error::OrchestratorError| {
+            ToolError::ExecutionFailed(format!("cron mission '{worker}': {e}"))
+        };
+        match action {
+            "pause" => manager
+                .pause_cron_mission(worker, &ctx.user_id)
+                .await
+                .map_err(as_tool_error)?,
+            "resume" => manager
+                .resume_cron_mission(worker, &ctx.user_id)
+                .await
+                .map_err(as_tool_error)?,
+            "status" => {}
+            other => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "unknown cron_mission action '{other}' (expected pause|resume|status)"
+                )));
+            }
+        }
+        let status = manager
+            .cron_mission_status(worker, &ctx.user_id)
+            .await
+            .map_err(as_tool_error)?;
+        let result = serde_json::to_value(&status)
+            .unwrap_or_else(|_| serde_json::json!({"error": "status serialization failed"}));
+        Ok(ToolOutput::success(
+            serde_json::json!({
+                "action": action,
+                "mission": result,
+            }),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+}
+
 /// Tool for reading sandbox job event logs.
 ///
 /// Lets the main agent inspect what a running (or completed) container job has
