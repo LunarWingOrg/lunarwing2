@@ -207,6 +207,15 @@ PY
   fi
 fi
 
+# WI#330: the baked config ships a placeholder base_url on the .invalid TLD
+# (guaranteed NXDOMAIN). mt-admin always renders KIMI_BASE_URL — defaulting to
+# the tenant's own LLM endpoint — so a placeholder that survives to the
+# runtime config means a hand-rolled deployment forgot the override. Fail
+# loudly at startup instead of at the first LLM request.
+if grep -q 'set-kimi-base-url\.invalid' "$KIMI_CODE_HOME/config.toml" 2>/dev/null; then
+  die "KIMI_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-kimi <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
+fi
+
 # ── always start the health server in the background ──────────────────────────
 log "Starting health server on port $HEALTH_PORT"
 export WS_STATE_FILE
