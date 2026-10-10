@@ -1454,7 +1454,7 @@ async fn preflight_action(
                 events.push(EventKind::ApprovalRequested {
                     action_name: action_name.into(),
                     call_id: call_id.into(),
-                    parameters: Some(params.clone()),
+                    parameters: Some(crate::types::event::redact_event_params(params)),
                     description: None,
                     allow_always: None,
                     gate_name: None,
@@ -1923,7 +1923,7 @@ async fn resolve_tool_completion(
             events.push(EventKind::ApprovalRequested {
                 action_name: action_name.clone(),
                 call_id: call_id.clone(),
-                parameters: Some(parameters.clone()),
+                parameters: Some(crate::types::event::redact_event_params(&parameters)),
                 description: None,
                 allow_always: match &resume_kind {
                     crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),
@@ -3280,6 +3280,76 @@ except Exception as error:
             Some(2),
             "pre-execution gate must refund its consumed lease use"
         );
+    }
+
+    #[tokio::test]
+    async fn approval_requested_event_redacts_sensitive_params_but_gate_keeps_raw() {
+        for preflight in [true, false] {
+            // Run-51 CJ-8 (scripting tier): the ApprovalRequested construction
+            // site must persist only the redacted display copy, while the
+            // returned GatePaused keeps the raw parameters for resume.
+            let thread = make_test_thread();
+            let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+                vec![ActionDef {
+                    requires_approval: preflight,
+                    ..test_action("mission_create")
+                }],
+                vec![Err(EngineError::GatePaused {
+                    gate_name: "approval".into(),
+                    action_name: "mission_create".into(),
+                    call_id: "call_1".into(),
+                    parameters: Box::new(
+                        serde_json::json!({"name":"digest", "webhook_secret":"super-secret-value"}),
+                    ),
+                    resume_kind: Box::new(crate::gate::ResumeKind::Approval { allow_always: true }),
+                    resume_output: None,
+                })],
+            ));
+            let leases = LeaseManager::new();
+            leases
+                .grant(thread.id, "tools", GrantedActions::All, None, None)
+                .await
+                .unwrap();
+
+            let result = run_code_with_leases(
+                r#"await mission_create(name="digest", webhook_secret="super-secret-value")
+FINAL("must not reach")"#,
+                effects,
+                &thread,
+                &leases,
+            )
+            .await
+            .unwrap();
+
+            // The gate pause carries the raw parameters — resume needs them.
+            match result.need_approval.as_ref() {
+                Some(crate::runtime::messaging::ThreadOutcome::GatePaused {
+                    action_name,
+                    parameters,
+                    ..
+                }) => {
+                    assert_eq!(action_name, "mission_create");
+                    assert_eq!(parameters["webhook_secret"], "super-secret-value");
+                }
+                other => panic!("expected GatePaused, got {other:?}"),
+            }
+            // The persisted event holds only the redacted display copy.
+            let redacted = result
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    EventKind::ApprovalRequested {
+                        action_name,
+                        parameters: Some(parameters),
+                        ..
+                    } if action_name == "mission_create" => Some(parameters),
+                    _ => None,
+                })
+                .expect("an ApprovalRequested event for mission_create");
+            assert_eq!(redacted["webhook_secret"], "[REDACTED]");
+            assert_eq!(redacted["name"], "digest");
+            assert!(!redacted.to_string().contains("super-secret-value"));
+        }
     }
 
     #[tokio::test]

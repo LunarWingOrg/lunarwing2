@@ -107,6 +107,21 @@ impl std::fmt::Debug for MissionCadence {
     }
 }
 
+impl MissionCadence {
+    /// Whether two cadences describe different schedules, for create-dedup
+    /// reporting. Webhook cadences compare by path only: the secret is a
+    /// runtime credential, not part of the schedule, so a dedup probe
+    /// carrying a different secret must not report a cadence difference
+    /// (WI#352, AO-7). The derived `PartialEq` still covers the secret and
+    /// remains the right comparison everywhere else.
+    pub fn schedule_differs(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Webhook { path: a, .. }, Self::Webhook { path: b, .. }) => a != b,
+            _ => self != other,
+        }
+    }
+}
+
 /// A mission — a long-running goal that spawns threads over time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
