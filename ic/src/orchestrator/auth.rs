@@ -85,6 +85,9 @@ impl<'de> Deserialize<'de> for SandboxJobGrants {
     }
 }
 
+/// Mounted harness secret values for one job: `(file_name, value)` pairs.
+type HarnessSecrets = Vec<(String, SecretString)>;
+
 /// In-memory store for per-job authentication tokens and credential grants.
 #[derive(Clone)]
 pub struct TokenStore {
@@ -94,7 +97,7 @@ pub struct TokenStore {
     credential_grants: Arc<RwLock<HashMap<Uuid, Vec<CredentialGrant>>>>,
     /// MCP grants stay isolated from generic shell/child-process credentials.
     mcp_credential_grants: Arc<RwLock<HashMap<Uuid, Vec<McpCredentialGrant>>>>,
-    /// Harness-mode secret values (WI#326), `(file_name, value)` pairs.
+    /// Harness-mode secret values (WI#326).
     ///
     /// Resolved host-side at dispatch and held for the job's lifetime: the
     /// worker pulls them over its authenticated channel (CV-2), and the
@@ -102,7 +105,7 @@ pub struct TokenStore {
     /// write-back mounted-secret scan (CW-10). Deliberately NOT cleared by
     /// `revoke` — promotion runs after the token dies; every terminal path
     /// calls [`TokenStore::clear_harness_secrets`] explicitly.
-    harness_secrets: Arc<RwLock<HashMap<Uuid, Vec<(String, SecretString)>>>>,
+    harness_secrets: Arc<RwLock<HashMap<Uuid, HarnessSecrets>>>,
 }
 
 impl TokenStore {
@@ -175,7 +178,7 @@ impl TokenStore {
 
     /// Store harness-mode secret values for a job (WI#326). Call right after
     /// `create_token()`, before the container is created.
-    pub async fn store_harness_secrets(&self, job_id: Uuid, secrets: Vec<(String, SecretString)>) {
+    pub async fn store_harness_secrets(&self, job_id: Uuid, secrets: HarnessSecrets) {
         let mut stored = self.harness_secrets.write().await;
         if secrets.is_empty() {
             stored.remove(&job_id);
@@ -185,7 +188,7 @@ impl TokenStore {
     }
 
     /// Retrieve the mounted file names and values for a job (worker pull).
-    pub async fn harness_secrets(&self, job_id: Uuid) -> Option<Vec<(String, SecretString)>> {
+    pub async fn harness_secrets(&self, job_id: Uuid) -> Option<HarnessSecrets> {
         self.harness_secrets.read().await.get(&job_id).cloned()
     }
 

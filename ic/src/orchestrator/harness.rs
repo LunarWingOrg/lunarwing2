@@ -1394,12 +1394,16 @@ mod tests {
             " projects",
             "projects ",
         ] {
-            let mut policy = WriteBackPolicy::default();
-            policy.allowed_roots = vec![bad_root.to_string()];
+            let policy = WriteBackPolicy {
+                allowed_roots: vec![bad_root.to_string()],
+                ..Default::default()
+            };
             assert!(policy.validate().is_err(), "root '{bad_root}' must fail");
         }
-        let mut narrowed = WriteBackPolicy::default();
-        narrowed.allowed_roots = vec!["projects/demo".to_string()];
+        let narrowed = WriteBackPolicy {
+            allowed_roots: vec!["projects/demo".to_string()],
+            ..Default::default()
+        };
         assert!(narrowed.validate().is_ok());
         assert!(narrowed.root_allows("projects/demo/out.md"));
         assert!(!narrowed.root_allows("projects/other/out.md"));
@@ -1408,22 +1412,32 @@ mod tests {
     #[test]
     fn write_back_limits_have_server_side_ceilings() {
         // CW-6: the caller may lower limits but never raise them past ceilings.
-        let mut policy = WriteBackPolicy::default();
-        policy.max_files = WRITE_BACK_MAX_FILES_CEILING + 1;
-        assert!(policy.validate().is_err());
-        let mut policy = WriteBackPolicy::default();
-        policy.max_file_bytes = WRITE_BACK_MAX_FILE_BYTES_CEILING + 1;
-        assert!(policy.validate().is_err());
-        let mut policy = WriteBackPolicy::default();
-        policy.max_total_bytes = WRITE_BACK_MAX_TOTAL_BYTES_CEILING + 1;
-        assert!(policy.validate().is_err());
-        let mut policy = WriteBackPolicy::default();
-        policy.max_files = 0;
-        assert!(policy.validate().is_err());
-        let mut lowered = WriteBackPolicy::default();
-        lowered.max_files = 1;
-        lowered.max_file_bytes = 1024;
-        lowered.max_total_bytes = 2048;
+        let too_many_files = WriteBackPolicy {
+            max_files: WRITE_BACK_MAX_FILES_CEILING + 1,
+            ..Default::default()
+        };
+        assert!(too_many_files.validate().is_err());
+        let too_big_file = WriteBackPolicy {
+            max_file_bytes: WRITE_BACK_MAX_FILE_BYTES_CEILING + 1,
+            ..Default::default()
+        };
+        assert!(too_big_file.validate().is_err());
+        let too_big_total = WriteBackPolicy {
+            max_total_bytes: WRITE_BACK_MAX_TOTAL_BYTES_CEILING + 1,
+            ..Default::default()
+        };
+        assert!(too_big_total.validate().is_err());
+        let zero = WriteBackPolicy {
+            max_files: 0,
+            ..Default::default()
+        };
+        assert!(zero.validate().is_err());
+        let lowered = WriteBackPolicy {
+            max_files: 1,
+            max_file_bytes: 1024,
+            max_total_bytes: 2048,
+            ..Default::default()
+        };
         assert!(lowered.validate().is_ok());
     }
 

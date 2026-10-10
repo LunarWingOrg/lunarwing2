@@ -1953,8 +1953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_harness_job_skips_write_back_promotion() {
-        // CW-7: promotion is a success-only path; failed jobs keep their
+    async fn failed_harness_job_skips_write_back_promotion() {        // CW-7: promotion is a success-only path; failed jobs keep their
         // staging out of tenant memory and record the skip.
         let mgr = ContainerJobManager::new(ContainerJobConfig::default(), TokenStore::new());
         let job_id = Uuid::new_v4();
@@ -2023,5 +2022,87 @@ mod tests {
                 .contains("did not complete successfully")
         );
         assert!(summary.records.is_empty());
+    }
+
+    /// CV-2 (WI#326): the runtime-specific tmpfs options must produce a
+    /// `/run/secrets` mount that is owned by — and writable by — the
+    /// container's worker uid (1000). Exercises whichever runtime the host
+    /// provides (podman's `U` path reproduced the MR !1510 failure; Docker
+    /// takes uid/gid). Self-skips when no runtime or worker image exists.
+    #[tokio::test]
+    async fn harness_secrets_tmpfs_is_worker_owned_and_writable() {
+        let mgr = ContainerJobManager::new(ContainerJobConfig::default(), TokenStore::new());
+        let Ok(docker) = mgr.docker().await else {
+            eprintln!("skipping: no container runtime available");
+            return;
+        };
+        let Ok(kind) = mgr.runtime_kind().await else {
+            eprintln!("skipping: runtime detection failed");
+            return;
+        };
+        let image = mgr.config.image.clone();
+        if docker.inspect_image(&image).await.is_err() {
+            eprintln!("skipping: worker image '{image}' not present");
+            return;
+        }
+
+        let tmpfs: HashMap<String, String> = [(
+            harness::HARNESS_SECRETS_CONTAINER_DIR.to_string(),
+            kind.secrets_tmpfs_options().to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let config = bollard::container::Config {
+            image: Some(image.clone()),
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                // Write as uid 1000, then prove ownership is uid 1000.
+                "touch /run/secrets/OK && test \"$(stat -c %u /run/secrets)\" = 1000"
+                    .to_string(),
+            ]),
+            user: Some("1000:1000".to_string()),
+            host_config: Some(bollard::models::HostConfig {
+                tmpfs: Some(tmpfs),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let name = format!("lunarwing-harness-tmpfs-test-{}", Uuid::new_v4());
+        let created = docker
+            .create_container(
+                Some(bollard::container::CreateContainerOptions {
+                    name: name.clone(),
+                    ..Default::default()
+                }),
+                config,
+            )
+            .await
+            .unwrap(); // safety: test — a create failure here is exactly CV-2
+        docker
+            .start_container::<String>(&created.id, None)
+            .await
+            .unwrap(); // safety: test
+        let wait = docker
+            .wait_container::<String>(&created.id, None)
+            .next()
+            .await;
+        let _ = docker
+            .remove_container(
+                &created.id,
+                Some(bollard::container::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let exit = wait
+            .and_then(|r| r.ok())
+            .map(|r| r.status_code)
+            .unwrap_or(-1);
+        assert_eq!(
+            exit, 0,
+            "tmpfs secrets mount must be writable by uid 1000 on {kind:?}"
+        );
     }
 }
