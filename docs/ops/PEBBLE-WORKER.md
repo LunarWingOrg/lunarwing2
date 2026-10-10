@@ -51,6 +51,39 @@ Before v2.1.2.0 the read loop was parked inside the running task, so
 mid-task cancels queued unread and every task ran to its full timeout
 (work item #101).
 
+## Task-Shell Toolchain PATH (WI#334)
+
+In the fat image (`WITH_TOOLCHAINS=true`) the toolchain environment must
+survive upstream pebble's shell tool, which can spawn the task shell as a
+login or otherwise sanitised shell that drops the image-level `ENV`
+(`PATH`, `RUSTUP_HOME`, `CARGO_HOME`, `GOROOT`, `GOPATH`). Exporting PATH
+from `entrypoint.sh` cannot help — the reset happens after the entrypoint.
+The image therefore anchors the toolchains in three places:
+
+- `/etc/profile.d/lunarwing-toolchain.sh`
+  (`pebble4lunarwing/scripts/toolchain-profile.sh`) restores the toolchain
+  variables and PATH entries for login shells; Debian's `/etc/profile`
+  resets PATH and then sources it. The snippet is existence-guarded, so it
+  is inert in the slim image.
+- `/usr/local/bin/{cargo,rustc,go,gofmt}` are symlinks to the real
+  toolchain binaries (not the rustup shims), so they run without
+  `RUSTUP_HOME`/`CARGO_HOME` from any shell whose fallback PATH includes
+  `/usr/local/bin`.
+- `/usr/local/bin/rustup`
+  (`pebble4lunarwing/scripts/rustup-wrapper.sh`) is a wrapper that
+  re-exports `RUSTUP_HOME`/`CARGO_HOME` before delegating to the real
+  rustup, keeping it discoverable and functional from sanitised shells.
+
+The image build proves the anchors with
+`env -i bash -lc 'cargo --version && rustc --version && go version && rustup --version'`.
+To re-check a built image or a live worker container (the pebble gauntlet
+smoke check for this finding):
+
+```bash
+pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh image lunarwing-worker-pebble:latest
+pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh container <pebble-container>
+```
+
 ## Single-Instance Setup
 
 ### Native (no Docker)
