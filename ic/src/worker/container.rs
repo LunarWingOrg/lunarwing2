@@ -56,8 +56,8 @@ fn read_secret_files() -> Vec<(String, String)> {
     if !harness_mode {
         return Vec::new();
     }
-    let dir = std::env::var("LUNARWING_SECRETS_DIR")
-        .unwrap_or_else(|_| DEFAULT_SECRETS_DIR.to_string());
+    let dir =
+        std::env::var("LUNARWING_SECRETS_DIR").unwrap_or_else(|_| DEFAULT_SECRETS_DIR.to_string());
     let dir = std::path::Path::new(&dir);
     let read_dir = match std::fs::read_dir(dir) {
         Ok(read_dir) => read_dir,
@@ -88,10 +88,7 @@ fn read_secret_files() -> Vec<(String, String)> {
         }
     }
     if !secrets.is_empty() {
-        tracing::info!(
-            "Loaded {} secret file(s) from tmpfs mount",
-            secrets.len()
-        );
+        tracing::info!("Loaded {} secret file(s) from tmpfs mount", secrets.len());
     }
     secrets
 }

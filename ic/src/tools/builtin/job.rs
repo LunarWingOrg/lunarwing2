@@ -234,7 +234,10 @@ fn harness_secret_mounts(params: &serde_json::Value) -> Result<Vec<SecretFileMou
         return Ok(Vec::new());
     };
     let obj = obj.as_object().ok_or_else(|| {
-        ToolError::InvalidParameters("worker_secrets must be an object mapping secret names to mounted file names".to_string())
+        ToolError::InvalidParameters(
+            "worker_secrets must be an object mapping secret names to mounted file names"
+                .to_string(),
+        )
     })?;
     let mut mounts = Vec::with_capacity(obj.len());
     for (secret_name, file_name) in obj {
@@ -268,14 +271,11 @@ fn harness_injection_specs(params: &serde_json::Value) -> Result<Vec<InjectionSp
         let spec = match item {
             serde_json::Value::String(source) => InjectionSpec::new(source.clone()),
             serde_json::Value::Object(_) => {
-                let source = item
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ToolError::InvalidParameters(
-                            "inject_files entries require a 'source' string".to_string(),
-                        )
-                    })?;
+                let source = item.get("source").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::InvalidParameters(
+                        "inject_files entries require a 'source' string".to_string(),
+                    )
+                })?;
                 let mut spec = InjectionSpec::new(source);
                 if let Some(target) = item.get("target").and_then(|v| v.as_str()) {
                     spec = spec.with_target(target);
@@ -304,9 +304,7 @@ fn harness_write_back_policy(
         return Ok(None);
     };
     match value {
-        serde_json::Value::Bool(enabled) => {
-            Ok(enabled.then(WriteBackPolicy::default))
-        }
+        serde_json::Value::Bool(enabled) => Ok(enabled.then(WriteBackPolicy::default)),
         serde_json::Value::Object(obj) => {
             let mut policy = WriteBackPolicy::default();
             if let Some(roots) = obj.get("allowed_roots") {
@@ -318,13 +316,11 @@ fn harness_write_back_policy(
                 policy.allowed_roots = roots
                     .iter()
                     .map(|r| {
-                        r.as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| {
-                                ToolError::InvalidParameters(
-                                    "write_back.allowed_roots entries must be strings".to_string(),
-                                )
-                            })
+                        r.as_str().map(str::to_string).ok_or_else(|| {
+                            ToolError::InvalidParameters(
+                                "write_back.allowed_roots entries must be strings".to_string(),
+                            )
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
             }
@@ -806,10 +802,7 @@ impl CreateJobTool {
             let mut entries = Vec::with_capacity(options.injections.len());
             for spec in &options.injections {
                 let document = workspace.read(&spec.source).await.map_err(|e| {
-                    ToolError::InvalidParameters(format!(
-                        "cannot inject '{}': {}",
-                        spec.source, e
-                    ))
+                    ToolError::InvalidParameters(format!("cannot inject '{}': {}", spec.source, e))
                 })?;
                 entries.push(harness::InjectionEntry {
                     source_path: spec.source.clone(),
@@ -891,7 +884,10 @@ impl CreateJobTool {
 
         // WI#326: prepare harness mounts before any container exists.
         let harness_request = match harness_options {
-            Some(options) => Some(self.prepare_harness_request(job_id, &ctx.user_id, options).await?),
+            Some(options) => Some(
+                self.prepare_harness_request(job_id, &ctx.user_id, options)
+                    .await?,
+            ),
             None => None,
         };
         let job_mode = if harness_request.is_some() {
@@ -1884,7 +1880,10 @@ impl Tool for CreateJobTool {
             let max_iterations = worker_max_iterations(&params)?;
             // Harness jobs dispatch async by default (external-worker model);
             // wait=true blocks until completion like the plain sandbox.
-            let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+            let wait = params
+                .get("wait")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let explicit_dir = params
                 .get("project_dir")
                 .and_then(|v| v.as_str())

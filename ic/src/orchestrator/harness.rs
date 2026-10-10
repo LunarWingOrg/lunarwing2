@@ -733,12 +733,20 @@ mod tests {
         assert_eq!(spec.resolved_target_name().unwrap(), "notes.md");
 
         let renamed = InjectionSpec::new("MEMORY.md").with_target("memory_snapshot.md");
-        assert_eq!(renamed.resolved_target_name().unwrap(), "memory_snapshot.md");
+        assert_eq!(
+            renamed.resolved_target_name().unwrap(),
+            "memory_snapshot.md"
+        );
 
         assert!(InjectionSpec::new("../escape").validate().is_err());
         assert!(InjectionSpec::new("/absolute").validate().is_err());
         assert!(InjectionSpec::new("a//b").validate().is_err());
-        assert!(InjectionSpec::new("ok.md").with_target("bad/name").validate().is_err());
+        assert!(
+            InjectionSpec::new("ok.md")
+                .with_target("bad/name")
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -889,8 +897,7 @@ mod tests {
         assert!(
             plan.rejections
                 .iter()
-                .any(|r| r.relative_path == "projects/leak.md"
-                    && r.reason.contains("leak scan"))
+                .any(|r| r.relative_path == "projects/leak.md" && r.reason.contains("leak scan"))
         );
 
         let tmp2 = staging_with(&[("projects/big.md", &"x".repeat(300 * 1024))]);

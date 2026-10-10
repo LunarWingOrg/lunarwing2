@@ -895,12 +895,13 @@ impl ContainerJobManager {
         if let Some(ref harness_req) = harness
             && !harness_req.resolved_secrets.is_empty()
         {
-            let upload = harness::build_secrets_tar(&harness_req.resolved_secrets).map_err(|e| {
-                OrchestratorError::ContainerCreationFailed {
-                    job_id,
-                    reason: format!("failed to build secrets archive: {e}"),
-                }
-            })?;
+            let upload =
+                harness::build_secrets_tar(&harness_req.resolved_secrets).map_err(|e| {
+                    OrchestratorError::ContainerCreationFailed {
+                        job_id,
+                        reason: format!("failed to build secrets archive: {e}"),
+                    }
+                })?;
             let options = bollard::container::UploadToContainerOptions {
                 path: harness::HARNESS_SECRETS_CONTAINER_DIR.to_string(),
                 ..Default::default()

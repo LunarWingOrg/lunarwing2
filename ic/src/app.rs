@@ -498,7 +498,14 @@ impl AppBuilder {
             None
         };
 
-        Ok((safety, tools, embeddings, workspace, workspace_resolver, builder))
+        Ok((
+            safety,
+            tools,
+            embeddings,
+            workspace,
+            workspace_resolver,
+            builder,
+        ))
     }
 
     /// Phase 5: Load WASM tools, MCP servers, and create extension manager.
