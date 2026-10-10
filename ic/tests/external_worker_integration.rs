@@ -514,6 +514,8 @@ fn config_for(url: &str) -> ExternalWorkerConfig {
         }],
         load_balance: LoadBalanceStrategy::RoundRobin,
         prompt_context: Default::default(),
+        mode: lunarwing::config::ExternalWorkerMode::Task,
+        cron: None,
     }
 }
 
@@ -532,6 +534,8 @@ fn config_for_with_auth(url: &str, token: &str) -> ExternalWorkerConfig {
         }],
         load_balance: LoadBalanceStrategy::RoundRobin,
         prompt_context: Default::default(),
+        mode: lunarwing::config::ExternalWorkerMode::Task,
+        cron: None,
     }
 }
 
