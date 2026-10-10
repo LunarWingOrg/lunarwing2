@@ -1571,9 +1571,14 @@ async fn run_external_task(
             // Bounded handoff on the timeout path too (WI#149): give the worker
             // the same window to acknowledge before the connection is torn
             // down, so its cancel processing isn't racing socket cleanup.
-            let _ =
-                wait_for_cancel_ack(&mut read, &mut write, job_id, worker_name, CANCEL_ACK_TIMEOUT)
-                    .await;
+            let _ = wait_for_cancel_ack(
+                &mut read,
+                &mut write,
+                job_id,
+                worker_name,
+                CANCEL_ACK_TIMEOUT,
+            )
+            .await;
             // WI#263: the streamed investigation is real work. Persist a
             // bounded evidence snapshot and a fallback-deliverable marker so
             // the partial result survives the timeout instead of vanishing
@@ -2030,14 +2035,20 @@ fn tool_result_envelope(
 /// must never abort the surrounding task loop.
 async fn send_reply_envelope(write: &mut WsWrite, env: &Envelope, worker_name: &str) {
     let Ok(json) = serde_json::to_string(env) else {
-        tracing::warn!("Failed to serialize {} reply for '{worker_name}'", env.msg_type);
+        tracing::warn!(
+            "Failed to serialize {} reply for '{worker_name}'",
+            env.msg_type
+        );
         return;
     };
     if let Err(e) = write
         .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
         .await
     {
-        tracing::warn!("Failed to send {} reply to '{worker_name}': {e}", env.msg_type);
+        tracing::warn!(
+            "Failed to send {} reply to '{worker_name}': {e}",
+            env.msg_type
+        );
     }
 }
 
@@ -2130,79 +2141,9 @@ async fn handle_tool_call(
     calls_used: &mut u32,
     cancel_rx: &watch::Receiver<bool>,
 ) -> Envelope {
-    // CQ-7: bind the frame to this connection's job. `task_id` is required
-    // and must match — a leftover worker process on a pooled socket must not
-    // run calls in the next job's scope.
-    let job_id_str = ctx.job_id.to_string();
-    if call.task_id.as_deref() != Some(job_id_str.as_str()) {
-        record_tool_result(
-            ctx.store,
-            ctx.job_id,
-            "unknown",
-            false,
-            "tool_call rejected: task_id missing or mismatched",
-        )
-        .await;
-        return tool_result_envelope(
-            &call.call_id,
-            "error",
-            String::new(),
-            Some(format!(
-                "task_id must equal this connection's job id ({job_id_str})"
-            )),
-        );
+    if let Some(reply) = frame_binding_rejection(ctx, &call, calls_used).await {
+        return reply;
     }
-
-    // CQ-3: validate worker-controlled identifiers before they are persisted
-    // or logged (raw newlines would forge log lines / poison event rows).
-    if !is_valid_frame_ident(&call.call_id, MAX_CALL_ID_BYTES) {
-        record_tool_result(
-            ctx.store,
-            ctx.job_id,
-            "unknown",
-            false,
-            "tool_call rejected: invalid call_id",
-        )
-        .await;
-        return tool_result_envelope("", "error", String::new(), Some("invalid call_id".to_string()));
-    }
-    if !is_valid_frame_ident(&call.name, MAX_TOOL_NAME_BYTES) {
-        record_tool_result(
-            ctx.store,
-            ctx.job_id,
-            "unknown",
-            false,
-            "tool_call rejected: invalid tool name",
-        )
-        .await;
-        return tool_result_envelope(
-            &call.call_id,
-            "error",
-            String::new(),
-            Some("invalid tool name".to_string()),
-        );
-    }
-
-    // CQ-3: per-job call cap, independent of the per-tool rate limiter.
-    if *calls_used >= MAX_TOOL_CALLS_PER_JOB {
-        record_tool_result(
-            ctx.store,
-            ctx.job_id,
-            &call.name,
-            false,
-            "tool_call denied: per-job call cap reached",
-        )
-        .await;
-        return tool_result_envelope(
-            &call.call_id,
-            "denied",
-            String::new(),
-            Some(format!(
-                "per-job proxied tool call cap ({MAX_TOOL_CALLS_PER_JOB}) reached"
-            )),
-        );
-    }
-    *calls_used += 1;
 
     // CQ-4: canonical audit trail — the call itself first, then exactly one
     // result row for every outcome below.
@@ -2230,6 +2171,97 @@ async fn handle_tool_call(
         Ok(prepared) => execute_proxied_call(ctx, proxy, &call, prepared, cancel_rx).await,
         Err(reply) => reply,
     }
+}
+
+/// Frame-level rejections, before the call enters the audit trail as a
+/// `tool_use`: job binding (CQ-7), identifier validation (CQ-3), and the
+/// per-job call cap (CQ-3). Each rejected frame still gets exactly one
+/// canonical `tool_result` event row (CQ-4). Returns `None` when the frame
+/// may proceed.
+async fn frame_binding_rejection(
+    ctx: &ToolCallCtx<'_>,
+    call: &ToolCallPayload,
+    calls_used: &mut u32,
+) -> Option<Envelope> {
+    // CQ-7: bind the frame to this connection's job. `task_id` is required
+    // and must match — a leftover worker process on a pooled socket must not
+    // run calls in the next job's scope.
+    let job_id_str = ctx.job_id.to_string();
+    if call.task_id.as_deref() != Some(job_id_str.as_str()) {
+        record_tool_result(
+            ctx.store,
+            ctx.job_id,
+            "unknown",
+            false,
+            "tool_call rejected: task_id missing or mismatched",
+        )
+        .await;
+        return Some(tool_result_envelope(
+            &call.call_id,
+            "error",
+            String::new(),
+            Some(format!(
+                "task_id must equal this connection's job id ({job_id_str})"
+            )),
+        ));
+    }
+
+    // CQ-3: validate worker-controlled identifiers before they are persisted
+    // or logged (raw newlines would forge log lines / poison event rows).
+    if !is_valid_frame_ident(&call.call_id, MAX_CALL_ID_BYTES) {
+        record_tool_result(
+            ctx.store,
+            ctx.job_id,
+            "unknown",
+            false,
+            "tool_call rejected: invalid call_id",
+        )
+        .await;
+        return Some(tool_result_envelope(
+            "",
+            "error",
+            String::new(),
+            Some("invalid call_id".to_string()),
+        ));
+    }
+    if !is_valid_frame_ident(&call.name, MAX_TOOL_NAME_BYTES) {
+        record_tool_result(
+            ctx.store,
+            ctx.job_id,
+            "unknown",
+            false,
+            "tool_call rejected: invalid tool name",
+        )
+        .await;
+        return Some(tool_result_envelope(
+            &call.call_id,
+            "error",
+            String::new(),
+            Some("invalid tool name".to_string()),
+        ));
+    }
+
+    // CQ-3: per-job call cap, independent of the per-tool rate limiter.
+    if *calls_used >= MAX_TOOL_CALLS_PER_JOB {
+        record_tool_result(
+            ctx.store,
+            ctx.job_id,
+            &call.name,
+            false,
+            "tool_call denied: per-job call cap reached",
+        )
+        .await;
+        return Some(tool_result_envelope(
+            &call.call_id,
+            "denied",
+            String::new(),
+            Some(format!(
+                "per-job proxied tool call cap ({MAX_TOOL_CALLS_PER_JOB}) reached"
+            )),
+        ));
+    }
+    *calls_used += 1;
+    None
 }
 
 /// Record a denied call and build its reply (status "denied": policy forbids
@@ -2278,14 +2310,15 @@ async fn preflight_gates(
         Err(reason) => return Err(fail_tool_call(ctx, call, reason).await),
     };
     if job_ctx.state.is_terminal() {
-        return Err(
-            fail_tool_call(
-                ctx,
-                call,
-                format!("job {} is {:?}; no new tool calls", ctx.job_id, job_ctx.state),
-            )
-            .await,
-        );
+        return Err(fail_tool_call(
+            ctx,
+            call,
+            format!(
+                "job {} is {:?}; no new tool calls",
+                ctx.job_id, job_ctx.state
+            ),
+        )
+        .await);
     }
 
     // User-scoped resolution (CQ-6): alias handling plus visibility —
@@ -2313,14 +2346,12 @@ async fn preflight_gates(
     if !tool.allows_autonomous_execution()
         || ApprovalContext::is_blocked_or_default(&approval, &resolved_name, requirement)
     {
-        return Err(
-            deny_tool_call(
-                ctx,
-                call,
-                crate::tools::autonomous_unavailable_message(&resolved_name, &job_ctx.user_id),
-            )
-            .await,
-        );
+        return Err(deny_tool_call(
+            ctx,
+            call,
+            crate::tools::autonomous_unavailable_message(&resolved_name, &job_ctx.user_id),
+        )
+        .await);
     }
 
     // Persisted `Disabled` permission (CQ-1): a user who disabled a tool
@@ -2338,8 +2369,8 @@ async fn preflight_gates(
     }
 
     // Per-tool rate limit keyed on the job's user (CQ-3).
-    if let Some(reason) = rate_limit_reason(proxy, &resolved_name, tool.as_ref(), &job_ctx.user_id)
-        .await
+    if let Some(reason) =
+        rate_limit_reason(proxy, &resolved_name, tool.as_ref(), &job_ctx.user_id).await
     {
         return Err(fail_tool_call(ctx, call, reason).await);
     }
@@ -2359,7 +2390,10 @@ async fn preflight_gates(
 /// manager wired this is authoritative — a missing context fails closed.
 /// Harnesses without a context manager fall back to the connection's scope
 /// (user_id from the host-side `TaskContext`, state `InProgress`).
-async fn load_job_context(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload) -> Result<JobContext, String> {
+async fn load_job_context(
+    ctx: &ToolCallCtx<'_>,
+    call: &ToolCallPayload,
+) -> Result<JobContext, String> {
     match ctx.context_manager {
         Some(cm) => cm
             .get_context(ctx.job_id)
@@ -2970,10 +3004,9 @@ mod tests {
     fn tool_call_payload_deserializes_with_defaults() {
         // `arguments` and `task_id` are optional at the serde layer; the
         // handler still requires `task_id` to equal the connection's job id.
-        let payload: ToolCallPayload = serde_json::from_str(
-            r#"{"call_id":"c1","name":"memory_read"}"#,
-        )
-        .expect("minimal payload");
+        let payload: ToolCallPayload =
+            serde_json::from_str(r#"{"call_id":"c1","name":"memory_read"}"#)
+                .expect("minimal payload");
         assert_eq!(payload.call_id, "c1");
         assert_eq!(payload.name, "memory_read");
         assert!(payload.arguments.is_null());
