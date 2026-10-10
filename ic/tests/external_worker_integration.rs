@@ -516,8 +516,7 @@ async fn handle_connection(
                                 else {
                                     continue;
                                 };
-                                if env.get("type").and_then(|v| v.as_str()) == Some("tool_result")
-                                {
+                                if env.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
                                     let _ = replies.send(env);
                                     break;
                                 }
@@ -2070,12 +2069,12 @@ async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
         calls: vec![
-            (
-                "probe_echo".to_string(),
-                serde_json::json!({ "k": "v" }),
-            ),
+            ("probe_echo".to_string(), serde_json::json!({ "k": "v" })),
             // Registered nowhere AND not allowlisted -> denied.
-            ("memory_write".to_string(), serde_json::json!({ "path": "x" })),
+            (
+                "memory_write".to_string(),
+                serde_json::json!({ "path": "x" }),
+            ),
         ],
         replies: reply_tx,
     })
@@ -2147,8 +2146,7 @@ async fn tool_call_denied_when_allowlist_empty() {
     })
     .await;
 
-    let mgr =
-        ExternalWorkerManager::new(vec![config_for(&url)]).with_tool_proxy(test_proxy(tools));
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)]).with_tool_proxy(test_proxy(tools));
 
     let res = timeout(
         TEST_BOUND,
@@ -2398,7 +2396,8 @@ async fn tool_call_missing_or_mismatched_task_id_is_rejected() {
             .as_str()
             .expect("error text")
             .contains("task_id"),
-        "missing task_id must be explained: {}", replies[0]
+        "missing task_id must be explained: {}",
+        replies[0]
     );
     assert_eq!(replies[1]["payload"]["status"], "error");
     assert_eq!(replies[2]["payload"]["status"], "success");
@@ -2476,10 +2475,7 @@ async fn tool_call_autonomous_opt_out_is_denied() {
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
-        calls: vec![(
-            "interactive_only_probe".to_string(),
-            serde_json::json!({}),
-        )],
+        calls: vec![("interactive_only_probe".to_string(), serde_json::json!({}))],
         replies: reply_tx,
     })
     .await;
@@ -2566,7 +2562,8 @@ async fn tool_call_disabled_permission_is_denied() {
             .as_str()
             .expect("error text")
             .contains("disabled"),
-        "denial must name the permission state: {}", replies[0]
+        "denial must name the permission state: {}",
+        replies[0]
     );
     assert!(probe.seen.lock().expect("probe lock").is_empty());
 }
@@ -2738,7 +2735,8 @@ async fn tool_call_rejected_for_terminal_job() {
             .as_str()
             .expect("error text")
             .contains("Cancelled"),
-        "terminal-state refusal must name the state: {}", replies[0]
+        "terminal-state refusal must name the state: {}",
+        replies[0]
     );
     assert!(probe.seen.lock().expect("probe lock").is_empty());
 }
@@ -2796,7 +2794,8 @@ async fn memory_write_read_roundtrip_and_mission_path_guard() {
 
     assert_eq!(
         replies[0]["payload"]["status"], "success",
-        "memory_write must succeed: {}", replies[0]
+        "memory_write must succeed: {}",
+        replies[0]
     );
     assert_eq!(replies[1]["payload"]["status"], "success");
     let read_output = replies[1]["payload"]["output"]
@@ -2809,13 +2808,15 @@ async fn memory_write_read_roundtrip_and_mission_path_guard() {
 
     assert_eq!(
         replies[2]["payload"]["status"], "denied",
-        "mission-tree writes are refused while WI#322 is open: {}", replies[2]
+        "mission-tree writes are refused while WI#322 is open: {}",
+        replies[2]
     );
     assert!(
         replies[2]["payload"]["error"]
             .as_str()
             .expect("error text")
             .contains("WI#322"),
-        "the refusal must name the guard: {}", replies[2]
+        "the refusal must name the guard: {}",
+        replies[2]
     );
 }
