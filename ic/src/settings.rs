@@ -908,6 +908,14 @@ pub struct ExternalWorkerSettings {
     /// Bounds applied when `create_job` requests recent conversation context.
     #[serde(default)]
     pub prompt_context: lunarwing_common::PromptContextLimits,
+    /// Per-worker tool capability allowlist for the proxied tool path
+    /// (WI#324). Names of in-process tools this worker may invoke over the
+    /// WebSocket control channel (e.g. "memory_read", "memory_write",
+    /// "knowledge_search"). Deny-by-default: an empty list means the worker
+    /// gets a hard reject for every `tool_call`. `"*"` opts in to all tools.
+    /// Secrets never cross the proxy — only tool results.
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
 }
 
 fn default_external_worker_timeout() -> u64 {
