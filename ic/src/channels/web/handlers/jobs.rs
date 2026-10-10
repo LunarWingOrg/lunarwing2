@@ -427,6 +427,28 @@ pub async fn jobs_restart_handler(
                 ));
             }
 
+            // CV-9 (WI#326): harness jobs cannot be restarted as plain
+            // workers — their secrets, injection snapshot, and staging dirs
+            // were per-dispatch and are gone, and the persisted task text
+            // still references them. Require a fresh harness dispatch.
+            match store.get_sandbox_job_mode(old_job_id).await {
+                Ok(Some(ref mode)) if mode == "harness" => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "Harness jobs cannot be restarted: secrets, injection snapshots, and \
+                         write-back staging are per-dispatch. Create a new job with mode 'harness'."
+                            .to_string(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Database error: {e}"),
+                    ));
+                }
+            }
+
             let jm = state.job_manager.as_ref().ok_or((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Sandbox not enabled".to_string(),
@@ -503,8 +525,9 @@ pub async fn jobs_restart_handler(
                     mcp_servers,
                     mcp_credential_grants,
                     max_iterations: lunarwing_common::DEFAULT_WORKER_ITERATIONS,
-                    // Restarts re-run as plain worker jobs; harness options
-                    // (WI#326) are per-dispatch and not persisted.
+                    // Harness jobs are rejected above (WI#326 CV-9); only
+                    // plain worker jobs restart, so there are no harness
+                    // options to re-dispatch.
                     harness: None,
                 })
                 .await

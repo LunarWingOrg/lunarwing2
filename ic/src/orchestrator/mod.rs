@@ -53,7 +53,7 @@ pub use external_worker::{ExternalTaskResult, ExternalWorkerManager};
 pub use harness::{
     HarnessError, HarnessJobOptions, InjectedFileProvenance, InjectionManifest, InjectionSpec,
     PromotionRecord, PromotionRejection, PromotionSummary, ResolvedSecretFile, SecretFileMount,
-    WriteBackPolicy,
+    SecretValueRedactor, WriteBackPolicy,
 };
 pub use job_manager::{
     CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager,
@@ -159,6 +159,18 @@ pub async fn setup_orchestrator(
             jm_inner = jm_inner.with_write_back_deps(resolver, db.cloned());
         }
         let jm = Arc::new(jm_inner);
+
+        // WI#326 CW-8: harness dirs hold injection snapshots (memory and
+        // opted-in identity documents) and staged writes. Sweep any left
+        // behind by a crash/restart; the sweep only removes dirs with no
+        // live labeled container and a grace period, so in-flight dispatch
+        // is never disturbed.
+        {
+            let jm = Arc::clone(&jm);
+            tokio::spawn(async move {
+                jm.sweep_orphaned_harness_dirs().await;
+            });
+        }
 
         let orchestrator_state = api::OrchestratorState {
             llm: Arc::clone(llm),
