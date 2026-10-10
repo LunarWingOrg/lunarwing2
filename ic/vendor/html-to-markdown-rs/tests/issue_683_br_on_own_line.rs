@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use html_to_markdown_rs::prescan::PrescanReport;
+use html_to_markdown_rs::prescan::{self, PrescanReport};
 use html_to_markdown_rs::{ConversionOptions, NewlineStyle, TierStrategy, convert, tier1};
 
 fn options(newline_style: NewlineStyle, tier_strategy: TierStrategy) -> ConversionOptions {
@@ -47,6 +47,12 @@ fn auto(html: &str) -> String {
         .expect("conversion must succeed")
         .content
         .unwrap_or_default()
+}
+
+fn fast_after_prescan(html: &str) -> String {
+    let (cleaned, report) = prescan::run(html);
+    tier1::run(&cleaned, &report, &options(NewlineStyle::Spaces, TierStrategy::Tier1))
+        .unwrap_or_else(|reason| panic!("the fast converter must not bail on {html:?}: {reason:?}"))
 }
 
 /// `own_line` gives what `inline`, the same markup without the source newlines, gives, in both
@@ -98,6 +104,22 @@ fn should_keep_a_br_on_its_own_line_in_a_block_as_a_hard_break() {
 #[test]
 fn should_keep_a_br_preceded_only_by_a_source_newline_as_a_hard_break() {
     assert_matches_inline_form("First\n<br>Second", "First<br>Second");
+}
+
+#[test]
+fn should_decode_a_character_reference_newline_before_deciding_the_br_break_kind() {
+    let html = "First&#10;<br>Second";
+    assert_eq!(full(html, NewlineStyle::Spaces), "First  \nSecond\n");
+    assert_eq!(fast(html), "First  \nSecond\n");
+    assert_eq!(auto(html), "First  \nSecond\n");
+}
+
+#[test]
+fn should_recognize_crlf_blank_lines_before_a_br_in_both_converters() {
+    for html in ["First\n\r\n<br>Second", "First\n<script>x</script>\r\n<br>Second"] {
+        assert_eq!(full(html, NewlineStyle::Spaces), "First\n\nSecond\n", "full: {html:?}");
+        assert_eq!(fast_after_prescan(html), "First\n\nSecond\n", "fast: {html:?}");
+    }
 }
 
 #[test]

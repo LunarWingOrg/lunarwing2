@@ -11,9 +11,9 @@ use std::borrow::Cow;
 use tl::{HTMLTag, NodeHandle, Parser};
 
 use crate::converter::Context;
-use crate::converter::dom_context::DomContext;
 use crate::converter::inline::link::{MarkdownLink, append_markdown_link};
 use crate::converter::main_helpers::tag_name_eq;
+use crate::converter::media::MediaContext;
 use crate::converter::media::first_address;
 use crate::converter::utility::escaping::escape_link_label;
 use crate::converter::utility::preprocessing::sanitize_markdown_url;
@@ -88,6 +88,36 @@ pub const fn should_output_media_link(src: &str) -> bool {
     !src.is_empty()
 }
 
+fn render_media_fallback(tag: &HTMLTag, parser: &Parser, output: &mut String, context: MediaContext<'_>) {
+    use crate::converter::main::walk_node;
+
+    let MediaContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = context;
+    let mut fallback = String::new();
+    for child_handle in tag.children().top().iter() {
+        let is_source =
+            matches!(child_handle.get(parser), Some(tl::Node::Tag(child_tag)) if is_source_element(child_tag));
+        if !is_source {
+            walk_node(
+                child_handle,
+                parser,
+                &mut fallback,
+                crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
+            );
+        }
+    }
+    if !fallback.is_empty() {
+        output.push_str(fallback.trim());
+        if !ctx.in_paragraph && !ctx.convert_as_inline {
+            output.push_str("\n\n");
+        }
+    }
+}
+
 /// Handle audio element conversion to Markdown.
 ///
 /// Extracts src from audio tag or nested source elements, outputs as a link,
@@ -98,15 +128,16 @@ pub fn handle_audio(
     tag: &HTMLTag,
     parser: &Parser,
     output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
+    context: MediaContext<'_>,
 ) {
-    use crate::converter::main::walk_node;
-
+    let MediaContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = context;
     let raw_src = media_element_src(tag, parser, options.inline_data_media);
-    let base_resolved_src = ctx.resolve_url(&raw_src);
+    let base_resolved_src = ctx.resolve_url(&raw_src, node_handle, parser, dom_ctx);
     let src = sanitize_markdown_url(base_resolved_src.as_deref().unwrap_or(&raw_src)).into_owned();
     let src_opt: Option<&str> = if src.is_empty() { None } else { Some(src.as_str()) };
 
@@ -165,24 +196,7 @@ pub fn handle_audio(
         }
     }
 
-    let mut fallback = String::new();
-    for child_handle in tag.children().top().iter() {
-        let is_source = if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-            is_source_element(child_tag)
-        } else {
-            false
-        };
-
-        if !is_source {
-            walk_node(child_handle, parser, &mut fallback, options, ctx, depth + 1, dom_ctx);
-        }
-    }
-    if !fallback.is_empty() {
-        output.push_str(fallback.trim());
-        if !ctx.in_paragraph && !ctx.convert_as_inline {
-            output.push_str("\n\n");
-        }
-    }
+    render_media_fallback(tag, parser, output, context);
 }
 
 /// Handle video element conversion to Markdown.
@@ -195,15 +209,16 @@ pub fn handle_video(
     tag: &HTMLTag,
     parser: &Parser,
     output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
+    context: MediaContext<'_>,
 ) {
-    use crate::converter::main::walk_node;
-
+    let MediaContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = context;
     let raw_src = media_element_src(tag, parser, options.inline_data_media);
-    let base_resolved_src = ctx.resolve_url(&raw_src);
+    let base_resolved_src = ctx.resolve_url(&raw_src, node_handle, parser, dom_ctx);
     let src = sanitize_markdown_url(base_resolved_src.as_deref().unwrap_or(&raw_src)).into_owned();
     let src_opt: Option<&str> = if src.is_empty() { None } else { Some(src.as_str()) };
 
@@ -262,24 +277,7 @@ pub fn handle_video(
         }
     }
 
-    let mut fallback = String::new();
-    for child_handle in tag.children().top().iter() {
-        let is_source = if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-            is_source_element(child_tag)
-        } else {
-            false
-        };
-
-        if !is_source {
-            walk_node(child_handle, parser, &mut fallback, options, ctx, depth + 1, dom_ctx);
-        }
-    }
-    if !fallback.is_empty() {
-        output.push_str(fallback.trim());
-        if !ctx.in_paragraph && !ctx.convert_as_inline {
-            output.push_str("\n\n");
-        }
-    }
+    render_media_fallback(tag, parser, output, context);
 }
 
 /// Handle picture element conversion to Markdown.
@@ -290,17 +288,25 @@ pub fn handle_picture(
     tag: &HTMLTag,
     parser: &Parser,
     output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
+    context: MediaContext<'_>,
 ) {
+    let MediaContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = context;
     use crate::converter::main::walk_node;
 
     for child_handle in tag.children().top().iter() {
         if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
             if tag_name_eq(child_tag.name().as_utf8_str(), "img") {
-                walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+                walk_node(
+                    child_handle,
+                    parser,
+                    output,
+                    crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
+                );
                 break;
             }
         }
@@ -315,15 +321,18 @@ pub fn handle_picture(
 pub fn handle_iframe(
     node_handle: &NodeHandle,
     tag: &HTMLTag,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
     parser: &Parser,
+    output: &mut String,
+    context: MediaContext<'_>,
 ) {
+    let MediaContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = context;
     let raw_src = crate::converter::utility::attributes::decoded_attribute(tag, "src").unwrap_or(Cow::Borrowed(""));
-    let base_resolved_src = ctx.resolve_url(&raw_src);
+    let base_resolved_src = ctx.resolve_url(&raw_src, node_handle, parser, dom_ctx);
     let src = sanitize_markdown_url(base_resolved_src.as_deref().unwrap_or(&raw_src)).into_owned();
     let src_opt: Option<&str> = if src.is_empty() { None } else { Some(src.as_str()) };
 

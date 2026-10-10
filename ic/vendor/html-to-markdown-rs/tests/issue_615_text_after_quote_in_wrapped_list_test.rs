@@ -563,6 +563,7 @@ fn should_keep_a_quote_that_starts_a_task_item_in_the_item() {
     }
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_keep_a_rule_that_starts_a_list_item_in_the_item() {
     let tier1 = ConversionOptions {

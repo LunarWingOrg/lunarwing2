@@ -1,5 +1,6 @@
 // ~keep Rust inner attributes below are crate-level attributes, not a shell shebang.
 #![allow(missing_docs)]
+#![cfg(feature = "testkit")]
 
 //! Regression tests for the checkbox of a task item whose first content is a block. GFM reads a
 //! checkbox only in a paragraph with content after the marker, so the checkbox line holds a space
@@ -163,7 +164,12 @@ fn should_keep_the_output_where_a_checkbox_is_text() {
     let cases = [
         same(false, format!("<code>{empty}</code>"), "`- [ ] `\n"),
         same(false, format!("<code><b>{empty}</b></code>"), "`- [ ] `\n"),
-        same(false, format!("<code>{quote}</code>"), "`- [ ]`  \n`  > q`\n"),
+        (
+            false,
+            format!("<code>{quote}</code>"),
+            "`- [ ]`  \n`  > q`\n",
+            "`- [ ]`\\\n`  > q`\n",
+        ),
         same(false, format!("<pre>{empty}</pre>"), "```\n- [ ]\n```\n"),
         same(false, format!("<pre>{quote}</pre>"), "```\n- [ ]\n  > q\n```\n"),
         (false, format!("<b>{empty}</b>"), "**- [ ]**\n", "*- [ ]*\n"),
@@ -172,10 +178,11 @@ fn should_keep_the_output_where_a_checkbox_is_text() {
         (false, format!("<em>{quote}</em>"), "*- [ ] > q*\n", "_- [ ] > q_\n"),
         same(false, format!(r#"<a href="u">{empty}</a>"#), "[- [ ]](u)\n"),
         same(false, format!(r#"<a href="u">{quote}</a>"#), "[- [ ] q](u)\n"),
-        same(
+        (
             false,
             format!("<table><tr><td>{quote}</td></tr></table>"),
             "| - [ ] q |\n| ------- |\n",
+            "| - [ ] q |\n|-------|\n",
         ),
         same(true, empty.to_string(), "- [ ]\n"),
         same(true, quote.to_string(), "- [ ] q\n"),

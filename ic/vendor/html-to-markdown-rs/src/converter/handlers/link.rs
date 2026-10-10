@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 use crate::converter::Context;
 use crate::converter::block::heading::{find_single_heading_child, heading_allows_inline_images, push_heading};
 use crate::converter::dom_context::DomContext;
-use crate::converter::inline::link::{MarkdownLink, append_markdown_link, has_uri_scheme};
+use crate::converter::inline::HandlerContext;
+use crate::converter::inline::link::{MarkdownLink, append_markdown_link_in_context, has_uri_scheme};
 use crate::converter::main::walk_node;
 use crate::converter::media::inline_data_treatment;
 use crate::converter::utility::content::{
@@ -28,6 +29,30 @@ use std::borrow::Cow;
 #[cfg(feature = "visitor")]
 use crate::converter::utility::serialization::serialize_node;
 
+fn indent_hard_break_continuations(label: &mut String, ctx: &Context, options: &ConversionOptions) {
+    if !ctx.in_list_item || !label.contains('\n') {
+        return;
+    }
+    let Some(indent) = crate::converter::list::utils::continuation_indent_string(ctx.list_indent_columns, options)
+    else {
+        return;
+    };
+    let original = std::mem::take(label);
+    let mut lines = original.split('\n');
+    let mut indented = lines.next().unwrap_or_default().to_string();
+    for line in lines {
+        indented.push('\n');
+        if !line.is_empty() {
+            // ~keep Link-label normalization collapses the content-column whitespace after a
+            // ~keep hard break to one space. Restore the enclosing item's actual column so the
+            // ~keep continuation cannot become a new block and split the link (issue #678).
+            indented.push_str(&indent);
+            indented.push_str(line.trim_start_matches([' ', '\t']));
+        }
+    }
+    *label = indented;
+}
+
 /// Handle an `<a>` (link) element and convert to Markdown.
 ///
 /// This handler processes link elements including:
@@ -38,399 +63,426 @@ use crate::converter::utility::serialization::serialize_node;
 /// - Invoking visitor callbacks when the visitor feature is enabled
 /// - Collecting link metadata when the metadata feature is enabled
 /// - Generating appropriate markdown link output
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
-#[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-pub fn handle_link(
-    node_handle: &tl::NodeHandle,
-    tag: &tl::HTMLTag,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    let href_attr = tag
-        .attributes()
-        .get("href")
-        .flatten()
-        .map(|v| text::decode_attribute_value_cow(&v.as_utf8_str()).into_owned())
-        .map(|href| ctx.resolve_url(&href).unwrap_or(href));
-    // ~keep An empty `title=""` carries no information, and `[t](u "")` / `![a](i "")` is
-    // ~keep noise that no Markdown serializer round-trips: re-rendering the output drops
-    // ~keep the empty title, so the second pass no longer matches the first. Treat it as
-    // ~keep absent, which is what it means.
-    let title = crate::converter::utility::attributes::decoded_attribute(tag, "title").filter(|v| !v.is_empty());
+pub fn handle_link(tag: &tl::HTMLTag, mut handler: HandlerContext<'_>) {
+    let Some(data) = LinkData::new(tag, &handler) else {
+        walk_handles_to_output(tag.children().top().iter().copied(), &mut handler);
+        return;
+    };
+    if emit_autolink(&data, &mut handler) || emit_heading_link(&data, &mut handler) {
+        return;
+    }
 
-    if let Some(href) = href_attr {
-        // ~keep #120 (link half): a `data:` href is not media, but it carries the same inline
-        // ~keep payload problem the image/svg/video/audio half of this option already solves.
-        // ~keep `AltTextOnly` and `DropElement` collapse to the same outcome for a link: unlike
-        // ~keep an image's alt attribute, a link has no separate "caption" distinct from its
-        // ~keep own text, and that text is content, never dropped -- only the address goes.
-        let href_addr_dropped = matches!(
-            inline_data_treatment(options.inline_data_media, &href),
-            InlineDataMedia::AltTextOnly | InlineDataMedia::DropElement
-        );
-        let owned_children: Vec<tl::NodeHandle>;
-        let children: &[tl::NodeHandle] = if let Some(c) = dom_ctx.children_of(node_handle.get_inner()) {
-            c.as_slice()
+    handler.context.inline_data_replaced.set(false);
+    let mut label = build_label(&data, &handler);
+    apply_label_fallbacks(&data, &mut label, &handler);
+    indent_hard_break_continuations(&mut label, handler.context, handler.options);
+    let drop_link = label.is_empty() && handler.context.inline_data_replaced.get();
+    let emit_deferred = emit_link(tag, &data, &label, drop_link, &mut handler);
+    #[cfg(feature = "metadata")]
+    record_link_metadata(tag, &data, &label, handler.context);
+    if data.emit_blocks_separately && emit_deferred {
+        walk_handles_to_output(data.deferred.iter().copied(), &mut handler);
+    }
+}
+
+struct LinkData<'a> {
+    href: String,
+    title: Option<Cow<'a, str>>,
+    children: Vec<tl::NodeHandle>,
+    inline_label: String,
+    raw_text: String,
+    inline_children: Vec<tl::NodeHandle>,
+    deferred: Vec<tl::NodeHandle>,
+    emit_blocks_separately: bool,
+    href_addr_dropped: bool,
+    link_allow_inline_images: bool,
+    saw_block: bool,
+}
+
+impl<'a> LinkData<'a> {
+    fn new(tag: &'a tl::HTMLTag<'a>, handler: &HandlerContext<'_>) -> Option<Self> {
+        let href = tag
+            .attributes()
+            .get("href")
+            .flatten()
+            .map(|value| text::decode_attribute_value_cow(&value.as_utf8_str()).into_owned())
+            .map(|href| {
+                handler
+                    .context
+                    .resolve_url(&href, handler.node_handle, handler.parser, handler.dom_context)
+                    .unwrap_or(href)
+            })?;
+        // ~keep Empty titles are absent because Markdown serializers drop `""` on reparse.
+        let title =
+            crate::converter::utility::attributes::decoded_attribute(tag, "title").filter(|value| !value.is_empty());
+        let children = handler
+            .dom_context
+            .children_of(handler.node_handle.get_inner())
+            .map_or_else(|| tag.children().top().iter().copied().collect(), ToOwned::to_owned);
+        let (inline_label, _, saw_block) = collect_link_label_text(&children, handler.parser, handler.dom_context);
+        let text_source = if saw_block {
+            get_text_content(handler.node_handle, handler.parser, handler.dom_context)
         } else {
-            owned_children = tag.children().top().iter().copied().collect();
-            owned_children.as_slice()
+            inline_label.clone()
         };
-        let (inline_label, _block_nodes, saw_block) = collect_link_label_text(children, parser, dom_ctx);
-        // ~keep #492: the only two prior consumers of `keep_inline_images_in` were headings
-        // ~keep and layout cells (#433's precedent); `<a>` had none. Computed once here and
-        // ~keep carried unchanged into both the block-label and inline-label `Context`
-        // ~keep literals below, so the option means the same thing regardless of whether the
-        // ~keep anchor happens to contain a block child.
-        let link_allow_inline_images = ctx.keep_inline_images_in.contains("a");
+        let raw_text = text::normalize_whitespace_cow(&text_source).trim().to_string();
+        let (inline_children, deferred) = partition_link_children(&children, handler.parser, handler.dom_context);
+        Some(Self {
+            href_addr_dropped: matches!(
+                inline_data_treatment(handler.options.inline_data_media, &href),
+                InlineDataMedia::AltTextOnly | InlineDataMedia::DropElement
+            ),
+            emit_blocks_separately: should_defer_table_blocks(
+                handler.context,
+                &deferred,
+                handler.parser,
+                handler.dom_context,
+            ),
+            link_allow_inline_images: handler.context.keep_inline_images_in.contains("a"),
+            href,
+            title,
+            children,
+            inline_label,
+            raw_text,
+            inline_children,
+            deferred,
+            saw_block,
+        })
+    }
+}
 
-        // ~keep Without block descendants the sweep above already visited exactly the nodes
-        // ~keep `get_text_content` would and decoded them the same way, so its text is reused
-        // ~keep rather than walking the `<a>` subtree a second time.
-        let text_source: Cow<'_, str> = if saw_block {
-            Cow::Owned(get_text_content(node_handle, parser, dom_ctx))
-        } else {
-            Cow::Borrowed(inline_label.as_str())
-        };
-        let normalized_text = text::normalize_whitespace_cow(text_source.as_ref());
-        let raw_text = normalized_text.trim();
-
-        // ~keep #490: partition the anchor's DIRECT children (not `collect_link_label_text`'s
-        // ~keep topmost block *descendants*, which can sit several inline wrappers deep) into
-        // ~keep inline and block using the identical `node_is_block_level` test, so every byte
-        // ~keep of the anchor's content lands in exactly one of the two halves -- this is also
-        // ~keep what catches a table buried under a block wrapper (`<a><div><table>...`).
-        let (inline_children, deferred) = partition_link_children(children, parser, dom_ctx);
-        let emit_blocks_separately = should_defer_table_blocks(ctx, &deferred, parser, dom_ctx);
-
-        // ~keep GFM requires an absolute URI with a scheme (e.g. `https://…`, `mailto:…`);
-        // ~keep bare paths or filenames must use the full `[text](href)` form (issue #397).
-        // ~keep `!emit_blocks_separately` (#490): `raw_text` is whole-subtree text including
-        // ~keep the deferred table's own cell text, so without this guard a table whose text
-        // ~keep happened to equal the href would autolink on the TABLE's text and silently
-        // ~keep drop the table itself.
-        // ~keep `!href_addr_dropped` (#120): the GFM autolink form writes the href as its own
-        // ~keep visible text (`<href>`), which would put the payload right back into the
-        // ~keep output the chosen treatment asked to remove.
-        let is_autolink = options.autolinks
-            && !options.default_title
-            && !emit_blocks_separately
-            && !href.is_empty()
-            && !href_addr_dropped
-            && has_uri_scheme(href.as_str())
-            && (raw_text == href || (href.starts_with("mailto:") && raw_text == &href[7..]));
-
-        if is_autolink {
-            output.push('<');
-            if href.starts_with("mailto:") && raw_text == &href[7..] {
-                output.push_str(raw_text);
-            } else {
-                output.push_str(&href);
-            }
-            output.push('>');
-            return;
-        }
-
-        // ~keep #120: the fast path below always writes `href` as the heading link's
-        // ~keep destination, so a dropped `data:` address must skip it and fall through to
-        // ~keep the general label logic further down, which honors `href_addr_dropped`.
-        if !href_addr_dropped {
-            if let Some((heading_level, heading_handle)) = find_single_heading_child(*node_handle, parser) {
-                if let Some(heading_node) = heading_handle.get(parser) {
-                    if let tl::Node::Tag(heading_tag) = heading_node {
-                        let heading_name = normalized_tag_name(heading_tag.name().as_utf8_str()).into_owned();
-                        let mut heading_text = String::new();
-                        let heading_ctx = Context {
-                            in_heading: true,
-                            convert_as_inline: true,
-                            heading_allow_inline_images: heading_allows_inline_images(
-                                &heading_name,
-                                &ctx.keep_inline_images_in,
-                            ),
-                            ..ctx.clone()
-                        };
-                        walk_node(
-                            &heading_handle,
-                            parser,
-                            &mut heading_text,
-                            options,
-                            &heading_ctx,
-                            depth + 1,
-                            dom_ctx,
-                        );
-                        let trimmed_heading = heading_text.trim();
-                        if !trimmed_heading.is_empty() {
-                            let escaped_label = escape_link_label(trimmed_heading);
-                            let mut link_buffer = String::new();
-                            append_markdown_link(
-                                &mut link_buffer,
-                                &MarkdownLink {
-                                    label: &escaped_label,
-                                    href: href.as_str(),
-                                    title: title.as_deref(),
-                                    raw_text,
-                                },
-                                options,
-                                ctx.reference_collector.as_ref(),
-                            );
-                            push_heading(output, ctx, options, heading_level, link_buffer.as_str());
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        ctx.inline_data_replaced.set(false);
-        let mut label = if emit_blocks_separately {
-            // ~keep #490: only the DIRECT inline children feed the label -- the deferred
-            // ~keep block children (which is what triggered this branch) are walked
-            // ~keep separately, after the link, near the end of this function. Walk them
-            // ~keep (do NOT reuse the text-only `inline_label`), or an `<img>` among the
-            // ~keep inline children would render as nothing instead of `![alt](src)`.
-            let mut content = String::new();
-            let link_ctx = Context {
-                inline_depth: ctx.inline_depth + 1,
-                in_link: true,
-                link_allow_inline_images,
-                ..ctx.clone()
-            };
-            for child_handle in &inline_children {
-                walk_node(
-                    child_handle,
-                    parser,
-                    &mut content,
-                    options,
-                    &link_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-            }
-            normalize_link_label(&content)
-        } else if saw_block {
-            let mut content = String::new();
-            let link_ctx = Context {
-                inline_depth: ctx.inline_depth + 1,
-                in_link: true,
-                convert_as_inline: true,
-                link_allow_inline_images,
-                ..ctx.clone()
-            };
-            for child_handle in children {
-                let mut child_buf = String::new();
-                walk_node(
-                    child_handle,
-                    parser,
-                    &mut child_buf,
-                    options,
-                    &link_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-                if !child_buf.trim().is_empty()
-                    && !content.is_empty()
-                    && !content.chars().last().is_none_or(char::is_whitespace)
-                    && !child_buf.chars().next().is_none_or(char::is_whitespace)
-                {
-                    content.push(' ');
-                }
-                content.push_str(&child_buf);
-            }
-            if content.trim().is_empty() {
-                normalize_link_label(&inline_label)
-            } else {
-                normalize_link_label(&content)
-            }
-        } else {
-            let mut content = String::new();
-            let link_ctx = Context {
-                inline_depth: ctx.inline_depth + 1,
-                in_link: true,
-                link_allow_inline_images,
-                ..ctx.clone()
-            };
-            for child_handle in children {
-                walk_node(
-                    child_handle,
-                    parser,
-                    &mut content,
-                    options,
-                    &link_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-            }
-            normalize_link_label(&content)
-        };
-
-        // ~keep `raw_text` is already the whole-subtree text when `saw_block`, so this single
-        // ~keep fallback covers both the block and inline cases. Suppressed when
-        // ~keep `emit_blocks_separately` (#490): `raw_text` there is whole-subtree text
-        // ~keep INCLUDING the deferred table's own cell text, so using it here would
-        // ~keep duplicate the table's text into the label. Suppressing it instead lets the
-        // ~keep href fallback immediately below fire.
-        if !emit_blocks_separately && label.is_empty() && !raw_text.is_empty() {
-            label = normalize_link_label(raw_text);
-        }
-
-        // ~keep A label left empty because `inline_data_media` replaced the link's only content
-        // ~keep (an image with no alt text, or a dropped one) takes the link with it: the href
-        // ~keep fallback below would print a bare self-link where the page showed an image.
-        let drop_link = label.is_empty() && ctx.inline_data_replaced.get();
-
-        // ~keep `!href_addr_dropped` (#120): this fallback's whole job is putting `href` into
-        // ~keep the visible text, which is exactly what a dropped `data:` address must not do.
-        if label.is_empty() && !href.is_empty() && !children.is_empty() && !drop_link && !href_addr_dropped {
-            // ~keep The href is raw attribute text that never passed through a text node's
-            // ~keep normal escaping, unlike every other label source above (heading text,
-            // ~keep inline content, `raw_text`) which was already escaped while it was
-            // ~keep walked. Escaping it here the same way keeps this fallback consistent with
-            // ~keep those paths -- without it, a `*`/`_`/literal backslash surviving unescaped
-            // ~keep into the label round-trips into structure (emphasis, or a silently
-            // ~keep swallowed backslash) once it is re-parsed.
-            label = text::escape(
-                &href,
-                options.escape_misc,
-                options.escape_asterisks,
-                options.escape_underscores,
-                options.escape_ascii,
-            )
-            .into_owned();
-        }
-
-        if label == "^" && href.starts_with('#') {
-            label = "↑".to_string();
-        }
-
-        let escaped_label = escape_link_label(&label);
-
-        // ~keep #120: with a dropped `data:` address, the label is written as plain text --
-        // ~keep not wrapped in `[...]`, so `escape_link_label`'s bracket-balancing (needed only
-        // ~keep to protect an OUTER `[`/`]` pair this call no longer writes) does not apply, and
-        // ~keep no destination or title survives either.
-        let write_link = |output: &mut String| {
-            if href_addr_dropped {
-                output.push_str(&label);
-            } else {
-                append_markdown_link(
-                    output,
-                    &MarkdownLink {
-                        label: &escaped_label,
-                        href: href.as_str(),
-                        title: title.as_deref(),
-                        raw_text: label.as_str(),
-                    },
-                    options,
-                    ctx.reference_collector.as_ref(),
-                );
-            }
-        };
-
-        // ~keep #490: whether the deferred block children (if any) should still be walked
-        // ~keep after the link markdown below. `false` only for `Skip` (the caller asked for
-        // ~keep nothing) and `PreserveHtml` (the serialized anchor already contains the
-        // ~keep table) -- every other outcome, including the no-visitor default, still wrote
-        // ~keep the link's own markdown/custom text and expects its deferred blocks to follow.
-        #[cfg(feature = "visitor")]
-        let mut should_emit_deferred_blocks = true;
-        #[cfg(not(feature = "visitor"))]
-        let should_emit_deferred_blocks = true;
-
-        #[cfg(feature = "visitor")]
-        if drop_link {
-        } else if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Link,
-                Cow::Borrowed("a"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                true,
-            );
-
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_link(&node_ctx, &href, &label, title.as_deref())
-            };
-            match visit_result {
-                VisitResult::Continue => write_link(output),
-                VisitResult::Custom(custom) => output.push_str(&custom),
-                VisitResult::Skip => should_emit_deferred_blocks = false,
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                }
-                VisitResult::PreserveHtml => {
-                    output.push_str(&serialize_node(node_handle, parser));
-                    should_emit_deferred_blocks = false;
-                }
-            }
-        } else {
-            write_link(output);
-        }
-
-        #[cfg(not(feature = "visitor"))]
-        if !drop_link {
-            write_link(output);
-        }
-
-        #[cfg(feature = "metadata")]
-        if ctx.metadata_wants_links {
-            if let Some(ref collector) = ctx.metadata_collector {
-                let rel_attr = tag
-                    .attributes()
-                    .get("rel")
-                    .flatten()
-                    .map(|v| v.as_utf8_str().to_string());
-                let mut attributes_map = BTreeMap::new();
-                for (key, value_opt) in tag.attributes().iter() {
-                    let key_str = key.to_string();
-                    if key_str == "href" {
-                        continue;
-                    }
-
-                    let value = value_opt.map(|v| v.to_string()).unwrap_or_default();
-                    attributes_map.insert(key_str, value);
-                }
-                collector.borrow_mut().add_link(
-                    href.clone(),
-                    label,
-                    title.as_deref().map(str::to_string),
-                    rel_attr,
-                    attributes_map,
-                );
-            }
-        }
-
-        // ~keep #490: walk the deferred block children (the wrapped `<table>`, or its block
-        // ~keep ancestor) with `ctx` UNCHANGED -- not `link_ctx` -- so it renders as a normal
-        // ~keep block (a real GFM table) rather than being forced inline. Skipped when the
-        // ~keep visitor already produced or suppressed all output for this link (see
-        // ~keep `should_emit_deferred_blocks`'s doc comment above).
-        if emit_blocks_separately && should_emit_deferred_blocks {
-            for child_handle in &deferred {
-                walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-            }
-        }
+fn emit_autolink(data: &LinkData<'_>, handler: &mut HandlerContext<'_>) -> bool {
+    // ~keep Deferred tables and dropped data addresses can never use the visible `<href>` form (#120, #490).
+    let autolink = handler.options.autolinks
+        && !handler.options.default_title
+        && !data.emit_blocks_separately
+        && !data.href.is_empty()
+        && !data.href_addr_dropped
+        && has_uri_scheme(&data.href)
+        && (data.raw_text == data.href || (data.href.starts_with("mailto:") && data.raw_text == data.href[7..]));
+    if !autolink {
+        return false;
+    }
+    handler.output.push('<');
+    if data.href.starts_with("mailto:") && data.raw_text == data.href[7..] {
+        handler.output.push_str(&data.raw_text);
     } else {
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+        handler.output.push_str(&data.href);
+    }
+    handler.output.push('>');
+    true
+}
+
+fn emit_heading_link(data: &LinkData<'_>, handler: &mut HandlerContext<'_>) -> bool {
+    if data.href_addr_dropped {
+        return false;
+    }
+    let Some((level, heading_handle)) = find_single_heading_child(*handler.node_handle, handler.parser) else {
+        return false;
+    };
+    let Some(tl::Node::Tag(heading_tag)) = heading_handle.get(handler.parser) else {
+        return false;
+    };
+    let heading_name = normalized_tag_name(heading_tag.name().as_utf8_str());
+    let heading_context = Context {
+        in_heading: true,
+        convert_as_inline: true,
+        heading_allow_inline_images: heading_allows_inline_images(
+            &heading_name,
+            &handler.context.keep_inline_images_in,
+        ),
+        ..handler.context.clone()
+    };
+    let mut heading_text = String::new();
+    walk_node(
+        &heading_handle,
+        handler.parser,
+        &mut heading_text,
+        crate::converter::block::container::HandlerContext::new(
+            handler.options,
+            &heading_context,
+            handler.depth + 1,
+            handler.dom_context,
+        ),
+    );
+    let heading_text = heading_text.trim();
+    if heading_text.is_empty() {
+        return false;
+    }
+    let mut link = String::new();
+    append_link(
+        &mut link,
+        data,
+        &escape_link_label(heading_text),
+        &data.raw_text,
+        handler.options,
+        handler.context,
+    );
+    push_heading(handler.output, handler.context, handler.options, level, &link);
+    true
+}
+
+fn build_label(data: &LinkData<'_>, handler: &HandlerContext<'_>) -> String {
+    if data.emit_blocks_separately {
+        return walk_label(&data.inline_children, false, data, handler);
+    }
+    if data.saw_block {
+        let content = walk_label_content(&data.children, true, data, handler);
+        return if content.trim().is_empty() {
+            normalize_link_label(&data.inline_label)
+        } else {
+            normalize_link_label(&content)
+        };
+    }
+    walk_label(&data.children, false, data, handler)
+}
+
+fn walk_label(
+    children: &[tl::NodeHandle],
+    convert_as_inline: bool,
+    data: &LinkData<'_>,
+    handler: &HandlerContext<'_>,
+) -> String {
+    normalize_link_label(&walk_label_content(children, convert_as_inline, data, handler))
+}
+
+fn walk_label_content(
+    children: &[tl::NodeHandle],
+    merge_child_spacing: bool,
+    data: &LinkData<'_>,
+    handler: &HandlerContext<'_>,
+) -> String {
+    let link_context = Context {
+        inline_depth: handler.context.inline_depth + 1,
+        in_link: true,
+        convert_as_inline: handler.context.convert_as_inline || merge_child_spacing,
+        link_allow_inline_images: data.link_allow_inline_images,
+        ..handler.context.clone()
+    };
+    let mut content = String::new();
+    if !merge_child_spacing {
+        for child in children {
+            walk_node(
+                child,
+                handler.parser,
+                &mut content,
+                crate::converter::block::container::HandlerContext::new(
+                    handler.options,
+                    &link_context,
+                    handler.depth + 1,
+                    handler.dom_context,
+                ),
+            );
+        }
+        return content;
+    }
+    for child in children {
+        let mut child_output = String::new();
+        walk_node(
+            child,
+            handler.parser,
+            &mut child_output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                &link_context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
+        if merge_child_spacing && needs_label_space(&content, &child_output) {
+            content.push(' ');
+        }
+        content.push_str(&child_output);
+    }
+    content
+}
+
+fn needs_label_space(content: &str, child: &str) -> bool {
+    !child.trim().is_empty()
+        && !content.is_empty()
+        && !content.chars().last().is_none_or(char::is_whitespace)
+        && !child.chars().next().is_none_or(char::is_whitespace)
+}
+
+fn apply_label_fallbacks(data: &LinkData<'_>, label: &mut String, handler: &HandlerContext<'_>) {
+    // ~keep Deferred table text must not be duplicated into the label (#490).
+    if !data.emit_blocks_separately && label.is_empty() && !data.raw_text.is_empty() {
+        *label = normalize_link_label(&data.raw_text);
+    }
+    let drop_link = label.is_empty() && handler.context.inline_data_replaced.get();
+    if label.is_empty() && !data.href.is_empty() && !data.children.is_empty() && !drop_link && !data.href_addr_dropped {
+        *label = text::escape(
+            &data.href,
+            handler.options.escape_misc,
+            handler.options.escape_asterisks,
+            handler.options.escape_underscores,
+            handler.options.escape_ascii,
+        )
+        .into_owned();
+    }
+    if label == "^" && data.href.starts_with('#') {
+        *label = "↑".to_string();
+    }
+}
+
+#[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
+fn emit_link(
+    tag: &tl::HTMLTag<'_>,
+    data: &LinkData<'_>,
+    label: &str,
+    drop_link: bool,
+    handler: &mut HandlerContext<'_>,
+) -> bool {
+    if drop_link {
+        return true;
+    }
+    #[cfg(feature = "visitor")]
+    if let Some(visitor) = handler.context.visitor.clone() {
+        return visit_link(tag, data, label, &visitor, handler);
+    }
+    write_link(handler.output, data, label, handler.options, handler.context);
+    true
+}
+
+fn write_link(output: &mut String, data: &LinkData<'_>, label: &str, options: &ConversionOptions, context: &Context) {
+    if data.href_addr_dropped {
+        output.push_str(label);
+        return;
+    }
+    append_link(output, data, &escape_link_label(label), label, options, context);
+}
+
+fn append_link(
+    output: &mut String,
+    data: &LinkData<'_>,
+    escaped_label: &str,
+    raw_text: &str,
+    options: &ConversionOptions,
+    context: &Context,
+) {
+    append_markdown_link_in_context(
+        output,
+        &MarkdownLink {
+            label: escaped_label,
+            href: &data.href,
+            title: data.title.as_deref(),
+            raw_text,
+        },
+        options,
+        context.reference_collector.as_ref(),
+        context.in_table_cell,
+    );
+}
+
+#[cfg(feature = "visitor")]
+fn visit_link(
+    tag: &tl::HTMLTag<'_>,
+    data: &LinkData<'_>,
+    label: &str,
+    visitor: &crate::visitor::VisitorHandle,
+    handler: &mut HandlerContext<'_>,
+) -> bool {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let node_id = handler.node_handle.get_inner();
+    let node_context = NodeContext::with_lazy_attributes(
+        NodeType::Link,
+        Cow::Borrowed("a"),
+        tag,
+        handler.depth,
+        handler.dom_context.get_sibling_index(node_id).unwrap_or(0),
+        handler
+            .dom_context
+            .parent_tag_name(node_id, handler.parser)
+            .map(Cow::Borrowed),
+        true,
+    );
+    let result = visitor.lock().expect("visitor mutex poisoned").visit_link(
+        &node_context,
+        &data.href,
+        label,
+        data.title.as_deref(),
+    );
+    match result {
+        VisitResult::Continue => write_link(handler.output, data, label, handler.options, handler.context),
+        VisitResult::Custom(custom) => {
+            if let Some(collector) = handler.context.structure_collector.as_ref() {
+                collector.borrow_mut().replace_current_element(Some(&custom));
+            }
+            handler.output.push_str(&custom);
+        }
+        VisitResult::Skip => {
+            if let Some(collector) = handler.context.structure_collector.as_ref() {
+                collector.borrow_mut().replace_current_element(None);
+            }
+            return false;
+        }
+        VisitResult::Error(error) => {
+            if let Some(collector) = handler.context.structure_collector.as_ref() {
+                collector.borrow_mut().replace_current_element(None);
+            }
+            if handler.context.visitor_error.borrow().is_none() {
+                *handler.context.visitor_error.borrow_mut() = Some(error);
             }
         }
+        VisitResult::PreserveHtml => {
+            let html = serialize_node(handler.node_handle, handler.parser);
+            if let Some(collector) = handler.context.structure_collector.as_ref() {
+                collector.borrow_mut().replace_current_element(Some(&html));
+            }
+            handler.output.push_str(&html);
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(feature = "metadata")]
+fn record_link_metadata(tag: &tl::HTMLTag<'_>, data: &LinkData<'_>, label: &str, context: &Context) {
+    if !context.metadata_wants_links {
+        return;
+    }
+    let Some(collector) = context.metadata_collector.as_ref() else {
+        return;
+    };
+    let rel = tag
+        .attributes()
+        .get("rel")
+        .flatten()
+        .map(|value| value.as_utf8_str().to_string());
+    let attributes = tag
+        .attributes()
+        .iter()
+        .filter(|(key, _)| key.as_ref() != "href")
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                value.map(|value| value.to_string()).unwrap_or_default(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    collector.borrow_mut().add_link(
+        data.href.clone(),
+        label.to_string(),
+        data.title.as_deref().map(str::to_string),
+        rel,
+        attributes,
+    );
+}
+
+fn walk_handles_to_output(children: impl Iterator<Item = tl::NodeHandle>, handler: &mut HandlerContext<'_>) {
+    for child in children {
+        walk_node(
+            &child,
+            handler.parser,
+            handler.output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
     }
 }
 

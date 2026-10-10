@@ -101,7 +101,14 @@ fn default_depth_uses_stack_safe_limit() {
     }
     html.push_str("</body></html>");
 
-    assert!(converts_without_overflow(html, ConversionOptions::default()));
+    // ~keep MSVC debug frames need more than the helper's 256 KiB budget even when the
+    // converter correctly stops at the native stack-safe depth. One MiB remains far below
+    // what an unfixed 1,000-frame traversal requires, so the regression still fails.
+    assert!(converts_without_overflow_on_stack(
+        html,
+        ConversionOptions::default(),
+        1024 * 1024
+    ));
 }
 
 #[test]

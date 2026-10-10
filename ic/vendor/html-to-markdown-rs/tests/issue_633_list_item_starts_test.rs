@@ -97,6 +97,7 @@ fn should_start_a_list_item_on_its_own_line_after_text_in_the_list() {
     );
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_start_a_list_item_after_text_in_the_list_the_same_way_in_tier_1() {
     let tier1 = ConversionOptions {
@@ -129,6 +130,7 @@ fn should_leave_a_blank_line_before_an_item_that_cannot_interrupt_the_text() {
     );
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_keep_text_after_a_quote_in_a_sibling_item_between_markers() {
     let options = tier2_options();
@@ -520,7 +522,7 @@ fn should_start_a_task_item_quote_after_an_empty_inline_element_on_the_next_line
     for (wrapper, expected) in [
         (r#"<img src="i.png" alt="i">"#, "- [ ] ![i](i.png)\n  > q\n"),
         ("<span>s</span>", "- [ ] s\n  > q\n"),
-        ("<b>", "- [ ] **> q**\n"),
+        ("<b>", "- [ ] &#32;\n  > **q**\n"),
     ] {
         let html = format!(r#"<ul><li><input type="checkbox">{wrapper}<blockquote>q</blockquote></li></ul>"#);
         assert_eq!(convert_with(&html, &options), expected, "{html}");

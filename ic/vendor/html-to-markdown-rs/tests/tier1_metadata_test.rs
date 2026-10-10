@@ -386,6 +386,25 @@ fn should_report_the_first_title_on_both_tiers() {
 }
 
 #[test]
+fn should_use_a_title_before_an_explicit_head_on_both_tiers() {
+    let html = "<title>First</title><head><title>Second</title></head><p>x</p>";
+    let expected = "---\ntitle: First\n---\n\nx\n";
+    assert_eq!(t1(html), expected);
+    assert_eq!(t2(html), expected);
+
+    #[cfg(feature = "metadata")]
+    {
+        let options = ConversionOptions {
+            tier_strategy: TierStrategy::Tier2,
+            extract_metadata: true,
+            ..ConversionOptions::default()
+        };
+        let document = convert(html, Some(options)).unwrap().metadata.document;
+        assert_eq!(document.title.as_deref(), Some("First"));
+    }
+}
+
+#[test]
 fn should_ignore_a_head_inside_the_body_on_both_tiers() {
     for html in [
         "<html><head></head><body><head><title>Stray</title></head><p>x</p></body></html>",
@@ -416,7 +435,10 @@ fn should_read_the_base_href_of_utf16_input_on_both_tiers() {
         let input = utf16_with_bom(html, little_endian);
         for tier in [TierStrategy::Tier2, TierStrategy::Tier1] {
             let out = with_base_url(&input, tier);
-            assert!(out.contains("base: /b/\n"), "{little_endian} {tier:?}: {out}");
+            assert!(
+                out.contains("base: https://example.com/b/\n"),
+                "{little_endian} {tier:?}: {out}"
+            );
             assert!(
                 out.contains("(https://example.com/b/rel)"),
                 "{little_endian} {tier:?}: {out}"
@@ -430,7 +452,7 @@ fn should_read_the_base_href_of_a_tag_name_holding_a_nul_byte_on_both_tiers() {
     let html = "<html><head><ba\0se href=\"/n/\"></head><body><p><a href=\"rel\">l</a></p></body></html>";
     for tier in [TierStrategy::Tier2, TierStrategy::Tier1] {
         let out = with_base_url(html, tier);
-        assert!(out.contains("base: /n/\n"), "{tier:?}: {out}");
+        assert!(out.contains("base: https://example.com/n/\n"), "{tier:?}: {out}");
         assert!(out.contains("(https://example.com/n/rel)"), "{tier:?}: {out}");
     }
 }
@@ -515,7 +537,7 @@ fn should_take_the_base_href_and_canonical_link_from_their_elements_and_a_meta_t
             .contains("(https://example.com/real/x)")
     );
     let document = result.metadata.document;
-    assert_eq!(document.base_href.as_deref(), Some("/real/"));
+    assert_eq!(document.base_href.as_deref(), Some("https://example.com/real/"));
     assert_eq!(document.canonical_url.as_deref(), Some("https://example.com/real"));
     assert_eq!(document.title.as_deref(), Some("Real"));
     assert_eq!(document.meta_tags.get("base").map(String::as_str), Some("/meta/"));

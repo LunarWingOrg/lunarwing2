@@ -51,6 +51,7 @@ fn assert_converts(html: &str, options: &ConversionOptions, expected: &str, rend
     }
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_start_a_heading_after_text_in_a_quote_after_a_blank_line() {
     let html = "<blockquote>a<h2>q</h2></blockquote>";
@@ -536,19 +537,20 @@ fn should_keep_the_text_of_a_quote_in_a_wide_ordered_item_right_after_an_inline_
 }
 
 #[test]
-fn should_keep_text_after_a_quote_in_a_list_in_a_caption_or_summary_after_the_list_item_ended_out_of_a_code_block() {
+fn should_keep_a_caption_or_summary_with_nested_blocks_inside_the_list_item() {
+    // ~keep Figures preserve their containing list item, as details elements do (#657).
     let html = "<ul><li>a<ul><li>b<figure><figcaption><ul><li>y<blockquote><ul><li>x<blockquote>q</blockquote>t</li></ul></blockquote>u</li></ul></figcaption></figure></li></ul></li></ul>";
     assert_converts(
         html,
         &width4(options(TierStrategy::Tier2)),
-        "- a\n    * b\n\n*+ y\n            > - x\n            >     > q\n            >     t\n            u*\n",
-        "<ul><li>a<ul><li>b</li></ul></li></ul><p><em>+ y&gt; - x&gt;     &gt; q&gt;     tu</em></p>",
+        "- a\n    * b\n\n        *+ y\n            > - x\n            >     > q\n            >     t\n            u*\n",
+        "<ul><li>a<ul><li><p>b</p><p><em>+ y&gt; - x&gt;     &gt; q&gt;     tu</em></p></li></ul></li></ul>",
     );
     assert_converts(
         html,
         &tabs(options(TierStrategy::Tier2)),
-        "- a\n\t* b\n\n*+ y\n\t\t> - x\n\t\t> \t> q\n\t\t> \tt\n\t\tu*\n",
-        "<ul><li>a<ul><li>b</li></ul></li></ul><p><em>+ y&gt; - x&gt; \t&gt; q&gt; \ttu</em></p>",
+        "- a\n\t* b\n\n\t\t*+ y\n\t\t> - x\n\t\t> \t> q\n\t\t> \tt\n\n\t\tu*\n",
+        "<ul><li>a<ul><li><p>b</p><p>*+ y</p><blockquote><ul><li>x<blockquote><p>qt</p></blockquote></li></ul></blockquote><p>u*</p></li></ul></li></ul>",
     );
     // ~keep A details converts like a div, so its summary stays in the list item.
     let html = "<ul><li>a<ul><li>b<details><summary><ul><li>y<blockquote><ul><li>x<blockquote>q</blockquote>t</li></ul></blockquote>u</li></ul></summary></details></li></ul></li></ul>";
@@ -607,17 +609,17 @@ fn should_keep_text_after_a_block_in_a_list_after_text_in_a_wrapper_without_mark
     }
     // ~keep A legend is a block, so it starts a paragraph in the item, as a div does.
     let html = "<ul><li>a<legend><ul><li>x<p>p</p>t</li></ul></legend></li></ul>";
-    let rendered = "<ul><li><p>a</p><p>*** x</p></li></ul><p>p</p><p>t**</p>";
+    let rendered = "<ul><li><p>a</p><ul><li><strong>x</strong></li></ul></li></ul><p><strong>p</strong></p><p><strong>t</strong></p>";
     assert_converts(
         html,
         &width4(options(TierStrategy::Tier2)),
-        "- a\n\n    *** x\n\np\n\nt**\n",
+        "- a\n\n    * **x**\n\n**p**\n\n**t**\n",
         rendered,
     );
     assert_converts(
         html,
         &tabs(options(TierStrategy::Tier2)),
-        "- a\n\n\t*** x\n\np\n\nt**\n",
+        "- a\n\n\t* **x**\n\n**p**\n\n**t**\n",
         rendered,
     );
 }
@@ -662,6 +664,7 @@ fn should_start_a_list_in_a_quote_in_a_wrapper_without_markers_after_a_list_item
     }
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_start_a_nested_list_that_starts_past_one_after_a_blank_line_under_the_tab_indent() {
     let html = r#"<ul><li>a<ul><li>b<ol start="3"><li>c</li></ol></li></ul></li></ul>"#;

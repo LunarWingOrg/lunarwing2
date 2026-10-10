@@ -33,38 +33,22 @@ pub fn handle(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
-        if ctx.convert_as_inline {
-            let children = tag.children();
-            {
-                for child_handle in children.top().iter() {
-                    super::walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-                }
-            }
+        if handler.ctx.convert_as_inline {
+            super::walk_tag_children(tag, parser, output, handler);
             return;
         }
 
         let mut content = String::with_capacity(256);
-        let children = tag.children();
-        {
-            let section_ctx = crate::converter::list::utils::nested_block_context(output, ctx, options);
-            for child_handle in children.top().iter() {
-                super::walk_node(
-                    child_handle,
-                    parser,
-                    &mut content,
-                    options,
-                    &section_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-            }
-        }
+        let section_ctx = crate::converter::list::utils::nested_block_context(output, handler.ctx, handler.options);
+        super::walk_tag_children(
+            tag,
+            parser,
+            &mut content,
+            super::HandlerContext::new(handler.options, &section_ctx, handler.depth, handler.dom_ctx),
+        );
 
         // ~keep A trailing <br> run with no following sibling has no next dispatch to catch
         // ~keep it in `walk_node`'s pre-block-dispatch strip, since this sectioning element's
@@ -73,7 +57,7 @@ pub fn handle(
         // ~keep pushed to `output` raw below (not `.trim()`-ed), so the strip has to run here.
         crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer(
             &mut content,
-            options.newline_style,
+            handler.options.newline_style,
         );
 
         if content.trim().is_empty() {
@@ -81,13 +65,13 @@ pub fn handle(
         }
 
         // ~keep Inside a list item the section starts at the item's content column (issue #583).
-        if ctx.in_list_item && !ctx.in_table_cell && !output.is_empty() {
-            crate::converter::list::utils::start_block_in_list_item(output, ctx, options);
+        if handler.ctx.in_list_item && !handler.ctx.in_table_cell && !output.is_empty() {
+            crate::converter::list::utils::start_block_in_list_item(output, handler.ctx, handler.options);
         } else if !output.is_empty() && !output.ends_with("\n\n") {
             output.push_str("\n\n");
         }
 
-        crate::converter::block::horizontal_rule::separate_leading_rule(output, &content, ctx);
+        crate::converter::block::horizontal_rule::separate_leading_rule(output, &content, handler.ctx);
         output.push_str(&content);
 
         if content.ends_with('\n') && !content.ends_with("\n\n") {

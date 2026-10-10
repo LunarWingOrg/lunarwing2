@@ -174,13 +174,10 @@ fn should_keep_the_pre_existing_br_in_tables_behaviour_for_a_link_inside_a_cell(
     );
 }
 
-// ~keep A `<br>` outside any link is untouched by this change: `block_content_start` still
-// ~keep governs there, so a leading top-level break still opens a line rather than emitting a
-// ~keep marker with nothing to break away from (issue #464, issue #112).
 #[test]
-fn should_leave_a_break_outside_a_link_exactly_as_it_was() {
+fn should_drop_a_paragraph_leading_break_outside_a_link() {
     assert_tiers_agree("<p>x<br></p>", "x  \n");
-    assert_tiers_agree("<p><br>x</p>", "\nx\n");
+    assert_tiers_agree("<p><br>x</p>", "x\n");
 }
 
 // ~keep A code SPAN inside a link splits into one backtick span per segment with the marker

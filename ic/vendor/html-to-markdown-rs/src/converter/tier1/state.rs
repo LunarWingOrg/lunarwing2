@@ -247,6 +247,8 @@ pub struct Tier1State {
     /// Reset to `None` after each `</pre>` so nested same-level blocks don't
     /// inherit a stale language.
     pub pre_lang: Option<String>,
+    /// Byte offsets of real `<br>` nodes inside the current table-cell `<pre>`. ~keep
+    pub pre_cell_break_offsets: Vec<usize>,
     /// Stack of `<summary>` and `<figcaption>` accumulation buffers.
     ///
     /// Pushed when a non-cell `<summary>`/`<figcaption>` opens; all child
@@ -370,6 +372,7 @@ impl Tier1State {
             abbr_titles: Vec::new(),
             head_range: None,
             pre_lang: None,
+            pre_cell_break_offsets: Vec::new(),
             summary_buf_stack: Vec::new(),
             last_closed_custom_element: false,
             last_emitted_was_img: false,

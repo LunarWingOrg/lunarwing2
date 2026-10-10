@@ -3,6 +3,7 @@
 //! Contains helper functions for loose list detection, indentation calculation,
 //! list spacing, and list child processing.
 
+use super::{ListContext, is_list_item};
 use crate::converter::main_helpers::{tag_name_eq, trim_trailing_whitespace};
 use crate::converter::utility::content::normalized_tag_name;
 use crate::options::{ConversionOptions, ListIndentType, OutputFormat};
@@ -403,214 +404,7 @@ fn bare_marker_line_is_rule(output: &str, end: usize) -> bool {
     }
 }
 
-/// The end of the last ordered list and the buffers it can still end.
-///
-/// ~keep A list continues after blank lines when the next marker has the same type (issue #666),
-/// ~keep so an ordered list that starts where the output still ends with an ordered list, in the
-/// ~keep same place, writes the other delimiter. Elements such as `<section>` write into a buffer
-/// ~keep of their own, rewrite it and append it to their parent's. `walk_node` reports each node's
-/// ~keep start and end here. Nodes that pass one buffer down form a run, and the key names the run
-/// ~keep that holds the list's end and the offset of that end. When the node that started the run
-/// ~keep ends, its buffer can go away, so the key waits for its parent. A later child of the same
-/// ~keep parent takes it back when its output is the same buffer: the same address, still holding
-/// ~keep the list's last bytes at the end offset. Otherwise the key moves to the end of the
-/// ~keep parent's output when the parent ends, after any rewrite. So the key never reads a buffer
-/// ~keep that is gone, and each byte after the end is checked once. A list whose last line opens a
-/// ~keep block left of its items' content is already closed, so it stores nothing. A stale answer
-/// ~keep only switches a marker that did not need it.
-#[derive(Clone, Default)]
-pub struct LastList(std::rc::Rc<std::cell::RefCell<ListTracker>>);
-
-#[derive(Default)]
-struct ListTracker {
-    frames: Vec<Frame>,
-    key: Option<ListEnd>,
-}
-
-/// A node being rendered: the address of its output and the first node of the run that writes
-/// into the same output.
-#[derive(Clone, Copy)]
-struct Frame {
-    buffer: usize,
-    run_start: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Owner {
-    /// The run, by its first node, whose buffer holds the end.
-    Run(usize),
-    /// The run ended; the key waits for the parent node (`None` above the root nodes).
-    Waiting(Option<usize>),
-}
-
-/// How many bytes before the end a later child compares to take the key back.
-const END_BYTES: usize = 32;
-
-struct ListEnd {
-    owner: Owner,
-    buffer: usize,
-    end: usize,
-    checked: usize,
-    end_bytes: [u8; END_BYTES],
-    place: ListPlace,
-    delimiter: char,
-}
-
-impl ListEnd {
-    /// The key for a list whose text ends `output`.
-    fn new(owner: Owner, buffer: usize, output: &str, place: ListPlace, delimiter: char) -> Self {
-        let mut key = Self {
-            owner,
-            buffer,
-            end: output.len(),
-            checked: output.len(),
-            end_bytes: [0; END_BYTES],
-            place,
-            delimiter,
-        };
-        key.take_end_bytes(output);
-        key
-    }
-
-    fn take_end_bytes(&mut self, output: &str) {
-        let bytes = &output.as_bytes()[self.end.saturating_sub(END_BYTES)..self.end];
-        self.end_bytes = [0; END_BYTES];
-        self.end_bytes[..bytes.len()].copy_from_slice(bytes);
-    }
-
-    fn holds_end_bytes(&self, output: &str) -> bool {
-        let start = self.end.saturating_sub(END_BYTES);
-        output.as_bytes().get(start..self.end) == Some(&self.end_bytes[..self.end - start])
-    }
-
-    /// Whether `output`, the buffer that holds the end, still reaches the end and has only
-    /// whitespace after it.
-    fn clean_after(&mut self, output: &str) -> bool {
-        let start = self.checked.min(output.len()).max(self.end);
-        self.checked = output.len();
-        output
-            .as_bytes()
-            .get(start..)
-            .is_some_and(|rest| rest.iter().all(u8::is_ascii_whitespace))
-    }
-}
-
-/// Where a list sits: the content column of the item around it and the quote depth.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ListPlace {
-    columns: usize,
-    quotes: usize,
-}
-
-impl ListPlace {
-    const fn of(ctx: &Context) -> Self {
-        Self {
-            columns: ctx.list_indent_columns,
-            quotes: ctx.blockquote_depth,
-        }
-    }
-}
-
-impl LastList {
-    /// A node starts rendering into `output`.
-    pub fn enter(&self, output: &String) {
-        let mut tracker = self.0.borrow_mut();
-        let buffer = std::ptr::from_ref::<String>(output) as usize;
-        let index = tracker.frames.len();
-        let run_start = match tracker.frames.last() {
-            Some(parent) if parent.buffer == buffer => parent.run_start,
-            _ => index,
-        };
-        tracker.frames.push(Frame { buffer, run_start });
-        let ListTracker { key, .. } = &mut *tracker;
-        if let Some(waiting) = key.as_mut().filter(|key| {
-            key.owner == Owner::Waiting(index.checked_sub(1)) && key.buffer == buffer && run_start == index
-        }) {
-            if waiting.holds_end_bytes(output) {
-                waiting.owner = Owner::Run(run_start);
-                if !waiting.clean_after(output) {
-                    *key = None;
-                }
-            }
-        }
-    }
-
-    /// The node that started last ends; `output` is its output.
-    pub fn leave(&self, output: &str) {
-        let mut tracker = self.0.borrow_mut();
-        let Some(frame) = tracker.frames.pop() else { return };
-        let index = tracker.frames.len();
-        let ListTracker { key, .. } = &mut *tracker;
-        let Some(list_end) = key.as_mut() else { return };
-        if list_end.owner == Owner::Waiting(Some(index)) {
-            *list_end = ListEnd::new(
-                Owner::Run(frame.run_start),
-                frame.buffer,
-                output,
-                list_end.place,
-                list_end.delimiter,
-            );
-        }
-        if list_end.owner == Owner::Run(frame.run_start) {
-            if !list_end.clean_after(output) {
-                *key = None;
-            } else if frame.run_start == index {
-                list_end.owner = Owner::Waiting(index.checked_sub(1));
-            }
-        }
-    }
-
-    /// Store the end of an ordered list whose items wrote `delimiter` at the end of `output`.
-    pub fn set(&self, output: &str, ctx: &Context, delimiter: char) {
-        use crate::converter::utility::escaping::{leading_indent, opens_block};
-        let mut tracker = self.0.borrow_mut();
-        let Some(frame) = tracker.frames.last().copied() else {
-            return;
-        };
-        let content = output.trim_end_matches(|c: char| c.is_ascii_whitespace());
-        let line = &content[content.rfind('\n').map_or(0, |pos| pos + 1)..];
-        let (indent, column) = leading_indent(line);
-        let rest = &line[indent..];
-        let closed =
-            column < ctx.list_indent_columns + 2 && opens_block(rest) && strip_leading_bare_marker(rest).is_none();
-        tracker.key = (!closed).then(|| {
-            ListEnd::new(
-                Owner::Run(frame.run_start),
-                frame.buffer,
-                output,
-                ListPlace::of(ctx),
-                delimiter,
-            )
-        });
-    }
-
-    /// The delimiter of the list that `output` still ends with, for a list that starts at the end
-    /// of `output`. A list in an outer buffer counts while `output` holds only whitespace.
-    fn delimiter_before(&self, output: &str, ctx: &Context) -> Option<char> {
-        let mut tracker = self.0.borrow_mut();
-        let run = tracker.frames.last()?.run_start;
-        let key = tracker.key.as_mut()?;
-        let open = if key.owner == Owner::Run(run) {
-            key.clean_after(output)
-        } else {
-            output.bytes().all(|byte| byte.is_ascii_whitespace())
-        };
-        (open && key.place == ListPlace::of(ctx)).then_some(key.delimiter)
-    }
-}
-
-/// The delimiter of an ordered list that starts at the end of `output`: `)` right after an
-/// ordered list that wrote `.`, so the two stay two lists (issue #666).
-pub fn switched_delimiter(output: &str, ctx: &Context) -> Option<char> {
-    // ~keep A list in heading text, inline text or text between markers is text: it continues
-    // ~keep nothing.
-    (!ctx.convert_as_inline
-        && ctx.inline_depth == 0
-        && !ctx.text_in_markers
-        && !ctx.in_marker_span
-        && ctx.last_list.delimiter_before(output, ctx) == Some('.'))
-    .then_some(')')
-}
+pub use super::{ItemLineScan, LastList, PreviousMarker, switched_delimiter};
 
 /// Whether a paragraph is open before the line at `line_start`, stored for the next marker line.
 fn paragraph_is_open_before(
@@ -682,42 +476,6 @@ fn paragraph_is_open(output: &str, enclosing_column: usize, previous: Option<(us
 /// ~keep The lists share it through the context. The buffer address, the enclosing content column
 /// ~keep and the line before the marker line must match: in another buffer, in a list at another
 /// ~keep depth, or after a write that changed the end of the buffer, the line start means nothing.
-#[derive(Clone, Default)]
-pub struct PreviousMarker(std::rc::Rc<std::cell::RefCell<Option<PreviousMarkerState>>>);
-
-struct PreviousMarkerState {
-    buffer: usize,
-    line_start: usize,
-    line_before: String,
-    enclosing_column: usize,
-    open: bool,
-}
-
-impl PreviousMarker {
-    fn get(&self, buffer: usize, output: &str, enclosing_column: usize) -> Option<(usize, bool)> {
-        let state = self.0.borrow();
-        let state = state.as_ref()?;
-        (state.buffer == buffer
-            && state.enclosing_column == enclosing_column
-            && output
-                .get(..state.line_start)
-                .is_some_and(|before| before.ends_with(state.line_before.as_str())))
-        .then_some((state.line_start, state.open))
-    }
-
-    fn set(&self, buffer: usize, output: &str, line_start: usize, enclosing_column: usize, open: bool) {
-        let before = &output[..line_start];
-        let line_before = &before[before.trim_end_matches('\n').rfind('\n').map_or(0, |pos| pos + 1)..];
-        *self.0.borrow_mut() = Some(PreviousMarkerState {
-            buffer,
-            line_start,
-            line_before: line_before.to_string(),
-            enclosing_column,
-            open,
-        });
-    }
-}
-
 /// If this list is immediately preceded by an HTML comment whose own immediately preceding
 /// sibling is a list of this same tag (`ul`/`ol`), return that comment's literal source text.
 ///
@@ -781,7 +539,7 @@ pub fn preceding_same_type_list_separator_comment(
 /// Strip one bare list marker -- a single bullet char (`-`, `*`, `+`) followed by a space,
 /// or one-or-more ASCII digits followed by `". "` or `") "` -- from the front of `text`,
 /// returning what remains after it. Returns `None` when `text` does not start with a marker.
-fn strip_leading_bare_marker(text: &str) -> Option<&str> {
+pub(super) fn strip_leading_bare_marker(text: &str) -> Option<&str> {
     let digit_count = text.bytes().take_while(u8::is_ascii_digit).count();
     if digit_count > 0 {
         let rest = &text[digit_count..];
@@ -867,7 +625,7 @@ pub fn item_is_open(output: &str, indent: &str, ctx: &Context) -> bool {
 
 /// Whether the item is open after the complete lines `output` (it ends at a line start), or
 /// `None` when they are all blank. Stores the answer in `scan` for the next check.
-fn lines_are_open(output: &str, indent: &str, scan: &ItemLineScan) -> Option<bool> {
+pub(super) fn lines_are_open(output: &str, indent: &str, scan: &ItemLineScan) -> Option<bool> {
     let buffer = output.as_ptr() as usize;
     let (start, below) = scan
         .read(buffer, indent, output)
@@ -899,55 +657,6 @@ fn last_marker_line_start(output: &str) -> usize {
         end = start;
     }
     0
-}
-
-/// The answer of the last check of an item's lines in one buffer: the buffer address, the
-/// indent, the end of the lines it covers, the last of those lines, and the answer.
-///
-/// ~keep The walk reads lines forward from the item's start, so the answer after a line depends
-/// ~keep only on the answer before it and the line itself; the next check starts from the stored
-/// ~keep end. Only the end of a buffer changes after it is written, and it changes by whitespace
-/// ~keep and line breaks. The stored last line must still be there: a later write that removed
-/// ~keep it removed the end the answer covers.
-#[derive(Clone, Default)]
-pub struct ItemLineScan(std::rc::Rc<std::cell::RefCell<Option<ItemLineScanState>>>);
-
-struct ItemLineScanState {
-    buffer: usize,
-    indent: String,
-    end: usize,
-    last_line_start: usize,
-    last_line: String,
-    open: Option<bool>,
-}
-
-impl ItemLineScan {
-    /// A scan for a quote or a container that writes a buffer of its own: the answer kept for
-    /// the enclosing buffer stays.
-    pub fn new_item() -> Self {
-        Self::default()
-    }
-
-    fn read(&self, buffer: usize, indent: &str, output: &str) -> Option<(usize, Option<bool>)> {
-        let state = self.0.borrow();
-        let state = state.as_ref()?;
-        (state.buffer == buffer
-            && state.indent == indent
-            && output.get(state.last_line_start..state.end) == Some(state.last_line.as_str()))
-        .then_some((state.end, state.open))
-    }
-
-    fn write(&self, buffer: usize, indent: &str, output: &str, open: Option<bool>) {
-        let last_line_start = output.trim_end().rfind('\n').map_or(0, |pos| pos + 1);
-        *self.0.borrow_mut() = Some(ItemLineScanState {
-            buffer,
-            indent: indent.to_string(),
-            end: output.len(),
-            last_line_start,
-            last_line: output[last_line_start..].to_string(),
-            open,
-        });
-    }
 }
 
 /// The context for the children of a container that renders them into a buffer of its own:
@@ -1022,7 +731,7 @@ pub fn add_list_leading_separator(output: &mut String, ctx: &Context, options: &
         let is_table_continuation =
             !output.is_empty() && !output.ends_with('|') && !output.ends_with(' ') && !output.ends_with("<br>");
         if is_table_continuation {
-            crate::converter::main_helpers::emit_table_cell_break(output, options.br_in_tables);
+            crate::converter::main_helpers::emit_table_cell_break_in_context(output, options.br_in_tables, ctx);
         }
         return;
     }
@@ -1099,239 +808,182 @@ pub const fn calculate_list_nesting_depth(ctx: &Context) -> usize {
     }
 }
 
-/// Check if a node is a list item element.
-pub fn is_list_item(node_handle: tl::NodeHandle, parser: &tl::Parser, dom_ctx: &DomContext) -> bool {
-    if let Some(info) = dom_ctx.tag_info(node_handle.get_inner(), parser) {
-        return info.name == "li";
-    }
-    matches!(
-        node_handle.get(parser),
-        Some(tl::Node::Tag(tag)) if tag_name_eq(tag.name().as_utf8_str(), "li")
-    )
+#[derive(Clone, Copy)]
+pub(super) struct ListChildrenContext<'a> {
+    pub list: ListContext<'a>,
+    pub ordered: bool,
+    pub loose: bool,
+    pub nested_depth: usize,
+    pub start_counter: i64,
+    pub delimiter: Option<char>,
 }
 
-/// Process a list's children, tracking which items had block elements.
-///
-/// This is used to determine proper spacing between list items.
-/// Returns true if the last processed item had block children.
-#[allow(clippy::too_many_arguments)]
-pub fn process_list_children(
-    node_handle: tl::NodeHandle,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    is_ordered: bool,
-    is_loose: bool,
-    nested_depth: usize,
-    start_counter: i64,
-    delimiter: Option<char>,
-    dom_ctx: &DomContext,
-) {
-    let mut counter = start_counter;
-    let mut counter_saturated = false;
-    let mut first_item = true;
+#[derive(Default)]
+struct MarkerPosition {
+    line_start: Option<usize>,
+    bare_end: Option<usize>,
+}
 
-    if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
-        let children = tag.children();
-        {
-            // ~keep Build the per-list context once; only `list_counter` varies
-            // ~keep per iteration, so mutate that field in place instead of
-            // ~keep cloning ctx for every <li>.  Tier-2 hot-spot pass III.
-            let mut list_ctx = Context {
-                in_ordered_list: is_ordered,
-                list_counter: if is_ordered { counter } else { 0 },
-                in_list: true,
-                list_depth: nested_depth,
-                ul_depth: if is_ordered { ctx.ul_depth } else { ctx.ul_depth + 1 },
-                loose_list: is_loose,
-                prev_item_had_blocks: false,
-                ordered_delimiter: delimiter,
-                ..ctx.clone()
+struct ListChildProcessor<'a> {
+    config: ListChildrenContext<'a>,
+    item_ctx: Context,
+    counter: i64,
+    counter_saturated: bool,
+    first_item: bool,
+}
+
+impl<'a> ListChildProcessor<'a> {
+    fn new(config: ListChildrenContext<'a>) -> Self {
+        let context = config.list.ctx;
+        let counter = config.start_counter;
+        let item_ctx = Context {
+            in_ordered_list: config.ordered,
+            list_counter: if config.ordered { counter } else { 0 },
+            in_list: true,
+            list_depth: config.nested_depth,
+            ul_depth: if config.ordered {
+                context.ul_depth
+            } else {
+                context.ul_depth + 1
+            },
+            loose_list: config.loose,
+            prev_item_had_blocks: false,
+            ordered_delimiter: config.delimiter,
+            ..context.clone()
+        };
+        Self {
+            config,
+            item_ctx,
+            counter,
+            counter_saturated: false,
+            first_item: true,
+        }
+    }
+
+    fn marker_before(
+        &mut self,
+        child_handle: tl::NodeHandle,
+        parser: &tl::Parser,
+        output: &mut String,
+    ) -> MarkerPosition {
+        let context = self.config.list.ctx;
+        if !self.first_item || !is_list_item(child_handle, parser, self.config.list.dom_ctx) {
+            return MarkerPosition::default();
+        }
+        self.first_item = false;
+        let item_block = context.in_list_item && context.inline_depth == 0 && !context.text_in_markers;
+        if !item_block {
+            return MarkerPosition::default();
+        }
+        if line_is_bare_list_marker(output) {
+            return MarkerPosition {
+                bare_end: Some(output.len()),
+                ..MarkerPosition::default()
             };
-
-            for child_handle in children.top().iter() {
-                if let Some(tl::Node::Raw(bytes)) = child_handle.get(parser) {
-                    if bytes.as_utf8_str().trim().is_empty() {
-                        continue;
-                    }
-                }
-
-                if is_ordered {
-                    list_ctx.list_counter = counter;
-                }
-                // ~keep A first marker that cannot interrupt the paragraph before it starts after a
-                // ~keep blank line (issues #662, #670). Between inline markers the list is text. The
-                // ~keep marker character does not change the answer, so `N. x` and `- x` stand for
-                // ~keep every item with content. Whether the item has content is known once it is
-                // ~keep written, so a marker line that could interrupt is checked again then (issue
-                // ~keep #667), except in a marker-only wrapper's text. The paragraph is read once
-                // ~keep per list either way.
-                let mut marker_line_start = None;
-                let mut bare_marker_end = None;
-                if first_item && is_list_item(*child_handle, parser, dom_ctx) {
-                    first_item = false;
-                    let item_block = ctx.in_list_item && ctx.inline_depth == 0 && !ctx.text_in_markers;
-                    if item_block && line_is_bare_list_marker(output) {
-                        bare_marker_end = Some(output.len());
-                    } else if item_block && output.ends_with('\n') {
-                        let marker = if is_ordered {
-                            format!("{counter}. x")
-                        } else {
-                            String::from("- x")
-                        };
-                        if list_needs_blank_line(
-                            (output, output.len()),
-                            &marker,
-                            ctx.real_item_columns,
-                            (&ctx.previous_marker, std::ptr::from_ref::<String>(output) as usize),
-                            options,
-                        ) {
-                            output.push('\n');
-                        } else if !ctx.in_marker_span && marker_line_interrupts(&marker, options) {
-                            marker_line_start = Some(output.len());
-                        }
-                    }
-                }
-
-                use crate::converter::walk_node;
-                walk_node(child_handle, parser, output, options, &list_ctx, depth + 1, dom_ctx);
-
-                if let Some(line_start) = marker_line_start {
-                    let line = written_marker_line(output, line_start);
-                    if list_needs_blank_line(
-                        (output, line_start),
-                        line,
-                        ctx.real_item_columns,
-                        (&ctx.previous_marker, std::ptr::from_ref::<String>(output) as usize),
-                        options,
-                    ) {
-                        output.insert(line_start, '\n');
-                    }
-                }
-                // ~keep An empty item that ends a line of bare markers can complete a thematic
-                // ~keep break (`- - -`), so its marker starts the next line instead, at the column
-                // ~keep it has on this line (issue #667).
-                if let Some(end) = bare_marker_end {
-                    if bare_marker_line_is_rule(output, end) {
-                        let indent = column_of_written_marker(output, end);
-                        output.replace_range(end - 1..end, &format!("\n{indent}"));
-                    }
-                }
-
-                if is_ordered && is_list_item(*child_handle, parser, dom_ctx) {
-                    if counter == i64::MAX {
-                        if !counter_saturated {
-                            tracing::warn!(
-                                target: "html_to_markdown::list",
-                                counter,
-                                "ordered list counter reached i64::MAX; subsequent items repeat this value"
-                            );
-                            counter_saturated = true;
-                        }
-                    } else {
-                        counter += 1;
-                    }
-                }
+        }
+        if !output.ends_with('\n') {
+            return MarkerPosition::default();
+        }
+        let marker = if self.config.ordered {
+            format!("{}. x", self.counter)
+        } else {
+            String::from("- x")
+        };
+        if list_needs_blank_line(
+            (output, output.len()),
+            &marker,
+            context.real_item_columns,
+            (&context.previous_marker, std::ptr::from_ref::<String>(output) as usize),
+            self.config.list.options,
+        ) {
+            output.push('\n');
+            MarkerPosition::default()
+        } else {
+            MarkerPosition {
+                line_start: (!context.in_marker_span && marker_line_interrupts(&marker, self.config.list.options))
+                    .then_some(output.len()),
+                bare_end: None,
             }
         }
     }
+
+    fn marker_after(&self, output: &mut String, position: MarkerPosition) {
+        let context = self.config.list.ctx;
+        if let Some(line_start) = position.line_start {
+            let line = written_marker_line(output, line_start);
+            if list_needs_blank_line(
+                (output, line_start),
+                line,
+                context.real_item_columns,
+                (&context.previous_marker, std::ptr::from_ref::<String>(output) as usize),
+                self.config.list.options,
+            ) {
+                output.insert(line_start, '\n');
+            }
+        }
+        // ~keep An empty item that ends a line of bare markers can complete a thematic
+        // ~keep break (`- - -`), so its marker starts the next line instead (issue #667).
+        if let Some(end) = position.bare_end.filter(|&end| bare_marker_line_is_rule(output, end)) {
+            let indent = column_of_written_marker(output, end);
+            output.replace_range(end - 1..end, &format!("\n{indent}"));
+        }
+    }
+
+    fn advance_counter(&mut self, child_handle: tl::NodeHandle, parser: &tl::Parser) {
+        if !self.config.ordered || !is_list_item(child_handle, parser, self.config.list.dom_ctx) {
+            return;
+        }
+        if self.counter < i64::MAX {
+            self.counter += 1;
+        } else if !self.counter_saturated {
+            tracing::warn!(
+                target: "html_to_markdown::list",
+                counter = self.counter,
+                "ordered list counter reached i64::MAX; subsequent items repeat this value"
+            );
+            self.counter_saturated = true;
+        }
+    }
+
+    fn render(&mut self, child_handle: &tl::NodeHandle, parser: &tl::Parser, output: &mut String) {
+        if self.config.ordered {
+            self.item_ctx.list_counter = self.counter;
+        }
+        let marker = self.marker_before(*child_handle, parser, output);
+        crate::converter::walk_node(
+            child_handle,
+            parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                self.config.list.options,
+                &self.item_ctx,
+                self.config.list.depth + 1,
+                self.config.list.dom_ctx,
+            ),
+        );
+        self.marker_after(output, marker);
+        self.advance_counter(*child_handle, parser);
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn is_whitespace_node(node_handle: &tl::NodeHandle, parser: &tl::Parser) -> bool {
+    matches!(node_handle.get(parser), Some(tl::Node::Raw(bytes)) if bytes.as_utf8_str().trim().is_empty())
+}
 
-    /// Render `first` as a child of a root node with an ordered list at its end, then enter a
-    /// second child whose output is the same `String` holding `second`, and return the owner of
-    /// the key at that point.
-    fn owner_after_sibling_enters(first: &str, second: &str) -> Option<Owner> {
-        let list = LastList::default();
-        let root = String::new();
-        let mut buffer = String::from(first);
-        list.enter(&root);
-        list.enter(&buffer);
-        let place = ListPlace { columns: 0, quotes: 0 };
-        let address = std::ptr::from_ref::<String>(&buffer) as usize;
-        list.0.borrow_mut().key = Some(ListEnd::new(Owner::Run(1), address, &buffer, place, '.'));
-        list.leave(&buffer);
-        buffer.clear();
-        buffer.push_str(second);
-        list.enter(&buffer);
-        list.0.borrow().key.as_ref().map(|key| key.owner)
-    }
-
-    #[test]
-    fn a_later_child_takes_the_list_end_back_only_from_the_same_buffer() {
-        assert_eq!(owner_after_sibling_enters("1. a\n", "1. a\n\n"), Some(Owner::Run(1)));
-        // ~keep A new buffer at the reused address does not hold the list's bytes at the end offset.
-        assert_eq!(
-            owner_after_sibling_enters("1. a\n", "zzzzzz\n"),
-            Some(Owner::Waiting(Some(0)))
-        );
-        assert_eq!(owner_after_sibling_enters("1. a\n", "1. a\nx"), None);
-    }
-
-    #[test]
-    fn a_buffer_that_no_longer_reaches_the_list_end_is_not_clean() {
-        let place = ListPlace { columns: 0, quotes: 0 };
-        let mut key = ListEnd::new(Owner::Run(0), 0, "1. a\n", place, '.');
-        assert!(key.clean_after("1. a\n\n"));
-        assert!(!key.clean_after("1."));
-    }
-
-    #[test]
-    fn a_later_child_with_another_buffer_leaves_the_list_end_waiting() {
-        let list = LastList::default();
-        let root = String::new();
-        let first = String::from("1. a\n");
-        let second = first.clone();
-        list.enter(&root);
-        list.enter(&first);
-        let place = ListPlace { columns: 0, quotes: 0 };
-        let address = std::ptr::from_ref::<String>(&first) as usize;
-        list.0.borrow_mut().key = Some(ListEnd::new(Owner::Run(1), address, &first, place, '.'));
-        list.leave(&first);
-        list.enter(&second);
-        let owner = list.0.borrow().key.as_ref().map(|key| key.owner);
-        assert_eq!(owner, Some(Owner::Waiting(Some(0))));
-    }
-
-    #[test]
-    fn item_line_scan_reads_the_lines_again_after_its_last_line_changed() {
-        let scan = ItemLineScan::new_item();
-        let mut output = String::from("- a\n  b\n");
-        assert_eq!(lines_are_open(&output, "  ", &scan), Some(true));
-        output.clear();
-        output.push_str("a\nb\nzzz\n");
-        assert_eq!(lines_are_open(&output, "  ", &scan), Some(false));
-    }
-
-    #[test]
-    fn item_line_scan_reads_the_lines_of_another_buffer_again() {
-        let scan = ItemLineScan::new_item();
-        let first = String::from("- a\n  b\n");
-        let second = String::from("a\nb\n  b\n");
-        assert_eq!(lines_are_open(&first, "  ", &scan), Some(true));
-        assert_eq!(lines_are_open(&second, "  ", &scan), Some(false));
-    }
-
-    #[test]
-    fn item_line_scan_reads_the_lines_again_for_another_indent() {
-        let scan = ItemLineScan::new_item();
-        let output = String::from("- a\n  b\n");
-        assert_eq!(lines_are_open(&output, "  ", &scan), Some(true));
-        assert_eq!(lines_are_open(&output, "    ", &scan), Some(false));
-    }
-
-    #[test]
-    fn previous_marker_answers_only_for_its_buffer_column_and_line_before_its_marker_line() {
-        let previous = PreviousMarker::default();
-        previous.set(1, "p\n- a\n", 2, 0, true);
-        assert_eq!(previous.get(1, "p\n- a\n- b\n", 0), Some((2, true)));
-        assert_eq!(previous.get(1, "p\n- a\n- b\n", 2), None);
-        assert_eq!(previous.get(2, "p\n- a\n- b\n", 0), None);
-        assert_eq!(previous.get(1, "q\n- a\n- b\n", 0), None);
+/// Process a list's children while maintaining marker and counter state.
+pub(super) fn process_list_children(
+    node_handle: tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    context: ListChildrenContext<'_>,
+) {
+    let Some(tl::Node::Tag(tag)) = node_handle.get(parser) else {
+        return;
+    };
+    let mut processor = ListChildProcessor::new(context);
+    for child_handle in tag.children().top().iter() {
+        if !is_whitespace_node(child_handle, parser) {
+            processor.render(child_handle, parser, output);
+        }
     }
 }

@@ -4,8 +4,8 @@
 //! not an internal detail. This test exists to let `bail.rs` be restructured for the size limits in
 //! issue #465 without changing a single rendered message. ~keep
 
-#![cfg(feature = "testkit")]
 #![allow(missing_docs)]
+#![cfg(feature = "testkit")]
 
 use html_to_markdown_rs::tier1::BailReason;
 

@@ -7,6 +7,7 @@
 //! - Empty element filtering
 //! - Visitor callbacks for custom paragraph processing
 
+use crate::converter::block::container::HandlerContext;
 use crate::converter::main_helpers::is_ascii_whitespace_only;
 use crate::options::{ConversionOptions, NewlineStyle};
 use tl::{NodeHandle, Parser};
@@ -18,19 +19,32 @@ type DomContext = crate::converter::DomContext;
 ///
 /// Processes children with proper context, manages spacing,
 /// and handles special cases for table cells and list items.
-pub fn handle(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    use crate::converter::walk_node;
+pub fn handle(node_handle: &NodeHandle, parser: &Parser, output: &mut String, handler: HandlerContext<'_>) {
+    let HandlerContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = handler;
 
     let content_start_pos = output.len();
+    open_paragraph(output, options, ctx);
+    let p_ctx = Context {
+        in_paragraph: true,
+        block_content_start: output.len(),
+        block_output_ptr: std::ptr::from_ref::<String>(output) as usize,
+        ..ctx.clone()
+    };
+    walk_paragraph_children(
+        node_handle,
+        parser,
+        output,
+        HandlerContext::new(options, &p_ctx, depth, dom_ctx),
+    );
+    close_paragraph(output, options, ctx, &p_ctx, content_start_pos);
+}
 
+fn open_paragraph(output: &mut String, options: &ConversionOptions, ctx: &Context) {
     let is_table_continuation = (ctx.in_table_cell || ctx.in_layout_cell)
         && !output.is_empty()
         && !output.ends_with('|')
@@ -63,56 +77,81 @@ pub fn handle(
         };
 
     if is_table_continuation {
-        crate::converter::emit_table_cell_break(output, options.br_in_tables);
+        crate::converter::main_helpers::emit_table_cell_break_in_context(output, options.br_in_tables, ctx);
     } else if is_list_continuation {
         crate::converter::list::utils::start_block_in_list_item(output, ctx, options);
     } else if needs_leading_sep {
         crate::converter::trim_trailing_whitespace(output);
         output.push_str("\n\n");
     }
+}
 
-    let p_ctx = Context {
-        in_paragraph: true,
-        block_content_start: output.len(),
-        block_output_ptr: std::ptr::from_ref::<String>(output) as usize,
-        ..ctx.clone()
+fn walk_paragraph_children(
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+) {
+    let Some(tl::Node::Tag(tag)) = node_handle.get(parser) else {
+        return;
+    };
+    let child_handles: std::borrow::Cow<'_, [NodeHandle]> = match handler.dom_ctx.children_of(node_handle.get_inner()) {
+        Some(children) => std::borrow::Cow::Borrowed(children.as_slice()),
+        None => std::borrow::Cow::Owned(tag.children().top().iter().copied().collect()),
     };
 
-    if let Some(node) = node_handle.get(parser) {
-        if let tl::Node::Tag(tag) = node {
-            let id = node_handle.get_inner();
-            let child_handles: std::borrow::Cow<'_, [tl::NodeHandle]> = match dom_ctx.children_of(id) {
-                Some(children) => std::borrow::Cow::Borrowed(children.as_slice()),
-                None => std::borrow::Cow::Owned(tag.children().top().iter().copied().collect()),
-            };
-
-            for (i, child_handle) in child_handles.iter().enumerate() {
-                if let Some(node) = child_handle.get(parser) {
-                    if let tl::Node::Raw(bytes) = node {
-                        let text = bytes.as_utf8_str();
-                        // ~keep `is_ascii_whitespace_only`, not `text.trim().is_empty()`: a
-                        // ~keep raw byte that is significant, Unicode-whitespace content (a
-                        // ~keep literal decoded nbsp, not the `&nbsp;` entity) trims to empty
-                        // ~keep under `str::trim`'s broader definition, but dropping it here
-                        // ~keep outright discarded real content -- it must only be skipped
-                        // ~keep when it is genuinely pure ASCII formatting whitespace.
-                        if is_ascii_whitespace_only(&text) && i > 0 && i < child_handles.len() - 1 {
-                            let prev = &child_handles[i - 1];
-                            let next = &child_handles[i + 1];
-                            if is_empty_inline_element(prev, parser, dom_ctx)
-                                && is_empty_inline_element(next, parser, dom_ctx)
-                            {
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                walk_node(child_handle, parser, output, options, &p_ctx, depth + 1, dom_ctx);
-            }
+    for (index, child_handle) in child_handles.iter().enumerate() {
+        if should_skip_interstitial_whitespace(child_handle, index, &child_handles, parser) {
+            continue;
         }
+        crate::converter::walk_node(
+            child_handle,
+            parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.ctx,
+                handler.depth + 1,
+                handler.dom_ctx,
+            ),
+        );
     }
+}
 
+fn should_skip_interstitial_whitespace(
+    child_handle: &NodeHandle,
+    index: usize,
+    child_handles: &[NodeHandle],
+    parser: &Parser,
+) -> bool {
+    let Some(tl::Node::Raw(bytes)) = child_handle.get(parser) else {
+        return false;
+    };
+    let text = bytes.as_utf8_str();
+    if !is_ascii_whitespace_only(&text) || index == 0 || index == child_handles.len() - 1 {
+        return false;
+    }
+    if is_image_element(&child_handles[index - 1], parser) && is_image_element(&child_handles[index + 1], parser) {
+        return false;
+    }
+    is_empty_inline_element(&child_handles[index - 1], parser)
+        && is_empty_inline_element(&child_handles[index + 1], parser)
+}
+
+fn is_image_element(node_handle: &NodeHandle, parser: &Parser) -> bool {
+    matches!(
+        node_handle.get(parser),
+        Some(tl::Node::Tag(tag)) if tag.name().as_utf8_str().eq_ignore_ascii_case("img")
+    )
+}
+
+fn close_paragraph(
+    output: &mut String,
+    options: &ConversionOptions,
+    ctx: &Context,
+    p_ctx: &Context,
+    content_start_pos: usize,
+) {
     if options.newline_style == NewlineStyle::Backslash {
         // ~keep A trailing run of <br> has no next line to break to, so the backslash
         // ~keep markers it emitted would otherwise leave literal, visible "\" characters at
@@ -126,16 +165,12 @@ pub fn handle(
     if has_content && !ctx.convert_as_inline && !ctx.in_table_cell {
         output.push_str("\n\n");
     }
+}
 
-    if has_content && !ctx.in_table_cell && !ctx.in_list_item && !ctx.convert_as_inline {
-        if let Some(ref sc) = ctx.structure_collector {
-            let safe_start = crate::converter::utility::content::floor_char_boundary(output, content_start_pos);
-            let text = output[safe_start..].trim();
-            if !text.is_empty() {
-                sc.borrow_mut().push_paragraph(text);
-            }
-        }
-    }
+#[cfg(test)]
+fn structure_text(output: &str, content_start_pos: usize) -> &str {
+    let safe_start = crate::converter::utility::content::floor_char_boundary(output, content_start_pos);
+    output[safe_start..].trim()
 }
 
 /// Whether `output` ends with a bare list marker and nothing else: an ordered marker's
@@ -161,7 +196,7 @@ fn ends_with_bare_list_marker(output: &str, options: &ConversionOptions) -> bool
 }
 
 /// Check if an element is empty (has no text content).
-fn is_empty_inline_element(node_handle: &NodeHandle, parser: &Parser, _dom_ctx: &DomContext) -> bool {
+fn is_empty_inline_element(node_handle: &NodeHandle, parser: &Parser) -> bool {
     if let Some(node) = node_handle.get(parser) {
         match node {
             tl::Node::Tag(tag) => {
@@ -172,5 +207,20 @@ fn is_empty_inline_element(node_handle: &NodeHandle, parser: &Parser, _dom_ctx: 
         }
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::structure_text;
+
+    #[test]
+    fn should_clamp_structure_slice_when_output_shrinks_below_a_multibyte_start() {
+        assert_eq!(structure_text("中", 4), "");
+    }
+
+    #[test]
+    fn should_floor_structure_slice_when_start_lands_inside_a_multibyte_character() {
+        assert_eq!(structure_text("a中", 2), "中");
     }
 }

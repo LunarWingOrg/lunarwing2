@@ -16,6 +16,19 @@ pub(crate) const NATIVE_STACK_SAFE_DEPTH: usize = 64;
 /// guards the recursive walker against a genuine stack overflow.
 pub(crate) const MAX_CONFIGURABLE_DEPTH: usize = 1024;
 
+/// Default HTML input limit for WebAssembly builds: 2 MiB. ~keep
+pub const DEFAULT_WASM_MAX_INPUT_SIZE: u64 = 2 * 1024 * 1024;
+
+#[cfg(target_arch = "wasm32")]
+const fn default_max_input_size() -> Option<u64> {
+    Some(DEFAULT_WASM_MAX_INPUT_SIZE)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const fn default_max_input_size() -> Option<u64> {
+    None
+}
+
 /// Controls which conversion tier is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(
@@ -178,6 +191,12 @@ pub struct ConversionOptions {
     pub extract_images: bool,
     /// Maximum decoded image size in bytes (default 5MB).
     pub max_image_size: u64,
+    /// Maximum accepted HTML input size in bytes.
+    ///
+    /// WebAssembly builds default to [`DEFAULT_WASM_MAX_INPUT_SIZE`] (2 MiB) to avoid
+    /// an uncatchable stack-exhaustion trap on unusually large DOMs. Native builds default
+    /// to `None`. Set `Some(bytes)` to choose another limit or `None` to disable it.
+    pub max_input_size: Option<u64>,
     /// Capture SVG elements as images.
     pub capture_svg: bool,
     /// Infer image dimensions from data.
@@ -289,6 +308,7 @@ impl Default for ConversionOptions {
             include_document_structure: false,
             extract_images: false,
             max_image_size: 5_242_880,
+            max_input_size: default_max_input_size(),
             capture_svg: false,
             infer_dimensions: true,
             max_depth: None,
@@ -422,6 +442,7 @@ impl ConversionOptionsBuilder {
     }
 
     builder_setter!(max_image_size, u64);
+    builder_setter!(max_input_size, Option<u64>);
     builder_setter!(capture_svg, bool);
     builder_setter!(infer_dimensions, bool);
     builder_setter!(max_depth, Option<usize>);
@@ -559,6 +580,8 @@ pub struct ConversionOptionsUpdate {
     pub extract_images: Option<bool>,
     /// Optional override for [`ConversionOptions::max_image_size`].
     pub max_image_size: Option<u64>,
+    /// Optional override for [`ConversionOptions::max_input_size`].
+    pub max_input_size: Option<Option<u64>>,
     /// Optional override for [`ConversionOptions::capture_svg`].
     pub capture_svg: Option<bool>,
     /// Optional override for [`ConversionOptions::infer_dimensions`].
@@ -626,6 +649,7 @@ impl ConversionOptions {
         apply!(include_document_structure);
         apply!(extract_images);
         apply!(max_image_size);
+        apply!(max_input_size);
         apply!(capture_svg);
         apply!(infer_dimensions);
         apply!(max_depth);

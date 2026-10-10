@@ -2,6 +2,15 @@
 
 use std::borrow::Cow;
 
+/// ~keep Whether Djot would parse this literal text as block syntax unless its stars are escaped.
+#[must_use]
+pub fn is_djot_rule_like(text: &str) -> bool {
+    text.contains('*')
+        && text
+            .chars()
+            .all(|character| matches!(character, '-' | '*') || character.is_whitespace())
+}
+
 /// Returns true when the byte is one of the misc-escape characters:
 /// `\` `&` `<` `` ` `` `[` `]` `>` `~` `#` `=` `+` `|` `-`.
 #[inline]

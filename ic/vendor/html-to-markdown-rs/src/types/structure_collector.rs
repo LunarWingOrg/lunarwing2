@@ -15,8 +15,57 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::document::{DocumentNode, DocumentStructure, NodeContent};
+use super::document::{DocumentNode, DocumentStructure, NodeContent, TextAnnotation};
 use super::tables::{TableData, TableGrid};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextCaptureKind {
+    Heading,
+    Paragraph,
+    ListItem,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextCaptureId(u64);
+
+struct OpenAnnotation {
+    token: u64,
+    start: usize,
+    kind: super::document::AnnotationKind,
+}
+
+struct TextCapture {
+    id: TextCaptureId,
+    kind: TextCaptureKind,
+    text: String,
+    annotations: Vec<TextAnnotation>,
+    open_annotations: Vec<OpenAnnotation>,
+    suspended: bool,
+}
+
+struct CaptureSnapshot {
+    id: TextCaptureId,
+    text_len: usize,
+    annotations_len: usize,
+    open_annotations_len: usize,
+    suspended: bool,
+}
+
+enum ElementCaptureResult {
+    Keep,
+    Replace(Option<String>),
+}
+
+struct ElementCapture {
+    snapshots: Vec<CaptureSnapshot>,
+    annotation_token: Option<u64>,
+    result: ElementCaptureResult,
+    nodes_len: usize,
+    section_stack: Vec<(u8, u32)>,
+    container_stack: Vec<u32>,
+    list_stack: Vec<u32>,
+    tables_len: usize,
+}
 
 /// Shared mutable handle used in [`crate::converter::Context`].
 pub type StructureCollectorHandle = Rc<RefCell<StructureCollector>>;
@@ -36,6 +85,10 @@ pub struct StructureCollector {
     ///
     /// Populated by [`push_table_data`] when document structure extraction is enabled.
     tables: Vec<TableData>,
+    text_captures: Vec<TextCapture>,
+    element_captures: Vec<ElementCapture>,
+    next_capture_id: u64,
+    next_annotation_token: u64,
 }
 
 impl StructureCollector {
@@ -61,6 +114,114 @@ impl StructureCollector {
             container_stack: Vec::new(),
             list_stack: Vec::new(),
             tables: Vec::new(),
+            text_captures: Vec::new(),
+            element_captures: Vec::new(),
+            next_capture_id: 0,
+            next_annotation_token: 0,
+        }
+    }
+
+    pub(crate) fn begin_text_capture(&mut self, kind: TextCaptureKind) -> TextCaptureId {
+        let id = TextCaptureId(self.next_capture_id);
+        self.next_capture_id = self.next_capture_id.wrapping_add(1);
+        self.text_captures.push(TextCapture {
+            id,
+            kind,
+            text: String::new(),
+            annotations: Vec::new(),
+            open_annotations: Vec::new(),
+            suspended: false,
+        });
+        id
+    }
+
+    pub(crate) fn finish_text_capture(&mut self, id: TextCaptureId) -> (String, Vec<TextAnnotation>) {
+        let Some(position) = self.text_captures.iter().position(|capture| capture.id == id) else {
+            return (String::new(), Vec::new());
+        };
+        let capture = self.text_captures.remove(position);
+        Self::trim_capture(capture.text, capture.annotations)
+    }
+
+    pub(crate) fn append_text(&mut self, text: &str) {
+        for capture in self.text_captures.iter_mut().filter(|capture| !capture.suspended) {
+            capture.text.push_str(text);
+        }
+    }
+
+    pub(crate) fn has_active_text_capture(&self) -> bool {
+        self.text_captures.iter().any(|capture| !capture.suspended)
+    }
+
+    pub(crate) fn begin_element(&mut self, kind: Option<super::document::AnnotationKind>) {
+        let snapshots = self
+            .text_captures
+            .iter()
+            .map(|capture| CaptureSnapshot {
+                id: capture.id,
+                text_len: capture.text.len(),
+                annotations_len: capture.annotations.len(),
+                open_annotations_len: capture.open_annotations.len(),
+                suspended: capture.suspended,
+            })
+            .collect();
+        let annotation_token = kind.map(|kind| self.begin_annotation(kind));
+        self.element_captures.push(ElementCapture {
+            snapshots,
+            annotation_token,
+            result: ElementCaptureResult::Keep,
+            nodes_len: self.nodes.len(),
+            section_stack: self.section_stack.clone(),
+            container_stack: self.container_stack.clone(),
+            list_stack: self.list_stack.clone(),
+            tables_len: self.tables.len(),
+        });
+    }
+
+    pub(crate) fn replace_current_element(&mut self, replacement: Option<&str>) {
+        if let Some(element) = self.element_captures.last_mut() {
+            element.result = ElementCaptureResult::Replace(replacement.map(str::to_string));
+        }
+    }
+
+    pub(crate) fn finish_element(&mut self) {
+        let Some(element) = self.element_captures.pop() else {
+            return;
+        };
+        match &element.result {
+            ElementCaptureResult::Keep => {
+                if let Some(token) = element.annotation_token {
+                    self.finish_annotation(token);
+                }
+            }
+            ElementCaptureResult::Replace(replacement) => {
+                self.restore_captures(&element.snapshots);
+                self.restore_structure(&element);
+                if let Some(replacement) = replacement.as_deref() {
+                    self.append_text(replacement);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn suspend_list_item_captures(&mut self) -> Vec<TextCaptureId> {
+        let mut suspended = Vec::new();
+        for capture in self
+            .text_captures
+            .iter_mut()
+            .filter(|capture| capture.kind == TextCaptureKind::ListItem && !capture.suspended)
+        {
+            capture.suspended = true;
+            suspended.push(capture.id);
+        }
+        suspended
+    }
+
+    pub(crate) fn resume_text_captures(&mut self, ids: &[TextCaptureId]) {
+        for capture in &mut self.text_captures {
+            if ids.contains(&capture.id) {
+                capture.suspended = false;
+            }
         }
     }
 
@@ -71,6 +232,16 @@ impl StructureCollector {
     ///
     /// Returns the index of the **heading** node (the group node is one before it).
     pub fn push_heading(&mut self, level: u8, text: &str, id: Option<&str>) -> u32 {
+        self.push_heading_with_annotations(level, text, id, Vec::new())
+    }
+
+    pub(crate) fn push_heading_with_annotations(
+        &mut self,
+        level: u8,
+        text: &str,
+        id: Option<&str>,
+        annotations: Vec<TextAnnotation>,
+    ) -> u32 {
         while let Some(&(open_level, _)) = self.section_stack.last() {
             if open_level >= level {
                 self.section_stack.pop();
@@ -108,7 +279,7 @@ impl StructureCollector {
             },
             parent: Some(group_idx),
             children: Vec::new(),
-            annotations: Vec::new(),
+            annotations,
             attributes: id.map(|v| {
                 let mut m = std::collections::HashMap::new();
                 m.insert("id".to_string(), v.to_string());
@@ -123,6 +294,10 @@ impl StructureCollector {
     ///
     /// Returns the node index.
     pub fn push_paragraph(&mut self, text: &str) -> u32 {
+        self.push_paragraph_with_annotations(text, Vec::new())
+    }
+
+    pub(crate) fn push_paragraph_with_annotations(&mut self, text: &str, annotations: Vec<TextAnnotation>) -> u32 {
         if text.is_empty() {
             return u32::MAX;
         }
@@ -133,7 +308,7 @@ impl StructureCollector {
             content: NodeContent::Paragraph { text: text.to_string() },
             parent,
             children: Vec::new(),
-            annotations: Vec::new(),
+            annotations,
             attributes: None,
         });
         if let Some(p) = parent {
@@ -174,6 +349,10 @@ impl StructureCollector {
     /// If there is no open list, the item is parented under the current section/container.
     /// Returns the node index.
     pub fn push_list_item(&mut self, text: &str) -> u32 {
+        self.push_list_item_with_annotations(text, Vec::new())
+    }
+
+    pub(crate) fn push_list_item_with_annotations(&mut self, text: &str, annotations: Vec<TextAnnotation>) -> u32 {
         let parent = self
             .list_stack
             .last()
@@ -185,7 +364,7 @@ impl StructureCollector {
             content: NodeContent::ListItem { text: text.to_string() },
             parent,
             children: Vec::new(),
-            annotations: Vec::new(),
+            annotations,
             attributes: None,
         });
         if let Some(p) = parent {
@@ -353,6 +532,82 @@ impl StructureCollector {
             source_format: Some("html".to_string()),
         };
         (doc, self.tables)
+    }
+
+    fn begin_annotation(&mut self, kind: super::document::AnnotationKind) -> u64 {
+        let token = self.next_annotation_token;
+        self.next_annotation_token = self.next_annotation_token.wrapping_add(1);
+        for capture in self.text_captures.iter_mut().filter(|capture| !capture.suspended) {
+            capture.open_annotations.push(OpenAnnotation {
+                token,
+                start: capture.text.len(),
+                kind: kind.clone(),
+            });
+        }
+        token
+    }
+
+    fn finish_annotation(&mut self, token: u64) {
+        for capture in self.text_captures.iter_mut().filter(|capture| !capture.suspended) {
+            let Some(position) = capture
+                .open_annotations
+                .iter()
+                .rposition(|annotation| annotation.token == token)
+            else {
+                continue;
+            };
+            let annotation = capture.open_annotations.remove(position);
+            if annotation.start < capture.text.len() {
+                capture.annotations.push(TextAnnotation {
+                    start: annotation.start as u32,
+                    end: capture.text.len() as u32,
+                    kind: annotation.kind,
+                });
+            }
+        }
+    }
+
+    fn restore_captures(&mut self, snapshots: &[CaptureSnapshot]) {
+        let mut restored = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            let Some(position) = self.text_captures.iter().position(|capture| capture.id == snapshot.id) else {
+                continue;
+            };
+            let mut capture = self.text_captures.remove(position);
+            capture.text.truncate(snapshot.text_len);
+            capture.annotations.truncate(snapshot.annotations_len);
+            capture.open_annotations.truncate(snapshot.open_annotations_len);
+            capture.suspended = snapshot.suspended;
+            restored.push(capture);
+        }
+        self.text_captures = restored;
+    }
+
+    fn restore_structure(&mut self, element: &ElementCapture) {
+        self.nodes.truncate(element.nodes_len);
+        for node in &mut self.nodes {
+            node.children.retain(|child| (*child as usize) < element.nodes_len);
+        }
+        self.section_stack.clone_from(&element.section_stack);
+        self.container_stack.clone_from(&element.container_stack);
+        self.list_stack.clone_from(&element.list_stack);
+        self.tables.truncate(element.tables_len);
+    }
+
+    fn trim_capture(text: String, mut annotations: Vec<TextAnnotation>) -> (String, Vec<TextAnnotation>) {
+        let text_start = text.len() - text.trim_start().len();
+        let text_end = text.trim_end().len();
+        annotations.retain_mut(|annotation| {
+            let start = (annotation.start as usize).max(text_start);
+            let end = (annotation.end as usize).min(text_end);
+            if start >= end {
+                return false;
+            }
+            annotation.start = (start - text_start) as u32;
+            annotation.end = (end - text_start) as u32;
+            true
+        });
+        (text[text_start..text_end].to_string(), annotations)
     }
 
     /// The effective structural parent for a new node:

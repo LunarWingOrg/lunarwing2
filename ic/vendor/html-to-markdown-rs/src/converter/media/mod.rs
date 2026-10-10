@@ -11,12 +11,18 @@ pub mod graphic;
 pub mod image;
 pub mod svg;
 
-pub use super::{Context, DomContext};
-
 #[cfg(feature = "inline-images")]
 pub use image::handle_inline_data_image;
 
 use crate::options::InlineDataMedia;
+
+#[derive(Clone, Copy)]
+pub struct MediaContext<'a> {
+    pub options: &'a crate::options::ConversionOptions,
+    pub ctx: &'a super::Context,
+    pub depth: usize,
+    pub dom_ctx: &'a super::DomContext,
+}
 
 /// Whether `address` is a `data:` URL, which carries its content inline. The scheme matches in
 /// any case, after leading whitespace, as a URL parser reads it.
@@ -84,10 +90,7 @@ pub fn dispatch_media_handler(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    context: MediaContext<'_>,
 ) -> bool {
     let Some(node) = node_handle.get(parser) else {
         return false;
@@ -99,27 +102,27 @@ pub fn dispatch_media_handler(
 
     match tag_name {
         "iframe" => {
-            embedded::handle_iframe(node_handle, tag, output, options, ctx, depth, dom_ctx, parser);
+            embedded::handle_iframe(node_handle, tag, parser, output, context);
             true
         }
         "video" => {
-            embedded::handle_video(node_handle, tag, parser, output, options, ctx, depth, dom_ctx);
+            embedded::handle_video(node_handle, tag, parser, output, context);
             true
         }
         "audio" => {
-            embedded::handle_audio(node_handle, tag, parser, output, options, ctx, depth, dom_ctx);
+            embedded::handle_audio(node_handle, tag, parser, output, context);
             true
         }
         "picture" => {
-            embedded::handle_picture(node_handle, tag, parser, output, options, ctx, depth, dom_ctx);
+            embedded::handle_picture(node_handle, tag, parser, output, context);
             true
         }
         "svg" => {
-            svg::handle_svg(node_handle, tag, parser, output, options, ctx, depth, dom_ctx);
+            svg::handle_svg(node_handle, tag, parser, output, context);
             true
         }
         "math" => {
-            svg::handle_math(node_handle, tag, parser, output, options, ctx, depth, dom_ctx);
+            svg::handle_math(node_handle, tag, parser, output, context);
             true
         }
         _ => false,

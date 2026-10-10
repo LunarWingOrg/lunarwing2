@@ -6,7 +6,7 @@ use rmcp::ErrorData as McpError;
 /// Map `ConversionError` variants to MCP `ErrorData` with appropriate codes.
 ///
 /// - `ParseError` → parse_error (-32700)
-/// - `ConfigError` / `SanitizationError` / `InvalidInput` → invalid_params (-32602)
+/// - `ConfigError` / `SanitizationError` / `InvalidInput` / `InputTooLarge` → invalid_params (-32602)
 /// - `IoError` / `Panic` / `Other` → internal_error (-32603)
 /// - `Visitor` (feature-gated) → internal_error (-32603)
 pub fn map_conversion_error_to_mcp(error: ConversionError) -> McpError {
@@ -15,6 +15,13 @@ pub fn map_conversion_error_to_mcp(error: ConversionError) -> McpError {
         ConversionError::SanitizationError(msg) => McpError::invalid_params(format!("Sanitization error: {msg}"), None),
         ConversionError::ConfigError(msg) => McpError::invalid_params(format!("Configuration error: {msg}"), None),
         ConversionError::InvalidInput(msg) => McpError::invalid_params(format!("Invalid input: {msg}"), None),
+        ConversionError::InputTooLarge {
+            observed_size,
+            max_size,
+        } => McpError::invalid_params(
+            format!("Input size {observed_size} bytes exceeds the configured maximum of {max_size} bytes"),
+            None,
+        ),
         ConversionError::IoError(msg) => McpError::internal_error(format!("I/O error: {msg}"), None),
         ConversionError::Panic(msg) => McpError::internal_error(format!("Internal panic: {msg}"), None),
         #[cfg(feature = "visitor")]
@@ -64,6 +71,20 @@ mod tests {
         let err = ConversionError::InvalidInput("binary data".into());
         let mcp = map_conversion_error_to_mcp(err);
         assert_eq!(mcp.code.0, -32602);
+    }
+
+    #[test]
+    fn test_input_too_large_maps_to_invalid_params() {
+        let err = ConversionError::InputTooLarge {
+            observed_size: 9,
+            max_size: 8,
+        };
+        let mcp = map_conversion_error_to_mcp(err);
+        assert_eq!(mcp.code.0, -32602);
+        assert_eq!(
+            mcp.message,
+            "Input size 9 bytes exceeds the configured maximum of 8 bytes"
+        );
     }
 
     #[test]

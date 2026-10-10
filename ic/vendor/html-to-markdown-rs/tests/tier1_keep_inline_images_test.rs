@@ -22,7 +22,7 @@
 //!   `![alt](src)` regardless of `keep_inline_images_in` (Tier-2 only gates on
 //!   `ctx.in_heading` / `ctx.link_allow_inline_images`).
 
-#[cfg(feature = "inline-images")]
+#[cfg(any(feature = "inline-images", feature = "testkit"))]
 use html_to_markdown_rs::{ConversionOptions, convert};
 
 /// Convert using `Auto` tier selection (exercising Tier-1 for simple inputs).
@@ -236,7 +236,7 @@ mod tier_parity {
     }
 }
 
-#[cfg(feature = "inline-images")]
+#[cfg(feature = "testkit")]
 #[test]
 fn an_image_in_a_heading_is_alt_text_in_both_tiers_when_the_option_is_unset() {
     // ~keep Tier-1 short-circuited to "keep the image" whenever `keep_inline_images_in` was

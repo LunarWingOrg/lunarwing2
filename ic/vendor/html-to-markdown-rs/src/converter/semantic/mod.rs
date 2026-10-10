@@ -31,12 +31,29 @@ pub mod summary;
 
 pub use super::walk_node;
 pub use super::{Context, DomContext};
+pub use crate::converter::block::container::HandlerContext;
 
 pub use attributes::handle as handle_attributes;
 pub use definition_list::handle as handle_definition_list;
 pub use figure::handle as handle_figure;
 pub use sectioning::handle as handle_sectioning;
 pub use summary::handle as handle_summary;
+
+pub fn walk_tag_children(tag: &tl::HTMLTag<'_>, parser: &tl::Parser, output: &mut String, handler: HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        walk_node(
+            child_handle,
+            parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.ctx,
+                handler.depth + 1,
+                handler.dom_ctx,
+            ),
+        );
+    }
+}
 
 /// Dispatches semantic element handling to the appropriate handler.
 ///
@@ -72,31 +89,28 @@ pub fn dispatch_semantic_handler(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: HandlerContext<'_>,
 ) -> bool {
     match tag_name {
         "article" | "section" | "nav" | "aside" | "header" | "footer" | "main" => {
-            handle_sectioning(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            handle_sectioning(tag_name, node_handle, parser, output, handler);
             true
         }
         "figure" | "figcaption" => {
-            handle_figure(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            handle_figure(tag_name, node_handle, parser, output, handler);
             true
         }
         // ~keep Summary and interactive elements
         "details" | "summary" => {
-            handle_summary(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            handle_summary(tag_name, node_handle, parser, output, handler);
             true
         }
         "hgroup" | "dl" | "dt" | "dd" | "menu" => {
-            handle_definition_list(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            handle_definition_list(tag_name, node_handle, parser, output, handler);
             true
         }
         "cite" | "q" | "abbr" | "dfn" | "time" | "data" => {
-            handle_attributes(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            handle_attributes(tag_name, node_handle, parser, output, handler);
             true
         }
         _ => false,

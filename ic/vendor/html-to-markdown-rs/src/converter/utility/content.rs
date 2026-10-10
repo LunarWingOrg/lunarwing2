@@ -156,38 +156,40 @@ pub fn collect_link_label_text(
     let mut stack: Vec<_> = children.iter().rev().copied().collect();
 
     while let Some(handle) = stack.pop() {
-        if let Some(node) = handle.get(parser) {
-            match node {
-                tl::Node::Raw(bytes) => {
-                    let raw = bytes.as_utf8_str();
-                    let decoded = text::decode_html_entities_cow(raw.as_ref());
-                    text.push_str(decoded.as_ref());
-                }
-                tl::Node::Tag(tag) => {
-                    let is_block = node_is_block_level(&handle, parser, dom_ctx);
-                    if is_block {
-                        saw_block = true;
-                        block_nodes.push(handle);
-                        continue;
-                    }
-
-                    if let Some(children) = dom_ctx.children_of(handle.get_inner()) {
-                        for child in children.iter().rev() {
-                            stack.push(*child);
-                        }
-                    } else {
-                        let tag_children = tag.children();
-                        let mut child_nodes: Vec<_> = tag_children.top().iter().copied().collect();
-                        child_nodes.reverse();
-                        stack.extend(child_nodes);
-                    }
-                }
-                _ => {}
+        let Some(node) = handle.get(parser) else {
+            continue;
+        };
+        match node {
+            tl::Node::Raw(bytes) => {
+                let raw = bytes.as_utf8_str();
+                let decoded = text::decode_html_entities_cow(raw.as_ref());
+                text.push_str(decoded.as_ref());
             }
+            tl::Node::Tag(tag) if node_is_block_level(&handle, parser, dom_ctx) => {
+                saw_block = true;
+                block_nodes.push(handle);
+            }
+            tl::Node::Tag(tag) => push_label_children(&mut stack, handle, tag, dom_ctx),
+            _ => {}
         }
     }
 
     (text, block_nodes, saw_block)
+}
+
+fn push_label_children(
+    stack: &mut Vec<tl::NodeHandle>,
+    handle: tl::NodeHandle,
+    tag: &tl::HTMLTag<'_>,
+    dom_ctx: &DomContext,
+) {
+    if let Some(children) = dom_ctx.children_of(handle.get_inner()) {
+        stack.extend(children.iter().rev().copied());
+        return;
+    }
+    let mut children: Vec<_> = tag.children().top().iter().copied().collect();
+    children.reverse();
+    stack.extend(children);
 }
 
 /// The two hard-line-break markers `block/line_break.rs` can emit for a real `<br>`:
@@ -233,7 +235,18 @@ pub fn normalize_link_label(label: &str) -> String {
     collapse_whitespace_into(&mut segment, rest);
     segments.push(segment);
 
-    assemble_label(segments, markers)
+    let label = assemble_label(segments, markers);
+    protect_adjacent_hard_breaks(&label).into_owned()
+}
+
+/// ~keep Keep consecutive hard breaks inside a link label from creating a blank line, which
+/// would end the paragraph before the link's closing delimiter is parsed.
+pub fn protect_adjacent_hard_breaks(label: &str) -> Cow<'_, str> {
+    if !label.contains("  \n  \n") && !label.contains("\\\n  \n") {
+        return Cow::Borrowed(label);
+    }
+    let protected = label.replace("  \n  \n", "  \n\\\n");
+    Cow::Owned(protected.replace("\\\n  \n", "\\\n\\\n"))
 }
 
 /// Re-join a label's whitespace-collapsed segments and the hard-break markers between them,

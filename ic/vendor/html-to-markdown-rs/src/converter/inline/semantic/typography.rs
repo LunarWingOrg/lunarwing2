@@ -7,30 +7,24 @@
 //! - Abbreviation (abbr) with optional title
 //! - Span element with special OCR handling
 
-use crate::converter::inline::wrapped::{EMPHASIS_SIBLING_TAGS, InlineDelimiters, InlineSite, emit_wrapped_inline};
+use crate::converter::inline::{
+    HandlerContext,
+    wrapped::{EMPHASIS_SIBLING_TAGS, InlineDelimiters, emit_wrapped_inline},
+};
 use crate::options::{ConversionOptions, OutputFormat};
 #[cfg(feature = "visitor")]
 use std::borrow::Cow;
-use tl::{NodeHandle, Parser};
-
 type Context = crate::converter::Context;
-type DomContext = crate::converter::DomContext;
 
 /// Handle small element.
 ///
 /// Small text has no direct Markdown equivalent, so just pass through content.
-pub fn handle_small(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_small(handler: HandlerContext<'_>) {
     use crate::converter::walk_node;
 
-    let Some(node) = node_handle.get(parser) else { return };
+    let Some(node) = handler.node_handle.get(handler.parser) else {
+        return;
+    };
 
     let tag = match node {
         tl::Node::Tag(tag) => tag,
@@ -39,7 +33,17 @@ pub fn handle_small(
 
     let children = tag.children();
     for child_handle in children.top().iter() {
-        walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+        walk_node(
+            child_handle,
+            handler.parser,
+            handler.output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
     }
 }
 
@@ -61,205 +65,54 @@ fn resolve_script_delimiters(options: &ConversionOptions, symbol: &str, djot_mar
 /// Handle subscript element (sub tag).
 ///
 /// Wraps content with configurable subscript symbol from options.
-pub fn handle_subscript(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    // ~keep reason: serialize_node is only used when the visitor feature is active;
-    // ~keep other imports depend on feature-gated code paths.
-    #[allow(unused_imports)]
-    use crate::converter::{append_inline_suffix, chomp_inline, get_text_content, serialize_node, walk_node};
-
-    let Some(node) = node_handle.get(parser) else { return };
-
-    let tag = match node {
-        tl::Node::Tag(tag) => tag,
-        _ => return,
-    };
-
-    let mut content = String::with_capacity(32);
-    let children = tag.children();
-    let (open, close) = resolve_script_delimiters(options, &options.sub_symbol, '~');
-    let marker_ctx = ctx.inline_buffer(output, !open.is_empty());
-    for child_handle in children.top().iter() {
-        walk_node(
-            child_handle,
-            parser,
-            &mut content,
-            options,
-            &marker_ctx,
-            depth + 1,
-            dom_ctx,
-        );
-    }
-
-    if ctx.in_code {
-        output.push_str(&content);
-        return;
-    }
-
-    #[cfg(feature = "visitor")]
-    let sub_output = if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-        let text_content = get_text_content(node_handle, parser, dom_ctx);
-
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-        let node_ctx = NodeContext::with_lazy_attributes(
-            NodeType::Subscript,
-            tag.name().as_utf8_str(),
-            tag,
-            depth,
-            index_in_parent,
-            parent_tag.map(Cow::Borrowed),
-            true,
-        );
-
-        let visit_result = {
-            let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-            visitor.visit_subscript(&node_ctx, &text_content)
-        };
-        match visit_result {
-            VisitResult::Continue => None,
-            VisitResult::Custom(custom) => Some(custom),
-            VisitResult::Skip => Some(String::new()),
-            VisitResult::PreserveHtml => Some(serialize_node(node_handle, parser)),
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    #[cfg(feature = "visitor")]
-    if let Some(custom_output) = sub_output {
-        output.push_str(&custom_output);
-        return;
-    }
-
-    emit_wrapped_inline(
-        output,
-        &content,
-        &InlineDelimiters {
-            open: &open,
-            close: &close,
-            merge_symbol: None,
-            sibling_tag_names: &[],
-        },
-        InlineSite {
-            node_handle,
-            parser,
-            dom_ctx,
-            ctx,
-        },
-    );
+pub fn handle_subscript(handler: HandlerContext<'_>) {
+    handle_script(handler, ScriptKind::Subscript);
 }
 
 /// Handle superscript element (sup tag).
 ///
 /// Wraps content with configurable superscript symbol from options.
-pub fn handle_superscript(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    // ~keep reason: serialize_node is only used when the visitor feature is active;
-    // ~keep other imports depend on feature-gated code paths.
-    #[allow(unused_imports)]
-    use crate::converter::{append_inline_suffix, chomp_inline, get_text_content, serialize_node, walk_node};
+pub fn handle_superscript(handler: HandlerContext<'_>) {
+    handle_script(handler, ScriptKind::Superscript);
+}
 
-    let Some(node) = node_handle.get(parser) else { return };
+#[derive(Clone, Copy)]
+enum ScriptKind {
+    Subscript,
+    Superscript,
+}
 
-    let tag = match node {
-        tl::Node::Tag(tag) => tag,
-        _ => return,
+fn handle_script(handler: HandlerContext<'_>, kind: ScriptKind) {
+    let Some(tl::Node::Tag(tag)) = handler.node_handle.get(handler.parser) else {
+        return;
     };
-
+    let symbol = match kind {
+        ScriptKind::Subscript => &handler.options.sub_symbol,
+        ScriptKind::Superscript => &handler.options.sup_symbol,
+    };
+    let djot_marker = match kind {
+        ScriptKind::Subscript => '~',
+        ScriptKind::Superscript => '^',
+    };
+    let (open, close) = resolve_script_delimiters(handler.options, symbol, djot_marker);
+    let marker_context = handler.context.inline_buffer(handler.output, !open.is_empty());
     let mut content = String::with_capacity(32);
-    let children = tag.children();
-    let (open, close) = resolve_script_delimiters(options, &options.sup_symbol, '^');
-    let marker_ctx = ctx.inline_buffer(output, !open.is_empty());
-    for child_handle in children.top().iter() {
-        walk_node(
-            child_handle,
-            parser,
-            &mut content,
-            options,
-            &marker_ctx,
-            depth + 1,
-            dom_ctx,
-        );
-    }
+    collect_children(tag, &mut content, &marker_context, &handler);
 
-    if ctx.in_code {
-        output.push_str(&content);
+    if handler.context.in_code {
+        handler.output.push_str(&content);
         return;
     }
 
     #[cfg(feature = "visitor")]
-    let sup_output = if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-        let text_content = get_text_content(node_handle, parser, dom_ctx);
-
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-        let node_ctx = NodeContext::with_lazy_attributes(
-            NodeType::Superscript,
-            tag.name().as_utf8_str(),
-            tag,
-            depth,
-            index_in_parent,
-            parent_tag.map(Cow::Borrowed),
-            true,
-        );
-
-        let visit_result = {
-            let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-            visitor.visit_superscript(&node_ctx, &text_content)
-        };
-        match visit_result {
-            VisitResult::Continue => None,
-            VisitResult::Custom(custom) => Some(custom),
-            VisitResult::Skip => Some(String::new()),
-            VisitResult::PreserveHtml => Some(serialize_node(node_handle, parser)),
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    #[cfg(feature = "visitor")]
-    if let Some(custom_output) = sup_output {
-        output.push_str(&custom_output);
+    if let Some(custom_output) = visit_script(tag, kind, &handler) {
+        handler.output.push_str(&custom_output);
         return;
     }
 
+    let site = handler.inline_site();
     emit_wrapped_inline(
-        output,
+        handler.output,
         &content,
         &InlineDelimiters {
             open: &open,
@@ -267,160 +120,122 @@ pub fn handle_superscript(
             merge_symbol: None,
             sibling_tag_names: &[],
         },
-        InlineSite {
-            node_handle,
-            parser,
-            dom_ctx,
-            ctx,
-        },
+        site,
     );
+}
+
+#[cfg(feature = "visitor")]
+fn visit_script(tag: &tl::HTMLTag<'_>, kind: ScriptKind, handler: &HandlerContext<'_>) -> Option<String> {
+    use crate::converter::{get_text_content, serialize_node};
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let visitor_handle = handler.context.visitor.as_ref()?;
+    let text_content = get_text_content(handler.node_handle, handler.parser, handler.dom_context);
+    let node_id = handler.node_handle.get_inner();
+    let node_context = NodeContext::with_lazy_attributes(
+        match kind {
+            ScriptKind::Subscript => NodeType::Subscript,
+            ScriptKind::Superscript => NodeType::Superscript,
+        },
+        tag.name().as_utf8_str(),
+        tag,
+        handler.depth,
+        handler.dom_context.get_sibling_index(node_id).unwrap_or(0),
+        handler
+            .dom_context
+            .parent_tag_name(node_id, handler.parser)
+            .map(Cow::Borrowed),
+        true,
+    );
+    let result = {
+        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
+        match kind {
+            ScriptKind::Subscript => visitor.visit_subscript(&node_context, &text_content),
+            ScriptKind::Superscript => visitor.visit_superscript(&node_context, &text_content),
+        }
+    };
+    match result {
+        VisitResult::Continue => None,
+        VisitResult::Custom(custom) => {
+            crate::converter::structure_capture::replace_element(handler.context, Some(&custom));
+            Some(custom)
+        }
+        VisitResult::Skip => {
+            crate::converter::structure_capture::replace_element(handler.context, None);
+            Some(String::new())
+        }
+        VisitResult::PreserveHtml => {
+            let html = serialize_node(handler.node_handle, handler.parser);
+            crate::converter::structure_capture::replace_element(handler.context, Some(&html));
+            Some(html)
+        }
+        VisitResult::Error(error) => {
+            crate::converter::structure_capture::replace_element(handler.context, None);
+            if handler.context.visitor_error.borrow().is_none() {
+                *handler.context.visitor_error.borrow_mut() = Some(error);
+            }
+            None
+        }
+    }
 }
 
 /// Handle variable element (var tag).
 ///
 /// Wraps content with italic symbol (`strong_em_symbol` from options).
-pub fn handle_variable(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    use crate::converter::walk_node;
-
-    let Some(node) = node_handle.get(parser) else { return };
-
-    let tag = match node {
-        tl::Node::Tag(tag) => tag,
-        _ => return,
-    };
-
-    if ctx.in_code {
-        // ~keep Every other marker-emitting inline handler suppresses itself inside a code
-        // ~keep span or a fenced block; `<var>`/`<dfn>` did not, so they emitted literal `*`
-        // ~keep INTO code content, where it is text rather than emphasis.
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-        }
-        return;
-    }
-
-    let mut content = String::with_capacity(32);
-    let children = tag.children();
-    let marker_ctx = ctx.inline_buffer(output, true);
-    for child_handle in children.top().iter() {
-        walk_node(
-            child_handle,
-            parser,
-            &mut content,
-            options,
-            &marker_ctx,
-            depth + 1,
-            dom_ctx,
-        );
-    }
-
-    let marker = options.strong_em_symbol.to_string();
-    emit_wrapped_inline(
-        output,
-        &content,
-        &InlineDelimiters {
-            open: &marker,
-            close: &marker,
-            merge_symbol: Some(options.strong_em_symbol),
-            sibling_tag_names: &EMPHASIS_SIBLING_TAGS,
-        },
-        InlineSite {
-            node_handle,
-            parser,
-            dom_ctx,
-            ctx,
-        },
-    );
+pub fn handle_variable(handler: HandlerContext<'_>) {
+    handle_italic_semantic(handler);
 }
 
 /// Handle definition element (dfn tag).
 ///
 /// Wraps content with italic symbol (`strong_em_symbol` from options).
-pub fn handle_definition(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    use crate::converter::walk_node;
+pub fn handle_definition(handler: HandlerContext<'_>) {
+    handle_italic_semantic(handler);
+}
 
-    let Some(node) = node_handle.get(parser) else { return };
-
-    let tag = match node {
-        tl::Node::Tag(tag) => tag,
-        _ => return,
+fn handle_italic_semantic(mut handler: HandlerContext<'_>) {
+    let Some(tl::Node::Tag(tag)) = handler.node_handle.get(handler.parser) else {
+        return;
     };
 
-    if ctx.in_code {
-        // ~keep Every other marker-emitting inline handler suppresses itself inside a code
-        // ~keep span or a fenced block; `<var>`/`<dfn>` did not, so they emitted literal `*`
-        // ~keep INTO code content, where it is text rather than emphasis.
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-        }
+    if handler.context.in_code {
+        walk_children_to_output(tag, &mut handler);
         return;
     }
 
+    let marker_context = handler.context.inline_buffer(handler.output, true);
     let mut content = String::with_capacity(32);
-    let children = tag.children();
-    let marker_ctx = ctx.inline_buffer(output, true);
-    for child_handle in children.top().iter() {
-        walk_node(
-            child_handle,
-            parser,
-            &mut content,
-            options,
-            &marker_ctx,
-            depth + 1,
-            dom_ctx,
-        );
-    }
-
-    let marker = options.strong_em_symbol.to_string();
+    collect_children(tag, &mut content, &marker_context, &handler);
+    let marker = handler.options.strong_em_symbol.to_string();
+    let site = handler.inline_site();
     emit_wrapped_inline(
-        output,
+        handler.output,
         &content,
         &InlineDelimiters {
             open: &marker,
             close: &marker,
-            merge_symbol: Some(options.strong_em_symbol),
+            merge_symbol: Some(handler.options.strong_em_symbol),
             sibling_tag_names: &EMPHASIS_SIBLING_TAGS,
         },
-        InlineSite {
-            node_handle,
-            parser,
-            dom_ctx,
-            ctx,
-        },
+        site,
     );
 }
 
 /// Handle abbreviation element (abbr tag).
 ///
 /// Passes through content and optionally appends title attribute in parentheses.
-pub fn handle_abbreviation(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_abbreviation(handler: HandlerContext<'_>) {
     use crate::converter::{append_inline_suffix, chomp_inline, walk_node};
+
+    let HandlerContext {
+        node_handle,
+        parser,
+        output,
+        options,
+        context: ctx,
+        depth,
+        dom_context: dom_ctx,
+    } = handler;
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -437,10 +252,7 @@ pub fn handle_abbreviation(
             child_handle,
             parser,
             &mut content,
-            options,
-            &abbr_ctx,
-            depth + 1,
-            dom_ctx,
+            crate::converter::block::container::HandlerContext::new(options, &abbr_ctx, depth + 1, dom_ctx),
         );
     }
 
@@ -474,16 +286,18 @@ pub fn handle_abbreviation(
 /// Processes span elements with special handling for:
 /// - OCR words (elements with class "`ocrx_word")`: adds space before if needed
 /// - Otherwise passes through content normally
-pub fn handle_span(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_span(handler: HandlerContext<'_>) {
     use crate::converter::walk_node;
+
+    let HandlerContext {
+        node_handle,
+        parser,
+        output,
+        options,
+        context: ctx,
+        depth,
+        dom_context: dom_ctx,
+    } = handler;
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -508,8 +322,45 @@ pub fn handle_span(
     let children = tag.children();
     {
         for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+            walk_node(
+                child_handle,
+                parser,
+                output,
+                crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
+            );
         }
+    }
+}
+
+fn walk_children_to_output(tag: &tl::HTMLTag<'_>, handler: &mut HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        crate::converter::walk_node(
+            child_handle,
+            handler.parser,
+            handler.output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
+    }
+}
+
+fn collect_children(tag: &tl::HTMLTag<'_>, output: &mut String, context: &Context, handler: &HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        crate::converter::walk_node(
+            child_handle,
+            handler.parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
     }
 }
 

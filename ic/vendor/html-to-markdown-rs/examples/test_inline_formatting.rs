@@ -10,66 +10,49 @@ fn convert(
 
 use html_to_markdown_rs::ConversionOptions;
 
-fn main() {
-    let html = "<p>This is <mark>highlighted</mark> text</p>";
-    match convert(html, None) {
+fn print_result(label: &str, html: &str, expected: &str, result: html_to_markdown_rs::error::Result<String>) {
+    match result {
         Ok(markdown) => {
-            println!("Test - Mark (default):");
+            println!("Test - {label}:");
             println!("HTML: {html}");
             println!("Markdown: {markdown}");
-            println!("Expected: This is ==highlighted== text");
+            println!("Expected: {expected}");
             println!();
         }
-        Err(e) => eprintln!("Error: {e}"),
+        Err(error) => eprintln!("Error: {error}"),
     }
+}
+
+fn main() {
+    let html = "<p>This is <mark>highlighted</mark> text</p>";
+    print_result(
+        "Mark (default)",
+        html,
+        "This is ==highlighted== text",
+        convert(html, None),
+    );
 
     let html2 = "<p>This is <del>deleted</del> and <s>strikethrough</s> text</p>";
-    match convert(html2, None) {
-        Ok(markdown) => {
-            println!("Test - Del/Strike:");
-            println!("HTML: {html2}");
-            println!("Markdown: {markdown}");
-            println!("Expected: This is ~~deleted~~ and ~~strikethrough~~ text");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_result(
+        "Del/Strike",
+        html2,
+        "This is ~~deleted~~ and ~~strikethrough~~ text",
+        convert(html2, None),
+    );
 
     let html3 = "<p>This is <ins>inserted</ins> text</p>";
-    match convert(html3, None) {
-        Ok(markdown) => {
-            println!("Test - Ins:");
-            println!("HTML: {html3}");
-            println!("Markdown: {markdown}");
-            println!("Expected: This is ==inserted== text");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_result("Ins", html3, "This is ==inserted== text", convert(html3, None));
 
     let html4 = "<p>Press <kbd>Ctrl+C</kbd> and see <samp>output</samp></p>";
-    match convert(html4, None) {
-        Ok(markdown) => {
-            println!("Test - Kbd/Samp:");
-            println!("HTML: {html4}");
-            println!("Markdown: {markdown}");
-            println!("Expected: Press `Ctrl+C` and see `output`");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_result(
+        "Kbd/Samp",
+        html4,
+        "Press `Ctrl+C` and see `output`",
+        convert(html4, None),
+    );
 
     let html5 = "<p>The variable <var>x</var> is defined</p>";
-    match convert(html5, None) {
-        Ok(markdown) => {
-            println!("Test - Var:");
-            println!("HTML: {html5}");
-            println!("Markdown: {markdown}");
-            println!("Expected: The variable *x* is defined");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_result("Var", html5, "The variable *x* is defined", convert(html5, None));
 
     let opts = ConversionOptions {
         sub_symbol: "~".to_string(),
@@ -78,38 +61,21 @@ fn main() {
     };
 
     let html6 = "<p>H<sub>2</sub>O and x<sup>2</sup></p>";
-    match convert(html6, Some(opts)) {
-        Ok(markdown) => {
-            println!("Test - Sub/Sup:");
-            println!("HTML: {html6}");
-            println!("Markdown: {markdown}");
-            println!("Expected: H~2~O and x^2^");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_result("Sub/Sup", html6, "H~2~O and x^2^", convert(html6, Some(opts)));
 
     let html7 = r#"<p>The <abbr title="World Health Organization">WHO</abbr> announced</p>"#;
-    match convert(html7, None) {
-        Ok(markdown) => {
-            println!("Test - Abbr:");
-            println!("HTML: {html7}");
-            println!("Markdown: {markdown}");
-            println!("Expected: The WHO (World Health Organization) announced");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_result(
+        "Abbr",
+        html7,
+        "The WHO (World Health Organization) announced",
+        convert(html7, None),
+    );
 
     let html8 = "<p>This is <u>underlined</u> and <small>small</small> text</p>";
-    match convert(html8, None) {
-        Ok(markdown) => {
-            println!("Test - U/Small:");
-            println!("HTML: {html8}");
-            println!("Markdown: {markdown}");
-            println!("Expected: This is underlined and small text");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_result(
+        "U/Small",
+        html8,
+        "This is underlined and small text",
+        convert(html8, None),
+    );
 }

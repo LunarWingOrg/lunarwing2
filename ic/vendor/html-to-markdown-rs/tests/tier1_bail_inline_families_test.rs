@@ -10,8 +10,8 @@
 //! Auto-strategy classifier, so a bail is a hard `Err` here rather than a silent fall-through
 //! to Tier-2 that would trivially match itself.
 
-#![cfg(feature = "testkit")]
 #![allow(missing_docs)]
+#![cfg(feature = "testkit")]
 
 use html_to_markdown_rs::prescan;
 use html_to_markdown_rs::tier1::{self, BailReason};

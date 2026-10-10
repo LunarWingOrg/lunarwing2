@@ -107,6 +107,8 @@ pub struct ConvertConfig {
     pub extract_images: Option<bool>,
     /// Maximum decoded image size in bytes. Default `5242880` (5 MB).
     pub max_image_size: Option<u64>,
+    /// Maximum accepted HTML input size in bytes. Omission uses the platform default.
+    pub max_input_size: Option<u64>,
     /// Capture inline `<svg>` elements as images. Default `false`.
     pub capture_svg: Option<bool>,
     /// Infer image dimensions from data. Default `true`.
@@ -357,6 +359,7 @@ impl ConvertConfig {
         update.include_document_structure = self.include_document_structure.take();
         update.extract_images = self.extract_images.take();
         update.max_image_size = self.max_image_size.take();
+        update.max_input_size = self.max_input_size.take().map(Some);
         update.capture_svg = self.capture_svg.take();
         update.infer_dimensions = self.infer_dimensions.take();
         update.max_depth = self.max_depth.take().map(|requested| Some(clamp_max_depth(requested)));
@@ -654,6 +657,16 @@ mod tests {
         };
         let opts: ConversionOptions = config.try_into().expect("no enum fields set");
         assert_eq!(opts.max_depth, Some(5));
+    }
+
+    #[test]
+    fn test_max_input_size_maps_through() {
+        let config = ConvertConfig {
+            max_input_size: Some(1_024),
+            ..ConvertConfig::default()
+        };
+        let opts: ConversionOptions = config.try_into().expect("no enum fields set");
+        assert_eq!(opts.max_input_size, Some(1_024));
     }
 
     #[test]

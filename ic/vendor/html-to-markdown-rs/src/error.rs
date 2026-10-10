@@ -34,6 +34,15 @@ pub enum ConversionError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// Input exceeds the configured byte limit.
+    #[error("Input size {observed_size} bytes exceeds the configured maximum of {max_size} bytes")]
+    InputTooLarge {
+        /// Actual input size in bytes.
+        observed_size: u64,
+        /// Configured maximum input size in bytes.
+        max_size: u64,
+    },
+
     /// Visitor callback error
     #[cfg(feature = "visitor")]
     #[error("Visitor error: {0}")]

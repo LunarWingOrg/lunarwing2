@@ -9,8 +9,6 @@
 //!
 //! These elements have special formatting requirements for proper Markdown output.
 
-use super::walk_node;
-
 /// Handles the `<hgroup>` element.
 ///
 /// An hgroup element groups related headings together (e.g., a title and subtitle).
@@ -26,18 +24,10 @@ pub fn handle_hgroup(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-            }
-        }
+        super::walk_tag_children(tag, parser, output, handler);
     }
 }
 
@@ -56,29 +46,16 @@ pub fn handle_dl(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
-        if ctx.convert_as_inline {
-            let children = tag.children();
-            {
-                for child_handle in children.top().iter() {
-                    walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-                }
-            }
+        if handler.ctx.convert_as_inline {
+            super::walk_tag_children(tag, parser, output, handler);
             return;
         }
 
         let mut content = String::new();
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
-            }
-        }
+        super::walk_tag_children(tag, parser, &mut content, handler);
 
         // ~keep A trailing <br> run with no following sibling has no next dispatch to catch
         // ~keep it in `walk_node`'s pre-block-dispatch strip, since the dl's content is
@@ -86,7 +63,7 @@ pub fn handle_dl(
         // ~keep `paragraph.rs` closes its own (issue #464 follow-up).
         crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer(
             &mut content,
-            options.newline_style,
+            handler.options.newline_style,
         );
 
         let trimmed = content.trim();
@@ -114,19 +91,11 @@ pub fn handle_dt(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
         let mut content = String::with_capacity(64);
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
-            }
-        }
+        super::walk_tag_children(tag, parser, &mut content, handler);
 
         // ~keep A trailing <br> run with no following sibling has no next dispatch to catch
         // ~keep it in `walk_node`'s pre-block-dispatch strip, since the dt's content is
@@ -134,12 +103,12 @@ pub fn handle_dt(
         // ~keep `paragraph.rs` closes its own (issue #464 follow-up).
         crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer(
             &mut content,
-            options.newline_style,
+            handler.options.newline_style,
         );
 
         let trimmed = content.trim();
         if !trimmed.is_empty() {
-            if ctx.convert_as_inline {
+            if handler.ctx.convert_as_inline {
                 output.push_str(trimmed);
             } else {
                 output.push_str(trimmed);
@@ -163,19 +132,11 @@ pub fn handle_dd(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
         let mut content = String::with_capacity(128);
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, &mut content, options, ctx, depth + 1, dom_ctx);
-            }
-        }
+        super::walk_tag_children(tag, parser, &mut content, handler);
 
         // ~keep A trailing <br> run with no following sibling has no next dispatch to catch
         // ~keep it in `walk_node`'s pre-block-dispatch strip, since the dd's content is
@@ -183,12 +144,12 @@ pub fn handle_dd(
         // ~keep `paragraph.rs` closes its own (issue #464 follow-up).
         crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer(
             &mut content,
-            options.newline_style,
+            handler.options.newline_style,
         );
 
         let trimmed = content.trim();
 
-        if ctx.convert_as_inline {
+        if handler.ctx.convert_as_inline {
             if !trimmed.is_empty() {
                 output.push_str(trimmed);
             }
@@ -215,16 +176,23 @@ pub fn handle_menu(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     let menu_options = crate::options::ConversionOptions {
         bullets: "-".to_string(),
-        ..options.clone()
+        ..handler.options.clone()
     };
-    crate::converter::block::div::handle(node_handle, parser, output, &menu_options, ctx, depth, dom_ctx);
+    crate::converter::block::div::handle(
+        node_handle,
+        parser,
+        output,
+        crate::converter::block::container::HandlerContext::new(
+            &menu_options,
+            handler.ctx,
+            handler.depth,
+            handler.dom_ctx,
+        ),
+    );
 }
 
 /// Dispatcher for definition list and related elements.
@@ -236,17 +204,14 @@ pub fn handle(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     match tag_name {
-        "hgroup" => handle_hgroup(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
-        "dl" => handle_dl(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
-        "dt" => handle_dt(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
-        "dd" => handle_dd(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
-        "menu" => handle_menu(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
+        "hgroup" => handle_hgroup(tag_name, node_handle, parser, output, handler),
+        "dl" => handle_dl(tag_name, node_handle, parser, output, handler),
+        "dt" => handle_dt(tag_name, node_handle, parser, output, handler),
+        "dd" => handle_dd(tag_name, node_handle, parser, output, handler),
+        "menu" => handle_menu(tag_name, node_handle, parser, output, handler),
         _ => {}
     }
 }

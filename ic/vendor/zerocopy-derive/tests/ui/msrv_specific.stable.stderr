@@ -19,20 +19,15 @@ help: the trait `zerocopy_renamed::Unaligned` is not implemented for `AU16`
    |     ^^^^^^^^^^^^^^^
    = note: Consider adding `#[derive(Unaligned)]` to `AU16`
    = help: the following other types implement trait `zerocopy_renamed::Unaligned`:
-             ()
-             AtomicBool
-             AtomicI8
-             AtomicU8
-             Cell<T>
-             F32<O>
-             F64<O>
-             I128<O>
+             $IMPLEMENTATION_SAMPLES
            and $OTHER_TYPES others
 note: required for `IntoBytes1<AU16>` to implement `zerocopy_renamed::IntoBytes`
   --> $DIR/msrv_specific.rs:25:10
    |
 25 | #[derive(IntoBytes)]
-   |          ^^^^^^^^^ unsatisfied trait bound introduced in this `derive` macro
+   |          ^^^^^^^^^ type parameter would need to implement `zerocopy_renamed::IntoBytes`
+   = help: consider manually implementing `zerocopy_renamed::IntoBytes` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
 note: required by a bound in `is_into_bytes_1`
   --> $DIR/msrv_specific.rs:35:23
    |
