@@ -43,12 +43,17 @@
 pub mod api;
 pub mod auth;
 pub mod external_worker;
+pub mod harness;
 pub mod job_manager;
 pub mod reaper;
 
 pub use api::OrchestratorApi;
 pub use auth::{CredentialGrant, McpCredentialGrant, TokenStore};
 pub use external_worker::{ExternalTaskResult, ExternalWorkerManager};
+pub use harness::{
+    HarnessError, HarnessJobOptions, InjectedFileProvenance, InjectionManifest, InjectionSpec,
+    PromotionRecord, PromotionSummary, ResolvedSecretFile, SecretFileMount, WriteBackPolicy,
+};
 pub use job_manager::{
     CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager,
     ContainerJobRequest, JobMode, snapshot_worker_mcp,
