@@ -132,18 +132,30 @@ def sanitize_line(line: str, state: LexerState) -> str:
             # not a closing quote. Treating lifetimes as char literals masked
             # code after them (false negatives) and desynced the lexer.
             if i + 2 < len(chars) and chars[i + 1] != "'" and chars[i + 2] == "'":
-                # Char literal like 'a' or '\n' (escape handled below).
+                # Char literal like 'a' or '\'' (escape handled below).
                 if chars[i + 1] == "\\":
+                    # The opening quote and the backslash are consumed, so the
+                    # next char is the escaped content: re-enter with the
+                    # escape pending. Entering with char_escape=False lets the
+                    # closing quote of '\'' be swallowed as content (and the
+                    # content quote terminate the literal early), desyncing
+                    # every later string/char boundary in the file.
                     state.in_char = True
-                    state.char_escape = False
+                    state.char_escape = True
                     i += 2
                     continue
                 i += 3
                 continue
             if i + 3 < len(chars) and chars[i + 1] == "\\" and chars[i + 3] == "'":
-                # Escaped char literal like '\n'.
+                # Escaped char literal like '\n' or '\\'. Same rule: the
+                # backslash is already consumed, so resume with the escape
+                # pending — otherwise the second backslash of '\\' starts a
+                # new escape, the closing quote is eaten as escaped content,
+                # and the lexer stays in_char until the next quote,
+                # desyncing string state for the rest of the file (this hid
+                # the `mod tests` boundary in orchestrator/harness.rs).
                 state.in_char = True
-                state.char_escape = False
+                state.char_escape = True
                 i += 2
                 continue
             if i + 1 < len(chars) and (chars[i + 1].isalnum() or chars[i + 1] == "_"):
@@ -562,6 +574,48 @@ class CheckNoPanicsTests(unittest.TestCase):
 
         self.assertTrue(contexts[3])
         self.assertTrue(contexts[4])
+
+    def test_escaped_backslash_char_does_not_desync_lexer(self) -> None:
+        # A char literal whose escaped content is itself a backslash ('\\')
+        # enters in_char with the escape already consumed; without the
+        # pending-escape state the closing quote was eaten as content and the
+        # next quote ended the "literal", desyncing string state for the rest
+        # of the file and hiding the `mod tests` boundary (MR !1510 review).
+        lines = [
+            "fn validate(path: &str) -> bool {\n",
+            "    path.split(['/', '\\\\']).count() > 1\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    #[test]\n",
+            "    fn it_works() {\n",
+            "        assert!(true);\n",
+            "    }\n",
+            "}\n",
+        ]
+
+        contexts = line_test_contexts(lines)
+
+        self.assertFalse(any(contexts[:4]))
+        self.assertTrue(all(contexts[4:]))
+
+    def test_escaped_quote_char_does_not_desync_lexer(self) -> None:
+        # '\'' likewise resumes on the escaped quote with the escape pending;
+        # otherwise the content quote closes the literal early and the real
+        # closing quote opens a phantom one.
+        lines = [
+            "fn is_quoted(ch: char) -> bool {\n",
+            "    ch == '\\''\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "}\n",
+        ]
+
+        contexts = line_test_contexts(lines)
+
+        self.assertFalse(any(contexts[:4]))
+        self.assertTrue(all(contexts[4:]))
 
     def test_brace_scan_marks_test_attribute_bodies(self) -> None:
         lines = [
