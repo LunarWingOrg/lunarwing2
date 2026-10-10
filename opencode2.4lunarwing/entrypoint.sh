@@ -133,6 +133,14 @@ PY
   else
     log "Config linked: /app/config/opencode2.json -> $WORKSPACE_ROOT/.opencode/opencode2.json"
   fi
+  # WI#330: the baked config ships a placeholder baseURL on the .invalid TLD
+  # (guaranteed NXDOMAIN). mt-admin always renders OPENCODE2_BASE_URL —
+  # defaulting to the tenant's own LLM endpoint — so a placeholder that
+  # survives to the runtime config means a hand-rolled deployment forgot the
+  # override. Fail loudly at startup instead of at the first LLM request.
+  if grep -q 'set-opencode2-base-url\.invalid' "$WORKSPACE_ROOT/.opencode/opencode2.json" 2>/dev/null; then
+    die "OPENCODE2_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-opencode2 <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
+  fi
   # opencode v2 only auto-discovers opencode.json/opencode.jsonc (project dirs,
   # .opencode/, the global config dir) and never reads .opencode/opencode2.json,
   # so without this the server ignores the lane config and falls back to its
