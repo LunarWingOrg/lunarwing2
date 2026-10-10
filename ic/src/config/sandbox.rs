@@ -259,14 +259,44 @@ pub struct CronWorkerConfig {
     pub tick_timeout_ms: Option<u64>,
     /// Maximum re-dispatches of a single tick after wedge/failure before the
     /// tick is abandoned (the mission continues at the next scheduled fire).
-    /// Default: 3.
+    /// Default: 3. Capped at [`Self::MAX_REENTRIES_LIMIT`].
     #[serde(default)]
     pub max_reentries: Option<u32>,
+    /// Explicit escape hatch for schedules with a fire gap below
+    /// [`Self::MIN_SCHEDULE_INTERVAL_SECS`] (e.g. a per-minute smoke
+    /// mission). Sub-minute schedules multiply LLM spend and `job_events`
+    /// growth, so the floor is enforced unless this is set.
+    #[serde(default)]
+    pub allow_subminute_schedule: Option<bool>,
+    /// Optional per-mission workspace directory sent as the tick job's
+    /// `context.project_dir` (WI#325). Relative paths resolve under the
+    /// worker's `WORKSPACE_ROOT`; the directory must already exist — both
+    /// shipped workers (kimi bridge, pebble) canonicalize the path and
+    /// reject a missing one before the task starts. When unset, tick jobs
+    /// use the worker root like any other dispatch.
+    #[serde(default)]
+    pub project_dir: Option<String>,
 }
 
 impl CronWorkerConfig {
     pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 900;
     pub const DEFAULT_MAX_REENTRIES: u32 = 3;
+    /// Minimum heartbeat watchdog window (seconds). Below this the watcher
+    /// polls so fast that a slow-but-alive job looks wedged.
+    pub const MIN_HEARTBEAT_TIMEOUT_SECS: u64 = 5;
+    /// Hard cap on per-tick re-dispatches; bounds LLM spend from a
+    /// crash-looping worker.
+    pub const MAX_REENTRIES_LIMIT: u32 = 16;
+    /// Minimum per-tick job deadline (ms).
+    pub const MIN_TICK_TIMEOUT_MS: u64 = 1_000;
+    /// Maximum per-tick job deadline (ms). Matches the default
+    /// `KIMI_MAX_TIMEOUT_MS` cap of the kimi worker bridge (4h): a larger
+    /// value is rejected by the worker on every tick, so it is refused at
+    /// load instead.
+    pub const MAX_TICK_TIMEOUT_MS: u64 = 14_400_000;
+    /// Minimum gap between scheduled fires (seconds) unless
+    /// `allow_subminute_schedule` is set.
+    pub const MIN_SCHEDULE_INTERVAL_SECS: u64 = 60;
 
     pub fn heartbeat_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -288,6 +318,74 @@ impl CronWorkerConfig {
             .clone()
             .unwrap_or_else(|| format!("cron-worker-{worker_name}"))
     }
+
+    /// Validate the cron block against runaway-guard limits (WI#325).
+    ///
+    /// Fails loudly at config resolution: an invalid block means the worker
+    /// is rejected from the resolved config entirely, so a typo can never
+    /// silently leave the worker with no mission.
+    pub fn validate(&self, worker_timeout_ms: u64) -> Result<(), String> {
+        if self.goal.trim().is_empty() {
+            return Err("cron.goal must not be empty".to_string());
+        }
+        self.validate_schedule()?;
+        self.validate_heartbeat()?;
+        self.validate_reentries()?;
+        self.validate_tick_timeout(worker_timeout_ms)
+    }
+
+    fn validate_schedule(&self) -> Result<(), String> {
+        crate::agent::routine::next_cron_fire(&self.schedule, None)
+            .map_err(|e| format!("cron.schedule does not parse: {e}"))?
+            .ok_or_else(|| "cron.schedule yields no future fire times".to_string())?;
+        if self.allow_subminute_schedule == Some(true) {
+            return Ok(());
+        }
+        match crate::agent::routine::cron_min_fire_gap_secs(&self.schedule, None) {
+            Ok(Some(gap)) if gap < Self::MIN_SCHEDULE_INTERVAL_SECS => Err(format!(
+                "cron.schedule fires every {gap}s, below the {}s floor; set \
+                 allow_subminute_schedule = true to override",
+                Self::MIN_SCHEDULE_INTERVAL_SECS
+            )),
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("cron.schedule does not parse: {e}")),
+        }
+    }
+
+    fn validate_heartbeat(&self) -> Result<(), String> {
+        if self.heartbeat_timeout() < std::time::Duration::from_secs(Self::MIN_HEARTBEAT_TIMEOUT_SECS)
+        {
+            return Err(format!(
+                "cron.heartbeat_timeout_secs below the {}s floor",
+                Self::MIN_HEARTBEAT_TIMEOUT_SECS
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_reentries(&self) -> Result<(), String> {
+        if self.max_reentries() > Self::MAX_REENTRIES_LIMIT {
+            return Err(format!(
+                "cron.max_reentries {} exceeds the {} cap",
+                self.max_reentries(),
+                Self::MAX_REENTRIES_LIMIT
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_tick_timeout(&self, worker_timeout_ms: u64) -> Result<(), String> {
+        let tick_timeout_ms = self.tick_timeout_ms(worker_timeout_ms);
+        if !(Self::MIN_TICK_TIMEOUT_MS..=Self::MAX_TICK_TIMEOUT_MS).contains(&tick_timeout_ms) {
+            return Err(format!(
+                "cron.tick_timeout_ms {tick_timeout_ms} outside {}..={} (ms); the upper bound \
+                 matches the kimi worker bridge cap so ticks are not rejected on the wire",
+                Self::MIN_TICK_TIMEOUT_MS,
+                Self::MAX_TICK_TIMEOUT_MS
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for a named external worker endpoint.
@@ -307,8 +405,9 @@ pub struct ExternalWorkerConfig {
     /// Operating mode (default task). `Cron` arms the host-side mission
     /// supervisor; the worker still accepts ordinary bounded dispatches.
     pub mode: ExternalWorkerMode,
-    /// Cron-mission settings; required in practice when `mode` is `Cron`
-    /// (a missing or invalid block is logged and the supervisor is skipped).
+    /// Cron-mission settings; required when `mode` is `Cron`. A missing or
+    /// invalid block rejects the worker at config resolution (logged at
+    /// `error!`), so a bad cron config never boots silently mission-less.
     pub cron: Option<CronWorkerConfig>,
 }
 
@@ -318,7 +417,7 @@ impl ExternalWorkerConfig {
             .sandbox
             .external_workers
             .iter()
-            .map(|ew| {
+            .filter_map(|ew| {
                 let prompt_context = ew.prompt_context.bounded();
                 if prompt_context != ew.prompt_context {
                     tracing::warn!(
@@ -329,7 +428,7 @@ impl ExternalWorkerConfig {
                         "External worker prompt-context limits exceeded hard ceilings; clamped"
                     );
                 }
-                Self {
+                let config = Self {
                     name: ew.name.clone(),
                     url: ew.url.clone(),
                     auth_token: ew.auth_token.clone(),
@@ -339,9 +438,35 @@ impl ExternalWorkerConfig {
                     prompt_context,
                     mode: ew.mode,
                     cron: ew.cron.clone(),
+                };
+                // WI#325: reject invalid cron configs loudly at load instead
+                // of booting a worker whose mission supervisor can never run.
+                if config.is_cron() && !config.cron_block_valid() {
+                    return None;
                 }
+                Some(config)
             })
             .collect()
+    }
+
+    /// Whether the cron block of a cron-mode worker passes validation.
+    /// Logs the precise reason at `error!` when it does not.
+    fn cron_block_valid(&self) -> bool {
+        let Some(cron) = &self.cron else {
+            tracing::error!(
+                worker = %self.name,
+                "External worker is mode=cron but has no [cron] block; worker rejected"
+            );
+            return false;
+        };
+        if let Err(reason) = cron.validate(self.timeout_ms) {
+            tracing::error!(
+                worker = %self.name,
+                "Invalid cron config for cron-mode worker; worker rejected: {reason}"
+            );
+            return false;
+        }
+        true
     }
 
     /// Returns the canonical endpoint list for this worker.
@@ -941,5 +1066,146 @@ goal = "Watch the herd"
             cron.max_reentries(),
             CronWorkerConfig::DEFAULT_MAX_REENTRIES
         );
+    }
+
+    // ── WI#325 runaway guards: invalid cron configs reject the worker ──
+
+    fn cron_worker_toml(cron_block: &str) -> String {
+        format!(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10007/ws/agent"
+timeout_ms = 3600000
+mode = "cron"
+
+[sandbox.external_workers.cron]
+{cron_block}
+"#
+        )
+    }
+
+    fn resolve_cron_worker(cron_block: &str) -> Option<ExternalWorkerConfig> {
+        let settings: crate::settings::Settings =
+            toml::from_str(&cron_worker_toml(cron_block)).expect("config must parse");
+        ExternalWorkerConfig::resolve_from_settings(&settings)
+            .into_iter()
+            .next()
+    }
+
+    #[test]
+    fn cron_mode_without_cron_block_is_rejected() {
+        let settings: crate::settings::Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10007/ws/agent"
+mode = "cron"
+"#,
+        )
+        .expect("config must parse");
+        assert!(ExternalWorkerConfig::resolve_from_settings(&settings).is_empty());
+    }
+
+    #[test]
+    fn invalid_schedule_is_rejected() {
+        assert!(resolve_cron_worker("schedule = \"not a schedule\"\ngoal = \"g\"").is_none());
+    }
+
+    #[test]
+    fn empty_goal_is_rejected() {
+        assert!(resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"  \"").is_none());
+    }
+
+    #[test]
+    fn subminute_schedule_is_rejected_without_override() {
+        assert!(
+            resolve_cron_worker("schedule = \"* * * * * *\"\ngoal = \"g\"").is_none(),
+            "per-second schedule must not pass the floor"
+        );
+        assert!(
+            resolve_cron_worker("schedule = \"* * * * *\"\ngoal = \"g\"").is_none(),
+            "per-minute schedule must not pass the floor"
+        );
+    }
+
+    #[test]
+    fn subminute_schedule_passes_with_explicit_override() {
+        let worker = resolve_cron_worker(
+            "schedule = \"* * * * *\"\ngoal = \"g\"\nallow_subminute_schedule = true",
+        )
+        .expect("override must allow the fast schedule");
+        assert!(worker.is_cron());
+    }
+
+    #[test]
+    fn heartbeat_below_floor_is_rejected() {
+        assert!(
+            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nheartbeat_timeout_secs = 0")
+                .is_none()
+        );
+        assert!(
+            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nheartbeat_timeout_secs = 4")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn max_reentries_above_cap_is_rejected() {
+        assert!(
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nmax_reentries = 4294967295"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn tick_timeout_outside_bounds_is_rejected() {
+        // Zero is rejected by the worker bridge (timeout_ms must be >= 1).
+        assert!(
+            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\ntick_timeout_ms = 0")
+                .is_none()
+        );
+        // Above the kimi bridge cap: every tick would be rejected on the wire.
+        assert!(
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\ntick_timeout_ms = 604800000"
+            )
+            .is_none()
+        );
+        // The cap itself is accepted.
+        assert!(
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\ntick_timeout_ms = 14400000"
+            )
+            .is_some()
+        );
+        // A worker default timeout above the cap also fails validation.
+        let settings: crate::settings::Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10007/ws/agent"
+timeout_ms = 86400000
+mode = "cron"
+
+[sandbox.external_workers.cron]
+schedule = "0 15 10 * * *"
+goal = "g"
+"#,
+        )
+        .expect("config must parse");
+        assert!(ExternalWorkerConfig::resolve_from_settings(&settings).is_empty());
+    }
+
+    #[test]
+    fn mission_project_dir_resolves() {
+        let worker = resolve_cron_worker(
+            "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nproject_dir = \"missions/pr-digest\"",
+        )
+        .expect("valid cron config with project_dir");
+        let cron = worker.cron.as_ref().expect("cron block");
+        assert_eq!(cron.project_dir.as_deref(), Some("missions/pr-digest"));
     }
 }
