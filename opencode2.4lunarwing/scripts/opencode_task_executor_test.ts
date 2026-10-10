@@ -4,6 +4,12 @@ import type { OpenCodeClient } from "@opencode/client/promise"
 
 import { executeTask } from "./opencode_task_executor.ts"
 import type { TaskRequest } from "./lunarwing_runtime.ts"
+import {
+  BRIDGE_SDK_METHODS,
+  STALE_SDK_METHODS,
+  mockMethodPaths,
+  resolveMethod,
+} from "./sdk_surface.ts"
 
 interface MockOptions {
   events?: unknown[]
@@ -140,6 +146,19 @@ function makeSdk(options: MockOptions = {}) {
     messageListArgs,
     signals,
     promptArgs,
+  }
+}
+
+// The mock must implement EXACTLY the shared sdk_surface.ts list — the same
+// list the image-build gate (sdk_surface_assert.ts) asserts against the real
+// pinned client (WI#329). A bridge call added without updating the list, a
+// mock path that drifted from it, or a stale path sneaking onto the mock all
+// fail here, so the two gates cannot diverge.
+{
+  const surface = mockMethodPaths(makeSdk().sdk)
+  assert.deepEqual(surface, [...BRIDGE_SDK_METHODS].sort())
+  for (const path of STALE_SDK_METHODS) {
+    assert.equal(resolveMethod(makeSdk().sdk, path), undefined, `mock exposes stale path ${path}`)
   }
 }
 
