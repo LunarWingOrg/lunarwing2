@@ -29,7 +29,11 @@
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329
-10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/330
+10. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/330 — DONE 2026-10-10 (rarity/kimi-10-20261010-1201)
+  - mt-admin (`ic/scripts/mt-admin-lib/06-env-generation.sh`): unset `OPENCODE_BASE_URL` / `KIMI_BASE_URL` / `OPENCODE2_BASE_URL` now inherit the tenant's LLM endpoint — precedence: per-worker flag > existing env value > `--llm-base-url`/`LUNARWING_MT_LLM_BASE_URL` > tenant TensorZero upstream (path-aware via `tensorzero_openai_base`). The daemon's proxy-loopback default is deliberately not inherited (unreachable from worker containers).
+  - Worker images no longer bake reachable endpoints: `opencode4lunarwing/config/opencode.json`, `opencode2.4lunarwing/config/opencode2.json`, `kimicode4lunarwing/config/config.toml` now carry `.invalid` placeholders (`set-opencode-base-url.invalid` etc.), and all three `entrypoint.sh` scripts die loudly with the fix-it command when the placeholder survives to the runtime config.
+  - Tests: `ic/scripts/tests/test-add-tenant-env-flags.sh` Case 6 (13 new assertions) — ALL TESTS PASSED (184 total); `kimicode4lunarwing` TS suite 57/57 incl. new placeholder-refusal test and updated pinned-default assertion; `check-mt-admin.sh` shellcheck clean; shellcheck clean on all three entrypoints; `test-mt-admin-opencode2.sh` / `test-study-mcp-worker-mount.sh` / `test-kawarimi-import-flags.sh` PASS (`test-mt-admin-kimi.sh` fails identically at base commit c57fda6cb — pre-existing, unrelated).
+  - Docs: new "LLM endpoints for LLM-backed workers (WI#330)" section in `docs/ops/WORKER-CONTAINERS.md` (resolution order, container-reachability rule, configure-* knobs, upgrade note for pre-existing tenants); `.env.example` / README / AGENTS.md / HOWTOCHANGECONFIG updated in all three worker dirs. Rollout note: worker images must be rebuilt and tenants' envs re-rendered (add-tenant re-run or `configure-<worker> --base-url`) for existing deployments.
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/332
 
