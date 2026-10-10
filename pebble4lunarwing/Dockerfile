@@ -153,6 +153,34 @@ ENV GOROOT=/usr/local/go \
     GOPATH=/root/go \
     PATH=/usr/local/cargo/bin:/usr/local/go/bin:/root/go/bin:$PATH
 
+# ── Task-shell toolchain anchors (WI#334) ────────────────────────────
+# Upstream pebble's shell tool can spawn a login/sanitised task shell that
+# drops the image-level ENV above, hiding cargo/go from task commands (the
+# WI#320 gauntlet, F6). An entrypoint.sh export cannot survive that reset,
+# so the toolchains are anchored where a reset shell still finds them:
+#   * /etc/profile.d/lunarwing-toolchain.sh restores the toolchain env for
+#     login shells (Debian /etc/profile resets PATH, then sources it). The
+#     snippet is existence-guarded, so it is inert in the slim image.
+#   * Real-binary symlinks in /usr/local/bin (cargo, rustc, go, gofmt) cover
+#     sanitised shells whose default PATH still includes /usr/local/bin.
+#   * /usr/local/bin/rustup is a wrapper that re-exports RUSTUP_HOME/
+#     CARGO_HOME before delegating, keeping rustup usable from any shell.
+COPY pebble4lunarwing/scripts/toolchain-profile.sh /etc/profile.d/lunarwing-toolchain.sh
+COPY pebble4lunarwing/scripts/rustup-wrapper.sh /usr/local/share/lunarwing/rustup-wrapper.sh
+
+RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
+      set -eu; \
+      toolchain_bins="$(ls -d /usr/local/rustup/toolchains/*/bin)"; \
+      [ "$(printf '%s\n' "${toolchain_bins}" | wc -l)" = "1" ] || { \
+        echo "expected exactly one rustup toolchain dir" >&2; exit 1; }; \
+      ln -s "${toolchain_bins}/cargo" /usr/local/bin/cargo; \
+      ln -s "${toolchain_bins}/rustc" /usr/local/bin/rustc; \
+      ln -s /usr/local/go/bin/go /usr/local/bin/go; \
+      ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt; \
+      install -m 0755 /usr/local/share/lunarwing/rustup-wrapper.sh /usr/local/bin/rustup; \
+      env -i bash -lc 'cargo --version && rustc --version && go version && rustup --version'; \
+    fi
+
 COPY --from=builder /build/bridge/target/release/pebble4lunarwing /usr/local/bin/pebble4lunarwing
 COPY --from=builder /build/pebble/target/release/pebble /usr/local/bin/pebble
 COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
