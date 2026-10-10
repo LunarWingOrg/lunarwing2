@@ -3,7 +3,8 @@
 //! Provides an embedded SQLite-compatible database using Turso's libSQL fork.
 //! Supports three modes:
 //! - Local embedded (file-based, no server needed)
-//! - Turso cloud with embedded replica (sync to cloud)
+//! - Turso cloud with embedded replica (sync to cloud) — only in builds with
+//!   the non-default `libsql-remote-replica` cargo feature (WI#331)
 //! - In-memory (for testing)
 
 mod conversations;
@@ -94,6 +95,12 @@ impl LibSqlBackend {
     }
 
     /// Create with Turso cloud sync (embedded replica).
+    ///
+    /// Only available with the non-default `libsql-remote-replica` cargo
+    /// feature (WI#331): the libsql 0.6.0 remote chain pins rustls-webpki
+    /// 0.102 / h2 0.3, which carry accepted RustSec advisories, so the code
+    /// is kept out of default builds.
+    #[cfg(feature = "libsql-remote-replica")]
     pub async fn new_remote_replica(
         path: &Path,
         url: &str,
@@ -111,6 +118,51 @@ impl LibSqlBackend {
             .map_err(|e| DatabaseError::Pool(format!("Failed to open remote replica: {}", e)))?;
 
         Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Open the standard libSQL connection for the given config trio:
+    /// a local database at `path`, or a Turso remote replica when `url` is
+    /// set (which then requires `auth_token`).
+    ///
+    /// Without the `libsql-remote-replica` cargo feature, requesting a remote
+    /// replica fails with a clear error instead of silently going local-only
+    /// (WI#331).
+    pub async fn from_config_parts(
+        path: &Path,
+        url: Option<&str>,
+        auth_token: Option<&str>,
+    ) -> Result<Self, DatabaseError> {
+        match (url, auth_token) {
+            (Some(url), Some(token)) => Self::remote_replica(path, url, token).await,
+            (Some(_), None) => Err(DatabaseError::Pool(
+                "LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set".to_string(),
+            )),
+            (None, _) => Self::new_local(path).await,
+        }
+    }
+
+    #[cfg(feature = "libsql-remote-replica")]
+    async fn remote_replica(
+        path: &Path,
+        url: &str,
+        auth_token: &str,
+    ) -> Result<Self, DatabaseError> {
+        Self::new_remote_replica(path, url, auth_token).await
+    }
+
+    #[cfg(not(feature = "libsql-remote-replica"))]
+    async fn remote_replica(
+        _path: &Path,
+        _url: &str,
+        _auth_token: &str,
+    ) -> Result<Self, DatabaseError> {
+        Err(DatabaseError::Pool(
+            "LIBSQL_URL is set but libSQL remote replicas (Turso sync) are disabled in this \
+             build: rebuild with the cargo feature `libsql-remote-replica` to enable them \
+             (WI#331: the libsql 0.6.0 remote chain carries accepted RustSec advisories; \
+             see ic/deny.toml)"
+                .to_string(),
+        ))
     }
 
     /// Get a shared reference to the underlying database handle.
