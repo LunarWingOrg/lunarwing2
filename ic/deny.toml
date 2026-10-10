@@ -3,43 +3,56 @@ unmaintained = "workspace"
 yanked = "deny"
 ignore = [
     # Accepted advisories — each entry re-verified against upstream 2026-10-10
-    # for v2.1.6.0. See docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md for the full
-    # audit trail, per-entry exposure analysis, and follow-up work items
-    # (v2.1.5.0 audit: docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md).
-    # Clearing owner for every entry below: WI#331 (open). The v2.1.5.0
-    # clearing items #304/#305/#306 are closed and historical.
+    # for v2.1.6.0. Clearing decisions are owned by work item WI#331
+    # (https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331);
+    # WI#304 was closed without a migration, so do not reference it as a
+    # clearing owner. Clearing work that outlives WI#331 is split into open
+    # follow-ups cited per entry: WI#367 (libsignal-protocol off
+    # failure/rental) and WI#368 (rsa policy / upstream tracking). Re-verify
+    # each exposure note at every release. Decision record:
+    # docs/ops/v2.1.6.0_WI331_ADVISORY_CLEARING.md. Audit trails:
+    # docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md (v2.1.6.0),
+    # docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md (v2.1.5.0).
     # Remove an entry only when its clearing upgrade has landed
     # in Cargo.lock AND the corresponding lockfile root has been re-checked
     # with `--config` overrides so the advisory surfaces as a hard error if
     # it ever comes back.
 
     # rustls-webpki 0.102.8 chain via libsql 0.6.0 -> hyper-rustls 0.25.0 ->
-    # rustls 0.22.4. Re-verified 2026-10-10: libsql 0.9.30 (latest stable)
-    # and 0.10.0-pre.4 (latest prerelease) still request hyper-rustls ^0.25
-    # and hyper ^0.14, so even a libsql bump today would keep this chain.
-    # Clearing requires an upstream libsql release that adopts rustls 0.23 /
-    # hyper-rustls 0.27+, which is a dedicated migration, not a deny.toml edit.
-    # EXPOSURE: compiled into default-feature builds. This copy of webpki is
-    # the X.509 validator for libSQL remote-replica TLS connections
-    # (LIBSQL_URL set; ic/src/db/mod.rs new_remote_replica) — i.e. TLS to a
-    # third-party database host validated with known name-constraint
-    # bypasses (2026-0098/0099). Postgres-only builds do not contain it.
-    # Clearing owner: WI#331.
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 CRL distributionPoint matching; pinned by libsql 0.6.0 legacy chain; libsql 0.9.30/0.10.0-pre.4 still pull hyper-rustls ^0.25; exposure: libSQL remote-replica TLS validation, default builds only; clearing owner WI#331 (re-verified 2026-10-10)" },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; same libsql 0.6.0 legacy chain and exposure as RUSTSEC-2026-0049; clearing owner WI#331 (re-verified 2026-10-10)" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name-constraint bypass; same libsql 0.6.0 legacy chain and exposure as RUSTSEC-2026-0049; clearing owner WI#331 (re-verified 2026-10-10)" },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 CRL parsing panic; same libsql 0.6.0 legacy chain and exposure as RUSTSEC-2026-0049; clearing owner WI#331 (re-verified 2026-10-10)" },
+    # rustls 0.22.4. Re-verified 2026-10-10 (WI#331): libsql 0.9.30 (latest
+    # stable) and 0.10.0-pre.4 (latest prerelease) still request hyper-rustls
+    # ^0.25 and hyper ^0.14, so even a libsql bump today would keep this
+    # chain. Clearing requires an upstream libsql release that adopts rustls
+    # 0.23 / hyper-rustls 0.27+, or a driver migration — WI#331 instead
+    # resolved on the mitigation below.
+    # MITIGATION (v2.1.6.0, WI#331): libsql's remote/replication/tls features
+    # moved behind the non-default `libsql-remote-replica` cargo feature, so
+    # default builds no longer compile this chain at all; the default-feature
+    # graph is pinned clean by .gitlab/scripts/check-default-graph-advisories.sh.
+    # EXPOSURE: only in opt-in `--features libsql-remote-replica` builds —
+    # this copy of webpki is the X.509 validator for libSQL remote-replica
+    # TLS connections (LIBSQL_URL set; ic/src/db/libsql/mod.rs
+    # new_remote_replica), i.e. TLS to a third-party database host validated
+    # with known name-constraint bypasses (2026-0098/0099). Default and
+    # postgres-only builds do not contain it. The ignores remain required
+    # because CI's cargo-deny gate queries --workspace --all-features, which
+    # enables the opt-in feature.
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 CRL distributionPoint matching; pinned by libsql 0.6.0 legacy chain; libsql 0.9.30/0.10.0-pre.4 still pull hyper-rustls ^0.25; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name-constraint bypass; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 CRL parsing panic; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
 
     # failure crate — vendored libsignal-protocol path dep only.
     # failure 0.1.8 is the final release (EOL); clearing requires porting
-    # the vendored wrapper off failure/failure_derive, not a version bump.
+    # the vendored wrapper off failure/failure_derive (dozens of uses across
+    # the vendored crate — a dedicated follow-up item, not a version bump).
     # EXPOSURE: compiled into every feature set; reached via the XMPP OMEMO
     # implementation (ic/src/channels/xmpp/omemo/) that links the vendored
     # libsignal-protocol wrapper — a LunarWing-owned path dependency, so the
     # pin is our own choice, not purely upstream's.
-    # Clearing owner: WI#331.
-    { id = "RUSTSEC-2019-0036", reason = "failure crate EOL type-confusion; vendored libsignal-protocol 0.1.0 path dep (XMPP OMEMO), every feature set; failure 0.1.8 is the final release; clearing owner WI#331 (re-verified 2026-10-10)" },
-    { id = "RUSTSEC-2020-0036", reason = "failure crate officially unmaintained; same vendored libsignal-protocol chain and exposure as RUSTSEC-2019-0036; clearing owner WI#331 (re-verified 2026-10-10)" },
+    # Clearing owner: WI#367 (split out of WI#331).
+    { id = "RUSTSEC-2019-0036", reason = "failure crate EOL type-confusion; vendored libsignal-protocol 0.1.0 path dep (XMPP OMEMO), every feature set; failure 0.1.8 is the final release; clearing owner WI#367, decision record WI#331 (re-verified 2026-10-10)" },
+    { id = "RUSTSEC-2020-0036", reason = "failure crate officially unmaintained; same vendored libsignal-protocol chain and exposure as RUSTSEC-2019-0036; clearing owner WI#367, decision record WI#331 (re-verified 2026-10-10)" },
 
     # rsa Marvin timing side channel via russh -> rsa 0.10.0-rc.18.
     # Re-verified 2026-10-10: the advisory still declares patched = [];
@@ -60,25 +73,26 @@ ignore = [
     # opencode/opencode2/pebble worker containers. Signing is unblinded
     # (rng = None) — unlimited chosen-message RSA signatures with local
     # timing for any tenant that configures an RSA host key.
-    # Clearing owner: WI#331.
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10.0-rc.18 Marvin timing attack; patched = [] (re-verified 2026-10-10); rc.19 published but not marked patched; russh 0.64.1 still pins rsa =0.10.0-rc.18; exposure: tenant SSH agent (auto-confirm, 0o666) mounted into untrusted worker containers signs with RSA host keys; LunarWing-enabled russh/rsa feature, every feature set; clearing owner WI#331" },
+    # Clearing owner: WI#368 (split out of WI#331).
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10.0-rc.18 Marvin timing attack; patched = [] (re-verified 2026-10-10); rc.19 published but not marked patched; russh 0.64.1 still pins rsa =0.10.0-rc.18; exposure: tenant SSH agent (auto-confirm, 0o666) mounted into untrusted worker containers signs with RSA host keys; LunarWing-enabled russh/rsa feature, every feature set; clearing owner WI#368, decision record WI#331" },
 
     # h2 empty DATA frames — low severity. The patched 0.4.20 is locked; the
     # remaining 0.3.27 copy is unpatchable upstream (0.3 line ended at 0.3.27)
     # and is reached only via the legacy libsql 0.6.0 -> tonic 0.11 -> hyper 0.14
-    # chain, same block as the webpki entries above.
-    # EXPOSURE: compiled into default-feature builds only (libsql chain);
-    # postgres-only builds do not contain it.
-    # Clearing owner: WI#331.
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.20; exposure: libsql default builds only; clearing owner WI#331 (re-verified 2026-10-10)" },
+    # chain, same mitigation as the webpki entries above (WI#331).
+    # EXPOSURE: only in opt-in `--features libsql-remote-replica` builds;
+    # default and postgres-only builds do not contain it, and the
+    # default-feature graph is pinned clean by
+    # .gitlab/scripts/check-default-graph-advisories.sh.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.20; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
 
     # rental — unmaintained (informational, no vulnerability). Only visible
     # since the gate widened to --workspace --all-features (v2.1.5.0, MR
     # !1371 review A4): direct dep of the vendored libsignal-protocol
     # workspace member behind its "crypto-openssl" feature. Clearing means
-    # porting the vendored wrapper off rental, same work item as failure.
-    # Clearing owner: WI#331.
-    { id = "RUSTSEC-2021-0134", reason = "rental unmaintained (informational, no vulnerability); vendored libsignal-protocol crypto-openssl feature; visible only in the --workspace --all-features graph; clearing owner WI#331 (accepted 2026-10-03, re-verified 2026-10-10)" },
+    # porting the vendored wrapper off rental, same follow-up as failure.
+    # Clearing owner: WI#367 (split out of WI#331).
+    { id = "RUSTSEC-2021-0134", reason = "rental unmaintained (informational, no vulnerability); vendored libsignal-protocol crypto-openssl feature; visible only in the --workspace --all-features graph; clearing owner WI#367, decision record WI#331 (accepted 2026-10-03, re-verified 2026-10-10)" },
 ]
 
 [licenses]
