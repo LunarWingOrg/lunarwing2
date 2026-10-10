@@ -35,7 +35,12 @@
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
-13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/334
+13. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/334 — completed 100% (2026-10-10, branch rarity/kimi-13-20261010-1501)
+  - Fix (survives upstream shell env reset): `pebble4lunarwing/Dockerfile` now installs existence-guarded `/etc/profile.d/lunarwing-toolchain.sh` (new `scripts/toolchain-profile.sh`), real-binary symlinks `/usr/local/bin/{cargo,rustc,go,gofmt}` → rustup toolchain/Go dirs, and `/usr/local/bin/rustup` wrapper (new `scripts/rustup-wrapper.sh`); build-time proof `env -i bash -lc 'cargo --version && rustc --version && go version && rustup --version'` runs inside the fat image build.
+  - Smoke check: new `pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh` probes `image [ref]` / `container <name>` with a scrubbed login shell; PASS on newly built fat image (`cargo 1.96.1`, `rustc 1.96.1`, `go 1.24.3`, `rustup 1.28.2`), correctly FAILS on the pre-fix slim image.
+  - CI: both anchor scripts added to pebble `input_files` in `.gitlab/scripts/build-worker-image.sh`; new `TaskShellToolchainPathTests` in `.gitlab/tests/test_pebble_build_inputs.py` (21 passed) — one stale assertion in the same file updated for the extended input list.
+  - Docs: F6 resolution note in `docs/ops/v2.1.5.0_WI320_EXTERNAL_WORKER_TEST.md`, new "Task-Shell Toolchain PATH (WI#334)" section in `docs/ops/PEBBLE-WORKER.md`, pebble-section pointer in `docs/ops/WORKER-CONTAINERS.md`.
+  - Verified on host: fat (`WITH_TOOLCHAINS=true`) and slim podman builds both exit 0; slim image keeps snippet inert with no dangling symlinks; shell-syntax/shellcheck suites clean; `validate_config.py` clean; test images/tags removed afterwards.
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/337
 15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/338
 16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/339
