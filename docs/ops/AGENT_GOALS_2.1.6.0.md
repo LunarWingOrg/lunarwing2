@@ -47,10 +47,10 @@
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/359
 23. [x] work on x
 24. [x] (S) (H MR) come back to item 2 at some point after manual review is completed (NOTE FOR LATER)
-25. [x] (S) RESERVED
+25. [x] (S) (H MR) release alpha of droid and desk repo projs
 26. [x] (S) RESERVED
 27. [x] (S) RESERVED
-28. [x] (S) RESERVED
+28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5375 for latest master pipeline run and see if anything is not GREEN
 29. [x] (S) RESERVED
 30. [x] (S) RESERVED
 31. [x] (S) RESERVED
