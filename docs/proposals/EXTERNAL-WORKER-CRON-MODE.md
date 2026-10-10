@@ -1,6 +1,7 @@
 # External Worker Cron Mode (WI#325)
 
-Status: implemented (host-side) in v2.1.6.0.
+Status: implemented (host-side) in v2.1.6.0; revised after the MR !1509
+adversarial review (CU-1..CU-9 addressed; see "Review-driven hardening").
 Work item: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
 
 ## Problem
@@ -31,10 +32,21 @@ mode = "cron"
 schedule = "0 15 10 * * *"        # 5/6/7-field cron (same normalization as routines)
 goal = "Produce the daily PR digest"
 mission_id = "pr-digest"          # optional; default "cron-worker-<name>"
-heartbeat_timeout_secs = 900      # optional; default 900 (15 min)
-tick_timeout_ms = 1800000         # optional; default = worker timeout_ms
-max_reentries = 3                 # optional; default 3
+heartbeat_timeout_secs = 900      # optional; default 900 (15 min); floor 5
+tick_timeout_ms = 1800000         # optional; default = worker timeout_ms;
+                                  # bounded to 1_000..=14_400_000 (the kimi
+                                  # bridge KIMI_MAX_TIMEOUT_MS default of 4h)
+max_reentries = 3                 # optional; default 3; hard cap 16
+# allow_subminute_schedule = true # explicit override for fire gaps < 60s
+# project_dir = "missions/pr-digest" # optional per-mission workspace dir
 ```
+
+**Validation fails loudly at load**: an invalid cron block (unparseable or
+sub-60s schedule without the override, empty goal, heartbeat below the floor,
+re-entry count above the cap, tick timeout outside the bounded range — or a
+missing `[cron]` block on a `mode = "cron"` worker) rejects the worker from
+the resolved config with an `error!` naming the reason. A schedule typo can
+never boot a silently mission-less worker (WI#321 class).
 
 ### 1. Cron-tick JSON events
 
@@ -55,9 +67,13 @@ On every scheduled fire the host supervisor dispatches a worker job whose
 
 The field is `skip_serializing_if = None` on `TaskContext`, so ordinary task
 dispatches never carry it and older workers ignore it. The prompt also carries
-the goal plus the chain-handoff contract ("read prior state from /workspace at
-tick start; write updated state before finishing"), so even a worker that only
-reads the prompt behaves mission-like.
+the goal plus the chain-handoff contract ("read prior state from the workspace
+at tick start; write updated state before finishing"), so even a worker that
+only reads the prompt behaves mission-like.
+
+`tick_index` is **persisted per mission** (DB settings store), so it is
+monotonic across daemon restarts; manual fires use `tick_index = 0` as an
+operator-trigger marker.
 
 ### 2. Infinite deadline participation
 
@@ -70,75 +86,135 @@ Because a cron-mode mission is never an engine `Mission` record, the WI#311
 `Completed`-parking lifecycle machine and the WI#317 boot writer never touch
 it (structural, not behavioral, exclusion).
 
+Note the honest bound: a single link cannot exceed the worker bridge's hard
+timeout cap (kimi's `KIMI_MAX_TIMEOUT_MS`, 4h by default) — the wire protocol
+rejects it. Config validation refuses such values at load instead of letting
+every tick fail on the wire, and a worker-side protocol-validation rejection
+(`timeout_ms must be…`, unresolvable `project_dir`) is treated as
+**non-retryable**: the tick is abandoned immediately rather than burning the
+re-entry budget on a config error. Missions longer than one link's bound are
+expressed by chaining (the goal text should work in per-tick increments).
+
 ### 3. Re-dispatch / re-entry supervisor
 
-`orchestrator::cron_worker` runs one serialized loop per cron-mode worker
-(a mission never overlaps itself):
+`orchestrator::cron_worker` runs one serialized loop per cron-mode worker.
+Scheduled fires and manual triggers share one mpsc command channel, so a
+mission never overlaps itself:
 
 1. Compute the next fire from the cron schedule (`agent::routine`'s
-   normalization), sleep until then or shutdown.
+   normalization), sleeping in a `select!` that also services commands and
+   shutdown — shutdown is observed mid-tick, not just between ticks, and
+   cancels the in-flight link with a distinct `daemon shutdown` reason.
 2. Dispatch a bounded tick job (fresh job id per link).
 3. Watch the job via the `ContextManager`: terminal state resolves the tick;
    no genuine progress for `heartbeat_timeout_secs` (synthetic `[worker] …`
-   keep-alives do not count — the WI#263 gate) cancels the wedged job and
-   re-dispatches a fresh bounded job for the same tick, up to
-   `max_reentries`.
+   keep-alives do not count — the WI#263 gate) cancels the wedged job with
+   the `cron supervisor (heartbeat lapse)` reason and re-dispatches a fresh
+   bounded job for the same tick, up to `max_reentries`.
 4. Mission state flows through the worker's durable `/workspace` bind mount
-   (verified host-side by the WI#324 probe); mission lifetime = the chain +
-   the state, never any one process.
-
-`ExternalWorkerManager::fire_cron_tick_now(worker, owner)` fires one tick on
-demand through the same chain path (operator trigger and integration tests).
+   (the WI#325 evidence section records live verification of cross-job
+   durability); mission lifetime = the chain + the state, never any one
+   process.
 
 ### 4. Logging / session capture
 
 Per-link jobs already stream `task_progress` into `job_events`. The supervisor
-adds structured records on top:
+adds structured records on top, all written **inline** (never detached
+spawns, so rows are ordered and survive shutdown):
 
 - `cron_tick` — on every dispatch (mission id, schedule, goal, tick/chain
   index, fired_at, tick_timeout_ms).
-- `cron_reentry` — on every re-dispatch (with the failure/wedge reason).
+- `cron_reentry` — on every re-dispatch, with `kind`: `reentry` (failure or
+  wedge, consumes budget) or `busy_retry` (workspace lock still held by the
+  old link; does **not** consume budget).
 - `cron_tick_end` — `completed` / `cancelled` / `abandoned` (+reason).
+- `cron_paused` — when the circuit breaker trips (see below).
 
 plus SSE `JobStatus` frames for live subscribers, and `info!`/`warn!`/`error!`
-tracing at supervisor start, each tick fire, each re-entry, and each tick end
-— answering WI#323's "dead ticker indistinguishable from idle" gap by
-construction. After the fact, a mission's full session log is retrievable by
-reading the per-tick jobs' `job_events` (the mission id links the chain; each
-job's metadata carries `mission_id`, `tick_index`, `chain_index`).
+tracing at supervisor start, each tick fire, each re-entry, each tick end, and
+supervisor death (a panicked mission loop is logged at `error!` instead of
+silently stranding the mission — WI#323 class). After the fact, a mission's
+full session log is retrievable by reading the per-tick jobs' `job_events`
+(the mission id links the chain; each job's metadata carries `mission_id`,
+`tick_index`, `chain_index`).
+
+## Review-driven hardening (MR !1509)
+
+- **Workspace-lock race (CU-1)** — after a heartbeat lapse the supervisor
+  cancels with the supervisor reason, then waits (bounded, 20s) for the old
+  link to reach a terminal state before re-dispatching, and applies
+  exponential backoff (2s base, 60s cap) between links. A worker rejection
+  reporting the workspace as busy ("already being modified" — the wording
+  shared by the kimi, pebble, and opencode bridges) retries the same chain
+  link with backoff up to 5 times without consuming re-entry budget.
+- **Per-mission workspace dir (CU-1)** — optional `cron.project_dir` is sent
+  as `context.project_dir` (relative paths resolve under the worker's
+  `WORKSPACE_ROOT`). It is opt-in because both shipped workers canonicalize
+  the path and reject a missing directory before the task starts — defaulting
+  to a subdir would break the first tick unless the operator pre-creates it.
+- **Runaway guards (CU-2)** — config validation (above), exponential backoff,
+  and a **circuit breaker**: after 3 consecutive abandoned ticks the mission
+  pauses itself, persists the pause (restart-safe), and surfaces it via
+  `job_events` (`cron_paused`) and SSE.
+- **Runtime stop (CU-2)** — the owner-gated `cron_mission` tool
+  (`pause`/`resume`/`status`, gated exactly like `cancel_job`; AskEachTime
+  permission; v1-only in the engine bridge). `cancel_job` still ends only the
+  current link; `cron_mission pause` stops future fires and survives restart.
+- **Memory growth (CU-2)** — terminal tick contexts are evicted from the
+  `ContextManager` once their events are persisted; the durable record lives
+  in `sandbox_jobs` + `job_events` (`job_status` falls back to the DB).
+- **Self-repair interference (CU-5)** — jobs whose metadata carries
+  `cron_mode: true` are exempt from the self-repair idle detector; the cron
+  supervisor owns their watchdog, so no double-cancel and no spurious
+  "Job … was stuck" owner notices.
+- **Manual fires serialized (CU-9)** — `fire_cron_tick_now` routes through the
+  supervisor's command channel; there is no out-of-band tick path.
 
 ## Verification checklist (WI#325)
 
 - [x] A `cron`-mode worker receives a `cron.tick` event on schedule and starts
-  a mission-like run — `fire_cron_tick_now` integration test asserts the
-  on-wire `cron_tick` payload; the scheduled loop shares the dispatch path.
+  a mission-like run — `cron_scheduled_loop_fires_on_schedule` drives the real
+  scheduled loop (per-second schedule) and asserts monotonic tick indices;
+  `cron_tick_reaches_worker_with_structured_tick_context` asserts the on-wire
+  payload.
 - [x] The run outlives the standard bounded deadline without being killed —
-  tick jobs use `tick_timeout_ms` (per-link bound); the mission has no
-  deadline and no `Completed` parking.
+  per-link `tick_timeout_ms` replaces the worker default; the mission has no
+  deadline and no `Completed` parking. (Per-link ceiling is the bridge cap,
+  documented above.)
 - [x] If the job dies mid-run, the supervisor re-dispatches a fresh job and
-  the mission resumes from `/workspace` state — heartbeat-lapse integration
-  test observes chain_index 0 → 1 under one mission id; `/workspace`
-  durability is host-side (bind mount, verified by the WI#324 probe).
+  the mission resumes from workspace state — `cron_supervisor_redispatches_wedged_tick_job`
+  (lapse path), `cron_reentry_on_failed_link` (failure path),
+  `cron_busy_rejection_retries_without_spending_reentry_budget` (lock-enforcing
+  mock). Cross-job workspace durability is a property of the worker bind mount
+  recorded in the WI's evidence section; the chain itself is
+  integration-tested.
 - [x] Every tick and job transition is visible in `job_events` —
-  `cron_tick` / `cron_reentry` / `cron_tick_end` plus the existing per-job
-  message/result events.
+  `cron_tick_events_persist_to_job_events` asserts persisted `cron_tick` and
+  `cron_tick_end` rows against a real store.
 - [x] A `cron`-mode mission is NOT parked `Completed` by the in-process
   lifecycle machine — it is never an engine `Mission` at all.
 - [~] Session audio/log capture — text session logs are covered by
-  `job_events` + `/workspace` state files; audio capture is not part of this
-  host-side pass (no audio path exists in external workers today).
+  `job_events` + workspace state files; **audio capture is not implemented**
+  (no audio path exists in external workers today) and remains out of scope.
 
 ## Files
 
 - `ic/src/config/sandbox.rs` — `ExternalWorkerMode`, `CronWorkerConfig`,
-  resolution from `[[sandbox.external_workers]]`.
+  validation/clamps, resolution from `[[sandbox.external_workers]]`.
 - `ic/src/settings.rs` — settings fields (TOML/JSON/DB map plumbing).
 - `ic/src/orchestrator/external_worker.rs` — `CronTick` payload on
-  `TaskContext`; supervisor-facing manager accessors.
-- `ic/src/orchestrator/cron_worker.rs` — the supervisor (schedule loop, tick
-  dispatch, heartbeat watchdog, re-entry chain, event persistence).
+  `TaskContext`; `CancelReason` plumbed through the cancel path;
+  `CronCommand`/control-channel registry.
+- `ic/src/orchestrator/cron_worker.rs` — the supervisor (schedule loop,
+  command channel, tick dispatch, heartbeat watchdog, re-entry chain with
+  backoff, circuit breaker, event persistence, context eviction, persisted
+  tick counter/pause flag).
+- `ic/src/agent/self_repair.rs` — cron-mode exemption from idle repair.
+- `ic/src/agent/routine.rs` — `cron_min_fire_gap_secs` (schedule floor).
+- `ic/src/tools/builtin/job.rs` — `CronMissionTool` (pause/resume/status).
 - `ic/src/main.rs` — supervisor spawn next to the pool eviction task.
-- `ic/tests/external_worker_integration.rs` — wire-shape and re-entry tests.
+- `ic/tests/external_worker_integration.rs` — wire-shape, scheduled-loop,
+  shutdown, re-entry, busy-lock, abandonment, owner-gate, and store tests.
 
 ## Out of scope
 
@@ -146,3 +222,5 @@ job's metadata carries `mission_id`, `tick_index`, `chain_index`).
   proxied tool path that lets workers call `memory_*`/`knowledge_*`).
 - Hub-mediated cross-thread coordination (KV + advisory locks) — WI#324 phase 2.
 - Audio session capture.
+- Worker-side consumption of `cron_tick` beyond the prompt (optional by
+  design).
