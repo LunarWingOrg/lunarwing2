@@ -2527,6 +2527,33 @@ mod tests {
         assert!(!props.contains_key("mode")); // safety: test
     }
 
+    /// WI#325: the cron_mission tool surfaces the supervisor/owner gate errors
+    /// instead of panicking or silently succeeding.
+    #[tokio::test]
+    async fn cron_mission_tool_errors_without_supervisor() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let tool = CronMissionTool::new(manager);
+        let ctx = JobContext::default();
+
+        let err = tool
+            .execute(
+                serde_json::json!({"action": "status", "worker": "nope"}),
+                &ctx,
+            )
+            .await
+            .expect_err("unknown worker must error"); // safety: test
+        assert!(err.to_string().contains("not configured for cron mode")); // safety: test
+
+        let err = tool
+            .execute(
+                serde_json::json!({"action": "bogus", "worker": "nope"}),
+                &ctx,
+            )
+            .await
+            .expect_err("unknown action must error"); // safety: test
+        assert!(err.to_string().contains("unknown cron_mission action")); // safety: test
+    }
+
     #[test]
     fn external_worker_schema_guides_direct_opencode_dispatch() {
         use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
