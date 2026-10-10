@@ -491,8 +491,70 @@ async fn handle_connection(
                     return;
                 }
                 let _ = requests.send(req_envelope);
-                tokio::time::sleep(hold).await;
-                active.fetch_sub(1, Ordering::SeqCst);
+                // The real worker's lock outlives the connection: a cancelled
+                // task's subprocess dies on its own schedule (SIGTERM→SIGKILL
+                // grace), so the workspace stays busy after the socket is
+                // gone. Model that with a detached release timer that holds
+                // the lock for `hold` AND until at least one busy rejection
+                // has occurred (bounded), so the test is timing-safe.
+                let active_release = active.clone();
+                let rejections_release = busy_rejections.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(hold).await;
+                    for _ in 0..300 {
+                        if rejections_release.load(Ordering::SeqCst) > 0 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    active_release.fetch_sub(1, Ordering::SeqCst);
+                });
+                // Wedge: read (rejecting concurrent requests busy) until the
+                // daemon tears the connection down.
+                loop {
+                    match ws.next().await {
+                        Some(Ok(m)) if !m.is_close() => {
+                            let Ok(text) = m.to_text() else {
+                                continue;
+                            };
+                            let Ok(env) = serde_json::from_str::<serde_json::Value>(text) else {
+                                continue;
+                            };
+                            if env.get("type").and_then(|v| v.as_str()) == Some("ping") {
+                                let pong = envelope("pong", serde_json::json!({}));
+                                if ws.send(Message::Text(pong.into())).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if env.get("type").and_then(|v| v.as_str()) == Some("cancel") {
+                                continue; // wedge: cancel never resolves the task
+                            }
+                            let other_id = env["payload"]["task_id"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string();
+                            busy_rejections.fetch_add(1, Ordering::SeqCst);
+                            let busy = envelope(
+                                "task_result",
+                                serde_json::json!({
+                                    "task_id": other_id,
+                                    "status": "error",
+                                    "output": "",
+                                    "error": format!(
+                                        "Workspace /workspace is already being modified by task {task_id}. \
+                                         Cancel or finish that task before dispatching another task to this workspace."
+                                    ),
+                                    "duration_ms": 0,
+                                }),
+                            );
+                            if ws.send(Message::Text(busy.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
                 return;
             }
             MockBehavior::WaitForCancel { ref messages } => {
@@ -2331,7 +2393,7 @@ async fn cron_busy_rejection_retries_without_spending_reentry_budget() {
         requests: request_tx,
         active: active.clone(),
         busy_rejections: busy_rejections.clone(),
-        hold: Duration::from_secs(12),
+        hold: Duration::from_secs(2),
     })
     .await;
     let (mgr, _cm, _shutdown) = spawn_cron_manager(cron_config_for(&url, 2, 1));
@@ -2341,35 +2403,32 @@ async fn cron_busy_rejection_retries_without_spending_reentry_budget() {
         .expect("tick timed out")
         .expect("tick errored");
 
-    // Link 1 (chain 0) wedges holding the lock; lapse → cancel → wait
-    // terminal → backoff. Link 2 (chain 1) may arrive while the mock still
-    // holds the lock (busy rejection), then the retry (still chain 1) lands
-    // after the lock frees.
+    // Only lock-holding links are captured (busy rejections are not): link 1
+    // (chain 0) wedges holding the lock; lapse → supervisor cancel → bounded
+    // terminal wait → backoff; link 2 (chain 1) arrives while the mock still
+    // holds the lock and is rejected busy (not captured); the busy retry —
+    // still chain 1, a fresh job id — lands after the lock frees and is
+    // captured. The retry happening at all, with chain 1 == max_reentries,
+    // proves the busy rejection did not consume the re-entry budget.
     let first = request_rx.recv().await.expect("link 1 captured");
     let second = timeout(TEST_BOUND * 4, request_rx.recv())
         .await
-        .expect("link 2 timed out")
-        .expect("link 2 captured");
-    let third = timeout(TEST_BOUND * 4, request_rx.recv())
-        .await
-        .expect("link 3 timed out")
-        .expect("link 3 captured");
+        .expect("busy retry timed out")
+        .expect("busy retry captured");
 
     assert_eq!(first["payload"]["context"]["cron_tick"]["chain_index"], 0);
-    // The busy retry reuses the same chain_index; job ids stay distinct.
-    let second_chain = second["payload"]["context"]["cron_tick"]["chain_index"]
-        .as_u64()
-        .expect("chain");
-    let third_chain = third["payload"]["context"]["cron_tick"]["chain_index"]
-        .as_u64()
-        .expect("chain");
-    assert_eq!(second_chain, 1);
-    assert_eq!(third_chain, 1);
-    assert_ne!(second["payload"]["task_id"], third["payload"]["task_id"]);
+    assert_eq!(second["payload"]["context"]["cron_tick"]["chain_index"], 1);
+    assert_ne!(first["payload"]["task_id"], second["payload"]["task_id"]);
     assert_eq!(
         busy_rejections.load(Ordering::SeqCst),
         1,
         "exactly one dispatch should have hit the held workspace lock"
+    );
+    // The retry wedges too, lapses, and the tick is then abandoned at the
+    // re-entry cap: no third link is dispatched.
+    assert!(
+        timeout(TEST_BOUND, request_rx.recv()).await.is_err(),
+        "a tick at its re-entry cap must not dispatch again"
     );
 }
 
@@ -2434,7 +2493,12 @@ async fn cron_tick_events_persist_to_job_events() {
     use lunarwing::db::Database;
     use lunarwing::db::libsql::LibSqlBackend;
 
-    let backend = LibSqlBackend::new_memory().await.expect("in-memory db");
+    // A temp-file db: `:memory:` libsql databases are per-connection, and the
+    // backend opens a fresh connection per call.
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join("cron.db"))
+        .await
+        .expect("test db");
     backend.run_migrations().await.expect("migrations");
     let db: Arc<dyn Database> = Arc::new(backend);
 
