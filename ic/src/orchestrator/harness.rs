@@ -4,28 +4,35 @@
 //! optional capability layers on top of the plain `worker` mode:
 //!
 //! 1. **tmpfs secret mounts** — worker-scoped secrets resolved host-side and
-//!    delivered as files under `/run/secrets/<NAME>` on an in-memory tmpfs
+//!    pulled by the worker over its authenticated per-job channel, then
+//!    written as files under `/run/secrets/<NAME>` on an in-memory tmpfs
 //!    (Docker-secrets pattern). Values never enter the container env, the job
 //!    context, logs, or job events.
 //! 2. **Read-only file/memory injection** — selected tenant workspace
 //!    documents are snapshotted into a per-job directory mounted read-only at
 //!    `/harness/injected`. Every injected file is recorded in a
-//!    `PROVENANCE.json` manifest (source path, SHA-256, size, timestamp).
-//!    Identity files (`SOUL.md`, `USER.md`, `IDENTITY.md`) require explicit
-//!    opt-in.
+//!    `PROVENANCE.json` manifest (normalized source path, SHA-256, size,
+//!    timestamp). Identity documents require explicit opt-in.
 //! 3. **Staged write-back** — a separate writable staging dir mounted at
 //!    `/harness/workspace_out`. On job completion the daemon promotes staged
 //!    writes into tenant workspace memory only after path-allowlist, size,
-//!    count, and secret-scan checks pass. Identity files, engine runtime
-//!    state, and engine-internal paths are NEVER writable (WI#322).
+//!    count, and secret-scan checks pass. The allowlist is operator-fixed to
+//!    `projects/**`; the caller may only narrow it. System-prompt files,
+//!    identity documents, daily logs, lorebooks, `context/`, `backups/`,
+//!    and engine-internal paths are NEVER writable (WI#322).
 //!
 //! Boundary rule: the injection mount is one-way (read-only from the job's
 //! perspective); the only way out is the promotion pipeline.
+//!
+//! Path discipline (MR !1510 review): every workspace-relative path is
+//! normalized with [`normalize_harness_path`], which requires
+//! normalized == raw, so whitespace/casing tricks cannot smuggle a denied
+//! path past the checks (`Workspace::write` trims; we check what we write).
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -51,10 +58,32 @@ pub const MAX_INJECTION_FILE_BYTES: u64 = 512 * 1024;
 /// Maximum total bytes across all injected files.
 pub const MAX_INJECTION_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Operator-fixed write-back roots (CW-1): staged files may only ever be
+/// promoted under `projects/`. Callers may narrow this set (e.g. to
+/// `projects/demo/`) but never widen or replace it.
+pub const WRITE_BACK_ALLOWED_ROOTS: &[&str] = &["projects"];
+
 const DEFAULT_WRITE_BACK_MAX_FILES: usize = 64;
 const DEFAULT_WRITE_BACK_MAX_FILE_BYTES: u64 = 256 * 1024;
 const DEFAULT_WRITE_BACK_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Server-side ceilings (CW-6): caller-supplied limits may only go LOWER.
+pub const WRITE_BACK_MAX_FILES_CEILING: usize = 256;
+pub const WRITE_BACK_MAX_FILE_BYTES_CEILING: u64 = 1024 * 1024;
+pub const WRITE_BACK_MAX_TOTAL_BYTES_CEILING: u64 = 8 * 1024 * 1024;
+
 const MAX_STAGING_DEPTH: usize = 8;
+/// Cap on directory entries visited during the staging walk (CW-6).
+const MAX_STAGING_WALK_ENTRIES: usize = 4096;
+/// Cap on recorded rejection entries so a hostile staging dir cannot bloat
+/// the audit row unboundedly (CW-6/CW-13).
+pub const MAX_PROMOTION_REJECTIONS: usize = 128;
+/// Maximum accepted length of a workspace-relative harness path.
+const MAX_HARNESS_PATH_CHARS: usize = 512;
+/// Secret values shorter than this are not value-redacted from job events:
+/// replacing a short token would mangle legitimate output. Such values still
+/// never enter env/logs by construction (tmpfs files only).
+const MIN_REDACTED_SECRET_BYTES: usize = 8;
 
 /// Errors raised by harness capability validation and staging I/O.
 #[derive(Debug, thiserror::Error)]
@@ -87,22 +116,136 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// File names that carry tenant identity and are never injected implicitly
-/// and never writable through write-back promotion.
-pub fn is_identity_file_name(file_name: &str) -> bool {
-    matches!(file_name, "SOUL.md" | "USER.md" | "IDENTITY.md")
+/// Basenames of the workspace identity documents (CW-14: one consistent set,
+/// shared with `workspace::IDENTITY_PATHS`).
+pub fn identity_file_names() -> Vec<&'static str> {
+    crate::workspace::IDENTITY_PATHS
+        .iter()
+        .filter_map(|p| Path::new(p).file_name())
+        .filter_map(|n| n.to_str())
+        .collect()
 }
 
-/// True when the workspace-relative path names an identity document.
+/// True when the file name carries tenant identity (any depth).
+pub fn is_identity_file_name(file_name: &str) -> bool {
+    identity_file_names().contains(&file_name)
+}
+
+/// True when the normalized workspace-relative path names an identity
+/// document, either exactly (the workspace identity set) or by basename at
+/// any depth (conservative: `docs/USER.md` also requires the opt-in).
 pub fn is_identity_path(path: &str) -> bool {
+    if crate::workspace::is_identity_path(path) {
+        return true;
+    }
     Path::new(path)
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(is_identity_file_name)
 }
 
-/// Validate a secret file name. File names double as env var names when the
-/// worker exports them for child processes, so they must be env-var-safe.
+/// Normalize a workspace-relative path and require normalized == raw.
+///
+/// `Workspace::write` trims and resolves `.`/`..` before writing, so checking
+/// the raw string but writing the normalized one let `" SOUL.md"` or
+/// `" engine/..."` bypass identity/engine guards (CW-2/CW-5). Here a path is
+/// accepted only when it is already in canonical form: no leading/trailing
+/// or doubled separators, no `.`/`..` segments, no absolute prefix, no
+/// backslashes, and no segment with leading/trailing whitespace or control
+/// characters.
+pub fn normalize_harness_path(raw: &str) -> Result<String, HarnessError> {
+    if raw.is_empty() || raw.len() > MAX_HARNESS_PATH_CHARS {
+        return Err(HarnessError::InvalidPolicy(format!(
+            "path must be 1..={MAX_HARNESS_PATH_CHARS} characters"
+        )));
+    }
+    if raw.starts_with('/') || raw.starts_with('\\') || raw.contains('\\') {
+        return Err(HarnessError::InvalidPolicy(format!(
+            "path '{raw}' must be workspace-relative with '/' separators"
+        )));
+    }
+    for segment in raw.split('/') {
+        if segment.is_empty() {
+            return Err(HarnessError::InvalidPolicy(format!(
+                "path '{raw}' contains an empty segment"
+            )));
+        }
+        if segment != segment.trim()
+            || segment.chars().any(|c| c.is_control())
+            || segment.chars().any(|c| {
+                c.is_whitespace() && !c.is_ascii()
+            })
+        {
+            return Err(HarnessError::InvalidPolicy(format!(
+                "path '{raw}' has a segment with leading/trailing whitespace or control characters"
+            )));
+        }
+    }
+    let normalized = crate::workspace::normalize_path(raw);
+    if normalized != raw {
+        return Err(HarnessError::InvalidPolicy(format!(
+            "path '{raw}' is not in canonical form (normalizes to '{normalized}')"
+        )));
+    }
+    Ok(normalized)
+}
+
+/// Hard-deny check for write-back promotion (CW-1). Applied AFTER
+/// normalization, regardless of the allowed roots: system-prompt files,
+/// identity documents, daily logs, lorebooks, `context/`, `backups/`,
+/// quarantined logs, and engine-internal state are never writable through
+/// the harness. Returns the rejection reason when denied.
+pub fn write_back_deny_reason(normalized: &str) -> Option<&'static str> {
+    if is_identity_path(normalized) {
+        return Some("identity documents are never writable through write-back");
+    }
+    if crate::workspace::is_system_prompt_file(normalized) {
+        return Some("system-prompt files are never writable through write-back");
+    }
+    if normalized == "context"
+        || normalized.starts_with("context/")
+        || normalized == "daily"
+        || normalized.starts_with("daily/")
+        || normalized == "lorebooks"
+        || normalized.starts_with("lorebooks/")
+    {
+        return Some("context/, daily/ and lorebooks/ are never writable through write-back");
+    }
+    if crate::workspace::is_backup_path(normalized)
+        || crate::workspace::is_quarantined_daily_log(normalized)
+    {
+        return Some("backup and quarantined paths are reserved for operator recovery");
+    }
+    if crate::workspace::is_engine_runtime_path(normalized)
+        || crate::workspace::is_engine_internal_path(normalized)
+    {
+        return Some("engine-managed paths are never writable through write-back (WI#322)");
+    }
+    None
+}
+
+/// Injection-side deny check (CW-5): shadow backups, quarantined daily logs,
+/// and engine runtime/internal state are never injected — they carry
+/// quarantined prompt-injection evidence or engine-private state. Identity
+/// documents are handled separately via the explicit opt-in.
+fn injection_deny_reason(normalized: &str) -> Option<&'static str> {
+    if crate::workspace::is_backup_path(normalized) {
+        return Some("shadow backup files (backups/) are reserved and cannot be injected");
+    }
+    if crate::workspace::is_quarantined_daily_log(normalized) {
+        return Some("quarantined daily logs are reserved for operator recovery");
+    }
+    if crate::workspace::is_engine_runtime_path(normalized)
+        || crate::workspace::is_engine_internal_path(normalized)
+    {
+        return Some("engine-managed paths cannot be injected");
+    }
+    None
+}
+
+/// Env var names that could hijack process behavior; harness secret file
+/// names share the env-name surface, so the same denylist applies (CV-4).
+/// Canonical list lives in `tools::builtin::job`.
 pub fn validate_secret_file_name(name: &str) -> Result<(), HarnessError> {
     if name.is_empty() {
         return Err(HarnessError::InvalidSecretMount(
@@ -118,6 +261,16 @@ pub fn validate_secret_file_name(name: &str) -> Result<(), HarnessError> {
             "file name '{name}' must match [A-Z_][A-Z0-9_]*"
         )));
     }
+    if crate::tools::builtin::job::is_dangerous_env_var_name(name) {
+        return Err(HarnessError::InvalidSecretMount(format!(
+            "file name '{name}' is on the env-var denylist (could hijack process behavior)"
+        )));
+    }
+    if name.starts_with("LUNARWING_") || name.starts_with("IRONCLAW_") {
+        return Err(HarnessError::InvalidSecretMount(format!(
+            "file name '{name}' uses a reserved runtime prefix"
+        )));
+    }
     Ok(())
 }
 
@@ -126,8 +279,7 @@ pub fn validate_secret_file_name(name: &str) -> Result<(), HarnessError> {
 pub struct SecretFileMount {
     /// Name of the secret in the tenant secrets store.
     pub secret_name: String,
-    /// File name under `/run/secrets/` (also the env var name the worker
-    /// exports for child processes).
+    /// File name under `/run/secrets/`.
     pub file_name: String,
 }
 
@@ -149,8 +301,8 @@ impl SecretFileMount {
     }
 }
 
-/// A secret value resolved host-side, ready to be archived into the tmpfs
-/// mount. The value is never logged or serialized.
+/// A secret value resolved host-side, held until the worker pulls it over its
+/// authenticated channel. The value is never logged or serialized.
 pub struct ResolvedSecretFile {
     pub file_name: String,
     value: SecretString,
@@ -164,8 +316,14 @@ impl ResolvedSecretFile {
         }
     }
 
-    pub fn value_bytes(&self) -> Vec<u8> {
-        self.value.expose_secret().as_bytes().to_vec()
+    /// Clone the secret value (secrecy zeroizes each copy on drop).
+    pub fn value_clone(&self) -> SecretString {
+        self.value.clone()
+    }
+
+    /// Consume into the mounted file name and the secret value.
+    pub fn into_parts(self) -> (String, SecretString) {
+        (self.file_name, self.value)
     }
 }
 
@@ -200,6 +358,19 @@ impl InjectionSpec {
         self
     }
 
+    /// Normalized source path (CW-5): canonical form required, engine/backup/
+    /// quarantined paths denied. Provenance records this normalized path.
+    pub fn normalized_source(&self) -> Result<String, HarnessError> {
+        let normalized = normalize_harness_path(&self.source)
+            .map_err(|e| HarnessError::InvalidInjection(e.to_string()))?;
+        if let Some(reason) = injection_deny_reason(&normalized) {
+            return Err(HarnessError::InvalidInjection(format!(
+                "'{normalized}': {reason}"
+            )));
+        }
+        Ok(normalized)
+    }
+
     /// File name the injected document lands under inside the mount.
     pub fn resolved_target_name(&self) -> Result<String, HarnessError> {
         let name = match &self.target_name {
@@ -220,32 +391,10 @@ impl InjectionSpec {
     }
 
     pub fn validate(&self) -> Result<(), HarnessError> {
-        validate_workspace_relative_path(&self.source)?;
+        self.normalized_source()?;
         self.resolved_target_name()?;
         Ok(())
     }
-}
-
-/// Reject absolute paths, parent traversal, and empty segments.
-fn validate_workspace_relative_path(path: &str) -> Result<(), HarnessError> {
-    if path.trim().is_empty() {
-        return Err(HarnessError::InvalidInjection(
-            "source path cannot be empty".to_string(),
-        ));
-    }
-    if path.starts_with('/') || path.starts_with('\\') {
-        return Err(HarnessError::InvalidInjection(format!(
-            "source path '{path}' must be workspace-relative"
-        )));
-    }
-    for segment in path.split(['/', '\\']) {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err(HarnessError::InvalidInjection(format!(
-                "source path '{path}' contains an invalid segment"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn validate_injection_target_name(name: &str) -> Result<(), HarnessError> {
@@ -266,9 +415,8 @@ fn validate_injection_target_name(name: &str) -> Result<(), HarnessError> {
 /// Write-back policy for the staged promotion pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteBackPolicy {
-    /// Workspace-relative roots staged files may promote into
-    /// (e.g. `["projects/"]`). Matched against the path relative to the
-    /// staging dir.
+    /// Workspace-relative roots staged files may promote into. These may only
+    /// NARROW the operator-fixed [`WRITE_BACK_ALLOWED_ROOTS`] set (CW-1).
     pub allowed_roots: Vec<String>,
     pub max_files: usize,
     pub max_file_bytes: u64,
@@ -278,7 +426,10 @@ pub struct WriteBackPolicy {
 impl Default for WriteBackPolicy {
     fn default() -> Self {
         Self {
-            allowed_roots: vec!["projects/".to_string()],
+            allowed_roots: WRITE_BACK_ALLOWED_ROOTS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             max_files: DEFAULT_WRITE_BACK_MAX_FILES,
             max_file_bytes: DEFAULT_WRITE_BACK_MAX_FILE_BYTES,
             max_total_bytes: DEFAULT_WRITE_BACK_MAX_TOTAL_BYTES,
@@ -294,25 +445,41 @@ impl WriteBackPolicy {
             ));
         }
         for root in &self.allowed_roots {
-            if root.trim().is_empty() || root.starts_with('/') || root.contains("..") {
+            let normalized = normalize_harness_path(root)
+                .map_err(|e| HarnessError::InvalidPolicy(e.to_string()))?;
+            let narrows_fixed_set = WRITE_BACK_ALLOWED_ROOTS
+                .iter()
+                .any(|fixed| normalized == *fixed || normalized.starts_with(&format!("{fixed}/")));
+            if !narrows_fixed_set {
                 return Err(HarnessError::InvalidPolicy(format!(
-                    "allowed root '{root}' must be a relative path without '..'"
+                    "allowed root '{root}' is outside the operator-fixed write-back roots ({})",
+                    WRITE_BACK_ALLOWED_ROOTS.join(", ")
                 )));
             }
         }
-        if self.max_files == 0 || self.max_file_bytes == 0 || self.max_total_bytes == 0 {
-            return Err(HarnessError::InvalidPolicy(
-                "write-back limits must be non-zero".to_string(),
-            ));
+        if self.max_files == 0 || self.max_files > WRITE_BACK_MAX_FILES_CEILING {
+            return Err(HarnessError::InvalidPolicy(format!(
+                "max_files must be 1..={WRITE_BACK_MAX_FILES_CEILING}"
+            )));
+        }
+        if self.max_file_bytes == 0 || self.max_file_bytes > WRITE_BACK_MAX_FILE_BYTES_CEILING {
+            return Err(HarnessError::InvalidPolicy(format!(
+                "max_file_bytes must be 1..={WRITE_BACK_MAX_FILE_BYTES_CEILING}"
+            )));
+        }
+        if self.max_total_bytes == 0 || self.max_total_bytes > WRITE_BACK_MAX_TOTAL_BYTES_CEILING {
+            return Err(HarnessError::InvalidPolicy(format!(
+                "max_total_bytes must be 1..={WRITE_BACK_MAX_TOTAL_BYTES_CEILING}"
+            )));
         }
         Ok(())
     }
 
-    /// True when a staging-relative path falls under an allowed root.
-    pub fn root_allows(&self, relative_path: &str) -> bool {
+    /// True when a normalized staging-relative path falls under an allowed
+    /// root. The hard-deny set ([`write_back_deny_reason`]) always wins.
+    pub fn root_allows(&self, normalized_path: &str) -> bool {
         self.allowed_roots.iter().any(|root| {
-            let root = root.trim_end_matches('/');
-            relative_path == root || relative_path.starts_with(&format!("{root}/"))
+            normalized_path == root || normalized_path.starts_with(&format!("{root}/"))
         })
     }
 }
@@ -335,15 +502,43 @@ impl HarnessJobOptions {
     }
 
     pub fn validate(&self) -> Result<(), HarnessError> {
+        self.validate_secret_mounts()?;
+        self.validate_injections()?;
+        if let Some(policy) = &self.write_back {
+            policy.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validate_secret_mounts(&self) -> Result<(), HarnessError> {
         if self.worker_secrets.len() > MAX_SECRET_FILES {
             return Err(HarnessError::InvalidSecretMount(format!(
                 "too many secret files ({} > {MAX_SECRET_FILES})",
                 self.worker_secrets.len()
             )));
         }
+        let mut names = std::collections::HashSet::new();
+        let mut files = std::collections::HashSet::new();
         for mount in &self.worker_secrets {
             mount.validate()?;
+            // CV-10: duplicate mounts would make delivery ambiguous.
+            if !names.insert(mount.secret_name.as_str()) {
+                return Err(HarnessError::InvalidSecretMount(format!(
+                    "duplicate secret name '{}'",
+                    mount.secret_name
+                )));
+            }
+            if !files.insert(mount.file_name.as_str()) {
+                return Err(HarnessError::InvalidSecretMount(format!(
+                    "duplicate secret file name '{}'",
+                    mount.file_name
+                )));
+            }
         }
+        Ok(())
+    }
+
+    fn validate_injections(&self) -> Result<(), HarnessError> {
         if self.injections.len() > MAX_INJECTIONS {
             return Err(HarnessError::InvalidInjection(format!(
                 "too many injections ({} > {MAX_INJECTIONS})",
@@ -353,10 +548,10 @@ impl HarnessJobOptions {
         let mut targets = std::collections::HashSet::new();
         for spec in &self.injections {
             spec.validate()?;
-            if !self.allow_identity_injection && is_identity_path(&spec.source) {
+            let normalized = spec.normalized_source()?;
+            if !self.allow_identity_injection && is_identity_path(&normalized) {
                 return Err(HarnessError::InvalidInjection(format!(
-                    "identity document '{}' requires allow_identity_injection=true",
-                    spec.source
+                    "identity document '{normalized}' requires allow_identity_injection=true"
                 )));
             }
             let target = spec.resolved_target_name()?;
@@ -366,9 +561,6 @@ impl HarnessJobOptions {
                 )));
             }
         }
-        if let Some(policy) = &self.write_back {
-            policy.validate()?;
-        }
         Ok(())
     }
 }
@@ -376,6 +568,7 @@ impl HarnessJobOptions {
 /// Provenance record for one injected file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InjectedFileProvenance {
+    /// Normalized workspace-relative source path actually read (CW-5).
     pub source_path: String,
     pub target_name: String,
     pub sha256: String,
@@ -394,12 +587,17 @@ pub struct InjectionManifest {
 /// A resolved injection: the document content read from the workspace plus
 /// the validated target name.
 pub struct InjectionEntry {
+    /// Normalized source path (post `normalize_harness_path`).
     pub source_path: String,
     pub target_name: String,
     pub content: String,
 }
 
 /// Write injected files (mode 0444) plus the provenance manifest into `dir`.
+///
+/// Files are created with `O_CREAT|O_EXCL|O_NOFOLLOW` and chmodded through
+/// the open fd so a hostile symlink planted at the target cannot redirect the
+/// write onto a host file (CW-3f).
 pub fn write_injection_dir(
     dir: &Path,
     job_id: Uuid,
@@ -426,10 +624,7 @@ pub fn write_injection_dir(
             )));
         }
         validate_injection_target_name(&entry.target_name)?;
-        let target = dir.join(&entry.target_name);
-        std::fs::write(&target, bytes)
-            .map_err(|e| HarnessError::io(format!("write {}", target.display()), e))?;
-        set_readonly(&target)?;
+        write_file_no_follow(&dir.join(&entry.target_name), bytes, 0o444)?;
         provenance.push(InjectedFileProvenance {
             source_path: entry.source_path.clone(),
             target_name: entry.target_name.clone(),
@@ -446,22 +641,34 @@ pub fn write_injection_dir(
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| HarnessError::Io(format!("serialize manifest: {e}")))?;
-    let manifest_path = dir.join(INJECTION_MANIFEST_NAME);
-    std::fs::write(&manifest_path, manifest_json)
-        .map_err(|e| HarnessError::io(format!("write {}", manifest_path.display()), e))?;
-    set_readonly(&manifest_path)?;
+    write_file_no_follow(&dir.join(INJECTION_MANIFEST_NAME), manifest_json.as_bytes(), 0o444)?;
     Ok(manifest)
 }
 
+/// Create `path` with `content`, refusing to follow or replace anything
+/// already there, and set `mode` via the open file descriptor.
 #[cfg(unix)]
-fn set_readonly(path: &Path) -> Result<(), HarnessError> {
+fn write_file_no_follow(path: &Path, content: &[u8], mode: u32) -> Result<(), HarnessError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| HarnessError::io(format!("create {}", path.display()), e))?;
+    let mut file = file;
+    use std::io::Write;
+    file.write_all(content)
+        .map_err(|e| HarnessError::io(format!("write {}", path.display()), e))?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
         .map_err(|e| HarnessError::io(format!("chmod {}", path.display()), e))
 }
 
 #[cfg(not(unix))]
-fn set_readonly(path: &Path) -> Result<(), HarnessError> {
+fn write_file_no_follow(path: &Path, content: &[u8], _mode: u32) -> Result<(), HarnessError> {
+    std::fs::write(path, content)
+        .map_err(|e| HarnessError::io(format!("write {}", path.display()), e))?;
     let mut perms = std::fs::metadata(path)
         .map_err(|e| HarnessError::io(format!("stat {}", path.display()), e))?
         .permissions();
@@ -470,44 +677,33 @@ fn set_readonly(path: &Path) -> Result<(), HarnessError> {
         .map_err(|e| HarnessError::io(format!("chmod {}", path.display()), e))
 }
 
-/// Build a tar archive of secret files for `upload_to_container` into the
-/// tmpfs mount. Files are mode 0440 owned by the container worker uid.
-pub fn build_secrets_tar(files: &[ResolvedSecretFile]) -> Result<Vec<u8>, HarnessError> {
-    let mut builder = tar::Builder::new(Vec::new());
-    for file in files {
-        validate_secret_file_name(&file.file_name)?;
-        let bytes = file.value_bytes();
-        if bytes.len() > MAX_SECRET_BYTES {
-            return Err(HarnessError::InvalidSecretMount(format!(
-                "secret file '{}' exceeds {MAX_SECRET_BYTES} bytes",
-                file.file_name
-            )));
-        }
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o440);
-        header.set_uid(1000);
-        header.set_gid(1000);
-        header.set_mtime(0);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, &file.file_name, bytes.as_slice())
-            .map_err(|e| HarnessError::io(format!("tar {}", file.file_name), e))?;
-    }
-    builder
-        .into_inner()
-        .map_err(|e| HarnessError::io("finish secrets tar", e))
+/// Base directory for per-job harness state: `~/.lunarwing/harness/`.
+///
+/// Deliberately OUTSIDE `~/.lunarwing/projects/` (CW-3): the projects base is
+/// bind-mountable by any job with an explicit `project_dir`, so harness
+/// injection snapshots and write-back staging must not live under it. The
+/// base is created mode 0700.
+pub fn harness_base_dir() -> PathBuf {
+    lunarwing_base_dir().join("harness")
 }
 
-/// Per-job harness host directory: `~/.lunarwing/projects/.harness/<job_id>`.
-///
-/// Lives under the projects base so the standard bind-mount validation
-/// applies, but outside any single job workspace.
+/// Create the harness base dir with owner-only permissions.
+pub fn ensure_harness_base_dir() -> Result<PathBuf, HarnessError> {
+    let base = harness_base_dir();
+    std::fs::create_dir_all(&base)
+        .map_err(|e| HarnessError::io(format!("create {}", base.display()), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| HarnessError::io(format!("chmod {}", base.display()), e))?;
+    }
+    Ok(base)
+}
+
+/// Per-job harness host directory: `~/.lunarwing/harness/<job_id>`.
 pub fn harness_job_dir(job_id: Uuid) -> PathBuf {
-    lunarwing_base_dir()
-        .join("projects")
-        .join(".harness")
-        .join(job_id.to_string())
+    harness_base_dir().join(job_id.to_string())
 }
 
 pub fn injection_dir(job_id: Uuid) -> PathBuf {
@@ -528,10 +724,141 @@ pub fn cleanup_harness_job_dir(job_id: Uuid) {
     }
 }
 
+/// Remove harness job dirs that do not belong to a live container (CW-8 boot
+/// sweep). `live_job_ids` carries the currently running labeled containers;
+/// dirs younger than `grace` are kept so an in-flight create never loses its
+/// staging dir mid-dispatch. Returns the number of dirs removed.
+pub fn sweep_stale_harness_dirs(
+    live_job_ids: &std::collections::HashSet<Uuid>,
+    grace: std::time::Duration,
+) -> usize {
+    let Ok(base) = ensure_harness_base_dir() else {
+        return 0;
+    };
+    sweep_harness_dirs_in(&base, live_job_ids, grace)
+}
+
+fn sweep_harness_dirs_in(
+    base: &Path,
+    live_job_ids: &std::collections::HashSet<Uuid>,
+    grace: std::time::Duration,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(job_id) = name.to_str().unwrap_or("").parse::<Uuid>() else {
+            continue; // foreign entry — leave it alone
+        };
+        if live_job_ids.contains(&job_id) {
+            continue;
+        }
+        let young = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|mtime| {
+                now.duration_since(mtime)
+                    .map(|age| age < grace)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true); // unreadable mtime: keep, fail safe
+        if young {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(job_id = %job_id, "Swept orphaned harness dir");
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job_id, "Failed to sweep harness dir: {}", e);
+            }
+        }
+    }
+    removed
+}
+
+/// Value-level redactor for worker-mounted secrets (CV-7).
+///
+/// Built from the job's resolved secret values; scrubs the exact value, its
+/// base64 encoding, and its URL-encoded form from job events before they are
+/// persisted or broadcast, and reused by the promotion pipeline to reject
+/// staged files that embed a mounted secret (CW-10).
+#[derive(Debug, Clone, Default)]
+pub struct SecretValueRedactor {
+    variants: Vec<String>,
+}
+
+impl SecretValueRedactor {
+    pub fn new(values: &[SecretString]) -> Self {
+        use base64::Engine;
+        use secrecy::ExposeSecret;
+        let mut variants = Vec::new();
+        for value in values {
+            let raw = value.expose_secret();
+            if raw.len() < MIN_REDACTED_SECRET_BYTES {
+                continue;
+            }
+            variants.push(raw.to_string());
+            variants.push(base64::engine::general_purpose::STANDARD.encode(raw));
+            variants.push(urlencoding::encode(raw).into_owned());
+        }
+        variants.sort_by_key(String::len);
+        variants.reverse(); // longest first so overlapping values redact fully
+        Self { variants }
+    }
+
+    pub fn is_armed(&self) -> bool {
+        !self.variants.is_empty()
+    }
+
+    /// True when `text` contains any mounted secret value (exact, base64, or
+    /// URL-encoded).
+    pub fn contains_secret(&self, text: &str) -> bool {
+        self.variants.iter().any(|v| text.contains(v))
+    }
+
+    pub fn scrub(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for variant in &self.variants {
+            if out.contains(variant) {
+                out = out.replace(variant.as_str(), "[redacted-secret]");
+            }
+        }
+        out
+    }
+
+    /// Recursively scrub every string in a JSON value in place.
+    pub fn scrub_json(&self, value: &mut serde_json::Value) {
+        if !self.is_armed() {
+            return;
+        }
+        match value {
+            serde_json::Value::String(s) => {
+                *s = self.scrub(s);
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.scrub_json(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for v in map.values_mut() {
+                    self.scrub_json(v);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// One staged file that passed all promotion checks.
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
-    /// Workspace-relative target path (forward slashes).
+    /// Normalized workspace-relative target path (forward slashes).
     pub relative_path: String,
     pub content: String,
     pub sha256: String,
@@ -550,6 +877,21 @@ pub struct PromotionRejection {
 pub struct PromotionPlan {
     pub accepted: Vec<StagedWrite>,
     pub rejections: Vec<PromotionRejection>,
+    /// Rejections dropped past [`MAX_PROMOTION_REJECTIONS`] (CW-6/CW-13).
+    pub dropped_rejections: usize,
+}
+
+impl PromotionPlan {
+    fn reject(&mut self, relative_path: String, reason: String) {
+        if self.rejections.len() >= MAX_PROMOTION_REJECTIONS {
+            self.dropped_rejections += 1;
+            return;
+        }
+        self.rejections.push(PromotionRejection {
+            relative_path: sanitize_display_path(&relative_path),
+            reason,
+        });
+    }
 }
 
 /// Audit record for one promoted file (WI#326 provenance trail).
@@ -557,8 +899,12 @@ pub struct PromotionPlan {
 pub struct PromotionRecord {
     pub relative_path: String,
     pub sha256: String,
+    /// SHA-256 of the document this write replaced, when one existed (CW-9
+    /// rollback support).
+    pub previous_sha256: Option<String>,
     pub size_bytes: u64,
     pub job_id: Uuid,
+    pub owner_id: String,
     pub promoted_at: DateTime<Utc>,
 }
 
@@ -567,141 +913,266 @@ pub struct PromotionRecord {
 pub struct PromotionSummary {
     pub records: Vec<PromotionRecord>,
     pub rejections: Vec<PromotionRejection>,
+    pub dropped_rejections: usize,
+    /// True when promotion never ran (failed job, container teardown failure,
+    /// missing resolver); `reason` says why.
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+/// Trim a container-controlled path to a bounded, control-char-free string
+/// before it is returned to the parent agent or persisted (CW-13).
+fn sanitize_display_path(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .take(MAX_HARNESS_PATH_CHARS)
+        .collect()
 }
 
 /// Scan the staging dir and partition files into promotable writes and
-/// rejections. Enforces the path allowlist, identity/engine/backup
-/// exclusions, size and count limits, UTF-8, and the leak scan.
+/// rejections. Enforces normalized path discipline, the hard-deny set, the
+/// (narrowed) root allowlist, size/count limits, UTF-8, the leak scan, and
+/// the mounted-secret scan.
 pub fn plan_promotion(
     staging: &Path,
     policy: &WriteBackPolicy,
+    redactor: Option<&SecretValueRedactor>,
 ) -> Result<PromotionPlan, HarnessError> {
     policy.validate()?;
     let mut files = Vec::new();
     if staging.is_dir() {
-        collect_staged_files(staging, staging, 0, &mut files)?;
+        let canonical_staging = staging
+            .canonicalize()
+            .map_err(|e| HarnessError::io(format!("canonicalize {}", staging.display()), e))?;
+        let mut visited = 0usize;
+        collect_staged_files(&canonical_staging, 0, &mut visited, &mut files)?;
     }
     files.sort();
 
     let mut plan = PromotionPlan::default();
     let mut total_bytes = 0u64;
     let detector = crate::safety::LeakDetector::new();
+    let canonical_staging = staging.canonicalize().unwrap_or_else(|_| staging.to_path_buf());
 
-    for path in files {
+    for (path, lstat_size) in files {
         if plan.accepted.len() >= policy.max_files {
-            plan.rejections.push(PromotionRejection {
-                relative_path: relative_display(staging, &path),
-                reason: format!("write-back file count limit ({}) reached", policy.max_files),
-            });
+            plan.reject(
+                relative_lossy(staging, &path),
+                format!("write-back file count limit ({}) reached", policy.max_files),
+            );
             continue;
         }
-        let relative = relative_display(staging, &path);
-        match screen_staged_file(&path, &relative, policy, &detector, &mut total_bytes) {
+        let relative = match strict_relative(staging, &path) {
+            Some(rel) => rel,
+            None => {
+                plan.reject(
+                    relative_lossy(staging, &path),
+                    "non-UTF-8 path cannot be promoted".to_string(),
+                );
+                continue;
+            }
+        };
+        match screen_staged_file(ScreenInput {
+            path: &path,
+            relative: &relative,
+            lstat_size,
+            canonical_staging: &canonical_staging,
+            policy,
+            detector: &detector,
+            redactor,
+            total_bytes: &mut total_bytes,
+        }) {
             Ok(write) => plan.accepted.push(write),
-            Err(reason) => plan.rejections.push(PromotionRejection {
-                relative_path: relative,
-                reason,
-            }),
+            Err(reason) => plan.reject(relative, reason),
         }
     }
     Ok(plan)
 }
 
+/// lstat-walk the staging dir (no symlink following), skipping dot-names.
+/// Carries the lstat size so oversized files can be rejected before any read
+/// (CW-6). Entry count is capped so a hostile dir cannot OOM the walk.
 fn collect_staged_files(
-    base: &Path,
     dir: &Path,
     depth: usize,
-    out: &mut Vec<PathBuf>,
+    visited: &mut usize,
+    out: &mut Vec<(PathBuf, u64)>,
 ) -> Result<(), HarnessError> {
     if depth > MAX_STAGING_DEPTH {
         return Err(HarnessError::PromotionRejected(format!(
             "staging nesting exceeds {MAX_STAGING_DEPTH} levels under {}",
-            base.display()
+            dir.display()
         )));
     }
     let entries = std::fs::read_dir(dir)
         .map_err(|e| HarnessError::io(format!("read {}", dir.display()), e))?;
     for entry in entries {
         let entry = entry.map_err(|e| HarnessError::io("read dir entry", e))?;
+        *visited += 1;
+        if *visited > MAX_STAGING_WALK_ENTRIES {
+            return Err(HarnessError::PromotionRejected(format!(
+                "staging entry count exceeds {MAX_STAGING_WALK_ENTRIES}"
+            )));
+        }
         let path = entry.path();
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.') {
             continue;
         }
+        // DirEntry::metadata is lstat: symlinks are not followed here.
         let metadata = entry
             .metadata()
             .map_err(|e| HarnessError::io(format!("stat {}", path.display()), e))?;
         if metadata.is_dir() {
-            collect_staged_files(base, &path, depth + 1, out)?;
+            collect_staged_files(&path, depth + 1, visited, out)?;
         } else if metadata.is_file() {
-            out.push(path);
+            out.push((path, metadata.len()));
         }
         // Symlinks and other special files are ignored entirely.
     }
     Ok(())
 }
 
-fn relative_display(base: &Path, path: &Path) -> String {
+/// Strict staging-relative path: forward-slash joined, UTF-8 required.
+fn strict_relative(base: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(base).ok()?;
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_str()?.to_string()),
+            _ => return None,
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn relative_lossy(base: &Path, path: &Path) -> String {
     path.strip_prefix(base)
         .unwrap_or(path)
         .to_string_lossy()
-        .replace('\\', "/")
+        .to_string()
 }
 
-fn screen_staged_file(
-    path: &Path,
-    relative: &str,
-    policy: &WriteBackPolicy,
-    detector: &crate::safety::LeakDetector,
-    total_bytes: &mut u64,
-) -> Result<StagedWrite, String> {
-    if relative.split('/').any(|seg| seg.is_empty() || seg == "..") {
-        return Err("path contains an invalid segment".to_string());
+struct ScreenInput<'a> {
+    path: &'a Path,
+    relative: &'a str,
+    lstat_size: u64,
+    canonical_staging: &'a Path,
+    policy: &'a WriteBackPolicy,
+    detector: &'a crate::safety::LeakDetector,
+    redactor: Option<&'a SecretValueRedactor>,
+    total_bytes: &'a mut u64,
+}
+
+fn screen_staged_file(input: ScreenInput<'_>) -> Result<StagedWrite, String> {
+    let relative = normalize_harness_path(input.relative)
+        .map_err(|e| format!("invalid staged path: {e}"))?;
+    if let Some(reason) = write_back_deny_reason(&relative) {
+        return Err(reason.to_string());
     }
-    if is_identity_path(relative) {
-        return Err("identity documents are never writable through write-back".to_string());
-    }
-    if crate::workspace::is_engine_runtime_path(relative)
-        || crate::workspace::is_engine_internal_path(relative)
-    {
-        return Err("engine-managed paths are never writable through write-back".to_string());
-    }
-    if crate::workspace::is_backup_path(relative) {
-        return Err("backup paths are not writable through write-back".to_string());
-    }
-    if !policy.root_allows(relative) {
+    if !input.policy.root_allows(&relative) {
         return Err(format!(
             "path is outside the allowed write-back roots ({})",
-            policy.allowed_roots.join(", ")
+            input.policy.allowed_roots.join(", ")
+        ));
+    }
+    // CW-3: re-verify containment right before reading — the walk used lstat,
+    // but a hostile job could swap an ancestor for a symlink afterwards.
+    let parent = input
+        .path
+        .parent()
+        .ok_or_else(|| "staged path has no parent".to_string())?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("canonicalize parent failed: {e}"))?;
+    if !canonical_parent.starts_with(input.canonical_staging) {
+        return Err("staged path escapes the staging dir".to_string());
+    }
+    if input.lstat_size > input.policy.max_file_bytes {
+        return Err(format!(
+            "file exceeds the {} byte per-file limit",
+            input.policy.max_file_bytes
         ));
     }
 
-    let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
+    let bytes = read_staged_file(input.path, input.policy.max_file_bytes)?;
     let size = bytes.len() as u64;
-    if size > policy.max_file_bytes {
-        return Err(format!(
-            "file exceeds the {} byte per-file limit",
-            policy.max_file_bytes
-        ));
-    }
-    *total_bytes += size;
-    if *total_bytes > policy.max_total_bytes {
+    *input.total_bytes += size;
+    if *input.total_bytes > input.policy.max_total_bytes {
         return Err(format!(
             "write-back total exceeds the {} byte limit",
-            policy.max_total_bytes
+            input.policy.max_total_bytes
         ));
     }
     let content = String::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())?;
-    let scan = detector.scan(&content);
+    let scan = input.detector.scan(&content);
     if !scan.is_clean() {
         return Err("secret pattern detected by leak scan".to_string());
     }
+    if let Some(redactor) = input.redactor
+        && redactor.contains_secret(&content)
+    {
+        return Err("content embeds a mounted worker secret value".to_string());
+    }
     Ok(StagedWrite {
-        relative_path: relative.to_string(),
+        relative_path: relative,
         sha256: sha256_hex(content.as_bytes()),
         size_bytes: size,
         content,
     })
+}
+
+/// Bounded, symlink-safe read of one staged file (CW-3d, CW-6):
+/// `O_NOFOLLOW|O_NONBLOCK` open (a dangling symlink or fifo fails instead of
+/// being followed or blocking), fstat confirms a regular file within the size
+/// limit, and the read itself is capped at `max_bytes + 1`.
+#[cfg(unix)]
+fn read_staged_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("open failed: {e}"))?;
+    let metadata = file.metadata().map_err(|e| format!("fstat failed: {e}"))?;
+    if !metadata.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    if metadata.size() > max_bytes {
+        return Err(format!("file exceeds the {max_bytes} byte per-file limit"));
+    }
+    let mut limited = file.take(max_bytes + 1);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("file exceeds the {max_bytes} byte per-file limit"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_staged_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("open failed: {e}"))?;
+    let metadata = file.metadata().map_err(|e| format!("stat failed: {e}"))?;
+    if !metadata.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let mut limited = file.take(max_bytes + 1);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("file exceeds the {max_bytes} byte per-file limit"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -720,11 +1191,70 @@ mod tests {
     }
 
     #[test]
+    fn secret_file_names_reject_env_denylist_and_reserved_prefixes() {
+        // CV-4: LD_PRELOAD/PATH-style names would echo values into job events
+        // via loader/shell behavior.
+        for denied in ["LD_PRELOAD", "PATH", "LD_LIBRARY_PATH", "BASH_ENV", "HOME"] {
+            assert!(
+                validate_secret_file_name(denied).is_err(),
+                "{denied} must be rejected"
+            );
+        }
+        for reserved in ["LUNARWING_TOKEN", "IRONCLAW_JOB_ID"] {
+            assert!(
+                validate_secret_file_name(reserved).is_err(),
+                "{reserved} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn identity_files_detected_by_name_at_any_depth() {
-        assert!(is_identity_path("SOUL.md"));
-        assert!(is_identity_path("docs/USER.md"));
+        // CW-14: the full workspace identity set, not just SOUL/USER/IDENTITY.
+        for name in [
+            "SOUL.md",
+            "USER.md",
+            "IDENTITY.md",
+            "AGENTS.md",
+            "TOOLS.md",
+            "BOOTSTRAP.md",
+        ] {
+            assert!(is_identity_path(name), "{name} at root");
+            assert!(is_identity_path(&format!("docs/{name}")), "{name} nested");
+        }
         assert!(!is_identity_path("projects/x/SOUL.md.txt"));
         assert!(!is_identity_path("MEMORY.md"));
+    }
+
+    #[test]
+    fn harness_paths_reject_noncanonical_forms() {
+        // CW-2/CW-5: paths are checked AFTER normalization and must already
+        // be canonical (normalized == raw).
+        for bad in [
+            " SOUL.md",
+            "SOUL.md\t",
+            "IDENTITY.md ",
+            "\u{3000}USER.md",
+            " engine",
+            "\u{a0}backups",
+            "SOUL.md\n",
+            "a//b",
+            "./MEMORY.md",
+            "projects/../MEMORY.md",
+            "/absolute.md",
+            "back\\slash.md",
+            "projects/\u{7}bell.md",
+        ] {
+            assert!(
+                normalize_harness_path(bad).is_err(),
+                "'{bad}' must be rejected"
+            );
+        }
+        assert_eq!(
+            normalize_harness_path("projects/demo/notes.md").unwrap(),
+            "projects/demo/notes.md"
+        );
+        assert_eq!(normalize_harness_path("MEMORY.md").unwrap(), "MEMORY.md");
     }
 
     #[test]
@@ -750,6 +1280,27 @@ mod tests {
     }
 
     #[test]
+    fn injection_denies_engine_backup_and_quarantined_sources() {
+        // CW-5: these stay denied even with the identity opt-in set.
+        for source in [
+            "backups/SOUL.md.bak",
+            "engine/.runtime/state.json",
+            "engine/projects/p/missions/m/mission.json",
+            "daily/2026-10-10.poisoned-1.md",
+        ] {
+            let options = HarnessJobOptions {
+                injections: vec![InjectionSpec::new(source)],
+                allow_identity_injection: true,
+                ..Default::default()
+            };
+            assert!(
+                options.validate().is_err(),
+                "'{source}' must never be injectable"
+            );
+        }
+    }
+
+    #[test]
     fn options_reject_identity_injection_without_opt_in() {
         let options = HarnessJobOptions {
             injections: vec![InjectionSpec::new("SOUL.md")],
@@ -762,6 +1313,15 @@ mod tests {
             ..options
         };
         assert!(opted_in.validate().is_ok());
+
+        // Whitespace-padded identity sources are rejected before the opt-in
+        // check, so they cannot smuggle identity content past it (CW-5).
+        let padded = HarnessJobOptions {
+            injections: vec![InjectionSpec::new(" SOUL.md")],
+            allow_identity_injection: true,
+            ..Default::default()
+        };
+        assert!(padded.validate().is_err());
     }
 
     #[test]
@@ -783,49 +1343,89 @@ mod tests {
     }
 
     #[test]
+    fn options_reject_duplicate_secret_names_and_file_names() {
+        // CV-10: duplicate mounts make delivery ambiguous.
+        let dup_file = HarnessJobOptions {
+            worker_secrets: vec![
+                SecretFileMount::new("secret_a", "API_KEY"),
+                SecretFileMount::new("secret_b", "API_KEY"),
+            ],
+            ..Default::default()
+        };
+        assert!(dup_file.validate().is_err());
+
+        let dup_name = HarnessJobOptions {
+            worker_secrets: vec![
+                SecretFileMount::new("secret_a", "KEY_A"),
+                SecretFileMount::new("secret_a", "KEY_B"),
+            ],
+            ..Default::default()
+        };
+        assert!(dup_name.validate().is_err());
+    }
+
+    #[test]
     fn write_back_policy_defaults_and_validation() {
         let policy = WriteBackPolicy::default();
         assert!(policy.validate().is_ok());
         assert!(policy.root_allows("projects/x/result.md"));
         assert!(!policy.root_allows("MEMORY.md"));
-
-        let mut bad = policy.clone();
-        bad.allowed_roots = vec!["../escape/".to_string()];
-        assert!(bad.validate().is_err());
-
-        let mut empty = policy.clone();
-        empty.allowed_roots = vec![];
-        assert!(empty.validate().is_err());
     }
 
     #[test]
-    fn secrets_tar_contains_files_with_restrictive_modes() {
-        let files = vec![ResolvedSecretFile::new(
-            "API_KEY",
-            SecretString::from("s3cret".to_string()),
-        )];
-        let tar_bytes = build_secrets_tar(&files).unwrap();
-        let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        let entries: Vec<_> = archive.entries().unwrap().collect();
-        assert_eq!(entries.len(), 1);
-        let entry = entries.into_iter().next().unwrap().unwrap();
-        assert_eq!(entry.path().unwrap().to_string_lossy(), "API_KEY");
-        assert_eq!(entry.header().mode().unwrap(), 0o440);
-        assert_eq!(entry.header().size().unwrap(), 6);
+    fn write_back_roots_may_only_narrow_the_fixed_set() {
+        // CW-1: the LLM may narrow `projects/` but never widen or replace it.
+        for bad_root in [
+            "AGENTS.md",
+            "HEARTBEAT.md",
+            "MEMORY.md",
+            "../escape/",
+            "/absolute",
+            "engine",
+            "backups",
+            "daily",
+            "context",
+            "lorebooks",
+            "projects/..",
+            " projects",
+            "projects ",
+        ] {
+            let mut policy = WriteBackPolicy::default();
+            policy.allowed_roots = vec![bad_root.to_string()];
+            assert!(policy.validate().is_err(), "root '{bad_root}' must fail");
+        }
+        let mut narrowed = WriteBackPolicy::default();
+        narrowed.allowed_roots = vec!["projects/demo".to_string()];
+        assert!(narrowed.validate().is_ok());
+        assert!(narrowed.root_allows("projects/demo/out.md"));
+        assert!(!narrowed.root_allows("projects/other/out.md"));
     }
 
     #[test]
-    fn secrets_tar_rejects_oversized_values() {
-        let files = vec![ResolvedSecretFile::new(
-            "BIG",
-            SecretString::from("x".repeat(MAX_SECRET_BYTES + 1)),
-        )];
-        assert!(build_secrets_tar(&files).is_err());
+    fn write_back_limits_have_server_side_ceilings() {
+        // CW-6: the caller may lower limits but never raise them past ceilings.
+        let mut policy = WriteBackPolicy::default();
+        policy.max_files = WRITE_BACK_MAX_FILES_CEILING + 1;
+        assert!(policy.validate().is_err());
+        let mut policy = WriteBackPolicy::default();
+        policy.max_file_bytes = WRITE_BACK_MAX_FILE_BYTES_CEILING + 1;
+        assert!(policy.validate().is_err());
+        let mut policy = WriteBackPolicy::default();
+        policy.max_total_bytes = WRITE_BACK_MAX_TOTAL_BYTES_CEILING + 1;
+        assert!(policy.validate().is_err());
+        let mut policy = WriteBackPolicy::default();
+        policy.max_files = 0;
+        assert!(policy.validate().is_err());
+        let mut lowered = WriteBackPolicy::default();
+        lowered.max_files = 1;
+        lowered.max_file_bytes = 1024;
+        lowered.max_total_bytes = 2048;
+        assert!(lowered.validate().is_ok());
     }
 
     #[test]
     fn injection_dir_writes_files_readonly_with_manifest() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
         let dir = tmp.path().join("injected");
         let entries = vec![InjectionEntry {
             source_path: "MEMORY.md".to_string(),
@@ -833,28 +1433,64 @@ mod tests {
             content: "# Memory".to_string(),
         }];
         let job_id = Uuid::new_v4();
-        let manifest = write_injection_dir(&dir, job_id, &entries).unwrap();
+        let manifest = write_injection_dir(&dir, job_id, &entries).unwrap(); // safety: test
 
         assert_eq!(manifest.job_id, job_id);
         assert_eq!(manifest.files.len(), 1);
         assert_eq!(manifest.files[0].source_path, "MEMORY.md");
         assert_eq!(manifest.files[0].sha256, sha256_hex(b"# Memory"));
 
-        let written = std::fs::read_to_string(dir.join("memory.md")).unwrap();
+        let written_path = dir.join("memory.md");
+        let written = std::fs::read_to_string(&written_path).unwrap(); // safety: test
         assert_eq!(written, "# Memory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&written_path)
+                .unwrap() // safety: test
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o444, "injected files must be read-only");
+        }
         let manifest_on_disk: InjectionManifest = serde_json::from_str(
-            &std::fs::read_to_string(dir.join(INJECTION_MANIFEST_NAME)).unwrap(),
+            &std::fs::read_to_string(dir.join(INJECTION_MANIFEST_NAME)).unwrap(), // safety: test
         )
-        .unwrap();
+        .unwrap(); // safety: test
         assert_eq!(manifest_on_disk.files.len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn injection_write_refuses_preexisting_target() {
+        // CW-3f: create_new + O_NOFOLLOW means a planted file or symlink at
+        // the target aborts the injection instead of being clobbered.
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let dir = tmp.path().join("injected");
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        let outside = tmp.path().join("host.md");
+        std::fs::write(&outside, "host").unwrap(); // safety: test
+        std::os::unix::fs::symlink(&outside, dir.join("link.md")).unwrap(); // safety: test
+        let entries = vec![InjectionEntry {
+            source_path: "MEMORY.md".to_string(),
+            target_name: "link.md".to_string(),
+            content: "injected".to_string(),
+        }];
+        let result = write_injection_dir(&dir, Uuid::new_v4(), &entries);
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(), // safety: test
+            "host",
+            "symlink target must not be clobbered"
+        );
+    }
+
     fn staging_with(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
         for (rel, content) in files {
             let path = tmp.path().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, content).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap(); // safety: test
+            std::fs::write(path, content).unwrap(); // safety: test
         }
         tmp
     }
@@ -868,7 +1504,7 @@ mod tests {
             ("engine/projects/x/missions/m/mission.json", "{}"),
             ("random.txt", "outside roots"),
         ]);
-        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default()).unwrap();
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
 
         assert_eq!(plan.accepted.len(), 1);
         assert_eq!(plan.accepted[0].relative_path, "projects/demo/out.md");
@@ -886,12 +1522,70 @@ mod tests {
     }
 
     #[test]
+    fn promotion_hard_denies_identity_and_reserved_paths_under_allowed_roots() {
+        // Non-vacuous guard coverage (MR !1510 review): these live UNDER the
+        // allowed root, so only the hard-deny checks can stop them.
+        let tmp = staging_with(&[
+            ("projects/demo/SOUL.md", "identity by basename"),
+            ("projects/demo/USER.md", "identity by basename"),
+            ("projects/demo/AGENTS.md", "identity by basename"),
+        ]);
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
+        assert!(plan.accepted.is_empty());
+        assert_eq!(plan.rejections.len(), 3);
+        assert!(
+            plan.rejections
+                .iter()
+                .all(|r| r.reason.contains("identity"))
+        );
+    }
+
+    #[test]
+    fn promotion_hard_denies_prompt_daily_lorebook_context_backup_paths() {
+        // CW-1: with any roots, these are never writable. Root check would
+        // also reject them, so deny the full set explicitly via the deny fn.
+        for denied in [
+            "MEMORY.md",
+            "HEARTBEAT.md",
+            "AGENTS.md",
+            "BOOTSTRAP.md",
+            "context/assistant-directives.md",
+            "context/profile.json",
+            "lorebooks/core.json",
+            "daily/2026-10-10.md",
+            "daily/2026-10-10.poisoned-1.md",
+            "backups/MEMORY.md.bak",
+            "engine/projects/p/missions/m/mission.json",
+        ] {
+            assert!(
+                write_back_deny_reason(denied).is_some(),
+                "'{denied}' must be hard-denied"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_rejects_whitespace_aliased_staged_names() {
+        // CW-2: a staged name whose segments carry leading/trailing
+        // whitespace normalizes onto a denied target; it must be rejected on
+        // the raw path, before any workspace write can trim it.
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        std::fs::write(dir.join(" SOUL.md"), "aliased identity").unwrap(); // safety: test
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
+        assert!(plan.accepted.is_empty());
+        assert_eq!(plan.rejections.len(), 1);
+        assert!(plan.rejections[0].reason.contains("invalid staged path"));
+    }
+
+    #[test]
     fn promotion_rejects_secret_content_and_enforces_limits() {
         let tmp = staging_with(&[
             ("projects/a.md", "plain"),
             ("projects/leak.md", "aws key AKIAIOSFODNN7EXAMPLE here"),
         ]);
-        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default()).unwrap();
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
         assert_eq!(plan.accepted.len(), 1);
         assert_eq!(plan.accepted[0].relative_path, "projects/a.md");
         assert!(
@@ -901,44 +1595,209 @@ mod tests {
         );
 
         let tmp2 = staging_with(&[("projects/big.md", &"x".repeat(300 * 1024))]);
-        let plan2 = plan_promotion(tmp2.path(), &WriteBackPolicy::default()).unwrap();
+        let plan2 = plan_promotion(tmp2.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
         assert!(plan2.accepted.is_empty());
         assert!(plan2.rejections[0].reason.contains("per-file limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_rejects_oversized_sparse_file_before_reading() {
+        // CW-6: the lstat size pre-check rejects oversized files before any
+        // content is read into daemon memory.
+        use std::io::Seek;
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        let mut file = std::fs::File::create(dir.join("sparse.md")).unwrap(); // safety: test
+        file.seek(std::io::SeekFrom::Start(512 * 1024)).unwrap(); // safety: test
+        file.write_all(b"end").unwrap(); // safety: test
+        drop(file);
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
+        assert!(plan.accepted.is_empty());
+        assert!(plan.rejections[0].reason.contains("per-file limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_never_follows_symlinks() {
+        // CW-3d: symlinks are invisible to the walk and unopenable to the
+        // reader; a symlink pointing outside staging must not be promoted.
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "host secret-free content").unwrap(); // safety: test
+        let staging = tmp.path().join("staging");
+        let dir = staging.join("projects");
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        std::os::unix::fs::symlink(&outside, dir.join("link.md")).unwrap(); // safety: test
+        std::os::unix::fs::symlink(tmp.path(), staging.join("projects_link")).unwrap(); // safety: test
+        let plan = plan_promotion(&staging, &WriteBackPolicy::default(), None).unwrap(); // safety: test
+        assert!(plan.accepted.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_rejects_fifos_without_hanging() {
+        // CW-3d: a fifo must fail fast (O_NONBLOCK), never block the daemon.
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        let fifo = dir.join("pipe.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap(); // safety: test
+        let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }; // safety: test fifo creation
+        assert_eq!(created, 0);
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
+        assert!(plan.accepted.is_empty());
+    }
+
+    #[test]
+    fn promotion_rejects_staged_content_embedding_mounted_secrets() {
+        // CW-10: the job's own mounted secret values are scanned in addition
+        // to pattern-based leak detection.
+        let tmp = staging_with(&[
+            ("projects/clean.md", "no secrets here"),
+            ("projects/dirty.md", "token: ghp_abcdefghijklmnop12345"),
+        ]);
+        let values = vec![SecretString::from("ghp_abcdefghijklmnop12345".to_string())];
+        let redactor = SecretValueRedactor::new(&values);
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor))
+            .unwrap(); // safety: test
+        assert_eq!(plan.accepted.len(), 1);
+        assert_eq!(plan.accepted[0].relative_path, "projects/clean.md");
+        assert!(
+            plan.rejections
+                .iter()
+                .any(|r| r.relative_path == "projects/dirty.md"
+                    && r.reason.contains("worker secret"))
+        );
     }
 
     #[test]
     fn promotion_ignores_hidden_and_missing_staging() {
         let tmp = staging_with(&[(".hidden", "ignored"), ("projects/ok.md", "fine")]);
-        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default()).unwrap();
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
         assert_eq!(plan.accepted.len(), 1);
 
-        let missing = tempfile::tempdir().unwrap();
+        let missing = tempfile::tempdir().unwrap(); // safety: test
         let plan = plan_promotion(
             &missing.path().join("does-not-exist"),
             &WriteBackPolicy::default(),
+            None,
         )
-        .unwrap();
+        .unwrap(); // safety: test
         assert!(plan.accepted.is_empty());
         assert!(plan.rejections.is_empty());
     }
 
     #[test]
     fn promotion_rejects_non_utf8() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
         let dir = tmp.path().join("projects");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("bin.md"), [0xff, 0xfe, 0xfd]).unwrap();
-        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        std::fs::write(dir.join("bin.md"), [0xff, 0xfe, 0xfd]).unwrap(); // safety: test
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
         assert!(plan.accepted.is_empty());
         assert_eq!(plan.rejections[0].reason, "not valid UTF-8");
     }
 
     #[test]
-    fn harness_dirs_live_under_projects_base() {
+    fn promotion_caps_walk_depth_and_rejection_list() {
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let mut deep = tmp.path().to_path_buf();
+        for level in 0..10 {
+            deep = deep.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap(); // safety: test
+        std::fs::write(deep.join("leaf.md"), "too deep").unwrap(); // safety: test
+        let result = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None);
+        assert!(result.is_err(), "depth cap must fail the plan");
+    }
+
+    #[test]
+    fn redactor_scrubs_exact_base64_and_url_encoded_values() {
+        use base64::Engine;
+        let value = "sk-live-abcdef1234567890";
+        let values = vec![SecretString::from(value.to_string())];
+        let redactor = SecretValueRedactor::new(&values);
+        assert!(redactor.is_armed());
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(value);
+        let url = urlencoding::encode(value).into_owned();
+        for variant in [value.to_string(), b64, url] {
+            let scrubbed = redactor.scrub(&format!("prefix {variant} suffix"));
+            assert!(!scrubbed.contains(&variant), "variant must be scrubbed");
+            assert!(scrubbed.contains("[redacted-secret]"));
+        }
+        assert!(redactor.contains_secret(value));
+        assert!(!redactor.contains_secret("unrelated content"));
+    }
+
+    #[test]
+    fn redactor_skips_short_values() {
+        let values = vec![SecretString::from("short".to_string())];
+        let redactor = SecretValueRedactor::new(&values);
+        assert!(!redactor.is_armed());
+        assert_eq!(redactor.scrub("a short story"), "a short story");
+    }
+
+    #[test]
+    fn redactor_scrubs_json_recursively() {
+        let values = vec![SecretString::from("tok_1234567890abcdef".to_string())];
+        let redactor = SecretValueRedactor::new(&values);
+        let mut event = serde_json::json!({
+            "output": "leaked tok_1234567890abcdef here",
+            "nested": ["tok_1234567890abcdef"],
+            "count": 3,
+        });
+        redactor.scrub_json(&mut event);
+        let text = event.to_string();
+        assert!(!text.contains("tok_1234567890abcdef"));
+        assert_eq!(event["count"], 3);
+    }
+
+    #[test]
+    fn harness_dirs_live_outside_projects_base() {
+        // CW-3: harness state must not sit under the bind-mountable projects
+        // base, or any job with an explicit project_dir could mount it RW.
         let job_id = Uuid::new_v4();
-        let base = lunarwing_base_dir().join("projects");
-        assert!(harness_job_dir(job_id).starts_with(base.join(".harness")));
+        let projects_base = lunarwing_base_dir().join("projects");
+        assert!(!harness_job_dir(job_id).starts_with(&projects_base));
+        assert!(harness_job_dir(job_id).starts_with(harness_base_dir()));
         assert!(injection_dir(job_id).ends_with("injected"));
         assert!(staging_dir(job_id).ends_with("workspace_out"));
+    }
+
+    #[test]
+    fn sweep_removes_only_dirs_for_non_live_jobs() {
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let live = Uuid::new_v4();
+        let stale_a = Uuid::new_v4();
+        let stale_b = Uuid::new_v4();
+        for id in [live, stale_a, stale_b] {
+            std::fs::create_dir_all(tmp.path().join(id.to_string())).unwrap(); // safety: test
+        }
+
+        // Zero grace: every non-live dir is old enough to sweep.
+        let live_set = std::collections::HashSet::from([live]);
+        let removed =
+            sweep_harness_dirs_in(tmp.path(), &live_set, std::time::Duration::ZERO);
+        assert_eq!(removed, 2);
+        assert!(tmp.path().join(live.to_string()).exists());
+        assert!(!tmp.path().join(stale_a.to_string()).exists());
+        assert!(!tmp.path().join(stale_b.to_string()).exists());
+
+        // Huge grace: freshly created dirs are all kept.
+        for id in [stale_a, stale_b] {
+            std::fs::create_dir_all(tmp.path().join(id.to_string())).unwrap(); // safety: test
+        }
+        let removed = sweep_harness_dirs_in(
+            tmp.path(),
+            &std::collections::HashSet::new(),
+            std::time::Duration::from_secs(86_400),
+        );
+        assert_eq!(removed, 0);
+        assert!(tmp.path().join(stale_a.to_string()).exists());
     }
 }
