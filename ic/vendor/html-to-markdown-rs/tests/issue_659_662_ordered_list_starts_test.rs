@@ -5,8 +5,10 @@
 //! (issue #659), and a nested ordered list that does not start at 1 starts after a blank line
 //! when it follows the text of its item (issue #662).
 
+#[cfg(feature = "testkit")]
+use html_to_markdown_rs::OutputFormat;
 use html_to_markdown_rs::options::ListIndentType;
-use html_to_markdown_rs::{ConversionOptions, OutputFormat, TierStrategy, convert};
+use html_to_markdown_rs::{ConversionOptions, TierStrategy, convert};
 
 fn tier2_options() -> ConversionOptions {
     ConversionOptions {
@@ -40,6 +42,7 @@ fn assert_converts(html: &str, options: &ConversionOptions, expected: &str, rend
     }
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_keep_the_number_of_a_task_item_in_an_ordered_list() {
     for strategy in [TierStrategy::Tier2, TierStrategy::Auto, TierStrategy::Tier1] {
@@ -79,6 +82,7 @@ fn should_keep_the_number_of_a_task_item_in_an_ordered_list() {
 // ~keep Djot has task items only in bullet lists: a list item that begins with `[ ]` or `[x]`
 // ~keep after a `-`, `*` or `+` marker is a task (djot syntax.md, "Task list item"). After a
 // ~keep number the checkbox is the item's text, so an ordered task item keeps the bullet.
+#[cfg(feature = "testkit")]
 #[test]
 fn should_keep_the_bullet_of_an_ordered_task_item_in_djot() {
     for strategy in [TierStrategy::Tier2, TierStrategy::Auto, TierStrategy::Tier1] {
@@ -142,6 +146,7 @@ fn should_start_the_content_of_an_ordered_task_item_at_its_content_column() {
     );
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_start_a_nested_ordered_list_that_does_not_start_at_one_after_a_blank_line() {
     for strategy in [TierStrategy::Tier2, TierStrategy::Auto, TierStrategy::Tier1] {

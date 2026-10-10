@@ -7,7 +7,7 @@
 //! - Preserves code blocks (indented or fenced) while removing empty content
 //! - Manages trailing whitespace intelligently
 
-use crate::options::ConversionOptions;
+use crate::converter::block::container::HandlerContext;
 #[cfg(feature = "visitor")]
 use std::borrow::Cow;
 use tl::{NodeHandle, Parser};
@@ -34,16 +34,15 @@ type DomContext = crate::converter::DomContext;
 /// Code blocks (identified by markdown formatting) are always preserved,
 /// even if they appear "empty" according to `trim()`.
 #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-pub fn handle(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle(node_handle: &NodeHandle, parser: &Parser, output: &mut String, handler: HandlerContext<'_>) {
     use crate::converter::walk_node;
+
+    let HandlerContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = handler;
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -53,46 +52,8 @@ pub fn handle(
     };
 
     #[cfg(feature = "visitor")]
-    if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::converter::utility::serialization::serialize_tag_to_html;
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-        let tag_name = tag.name().as_utf8_str();
-        let raw_html = serialize_tag_to_html(node_handle, parser);
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-        let node_ctx = NodeContext::with_lazy_attributes(
-            NodeType::Custom,
-            Cow::Borrowed(tag_name.as_ref()),
-            tag,
-            depth,
-            index_in_parent,
-            parent_tag.map(Cow::Borrowed),
-            false,
-        );
-        let visit_result = {
-            let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-            visitor.visit_custom_element(&node_ctx, &tag_name, &raw_html)
-        };
-        match visit_result {
-            VisitResult::Continue => {}
-            VisitResult::Skip => return,
-            VisitResult::Custom(custom) => {
-                output.push_str(&custom);
-                return;
-            }
-            VisitResult::PreserveHtml => {
-                output.push_str(&raw_html);
-                return;
-            }
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                return;
-            }
-        }
+    if visit_unknown(node_handle, parser, output, tag, handler) {
+        return;
     }
 
     let len_before = output.len();
@@ -101,7 +62,12 @@ pub fn handle(
     let children = tag.children();
     {
         for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+            walk_node(
+                child_handle,
+                parser,
+                output,
+                crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
+            );
         }
     }
 
@@ -129,6 +95,58 @@ pub fn handle(
             if !had_trailing_space && added_content.contains(' ') {
                 output.push(' ');
             }
+        }
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn visit_unknown(
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    output: &mut String,
+    tag: &tl::HTMLTag<'_>,
+    handler: HandlerContext<'_>,
+) -> bool {
+    use crate::converter::utility::serialization::serialize_tag_to_html;
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let Some(ref visitor_handle) = handler.ctx.visitor else {
+        return false;
+    };
+    let tag_name = tag.name().as_utf8_str();
+    let raw_html = serialize_tag_to_html(node_handle, parser);
+    let node_id = node_handle.get_inner();
+    let parent_tag = handler.dom_ctx.parent_tag_name(node_id, parser);
+    let index_in_parent = handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0);
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Custom,
+        Cow::Borrowed(tag_name.as_ref()),
+        tag,
+        handler.depth,
+        index_in_parent,
+        parent_tag.map(Cow::Borrowed),
+        false,
+    );
+    let visit_result = {
+        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
+        visitor.visit_custom_element(&node_ctx, &tag_name, &raw_html)
+    };
+    match visit_result {
+        VisitResult::Continue => false,
+        VisitResult::Skip => true,
+        VisitResult::Custom(custom) => {
+            output.push_str(&custom);
+            true
+        }
+        VisitResult::PreserveHtml => {
+            output.push_str(&raw_html);
+            true
+        }
+        VisitResult::Error(err) => {
+            if handler.ctx.visitor_error.borrow().is_none() {
+                *handler.ctx.visitor_error.borrow_mut() = Some(err);
+            }
+            true
         }
     }
 }

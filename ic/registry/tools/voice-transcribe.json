@@ -2,7 +2,7 @@
   "name": "voice-transcribe",
   "display_name": "Voice Transcribe",
   "kind": "tool",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "wit_version": "0.3.0",
   "description": "Transcribe base64 audio locally through the LunarVoice ONNX sidecar.",
   "keywords": ["voice", "audio", "transcription", "speech-to-text", "lunarvoice"],

@@ -5,14 +5,14 @@
 //! - Strikethrough (del, s tags) with ~~ syntax
 //! - Inserted/underlined text (ins, u tags) with == syntax
 
-use crate::converter::inline::wrapped::{InlineDelimiters, InlineSite, emit_wrapped_inline};
+use crate::converter::inline::{
+    HandlerContext,
+    wrapped::{InlineDelimiters, InlineSite, emit_first_block_wrapped, emit_wrapped_inline},
+};
 use crate::options::{ConversionOptions, OutputFormat};
 #[cfg(feature = "visitor")]
 use std::borrow::Cow;
-use tl::{NodeHandle, Parser};
-
 type Context = crate::converter::Context;
-type DomContext = crate::converter::DomContext;
 
 /// Handle mark (highlight) element with configurable styles.
 ///
@@ -21,19 +21,21 @@ type DomContext = crate::converter::DomContext;
 /// - Html: `<mark>highlighted</mark>`
 /// - Bold: `**highlighted**`
 /// - None: just pass through content
-pub fn handle_mark(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_mark(handler: HandlerContext<'_>) {
     // ~keep reason: serialize_node is only used when the visitor feature is active;
     // ~keep walk_node depends on feature-gated code paths.
     #[allow(unused_imports)]
     use crate::converter::{get_text_content, serialize_node, walk_node};
+
+    let HandlerContext {
+        node_handle,
+        parser,
+        output,
+        options,
+        context: ctx,
+        depth,
+        dom_context: dom_ctx,
+    } = handler;
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -41,58 +43,28 @@ pub fn handle_mark(
         tl::Node::Tag(tag) => tag,
         _ => return,
     };
-
-    #[cfg(feature = "visitor")]
-    let mark_output = if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-        let text_content = get_text_content(node_handle, parser, dom_ctx);
-
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-        let node_ctx = NodeContext::with_lazy_attributes(
-            NodeType::Mark,
-            tag.name().as_utf8_str(),
-            tag,
-            depth,
-            index_in_parent,
-            parent_tag.map(Cow::Borrowed),
-            true,
-        );
-
-        let visit_result = {
-            let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-            visitor.visit_mark(&node_ctx, &text_content)
-        };
-        match visit_result {
-            VisitResult::Continue => None,
-            VisitResult::Custom(custom) => Some(custom),
-            VisitResult::Skip => Some(String::new()),
-            VisitResult::PreserveHtml => Some(serialize_node(node_handle, parser)),
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                None
-            }
-        }
-    } else {
-        None
+    let site = InlineSite {
+        node_handle,
+        parser,
+        dom_ctx,
+        ctx,
+        options,
     };
 
     #[cfg(feature = "visitor")]
-    if let Some(custom_output) = mark_output {
-        output.push_str(&custom_output);
-        return;
+    if let Some(outcome) = visit_semantic(tag, SemanticKind::Mark, depth, site) {
+        match outcome {
+            VisitorOutcome::Continue => {}
+            VisitorOutcome::Output(custom_output) => {
+                output.push_str(&custom_output);
+                return;
+            }
+            VisitorOutcome::Skip => return,
+        }
     }
 
     if ctx.convert_as_inline {
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-        }
+        walk_children(tag, output, ctx, depth, site);
         return;
     }
 
@@ -105,20 +77,18 @@ pub fn handle_mark(
         ..ctx.inline_buffer(output, options.highlight_style != HighlightStyle::None)
     };
     let mut content = String::with_capacity(32);
-    let children = tag.children();
-    for child_handle in children.top().iter() {
-        walk_node(
-            child_handle,
-            parser,
-            &mut content,
-            options,
-            &child_ctx,
-            depth + 1,
-            dom_ctx,
-        );
-    }
+    walk_children(tag, &mut content, &child_ctx, depth, site);
 
     let (open, close, merge_symbol) = resolve_mark_delimiters(options);
+    // ~keep Markdown delimiters hoist edge whitespace, but raw HTML must preserve the source boundary exactly (#744).
+    if options.highlight_style == HighlightStyle::Html {
+        if !content.is_empty() {
+            output.push_str(&open);
+            output.push_str(&content);
+            output.push_str(&close);
+        }
+        return;
+    }
     emit_wrapped_inline(
         output,
         &content,
@@ -128,13 +98,19 @@ pub fn handle_mark(
             merge_symbol,
             sibling_tag_names: &MARK_SIBLING_TAGS,
         },
-        InlineSite {
-            node_handle,
-            parser,
-            dom_ctx,
-            ctx,
-        },
+        site,
     );
+}
+
+fn walk_children(tag: &tl::HTMLTag<'_>, output: &mut String, context: &Context, depth: usize, site: InlineSite<'_>) {
+    for child_handle in tag.children().top().iter() {
+        crate::converter::walk_node(
+            child_handle,
+            site.parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(site.options, context, depth + 1, site.dom_ctx),
+        );
+    }
 }
 
 /// Resolve `<mark>`'s wrapping pair, and the character it can merge a delimiter run with.
@@ -175,63 +151,33 @@ const MARK_SIBLING_TAGS: [&str; 1] = ["mark"];
 
 /// Resolve `<del>`/`<s>`/`<strike>`'s wrapping delimiters for the current output format,
 /// then emit via [`emit_wrapped_inline`].
-fn emit_strikethrough_wrapped(
-    output: &mut String,
-    content: &str,
-    options: &ConversionOptions,
-    ctx: &Context,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    dom_ctx: &DomContext,
-) {
-    if options.output_format == OutputFormat::Djot {
-        emit_wrapped_inline(
-            output,
-            content,
-            &InlineDelimiters {
-                open: "{-",
-                close: "-}",
-                merge_symbol: None,
-                sibling_tag_names: &STRIKETHROUGH_SIBLING_TAGS,
-            },
-            InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
-                ctx,
-            },
-        );
+fn emit_strikethrough_wrapped(output: &mut String, content: &str, site: InlineSite<'_>) {
+    let options = site.options;
+    let (open, close, merge_symbol) = if options.output_format == OutputFormat::Djot {
+        ("{-", "-}", None)
     } else {
-        emit_wrapped_inline(
-            output,
-            content,
-            &InlineDelimiters {
-                open: "~~",
-                close: "~~",
-                merge_symbol: Some('~'),
-                sibling_tag_names: &STRIKETHROUGH_SIBLING_TAGS,
-            },
-            InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
-                ctx,
-            },
-        );
+        ("~~", "~~", Some('~'))
+    };
+    if emit_first_block_wrapped(output, content, open, close, site.ctx, site.parser) {
+        return;
     }
+    emit_wrapped_inline(
+        output,
+        content,
+        &InlineDelimiters {
+            open,
+            close,
+            merge_symbol,
+            sibling_tag_names: &STRIKETHROUGH_SIBLING_TAGS,
+        },
+        site,
+    );
 }
 
 /// Resolve `<ins>`'s wrapping delimiters for the current output format, then emit via
 /// [`emit_wrapped_inline`].
-fn emit_inserted_wrapped(
-    output: &mut String,
-    content: &str,
-    options: &ConversionOptions,
-    ctx: &Context,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    dom_ctx: &DomContext,
-) {
+fn emit_inserted_wrapped(output: &mut String, content: &str, site: InlineSite<'_>) {
+    let options = site.options;
     if options.output_format == OutputFormat::Djot {
         emit_wrapped_inline(
             output,
@@ -242,12 +188,7 @@ fn emit_inserted_wrapped(
                 merge_symbol: None,
                 sibling_tag_names: &INSERTED_SIBLING_TAGS,
             },
-            InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
-                ctx,
-            },
+            site,
         );
     } else {
         emit_wrapped_inline(
@@ -259,12 +200,7 @@ fn emit_inserted_wrapped(
                 merge_symbol: Some('='),
                 sibling_tag_names: &INSERTED_SIBLING_TAGS,
             },
-            InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
-                ctx,
-            },
+            site,
         );
     }
 }
@@ -276,17 +212,19 @@ fn emit_inserted_wrapped(
 // ~keep reason: some parameters are only used when the visitor feature is active;
 // ~keep using cfg_attr here is equivalent but more verbose given the function signature.
 #[allow(unused_variables)]
-pub fn handle_strikethrough(
-    tag_name: &str,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_strikethrough(tag_name: &str, handler: HandlerContext<'_>) {
     use crate::converter::walk_node;
+
+    let site = handler.inline_site();
+    let HandlerContext {
+        node_handle,
+        parser,
+        output,
+        options,
+        context: ctx,
+        depth,
+        dom_context: dom_ctx,
+    } = handler;
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -298,7 +236,12 @@ pub fn handle_strikethrough(
     if ctx.in_code {
         let children = tag.children();
         for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+            walk_node(
+                child_handle,
+                parser,
+                output,
+                crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
+            );
         }
     } else {
         let mut content = String::with_capacity(32);
@@ -309,83 +252,40 @@ pub fn handle_strikethrough(
                 child_handle,
                 parser,
                 &mut content,
-                options,
-                &marker_ctx,
-                depth + 1,
-                dom_ctx,
+                crate::converter::block::container::HandlerContext::new(options, &marker_ctx, depth + 1, dom_ctx),
             );
         }
 
         #[cfg(feature = "visitor")]
-        let strikethrough_output = if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::converter::get_text_content;
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-            let text_content = get_text_content(node_handle, parser, dom_ctx);
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Strikethrough,
-                Cow::Borrowed(tag_name),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                true,
-            );
-
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_strikethrough(&node_ctx, &text_content)
-            };
-            match visit_result {
-                VisitResult::Continue => None,
-                VisitResult::Custom(custom) => Some(custom),
-                VisitResult::Skip => Some(String::new()),
-                VisitResult::PreserveHtml => {
-                    use crate::converter::serialize_node;
-                    Some(serialize_node(node_handle, parser))
-                }
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    None
-                }
+        if let Some(outcome) = visit_semantic(tag, SemanticKind::Strikethrough(tag_name), depth, site) {
+            match outcome {
+                VisitorOutcome::Continue => emit_strikethrough_wrapped(output, &content, site),
+                VisitorOutcome::Output(custom_output) => output.push_str(&custom_output),
+                VisitorOutcome::Skip => {}
             }
-        } else {
-            None
-        };
-
-        #[cfg(feature = "visitor")]
-        if let Some(custom_output) = strikethrough_output {
-            output.push_str(&custom_output);
-        } else {
-            emit_strikethrough_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
+            return;
         }
 
-        #[cfg(not(feature = "visitor"))]
-        {
-            emit_strikethrough_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
-        }
+        emit_strikethrough_wrapped(output, &content, site);
     }
 }
 
 /// Handle inserted/underlined text (ins tag).
 ///
 /// Converts to `==content==` syntax. Supports visitor callbacks when enabled.
-pub fn handle_inserted(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_inserted(handler: HandlerContext<'_>) {
     use crate::converter::walk_node;
+
+    let site = handler.inline_site();
+    let HandlerContext {
+        node_handle,
+        parser,
+        output,
+        options,
+        context: ctx,
+        depth,
+        dom_context: dom_ctx,
+    } = handler;
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -399,7 +299,12 @@ pub fn handle_inserted(
         // ~keep did not, so it emitted literal `==` INTO code content, where it is text.
         let children = tag.children();
         for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+            walk_node(
+                child_handle,
+                parser,
+                output,
+                crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
+            );
         }
         return;
     }
@@ -412,84 +317,39 @@ pub fn handle_inserted(
             child_handle,
             parser,
             &mut content,
-            options,
-            &marker_ctx,
-            depth + 1,
-            dom_ctx,
+            crate::converter::block::container::HandlerContext::new(options, &marker_ctx, depth + 1, dom_ctx),
         );
     }
 
     #[cfg(feature = "visitor")]
-    let underline_output = if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::converter::get_text_content;
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-        let text_content = get_text_content(node_handle, parser, dom_ctx);
-
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-        let node_ctx = NodeContext::with_lazy_attributes(
-            NodeType::Underline,
-            Cow::Borrowed("ins"),
-            tag,
-            depth,
-            index_in_parent,
-            parent_tag.map(Cow::Borrowed),
-            true,
-        );
-
-        let visit_result = {
-            let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-            visitor.visit_underline(&node_ctx, &text_content)
-        };
-        match visit_result {
-            VisitResult::Continue => None,
-            VisitResult::Custom(custom) => Some(custom),
-            VisitResult::Skip => Some(String::new()),
-            VisitResult::PreserveHtml => {
-                use crate::converter::serialize_node;
-                Some(serialize_node(node_handle, parser))
-            }
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                None
-            }
+    if let Some(outcome) = visit_semantic(tag, SemanticKind::Underline("ins"), depth, site) {
+        match outcome {
+            VisitorOutcome::Continue => emit_inserted_wrapped(output, &content, site),
+            VisitorOutcome::Output(custom_output) => output.push_str(&custom_output),
+            VisitorOutcome::Skip => {}
         }
-    } else {
-        None
-    };
-
-    #[cfg(feature = "visitor")]
-    if let Some(custom_output) = underline_output {
-        output.push_str(&custom_output);
-    } else {
-        emit_inserted_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
+        return;
     }
 
-    #[cfg(not(feature = "visitor"))]
-    {
-        emit_inserted_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
-    }
+    emit_inserted_wrapped(output, &content, site);
 }
 
 /// Handle underline element (u tag).
 ///
 /// Just passes through content (HTML doesn't have native underline in Markdown).
 /// Supports visitor callbacks when enabled, which can provide custom formatting.
-pub fn handle_underline(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_underline(handler: HandlerContext<'_>) {
     use crate::converter::walk_node;
+
+    let HandlerContext {
+        node_handle,
+        parser,
+        output,
+        options,
+        context: ctx,
+        depth,
+        dom_context: dom_ctx,
+    } = handler;
 
     let Some(node) = node_handle.get(parser) else { return };
 
@@ -499,69 +359,111 @@ pub fn handle_underline(
     };
 
     #[cfg(feature = "visitor")]
-    if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::converter::get_text_content;
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
+    if let Some(outcome) = visit_semantic(
+        tag,
+        SemanticKind::Underline("u"),
+        depth,
+        InlineSite {
+            node_handle,
+            parser,
+            dom_ctx,
+            ctx,
+            options,
+        },
+    ) {
+        match outcome {
+            VisitorOutcome::Continue => {}
+            VisitorOutcome::Output(custom_output) => {
+                output.push_str(&custom_output);
+                return;
+            }
+            VisitorOutcome::Skip => return,
+        }
+    }
 
-        let text_content = get_text_content(node_handle, parser, dom_ctx);
-
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-        let node_ctx = NodeContext::with_lazy_attributes(
-            NodeType::Underline,
-            Cow::Borrowed("u"),
-            tag,
-            depth,
-            index_in_parent,
-            parent_tag.map(Cow::Borrowed),
-            true,
+    for child_handle in tag.children().top().iter() {
+        walk_node(
+            child_handle,
+            parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
         );
-
-        let visit_result = {
-            let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-            visitor.visit_underline(&node_ctx, &text_content)
-        };
-        match visit_result {
-            VisitResult::Continue => {
-                let children = tag.children();
-                for child_handle in children.top().iter() {
-                    walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-                }
-            }
-            VisitResult::Custom(custom) => {
-                output.push_str(&custom);
-            }
-            VisitResult::Skip => {}
-            VisitResult::PreserveHtml => {
-                use crate::converter::serialize_node;
-                output.push_str(&serialize_node(node_handle, parser));
-            }
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                let children = tag.children();
-                for child_handle in children.top().iter() {
-                    walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-                }
-            }
-        }
-    } else {
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-        }
     }
+}
 
-    #[cfg(not(feature = "visitor"))]
-    {
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+#[cfg(feature = "visitor")]
+#[derive(Clone, Copy)]
+enum SemanticKind<'a> {
+    Mark,
+    Strikethrough(&'a str),
+    Underline(&'a str),
+}
+
+#[cfg(feature = "visitor")]
+enum VisitorOutcome {
+    Continue,
+    Output(String),
+    Skip,
+}
+
+#[cfg(feature = "visitor")]
+fn visit_semantic(
+    tag: &tl::HTMLTag<'_>,
+    kind: SemanticKind<'_>,
+    depth: usize,
+    site: InlineSite<'_>,
+) -> Option<VisitorOutcome> {
+    use crate::converter::{get_text_content, serialize_node};
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let visitor_handle = site.ctx.visitor.as_ref()?;
+    let text_content = get_text_content(site.node_handle, site.parser, site.dom_ctx);
+    let node_id = site.node_handle.get_inner();
+    let (node_type, tag_name) = match kind {
+        SemanticKind::Mark => (NodeType::Mark, tag.name().as_utf8_str()),
+        SemanticKind::Strikethrough(tag_name) => (NodeType::Strikethrough, Cow::Borrowed(tag_name)),
+        SemanticKind::Underline(tag_name) => (NodeType::Underline, Cow::Borrowed(tag_name)),
+    };
+    let node_context = NodeContext::with_lazy_attributes(
+        node_type,
+        tag_name,
+        tag,
+        depth,
+        site.dom_ctx.get_sibling_index(node_id).unwrap_or(0),
+        site.dom_ctx.parent_tag_name(node_id, site.parser).map(Cow::Borrowed),
+        true,
+    );
+    let result = {
+        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
+        match kind {
+            SemanticKind::Mark => visitor.visit_mark(&node_context, &text_content),
+            SemanticKind::Strikethrough(_) => visitor.visit_strikethrough(&node_context, &text_content),
+            SemanticKind::Underline(_) => visitor.visit_underline(&node_context, &text_content),
         }
-    }
+    };
+    Some(match result {
+        VisitResult::Continue => VisitorOutcome::Continue,
+        VisitResult::Custom(custom) => {
+            crate::converter::structure_capture::replace_element(site.ctx, Some(&custom));
+            VisitorOutcome::Output(custom)
+        }
+        VisitResult::Skip => {
+            crate::converter::structure_capture::replace_element(site.ctx, None);
+            VisitorOutcome::Skip
+        }
+        VisitResult::PreserveHtml => {
+            let html = serialize_node(site.node_handle, site.parser);
+            crate::converter::structure_capture::replace_element(site.ctx, Some(&html));
+            VisitorOutcome::Output(html)
+        }
+        VisitResult::Error(error) => {
+            crate::converter::structure_capture::replace_element(site.ctx, None);
+            if site.ctx.visitor_error.borrow().is_none() {
+                *site.ctx.visitor_error.borrow_mut() = Some(error);
+            }
+            VisitorOutcome::Continue
+        }
+    })
 }
 
 #[cfg(all(test, feature = "visitor"))]

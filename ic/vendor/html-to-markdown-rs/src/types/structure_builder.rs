@@ -95,31 +95,7 @@ fn collect_annotations(tag: &tl::HTMLTag, parser: &tl::Parser, text: &str, annot
                     continue;
                 }
 
-                let kind = match name.as_str() {
-                    "strong" | "b" => Some(AnnotationKind::Bold),
-                    "em" | "i" => Some(AnnotationKind::Italic),
-                    "u" | "ins" => Some(AnnotationKind::Underline),
-                    "s" | "del" | "strike" => Some(AnnotationKind::Strikethrough),
-                    "code" | "kbd" | "samp" => Some(AnnotationKind::Code),
-                    "sub" => Some(AnnotationKind::Subscript),
-                    "sup" => Some(AnnotationKind::Superscript),
-                    "mark" => Some(AnnotationKind::Highlight),
-                    "a" => {
-                        let url = child_tag
-                            .attributes()
-                            .get("href")
-                            .flatten()
-                            .map(|v| v.as_utf8_str().to_string())
-                            .unwrap_or_default();
-                        let title = child_tag
-                            .attributes()
-                            .get("title")
-                            .flatten()
-                            .map(|v| v.as_utf8_str().to_string());
-                        Some(AnnotationKind::Link { url, title })
-                    }
-                    _ => None,
-                };
+                let kind = annotation_kind_for_tag(name.as_str(), child_tag);
 
                 stack.push(Frame::Finish { start: offset, kind });
                 for child_handle in reversed_child_handles(child_tag) {
@@ -129,6 +105,53 @@ fn collect_annotations(tag: &tl::HTMLTag, parser: &tl::Parser, text: &str, annot
             tl::Node::Comment(_) => {}
         }
     }
+}
+
+pub(crate) fn annotation_kind_for_tag(name: &str, tag: &tl::HTMLTag) -> Option<AnnotationKind> {
+    match name {
+        "strong" | "b" => Some(AnnotationKind::Bold),
+        "em" | "i" => Some(AnnotationKind::Italic),
+        "u" | "ins" => Some(AnnotationKind::Underline),
+        "s" | "del" | "strike" => Some(AnnotationKind::Strikethrough),
+        "code" | "kbd" | "samp" => Some(AnnotationKind::Code),
+        "sub" => Some(AnnotationKind::Subscript),
+        "sup" => Some(AnnotationKind::Superscript),
+        "mark" => Some(AnnotationKind::Highlight),
+        "a" => {
+            let url = tag
+                .attributes()
+                .get("href")
+                .flatten()
+                .map(|value| value.as_utf8_str().to_string())
+                .unwrap_or_default();
+            let title = tag
+                .attributes()
+                .get("title")
+                .flatten()
+                .map(|value| value.as_utf8_str().to_string());
+            Some(AnnotationKind::Link { url, title })
+        }
+        _ => None,
+    }
+}
+
+fn collect_annotated_text(tag: &tl::HTMLTag, parser: &tl::Parser) -> (String, Vec<TextAnnotation>) {
+    let raw_text = extract_text(tag, parser);
+    let text_start = raw_text.len() - raw_text.trim_start().len();
+    let text_end = raw_text.trim_end().len();
+    let mut annotations = Vec::new();
+    collect_annotations(tag, parser, &raw_text, &mut annotations);
+    annotations.retain_mut(|annotation| {
+        let start = (annotation.start as usize).max(text_start);
+        let end = (annotation.end as usize).min(text_end);
+        if start >= end {
+            return false;
+        }
+        annotation.start = (start - text_start) as u32;
+        annotation.end = (end - text_start) as u32;
+        true
+    });
+    (raw_text[text_start..text_end].to_string(), annotations)
 }
 
 /// Build a [`TableGrid`] from a `<table>` element.
@@ -342,6 +365,15 @@ impl BuilderState {
         idx
     }
 
+    fn push_attached(&mut self, node: DocumentNode) -> u32 {
+        let parent = node.parent;
+        let idx = self.push(node);
+        if let Some(parent) = parent {
+            self.add_child(parent, idx);
+        }
+        idx
+    }
+
     /// Index of the innermost open group, if any.
     fn current_group(&self) -> Option<u32> {
         self.group_stack.last().map(|(_, idx)| *idx)
@@ -421,7 +453,6 @@ fn walk(state: &mut BuilderState, handle: &tl::NodeHandle, parser: &tl::Parser, 
 }
 
 /// Decide how to handle a given tag, creating nodes and visiting children as needed.
-#[allow(clippy::too_many_lines)]
 fn process_tag(
     state: &mut BuilderState,
     tag_name: &str,
@@ -432,338 +463,342 @@ fn process_tag(
 ) {
     match tag_name {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-            let level = tag_name[1..].parse::<u8>().unwrap_or(1);
-            let text = extract_text(tag, parser).trim().to_string();
-
-            while let Some(&(open_level, _)) = state.group_stack.last() {
-                if open_level >= level {
-                    state.group_stack.pop();
-                } else {
-                    break;
-                }
-            }
-
-            let group_parent = state.group_stack.last().map(|(_, idx)| *idx).or(parent_idx);
-            let group_id = make_node_id("group", &text, state.nodes.len());
-            let group_idx = state.push(DocumentNode {
-                id: group_id,
-                content: NodeContent::Group {
-                    label: Some(text.clone()),
-                    heading_level: Some(level),
-                    heading_text: Some(text.clone()),
-                },
-                parent: group_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
-            if let Some(gp) = group_parent {
-                state.add_child(gp, group_idx);
-            }
-            state.group_stack.push((level, group_idx));
-
-            let mut annotations = Vec::new();
-            collect_annotations(tag, parser, &text, &mut annotations);
-            let heading_id = make_node_id("heading", &text, state.nodes.len());
-            let heading_idx = state.push(DocumentNode {
-                id: heading_id,
-                content: NodeContent::Heading { level, text },
-                parent: Some(group_idx),
-                children: Vec::new(),
-                annotations,
-                attributes: None,
-            });
-            state.add_child(group_idx, heading_idx);
+            process_heading(state, tag_name, tag, parser, parent_idx);
         }
 
         "p" => {
-            let text = extract_text(tag, parser).trim().to_string();
-            if text.is_empty() {
-                return;
-            }
-            let effective_parent = state.current_group().or(parent_idx);
-            let mut annotations = Vec::new();
-            collect_annotations(tag, parser, &text, &mut annotations);
-            let id = make_node_id("paragraph", &text, state.nodes.len());
-            let idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::Paragraph { text },
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations,
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, idx);
-            }
+            process_paragraph(state, tag, parser, parent_idx);
         }
 
         "ul" | "ol" => {
-            let ordered = tag_name == "ol";
-            let effective_parent = state.current_group().or(parent_idx);
-            let id = make_node_id("list", if ordered { "ordered" } else { "unordered" }, state.nodes.len());
-            let list_idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::List { ordered },
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, list_idx);
-            }
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                walk(state, child_handle, parser, Some(list_idx), depth + 1);
-            }
+            process_list(state, tag_name == "ol", tag, parser, parent_idx, depth);
         }
 
         "li" => {
-            let text = extract_text(tag, parser).trim().to_string();
-            let effective_parent = parent_idx.or_else(|| state.current_group());
-            let mut annotations = Vec::new();
-            collect_annotations(tag, parser, &text, &mut annotations);
-            let id = make_node_id("list_item", &text, state.nodes.len());
-            let idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::ListItem { text },
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations,
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, idx);
-            }
+            process_list_item(state, tag, parser, parent_idx);
         }
 
         "table" => {
-            let grid = extract_table_grid(tag, parser);
-            let effective_parent = state.current_group().or(parent_idx);
-            let id = make_node_id("table", &grid.rows.to_string(), state.nodes.len());
-            let idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::Table { grid },
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, idx);
-            }
+            process_table(state, tag, parser, parent_idx);
         }
 
         "img" => {
-            let src = tag
-                .attributes()
-                .get("src")
-                .flatten()
-                .map(|v| v.as_utf8_str().to_string());
-            let description = tag
-                .attributes()
-                .get("alt")
-                .flatten()
-                .map(|v| v.as_utf8_str().to_string())
-                .filter(|s| !s.is_empty());
-            let effective_parent = state.current_group().or(parent_idx);
-            let label = src.as_deref().unwrap_or("img");
-            let id = make_node_id("image", label, state.nodes.len());
-            let idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::Image {
-                    description,
-                    src,
-                    image_index: None,
-                },
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, idx);
-            }
+            process_image(state, tag, parent_idx);
         }
 
         "pre" => {
-            let mut language: Option<String> = None;
-            let mut code_text: Option<String> = None;
-
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                    let child_name = child_tag.name().as_utf8_str().to_ascii_lowercase();
-                    if child_name == "code" {
-                        if let Some(Some(class_val)) = child_tag.attributes().get("class") {
-                            let class_str = class_val.as_utf8_str();
-                            for token in class_str.split_whitespace() {
-                                if let Some(lang) = token.strip_prefix("language-") {
-                                    language = Some(lang.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        code_text = Some(extract_text(child_tag, parser));
-                        break;
-                    }
-                }
-            }
-
-            let text = code_text.unwrap_or_else(|| extract_text(tag, parser));
-            let effective_parent = state.current_group().or(parent_idx);
-            let id = make_node_id("code", &text, state.nodes.len());
-            let idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::Code { text, language },
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, idx);
-            }
+            process_code_block(state, tag, parser, parent_idx);
         }
 
         "blockquote" => {
-            let effective_parent = state.current_group().or(parent_idx);
-            let id = make_node_id("quote", "blockquote", state.nodes.len());
-            let quote_idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::Quote,
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, quote_idx);
-            }
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                walk(state, child_handle, parser, Some(quote_idx), depth + 1);
-            }
+            process_quote(state, tag, parser, parent_idx, depth);
         }
 
         "dl" => {
-            let effective_parent = state.current_group().or(parent_idx);
-            let id = make_node_id("definition_list", "dl", state.nodes.len());
-            let dl_idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::DefinitionList,
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, dl_idx);
-            }
-
-            for (term, definition) in collect_definition_items(tag, parser) {
-                let item_id = make_node_id("definition_item", &term, state.nodes.len());
-                let item_idx = state.push(DocumentNode {
-                    id: item_id,
-                    content: NodeContent::DefinitionItem { term, definition },
-                    parent: Some(dl_idx),
-                    children: Vec::new(),
-                    annotations: Vec::new(),
-                    attributes: None,
-                });
-                state.add_child(dl_idx, item_idx);
-            }
+            process_definition_list(state, tag, parser, parent_idx);
         }
 
         "script" | "style" => {
-            let format = if tag_name == "script" {
-                tag.attributes()
-                    .get("type")
-                    .flatten()
-                    .map_or_else(|| "javascript".to_string(), |v| v.as_utf8_str().to_string())
-            } else {
-                "css".to_string()
-            };
-            let content = extract_text(tag, parser);
-            if content.trim().is_empty() {
-                return;
-            }
-            let effective_parent = state.current_group().or(parent_idx);
-            let id = make_node_id("raw_block", &format, state.nodes.len());
-            let idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::RawBlock { format, content },
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, idx);
-            }
+            process_raw_block(state, tag_name, tag, parser, parent_idx);
         }
 
         "head" => {
-            let entries = extract_head_metadata_entries(tag, parser);
-            if entries.is_empty() {
-                return;
-            }
-            let id = make_node_id("metadata_block", "head", state.nodes.len());
-            state.push(DocumentNode {
-                id,
-                content: NodeContent::MetadataBlock { entries },
-                parent: None,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: None,
-            });
+            process_head(state, tag, parser);
         }
 
         "main" | "article" | "section" | "header" | "footer" | "nav" | "aside" => {
-            let label = tag
-                .attributes()
-                .get("aria-label")
-                .flatten()
-                .map(|v| v.as_utf8_str().to_string());
-            let effective_parent = state.current_group().or(parent_idx);
-            let id = make_node_id("group", tag_name, state.nodes.len());
-            let group_idx = state.push(DocumentNode {
-                id,
-                content: NodeContent::Group {
-                    label,
-                    heading_level: None,
-                    heading_text: None,
-                },
-                parent: effective_parent,
-                children: Vec::new(),
-                annotations: Vec::new(),
-                attributes: collect_attributes(tag),
-            });
-            if let Some(ep) = effective_parent {
-                state.add_child(ep, group_idx);
-            }
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                walk(state, child_handle, parser, Some(group_idx), depth + 1);
-            }
+            process_section_group(state, tag_name, tag, parser, parent_idx, depth);
         }
 
         "html" | "body" | "div" | "figure" | "figcaption" | "details" | "summary" | "address" | "hgroup" | "search"
         | "form" | "fieldset" => {
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                walk(state, child_handle, parser, parent_idx, depth + 1);
-            }
+            walk_children(state, tag, parser, parent_idx, depth);
         }
 
         _ => {
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                walk(state, child_handle, parser, parent_idx, depth + 1);
-            }
+            walk_children(state, tag, parser, parent_idx, depth);
         }
     }
+}
+
+fn process_raw_block(
+    state: &mut BuilderState,
+    tag_name: &str,
+    tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    parent_idx: Option<u32>,
+) {
+    let format = if tag_name == "script" {
+        tag.attributes()
+            .get("type")
+            .flatten()
+            .map_or_else(|| "javascript".to_string(), |value| value.as_utf8_str().to_string())
+    } else {
+        "css".to_string()
+    };
+    let content = extract_text(tag, parser);
+    if content.trim().is_empty() {
+        return;
+    }
+    state.push_attached(DocumentNode {
+        id: make_node_id("raw_block", &format, state.nodes.len()),
+        content: NodeContent::RawBlock { format, content },
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+}
+
+fn process_head(state: &mut BuilderState, tag: &tl::HTMLTag, parser: &tl::Parser) {
+    let entries = extract_head_metadata_entries(tag, parser);
+    if entries.is_empty() {
+        return;
+    }
+    state.push(DocumentNode {
+        id: make_node_id("metadata_block", "head", state.nodes.len()),
+        content: NodeContent::MetadataBlock { entries },
+        parent: None,
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+}
+
+fn process_section_group(
+    state: &mut BuilderState,
+    tag_name: &str,
+    tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    parent_idx: Option<u32>,
+    depth: usize,
+) {
+    let label = tag
+        .attributes()
+        .get("aria-label")
+        .flatten()
+        .map(|value| value.as_utf8_str().to_string());
+    let group_idx = state.push_attached(DocumentNode {
+        id: make_node_id("group", tag_name, state.nodes.len()),
+        content: NodeContent::Group {
+            label,
+            heading_level: None,
+            heading_text: None,
+        },
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: collect_attributes(tag),
+    });
+    walk_children(state, tag, parser, Some(group_idx), depth);
+}
+
+fn walk_children(
+    state: &mut BuilderState,
+    tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    parent_idx: Option<u32>,
+    depth: usize,
+) {
+    for child_handle in tag.children().top().iter() {
+        walk(state, child_handle, parser, parent_idx, depth + 1);
+    }
+}
+
+fn process_code_block(state: &mut BuilderState, tag: &tl::HTMLTag, parser: &tl::Parser, parent_idx: Option<u32>) {
+    let (text, language) = find_code_child(tag, parser).unwrap_or_else(|| (extract_text(tag, parser), None));
+    state.push_attached(DocumentNode {
+        id: make_node_id("code", &text, state.nodes.len()),
+        content: NodeContent::Code { text, language },
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+}
+
+fn find_code_child(tag: &tl::HTMLTag, parser: &tl::Parser) -> Option<(String, Option<String>)> {
+    for child_handle in tag.children().top().iter() {
+        let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) else {
+            continue;
+        };
+        if !child_tag.name().as_utf8_str().eq_ignore_ascii_case("code") {
+            continue;
+        }
+        let language = child_tag.attributes().get("class").flatten().and_then(|value| {
+            value
+                .as_utf8_str()
+                .split_whitespace()
+                .find_map(|token| token.strip_prefix("language-").map(str::to_string))
+        });
+        return Some((extract_text(child_tag, parser), language));
+    }
+    None
+}
+
+fn process_quote(
+    state: &mut BuilderState,
+    tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    parent_idx: Option<u32>,
+    depth: usize,
+) {
+    let quote_idx = state.push_attached(DocumentNode {
+        id: make_node_id("quote", "blockquote", state.nodes.len()),
+        content: NodeContent::Quote,
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+    walk_children(state, tag, parser, Some(quote_idx), depth);
+}
+
+fn process_definition_list(state: &mut BuilderState, tag: &tl::HTMLTag, parser: &tl::Parser, parent_idx: Option<u32>) {
+    let list_idx = state.push_attached(DocumentNode {
+        id: make_node_id("definition_list", "dl", state.nodes.len()),
+        content: NodeContent::DefinitionList,
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+    for (term, definition) in collect_definition_items(tag, parser) {
+        state.push_attached(DocumentNode {
+            id: make_node_id("definition_item", &term, state.nodes.len()),
+            content: NodeContent::DefinitionItem { term, definition },
+            parent: Some(list_idx),
+            children: Vec::new(),
+            annotations: Vec::new(),
+            attributes: None,
+        });
+    }
+}
+
+fn process_paragraph(state: &mut BuilderState, tag: &tl::HTMLTag, parser: &tl::Parser, parent_idx: Option<u32>) {
+    let (text, annotations) = collect_annotated_text(tag, parser);
+    if text.is_empty() {
+        return;
+    }
+    state.push_attached(DocumentNode {
+        id: make_node_id("paragraph", &text, state.nodes.len()),
+        content: NodeContent::Paragraph { text },
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations,
+        attributes: None,
+    });
+}
+
+fn process_list(
+    state: &mut BuilderState,
+    ordered: bool,
+    tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    parent_idx: Option<u32>,
+    depth: usize,
+) {
+    let label = if ordered { "ordered" } else { "unordered" };
+    let list_idx = state.push_attached(DocumentNode {
+        id: make_node_id("list", label, state.nodes.len()),
+        content: NodeContent::List { ordered },
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+    walk_children(state, tag, parser, Some(list_idx), depth);
+}
+
+fn process_list_item(state: &mut BuilderState, tag: &tl::HTMLTag, parser: &tl::Parser, parent_idx: Option<u32>) {
+    let (text, annotations) = collect_annotated_text(tag, parser);
+    state.push_attached(DocumentNode {
+        id: make_node_id("list_item", &text, state.nodes.len()),
+        content: NodeContent::ListItem { text },
+        parent: parent_idx.or_else(|| state.current_group()),
+        children: Vec::new(),
+        annotations,
+        attributes: None,
+    });
+}
+
+fn process_table(state: &mut BuilderState, tag: &tl::HTMLTag, parser: &tl::Parser, parent_idx: Option<u32>) {
+    let grid = extract_table_grid(tag, parser);
+    state.push_attached(DocumentNode {
+        id: make_node_id("table", &grid.rows.to_string(), state.nodes.len()),
+        content: NodeContent::Table { grid },
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+}
+
+fn process_image(state: &mut BuilderState, tag: &tl::HTMLTag, parent_idx: Option<u32>) {
+    let src = tag
+        .attributes()
+        .get("src")
+        .flatten()
+        .map(|value| value.as_utf8_str().to_string());
+    let description = tag
+        .attributes()
+        .get("alt")
+        .flatten()
+        .map(|value| value.as_utf8_str().to_string())
+        .filter(|value| !value.is_empty());
+    state.push_attached(DocumentNode {
+        id: make_node_id("image", src.as_deref().unwrap_or("img"), state.nodes.len()),
+        content: NodeContent::Image {
+            description,
+            src,
+            image_index: None,
+        },
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+}
+
+fn process_heading(
+    state: &mut BuilderState,
+    tag_name: &str,
+    tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    parent_idx: Option<u32>,
+) {
+    let level = tag_name[1..].parse::<u8>().unwrap_or(1);
+    let (text, annotations) = collect_annotated_text(tag, parser);
+    while state
+        .group_stack
+        .last()
+        .is_some_and(|(open_level, _)| *open_level >= level)
+    {
+        state.group_stack.pop();
+    }
+
+    let group_idx = state.push_attached(DocumentNode {
+        id: make_node_id("group", &text, state.nodes.len()),
+        content: NodeContent::Group {
+            label: Some(text.clone()),
+            heading_level: Some(level),
+            heading_text: Some(text.clone()),
+        },
+        parent: state.current_group().or(parent_idx),
+        children: Vec::new(),
+        annotations: Vec::new(),
+        attributes: None,
+    });
+    state.group_stack.push((level, group_idx));
+
+    state.push_attached(DocumentNode {
+        id: make_node_id("heading", &text, state.nodes.len()),
+        content: NodeContent::Heading { level, text },
+        parent: Some(group_idx),
+        children: Vec::new(),
+        annotations,
+        attributes: None,
+    });
 }
 
 /// Collect a safe subset of attributes into a `HashMap`.

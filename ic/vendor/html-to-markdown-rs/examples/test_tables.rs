@@ -10,6 +10,22 @@ fn convert(
     html_to_markdown_rs::convert(html, opts).map(|r| r.content.unwrap_or_default())
 }
 
+fn print_table_result(label: &str, html: &str, expected_lines: &[&str]) {
+    match convert(html, None) {
+        Ok(markdown) => {
+            println!("Test - {label}:");
+            println!("HTML: {html}");
+            println!("\nMarkdown:\n{markdown}");
+            println!("Expected:");
+            for line in expected_lines {
+                println!("{line}");
+            }
+            println!();
+        }
+        Err(error) => eprintln!("Error: {error}"),
+    }
+}
+
 fn main() {
     let html = r"<table>
         <tr>
@@ -26,20 +42,11 @@ fn main() {
         </tr>
     </table>";
 
-    match convert(html, None) {
-        Ok(markdown) => {
-            println!("Test - Simple table with header:");
-            println!("HTML: {html}");
-            println!("\nMarkdown:\n{markdown}");
-            println!("Expected:");
-            println!("| Name | Age |");
-            println!("| --- | --- |");
-            println!("| Alice | 30 |");
-            println!("| Bob | 25 |");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_table_result(
+        "Simple table with header",
+        html,
+        &["| Name | Age |", "| --- | --- |", "| Alice | 30 |", "| Bob | 25 |"],
+    );
 
     let html2 = r#"<table>
         <tr>
@@ -53,19 +60,11 @@ fn main() {
         </tr>
     </table>"#;
 
-    match convert(html2, None) {
-        Ok(markdown) => {
-            println!("Test - Table with colspan:");
-            println!("HTML: {html2}");
-            println!("\nMarkdown:\n{markdown}");
-            println!("Expected:");
-            println!("| Full Name | | Age |");
-            println!("| --- | --- | --- |");
-            println!("| Alice | Smith | 30 |");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_table_result(
+        "Table with colspan",
+        html2,
+        &["| Full Name | | Age |", "| --- | --- | --- |", "| Alice | Smith | 30 |"],
+    );
 
     let html3 = r"<table>
         <thead>
@@ -86,18 +85,14 @@ fn main() {
         </tbody>
     </table>";
 
-    match convert(html3, None) {
-        Ok(markdown) => {
-            println!("Test - Table with thead/tbody:");
-            println!("HTML: {html3}");
-            println!("\nMarkdown:\n{markdown}");
-            println!("Expected:");
-            println!("| Product | Price |");
-            println!("| --- | --- |");
-            println!("| Widget | $10 |");
-            println!("| Gadget | $15 |");
-            println!();
-        }
-        Err(e) => eprintln!("Error: {e}"),
-    }
+    print_table_result(
+        "Table with thead/tbody",
+        html3,
+        &[
+            "| Product | Price |",
+            "| --- | --- |",
+            "| Widget | $10 |",
+            "| Gadget | $15 |",
+        ],
+    );
 }

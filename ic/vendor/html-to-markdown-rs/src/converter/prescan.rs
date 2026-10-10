@@ -44,219 +44,261 @@ const SELF_CLOSING: [(&[u8], &str); 3] = [(b"<br/>", "<br>"), (b"<hr/>", "<hr>")
 /// sub-slice of the valid UTF-8 input `html`).
 #[must_use]
 pub fn run(html: &str) -> (Cow<'_, str>, PrescanReport) {
-    let bytes = html.as_bytes();
-    let len = bytes.len();
-
-    if len == 0 {
+    if html.is_empty() {
         return (Cow::Borrowed(html), PrescanReport::default());
     }
-
-    let mut report = PrescanReport::default();
-
-    let mut idx = 0usize;
-    let mut last = 0usize;
-    let mut output: Option<String> = None;
-
-    let mut svg_depth = 0usize;
-
-    let mut head_open_end: Option<usize> = None;
-
-    while idx < len {
-        if bytes[idx] != b'<' {
-            idx += 1;
-            continue;
-        }
-
-        if bytes[idx..].starts_with(CDATA_START) {
-            report.had_cdata = true;
-        }
-
-        if bytes[idx..].starts_with(EMPTY_COMMENT) {
-            let out = output.get_or_insert_with(|| String::with_capacity(html.len()));
-            out.push_str(&html[last..idx]);
-            out.push_str("<!-- -->");
-            idx += EMPTY_COMMENT.len();
-            last = idx;
-            continue;
-        }
-
-        {
-            let mut replaced = false;
-            for (pattern, replacement) in &SELF_CLOSING {
-                if bytes[idx..].starts_with(pattern) {
-                    let out = output.get_or_insert_with(|| String::with_capacity(html.len()));
-                    out.push_str(&html[last..idx]);
-                    out.push_str(replacement);
-                    idx += pattern.len();
-                    last = idx;
-                    replaced = true;
-                    break;
-                }
-            }
-            if replaced {
-                continue;
-            }
-        }
-
-        // ~keep ── SVG open / close ──────────────────────────────────────────────────
-        if matches_tag_start(bytes, idx + 1, SVG_TAG) {
-            if let Some(open_end) = find_tag_end(bytes, idx + 1 + SVG_TAG.len()) {
-                svg_depth += 1;
-                report.has_svg = true;
-                idx = open_end;
-                continue;
-            }
-        } else if matches_end_tag_start(bytes, idx + 1, SVG_TAG) {
-            if let Some(close_end) = find_tag_end(bytes, idx + 2 + SVG_TAG.len()) {
-                if svg_depth > 0 {
-                    svg_depth = svg_depth.saturating_sub(1);
-                }
-                idx = close_end;
-                continue;
-            }
-        }
-
-        // ~keep ── Operations only outside SVG ───────────────────────────────────────
-        if svg_depth == 0 {
-            let mut handled = false;
-            for tag in &STRIP_CONTENT_TAGS {
-                if matches_tag_start(bytes, idx + 1, tag) {
-                    if let Some(open_end) = find_tag_end(bytes, idx + 1 + tag.len()) {
-                        report.has_script_or_style = true;
-                        let remove_end = find_closing_tag(bytes, open_end, tag).unwrap_or(len);
-                        let out = output.get_or_insert_with(|| String::with_capacity(html.len()));
-                        out.push_str(&html[last..idx]);
-                        out.push_str(&html[idx..open_end]);
-                        out.push_str("</");
-                        out.push_str(str::from_utf8(tag).unwrap());
-                        out.push('>');
-                        last = remove_end;
-                        idx = remove_end;
-                        handled = true;
-                        break;
-                    }
-                }
-            }
-
-            if handled {
-                continue;
-            }
-
-            if idx + 2 < len && bytes[idx + 1] == b'!' {
-                let mut cursor = idx + 2;
-                while cursor < len && bytes[cursor].is_ascii_whitespace() {
-                    cursor += 1;
-                }
-                if cursor + DOCTYPE.len() <= len && bytes[cursor..cursor + DOCTYPE.len()].eq_ignore_ascii_case(DOCTYPE)
-                {
-                    if let Some(end) = find_tag_end(bytes, cursor + DOCTYPE.len()) {
-                        let out = output.get_or_insert_with(|| String::with_capacity(html.len()));
-                        out.push_str(&html[last..idx]);
-                        last = end;
-                        idx = end;
-                        continue;
-                    }
-                }
-            }
-
-            if matches_tag_start(bytes, idx + 1, HEAD_TAG) {
-                if let Some(open_end) = find_tag_end(bytes, idx + 1 + HEAD_TAG.len()) {
-                    let flushed_so_far = if let Some(ref out) = output {
-                        out.len() + (open_end - last)
-                    } else {
-                        open_end
-                    };
-                    head_open_end = Some(flushed_so_far);
-                    idx = open_end;
-                    continue;
-                }
-            } else if matches_end_tag_start(bytes, idx + 1, HEAD_TAG) {
-                if let Some(close_end) = find_tag_end(bytes, idx + 2 + HEAD_TAG.len()) {
-                    if let Some(start) = head_open_end.take() {
-                        let flushed_so_far = if let Some(ref out) = output {
-                            out.len() + (idx - last)
-                        } else {
-                            idx
-                        };
-                        report.head_range = Some(start..flushed_so_far);
-                    }
-                    idx = close_end;
-                    continue;
-                }
-            }
-
-            // ~keep ── Signal: custom elements (tag name contains `-`) ───────────────
-            // ~keep Only fires for open tags, not close tags.
-            {
-                let tag_start = idx + 1;
-                if tag_start < len && (bytes[tag_start].is_ascii_alphabetic()) {
-                    let name_end = {
-                        let mut e = tag_start;
-                        while e < len && (bytes[e].is_ascii_alphanumeric() || bytes[e] == b'-' || bytes[e] == b'_') {
-                            e += 1;
-                        }
-                        e
-                    };
-                    let tag_name = &bytes[tag_start..name_end];
-                    if tag_name.contains(&b'-') {
-                        report.had_custom_elements = true;
-                    }
-                }
-            }
-        }
-
-        let is_valid_tag = if idx + 1 < len {
-            match bytes[idx + 1] {
-                b'!' => {
-                    idx + 2 < len
-                        && (bytes[idx + 2] == b'-'
-                            || bytes[idx + 2].is_ascii_alphabetic()
-                            || bytes[idx + 2].is_ascii_uppercase())
-                }
-                b'/' => idx + 2 < len && (bytes[idx + 2].is_ascii_alphabetic() || bytes[idx + 2].is_ascii_uppercase()),
-                b'?' => true,
-                c if c.is_ascii_alphabetic() || c.is_ascii_uppercase() => true,
-                _ => false,
-            }
-        } else {
-            false
-        };
-
-        if !is_valid_tag {
-            report.had_unescaped_lt = true;
-            let out = output.get_or_insert_with(|| String::with_capacity(html.len() + 4));
-            out.push_str(&html[last..idx]);
-            out.push_str("&lt;");
-            idx += 1;
-            last = idx;
-            continue;
-        }
-
-        idx += 1;
-    }
-
-    if let Some(start) = head_open_end.take() {
-        let end = if let Some(ref out) = output {
-            out.len() + (len - last)
-        } else {
-            len
-        };
-        report.head_range = Some(start..end);
-    }
-
-    let cow = if let Some(mut out) = output {
-        if last < len {
-            out.push_str(&html[last..]);
-        }
-        Cow::Owned(out)
-    } else {
-        Cow::Borrowed(html)
-    };
-
-    (cow, report)
+    Prescanner::new(html).scan()
 }
 
-pub(crate) fn matches_tag_start(bytes: &[u8], mut start: usize, tag: &[u8]) -> bool {
+struct Prescanner<'a> {
+    html: &'a str,
+    bytes: &'a [u8],
+    report: PrescanReport,
+    idx: usize,
+    last: usize,
+    output: Option<String>,
+    svg_depth: usize,
+    head_open_end: Option<usize>,
+}
+
+impl<'a> Prescanner<'a> {
+    fn new(html: &'a str) -> Self {
+        Self {
+            html,
+            bytes: html.as_bytes(),
+            report: PrescanReport::default(),
+            idx: 0,
+            last: 0,
+            output: None,
+            svg_depth: 0,
+            head_open_end: None,
+        }
+    }
+
+    fn scan(mut self) -> (Cow<'a, str>, PrescanReport) {
+        while self.idx < self.bytes.len() {
+            if self.bytes[self.idx] != b'<' {
+                self.idx += 1;
+                continue;
+            }
+            self.scan_markup();
+        }
+        self.finish()
+    }
+
+    fn scan_markup(&mut self) {
+        if self.bytes[self.idx..].starts_with(CDATA_START) {
+            self.report.had_cdata = true;
+        }
+        if self.replace_empty_comment() || self.replace_self_closing() || self.track_svg() {
+            return;
+        }
+        if self.svg_depth == 0 && self.handle_outside_svg() {
+            return;
+        }
+        if !is_valid_tag_start(self.bytes, self.idx) {
+            self.escape_less_than();
+            return;
+        }
+        self.idx += 1;
+    }
+
+    fn replace_empty_comment(&mut self) -> bool {
+        if !self.bytes[self.idx..].starts_with(EMPTY_COMMENT) {
+            return false;
+        }
+        self.flush_prefix();
+        self.output.as_mut().expect("output initialized").push_str("<!-- -->");
+        self.idx += EMPTY_COMMENT.len();
+        self.last = self.idx;
+        true
+    }
+
+    fn replace_self_closing(&mut self) -> bool {
+        let Some((pattern, replacement)) = SELF_CLOSING
+            .iter()
+            .find(|(pattern, _)| self.bytes[self.idx..].starts_with(pattern))
+        else {
+            return false;
+        };
+        self.flush_prefix();
+        self.output.as_mut().expect("output initialized").push_str(replacement);
+        self.idx += pattern.len();
+        self.last = self.idx;
+        true
+    }
+
+    fn track_svg(&mut self) -> bool {
+        if matches_tag_start(self.bytes, self.idx + 1, SVG_TAG) {
+            let Some(open_end) = find_tag_end(self.bytes, self.idx + 1 + SVG_TAG.len()) else {
+                return false;
+            };
+            self.svg_depth += 1;
+            self.report.has_svg = true;
+            self.idx = open_end;
+            return true;
+        }
+        if !matches_end_tag_start(self.bytes, self.idx + 1, SVG_TAG) {
+            return false;
+        }
+        let Some(close_end) = find_tag_end(self.bytes, self.idx + 2 + SVG_TAG.len()) else {
+            return false;
+        };
+        self.svg_depth = self.svg_depth.saturating_sub(1);
+        self.idx = close_end;
+        true
+    }
+
+    fn handle_outside_svg(&mut self) -> bool {
+        if self.strip_raw_text() || self.strip_doctype() || self.track_head() {
+            return true;
+        }
+        self.track_custom_element();
+        false
+    }
+
+    fn strip_raw_text(&mut self) -> bool {
+        let Some(tag) = STRIP_CONTENT_TAGS
+            .iter()
+            .find(|tag| matches_tag_start(self.bytes, self.idx + 1, tag))
+        else {
+            return false;
+        };
+        let Some(open_end) = find_tag_end(self.bytes, self.idx + 1 + tag.len()) else {
+            return false;
+        };
+        self.report.has_script_or_style = true;
+        let remove_end = find_closing_tag(self.bytes, open_end, tag).unwrap_or(self.bytes.len());
+        self.flush_prefix();
+        let output = self.output.as_mut().expect("output initialized");
+        output.push_str(&self.html[self.idx..open_end]);
+        output.push_str("</");
+        output.push_str(str::from_utf8(tag).expect("tag names are valid UTF-8"));
+        output.push('>');
+        self.last = remove_end;
+        self.idx = remove_end;
+        true
+    }
+
+    fn strip_doctype(&mut self) -> bool {
+        if self.idx + 2 >= self.bytes.len() || self.bytes[self.idx + 1] != b'!' {
+            return false;
+        }
+        let mut cursor = self.idx + 2;
+        while cursor < self.bytes.len() && self.bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor + DOCTYPE.len() > self.bytes.len()
+            || !self.bytes[cursor..cursor + DOCTYPE.len()].eq_ignore_ascii_case(DOCTYPE)
+        {
+            return false;
+        }
+        let Some(end) = find_tag_end(self.bytes, cursor + DOCTYPE.len()) else {
+            return false;
+        };
+        self.flush_prefix();
+        self.last = end;
+        self.idx = end;
+        true
+    }
+
+    fn track_head(&mut self) -> bool {
+        if matches_tag_start(self.bytes, self.idx + 1, HEAD_TAG) {
+            let Some(open_end) = find_tag_end(self.bytes, self.idx + 1 + HEAD_TAG.len()) else {
+                return false;
+            };
+            self.head_open_end = Some(self.output_position(open_end));
+            self.idx = open_end;
+            return true;
+        }
+        if !matches_end_tag_start(self.bytes, self.idx + 1, HEAD_TAG) {
+            return false;
+        }
+        let Some(close_end) = find_tag_end(self.bytes, self.idx + 2 + HEAD_TAG.len()) else {
+            return false;
+        };
+        if let Some(start) = self.head_open_end.take() {
+            self.report.head_range = Some(start..self.output_position(self.idx));
+        }
+        self.idx = close_end;
+        true
+    }
+
+    fn track_custom_element(&mut self) {
+        let tag_start = self.idx + 1;
+        if tag_start >= self.bytes.len() || !self.bytes[tag_start].is_ascii_alphabetic() {
+            return;
+        }
+        let mut name_end = tag_start;
+        while name_end < self.bytes.len()
+            && (self.bytes[name_end].is_ascii_alphanumeric()
+                || self.bytes[name_end] == b'-'
+                || self.bytes[name_end] == b'_')
+        {
+            name_end += 1;
+        }
+        self.report.had_custom_elements |= self.bytes[tag_start..name_end].contains(&b'-');
+    }
+
+    fn escape_less_than(&mut self) {
+        self.report.had_unescaped_lt = true;
+        self.flush_prefix_with_capacity(4);
+        self.output.as_mut().expect("output initialized").push_str("&lt;");
+        self.idx += 1;
+        self.last = self.idx;
+    }
+
+    fn output_position(&self, source_position: usize) -> usize {
+        self.output
+            .as_ref()
+            .map_or(source_position, |output| output.len() + source_position - self.last)
+    }
+
+    fn flush_prefix(&mut self) {
+        self.flush_prefix_with_capacity(0);
+    }
+
+    fn flush_prefix_with_capacity(&mut self, extra: usize) {
+        let output = self
+            .output
+            .get_or_insert_with(|| String::with_capacity(self.html.len() + extra));
+        output.push_str(&self.html[self.last..self.idx]);
+    }
+
+    fn finish(mut self) -> (Cow<'a, str>, PrescanReport) {
+        if let Some(start) = self.head_open_end.take() {
+            self.report.head_range = Some(start..self.output_position(self.bytes.len()));
+        }
+        let cleaned = if let Some(mut output) = self.output {
+            if self.last < self.bytes.len() {
+                output.push_str(&self.html[self.last..]);
+            }
+            Cow::Owned(output)
+        } else {
+            Cow::Borrowed(self.html)
+        };
+        (cleaned, self.report)
+    }
+}
+
+fn is_valid_tag_start(bytes: &[u8], idx: usize) -> bool {
+    let Some(next) = bytes.get(idx + 1) else {
+        return false;
+    };
+    match next {
+        b'!' => {
+            let Some(after_bang) = bytes.get(idx + 2) else {
+                return false;
+            };
+            *after_bang == b'-' || after_bang.is_ascii_alphabetic()
+        }
+        b'/' => bytes.get(idx + 2).is_some_and(u8::is_ascii_alphabetic),
+        b'?' => true,
+        value => value.is_ascii_alphabetic(),
+    }
+}
+
+fn matches_tag_start(bytes: &[u8], mut start: usize, tag: &[u8]) -> bool {
     if start >= bytes.len() || start + tag.len() > bytes.len() {
         return false;
     }
@@ -277,7 +319,7 @@ fn matches_end_tag_start(bytes: &[u8], start: usize, tag: &[u8]) -> bool {
     matches_tag_start(bytes, start + 1, tag)
 }
 
-pub(crate) fn find_tag_end(bytes: &[u8], mut idx: usize) -> Option<usize> {
+fn find_tag_end(bytes: &[u8], mut idx: usize) -> Option<usize> {
     let len = bytes.len();
     let mut in_quote: Option<u8> = None;
     while idx < len {
@@ -303,25 +345,32 @@ fn find_closing_tag(bytes: &[u8], mut idx: usize, tag: &[u8]) -> Option<usize> {
     let len = bytes.len();
     let mut depth = 1usize;
     while idx < len {
-        if bytes[idx] == b'<' {
-            if matches_tag_start(bytes, idx + 1, tag) {
-                if let Some(next) = find_tag_end(bytes, idx + 1 + tag.len()) {
-                    depth += 1;
-                    idx = next;
-                    continue;
-                }
-            } else if matches_end_tag_start(bytes, idx + 1, tag) {
-                if let Some(close) = find_tag_end(bytes, idx + 2 + tag.len()) {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(close);
-                    }
-                    idx = close;
-                    continue;
-                }
+        if let Some(next) = nested_open_end(bytes, idx, tag) {
+            depth += 1;
+            idx = next;
+            continue;
+        }
+        if let Some(close) = nested_close_end(bytes, idx, tag) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(close);
             }
+            idx = close;
+            continue;
         }
         idx += 1;
     }
     None
+}
+
+fn nested_open_end(bytes: &[u8], idx: usize, tag: &[u8]) -> Option<usize> {
+    (bytes.get(idx) == Some(&b'<') && matches_tag_start(bytes, idx + 1, tag))
+        .then(|| find_tag_end(bytes, idx + 1 + tag.len()))
+        .flatten()
+}
+
+fn nested_close_end(bytes: &[u8], idx: usize, tag: &[u8]) -> Option<usize> {
+    (bytes.get(idx) == Some(&b'<') && matches_end_tag_start(bytes, idx + 1, tag))
+        .then(|| find_tag_end(bytes, idx + 2 + tag.len()))
+        .flatten()
 }

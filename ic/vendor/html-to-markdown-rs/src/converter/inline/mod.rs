@@ -9,16 +9,8 @@
 //! These handlers are designed to be extracted from the main `converter.rs`
 //! file and integrated through the dispatcher function.
 //!
-//! **Integration Pattern:**
-//! Each handler function takes the same signature:
-//! - `tag_name: &str` - The HTML tag being processed
-//! - `node_handle: &NodeHandle` - The DOM node handle
-//! - `parser: &Parser` - The HTML parser reference
-//! - `output: &mut String` - The output buffer to write to
-//! - `options: &ConversionOptions` - Conversion configuration
-//! - `ctx: &Context` - Processing context (state tracking)
-//! - `depth: usize` - Current DOM tree depth
-//! - `dom_ctx: &DomContext` - DOM context for tree relationships
+//! Each handler receives a [`HandlerContext`] that groups the DOM node, parser,
+//! output buffer, conversion options, processing state, depth, and DOM context.
 //!
 //! The main dispatcher function `dispatch_inline_handler` routes tags to
 //! their appropriate handlers and returns a boolean indicating success.
@@ -29,6 +21,51 @@ pub mod link;
 pub mod ruby;
 pub mod semantic;
 pub mod wrapped;
+
+pub struct HandlerContext<'a> {
+    pub node_handle: &'a tl::NodeHandle,
+    pub parser: &'a tl::Parser<'a>,
+    pub output: &'a mut String,
+    pub options: &'a crate::options::ConversionOptions,
+    pub context: &'a crate::converter::Context,
+    pub depth: usize,
+    pub dom_context: &'a crate::converter::DomContext,
+}
+
+type HandlerParts<'a> = (
+    &'a tl::NodeHandle,
+    &'a tl::Parser<'a>,
+    &'a mut String,
+    &'a crate::options::ConversionOptions,
+    &'a crate::converter::Context,
+    usize,
+    &'a crate::converter::DomContext,
+);
+
+impl<'a> HandlerContext<'a> {
+    pub const fn new(parts: HandlerParts<'a>) -> Self {
+        let (node_handle, parser, output, options, context, depth, dom_context) = parts;
+        Self {
+            node_handle,
+            parser,
+            output,
+            options,
+            context,
+            depth,
+            dom_context,
+        }
+    }
+
+    pub const fn inline_site(&self) -> wrapped::InlineSite<'a> {
+        wrapped::InlineSite {
+            node_handle: self.node_handle,
+            parser: self.parser,
+            dom_ctx: self.dom_context,
+            ctx: self.context,
+            options: self.options,
+        }
+    }
+}
 
 /// Dispatches inline element handling to the appropriate handler.
 ///
@@ -58,16 +95,8 @@ pub mod wrapped;
 /// # Usage in converter.rs
 ///
 /// ```text
-/// if crate::converter::inline::dispatch_inline_handler(
-///     &tag_name,
-///     &node_handle,
-///     parser,
-///     output,
-///     options,
-///     ctx,
-///     depth,
-///     dom_ctx,
-/// ) {
+/// let handler = HandlerContext::new((node_handle, parser, output, options, ctx, depth, dom_ctx));
+/// if crate::converter::inline::dispatch_inline_handler(&tag_name, handler) {
 ///     return; // Element was handled, move to next sibling
 /// }
 /// // Element was not handled, process as default inline element
@@ -76,13 +105,7 @@ pub mod wrapped;
 /// # Parameters
 ///
 /// * `tag_name` - The normalized HTML tag name (lowercase)
-/// * `node_handle` - The DOM node handle from the parser
-/// * `parser` - Reference to the tl HTML parser
-/// * `output` - Output buffer to write converted content to
-/// * `options` - Conversion configuration options
-/// * `ctx` - Processing context with state tracking
-/// * `depth` - Current DOM tree depth for recursion tracking
-/// * `dom_ctx` - DOM context for accessing tree structure
+/// * `context` - The DOM and conversion state used by the selected handler
 ///
 /// # Example
 ///
@@ -92,35 +115,24 @@ pub mod wrapped;
 /// 3. Returns `true`
 /// 4. Emphasis handler outputs `**Bold text**` to output buffer
 ///
-/// For `<span>Normal text</span>`, the dispatcher:
-/// 1. Fails to recognize "span" tag
-/// 2. Returns `false`
-/// 3. Caller processes as default inline content
-pub fn dispatch_inline_handler(
-    tag_name: &str,
-    node_handle: &tl::NodeHandle,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &crate::converter::Context,
-    depth: usize,
-    dom_ctx: &crate::converter::DomContext,
-) -> bool {
+/// For an unrecognized tag, the dispatcher returns `false` so the caller can
+/// process the element through the default path.
+pub fn dispatch_inline_handler(tag_name: &str, context: HandlerContext<'_>) -> bool {
     match tag_name {
         "strong" | "b" | "em" | "i" => {
-            emphasis::handle(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            emphasis::handle(tag_name, context);
             true
         }
         "kbd" | "samp" => {
-            code::handle(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            code::handle(tag_name, context);
             true
         }
         "mark" | "del" | "s" | "strike" | "ins" | "u" | "small" | "sub" | "sup" | "var" | "dfn" | "abbr" | "span" => {
-            semantic::handle(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            semantic::handle(tag_name, context);
             true
         }
         "ruby" | "rb" | "rt" | "rp" | "rtc" => {
-            ruby::handle(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            ruby::handle(tag_name, context);
             true
         }
         _ => false,

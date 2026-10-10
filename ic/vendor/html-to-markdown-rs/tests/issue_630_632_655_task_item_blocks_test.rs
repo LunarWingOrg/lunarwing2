@@ -133,6 +133,7 @@ fn should_keep_a_block_inside_an_inline_marker_on_the_checkbox_line() {
     }
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_write_the_checkbox_of_a_task_item_with_the_fast_converter() {
     let tier1 = ConversionOptions {
@@ -179,13 +180,18 @@ fn should_hand_a_list_item_with_a_checkbox_to_the_full_converter() {
             "{html}: {result:?}"
         );
     }
-    for html in [
-        r#"<p><input type="checkbox">p</p>"#,
-        r#"<ul><li><input type="text">p</li></ul>"#,
-    ] {
-        let result = tier1::run(html, &PrescanReport::default(), &options);
-        assert!(result.is_ok(), "{html}: {result:?}");
-    }
+    let checkbox = r#"<p><input type="checkbox">p</p>"#;
+    assert!(
+        matches!(
+            tier1::run(checkbox, &PrescanReport::default(), &options),
+            Err(BailReason::InlineMarkerNotReproduced)
+        ),
+        "{checkbox}"
+    );
+
+    let text = r#"<ul><li><input type="text">p</li></ul>"#;
+    let result = tier1::run(text, &PrescanReport::default(), &options);
+    assert!(result.is_ok(), "{text}: {result:?}");
 }
 
 #[test]

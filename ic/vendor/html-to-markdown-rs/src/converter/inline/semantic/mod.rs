@@ -14,11 +14,7 @@
 mod marks;
 mod typography;
 
-use crate::options::ConversionOptions;
-use tl::{NodeHandle, Parser};
-
-type Context = crate::converter::Context;
-type DomContext = crate::converter::DomContext;
+use crate::converter::inline::HandlerContext;
 
 /// Handler for semantic inline elements: mark, del, s, ins, u, small, sub, sup, var, dfn, abbr, span.
 ///
@@ -37,50 +33,19 @@ type DomContext = crate::converter::DomContext;
 /// # Note
 /// This function references helper functions and `walk_node` from converter.rs
 /// which must be accessible (pub(crate)) for this module to work correctly.
-pub fn handle(
-    tag_name: &str,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle(tag_name: &str, context: HandlerContext<'_>) {
     match tag_name {
-        "mark" => {
-            marks::handle_mark(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "del" | "s" | "strike" => {
-            marks::handle_strikethrough(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "ins" => {
-            marks::handle_inserted(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "u" => {
-            marks::handle_underline(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "small" => {
-            typography::handle_small(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "sub" => {
-            typography::handle_subscript(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "sup" => {
-            typography::handle_superscript(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "var" => {
-            typography::handle_variable(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "dfn" => {
-            typography::handle_definition(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "abbr" => {
-            typography::handle_abbreviation(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "span" => {
-            typography::handle_span(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
+        "mark" => marks::handle_mark(context),
+        "del" | "s" | "strike" => marks::handle_strikethrough(tag_name, context),
+        "ins" => marks::handle_inserted(context),
+        "u" => marks::handle_underline(context),
+        "small" => typography::handle_small(context),
+        "sub" => typography::handle_subscript(context),
+        "sup" => typography::handle_superscript(context),
+        "var" => typography::handle_variable(context),
+        "dfn" => typography::handle_definition(context),
+        "abbr" => typography::handle_abbreviation(context),
+        "span" => typography::handle_span(context),
         _ => {}
     }
 }

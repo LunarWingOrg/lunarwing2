@@ -6,6 +6,7 @@
 //! - Metadata collection (headers, IDs)
 //! - Visitor callbacks for custom heading processing
 
+use crate::converter::block::container::HandlerContext;
 use crate::options::{ConversionOptions, HeadingStyle, OutputFormat};
 use std::borrow::Cow;
 use tl::{NodeHandle, Parser};
@@ -26,15 +27,35 @@ pub fn handle(
     node_handle: &NodeHandle,
     parser: &Parser,
     output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
+    handler: HandlerContext<'_>,
 ) {
-    use crate::converter::walk_node;
+    let options = handler.options;
+    let ctx = handler.ctx;
 
     let level = tag_name.chars().last().and_then(|c| c.to_digit(10)).unwrap_or(1) as usize;
+    separate_heading(output, options, ctx, level);
+    let Some(normalized) = heading_text(tag_name, node_handle, parser, handler) else {
+        return;
+    };
 
+    #[cfg(feature = "visitor")]
+    let heading_output = visitor_heading_output(node_handle, parser, tag_name, level, &normalized, handler);
+
+    #[cfg(not(feature = "visitor"))]
+    let heading_output = {
+        let mut buf = String::new();
+        push_heading(&mut buf, ctx, options, level, &normalized);
+        Some(buf)
+    };
+
+    if let Some(heading_output) = heading_output {
+        append_heading(output, &heading_output, options, ctx, level);
+    }
+    #[cfg(feature = "metadata")]
+    record_heading(node_handle, parser, &normalized, level, handler);
+}
+
+fn separate_heading(output: &mut String, options: &ConversionOptions, ctx: &Context, level: usize) {
     let needs_leading_sep = !ctx.in_table_cell
         && !ctx.in_list_item
         && !ctx.convert_as_inline
@@ -50,119 +71,90 @@ pub fn handle(
             "\n\n"
         });
     }
+}
 
+fn heading_text(
+    tag_name: &str,
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    handler: HandlerContext<'_>,
+) -> Option<String> {
     let mut text = String::new();
     let heading_ctx = Context {
         in_heading: true,
         convert_as_inline: true,
-        heading_allow_inline_images: heading_allows_inline_images(tag_name, &ctx.keep_inline_images_in),
-        ..ctx.clone()
+        heading_allow_inline_images: heading_allows_inline_images(tag_name, &handler.ctx.keep_inline_images_in),
+        ..handler.ctx.clone()
     };
 
-    if let Some(node) = node_handle.get(parser) {
-        if let tl::Node::Tag(tag) = node {
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                walk_node(
-                    child_handle,
-                    parser,
-                    &mut text,
-                    options,
-                    &heading_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-            }
-        }
-    }
-
-    let trimmed = text.trim();
-    if !trimmed.is_empty() {
-        let normalized = normalize_heading_text(trimmed);
-
-        #[cfg(feature = "visitor")]
-        let heading_output = visitor_heading_output(
-            node_handle,
+    let Some(tl::Node::Tag(tag)) = node_handle.get(parser) else {
+        return None;
+    };
+    for child_handle in tag.children().top().iter() {
+        crate::converter::walk_node(
+            child_handle,
             parser,
-            tag_name,
-            level,
-            &normalized,
-            output,
-            options,
-            ctx,
-            depth,
-            dom_ctx,
+            &mut text,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                &heading_ctx,
+                handler.depth + 1,
+                handler.dom_ctx,
+            ),
         );
+    }
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| normalize_heading_text(trimmed).into_owned())
+}
 
-        #[cfg(not(feature = "visitor"))]
-        let heading_output = {
-            let mut buf = String::new();
-            push_heading(&mut buf, ctx, options, level, normalized.as_ref());
-            Some(buf)
-        };
+fn append_heading(output: &mut String, heading_text: &str, options: &ConversionOptions, ctx: &Context, level: usize) {
+    // ~keep A setext heading's text line after a line of the item would continue that
+    // ~keep line's paragraph, so it starts after a blank line (issue #635).
+    let line_start = output.rfind('\n').map_or(0, |pos| pos + 1);
+    if ctx.in_list_item
+        && options.heading_style == HeadingStyle::Underlined
+        && level <= 2
+        && line_start > 0
+        && output[line_start..].trim().is_empty()
+        && !output[..line_start - 1]
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        let indent = output.split_off(line_start);
+        output.push('\n');
+        output.push_str(&indent);
+    }
+    // ~keep In a cell the heading's text is a block of the cell's one line (issue #645).
+    if ctx.in_table_cell && !ctx.convert_as_inline && !ctx.in_code && !heading_text.is_empty() {
+        crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
+    }
+    output.push_str(heading_text);
+}
 
-        if let Some(heading_text) = heading_output {
-            // ~keep A setext heading's text line after a line of the item would continue that
-            // ~keep line's paragraph, so it starts after a blank line (issue #635).
-            let line_start = output.rfind('\n').map_or(0, |pos| pos + 1);
-            if ctx.in_list_item
-                && options.heading_style == HeadingStyle::Underlined
-                && level <= 2
-                && line_start > 0
-                && output[line_start..].trim().is_empty()
-                && !output[..line_start - 1]
-                    .rsplit('\n')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty()
-            {
-                let indent = output.split_off(line_start);
-                output.push('\n');
-                output.push_str(&indent);
-            }
-            // ~keep In a cell the heading's text is a block of the cell's one line (issue #645).
-            if ctx.in_table_cell && !ctx.convert_as_inline && !ctx.in_code && !heading_text.is_empty() {
-                crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
-            }
-            output.push_str(&heading_text);
-        }
+#[cfg(feature = "metadata")]
+fn record_heading(
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    normalized: &str,
+    level: usize,
+    handler: HandlerContext<'_>,
+) {
+    let id = node_handle
+        .get(parser)
+        .and_then(|node| match node {
+            tl::Node::Tag(tag) => tag.attributes().get("id").flatten(),
+            _ => None,
+        })
+        .map(|value| value.as_utf8_str().to_string());
 
-        #[cfg(feature = "metadata")]
-        if ctx.metadata_wants_headers {
-            if let Some(ref collector) = ctx.metadata_collector {
-                if let Some(node) = node_handle.get(parser) {
-                    if let tl::Node::Tag(tag) = node {
-                        let id = tag
-                            .attributes()
-                            .get("id")
-                            .flatten()
-                            .map(|v| v.as_utf8_str().to_string());
-                        collector
-                            .borrow_mut()
-                            .add_header(level as u8, normalized.to_string(), id, depth, 0);
-                    }
-                }
-            }
-        }
-
-        // ~keep Notify the structure collector if present.
-        // ~keep Skip headings inside table cells — they are part of the table content,
-        // ~keep not standalone structural headings.
-        if !ctx.in_table_cell {
-            if let Some(ref sc) = ctx.structure_collector {
-                if let Some(node) = node_handle.get(parser) {
-                    if let tl::Node::Tag(tag) = node {
-                        let id = tag
-                            .attributes()
-                            .get("id")
-                            .flatten()
-                            .map(|v| v.as_utf8_str().to_string());
-                        sc.borrow_mut()
-                            .push_heading(level as u8, normalized.as_ref(), id.as_deref());
-                    }
-                }
-            }
+    if handler.ctx.metadata_wants_headers {
+        if let Some(ref collector) = handler.ctx.metadata_collector {
+            collector
+                .borrow_mut()
+                .add_header(level as u8, normalized.to_string(), id, handler.depth, 0);
         }
     }
 }
@@ -229,22 +221,36 @@ pub fn push_heading(output: &mut String, ctx: &Context, options: &ConversionOpti
     if text.is_empty() {
         return;
     }
+    if write_inline_heading(output, ctx, text) {
+        return;
+    }
+    prepare_block_heading(output, ctx, options);
+    render_heading_style(output, ctx, options, level, text);
+    output.push_str(if ctx.in_list_item || ctx.blockquote_depth > 0 {
+        "\n"
+    } else {
+        "\n\n"
+    });
+}
 
+fn write_inline_heading(output: &mut String, ctx: &Context, text: &str) -> bool {
     if ctx.convert_as_inline {
         output.push_str(text);
-        return;
+        return true;
     }
-
-    if ctx.in_table_cell {
-        let is_table_continuation =
-            !output.is_empty() && !output.ends_with('|') && !output.ends_with(' ') && !output.ends_with("<br>");
-        if is_table_continuation {
-            output.push_str("<br>");
-        }
-        output.push_str(text);
-        return;
+    if !ctx.in_table_cell {
+        return false;
     }
+    let is_table_continuation =
+        !output.is_empty() && !output.ends_with('|') && !output.ends_with(' ') && !output.ends_with("<br>");
+    if is_table_continuation {
+        output.push_str("<br>");
+    }
+    output.push_str(text);
+    true
+}
 
+fn prepare_block_heading(output: &mut String, ctx: &Context, options: &ConversionOptions) {
     if ctx.in_list_item {
         if output.ends_with('\n') {
             if let Some(indent) = continuation_indent_string(ctx.list_depth, options) {
@@ -261,75 +267,66 @@ pub fn push_heading(output: &mut String, ctx: &Context, options: &ConversionOpti
             output.push_str("\n\n");
         }
     }
+}
 
-    let heading_suffix = if ctx.in_list_item || ctx.blockquote_depth > 0 {
-        "\n"
-    } else {
-        "\n\n"
-    };
-
+fn render_heading_style(output: &mut String, ctx: &Context, options: &ConversionOptions, level: usize, text: &str) {
     match options.heading_style {
-        HeadingStyle::Underlined => {
-            // ~keep The underline is a line of the item like every quote line, so it gets the
-            // ~keep item's continuation indent; at column 0 a `-` underline is a new list item
-            // ~keep (issue #635).
-            let underline_indent = if ctx.in_list_item {
-                crate::converter::list::utils::continuation_indent_string(ctx.list_indent_columns, options)
-            } else {
-                None
-            };
-            // ~keep The text is a paragraph line, so a list marker or other block opener at its
-            // ~keep start is escaped (issue #653).
-            if level == 1 {
-                output.push_str(&crate::converter::utility::escaping::escape_paragraph_start(text, b'='));
-                output.push('\n');
-                output.push_str(underline_indent.as_deref().unwrap_or_default());
-                for _ in 0..text.len() {
-                    output.push('=');
-                }
-            } else if level == 2 {
-                output.push_str(&crate::converter::utility::escaping::escape_paragraph_start(text, b'-'));
-                output.push('\n');
-                output.push_str(underline_indent.as_deref().unwrap_or_default());
-                // ~keep In a list item a lone `-` line reads as an empty item marker, both to
-                // ~keep `CommonMark` after a blank line and to the item's own marker checks, so the
-                // ~keep underline there has at least two dashes (issue #635).
-                let width = if ctx.in_list_item {
-                    text.len().max(2)
-                } else {
-                    text.len()
-                };
-                for _ in 0..width {
-                    output.push('-');
-                }
-            } else {
-                for _ in 0..level {
-                    output.push('#');
-                }
-                output.push(' ');
-                output.push_str(&atx_heading_text(text, options));
-            }
-        }
+        HeadingStyle::Underlined => render_underlined_heading(output, ctx, options, level, text),
         HeadingStyle::Atx => {
-            for _ in 0..level {
-                output.push('#');
-            }
+            output.extend(std::iter::repeat_n('#', level));
             output.push(' ');
             output.push_str(&atx_heading_text(text, options));
         }
         HeadingStyle::AtxClosed => {
-            for _ in 0..level {
-                output.push('#');
-            }
+            output.extend(std::iter::repeat_n('#', level));
             output.push(' ');
             output.push_str(text);
             output.push(' ');
-            for _ in 0..level {
-                output.push('#');
-            }
+            output.extend(std::iter::repeat_n('#', level));
         }
     }
-    output.push_str(heading_suffix);
+}
+
+fn render_underlined_heading(
+    output: &mut String,
+    ctx: &Context,
+    options: &ConversionOptions,
+    level: usize,
+    text: &str,
+) {
+    // ~keep The underline is a line of the item like every quote line, so it gets the
+    // ~keep item's continuation indent; at column 0 a `-` underline is a new list item
+    // ~keep (issue #635).
+    let underline_indent = if ctx.in_list_item {
+        crate::converter::list::utils::continuation_indent_string(ctx.list_indent_columns, options)
+    } else {
+        None
+    };
+    // ~keep The text is a paragraph line, so a list marker or other block opener at its
+    // ~keep start is escaped (issue #653).
+    if level == 1 {
+        output.push_str(&crate::converter::utility::escaping::escape_paragraph_start(text, b'='));
+        output.push('\n');
+        output.push_str(underline_indent.as_deref().unwrap_or_default());
+        output.extend(std::iter::repeat_n('=', text.len()));
+    } else if level == 2 {
+        output.push_str(&crate::converter::utility::escaping::escape_paragraph_start(text, b'-'));
+        output.push('\n');
+        output.push_str(underline_indent.as_deref().unwrap_or_default());
+        // ~keep In a list item a lone `-` line reads as an empty item marker, both to
+        // ~keep CommonMark after a blank line and to the item's own marker checks, so the
+        // ~keep underline there has at least two dashes (issue #635).
+        let width = if ctx.in_list_item {
+            text.len().max(2)
+        } else {
+            text.len()
+        };
+        output.extend(std::iter::repeat_n('-', width));
+    } else {
+        output.extend(std::iter::repeat_n('#', level));
+        output.push(' ');
+        output.push_str(&atx_heading_text(text, options));
+    }
 }
 
 /// The text of an ATX heading line that ends without a closing sequence of its own, with a `#` run
@@ -365,71 +362,67 @@ fn visitor_heading_output(
     tag_name: &str,
     level: usize,
     normalized: &str,
-    _output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
+    handler: HandlerContext<'_>,
 ) -> Option<String> {
     use crate::visitor::{NodeContext, NodeType, VisitResult};
 
-    if let Some(ref visitor_handle) = ctx.visitor {
-        if let Some(node) = node_handle.get(parser) {
-            if let tl::Node::Tag(tag) = node {
-                let id_attr = tag
-                    .attributes()
-                    .get("id")
-                    .flatten()
-                    .map(|v| v.as_utf8_str().to_string());
-
-                let node_id = node_handle.get_inner();
-                let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-                let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-                let node_ctx = NodeContext::with_lazy_attributes(
-                    NodeType::Heading,
-                    Cow::Borrowed(tag_name),
-                    tag,
-                    depth,
-                    index_in_parent,
-                    parent_tag.map(Cow::Borrowed),
-                    false,
-                );
-
-                let visit_result = {
-                    let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                    visitor.visit_heading(&node_ctx, level as u32, normalized, id_attr.as_deref())
-                };
-                match visit_result {
-                    VisitResult::Continue => {
-                        let mut buf = String::new();
-                        push_heading(&mut buf, ctx, options, level, normalized);
-                        Some(buf)
-                    }
-                    VisitResult::Custom(custom) => Some(custom),
-                    VisitResult::Skip => None,
-                    VisitResult::Error(err) => {
-                        if ctx.visitor_error.borrow().is_none() {
-                            *ctx.visitor_error.borrow_mut() = Some(err);
-                        }
-                        None
-                    }
-                    VisitResult::PreserveHtml => {
-                        let mut buf = String::new();
-                        push_heading(&mut buf, ctx, options, level, normalized);
-                        Some(buf)
-                    }
-                }
-            } else {
-                None
+    let ctx = handler.ctx;
+    let Some(ref visitor_handle) = ctx.visitor else {
+        let mut buf = String::new();
+        push_heading(&mut buf, ctx, handler.options, level, normalized);
+        return Some(buf);
+    };
+    let Some(tl::Node::Tag(tag)) = node_handle.get(parser) else {
+        return None;
+    };
+    let id_attr = tag
+        .attributes()
+        .get("id")
+        .flatten()
+        .map(|value| value.as_utf8_str().to_string());
+    let node_id = node_handle.get_inner();
+    let parent_tag = handler.dom_ctx.parent_tag_name(node_id, parser);
+    let index_in_parent = handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0);
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Heading,
+        Cow::Borrowed(tag_name),
+        tag,
+        handler.depth,
+        index_in_parent,
+        parent_tag.map(Cow::Borrowed),
+        false,
+    );
+    let visit_result = {
+        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
+        visitor.visit_heading(&node_ctx, level as u32, normalized, id_attr.as_deref())
+    };
+    match visit_result {
+        VisitResult::Continue | VisitResult::PreserveHtml => {
+            let mut buf = String::new();
+            push_heading(&mut buf, ctx, handler.options, level, normalized);
+            Some(buf)
+        }
+        VisitResult::Custom(custom) => {
+            if let Some(collector) = ctx.structure_collector.as_ref() {
+                collector.borrow_mut().replace_current_element(Some(&custom));
             }
-        } else {
+            Some(custom)
+        }
+        VisitResult::Skip => {
+            if let Some(collector) = ctx.structure_collector.as_ref() {
+                collector.borrow_mut().replace_current_element(None);
+            }
             None
         }
-    } else {
-        let mut buf = String::new();
-        push_heading(&mut buf, ctx, options, level, normalized);
-        Some(buf)
+        VisitResult::Error(err) => {
+            if let Some(collector) = ctx.structure_collector.as_ref() {
+                collector.borrow_mut().replace_current_element(None);
+            }
+            if ctx.visitor_error.borrow().is_none() {
+                *ctx.visitor_error.borrow_mut() = Some(err);
+            }
+            None
+        }
     }
 }
 

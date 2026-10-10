@@ -68,6 +68,13 @@ fn test_plain_code_block() {
 }
 
 #[test]
+fn should_normalize_list_item_whitespace_inside_preformatted_html() {
+    let html = "<pre><ul><li>a   b</li></ul></pre>";
+    let result = convert(html, Some(plain_options())).unwrap();
+    assert_eq!(result, "- a b\n");
+}
+
+#[test]
 fn test_plain_blockquote_no_prefix() {
     let html = "<blockquote><p>Quoted text</p></blockquote>";
     let result = convert(html, Some(plain_options())).unwrap();

@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.89"
 name = "pageant"
-version = "0.2.3"
+version = "0.2.4"
 authors = ["Eugene <inbox@null.page>"]
 build = false
 autolib = false

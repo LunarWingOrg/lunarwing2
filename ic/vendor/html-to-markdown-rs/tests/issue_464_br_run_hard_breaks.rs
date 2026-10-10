@@ -120,16 +120,8 @@ fn should_emit_a_break_for_each_run_when_runs_are_separated_by_text() {
 }
 
 #[test]
-fn a_leading_br_opens_a_line_and_the_rest_of_the_run_breaks_normally() {
-    // ~keep NOT symmetric with the trailing-run case, and deliberately left that way.
-    // ~keep Issue #464 is about CONSECUTIVE and TRAILING breaks; leading runs were never
-    // ~keep reported. The first <br> of a leading run emits a bare newline because
-    // ~keep `integration_test.rs::test_breaks_and_newlines_issue_112` pins exactly that for
-    // ~keep a top-level <br>, and collapsing leading runs here would silently break it.
-    // ~keep Every later <br> in the run has a line to break and emits a real marker.
-    // ~keep Pinned so a future decision to collapse leading runs is a deliberate change
-    // ~keep with this test updated, not an accident.
-    assert_eq!(convert("<p><br/><br/>A</p>", backslash_options()), "\n\\\nA\n");
+fn should_drop_a_leading_br_run_inside_a_paragraph() {
+    assert_eq!(convert("<p><br/><br/>A</p>", backslash_options()), "A\n");
 }
 
 #[test]

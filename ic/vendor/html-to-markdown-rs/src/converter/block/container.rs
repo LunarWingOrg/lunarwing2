@@ -14,6 +14,25 @@ use tl::{NodeHandle, Parser};
 type Context = crate::converter::Context;
 type DomContext = crate::converter::DomContext;
 
+#[derive(Clone, Copy)]
+pub struct HandlerContext<'a> {
+    pub options: &'a ConversionOptions,
+    pub ctx: &'a Context,
+    pub depth: usize,
+    pub dom_ctx: &'a DomContext,
+}
+
+impl<'a> HandlerContext<'a> {
+    pub const fn new(options: &'a ConversionOptions, ctx: &'a Context, depth: usize, dom_ctx: &'a DomContext) -> Self {
+        Self {
+            options,
+            ctx,
+            depth,
+            dom_ctx,
+        }
+    }
+}
+
 /// Handle structural container elements that recursively process children.
 ///
 /// This is used for elements like `body` and `html` that should process their
@@ -31,10 +50,7 @@ pub fn handle_structural_container(
     node_handle: &NodeHandle,
     parser: &Parser,
     output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
+    handler: HandlerContext<'_>,
 ) {
     let Some(node) = node_handle.get(parser) else {
         return;
@@ -46,7 +62,17 @@ pub fn handle_structural_container(
 
     let children = tag.children();
     for child_handle in children.top().iter() {
-        crate::converter::main::walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+        crate::converter::main::walk_node(
+            child_handle,
+            parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.ctx,
+                handler.depth + 1,
+                handler.dom_ctx,
+            ),
+        );
     }
 }
 
@@ -63,15 +89,7 @@ pub fn handle_structural_container(
 /// * `ctx` - Current conversion context
 /// * `depth` - Current recursion depth
 /// * `dom_ctx` - DOM context for tracking relationships
-pub fn handle_passthrough(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_passthrough(node_handle: &NodeHandle, parser: &Parser, output: &mut String, handler: HandlerContext<'_>) {
     let Some(node) = node_handle.get(parser) else {
         return;
     };
@@ -82,7 +100,17 @@ pub fn handle_passthrough(
 
     let children = tag.children();
     for child_handle in children.top().iter() {
-        crate::converter::main::walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+        crate::converter::main::walk_node(
+            child_handle,
+            parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.ctx,
+                handler.depth + 1,
+                handler.dom_ctx,
+            ),
+        );
     }
 }
 
@@ -100,13 +128,4 @@ pub fn handle_passthrough(
 /// * `_depth` - Current recursion depth (unused)
 /// * `_dom_ctx` - DOM context (unused)
 #[inline]
-pub const fn handle_noop(
-    _node_handle: &NodeHandle,
-    _parser: &Parser,
-    _output: &mut String,
-    _options: &ConversionOptions,
-    _ctx: &Context,
-    _depth: usize,
-    _dom_ctx: &DomContext,
-) {
-}
+pub const fn handle_noop() {}

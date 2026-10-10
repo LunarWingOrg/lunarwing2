@@ -3,6 +3,7 @@
 //! Converts HTML horizontal rule tags to Markdown horizontal rules (---)
 //! with appropriate spacing handling based on context.
 
+use crate::converter::block::container::HandlerContext;
 use crate::converter::main_helpers::trim_trailing_whitespace;
 use crate::converter::utility::siblings::get_previous_sibling_tag;
 #[cfg(feature = "visitor")]
@@ -17,58 +18,16 @@ type DomContext = crate::converter::DomContext;
 /// Converts to Markdown horizontal rule (---) with appropriate blank line
 /// spacing based on context and previous siblings.
 #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-pub fn handle(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle(node_handle: &NodeHandle, parser: &Parser, output: &mut String, handler: HandlerContext<'_>) {
+    let HandlerContext {
+        options,
+        ctx,
+        depth: _,
+        dom_ctx,
+    } = handler;
     #[cfg(feature = "visitor")]
-    if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-        let tag = match node_handle.get(parser) {
-            Some(tl::Node::Tag(t)) => t,
-            _ => return,
-        };
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-        let node_ctx = NodeContext::with_lazy_attributes(
-            NodeType::Hr,
-            Cow::Borrowed("hr"),
-            tag,
-            depth,
-            index_in_parent,
-            parent_tag.map(Cow::Borrowed),
-            false,
-        );
-        let visit_result = {
-            let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-            visitor.visit_horizontal_rule(&node_ctx)
-        };
-        match visit_result {
-            VisitResult::Continue => {}
-            VisitResult::Skip => return,
-            VisitResult::Custom(custom) => {
-                output.push_str(&custom);
-                return;
-            }
-            VisitResult::PreserveHtml => {
-                use crate::converter::utility::serialization::serialize_node;
-                output.push_str(&serialize_node(node_handle, parser));
-                return;
-            }
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                return;
-            }
-        }
+    if visit_horizontal_rule(node_handle, parser, output, handler) {
+        return;
     }
 
     if ctx.in_marker_text() {
@@ -92,42 +51,97 @@ pub fn handle(
         output.push_str("___\n");
         return;
     }
-    let list_indent = if ctx.in_list_item && !ctx.convert_as_inline && !ctx.in_table_cell && !output.is_empty() {
-        crate::converter::list::utils::continuation_indent_string(ctx.list_indent_columns, options)
-            .filter(|indent| crate::converter::list::utils::item_is_open(output, indent, ctx))
-    } else {
-        None
-    };
-    if !output.is_empty() {
-        let prev_tag = get_previous_sibling_tag(node_handle, parser, dom_ctx);
-        let last_line_is_blockquote = output
-            .rsplit('\n')
-            .find(|line| !line.trim().is_empty())
-            .is_some_and(|line| line.trim_start().starts_with('>'));
-        // ~keep Inside a paragraph too: `---` on the line under text is a setext heading underline.
-        let needs_blank_line = !matches!(prev_tag, Some("blockquote")) && !last_line_is_blockquote;
-
-        if matches!(prev_tag, Some("blockquote")) && output.ends_with("\n\n") {
-            output.truncate(output.len() - 1);
-        } else if !needs_blank_line {
-            if !output.ends_with('\n') {
-                output.push('\n');
-            }
-        } else {
-            trim_trailing_whitespace(output);
-            if output.ends_with('\n') {
-                if !output.ends_with("\n\n") {
-                    output.push('\n');
-                }
-            } else {
-                output.push_str("\n\n");
-            }
-        }
-    }
+    let list_indent = list_rule_indent(output, options, ctx);
+    separate_from_previous_rule(node_handle, parser, output, dom_ctx);
     if let Some(indent) = list_indent {
         output.push_str(&indent);
     }
     output.push_str("---\n");
+}
+
+fn list_rule_indent(output: &str, options: &crate::options::ConversionOptions, ctx: &Context) -> Option<String> {
+    if !ctx.in_list_item || ctx.convert_as_inline || ctx.in_table_cell || output.is_empty() {
+        return None;
+    }
+    crate::converter::list::utils::continuation_indent_string(ctx.list_indent_columns, options)
+        .filter(|indent| crate::converter::list::utils::item_is_open(output, indent, ctx))
+}
+
+fn separate_from_previous_rule(node_handle: &NodeHandle, parser: &Parser, output: &mut String, dom_ctx: &DomContext) {
+    if output.is_empty() {
+        return;
+    }
+    let prev_tag = get_previous_sibling_tag(node_handle, parser, dom_ctx);
+    let last_line_is_blockquote = output
+        .rsplit('\n')
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim_start().starts_with('>'));
+    let needs_blank_line = !matches!(prev_tag, Some("blockquote")) && !last_line_is_blockquote;
+
+    if matches!(prev_tag, Some("blockquote")) && output.ends_with("\n\n") {
+        output.truncate(output.len() - 1);
+    } else if !needs_blank_line {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    } else {
+        trim_trailing_whitespace(output);
+        if !output.ends_with("\n\n") {
+            output.push_str(if output.ends_with('\n') { "\n" } else { "\n\n" });
+        }
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn visit_horizontal_rule(
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+) -> bool {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let Some(ref visitor_handle) = handler.ctx.visitor else {
+        return false;
+    };
+    let Some(tl::Node::Tag(tag)) = node_handle.get(parser) else {
+        return true;
+    };
+    let node_id = node_handle.get_inner();
+    let parent_tag = handler.dom_ctx.parent_tag_name(node_id, parser);
+    let index_in_parent = handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0);
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Hr,
+        Cow::Borrowed("hr"),
+        tag,
+        handler.depth,
+        index_in_parent,
+        parent_tag.map(Cow::Borrowed),
+        false,
+    );
+    let visit_result = {
+        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
+        visitor.visit_horizontal_rule(&node_ctx)
+    };
+    match visit_result {
+        VisitResult::Continue => false,
+        VisitResult::Skip => true,
+        VisitResult::Custom(custom) => {
+            output.push_str(&custom);
+            true
+        }
+        VisitResult::PreserveHtml => {
+            use crate::converter::utility::serialization::serialize_node;
+            output.push_str(&serialize_node(node_handle, parser));
+            true
+        }
+        VisitResult::Error(err) => {
+            if handler.ctx.visitor_error.borrow().is_none() {
+                *handler.ctx.visitor_error.borrow_mut() = Some(err);
+            }
+            true
+        }
+    }
 }
 
 /// Continue the text in `output` with a space for a rule written between inline markers.

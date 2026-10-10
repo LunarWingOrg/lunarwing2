@@ -8,7 +8,7 @@ LunarWing's DarkIRC integration has three components:
 
 Multi-tenant deployments use one daemon and adapter per tenant. Sharing a daemon would share DarkIRC key material and is not a supported isolation model.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** Registry manifest,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-10 (v2.1.6.0).** Registry manifest,
 capability file (3000 ms poll floor, loopback allowlist, `pairing` DM default),
 and the `darkirc-contact prepare/respond/complete` exchange commands were
 re-checked against the current tree; no changes were needed (the 2.1.2.0
@@ -16,7 +16,8 @@ release only bumped the channel crate/registry versions to 0.1.8; the
 2.1.3.0 release again only bumped them to 0.1.9; the 2.1.4.0 release bumped
 the registry manifest to 0.1.10 and the WASM channel crate to the workspace
 `2.1.4` version; the 2.1.5.0 release bumped the registry manifest to 0.1.11
-and the WASM channel crate to `2.1.5`).
+and the WASM channel crate to `2.1.5`; the 2.1.6.0 release bumped the
+registry manifest to 0.1.12 and the WASM channel crate to `2.1.6`).
 
 ## Source Layout
 

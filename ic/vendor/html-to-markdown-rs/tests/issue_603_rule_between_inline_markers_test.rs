@@ -257,11 +257,14 @@ fn should_join_a_rule_that_starts_a_term_or_a_section_between_markers() {
     }
 }
 
-/// A paragraph between the markers already splits them (a known gap); the rule after it still
-/// follows the markers' judgement and continues the text.
+/// ~keep A paragraph splits the emphasis into valid per-block runs; the rule after it still follows
+/// the surrounding marker's judgement and continues the second run.
 #[test]
 fn should_write_a_rule_after_a_paragraph_between_markers_as_text() {
-    assert_eq!(tier2("<div><b>a<p>x</p><hr>c</b></div>").trim_end(), "**a\n\nx --- c**");
+    assert_eq!(
+        tier2("<div><b>a<p>x</p><hr>c</b></div>").trim_end(),
+        "**a**\n\n**x --- c**"
+    );
 }
 
 #[test]

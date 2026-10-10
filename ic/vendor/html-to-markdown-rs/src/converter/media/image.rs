@@ -38,108 +38,18 @@ pub fn handle_inline_data_image(
         collector.warn_skip(index, "missing data URI separator");
         return;
     };
-
     if payload.trim().is_empty() {
         collector.warn_skip(index, "empty data URI payload");
         return;
     }
 
-    if header.is_empty() {
-        collector.warn_skip(index, "missing MIME type");
-        return;
-    }
-
-    let mut segments = header.split(';');
-    let mime = segments.next().unwrap_or("");
-    let Some((top_level, subtype_raw)) = mime.split_once('/') else {
-        collector.warn_skip(index, "missing MIME subtype");
+    let Some((subtype, inline_name)) = parse_image_header(&mut collector, index, header) else {
         return;
     };
-
-    if !top_level.eq_ignore_ascii_case("image") {
-        collector.warn_skip(index, format!("unsupported MIME type {mime}"));
-        return;
-    }
-
-    let subtype_raw = subtype_raw.trim();
-    if subtype_raw.is_empty() {
-        collector.warn_skip(index, "missing MIME subtype");
-        return;
-    }
-
-    let mut is_base64 = false;
-    let mut inline_name: Option<String> = None;
-    for segment in segments {
-        if segment.eq_ignore_ascii_case("base64") {
-            is_base64 = true;
-        } else if let Some(value) = segment.strip_prefix("name=") {
-            inline_name = non_empty_trimmed(value.trim_matches('"'));
-        } else if let Some(value) = segment.strip_prefix("filename=") {
-            inline_name = non_empty_trimmed(value.trim_matches('"'));
-        }
-    }
-
-    if !is_base64 {
-        collector.warn_skip(index, "missing base64 encoding marker");
-        return;
-    }
-
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
-    let payload_clean = payload.trim();
-    let max_size = collector.max_decoded_size();
-    let max_encoded = max_size.saturating_div(3).saturating_mul(4).saturating_add(4);
-    if payload_clean.len() as u64 > max_encoded {
-        collector.warn_skip(
-            index,
-            format!(
-                "encoded payload ({} bytes) exceeds configured max ({})",
-                payload_clean.len(),
-                max_size
-            ),
-        );
-        return;
-    }
-
-    let decoded = if let Ok(bytes) = STANDARD.decode(payload_clean) {
-        bytes
-    } else {
-        collector.warn_skip(index, "invalid base64 payload");
+    let Some(decoded) = decode_payload(&mut collector, index, payload) else {
         return;
     };
-
-    if decoded.is_empty() {
-        collector.warn_skip(index, "empty base64 payload");
-        return;
-    }
-
-    if decoded.len() as u64 > max_size {
-        collector.warn_skip(
-            index,
-            format!(
-                "decoded payload ({} bytes) exceeds configured max ({})",
-                decoded.len(),
-                max_size
-            ),
-        );
-        return;
-    }
-
-    let format = if subtype_raw.eq_ignore_ascii_case("png") {
-        InlineImageFormat::Png
-    } else if subtype_raw.eq_ignore_ascii_case("jpeg") || subtype_raw.eq_ignore_ascii_case("jpg") {
-        InlineImageFormat::Jpeg
-    } else if subtype_raw.eq_ignore_ascii_case("gif") {
-        InlineImageFormat::Gif
-    } else if subtype_raw.eq_ignore_ascii_case("bmp") {
-        InlineImageFormat::Bmp
-    } else if subtype_raw.eq_ignore_ascii_case("webp") {
-        InlineImageFormat::Webp
-    } else if subtype_raw.eq_ignore_ascii_case("svg+xml") {
-        InlineImageFormat::Svg
-    } else {
-        InlineImageFormat::Other(subtype_raw.to_ascii_lowercase())
-    };
+    let format = inline_image_format(&subtype);
 
     let description = non_empty_trimmed(alt).or_else(|| title.and_then(non_empty_trimmed));
 
@@ -163,6 +73,105 @@ pub fn handle_inline_data_image(
     });
 
     collector.push_image(index, image);
+}
+
+#[cfg(feature = "inline-images")]
+fn parse_image_header(
+    collector: &mut InlineImageCollector,
+    index: usize,
+    header: &str,
+) -> Option<(String, Option<String>)> {
+    if header.is_empty() {
+        collector.warn_skip(index, "missing MIME type");
+        return None;
+    }
+    let mut segments = header.split(';');
+    let mime = segments.next().unwrap_or("");
+    let Some((top_level, subtype)) = mime.split_once('/') else {
+        collector.warn_skip(index, "missing MIME subtype");
+        return None;
+    };
+    if !top_level.eq_ignore_ascii_case("image") {
+        collector.warn_skip(index, format!("unsupported MIME type {mime}"));
+        return None;
+    }
+    let subtype = subtype.trim();
+    if subtype.is_empty() {
+        collector.warn_skip(index, "missing MIME subtype");
+        return None;
+    }
+    let mut is_base64 = false;
+    let mut inline_name = None;
+    for segment in segments {
+        if segment.eq_ignore_ascii_case("base64") {
+            is_base64 = true;
+        } else if let Some(value) = segment
+            .strip_prefix("name=")
+            .or_else(|| segment.strip_prefix("filename="))
+        {
+            inline_name = non_empty_trimmed(value.trim_matches('"'));
+        }
+    }
+    if !is_base64 {
+        collector.warn_skip(index, "missing base64 encoding marker");
+        return None;
+    }
+    Some((subtype.to_string(), inline_name))
+}
+
+#[cfg(feature = "inline-images")]
+fn decode_payload(collector: &mut InlineImageCollector, index: usize, payload: &str) -> Option<Vec<u8>> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let payload = payload.trim();
+    if payload.is_empty() {
+        collector.warn_skip(index, "empty data URI payload");
+        return None;
+    }
+    let max_size = collector.max_decoded_size();
+    let max_encoded = max_size.saturating_div(3).saturating_mul(4).saturating_add(4);
+    if payload.len() as u64 > max_encoded {
+        collector.warn_skip(
+            index,
+            format!(
+                "encoded payload ({} bytes) exceeds configured max ({max_size})",
+                payload.len()
+            ),
+        );
+        return None;
+    }
+    let Ok(decoded) = STANDARD.decode(payload) else {
+        collector.warn_skip(index, "invalid base64 payload");
+        return None;
+    };
+    if decoded.is_empty() {
+        collector.warn_skip(index, "empty base64 payload");
+        return None;
+    }
+    if decoded.len() as u64 > max_size {
+        collector.warn_skip(
+            index,
+            format!(
+                "decoded payload ({} bytes) exceeds configured max ({max_size})",
+                decoded.len()
+            ),
+        );
+        return None;
+    }
+    Some(decoded)
+}
+
+#[cfg(feature = "inline-images")]
+fn inline_image_format(subtype: &str) -> InlineImageFormat {
+    match subtype.to_ascii_lowercase().as_str() {
+        "png" => InlineImageFormat::Png,
+        "jpeg" | "jpg" => InlineImageFormat::Jpeg,
+        "gif" => InlineImageFormat::Gif,
+        "bmp" => InlineImageFormat::Bmp,
+        "webp" => InlineImageFormat::Webp,
+        "svg+xml" => InlineImageFormat::Svg,
+        subtype => InlineImageFormat::Other(subtype.to_string()),
+    }
 }
 
 /// Extract non-empty trimmed string or return None.

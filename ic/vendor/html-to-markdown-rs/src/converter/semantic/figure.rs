@@ -33,128 +33,22 @@ pub fn handle_figure(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
-        if ctx.convert_as_inline {
-            let children = tag.children();
-            {
-                for child_handle in children.top().iter() {
-                    super::walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-                }
-            }
+        if handler.ctx.convert_as_inline {
+            super::walk_tag_children(tag, parser, output, handler);
             return;
         }
 
         #[cfg(feature = "visitor")]
-        if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Figure,
-                Cow::Borrowed("figure"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                false,
-            );
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_figure_start(&node_ctx)
-            };
-            match visit_result {
-                VisitResult::Continue => {}
-                VisitResult::Skip => return,
-                VisitResult::Custom(custom) => {
-                    let start_pos = output.len();
-                    if !output.is_empty() && !output.ends_with("\n\n") {
-                        output.push_str("\n\n");
-                    }
-                    output.push_str(&custom);
-                    let safe_start =
-                        crate::converter::utility::content::floor_char_boundary(output, start_pos.min(output.len()));
-                    let figure_output = output[safe_start..].to_owned();
-                    let end_result = {
-                        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                        visitor.visit_figure_end(&node_ctx, &figure_output)
-                    };
-                    match end_result {
-                        VisitResult::Continue => {
-                            if !output.ends_with('\n') {
-                                output.push_str("\n\n");
-                            } else if !output.ends_with("\n\n") {
-                                output.push('\n');
-                            }
-                        }
-                        VisitResult::Custom(end_custom) => {
-                            output.truncate(safe_start);
-                            output.push_str(&end_custom);
-                        }
-                        VisitResult::Skip => {
-                            output.truncate(safe_start);
-                        }
-                        VisitResult::PreserveHtml => {
-                            use crate::converter::utility::serialization::serialize_node;
-                            output.truncate(safe_start);
-                            output.push_str(&serialize_node(node_handle, parser));
-                        }
-                        VisitResult::Error(err) => {
-                            if ctx.visitor_error.borrow().is_none() {
-                                *ctx.visitor_error.borrow_mut() = Some(err);
-                            }
-                        }
-                    }
-                    return;
-                }
-                VisitResult::PreserveHtml => {
-                    use crate::converter::utility::serialization::serialize_node;
-                    output.push_str(&serialize_node(node_handle, parser));
-                    return;
-                }
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    return;
-                }
-            }
-        }
-
-        if !output.is_empty() && !output.ends_with("\n\n") {
-            output.push_str("\n\n");
+        if visit_figure_start(tag, node_handle, parser, output, handler) {
+            return;
         }
 
         let figure_start = output.len();
 
-        let mut figure_content = String::new();
-        let children = tag.children();
-        {
-            // ~keep The figure is written at the start of the line, so inside it the list item
-            // ~keep has ended (issue #583).
-            let figure_ctx = super::Context {
-                list_item_open: false,
-                real_item_columns: 0,
-                ..ctx.clone()
-            };
-            for child_handle in children.top().iter() {
-                super::walk_node(
-                    child_handle,
-                    parser,
-                    &mut figure_content,
-                    options,
-                    &figure_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-            }
-        }
+        let mut figure_content = collect_figure_content(tag, parser, handler);
 
         // ~keep A trailing <br> run with no following sibling has no next dispatch to catch
         // ~keep it in `walk_node`'s pre-block-dispatch strip, since the figure's content is
@@ -163,7 +57,7 @@ pub fn handle_figure(
         // ~keep does not treat `\` as trimmable, so it cannot clean this up on its own.
         crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer(
             &mut figure_content,
-            options.newline_style,
+            handler.options.newline_style,
         );
 
         figure_content = figure_content.replace("\n![", "![");
@@ -171,59 +65,168 @@ pub fn handle_figure(
 
         let trimmed = figure_content.trim_matches(|c| c == '\n' || c == ' ' || c == '\t');
         if !trimmed.is_empty() {
-            output.push_str(trimmed);
-            if !output.ends_with('\n') {
-                output.push('\n');
-            }
-            if !output.ends_with("\n\n") {
-                output.push('\n');
-            }
+            crate::converter::block::div::push_block(output, handler.options, handler.ctx, trimmed);
         }
 
         #[cfg(feature = "visitor")]
-        if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
+        visit_figure_end(tag, node_handle, parser, output, figure_start, handler);
+    }
+}
 
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Figure,
-                Cow::Borrowed("figure"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                false,
-            );
-            let safe_start =
-                crate::converter::utility::content::floor_char_boundary(output, figure_start.min(output.len()));
-            let figure_output = output[safe_start..].to_owned();
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_figure_end(&node_ctx, &figure_output)
-            };
-            match visit_result {
-                VisitResult::Continue => {}
-                VisitResult::Skip => {
-                    output.truncate(safe_start);
-                }
-                VisitResult::Custom(custom) => {
-                    output.truncate(safe_start);
-                    output.push_str(&custom);
-                }
-                VisitResult::PreserveHtml => {
-                    use crate::converter::utility::serialization::serialize_node;
-                    output.truncate(safe_start);
-                    output.push_str(&serialize_node(node_handle, parser));
-                }
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                }
-            }
+fn collect_figure_content(tag: &tl::HTMLTag<'_>, parser: &tl::Parser, handler: super::HandlerContext<'_>) -> String {
+    let mut content = String::new();
+    super::walk_tag_children(tag, parser, &mut content, handler);
+    content
+}
+
+#[cfg(feature = "visitor")]
+fn visit_figure_start(
+    tag: &tl::HTMLTag<'_>,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    handler: super::HandlerContext<'_>,
+) -> bool {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let Some(visitor_handle) = handler.ctx.visitor.as_ref() else {
+        return false;
+    };
+    let node_id = node_handle.get_inner();
+    let parent_tag = handler.dom_ctx.parent_tag_name(node_id, parser);
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Figure,
+        Cow::Borrowed("figure"),
+        tag,
+        handler.depth,
+        handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0),
+        parent_tag.map(Cow::Borrowed),
+        false,
+    );
+    let visit_result = visitor_handle
+        .lock()
+        .expect("visitor mutex poisoned")
+        .visit_figure_start(&node_ctx);
+    match visit_result {
+        VisitResult::Continue => false,
+        VisitResult::Skip => true,
+        VisitResult::Custom(custom) => {
+            render_custom_figure(&node_ctx, node_handle, parser, output, &custom, handler.ctx);
+            true
         }
+        VisitResult::PreserveHtml => {
+            output.push_str(&crate::converter::utility::serialization::serialize_node(
+                node_handle,
+                parser,
+            ));
+            true
+        }
+        VisitResult::Error(error) => {
+            record_visitor_error(handler.ctx, error);
+            true
+        }
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn render_custom_figure(
+    node_context: &crate::visitor::NodeContext<'_>,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    custom: &str,
+    ctx: &super::Context,
+) {
+    use crate::visitor::VisitResult;
+
+    let start = output.len();
+    if !output.is_empty() && !output.ends_with("\n\n") {
+        output.push_str("\n\n");
+    }
+    output.push_str(custom);
+    let safe_start = crate::converter::utility::content::floor_char_boundary(output, start.min(output.len()));
+    let result = ctx
+        .visitor
+        .as_ref()
+        .expect("visitor available")
+        .lock()
+        .expect("visitor mutex poisoned")
+        .visit_figure_end(node_context, &output[safe_start..]);
+    match result {
+        VisitResult::Continue => ensure_figure_trailing_blank_line(output),
+        VisitResult::Custom(replacement) => replace_figure_output(output, safe_start, &replacement),
+        VisitResult::Skip => output.truncate(safe_start),
+        VisitResult::PreserveHtml => replace_figure_output(
+            output,
+            safe_start,
+            &crate::converter::utility::serialization::serialize_node(node_handle, parser),
+        ),
+        VisitResult::Error(error) => record_visitor_error(ctx, error),
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn visit_figure_end(
+    tag: &tl::HTMLTag<'_>,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    figure_start: usize,
+    handler: super::HandlerContext<'_>,
+) {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let Some(visitor_handle) = handler.ctx.visitor.as_ref() else {
+        return;
+    };
+    let node_id = node_handle.get_inner();
+    let parent_tag = handler.dom_ctx.parent_tag_name(node_id, parser);
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Figure,
+        Cow::Borrowed("figure"),
+        tag,
+        handler.depth,
+        handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0),
+        parent_tag.map(Cow::Borrowed),
+        false,
+    );
+    let safe_start = crate::converter::utility::content::floor_char_boundary(output, figure_start.min(output.len()));
+    let result = visitor_handle
+        .lock()
+        .expect("visitor mutex poisoned")
+        .visit_figure_end(&node_ctx, &output[safe_start..]);
+    match result {
+        VisitResult::Continue => {}
+        VisitResult::Skip => output.truncate(safe_start),
+        VisitResult::Custom(custom) => replace_figure_output(output, safe_start, &custom),
+        VisitResult::PreserveHtml => replace_figure_output(
+            output,
+            safe_start,
+            &crate::converter::utility::serialization::serialize_node(node_handle, parser),
+        ),
+        VisitResult::Error(error) => record_visitor_error(handler.ctx, error),
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn ensure_figure_trailing_blank_line(output: &mut String) {
+    if !output.ends_with('\n') {
+        output.push_str("\n\n");
+    } else if !output.ends_with("\n\n") {
+        output.push('\n');
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn replace_figure_output(output: &mut String, start: usize, replacement: &str) {
+    output.truncate(start);
+    output.push_str(replacement);
+}
+
+#[cfg(feature = "visitor")]
+fn record_visitor_error(ctx: &super::Context, error: String) {
+    if ctx.visitor_error.borrow().is_none() {
+        *ctx.visitor_error.borrow_mut() = Some(error);
     }
 }
 
@@ -251,10 +254,7 @@ pub fn handle_figcaption(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
         let mut text = String::new();
@@ -262,17 +262,19 @@ pub fn handle_figcaption(
         {
             let caption_ctx = super::Context {
                 text_in_markers: true,
-                ..ctx.clone()
+                ..handler.ctx.clone()
             };
             for child_handle in children.top().iter() {
                 super::walk_node(
                     child_handle,
                     parser,
                     &mut text,
-                    options,
-                    &caption_ctx,
-                    depth + 1,
-                    dom_ctx,
+                    crate::converter::block::container::HandlerContext::new(
+                        handler.options,
+                        &caption_ctx,
+                        handler.depth + 1,
+                        handler.dom_ctx,
+                    ),
                 );
             }
         }
@@ -285,7 +287,7 @@ pub fn handle_figcaption(
         // ~keep emphasis delimiter instead of merely surviving as a visible character.
         crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer(
             &mut text,
-            options.newline_style,
+            handler.options.newline_style,
         );
 
         let text = text.trim().to_owned();
@@ -294,81 +296,87 @@ pub fn handle_figcaption(
         }
 
         #[cfg(feature = "visitor")]
-        if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Figcaption,
-                Cow::Borrowed("figcaption"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                false,
-            );
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_figcaption(&node_ctx, &text)
-            };
-            match visit_result {
-                VisitResult::Continue => {}
-                VisitResult::Skip => return,
-                VisitResult::Custom(custom) => {
-                    if !output.is_empty() {
-                        if output.ends_with("```\n") {
-                            output.push('\n');
-                        } else {
-                            while output.ends_with(' ') || output.ends_with('\t') {
-                                output.pop();
-                            }
-                            if output.ends_with('\n') && !output.ends_with("\n\n") {
-                                output.push('\n');
-                            } else if !output.ends_with('\n') {
-                                output.push_str("\n\n");
-                            }
-                        }
-                    }
-                    output.push_str(&custom);
-                    if !custom.ends_with('\n') {
-                        output.push_str("\n\n");
-                    }
-                    return;
-                }
-                VisitResult::PreserveHtml => {
-                    use crate::converter::utility::serialization::serialize_node;
-                    output.push_str(&serialize_node(node_handle, parser));
-                    return;
-                }
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    return;
-                }
-            }
+        if visit_figcaption(tag, node_handle, parser, output, &text, handler) {
+            return;
         }
 
-        if !output.is_empty() {
-            if output.ends_with("```\n") {
-                output.push('\n');
-            } else {
-                while output.ends_with(' ') || output.ends_with('\t') {
-                    output.pop();
-                }
-                if output.ends_with('\n') && !output.ends_with("\n\n") {
-                    output.push('\n');
-                } else if !output.ends_with('\n') {
-                    output.push_str("\n\n");
-                }
-            }
-        }
+        separate_caption(output);
 
         output.push('*');
         output.push_str(&text);
         output.push_str("*\n\n");
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn visit_figcaption(
+    tag: &tl::HTMLTag<'_>,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    text: &str,
+    handler: super::HandlerContext<'_>,
+) -> bool {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let Some(visitor_handle) = handler.ctx.visitor.as_ref() else {
+        return false;
+    };
+    let node_id = node_handle.get_inner();
+    let parent_tag = handler.dom_ctx.parent_tag_name(node_id, parser);
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Figcaption,
+        Cow::Borrowed("figcaption"),
+        tag,
+        handler.depth,
+        handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0),
+        parent_tag.map(Cow::Borrowed),
+        false,
+    );
+    let visit_result = visitor_handle
+        .lock()
+        .expect("visitor mutex poisoned")
+        .visit_figcaption(&node_ctx, text);
+    match visit_result {
+        VisitResult::Continue => false,
+        VisitResult::Skip => true,
+        VisitResult::Custom(custom) => {
+            separate_caption(output);
+            output.push_str(&custom);
+            if !custom.ends_with('\n') {
+                output.push_str("\n\n");
+            }
+            true
+        }
+        VisitResult::PreserveHtml => {
+            output.push_str(&crate::converter::utility::serialization::serialize_node(
+                node_handle,
+                parser,
+            ));
+            true
+        }
+        VisitResult::Error(error) => {
+            record_visitor_error(handler.ctx, error);
+            true
+        }
+    }
+}
+
+fn separate_caption(output: &mut String) {
+    if output.is_empty() {
+        return;
+    }
+    if output.ends_with("```\n") {
+        output.push('\n');
+        return;
+    }
+    while output.ends_with(' ') || output.ends_with('\t') {
+        output.pop();
+    }
+    if output.ends_with('\n') && !output.ends_with("\n\n") {
+        output.push('\n');
+    } else if !output.ends_with('\n') {
+        output.push_str("\n\n");
     }
 }
 
@@ -380,14 +388,11 @@ pub fn handle(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     match tag_name {
-        "figure" => handle_figure(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
-        "figcaption" => handle_figcaption(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
+        "figure" => handle_figure(tag_name, node_handle, parser, output, handler),
+        "figcaption" => handle_figcaption(tag_name, node_handle, parser, output, handler),
         _ => {}
     }
 }

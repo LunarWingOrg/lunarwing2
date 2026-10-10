@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "lazy-regex-proc_macros"
-version = "3.6.1"
+version = "3.6.2"
 authors = ["Canop <cano.petrole@gmail.com>"]
 build = false
 autolib = false
@@ -40,5 +40,5 @@ version = "1.0"
 version = "1.13"
 
 [dependencies.syn]
-version = "2.0"
+version = "3.0"
 features = ["full"]

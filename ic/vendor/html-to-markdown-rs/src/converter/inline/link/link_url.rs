@@ -385,6 +385,37 @@ pub fn append_markdown_link(
     options: &ConversionOptions,
     reference_collector: Option<&crate::converter::reference_collector::ReferenceCollectorHandle>,
 ) {
+    append_markdown_link_in_context(output, link, options, reference_collector, false);
+}
+
+fn append_link_destination_in_context(
+    output: &mut String,
+    href: &str,
+    options: &ConversionOptions,
+    title_follows: bool,
+    in_table_cell: bool,
+) {
+    if options.output_format == crate::options::OutputFormat::Djot && in_table_cell {
+        let mut destination = String::new();
+        append_url_destination(&mut destination, href, options.url_escape_style, title_follows);
+        output.push_str(&crate::converter::utility::escaping::escape_djot_table_cell_literal(
+            &destination,
+            options.output_format,
+            in_table_cell,
+        ));
+    } else {
+        append_url_destination(output, href, options.url_escape_style, title_follows);
+    }
+}
+
+/// Format and append a Markdown link with awareness of an enclosing table cell. ~keep
+pub fn append_markdown_link_in_context(
+    output: &mut String,
+    link: &MarkdownLink<'_>,
+    options: &ConversionOptions,
+    reference_collector: Option<&crate::converter::reference_collector::ReferenceCollectorHandle>,
+    in_table_cell: bool,
+) {
     let MarkdownLink {
         label,
         href,
@@ -408,15 +439,25 @@ pub fn append_markdown_link(
     output.push_str("](");
 
     let title_follows = title.is_some() || (options.default_title && raw_text == href);
-    append_url_destination(output, href, options.url_escape_style, title_follows);
+    append_link_destination_in_context(output, href, options, title_follows, in_table_cell);
 
     if let Some(title_text) = title {
         output.push_str(" \"");
-        output.push_str(&escape_markdown_title(title_text));
+        let escaped = escape_markdown_title(title_text);
+        output.push_str(&crate::converter::utility::escaping::escape_djot_table_cell_literal(
+            &escaped,
+            options.output_format,
+            in_table_cell,
+        ));
         output.push('"');
     } else if options.default_title && raw_text == href {
         output.push_str(" \"");
-        output.push_str(&escape_markdown_title(href));
+        let escaped = escape_markdown_title(href);
+        output.push_str(&crate::converter::utility::escaping::escape_djot_table_cell_literal(
+            &escaped,
+            options.output_format,
+            in_table_cell,
+        ));
         output.push('"');
     }
 

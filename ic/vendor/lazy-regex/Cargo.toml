@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.71"
 name = "lazy-regex"
-version = "3.6.1"
+version = "3.6.2"
 authors = ["Canop <cano.petrole@gmail.com>"]
 build = false
 autolib = false
@@ -72,7 +72,7 @@ name = "replace"
 path = "tests/replace.rs"
 
 [dependencies.lazy-regex-proc_macros]
-version = "3.6.1"
+version = "3.6.2"
 
 [dependencies.once_cell]
 version = "1.21"

@@ -46,7 +46,8 @@ use crate::{HtmlMetadata, MetadataConfig};
 ///
 /// # Errors
 ///
-/// Returns an error if HTML parsing fails or if the input contains invalid UTF-8.
+/// Returns an error if the configured input-size limit is exceeded, HTML parsing fails,
+/// or the input contains invalid UTF-8.
 ///
 /// # Observability
 ///
@@ -84,284 +85,143 @@ pub fn convert(html: &str, options: impl Into<Option<ConversionOptions>>) -> Res
     convert_inner(html, options)
 }
 
+struct PreparedConversion<'a> {
+    html: Cow<'a, str>,
+    effective_base: Option<std::rc::Rc<url::Url>>,
+    metadata_base_href: Option<String>,
+}
+
+#[cfg(feature = "metadata")]
+type MetadataCollectorHandle = std::rc::Rc<std::cell::RefCell<crate::metadata::MetadataCollector>>;
+#[cfg(feature = "inline-images")]
+type ImageCollectorHandle = std::rc::Rc<std::cell::RefCell<crate::inline_images::InlineImageCollector>>;
+
+struct Tier2Collectors {
+    #[cfg(feature = "metadata")]
+    metadata: Option<MetadataCollectorHandle>,
+    #[cfg(feature = "inline-images")]
+    images: Option<ImageCollectorHandle>,
+}
+
+type ConvertOutput = (
+    String,
+    Option<crate::types::DocumentStructure>,
+    Vec<crate::types::TableData>,
+    Option<crate::types::ProcessingWarning>,
+);
+
 fn convert_inner(html: &str, options: ConversionOptions) -> Result<ConversionResult> {
-    #[cfg(any(feature = "metadata", feature = "inline-images"))]
-    use std::cell::RefCell;
-    #[cfg(any(feature = "metadata", feature = "inline-images"))]
-    use std::rc::Rc;
+    validate_input_size(html, options.max_input_size)?;
+    let prepared = prepare_conversion(html, &options)?;
+    if let Some(result) = try_tier1(&prepared, &options) {
+        return Ok(result);
+    }
+    if !options.wrap
+        && let Some(markdown) = fast_text_only(prepared.html.as_ref(), &options)
+    {
+        return Ok(ConversionResult {
+            content: Some(markdown),
+            ..ConversionResult::default()
+        });
+    }
+    run_tier2(prepared, options)
+}
 
-    // ~keep Both tiers convert this text, so the base is read from it too.
-    let normalized_html = normalize_input(html)?;
+fn validate_input_size(html: &str, max_size: Option<u64>) -> Result<()> {
+    if let Some(max_size) = max_size {
+        let observed_size = u64::try_from(html.len()).unwrap_or(u64::MAX);
+        if observed_size > max_size {
+            return Err(crate::error::ConversionError::InputTooLarge {
+                observed_size,
+                max_size,
+            });
+        }
+    }
+    Ok(())
+}
 
-    // ~keep The same `<base href>` is the `base` metadata, so both read it here, once.
+fn prepare_conversion<'a>(html: &'a str, options: &ConversionOptions) -> Result<PreparedConversion<'a>> {
+    // ~keep Both tiers must see the same repaired tree when head content precedes an
+    // ~keep explicit `<head>`; browsers place that content in the implicit head (issue #592).
+    let normalized_input = normalize_input(html)?;
+    let normalized_html = crate::converter::repair_head_content_before_explicit_head(normalized_input.as_ref())
+        .map_or(normalized_input, Cow::Owned);
     let document_base_href = (options.base_url.is_some() || options.extract_metadata)
         .then(|| crate::converter::url_resolve::document_base_href(&normalized_html))
         .flatten();
-
-    // ~keep Computed once, from the normalized input, and reused for both the
-    // ~keep Tier-1 attempt and the Tier-2 fallback below -- the single most important property
-    // ~keep for `base_url`: both tiers resolve every relative destination against the exact
-    // ~keep same `Url` value, so they cannot disagree on what a relative reference resolves
-    // ~keep to. `None` (the default, `options.base_url` unset) makes every downstream
-    // ~keep resolution call a no-op, so output stays byte-identical to before this option
-    // ~keep existed.
-    let effective_base: Option<std::rc::Rc<url::Url>> = options
+    let effective_base = options
         .base_url
         .as_deref()
         .and_then(|base| crate::converter::url_resolve::compute_effective_base(document_base_href.as_deref(), base))
         .map(std::rc::Rc::new);
+    let metadata_base_href = document_base_href.as_ref().map(|document_base_href| {
+        effective_base
+            .as_deref()
+            .map_or_else(|| document_base_href.clone(), |base| base.as_str().to_owned())
+    });
+    Ok(PreparedConversion {
+        html: normalized_html,
+        effective_base,
+        metadata_base_href,
+    })
+}
 
-    // ~keep Tier-1 dispatcher.
-    // ~keep
-    // ~keep `TierStrategy::Tier2` skips this block entirely and falls straight to
-    // ~keep the Tier-2 pipeline below.
-    // ~keep
-    // ~keep `TierStrategy::Auto` runs the prescan + classifier once.  If the
-    // ~keep classifier returns `RouterDecision::Tier1`, the scanner is invoked.  On
-    // ~keep success the result is returned immediately.  On bail the Tier-2 pipeline
-    // ~keep below converts the same normalized input.
-    // ~keep
-    // ~keep `TierStrategy::Tier1` (testkit-only) bypasses the classifier and forces
-    // ~keep the scanner unconditionally, still with Tier-2 fallback on bail.
+fn try_tier1(prepared: &PreparedConversion<'_>, options: &ConversionOptions) -> Option<ConversionResult> {
+    let report = crate::converter::prescan::PrescanReport::default();
     match options.tier_strategy {
-        crate::options::TierStrategy::Tier2 => {
-            // ~keep Skip Tier-1 entirely; fall through to the Tier-2 path below.
-        }
+        crate::options::TierStrategy::Tier2 => None,
         crate::options::TierStrategy::Auto => {
-            // ~keep Phase C: skip the prescan pre-pass for the Tier-1 attempt.  The
-            // ~keep scanner now handles every construct prescan used to strip
-            // ~keep (script/style, head, meta/link, doctype, comments, self-closing
-            // ~keep void tags) inline, and bails cleanly on the constructs the
-            // ~keep router used to gate on (SVG, CDATA, custom elements, bare `<`).
-            // ~keep For routing we still consult the option-based gates in
-            // ~keep `classify`; we pass a default `PrescanReport` whose fields are
-            // ~keep all false because the scanner will detect any structural
-            // ~keep edge-case during its single walk.
-            let stub_report = crate::converter::prescan::PrescanReport::default();
-            let decision = crate::converter::tier1::router::classify(&stub_report, &options);
+            let decision = crate::converter::tier1::router::classify(&report, options);
             if decision == crate::converter::tier1::RouterDecision::Tier1 {
-                match crate::converter::tier1::run_with_base(
-                    normalized_html.as_ref(),
-                    &stub_report,
-                    &options,
-                    effective_base.clone(),
-                    document_base_href.as_deref(),
-                ) {
-                    Ok(markdown) => {
-                        tracing::debug!(
-                            target: "html_to_markdown::convert",
-                            output_len = markdown.len(),
-                            "tier-1 fast-path conversion completed"
-                        );
-                        return Ok(crate::types::ConversionResult {
-                            content: Some(markdown),
-                            document: None,
-                            tables: Vec::new(),
-                            warnings: Vec::new(),
-                            #[cfg(feature = "metadata")]
-                            metadata: crate::metadata::HtmlMetadata::default(),
-                            #[cfg(feature = "inline-images")]
-                            images: Vec::new(),
-                        });
-                    }
-                    Err(bail) => {
-                        // ~keep Tier-1 bailed — fall through to Tier-2 with the
-                        // ~keep already-normalized input.  Tier-2 runs its own
-                        // ~keep prescan internally via `convert_html_impl`.
-                        tracing::warn!(
-                            target: "html_to_markdown::convert",
-                            reason = %bail,
-                            "tier-1 conversion bailed; falling back to tier-2"
-                        );
-                    }
-                }
+                run_tier1(prepared, options, &report)
             } else {
-                // ~keep RouterDecision::Tier2: fall through with the already-normalized input.
                 tracing::debug!(target: "html_to_markdown::convert", "router selected tier-2 conversion path directly");
+                None
             }
         }
         #[cfg(any(test, feature = "testkit"))]
-        crate::options::TierStrategy::Tier1 => {
-            // ~keep Testkit path: bypass the classifier and force Tier-1, with
-            // ~keep Tier-2 fallback on bail.  Like the Auto path, skip the prescan
-            // ~keep pre-pass — the scanner handles every construct it would have
-            // ~keep stripped or bails cleanly.
-            let stub_report = crate::converter::prescan::PrescanReport::default();
-            match crate::converter::tier1::run_with_base(
-                normalized_html.as_ref(),
-                &stub_report,
-                &options,
-                effective_base.clone(),
-                document_base_href.as_deref(),
-            ) {
-                Ok(markdown) => {
-                    tracing::debug!(
-                        target: "html_to_markdown::convert",
-                        output_len = markdown.len(),
-                        "tier-1 fast-path conversion completed"
-                    );
-                    return Ok(crate::types::ConversionResult {
-                        content: Some(markdown),
-                        document: None,
-                        tables: Vec::new(),
-                        warnings: Vec::new(),
-                        #[cfg(feature = "metadata")]
-                        metadata: crate::metadata::HtmlMetadata::default(),
-                        #[cfg(feature = "inline-images")]
-                        images: Vec::new(),
-                    });
-                }
-                Err(bail) => {
-                    tracing::warn!(
-                        target: "html_to_markdown::convert",
-                        reason = %bail,
-                        "tier-1 conversion bailed; falling back to tier-2"
-                    );
-                }
-            }
-        }
+        crate::options::TierStrategy::Tier1 => run_tier1(prepared, options, &report),
     }
+}
 
-    #[cfg(feature = "visitor")]
-    let visitor = options.visitor.clone();
-
-    if !options.wrap {
-        if let Some(markdown) = fast_text_only(normalized_html.as_ref(), &options) {
-            return Ok(ConversionResult {
+fn run_tier1(
+    prepared: &PreparedConversion<'_>,
+    options: &ConversionOptions,
+    report: &crate::converter::prescan::PrescanReport,
+) -> Option<ConversionResult> {
+    match crate::converter::tier1::run_with_base(
+        prepared.html.as_ref(),
+        report,
+        options,
+        prepared.effective_base.clone(),
+        prepared.metadata_base_href.as_deref(),
+    ) {
+        Ok(markdown) => {
+            tracing::debug!(target: "html_to_markdown::convert", output_len = markdown.len(), "tier-1 fast-path conversion completed");
+            Some(ConversionResult {
                 content: Some(markdown),
-                ..ConversionResult::default()
-            });
+                document: None,
+                tables: Vec::new(),
+                warnings: Vec::new(),
+                #[cfg(feature = "metadata")]
+                metadata: crate::metadata::HtmlMetadata::default(),
+                #[cfg(feature = "inline-images")]
+                images: Vec::new(),
+            })
+        }
+        Err(bail) => {
+            tracing::warn!(target: "html_to_markdown::convert", reason = %bail, "tier-1 conversion bailed; falling back to tier-2");
+            None
         }
     }
+}
 
-    #[cfg(feature = "metadata")]
-    let wants_metadata = options.extract_metadata;
-    #[cfg(not(feature = "metadata"))]
-    let wants_metadata = false;
-
-    #[cfg(feature = "inline-images")]
-    let wants_images = options.extract_images;
-    #[cfg(not(feature = "inline-images"))]
-    let wants_images = false;
-
-    #[cfg(feature = "metadata")]
-    let metadata_collector = if wants_metadata {
-        Some(Rc::new(RefCell::new(crate::metadata::MetadataCollector::new(
-            MetadataConfig::default(),
-        ))))
-    } else {
-        None
-    };
-
-    #[cfg(feature = "inline-images")]
-    let image_collector = if wants_images {
-        use crate::inline_images::InlineImageConfig as IIC;
-        // ~keep `IIC::new` only seeds its own defaults, and two of them are the INVERSE of
-        // ~keep the documented `ConversionOptions` defaults (`capture_svg` true vs false,
-        // ~keep `infer_dimensions` false vs true). Forwarding is therefore not optional
-        // ~keep polish: without it every caller silently gets both flipped, and
-        // ~keep `max_image_size` is ignored because it only ever coincided with the constant.
-        let mut config = IIC::new(options.max_image_size);
-        config.capture_svg = options.capture_svg;
-        config.infer_dimensions = options.infer_dimensions;
-        Some(Rc::new(RefCell::new(crate::inline_images::InlineImageCollector::new(
-            config,
-        )?)))
-    } else {
-        None
-    };
-
-    let structure_collector: Option<std::rc::Rc<std::cell::RefCell<crate::types::StructureCollector>>> =
-        if options.include_document_structure {
-            Some(std::rc::Rc::new(std::cell::RefCell::new(
-                crate::types::StructureCollector::new(),
-            )))
-        } else {
-            None
-        };
-
-    #[cfg(not(feature = "visitor"))]
-    let visitor: Option<()> = None;
-
-    // ~keep Pass structure_collector by value — convert_html_impl will consume it via Rc::try_unwrap
-    // ~keep to return the finished DocumentStructure. We must not hold a second Rc reference.
-    //
-    // ~keep The whole pipeline runs inside `catch_unwind`: a panicking visitor callback
-    // ~keep poisons the visitor's `Mutex` (std::sync::Mutex poisons on an unwind while
-    // ~keep the guard is held). Without a catch here, that panic would unwind straight
-    // ~keep out of `convert()`, and any *later* call reusing the same visitor handle
-    // ~keep would find it permanently poisoned. Catching it here confines the failure
-    // ~keep to this call and lets us clear the poison flag below. See
-    // ~keep xberg-io/html-to-markdown#28.
-    type ConvertOutput = (
-        String,
-        Option<crate::types::DocumentStructure>,
-        Vec<crate::types::TableData>,
-        Option<crate::types::ProcessingWarning>,
-    );
-    let convert_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<ConvertOutput> {
-        #[cfg(all(feature = "metadata", feature = "inline-images"))]
-        {
-            crate::converter::convert_html_impl(
-                normalized_html.as_ref(),
-                &options,
-                image_collector.as_ref().map(Rc::clone),
-                metadata_collector.as_ref().map(Rc::clone),
-                visitor,
-                structure_collector,
-                effective_base,
-                document_base_href.as_deref(),
-            )
-        }
-        #[cfg(all(feature = "metadata", not(feature = "inline-images")))]
-        {
-            crate::converter::convert_html_impl(
-                normalized_html.as_ref(),
-                &options,
-                None,
-                metadata_collector.as_ref().map(Rc::clone),
-                visitor,
-                structure_collector,
-                effective_base,
-                document_base_href.as_deref(),
-            )
-        }
-        #[cfg(all(not(feature = "metadata"), feature = "inline-images"))]
-        {
-            crate::converter::convert_html_impl(
-                normalized_html.as_ref(),
-                &options,
-                image_collector.as_ref().map(Rc::clone),
-                None,
-                visitor,
-                structure_collector,
-                effective_base,
-                document_base_href.as_deref(),
-            )
-        }
-        #[cfg(all(not(feature = "metadata"), not(feature = "inline-images")))]
-        {
-            crate::converter::convert_html_impl(
-                normalized_html.as_ref(),
-                &options,
-                None,
-                None,
-                visitor,
-                structure_collector,
-                effective_base,
-                document_base_href.as_deref(),
-            )
-        }
-    }));
-
-    let (markdown, document, tables, depth_warning) = match convert_outcome {
+fn run_tier2(prepared: PreparedConversion<'_>, options: ConversionOptions) -> Result<ConversionResult> {
+    let collectors = create_collectors(&options)?;
+    let outcome = invoke_converter(&prepared, &options, &collectors);
+    let (markdown, document, tables, depth_warning) = match outcome {
         Ok(result) => result?,
         Err(panic_payload) => {
-            // ~keep Clear the poison flag so a later, unrelated conversion that reuses this
-            // ~keep same visitor handle is not permanently latched into failure. The state
-            // ~keep guarded by this Mutex is the caller's own visitor object; no other
-            // ~keep thread can observe it mid-mutation because every access is serialised
-            // ~keep through this same lock, so recovering it here cannot expose a torn read.
             #[cfg(feature = "visitor")]
             if let Some(handle) = &options.visitor {
                 handle.clear_poison();
@@ -369,44 +229,109 @@ fn convert_inner(html: &str, options: ConversionOptions) -> Result<ConversionRes
             return Err(crate::error::ConversionError::Panic(panic_message(&*panic_payload)));
         }
     };
+    finish_conversion(markdown, document, tables, depth_warning, collectors)
+}
 
+#[cfg(any(feature = "metadata", feature = "inline-images"))]
+fn create_collectors(options: &ConversionOptions) -> Result<Tier2Collectors> {
     #[cfg(feature = "metadata")]
-    let metadata = if let Some(collector) = metadata_collector {
-        Rc::try_unwrap(collector)
-            .map_err(|_| ConversionError::Other("failed to recover metadata state".to_string()))?
-            .into_inner()
-            .finish()
-    } else {
-        HtmlMetadata::default()
-    };
-
+    let metadata = options.extract_metadata.then(|| {
+        std::rc::Rc::new(std::cell::RefCell::new(crate::metadata::MetadataCollector::new(
+            MetadataConfig::default(),
+        )))
+    });
     #[cfg(feature = "inline-images")]
-    let (images, image_warnings) = if let Some(collector) = image_collector {
-        let c = Rc::try_unwrap(collector)
-            .map_err(|_| ConversionError::Other("failed to recover inline image state".to_string()))?
-            .into_inner();
-        c.finish()
+    let images = if options.extract_images {
+        let mut config = crate::inline_images::InlineImageConfig::new(options.max_image_size);
+        config.capture_svg = options.capture_svg;
+        config.infer_dimensions = options.infer_dimensions;
+        Some(std::rc::Rc::new(std::cell::RefCell::new(
+            crate::inline_images::InlineImageCollector::new(config)?,
+        )))
     } else {
-        (Vec::new(), Vec::new())
+        None
     };
+    Ok(Tier2Collectors {
+        #[cfg(feature = "metadata")]
+        metadata,
+        #[cfg(feature = "inline-images")]
+        images,
+    })
+}
 
+#[cfg(not(any(feature = "metadata", feature = "inline-images")))]
+const fn create_collectors(_: &ConversionOptions) -> Result<Tier2Collectors> {
+    Ok(Tier2Collectors {})
+}
+
+fn invoke_converter(
+    prepared: &PreparedConversion<'_>,
+    options: &ConversionOptions,
+    collectors: &Tier2Collectors,
+) -> std::thread::Result<Result<ConvertOutput>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        call_converter(prepared, options, collectors)
+    }))
+}
+
+fn call_converter(
+    prepared: &PreparedConversion<'_>,
+    options: &ConversionOptions,
+    collectors: &Tier2Collectors,
+) -> Result<ConvertOutput> {
+    #[cfg(feature = "visitor")]
+    let visitor = options.visitor.clone();
+    let structure = options
+        .include_document_structure
+        .then(|| std::rc::Rc::new(std::cell::RefCell::new(crate::types::StructureCollector::new())));
+    crate::converter::convert_html_impl(
+        prepared.html.as_ref(),
+        options,
+        crate::converter::main::ConversionParameters {
+            inline_collector: image_collector(collectors),
+            #[cfg(feature = "metadata")]
+            metadata_collector: metadata_collector(collectors),
+            #[cfg(feature = "visitor")]
+            visitor,
+            structure_collector: structure,
+            base_url: prepared.effective_base.clone(),
+            document_base_href: prepared.metadata_base_href.as_deref(),
+        },
+    )
+}
+
+#[cfg(feature = "inline-images")]
+fn image_collector(collectors: &Tier2Collectors) -> Option<ImageCollectorHandle> {
+    collectors.images.as_ref().map(std::rc::Rc::clone)
+}
+
+#[cfg(not(feature = "inline-images"))]
+const fn image_collector(_: &Tier2Collectors) -> Option<()> {
+    None
+}
+
+#[cfg(feature = "metadata")]
+fn metadata_collector(collectors: &Tier2Collectors) -> Option<MetadataCollectorHandle> {
+    collectors.metadata.as_ref().map(std::rc::Rc::clone)
+}
+
+fn finish_conversion(
+    markdown: String,
+    document: Option<crate::types::DocumentStructure>,
+    tables: Vec<crate::types::TableData>,
+    depth_warning: Option<crate::types::ProcessingWarning>,
+    collectors: Tier2Collectors,
+) -> Result<ConversionResult> {
+    let _ = &collectors;
+    #[cfg(feature = "metadata")]
+    let metadata = finish_metadata(collectors.metadata)?;
     #[cfg(feature = "inline-images")]
-    let mut warnings: Vec<crate::types::ProcessingWarning> = image_warnings
-        .into_iter()
-        .map(|w| crate::types::ProcessingWarning {
-            kind: crate::types::WarningKind::ImageExtractionFailed,
-            message: w.message,
-        })
-        .collect();
+    let (images, mut warnings) = finish_images(collectors.images)?;
     #[cfg(not(feature = "inline-images"))]
-    let mut warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
+    let mut warnings = Vec::new();
     if let Some(warning) = depth_warning {
         warnings.push(warning);
     }
-
-    let _ = wants_metadata;
-    let _ = wants_images;
-
     Ok(ConversionResult {
         content: Some(markdown),
         document,
@@ -417,6 +342,43 @@ fn convert_inner(html: &str, options: ConversionOptions) -> Result<ConversionRes
         images,
         warnings,
     })
+}
+
+#[cfg(feature = "metadata")]
+fn finish_metadata(collector: Option<MetadataCollectorHandle>) -> Result<HtmlMetadata> {
+    collector.map_or_else(
+        || Ok(HtmlMetadata::default()),
+        |collector| {
+            Ok(std::rc::Rc::try_unwrap(collector)
+                .map_err(|_| ConversionError::Other("failed to recover metadata state".to_string()))?
+                .into_inner()
+                .finish())
+        },
+    )
+}
+
+#[cfg(feature = "inline-images")]
+fn finish_images(
+    collector: Option<ImageCollectorHandle>,
+) -> Result<(
+    Vec<crate::inline_images::InlineImage>,
+    Vec<crate::types::ProcessingWarning>,
+)> {
+    let Some(collector) = collector else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let collector = std::rc::Rc::try_unwrap(collector)
+        .map_err(|_| ConversionError::Other("failed to recover inline image state".to_string()))?
+        .into_inner();
+    let (images, warnings) = collector.finish();
+    let warnings = warnings
+        .into_iter()
+        .map(|warning| crate::types::ProcessingWarning {
+            kind: crate::types::WarningKind::ImageExtractionFailed,
+            message: warning.message,
+        })
+        .collect();
+    Ok((images, warnings))
 }
 
 /// Extract a human-readable message from a `catch_unwind` panic payload.
@@ -580,10 +542,13 @@ fn fast_text_only(html: &str, options: &ConversionOptions) -> Option<String> {
         Cow::Borrowed(trimmed)
     };
 
+    let escape_asterisks = options.escape_asterisks
+        || (options.output_format == crate::options::OutputFormat::Djot
+            && text::is_djot_rule_like(normalized.as_ref()));
     let escaped = if options.output_format == crate::options::OutputFormat::Plain {
         normalized.into_owned()
     } else if options.escape_misc
-        || options.escape_asterisks
+        || escape_asterisks
         || options.escape_underscores
         || options.escape_ascii
         // ~keep `text::escape` escapes a literal backslash regardless of the flags above,
@@ -594,7 +559,7 @@ fn fast_text_only(html: &str, options: &ConversionOptions) -> Option<String> {
         text::escape(
             normalized.as_ref(),
             options.escape_misc,
-            options.escape_asterisks,
+            escape_asterisks,
             options.escape_underscores,
             options.escape_ascii,
         )

@@ -20,22 +20,25 @@ use crate::converter::main_helpers::{
     trim_line_end_whitespace, trim_trailing_whitespace,
 };
 use crate::converter::plain_text::extract_plain_text;
-use crate::converter::preprocessing_helpers::{has_inline_block_misnest, should_drop_for_preprocessing};
-use crate::converter::utility::caching::build_dom_context;
+use crate::converter::preprocessing_helpers::{is_page_header, should_drop_for_preprocessing};
 use crate::converter::utility::content::{is_block_level_element, normalized_tag_name};
 use crate::converter::utility::preprocessing::{
-    normalize_bogus_comment_endings, normalize_split_closing_tags, normalize_unclosed_list_items, preprocess_html,
-    strip_bogus_comments, strip_hidden_elements, strip_script_and_style_tags,
+    PRESERVED_MENU_ATTRIBUTE, normalize_bogus_comment_endings, normalize_menu_elements, normalize_split_closing_tags,
+    normalize_unclosed_list_items, preprocess_html, restore_preserved_menu_elements, strip_bogus_comments,
+    strip_hidden_elements, strip_script_and_style_tags,
 };
 use crate::converter::utility::serialization::serialize_tag_to_html;
 use crate::options::{NewlineStyle, OutputFormat};
 
-use crate::converter::handlers::{handle_blockquote, handle_code, handle_graphic, handle_img, handle_link, handle_pre};
+use crate::converter::block::container::HandlerContext;
 use crate::error::Result;
 use crate::options::ConversionOptions;
 
-use crate::converter::context::{Context, InlineCollectorHandle};
+use crate::converter::context::{Context, ContextParameters, InlineCollectorHandle};
 use crate::types::structure_collector::StructureCollectorHandle;
+
+mod parse;
+use self::parse::{ParseOutcome, parse_for_conversion};
 
 type ConversionOutput = (
     String,
@@ -44,268 +47,78 @@ type ConversionOutput = (
     Option<crate::types::ProcessingWarning>,
 );
 
+pub struct ConversionParameters<'a> {
+    pub inline_collector: Option<InlineCollectorHandle>,
+    #[cfg(feature = "metadata")]
+    pub metadata_collector: Option<crate::metadata::MetadataCollectorHandle>,
+    #[cfg(feature = "visitor")]
+    pub visitor: Option<crate::visitor::VisitorHandle>,
+    pub structure_collector: Option<StructureCollectorHandle>,
+    pub base_url: Option<std::rc::Rc<url::Url>>,
+    pub document_base_href: Option<&'a str>,
+}
 /// Internal implementation of HTML to Markdown conversion.
 ///
 /// Returns the converted content, optional document structure, extracted tables, and an
 /// optional depth-limit warning.
-#[cfg_attr(
-    any(not(feature = "inline-images"), not(feature = "metadata"), not(feature = "visitor")),
-    allow(unused_variables)
-)]
-#[allow(clippy::too_many_lines)]
 pub fn convert_html_impl(
     html: &str,
     options: &ConversionOptions,
-    inline_collector: Option<InlineCollectorHandle>,
-    #[cfg(feature = "metadata")] metadata_collector: Option<crate::metadata::MetadataCollectorHandle>,
-    #[cfg(not(feature = "metadata"))] _metadata_collector: Option<()>,
-    #[cfg(feature = "visitor")] visitor: Option<crate::visitor::VisitorHandle>,
-    #[cfg(not(feature = "visitor"))] _visitor: Option<()>,
-    structure_collector: Option<StructureCollectorHandle>,
-    base_url: Option<std::rc::Rc<url::Url>>,
-    document_base_href: Option<&str>,
+    parameters: ConversionParameters<'_>,
 ) -> Result<ConversionOutput> {
-    let stripped = strip_script_and_style_tags(html);
-    // ~keep Before anything else looks for tags: an HTML5 bogus comment (`<?php … ?>`,
-    // ~keep `<!bogus>`, `</3>`) is a comment token, so it must render as nothing rather
-    // ~keep than leak its text. Running it here also keeps it from confusing the passes
-    // ~keep below, which do look for tag-shaped runs.
-    let stripped = strip_bogus_comments(&stripped);
-    let stripped = strip_hidden_elements(&stripped);
-    // ~keep Normalise bogus HTML comment endings (`--->`, `---->`, …) that cause the
-    // ~keep `tl` parser to silently discard all document content that follows them.
-    let stripped = normalize_bogus_comment_endings(&stripped);
-    // ~keep Normalise closing tags whose `>` is on a subsequent line (JSX-style `</a\n>`).
-    // ~keep The `tl` parser does not handle such end-tags and leaves the element unclosed,
-    // ~keep causing all subsequent siblings to be absorbed as children.
-    let stripped = normalize_split_closing_tags(&stripped);
-    // ~keep Insert missing `</li>`, `</dt>`, `</dd>` close tags that the HTML5 spec
-    // ~keep says are implicitly added when a new list-item starts or the parent list
-    // ~keep closes.  Without this, `tl` nests each item inside the previous one,
-    // ~keep building a chain as deep as the number of items and causing a stack
-    // ~keep overflow on large changelogs with hundreds of unclosed `<li>` tags.
-    let stripped = normalize_unclosed_list_items(&stripped);
-    let mut preprocessed = preprocess_html(&stripped).into_owned();
-    let mut preprocessed_len = preprocessed.len();
-
-    if has_custom_element_tags(&preprocessed) {
-        if let Some(repaired_html) = repair_with_html5ever(&preprocessed) {
-            tracing::warn!(
-                target: "html_to_markdown::convert",
-                "custom element tags detected; re-parsed input with html5ever repair fallback"
-            );
-            let stripped = strip_script_and_style_tags(&repaired_html);
-            let stripped = strip_hidden_elements(&stripped);
-            let stripped = normalize_bogus_comment_endings(&stripped);
-            let stripped = normalize_split_closing_tags(&stripped);
-            let repaired = preprocess_html(&stripped).into_owned();
-            preprocessed = repaired;
-            preprocessed_len = preprocessed.len();
-        } else {
-            tracing::warn!(
-                target: "html_to_markdown::convert",
-                "custom element tags detected; html5ever repair failed, proceeding with unrepaired markup"
-            );
-        }
-    }
-    let parser_options = tl::ParserOptions::default();
-    let mut dom = loop {
-        if let Ok(dom) = tl::parse(&preprocessed, parser_options) {
-            break dom;
-        }
-        if let Some(repaired_html) = repair_with_html5ever(&preprocessed) {
-            tracing::warn!(
-                target: "html_to_markdown::convert",
-                "primary HTML parser failed on preprocessed input; retrying with html5ever-repaired markup"
-            );
-            let stripped = strip_script_and_style_tags(&repaired_html);
-            let stripped = strip_hidden_elements(&stripped);
-            let stripped = normalize_bogus_comment_endings(&stripped);
-            let stripped = normalize_split_closing_tags(&stripped);
-            preprocessed = preprocess_html(&stripped).into_owned();
-            preprocessed_len = preprocessed.len();
-            continue;
-        }
-        tracing::error!(
-            target: "html_to_markdown::convert",
-            "failed to parse HTML; no repair strategy recovered a valid document"
-        );
-        return Err(crate::error::ConversionError::ParseError(
-            "Failed to parse HTML".to_string(),
-        ));
+    let ConversionParameters {
+        inline_collector,
+        #[cfg(feature = "metadata")]
+        metadata_collector,
+        #[cfg(feature = "visitor")]
+        visitor,
+        structure_collector,
+        base_url,
+        document_base_href,
+    } = parameters;
+    let preserve_menu = options.preserve_tags.iter().any(|tag| tag.eq_ignore_ascii_case("menu"));
+    let mut preprocessed = prepare_html(html, preserve_menu);
+    let mut attempted_misnest_repair = false;
+    let (dom, dom_ctx) = loop {
+        let repaired = match parse_for_conversion(&preprocessed, preserve_menu, &mut attempted_misnest_repair)? {
+            ParseOutcome::Ready { dom, dom_ctx } => break (dom, dom_ctx),
+            ParseOutcome::Retry(repaired) => repaired,
+        };
+        preprocessed = repaired;
     };
-    tracing::debug!(
-        target: "html_to_markdown::convert",
-        node_count = dom.nodes().len(),
-        input_len = preprocessed_len,
-        "html parse stage complete"
-    );
-    let mut parser = dom.parser();
+    let preprocessed_len = preprocessed.len();
+    trace_parse_complete(&dom, preprocessed_len);
+    let parser = dom.parser();
     let mut output = String::with_capacity(preprocessed_len.saturating_add(preprocessed_len / 4));
-
-    let mut dom_ctx = build_dom_context(&dom, parser, preprocessed_len);
-
-    if has_inline_block_misnest(&dom_ctx, parser) {
-        if let Some(repaired_html) = repair_with_html5ever(&preprocessed) {
-            tracing::warn!(
-                target: "html_to_markdown::convert",
-                "misnested HTML elements detected; re-parsed with html5ever repair"
-            );
-            drop(dom);
-            let stripped = strip_script_and_style_tags(&repaired_html);
-            let stripped = strip_hidden_elements(&stripped);
-            let stripped = normalize_bogus_comment_endings(&stripped);
-            let stripped = normalize_split_closing_tags(&stripped);
-            preprocessed = preprocess_html(&stripped).into_owned();
-            preprocessed_len = preprocessed.len();
-            dom = tl::parse(&preprocessed, parser_options)
-                .map_err(|_| crate::error::ConversionError::ParseError("Failed to parse repaired HTML".to_string()))?;
-            parser = dom.parser();
-            dom_ctx = build_dom_context(&dom, parser, preprocessed_len);
-            output = String::with_capacity(preprocessed_len.saturating_add(preprocessed_len / 4));
-        } else {
-            tracing::warn!(
-                target: "html_to_markdown::convert",
-                "block-level element misnested under an inline ancestor; html5ever repair failed, proceeding with original structure"
-            );
-        }
-    }
-
     let is_plain_text = options.output_format == OutputFormat::Plain;
-
-    let wants_frontmatter = options.extract_metadata && !options.convert_as_inline;
-    let mut frontmatter = String::new();
-    #[cfg(feature = "metadata")]
-    let wants_document = metadata_collector
-        .as_ref()
-        .is_some_and(|collector| collector.borrow().wants_document());
-    #[cfg(not(feature = "metadata"))]
-    let wants_document = false;
-
-    if wants_frontmatter || wants_document {
-        let head_metadata = extract_head_metadata(dom.children(), parser, options, document_base_href);
+    let frontmatter = prepare_frontmatter(
+        &dom,
+        parser,
+        options,
+        document_base_href,
         #[cfg(feature = "metadata")]
-        let mut document_lang: Option<String> = None;
-        #[cfg(feature = "metadata")]
-        let mut document_dir: Option<String> = None;
+        metadata_collector.as_ref(),
+    );
+    output.push_str(&frontmatter);
 
-        #[cfg(feature = "metadata")]
-        for child_handle in dom.children() {
-            if wants_document {
-                if let Some(tl::Node::Tag(tag)) = child_handle.get(parser) {
-                    let tag_name = tag.name().as_utf8_str();
-                    if tag_name == "html" || tag_name == "body" {
-                        if document_lang.is_none() {
-                            if let Some(Some(lang_bytes)) = tag.attributes().get("lang") {
-                                document_lang = Some(lang_bytes.as_utf8_str().to_string());
-                            }
-                        }
-                        if document_dir.is_none() {
-                            if let Some(Some(dir_bytes)) = tag.attributes().get("dir") {
-                                document_dir = Some(dir_bytes.as_utf8_str().to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    let reference_collector = create_reference_collector(options);
 
-        if wants_frontmatter && !head_metadata.is_empty() {
-            frontmatter = format_metadata_frontmatter(&head_metadata);
-            output.push_str(&frontmatter);
-        }
-
-        #[cfg(feature = "metadata")]
-        if wants_document {
-            if let Some(ref collector) = metadata_collector {
-                if !head_metadata.is_empty() {
-                    collector.borrow_mut().set_head_metadata(head_metadata);
-                }
-                if let Some(lang) = document_lang {
-                    collector.borrow_mut().set_language(lang);
-                }
-                if let Some(dir) = document_dir {
-                    collector.borrow_mut().set_text_direction(dir);
-                }
-            }
-        }
-    }
-
-    let reference_collector = if options.link_style == crate::options::LinkStyle::Reference {
-        Some(std::rc::Rc::new(std::cell::RefCell::new(
-            crate::converter::reference_collector::ReferenceCollector::new(),
-        )))
-    } else {
-        None
-    };
-
-    #[cfg(all(feature = "metadata", feature = "visitor"))]
     let mut ctx = Context::new(
         options,
-        inline_collector,
-        metadata_collector,
-        visitor,
-        structure_collector.as_ref().map(std::rc::Rc::clone),
-        reference_collector.as_ref().map(std::rc::Rc::clone),
-        base_url,
-    );
-    #[cfg(all(feature = "metadata", not(feature = "visitor")))]
-    #[allow(clippy::used_underscore_binding)]
-    let mut ctx = Context::new(
-        options,
-        inline_collector,
-        metadata_collector,
-        _visitor,
-        structure_collector.as_ref().map(std::rc::Rc::clone),
-        reference_collector.as_ref().map(std::rc::Rc::clone),
-        base_url,
-    );
-    #[cfg(all(not(feature = "metadata"), feature = "visitor"))]
-    let mut ctx = Context::new(
-        options,
-        inline_collector,
-        _metadata_collector,
-        visitor,
-        structure_collector.as_ref().map(std::rc::Rc::clone),
-        reference_collector.as_ref().map(std::rc::Rc::clone),
-        base_url,
-    );
-    #[cfg(all(not(feature = "metadata"), not(feature = "visitor")))]
-    let mut ctx = Context::new(
-        options,
-        inline_collector,
-        _metadata_collector,
-        _visitor,
-        structure_collector.as_ref().map(std::rc::Rc::clone),
-        reference_collector.as_ref().map(std::rc::Rc::clone),
-        base_url,
+        ContextParameters {
+            inline_collector,
+            #[cfg(feature = "metadata")]
+            metadata_collector,
+            #[cfg(feature = "visitor")]
+            visitor,
+            structure_collector: structure_collector.as_ref().map(std::rc::Rc::clone),
+            reference_collector: reference_collector.as_ref().map(std::rc::Rc::clone),
+            base_url,
+        },
     );
 
-    if !options.exclude_selectors.is_empty() {
-        let mut excluded: HashSet<u32> = HashSet::new();
-        for selector in &options.exclude_selectors {
-            if let Some(iter) = dom.query_selector(selector) {
-                for handle in iter {
-                    excluded.insert(handle.get_inner());
-                }
-            }
-        }
-        ctx.set_excluded_node_ids(excluded);
-    }
-
-    let top_level_start = output.len();
-    for child_handle in dom.children() {
-        walk_node(child_handle, parser, &mut output, options, &ctx, 0, &dom_ctx);
-    }
-
-    // ~keep Mirrors the pre-block-dispatch strip in `walk_node`, for the one block boundary
-    // ~keep that check can never see: the end of the document itself, when a trailing `<br>`
-    // ~keep run is the last thing at top level with no following sibling to trigger it
-    // ~keep (issue #464 follow-up, e.g. `"A<br>"`). Bounded to `top_level_start` so frontmatter
-    // ~keep already written above is never touched.
-    if options.newline_style == NewlineStyle::Backslash {
-        strip_trailing_backslash_breaks(&mut output, top_level_start);
-    }
+    apply_exclusions(&dom, options, &mut ctx);
+    walk_document(&dom, parser, &mut output, options, &ctx, &dom_ctx);
 
     tracing::debug!(
         target: "html_to_markdown::convert",
@@ -313,18 +126,84 @@ pub fn convert_html_impl(
         "dom walk stage complete"
     );
 
-    #[cfg(feature = "visitor")]
-    if let Some(err) = ctx.visitor_error.borrow().as_ref() {
-        tracing::error!(
-            target: "html_to_markdown::convert",
-            error = %err,
-            "visitor callback returned an error; aborting conversion"
-        );
-        return Err(crate::error::ConversionError::Visitor(err.clone()));
-    }
+    check_visitor_error(&ctx)?;
 
+    let depth_warning = depth_warning(&ctx, options);
+
+    // ~keep Drop ctx before unwrapping the structure collector Rc — ctx holds a cloned Rc
+    // ~keep reference to the same collector, and Rc::try_unwrap requires exactly one reference.
+    drop(ctx);
+
+    append_references(&mut output, reference_collector);
+    let output = finalize_output(&dom, parser, options, output, &frontmatter, is_plain_text);
+    let (document, tables) = finish_structure_collector(structure_collector);
+    trace_render_complete(&output, &tables);
+    Ok((output, document, tables, depth_warning))
+}
+
+fn create_reference_collector(
+    options: &ConversionOptions,
+) -> Option<crate::converter::reference_collector::ReferenceCollectorHandle> {
+    (options.link_style == crate::options::LinkStyle::Reference).then(|| {
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::converter::reference_collector::ReferenceCollector::new(),
+        ))
+    })
+}
+
+fn trace_parse_complete(dom: &tl::VDom<'_>, input_len: usize) {
+    tracing::debug!(
+        target: "html_to_markdown::convert",
+        node_count = dom.nodes().len(),
+        input_len,
+        "html parse stage complete"
+    );
+}
+
+fn trace_render_complete(output: &str, tables: &[crate::types::TableData]) {
+    tracing::debug!(
+        target: "html_to_markdown::convert",
+        output_len = output.len(),
+        table_count = tables.len(),
+        "render stage complete"
+    );
+}
+
+fn apply_exclusions(dom: &tl::VDom<'_>, options: &ConversionOptions, ctx: &mut Context) {
+    if options.exclude_selectors.is_empty() {
+        return;
+    }
+    let mut excluded: HashSet<u32> = HashSet::new();
+    for selector in &options.exclude_selectors {
+        if let Some(iter) = dom.query_selector(selector) {
+            excluded.extend(iter.map(|handle| handle.get_inner()));
+        }
+    }
+    ctx.set_excluded_node_ids(excluded);
+}
+
+fn walk_document(
+    dom: &tl::VDom<'_>,
+    parser: &tl::Parser<'_>,
+    output: &mut String,
+    options: &ConversionOptions,
+    ctx: &Context,
+    dom_ctx: &DomContext,
+) {
+    let top_level_start = output.len();
+    let handler = HandlerContext::new(options, ctx, 0, dom_ctx);
+    for child_handle in dom.children() {
+        walk_node(child_handle, parser, output, handler);
+    }
+    // ~keep The document end is the one block boundary no subsequent dispatch can observe.
+    if options.newline_style == NewlineStyle::Backslash {
+        strip_trailing_backslash_breaks(output, top_level_start);
+    }
+}
+
+fn depth_warning(ctx: &Context, options: &ConversionOptions) -> Option<crate::types::ProcessingWarning> {
     let max_depth = effective_max_depth(options);
-    let depth_warning = ctx.depth_limit_reached.get().then(|| {
+    ctx.depth_limit_reached.get().then(|| {
         tracing::warn!(
             target: "html_to_markdown::convert",
             max_depth,
@@ -336,44 +215,194 @@ pub fn convert_html_impl(
                 "DOM traversal reached the effective depth limit of {max_depth}; deeper nodes were skipped."
             ),
         }
-    });
+    })
+}
 
-    // ~keep Drop ctx before unwrapping the structure collector Rc — ctx holds a cloned Rc
-    // ~keep reference to the same collector, and Rc::try_unwrap requires exactly one reference.
-    drop(ctx);
-
-    if let Some(rc) = reference_collector {
-        if let Ok(collector) = std::rc::Rc::try_unwrap(rc) {
-            let ref_section = collector.into_inner().finish();
-            if !ref_section.is_empty() {
-                let trimmed_len = output.trim_end_matches('\n').len();
-                output.truncate(trimmed_len);
-                output.push_str("\n\n");
-                output.push_str(&ref_section);
-            }
-        }
+fn append_references(
+    output: &mut String,
+    reference_collector: Option<
+        std::rc::Rc<std::cell::RefCell<crate::converter::reference_collector::ReferenceCollector>>,
+    >,
+) {
+    let Some(rc) = reference_collector else { return };
+    let Ok(collector) = std::rc::Rc::try_unwrap(rc) else {
+        return;
+    };
+    let ref_section = collector.into_inner().finish();
+    if ref_section.is_empty() {
+        return;
     }
+    output.truncate(output.trim_end_matches('\n').len());
+    output.push_str("\n\n");
+    output.push_str(&ref_section);
+}
 
-    let output = if is_plain_text {
-        extract_plain_text(&dom, parser, options)
+fn finalize_output(
+    dom: &tl::VDom<'_>,
+    parser: &tl::Parser<'_>,
+    options: &ConversionOptions,
+    mut output: String,
+    frontmatter: &str,
+    is_plain_text: bool,
+) -> String {
+    if is_plain_text {
+        output = extract_plain_text(dom, parser, options);
     } else {
         trim_line_end_whitespace(&mut output);
         collapse_excess_blank_lines(&mut output);
-        output
-    };
-    let output = if options.wrap {
-        wrap_after_frontmatter(&output, &frontmatter, options)
+    }
+    if options.wrap {
+        wrap_after_frontmatter(&output, frontmatter, options)
     } else {
         output
+    }
+}
+
+fn prepare_frontmatter(
+    dom: &tl::VDom<'_>,
+    parser: &tl::Parser<'_>,
+    options: &ConversionOptions,
+    document_base_href: Option<&str>,
+    #[cfg(feature = "metadata")] metadata_collector: Option<&crate::metadata::MetadataCollectorHandle>,
+) -> String {
+    let wants_frontmatter = options.extract_metadata && !options.convert_as_inline;
+    #[cfg(feature = "metadata")]
+    let wants_document = metadata_collector.is_some_and(|collector| collector.borrow().wants_document());
+    #[cfg(not(feature = "metadata"))]
+    let wants_document = false;
+    if !wants_frontmatter && !wants_document {
+        return String::new();
+    }
+    let head_metadata = extract_head_metadata(dom.children(), parser, options, document_base_href);
+    let frontmatter = if wants_frontmatter && !head_metadata.is_empty() {
+        format_metadata_frontmatter(&head_metadata)
+    } else {
+        String::new()
     };
-    let (document, tables) = finish_structure_collector(structure_collector);
-    tracing::debug!(
+    #[cfg(feature = "metadata")]
+    populate_metadata_collector(dom, parser, metadata_collector, head_metadata, wants_document);
+    frontmatter
+}
+
+#[cfg(feature = "visitor")]
+fn check_visitor_error(ctx: &Context) -> Result<()> {
+    let Some(err) = ctx.visitor_error.borrow().as_ref().cloned() else {
+        return Ok(());
+    };
+    tracing::error!(
         target: "html_to_markdown::convert",
-        output_len = output.len(),
-        table_count = tables.len(),
-        "render stage complete"
+        error = %err,
+        "visitor callback returned an error; aborting conversion"
     );
-    Ok((output, document, tables, depth_warning))
+    Err(crate::error::ConversionError::Visitor(err))
+}
+
+#[cfg(not(feature = "visitor"))]
+const fn check_visitor_error(_ctx: &Context) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "metadata")]
+fn populate_metadata_collector(
+    dom: &tl::VDom<'_>,
+    parser: &tl::Parser<'_>,
+    metadata_collector: Option<&crate::metadata::MetadataCollectorHandle>,
+    head_metadata: std::collections::BTreeMap<String, String>,
+    wants_document: bool,
+) {
+    if !wants_document {
+        return;
+    }
+    let Some(collector) = metadata_collector else {
+        return;
+    };
+    let (language, direction) = document_language_and_direction(dom.children(), parser);
+    let mut collector = collector.borrow_mut();
+    if !head_metadata.is_empty() {
+        collector.set_head_metadata(head_metadata);
+    }
+    if let Some(language) = language {
+        collector.set_language(language);
+    }
+    if let Some(direction) = direction {
+        collector.set_text_direction(direction);
+    }
+}
+
+#[cfg(feature = "metadata")]
+fn document_language_and_direction(
+    children: &[tl::NodeHandle],
+    parser: &tl::Parser<'_>,
+) -> (Option<String>, Option<String>) {
+    let mut language = None;
+    let mut direction = None;
+    for child_handle in children {
+        let Some(tl::Node::Tag(tag)) = child_handle.get(parser) else {
+            continue;
+        };
+        if !matches!(tag.name().as_utf8_str().as_ref(), "html" | "body") {
+            continue;
+        }
+        language = language.or_else(|| {
+            tag.attributes()
+                .get("lang")
+                .flatten()
+                .map(|value| value.as_utf8_str().to_string())
+        });
+        direction = direction.or_else(|| {
+            tag.attributes()
+                .get("dir")
+                .flatten()
+                .map(|value| value.as_utf8_str().to_string())
+        });
+    }
+    (language, direction)
+}
+
+fn prepare_html(html: &str, preserve_menu: bool) -> String {
+    let mut preprocessed = preprocess_initial_html(html, preserve_menu);
+    if has_custom_element_tags(&preprocessed) {
+        preprocessed = repair_custom_elements(preprocessed, preserve_menu);
+    }
+    preprocessed
+}
+
+fn preprocess_initial_html(html: &str, preserve_menu: bool) -> String {
+    let stripped = strip_script_and_style_tags(html);
+    // ~keep Bogus comments must be removed before tag-shaped preprocessing examines them.
+    let stripped = strip_bogus_comments(&stripped);
+    let stripped = strip_hidden_elements(&stripped);
+    let stripped = normalize_bogus_comment_endings(&stripped);
+    let stripped = normalize_split_closing_tags(&stripped);
+    // ~keep Implicit list-item closes prevent deeply nested parser output on large changelogs.
+    let stripped = normalize_unclosed_list_items(&stripped);
+    let stripped = normalize_menu_elements(&stripped, preserve_menu);
+    preprocess_html(&stripped).into_owned()
+}
+
+fn preprocess_repaired_html(html: &str, preserve_menu: bool) -> String {
+    let stripped = strip_script_and_style_tags(html);
+    let stripped = strip_hidden_elements(&stripped);
+    let stripped = normalize_bogus_comment_endings(&stripped);
+    let stripped = normalize_split_closing_tags(&stripped);
+    let stripped = normalize_unclosed_list_items(&stripped);
+    let stripped = normalize_menu_elements(&stripped, preserve_menu);
+    preprocess_html(&stripped).into_owned()
+}
+
+fn repair_custom_elements(preprocessed: String, preserve_menu: bool) -> String {
+    let Some(repaired) = repair_with_html5ever(&preprocessed) else {
+        tracing::warn!(
+            target: "html_to_markdown::convert",
+            "custom element tags detected; html5ever repair failed, proceeding with unrepaired markup"
+        );
+        return preprocessed;
+    };
+    tracing::warn!(
+        target: "html_to_markdown::convert",
+        "custom element tags detected; re-parsed input with html5ever repair fallback"
+    );
+    preprocess_repaired_html(&repaired, preserve_menu)
 }
 
 /// Wrap `output` at the wrap width, leaving the `frontmatter` it starts with as it is.
@@ -421,10 +450,11 @@ fn separate_from_block(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    dom_ctx: &DomContext,
+    handler: HandlerContext<'_>,
 ) {
+    let HandlerContext {
+        options, ctx, dom_ctx, ..
+    } = handler;
     // ~keep A heading or a link label converts inline, but in a cell the text after a block needs the break.
     if output.is_empty() || (ctx.convert_as_inline && !ctx.in_table_cell) || ctx.in_code {
         return;
@@ -447,7 +477,7 @@ fn separate_from_block(
     }
     if ctx.in_list_item {
         if !parent_is_list(node_handle, parser, dom_ctx) {
-            separate_in_list_item(node, node_handle, parser, output, options, ctx, dom_ctx);
+            separate_in_list_item(node, node_handle, parser, output, handler);
         }
     } else if !ctx.in_list
         && ends_with_block_line_end(output)
@@ -481,16 +511,22 @@ fn separate_in_list_item(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    dom_ctx: &DomContext,
+    handler: HandlerContext<'_>,
 ) {
+    let HandlerContext {
+        options, ctx, dom_ctx, ..
+    } = handler;
     // ~keep A block that preprocessing drops (a `<nav>`) writes nothing, so it gets no line.
     let starts_block = match node {
         tl::Node::Tag(tag) => dom_ctx.tag_info(node_handle.get_inner(), parser).is_some_and(|info| {
             is_block_level_element(&info.name)
                 && !matches!(info.name.as_str(), "ul" | "ol" | "li")
-                && !should_drop_for_preprocessing(&info.name, tag, options)
+                && !should_drop_for_preprocessing(
+                    &info.name,
+                    tag,
+                    options,
+                    info.name == "header" && is_page_header(node_handle, parser, dom_ctx),
+                )
         }),
         _ => false,
     };
@@ -592,25 +628,18 @@ fn parent_is_list(node_handle: &tl::NodeHandle, parser: &tl::Parser, dom_ctx: &D
 
 /// Recursively walk DOM nodes and convert to Markdown.
 #[allow(clippy::trivially_copy_pass_by_ref)]
-pub fn walk_node(
-    node_handle: &tl::NodeHandle,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn walk_node(node_handle: &tl::NodeHandle, parser: &tl::Parser, output: &mut String, handler: HandlerContext<'_>) {
+    let ctx = handler.ctx;
     ctx.last_list.enter(output);
     // ~keep In a task item, the render of each node before the first content reports whether
     // ~keep it wrote, so the item knows which element wrote first (issue #650).
     match ctx.first_writer.as_ref().filter(|first_writer| first_writer.is_open()) {
         Some(first_writer) => {
             let start = output.len();
-            convert_node(node_handle, parser, output, options, ctx, depth, dom_ctx);
+            convert_node(node_handle, parser, output, handler);
             first_writer.record(*node_handle, parser, output.get(start..));
         }
-        None => convert_node(node_handle, parser, output, options, ctx, depth, dom_ctx),
+        None => convert_node(node_handle, parser, output, handler),
     }
     ctx.last_list.leave(output);
 }
@@ -619,15 +648,11 @@ pub fn walk_node(
 #[allow(clippy::only_used_in_recursion)]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 #[allow(clippy::cast_possible_truncation)]
-fn convert_node(
-    node_handle: &tl::NodeHandle,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+fn convert_node(node_handle: &tl::NodeHandle, parser: &tl::Parser, output: &mut String, handler: HandlerContext<'_>) {
+    let options = handler.options;
+    let ctx = handler.ctx;
+    let depth = handler.depth;
+    let dom_ctx = handler.dom_ctx;
     let Some(node) = node_handle.get(parser) else { return };
 
     if depth >= effective_max_depth(options) {
@@ -635,7 +660,7 @@ fn convert_node(
         return;
     }
 
-    separate_from_block(node, node_handle, parser, output, options, ctx, dom_ctx);
+    separate_from_block(node, node_handle, parser, output, handler);
 
     match node {
         tl::Node::Raw(bytes) => {
@@ -645,415 +670,275 @@ fn convert_node(
                 node_handle,
                 parser,
                 output,
-                options,
-                ctx,
-                depth,
-                dom_ctx,
+                crate::converter::block::container::HandlerContext::new(options, ctx, depth, dom_ctx),
             );
         }
 
-        tl::Node::Tag(tag) => {
-            let tag_name = match dom_ctx.tag_info(node_handle.get_inner(), parser) {
-                Some(info) => Cow::Borrowed(info.name.as_str()),
-                None => normalized_tag_name(tag.name().as_utf8_str()),
-            };
-
-            #[cfg(feature = "visitor")]
-            let visitor_element_state = if ctx.skip_visitor_hooks {
-                None
-            } else if let Some(ref visitor_handle) = ctx.visitor {
-                use crate::converter::visitor_hooks::{
-                    VisitAction, build_visitor_element_state, handle_visitor_element_start,
-                };
-
-                let state = build_visitor_element_state(tag_name.as_ref(), node_handle, parser, dom_ctx);
-                let action =
-                    handle_visitor_element_start(visitor_handle, tag_name.as_ref(), tag, &state, output, depth);
-
-                match action {
-                    VisitAction::Continue => Some(state),
-                    VisitAction::Skip => return,
-                    VisitAction::Custom => return,
-                    VisitAction::Error => return,
-                }
-            } else {
-                None
-            };
-
-            #[cfg(feature = "visitor")]
-            let visitor_is_active = ctx.visitor.is_some() && !ctx.skip_visitor_hooks;
-            #[cfg(not(feature = "visitor"))]
-            let visitor_is_active = false;
-
-            if !visitor_is_active && should_drop_for_preprocessing(tag_name.as_ref(), tag, options) {
-                trim_trailing_whitespace(output);
-                return;
-            }
-
-            if !ctx.excluded_node_ids.is_empty() && ctx.excluded_node_ids.contains(&node_handle.get_inner()) {
-                trim_trailing_whitespace(output);
-                return;
-            }
-
-            if ctx.strip_tags.contains(tag_name.as_ref()) {
-                let children = tag.children();
-                {
-                    for child_handle in children.top().iter() {
-                        walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-                    }
-                }
-                return;
-            }
-
-            if ctx.preserve_tags.contains(tag_name.as_ref()) {
-                let starts_line = at_line_start(output);
-                let html = serialize_tag_to_html(node_handle, parser);
-                output.push_str(&html);
-                // ~keep An HTML block ends only at a blank line, so one follows it (issue #655).
-                if starts_line
-                    && !ctx.in_marker_text()
-                    && !ctx.in_table_cell
-                    && !ctx.convert_as_inline
-                    && !ctx.in_code
-                    && crate::converter::utility::escaping::opens_block(html.trim_start())
-                {
-                    output.push_str("\n\n");
-                }
-                return;
-            }
-
-            #[cfg(feature = "metadata")]
-            if matches!(tag_name.as_ref(), "html" | "head" | "body") && ctx.metadata_wants_document {
-                if let Some(ref collector) = ctx.metadata_collector {
-                    let mut c = collector.borrow_mut();
-
-                    if let Some(lang) = tag.attributes().get("lang").flatten() {
-                        c.set_language(lang.as_utf8_str().to_string());
-                    }
-
-                    if let Some(dir) = tag.attributes().get("dir").flatten() {
-                        c.set_text_direction(dir.as_utf8_str().to_string());
-                    }
-                }
-            }
-
-            #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-            let element_output_start = output.len();
-
-            // ~keep A hard line break has no effect at the end of a block (CommonMark
-            // ~keep <https://spec.commonmark.org/spec#hard-line-breaks>): the run is only
-            // ~keep ever trailing once it turns out nothing but a new block follows it, and
-            // ~keep this is the single place every block-level dispatch already passes
-            // ~keep through, so it is where that becomes knowable regardless of which
-            // ~keep container the run started in. `is_block_level_element` is the same
-            // ~keep inline/block classification `plain_text.rs` and `visitor_hooks.rs`
-            // ~keep already use, so an inline sibling (real content, e.g. `<em>`/`<span>`)
-            // ~keep never trips this and the marker survives, matching issue #464's
-            // ~keep "only a run with nothing following in the same block is stripped".
-            // ~keep Container endings with no following sibling at all (a trailing `<br>`
-            // ~keep closing a `<div>`/`<li>`/`<blockquote>`, or the whole document) have no
-            // ~keep next dispatch to catch them here, so those close their own trailing run
-            // ~keep at their own point of closing instead (`block/div.rs`, `handlers/blockquote.rs`,
-            // ~keep `list/item.rs`, several `semantic/*.rs` handlers that splice a local
-            // ~keep buffer back into `output`, and the top-level loop in this file).
-            if options.newline_style == NewlineStyle::Backslash && is_block_level_element(tag_name.as_ref()) {
-                strip_trailing_backslash_breaks(output, ctx.block_content_start);
-            }
-
-            match tag_name.as_ref() {
-                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                    crate::converter::block::heading::handle(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "p" => {
-                    crate::converter::block::paragraph::handle(
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "strong" | "b" | "em" | "i" | "mark" | "del" | "s" | "strike" | "ins" | "u" | "small" | "sub"
-                | "sup" | "kbd" | "samp" | "var" | "dfn" | "abbr" | "ruby" | "rb" | "rt" | "rp" | "rtc" | "span" => {
-                    crate::converter::inline::dispatch_inline_handler(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "a" => handle_link(node_handle, tag, parser, output, options, ctx, depth, dom_ctx),
-                "img" => handle_img(node_handle, tag, parser, output, options, ctx, depth, dom_ctx),
-                "graphic" => handle_graphic(node_handle, tag, parser, output, options, ctx, depth, dom_ctx),
-                "code" => handle_code(node_handle, tag, parser, output, options, ctx, depth, dom_ctx),
-                "pre" => handle_pre(node_handle, tag, parser, output, options, ctx, depth, dom_ctx),
-                "blockquote" => handle_blockquote(node_handle, tag, parser, output, options, ctx, depth, dom_ctx),
-
-                "time" | "data" => {
-                    crate::converter::block::container::handle_passthrough(
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "wbr" | "thead" | "tbody" | "tfoot" | "tr" | "th" | "td" | "source" => {
-                    crate::converter::block::container::handle_noop(
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "br" => crate::converter::block::line_break::handle(
-                    node_handle,
-                    parser,
-                    output,
-                    options,
-                    ctx,
-                    depth,
-                    dom_ctx,
-                ),
-                "hr" => crate::converter::block::horizontal_rule::handle(
-                    node_handle,
-                    parser,
-                    output,
-                    options,
-                    ctx,
-                    depth,
-                    dom_ctx,
-                ),
-                "div" => {
-                    crate::converter::block::div::handle(node_handle, parser, output, options, ctx, depth, dom_ctx);
-                }
-
-                // ~keep `<address>`/`<search>`/`<hgroup>`/`<center>`/`<dialog>` are content-bearing block
-                // ~keep containers with no formatting of their own beyond block separation --
-                // ~keep the same shape as `<div>`. Routing them through `div::handle` (rather
-                // ~keep than a semantic-module dispatcher) matters for Tier-1 parity: Tier-1's
-                // ~keep generic `TagKind::Block` open/close handling in
-                // ~keep `tier1/scanner.rs` mirrors `div::handle` byte-for-byte (leading `\n\n`,
-                // ~keep table-cell `"  \n"` continuation, list-item indent), so reusing
-                // ~keep `div::handle` here -- instead of `semantic::sectioning::handle`, which
-                // ~keep has no table-cell/list-item special-casing -- keeps both tiers in
-                // ~keep agreement. See `tests/tier1_address_block_separator_test.rs`.
-                "address" | "search" | "hgroup" | "center" | "dialog" => {
-                    crate::converter::block::div::handle(node_handle, parser, output, options, ctx, depth, dom_ctx);
-                }
-                "caption" => crate::converter::block::table::handle_caption(
-                    node_handle,
-                    parser,
-                    output,
-                    options,
-                    ctx,
-                    depth,
-                    dom_ctx,
-                ),
-                "table" => {
-                    // ~keep Issue #406: during an outer table's width-measurement pre-pass,
-                    // ~keep skip the nested-table dispatch and fall back to descendant text
-                    // ~keep content.  Running the full table handler here would launch the
-                    // ~keep nested table's own measurement pre-pass on every descendant cell,
-                    // ~keep recursing combinatorially (393 nested layout tables × ~393 cells
-                    // ~keep each in the reported reproducer, unbounded at greater nesting depth).
-                    // ~keep The per-cell output cap (`MAX_CELL_WIDTH = 200`) bounded discarded
-                    // ~keep *output* but not measurement CPU.  Emitting descendant text keeps
-                    // ~keep the pre-pass linear in descendant character count, and the resulting
-                    // ~keep width still approximates the rendered cell content for separator-row
-                    // ~keep padding.
-                    if ctx.measure_width_only {
-                        output.push_str(dom_ctx.text_content(*node_handle, parser).as_str());
-                        return;
-                    }
-                    crate::converter::block::table::handle_table_with_context(
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        dom_ctx,
-                        depth,
-                    );
-                }
-
-                "ul" | "ol" | "li" | "dl" | "dt" | "dd" => {
-                    crate::converter::list::dispatch_list_handler(
-                        &tag_name,
-                        node_handle,
-                        tag,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "article" | "section" | "nav" | "aside" | "header" | "footer" | "main" => {
-                    crate::converter::semantic::dispatch_semantic_handler(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "q" => {
-                    crate::converter::semantic::dispatch_semantic_handler(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "figure" | "figcaption" => {
-                    crate::converter::semantic::dispatch_semantic_handler(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "details" | "summary" | "menu" => {
-                    crate::converter::semantic::dispatch_semantic_handler(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "audio" | "video" | "picture" | "iframe" | "svg" | "math" => {
-                    crate::converter::media::dispatch_media_handler(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "form" | "fieldset" | "legend" | "label" | "input" | "textarea" | "select" | "option" | "optgroup"
-                | "button" | "progress" | "meter" | "output" | "datalist" => {
-                    crate::converter::form::dispatch_form_handler(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                // ~keep `<template>` content is an inert, unrendered document fragment per the
-                // ~keep HTML spec, and `<noscript>` content only renders with scripting disabled
-                // ~keep (never true for a Markdown conversion, which mirrors a scripting-enabled
-                // ~keep browser). Both must never reach the output. `plain_text.rs`'s `SKIP_TAGS`
-                // ~keep already treats them this way; kept as a separate arm here (rather than a
-                // ~keep shared constant) because this match also holds `svg`/`math` — which
-                // ~keep plain_text.rs skips outright but this path renders via a dedicated media
-                // ~keep handler — so the two tag sets are not actually the same list.
-                "template" | "noscript" => {}
-
-                "head" | "script" | "style" => {
-                    crate::converter::metadata::handle(
-                        &tag_name,
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                "body" | "html" => {
-                    crate::converter::block::container::handle_structural_container(
-                        node_handle,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth,
-                        dom_ctx,
-                    );
-                }
-
-                _ => {
-                    crate::converter::block::unknown::handle(node_handle, parser, output, options, ctx, depth, dom_ctx);
-                }
-            }
-
-            #[cfg(feature = "visitor")]
-            if let (Some(visitor_handle), Some(state)) = (ctx.visitor.as_ref(), visitor_element_state.as_ref()) {
-                use crate::converter::visitor_hooks::{VisitorElementEndContext, handle_visitor_element_end};
-
-                handle_visitor_element_end(
-                    visitor_handle,
-                    tag_name.as_ref(),
-                    state,
-                    tag,
-                    VisitorElementEndContext {
-                        output,
-                        element_output_start,
-                        ctx,
-                        depth,
-                    },
-                );
-            }
-        }
+        tl::Node::Tag(tag) => convert_tag(node_handle, tag, parser, output, handler),
 
         tl::Node::Comment(_) => {}
     }
+}
+
+#[cfg_attr(not(feature = "visitor"), allow(clippy::needless_return))]
+fn convert_tag(
+    node_handle: &tl::NodeHandle,
+    tag: &tl::HTMLTag<'_>,
+    parser: &tl::Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+) {
+    let options = handler.options;
+    let depth = handler.depth;
+    let dom_ctx = handler.dom_ctx;
+    let tag_name = normalized_node_tag_name(node_handle, tag, parser, dom_ctx);
+    let djot_scope = djot_context(node_handle, parser, tag_name.as_ref(), handler);
+    let ctx = djot_scope.as_ref().unwrap_or(handler.ctx);
+    #[cfg(feature = "visitor")]
+    let visitor_output_start = output.len();
+    #[cfg(feature = "visitor")]
+    let visitor_element_state = if ctx.skip_visitor_hooks {
+        None
+    } else if let Some(ref visitor_handle) = ctx.visitor {
+        use crate::converter::visitor_hooks::{VisitAction, build_visitor_element_state, handle_visitor_element_start};
+
+        let state = build_visitor_element_state(tag_name.as_ref(), node_handle, parser, dom_ctx);
+        let action = handle_visitor_element_start(visitor_handle, tag_name.as_ref(), tag, &state, output, depth);
+
+        match action {
+            VisitAction::Continue => Some(state),
+            VisitAction::Skip => return,
+            VisitAction::Custom => {
+                if let Some(replacement) = output.get(visitor_output_start..) {
+                    collect_document_attributes(tag_name.as_ref(), tag, ctx);
+                    super::structure_capture::replace_element_at_start(tag_name.as_ref(), tag, ctx, replacement);
+                }
+                return;
+            }
+            VisitAction::Error => return,
+        }
+    } else {
+        None
+    };
+
+    if skip_or_render_tag(
+        tag_name.as_ref(),
+        node_handle,
+        tag,
+        parser,
+        output,
+        HandlerContext::new(options, ctx, depth, dom_ctx),
+    ) {
+        return;
+    }
+    collect_document_attributes(tag_name.as_ref(), tag, ctx);
+    let structure_capture = super::structure_capture::begin_element(tag_name.as_ref(), tag, ctx);
+    #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
+    let element_output_start = output.len();
+    strip_breaks_before_block(tag_name.as_ref(), output, options, ctx);
+
+    #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
+    let stop = super::main_dispatch::dispatch_tag(
+        tag_name.as_ref(),
+        node_handle,
+        tag,
+        parser,
+        output,
+        HandlerContext::new(options, ctx, depth, dom_ctx),
+    );
+
+    #[cfg(feature = "visitor")]
+    if !stop {
+        super::structure_capture::handle_visitor_end(super::structure_capture::VisitorEndCapture {
+            state: visitor_element_state.as_ref(),
+            tag_name: tag_name.as_ref(),
+            tag,
+            output,
+            element_output_start,
+            ctx,
+            depth,
+        });
+    }
+    super::structure_capture::finish_element(structure_capture, tag_name.as_ref(), tag, ctx);
+}
+
+fn normalized_node_tag_name<'a>(
+    node_handle: &tl::NodeHandle,
+    tag: &'a tl::HTMLTag<'a>,
+    parser: &'a tl::Parser<'a>,
+    dom_ctx: &'a DomContext,
+) -> Cow<'a, str> {
+    match dom_ctx.tag_info(node_handle.get_inner(), parser) {
+        Some(info) => Cow::Borrowed(info.name.as_str()),
+        None => normalized_tag_name(tag.name().as_utf8_str()),
+    }
+}
+
+fn djot_context(
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    tag_name: &str,
+    handler: HandlerContext<'_>,
+) -> Option<Context> {
+    let ctx = handler.ctx;
+    (handler.options.output_format == OutputFormat::Djot
+        && (ctx.djot_rule_like_text.is_none() || is_block_level_element(tag_name)))
+    .then(|| Context {
+        djot_rule_like_text: Some(crate::converter::context::DjotRuleLikeText::new(djot_rule_like_lines(
+            *node_handle,
+            parser,
+            handler.dom_ctx,
+        ))),
+        ..ctx.clone()
+    })
+}
+
+fn skip_or_render_tag(
+    tag_name: &str,
+    node_handle: &tl::NodeHandle,
+    tag: &tl::HTMLTag<'_>,
+    parser: &tl::Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+) -> bool {
+    if should_skip_tag(tag_name, node_handle, tag, parser, handler) {
+        trim_trailing_whitespace(output);
+        return true;
+    }
+    if handler.ctx.strip_tags.contains(tag_name) {
+        for child_handle in tag.children().top().iter() {
+            walk_node(
+                child_handle,
+                parser,
+                output,
+                HandlerContext::new(handler.options, handler.ctx, handler.depth + 1, handler.dom_ctx),
+            );
+        }
+        return true;
+    }
+    let preserved_menu_placeholder = tag_name == "ul"
+        && handler.ctx.preserve_tags.contains("menu")
+        && tag.attributes().get(PRESERVED_MENU_ATTRIBUTE).is_some();
+    (handler.ctx.preserve_tags.contains(tag_name) || preserved_menu_placeholder)
+        && render_preserved_tag(
+            tag_name,
+            node_handle,
+            parser,
+            output,
+            handler,
+            preserved_menu_placeholder,
+        )
+}
+
+fn should_skip_tag(
+    tag_name: &str,
+    node_handle: &tl::NodeHandle,
+    tag: &tl::HTMLTag<'_>,
+    parser: &tl::Parser,
+    handler: HandlerContext<'_>,
+) -> bool {
+    #[cfg(feature = "visitor")]
+    let visitor_is_active = handler.ctx.visitor.is_some() && !handler.ctx.skip_visitor_hooks;
+    #[cfg(not(feature = "visitor"))]
+    let visitor_is_active = false;
+    (!visitor_is_active
+        && should_drop_for_preprocessing(
+            tag_name,
+            tag,
+            handler.options,
+            tag_name == "header" && is_page_header(node_handle, parser, handler.dom_ctx),
+        ))
+        || (!handler.ctx.excluded_node_ids.is_empty()
+            && handler.ctx.excluded_node_ids.contains(&node_handle.get_inner()))
+}
+
+fn render_preserved_tag(
+    tag_name: &str,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+    preserved_menu_placeholder: bool,
+) -> bool {
+    let ctx = handler.ctx;
+    let starts_line = at_line_start(output);
+    let mut html = serialize_tag_to_html(node_handle, parser);
+    if preserved_menu_placeholder {
+        html = restore_preserved_menu_elements(&html).into_owned();
+    }
+    let custom_element_starts_block =
+        ctx.in_list_item && tag_name.contains('-') && !crate::converter::list::utils::line_is_bare_list_marker(output);
+    let opens_html_block = (starts_line || (preserved_menu_placeholder && ctx.in_list_item))
+        && !ctx.in_marker_text()
+        && !ctx.in_table_cell
+        && !ctx.convert_as_inline
+        && !ctx.in_code
+        && (custom_element_starts_block || crate::converter::utility::escaping::opens_block(html.trim_start()));
+    // ~keep Custom elements are not in the converter's block-tag allowlist, so
+    // ~keep `separate_from_block` cannot put a preserved custom block at the item's
+    // ~keep content column. A hyphenated HTML name identifies that custom-element
+    // ~keep case at the preservation boundary (issue #658).
+    if opens_html_block && ctx.in_list_item {
+        crate::converter::list::utils::start_block_in_list_item(output, ctx, handler.options);
+    }
+    output.push_str(&html);
+    // ~keep An HTML block ends only at a blank line, so one follows it (issue #655).
+    if opens_html_block {
+        output.push_str("\n\n");
+    }
+    true
+}
+
+#[cfg(feature = "metadata")]
+fn collect_document_attributes(tag_name: &str, tag: &tl::HTMLTag<'_>, ctx: &Context) {
+    if !matches!(tag_name, "html" | "head" | "body") || !ctx.metadata_wants_document {
+        return;
+    }
+    let Some(collector) = ctx.metadata_collector.as_ref() else {
+        return;
+    };
+    let mut collector = collector.borrow_mut();
+    if let Some(lang) = tag.attributes().get("lang").flatten() {
+        collector.set_language(lang.as_utf8_str().to_string());
+    }
+    if let Some(dir) = tag.attributes().get("dir").flatten() {
+        collector.set_text_direction(dir.as_utf8_str().to_string());
+    }
+}
+
+#[cfg(not(feature = "metadata"))]
+const fn collect_document_attributes(_tag_name: &str, _tag: &tl::HTMLTag<'_>, _ctx: &Context) {}
+
+/// ~keep Block dispatch is where a trailing hard-break run becomes knowably
+/// ineffective; container endings handle the no-following-sibling case themselves.
+fn strip_breaks_before_block(tag_name: &str, output: &mut String, options: &ConversionOptions, ctx: &Context) {
+    if options.newline_style == NewlineStyle::Backslash && is_block_level_element(tag_name) {
+        strip_trailing_backslash_breaks(output, ctx.block_content_start);
+    }
+}
+
+fn djot_rule_like_lines(node_handle: tl::NodeHandle, parser: &tl::Parser, dom_ctx: &DomContext) -> Vec<bool> {
+    let mut text = String::with_capacity(64);
+    let mut stack = vec![node_handle];
+    while let Some(handle) = stack.pop() {
+        match handle.get(parser) {
+            Some(tl::Node::Raw(bytes)) => {
+                let raw = bytes.as_utf8_str();
+                text.push_str(crate::text::decode_html_entities_cow(raw.as_ref()).as_ref());
+            }
+            Some(tl::Node::Tag(tag)) => {
+                if dom_ctx.tag_name_for(handle, parser).as_deref() == Some("br") {
+                    text.push('\n');
+                } else if let Some(children) = dom_ctx.children_of(handle.get_inner()) {
+                    stack.extend(children.iter().rev().copied());
+                } else {
+                    let mut children: Vec<_> = tag.children().top().iter().copied().collect();
+                    children.reverse();
+                    stack.extend(children);
+                }
+            }
+            Some(tl::Node::Comment(_)) | None => {}
+        }
+    }
+    text.split('\n').map(crate::text::is_djot_rule_like).collect()
 }

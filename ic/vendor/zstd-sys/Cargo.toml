@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.64"
 name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.1+zstd.1.5.7"
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 build = "build.rs"
 links = "zstd"
@@ -88,7 +88,7 @@ path = "src/lib.rs"
 doctest = false
 
 [build-dependencies.bindgen]
-version = "0.72"
+version = "0.73.2"
 features = ["runtime"]
 optional = true
 default-features = false

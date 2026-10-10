@@ -66,33 +66,37 @@ use std::borrow::Cow;
 ///
 /// ```text
 /// let ctx = build_node_context(
-///     NodeType::Heading,
-///     "h1",
-///     &attrs,
-///     1,
-///     0,
-///     Some("body"),
-///     false,
+///     NodeContextParts {
+///         node_type: NodeType::Heading,
+///         tag_name: "h1",
+///         attributes: &attrs,
+///         depth: 1,
+///         index_in_parent: 0,
+///         parent_tag: Some("body"),
+///         is_inline: false,
+///     },
 /// );
 /// ```
+pub struct NodeContextParts<'a> {
+    pub node_type: NodeType,
+    pub tag_name: &'a str,
+    pub attributes: &'a BTreeMap<String, String>,
+    pub depth: usize,
+    pub index_in_parent: usize,
+    pub parent_tag: Option<&'a str>,
+    pub is_inline: bool,
+}
+
 #[inline]
-pub fn build_node_context<'a>(
-    node_type: NodeType,
-    tag_name: &'a str,
-    attributes: &'a BTreeMap<String, String>,
-    depth: usize,
-    index_in_parent: usize,
-    parent_tag: Option<&'a str>,
-    is_inline: bool,
-) -> NodeContext<'a> {
+pub fn build_node_context(parts: NodeContextParts<'_>) -> NodeContext<'_> {
     NodeContext::with_borrowed_attributes(
-        node_type,
-        Cow::Borrowed(tag_name),
-        attributes,
-        depth,
-        index_in_parent,
-        parent_tag.map(Cow::Borrowed),
-        is_inline,
+        parts.node_type,
+        Cow::Borrowed(parts.tag_name),
+        parts.attributes,
+        parts.depth,
+        parts.index_in_parent,
+        parts.parent_tag.map(Cow::Borrowed),
+        parts.is_inline,
     )
 }
 
@@ -371,7 +375,15 @@ mod tests {
         attrs.insert("id".to_string(), "main".to_string());
         attrs.insert("class".to_string(), "container".to_string());
 
-        let ctx = build_node_context(NodeType::Div, "div", &attrs, 2, 3, Some("body"), false);
+        let ctx = build_node_context(NodeContextParts {
+            node_type: NodeType::Div,
+            tag_name: "div",
+            attributes: &attrs,
+            depth: 2,
+            index_in_parent: 3,
+            parent_tag: Some("body"),
+            is_inline: false,
+        });
 
         assert_eq!(ctx.node_type, NodeType::Div);
         assert_eq!(ctx.tag_name, "div");
@@ -387,7 +399,15 @@ mod tests {
     fn test_build_node_context_no_parent() {
         let attrs = BTreeMap::new();
 
-        let ctx = build_node_context(NodeType::Html, "html", &attrs, 0, 0, None, false);
+        let ctx = build_node_context(NodeContextParts {
+            node_type: NodeType::Html,
+            tag_name: "html",
+            attributes: &attrs,
+            depth: 0,
+            index_in_parent: 0,
+            parent_tag: None,
+            is_inline: false,
+        });
 
         assert_eq!(ctx.node_type, NodeType::Html);
         assert_eq!(ctx.parent_tag, None);

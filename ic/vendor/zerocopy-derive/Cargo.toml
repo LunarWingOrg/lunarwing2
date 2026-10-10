@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "zerocopy-derive"
-version = "0.8.59"
+version = "0.8.62"
 build = false
 exclude = [
     ".*",

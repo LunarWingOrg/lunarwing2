@@ -9,7 +9,9 @@ pub mod inline_image;
 pub mod preprocessing;
 pub mod validation;
 
-pub use conversion::{ConversionOptions, ConversionOptionsBuilder, ConversionOptionsUpdate, TierStrategy};
+pub use conversion::{
+    ConversionOptions, ConversionOptionsBuilder, ConversionOptionsUpdate, DEFAULT_WASM_MAX_INPUT_SIZE, TierStrategy,
+};
 pub use preprocessing::{PreprocessingOptions, PreprocessingOptionsUpdate, PreprocessingPreset};
 pub use validation::{
     CodeBlockStyle, HeadingStyle, HighlightStyle, InlineDataMedia, LinkStyle, ListIndentType, NewlineStyle,

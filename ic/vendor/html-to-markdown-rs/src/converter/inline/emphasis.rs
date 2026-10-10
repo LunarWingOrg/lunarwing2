@@ -8,13 +8,11 @@
 //! - Visitor callbacks for custom emphasis processing
 //! - Bootstrap caret detection (.caret class)
 
-use crate::options::{ConversionOptions, OutputFormat};
+use crate::converter::inline::HandlerContext;
+use crate::options::OutputFormat;
 #[cfg(feature = "visitor")]
 use std::borrow::Cow;
-use tl::{NodeHandle, Parser};
-
 type Context = crate::converter::Context;
-type DomContext = crate::converter::DomContext;
 
 /// Handler for emphasis elements: strong, b (bold) and em, i (italic).
 ///
@@ -28,42 +26,39 @@ type DomContext = crate::converter::DomContext;
 /// # Note
 /// This function references helper functions and `walk_node` from converter.rs
 /// which must be accessible (pub(crate)) for this module to work correctly.
-pub fn handle(
-    tag_name: &str,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle(tag_name: &str, context: HandlerContext<'_>) {
     match tag_name {
-        "strong" | "b" => {
-            handle_strong(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
-        "em" | "i" => {
-            handle_emphasis(node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
+        "strong" | "b" => handle_strong(context),
+        "em" | "i" => handle_emphasis(context),
         _ => {}
     }
 }
 
 use crate::converter::inline::wrapped::{
-    EMPHASIS_SIBLING_TAGS, InlineDelimiters, InlineSite, STRONG_SIBLING_TAGS, emit_wrapped_inline,
+    EMPHASIS_SIBLING_TAGS, InlineDelimiters, InlineSite, STRONG_SIBLING_TAGS, block_runs_are_plain,
+    block_runs_are_single_line, emit_first_block_wrapped, emit_wrapped_inline, wrap_block_runs,
 };
 
 /// Resolve `<strong>`/`<b>`'s wrapping delimiters for the current context and options, then
 /// emit via [`emit_wrapped_inline`].
-fn emit_strong_wrapped(
-    output: &mut String,
-    content: &str,
-    options: &ConversionOptions,
-    ctx: &Context,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    dom_ctx: &DomContext,
-) {
+pub fn emit_strong_wrapped(output: &mut String, content: &str, site: InlineSite<'_>) {
+    let options = site.options;
+    let ctx = site.ctx;
+    let marker = if ctx.in_strong {
+        String::new()
+    } else if options.output_format == OutputFormat::Djot {
+        String::from("*")
+    } else {
+        [options.strong_em_symbol; 2].iter().collect()
+    };
+    if emit_first_block_wrapped(output, content, &marker, &marker, ctx, site.parser) {
+        return;
+    }
+    if !marker.is_empty() && content.contains("\n\n") && block_runs_are_plain(content) {
+        output.push_str(&wrap_block_runs(content, &marker, &marker));
+        return;
+    }
+
     if ctx.in_strong {
         emit_wrapped_inline(
             output,
@@ -75,10 +70,11 @@ fn emit_strong_wrapped(
                 sibling_tag_names: &STRONG_SIBLING_TAGS,
             },
             InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
+                node_handle: site.node_handle,
+                parser: site.parser,
+                dom_ctx: site.dom_ctx,
                 ctx,
+                options,
             },
         );
     } else if options.output_format == OutputFormat::Djot {
@@ -94,14 +90,14 @@ fn emit_strong_wrapped(
                 sibling_tag_names: &STRONG_SIBLING_TAGS,
             },
             InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
+                node_handle: site.node_handle,
+                parser: site.parser,
+                dom_ctx: site.dom_ctx,
                 ctx,
+                options,
             },
         );
     } else {
-        let marker: String = [options.strong_em_symbol; 2].iter().collect();
         emit_wrapped_inline(
             output,
             content,
@@ -112,26 +108,51 @@ fn emit_strong_wrapped(
                 sibling_tag_names: &STRONG_SIBLING_TAGS,
             },
             InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
+                node_handle: site.node_handle,
+                parser: site.parser,
+                dom_ctx: site.dom_ctx,
                 ctx,
+                options,
             },
         );
     }
 }
 
+/// ~keep Legend semantically bolds every child block, including structured list runs (#724).
+pub fn emit_strong_wrapped_blocks(output: &mut String, content: &str, site: InlineSite<'_>) {
+    let options = site.options;
+    let ctx = site.ctx;
+    let marker = if ctx.in_strong {
+        String::new()
+    } else if options.output_format == OutputFormat::Djot {
+        String::from("*")
+    } else {
+        [options.strong_em_symbol; 2].iter().collect()
+    };
+    if !marker.is_empty() && content.contains("\n\n") && block_runs_are_single_line(content) {
+        output.push_str(&wrap_block_runs(content, &marker, &marker));
+    } else {
+        emit_strong_wrapped(output, content, site);
+    }
+}
+
 /// Resolve `<em>`/`<i>`'s wrapping delimiters for the current context and options, then emit
 /// via [`emit_wrapped_inline`].
-fn emit_emphasis_wrapped(
-    output: &mut String,
-    content: &str,
-    options: &ConversionOptions,
-    ctx: &Context,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    dom_ctx: &DomContext,
-) {
+fn emit_emphasis_wrapped(output: &mut String, content: &str, site: InlineSite<'_>) {
+    let options = site.options;
+    let marker = if options.output_format == OutputFormat::Djot {
+        String::from("_")
+    } else {
+        options.strong_em_symbol.to_string()
+    };
+    if emit_first_block_wrapped(output, content, &marker, &marker, site.ctx, site.parser) {
+        return;
+    }
+    if content.contains("\n\n") && block_runs_are_plain(content) {
+        output.push_str(&wrap_block_runs(content, &marker, &marker));
+        return;
+    }
+
     if options.output_format == OutputFormat::Djot {
         // ~keep Djot emphasis always uses `_`, independent of `options.strong_em_symbol`
         // ~keep (pre-existing behaviour, unchanged by this refactor).
@@ -145,14 +166,14 @@ fn emit_emphasis_wrapped(
                 sibling_tag_names: &EMPHASIS_SIBLING_TAGS,
             },
             InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
-                ctx,
+                node_handle: site.node_handle,
+                parser: site.parser,
+                dom_ctx: site.dom_ctx,
+                ctx: site.ctx,
+                options,
             },
         );
     } else {
-        let marker = options.strong_em_symbol.to_string();
         emit_wrapped_inline(
             output,
             content,
@@ -163,209 +184,151 @@ fn emit_emphasis_wrapped(
                 sibling_tag_names: &EMPHASIS_SIBLING_TAGS,
             },
             InlineSite {
-                node_handle,
-                parser,
-                dom_ctx,
-                ctx,
+                node_handle: site.node_handle,
+                parser: site.parser,
+                dom_ctx: site.dom_ctx,
+                ctx: site.ctx,
+                options,
             },
         );
     }
 }
 
 /// Handle strong/bold emphasis (strong, b tags).
-fn handle_strong(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    // ~keep reason: serialize_node is only used with the visitor feature; other imports depend
-    // ~keep on feature-gated code paths in this function.
-    #[allow(unused_imports)]
-    use crate::converter::{get_text_content, serialize_node, walk_node};
-
-    let Some(node) = node_handle.get(parser) else { return };
-
-    let tag = match node {
-        tl::Node::Tag(tag) => tag,
-        _ => return,
-    };
-
-    if ctx.in_code {
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-        }
-    } else {
-        let mut content = String::with_capacity(64);
-        let children = tag.children();
-        {
-            let strong_ctx = Context {
-                inline_depth: ctx.inline_depth + 1,
-                in_strong: true,
-                ..ctx.clone()
-            };
-            for child_handle in children.top().iter() {
-                walk_node(
-                    child_handle,
-                    parser,
-                    &mut content,
-                    options,
-                    &strong_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-            }
-        }
-
-        #[cfg(feature = "visitor")]
-        let strong_output = if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let text_content = get_text_content(node_handle, parser, dom_ctx);
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Strong,
-                tag.name().as_utf8_str(),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                true,
-            );
-
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_strong(&node_ctx, &text_content)
-            };
-            match visit_result {
-                VisitResult::Continue => None,
-                VisitResult::Custom(custom) => Some(custom),
-                VisitResult::Skip => Some(String::new()),
-                VisitResult::PreserveHtml => Some(serialize_node(node_handle, parser)),
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        #[cfg(feature = "visitor")]
-        if let Some(custom_output) = strong_output {
-            output.push_str(&custom_output);
-        } else {
-            emit_strong_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
-        }
-
-        #[cfg(not(feature = "visitor"))]
-        emit_strong_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
-    }
+fn handle_strong(handler: HandlerContext<'_>) {
+    handle_emphasis_element(handler, EmphasisKind::Strong);
 }
 
 /// Handle emphasis/italic (em, i tags).
-fn handle_emphasis(
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    // ~keep reason: serialize_node is only used with the visitor feature; other imports depend
-    // ~keep on feature-gated code paths in this function.
-    #[allow(unused_imports)]
-    use crate::converter::{get_text_content, serialize_node, walk_node};
+fn handle_emphasis(handler: HandlerContext<'_>) {
+    handle_emphasis_element(handler, EmphasisKind::Emphasis);
+}
 
-    let Some(node) = node_handle.get(parser) else { return };
+#[derive(Clone, Copy)]
+enum EmphasisKind {
+    Strong,
+    Emphasis,
+}
 
-    let tag = match node {
-        tl::Node::Tag(tag) => tag,
-        _ => return,
+fn handle_emphasis_element(mut handler: HandlerContext<'_>, kind: EmphasisKind) {
+    let Some(tl::Node::Tag(tag)) = handler.node_handle.get(handler.parser) else {
+        return;
     };
+    if handler.context.in_code {
+        walk_children_to_output(tag, &mut handler);
+        return;
+    }
 
-    if ctx.in_code {
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+    let buffer_context = handler.context.inline_buffer(handler.output, true);
+    let child_context = Context {
+        inline_depth: handler.context.inline_depth + 1,
+        in_strong: handler.context.in_strong || matches!(kind, EmphasisKind::Strong),
+        inline_buffer_after_hard_break: buffer_context.inline_buffer_after_hard_break,
+        ..handler.context.clone()
+    };
+    let mut content = String::with_capacity(64);
+    collect_children(tag, &mut content, &child_context, &handler);
+
+    #[cfg(feature = "visitor")]
+    if let Some(custom_output) = visit_emphasis(tag, kind, &handler) {
+        handler.output.push_str(&custom_output);
+        return;
+    }
+
+    let site = handler.inline_site();
+    match kind {
+        EmphasisKind::Strong => emit_strong_wrapped(handler.output, &content, site),
+        EmphasisKind::Emphasis => {
+            emit_emphasis_wrapped(handler.output, &content, site);
+            maybe_emit_caret(handler.output, &content, tag);
         }
-    } else {
-        let mut content = String::with_capacity(64);
-        let children = tag.children();
-        {
-            let em_ctx = Context {
-                inline_depth: ctx.inline_depth + 1,
-                ..ctx.clone()
-            };
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, &mut content, options, &em_ctx, depth + 1, dom_ctx);
-            }
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn visit_emphasis(tag: &tl::HTMLTag<'_>, kind: EmphasisKind, handler: &HandlerContext<'_>) -> Option<String> {
+    use crate::converter::{get_text_content, serialize_node};
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let visitor_handle = handler.context.visitor.as_ref()?;
+    let text_content = get_text_content(handler.node_handle, handler.parser, handler.dom_context);
+    let node_id = handler.node_handle.get_inner();
+    let node_context = NodeContext::with_lazy_attributes(
+        match kind {
+            EmphasisKind::Strong => NodeType::Strong,
+            EmphasisKind::Emphasis => NodeType::Em,
+        },
+        tag.name().as_utf8_str(),
+        tag,
+        handler.depth,
+        handler.dom_context.get_sibling_index(node_id).unwrap_or(0),
+        handler
+            .dom_context
+            .parent_tag_name(node_id, handler.parser)
+            .map(Cow::Borrowed),
+        true,
+    );
+    let result = {
+        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
+        match kind {
+            EmphasisKind::Strong => visitor.visit_strong(&node_context, &text_content),
+            EmphasisKind::Emphasis => visitor.visit_emphasis(&node_context, &text_content),
         }
-
-        #[cfg(feature = "visitor")]
-        let em_output = if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let text_content = get_text_content(node_handle, parser, dom_ctx);
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Em,
-                tag.name().as_utf8_str(),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                true,
-            );
-
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_emphasis(&node_ctx, &text_content)
-            };
-            match visit_result {
-                VisitResult::Continue => None,
-                VisitResult::Custom(custom) => Some(custom),
-                VisitResult::Skip => Some(String::new()),
-                VisitResult::PreserveHtml => Some(serialize_node(node_handle, parser)),
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    None
-                }
+    };
+    match result {
+        VisitResult::Continue => None,
+        VisitResult::Custom(custom) => {
+            crate::converter::structure_capture::replace_element(handler.context, Some(&custom));
+            Some(custom)
+        }
+        VisitResult::Skip => {
+            crate::converter::structure_capture::replace_element(handler.context, None);
+            Some(String::new())
+        }
+        VisitResult::PreserveHtml => {
+            let html = serialize_node(handler.node_handle, handler.parser);
+            crate::converter::structure_capture::replace_element(handler.context, Some(&html));
+            Some(html)
+        }
+        VisitResult::Error(error) => {
+            crate::converter::structure_capture::replace_element(handler.context, None);
+            if handler.context.visitor_error.borrow().is_none() {
+                *handler.context.visitor_error.borrow_mut() = Some(error);
             }
-        } else {
             None
-        };
-
-        #[cfg(feature = "visitor")]
-        if let Some(custom_output) = em_output {
-            output.push_str(&custom_output);
-        } else {
-            emit_emphasis_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
-            maybe_emit_caret(output, &content, tag);
         }
+    }
+}
 
-        #[cfg(not(feature = "visitor"))]
-        {
-            emit_emphasis_wrapped(output, &content, options, ctx, node_handle, parser, dom_ctx);
-            maybe_emit_caret(output, &content, tag);
-        }
+fn walk_children_to_output(tag: &tl::HTMLTag<'_>, handler: &mut HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        crate::converter::walk_node(
+            child_handle,
+            handler.parser,
+            handler.output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
+    }
+}
+
+fn collect_children(tag: &tl::HTMLTag<'_>, output: &mut String, context: &Context, handler: &HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        crate::converter::walk_node(
+            child_handle,
+            handler.parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
     }
 }
 

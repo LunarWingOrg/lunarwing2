@@ -1,8 +1,9 @@
 //! Synchronous text wrapping for Markdown output.
 
 use super::utils::{
-    is_heading, is_list_like, is_numbered_list, joins_into_a_block, parse_blockquote_line, parse_list_item,
-    push_paragraph_line, wrap_blockquote_paragraph, wrap_indented_line, wrap_list_item,
+    hard_break, is_heading, is_list_like, is_non_interrupting_ordered_item, is_numbered_list, joins_into_a_block,
+    parse_blockquote_line, parse_list_item, push_paragraph_line, wrap_blockquote_paragraph, wrap_indented_line,
+    wrap_list_item,
 };
 use crate::converter::utility::escaping::{code_fence, is_heading_underline, opens_block};
 use crate::options::ConversionOptions;
@@ -108,6 +109,261 @@ impl OpenParagraph {
     }
 }
 
+#[derive(Default)]
+struct BlockquoteState {
+    open_fence: Option<(u8, usize)>,
+    in_paragraph: bool,
+    prefix: String,
+    indent: String,
+    buffer: String,
+}
+
+impl BlockquoteState {
+    fn flush(&mut self, out: &mut String, width: usize) {
+        if !self.in_paragraph || self.buffer.is_empty() {
+            return;
+        }
+        out.push_str(&wrap_blockquote_paragraph(
+            &format!("{}{}", self.prefix, self.indent),
+            &self.buffer,
+            width,
+        ));
+        out.push('\n');
+        self.buffer.clear();
+        self.in_paragraph = false;
+    }
+
+    fn flush_before_block(&mut self, out: &mut String, width: usize, underline: bool) {
+        if !self.in_paragraph || self.buffer.is_empty() {
+            return;
+        }
+        out.push_str(&wrap_blockquote_paragraph(
+            &format!("{}{}", self.prefix, self.indent),
+            &self.buffer,
+            if underline { usize::MAX } else { width },
+        ));
+        if let Some(text) = self.buffer.strip_suffix('\n') {
+            out.push_str(&text[text.trim_end_matches(' ').len()..]);
+        }
+        out.push('\n');
+        self.buffer.clear();
+        self.in_paragraph = false;
+    }
+
+    fn process(&mut self, line: &str, prefix: String, content: String, out: &mut String, width: usize) {
+        // ~keep The indent after the quote prefix is a list item's content column inside
+        // ~keep the quote; written without it, the paragraph would leave the item.
+        let after_prefix = &line[prefix.len()..];
+        let indent = &after_prefix[..after_prefix.len() - after_prefix.trim_start().len()];
+        let mut normalized_prefix = prefix;
+        if !normalized_prefix.ends_with(' ') {
+            normalized_prefix.push(' ');
+        }
+
+        if content.is_empty() {
+            self.flush(out, width);
+            out.push_str(normalized_prefix.trim_end());
+            out.push('\n');
+            return;
+        }
+        if self.in_paragraph && normalized_prefix != self.prefix {
+            self.flush(out, width);
+        }
+        if let Some((marker, length)) = self.open_fence {
+            if closes_fence(&content, marker, length) {
+                self.open_fence = None;
+            }
+            push_verbatim_line(out, line);
+            return;
+        }
+
+        // ~keep Inside a quote a line that starts a block keeps its own line, as outside one.
+        // ~keep A hard break before such a line stays because the reflow cannot infer item columns.
+        let underline = self.in_paragraph && is_heading_underline(&content);
+        let fence = code_fence(&content);
+        let list_item = parse_list_item(&content).is_some();
+        let continues_numbered_paragraph =
+            self.in_paragraph && self.buffer.ends_with('\n') && is_non_interrupting_ordered_item(&content);
+        if underline
+            || fence.is_some()
+            || (opens_block(&content) && !continues_numbered_paragraph)
+            || (list_item && !continues_numbered_paragraph)
+            || content.starts_with('|')
+        {
+            self.flush_before_block(out, width, underline);
+            self.open_fence = fence;
+            push_verbatim_line(out, line);
+            return;
+        }
+        if !self.in_paragraph {
+            self.prefix = normalized_prefix;
+            self.indent.clear();
+            self.indent.push_str(indent);
+            self.in_paragraph = true;
+        }
+        push_paragraph_line(&mut self.buffer, after_prefix);
+    }
+}
+
+struct MarkdownWrapper {
+    width: usize,
+    result: String,
+    open_fence: Option<(u8, usize)>,
+    paragraph: OpenParagraph,
+    blockquote: BlockquoteState,
+}
+
+impl MarkdownWrapper {
+    fn new(capacity: usize, width: usize) -> Self {
+        Self {
+            width,
+            result: String::with_capacity(capacity),
+            open_fence: None,
+            paragraph: OpenParagraph::default(),
+            blockquote: BlockquoteState::default(),
+        }
+    }
+
+    fn process_line(&mut self, line: &str) {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if self.process_open_fence(line, trimmed) || self.continue_paragraph(line, trimmed) {
+            return;
+        }
+        if self.process_code_line(line, trimmed) {
+            return;
+        }
+        if let Some((prefix, content)) = parse_blockquote_line(line) {
+            self.paragraph.flush(&mut self.result, self.width);
+            self.blockquote
+                .process(line, prefix, content, &mut self.result, self.width);
+            return;
+        }
+
+        self.blockquote.open_fence = None;
+        self.blockquote.flush(&mut self.result, self.width);
+        if self.process_setext_heading(line, trimmed)
+            || self.process_list_item(line)
+            || self.process_structural_line(line, trimmed)
+            || self.process_blank_line(line)
+        {
+            return;
+        }
+        self.paragraph.open(&line[..line.len() - trimmed.len()], "", line);
+    }
+
+    fn process_open_fence(&mut self, line: &str, trimmed: &str) -> bool {
+        let Some((marker, length)) = self.open_fence else {
+            return false;
+        };
+        if closes_fence(trimmed, marker, length) {
+            self.open_fence = None;
+        }
+        push_verbatim_line(&mut self.result, line);
+        true
+    }
+
+    fn continue_paragraph(&mut self, line: &str, trimmed: &str) -> bool {
+        if !self.paragraph.is_open() || !self.paragraph.continues_with(line, trimmed) {
+            return false;
+        }
+        self.paragraph.push_line(line);
+        true
+    }
+
+    fn process_code_line(&mut self, line: &str, trimmed: &str) -> bool {
+        let fence = code_fence(trimmed);
+        let is_indented_code = line.starts_with("    ")
+            && !is_list_like(trimmed)
+            && !is_numbered_list(trimmed)
+            && !is_heading(trimmed)
+            && !trimmed.starts_with('>')
+            && !trimmed.starts_with('|');
+        if fence.is_none() && !is_indented_code {
+            return false;
+        }
+        self.paragraph.flush(&mut self.result, self.width);
+        self.open_fence = fence;
+        push_verbatim_line(&mut self.result, line);
+        true
+    }
+
+    fn process_setext_heading(&mut self, line: &str, trimmed: &str) -> bool {
+        if !self.paragraph.is_open() || self.paragraph.is_item() || !is_heading_underline(trimmed) {
+            return false;
+        }
+        // ~keep An underline directly below paragraph text turns it into a heading, so the text
+        // ~keep remains unwrapped and ends with one line break rather than a blank line (#607).
+        self.paragraph.flush(&mut self.result, usize::MAX);
+        self.result.pop();
+        push_verbatim_line(&mut self.result, line);
+        true
+    }
+
+    fn process_list_item(&mut self, line: &str) -> bool {
+        let Some((indent, mut marker, mut content)) = parse_list_item(line) else {
+            return false;
+        };
+        // ~keep Nested markers on one physical line form one prefix and set the continuation column.
+        while let Some((_, inner_marker, inner_content)) = parse_list_item(&content) {
+            marker.push_str(&inner_marker);
+            content = inner_content;
+        }
+        self.paragraph.flush(&mut self.result, self.width);
+        if content.is_empty() {
+            let mut item = wrap_list_item(&indent, &marker, &content, self.width);
+            // ~keep Parsing trims an empty item's trailing whitespace, but an explicit
+            // ~keep two-space break still separates it from the escaped line after it (#679).
+            if let Some(spaces) = hard_break(line) {
+                let _ = item.pop();
+                item.push_str(spaces);
+                item.push('\n');
+            }
+            self.result.push_str(&item);
+        } else if opens_block(&content) {
+            // ~keep Reflowing heading, fence, quote, or rule content would change its structure.
+            self.open_fence = code_fence(&content);
+            push_verbatim_line(&mut self.result, line);
+        } else {
+            self.paragraph.open(&indent, &marker, &content);
+        }
+        true
+    }
+
+    fn process_structural_line(&mut self, line: &str, trimmed: &str) -> bool {
+        let is_structural =
+            is_heading(trimmed) || opens_block(trimmed) || trimmed.starts_with('|') || trimmed.starts_with('=');
+        if !is_structural {
+            return false;
+        }
+        self.paragraph.flush_before_line(&mut self.result, self.width);
+        push_verbatim_line(&mut self.result, line);
+        true
+    }
+
+    fn process_blank_line(&mut self, line: &str) -> bool {
+        if !line.trim().is_empty() {
+            return false;
+        }
+        let was_plain = self.paragraph.is_open() && !self.paragraph.is_item();
+        self.paragraph.flush(&mut self.result, self.width);
+        if !was_plain {
+            self.result.push('\n');
+        }
+        true
+    }
+
+    fn finish(mut self) -> String {
+        self.blockquote.flush(&mut self.result, self.width);
+        self.paragraph.flush(&mut self.result, self.width);
+        self.result
+    }
+}
+
+fn push_verbatim_line(out: &mut String, line: &str) {
+    out.push_str(line);
+    out.push('\n');
+}
+
 /// Wrap text at specified width while preserving Markdown formatting.
 ///
 /// This function wraps paragraphs of text at the specified width, but:
@@ -116,223 +372,16 @@ impl OpenParagraph {
 /// - Preserves Markdown formatting (links, bold, etc.)
 /// - Only wraps paragraph content, not headers, lists, code blocks, etc.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn wrap_markdown(markdown: &str, options: &ConversionOptions) -> String {
     if !options.wrap {
         return markdown.to_string();
     }
 
-    let width = options.wrap_width;
-    let mut result = String::with_capacity(markdown.len());
-    let mut open_fence: Option<(u8, usize)> = None;
-    let mut quote_fence: Option<(u8, usize)> = None;
-    let mut paragraph = OpenParagraph::default();
-    let mut in_blockquote_paragraph = false;
-    let mut blockquote_prefix = String::new();
-    let mut blockquote_indent = String::new();
-    let mut blockquote_buffer = String::new();
-
+    let mut wrapper = MarkdownWrapper::new(markdown.len(), options.wrap_width);
     for line in markdown.lines() {
-        let trimmed = line.trim_start_matches([' ', '\t']);
-        if let Some((marker, length)) = open_fence {
-            if closes_fence(trimmed, marker, length) {
-                open_fence = None;
-            }
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-
-        if paragraph.is_open() && paragraph.continues_with(line, trimmed) {
-            paragraph.push_line(line);
-            continue;
-        }
-
-        let fence = code_fence(trimmed);
-        let is_indented_code = line.starts_with("    ")
-            && !is_list_like(trimmed)
-            && !is_numbered_list(trimmed)
-            && !is_heading(trimmed)
-            && !trimmed.starts_with('>')
-            && !trimmed.starts_with('|');
-
-        if fence.is_some() || is_indented_code {
-            paragraph.flush(&mut result, width);
-            open_fence = fence;
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-
-        if let Some((prefix, content)) = parse_blockquote_line(line) {
-            // ~keep The indent after the quote prefix is a list item's content column inside
-            // ~keep the quote; written without it, the paragraph would leave the item.
-            let after_prefix = &line[prefix.len()..];
-            let indent = &after_prefix[..after_prefix.len() - after_prefix.trim_start().len()];
-            paragraph.flush(&mut result, width);
-
-            let mut normalized_prefix = prefix;
-            if !normalized_prefix.ends_with(' ') {
-                normalized_prefix.push(' ');
-            }
-
-            if content.is_empty() {
-                if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
-                    result.push_str(&wrap_blockquote_paragraph(
-                        &format!("{blockquote_prefix}{blockquote_indent}"),
-                        &blockquote_buffer,
-                        width,
-                    ));
-                    result.push('\n');
-                    blockquote_buffer.clear();
-                    in_blockquote_paragraph = false;
-                }
-                result.push_str(normalized_prefix.trim_end());
-                result.push('\n');
-                continue;
-            }
-
-            if in_blockquote_paragraph && normalized_prefix != blockquote_prefix {
-                result.push_str(&wrap_blockquote_paragraph(
-                    &format!("{blockquote_prefix}{blockquote_indent}"),
-                    &blockquote_buffer,
-                    width,
-                ));
-                result.push('\n');
-                blockquote_buffer.clear();
-                in_blockquote_paragraph = false;
-            }
-
-            if let Some((marker, length)) = quote_fence {
-                if closes_fence(&content, marker, length) {
-                    quote_fence = None;
-                }
-                result.push_str(line);
-                result.push('\n');
-                continue;
-            }
-
-            // ~keep Inside a quote a line that starts a block keeps its own line, as outside one:
-            // ~keep a heading underline, a rule, a list item, a fence, a heading, a table row (#607).
-            // ~keep A hard break before such a line stays: a `1990.` line can continue the paragraph,
-            // ~keep and the reflow does not know the column of a list item in a quote to tell.
-            let underline = in_blockquote_paragraph && is_heading_underline(&content);
-            let fence = code_fence(&content);
-            if underline
-                || fence.is_some()
-                || opens_block(&content)
-                || parse_list_item(&content).is_some()
-                || content.starts_with('|')
-            {
-                if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
-                    result.push_str(&wrap_blockquote_paragraph(
-                        &format!("{blockquote_prefix}{blockquote_indent}"),
-                        &blockquote_buffer,
-                        if underline { usize::MAX } else { width },
-                    ));
-                    if let Some(text) = blockquote_buffer.strip_suffix('\n') {
-                        result.push_str(&text[text.trim_end_matches(' ').len()..]);
-                    }
-                    result.push('\n');
-                    blockquote_buffer.clear();
-                    in_blockquote_paragraph = false;
-                }
-                quote_fence = fence;
-                result.push_str(line);
-                result.push('\n');
-                continue;
-            }
-
-            if !in_blockquote_paragraph {
-                blockquote_prefix = normalized_prefix;
-                blockquote_indent.clear();
-                blockquote_indent.push_str(indent);
-                in_blockquote_paragraph = true;
-            }
-            push_paragraph_line(&mut blockquote_buffer, after_prefix);
-            continue;
-        }
-        quote_fence = None;
-        if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
-            result.push_str(&wrap_blockquote_paragraph(
-                &format!("{blockquote_prefix}{blockquote_indent}"),
-                &blockquote_buffer,
-                width,
-            ));
-            result.push('\n');
-            blockquote_buffer.clear();
-            in_blockquote_paragraph = false;
-        }
-
-        // ~keep An underline right under paragraph text makes that text its heading: the text ends
-        // ~keep with one line break, and it is not reflowed, like an ATX heading. Folded into the
-        // ~keep text, or cut off by a blank line, the underline is lost (#607).
-        if paragraph.is_open() && !paragraph.is_item() && is_heading_underline(trimmed) {
-            paragraph.flush(&mut result, usize::MAX);
-            result.pop();
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-
-        if let Some((indent, mut marker, mut content)) = parse_list_item(line) {
-            // ~keep An item whose text starts with a marker holds a nested list on the same line, and
-            // ~keep its text continues at the nested item's content column: `- 1.` alone on a line is
-            // ~keep an empty item that the next line cannot join. Both markers wrap as one.
-            while let Some((_, inner_marker, inner_content)) = parse_list_item(&content) {
-                marker.push_str(&inner_marker);
-                content = inner_content;
-            }
-            paragraph.flush(&mut result, width);
-            if content.is_empty() {
-                result.push_str(&wrap_list_item(&indent, &marker, &content, width));
-            } else if opens_block(&content) {
-                // ~keep Text that starts a heading, a fence, a quote or a rule is not a paragraph:
-                // ~keep reflowed, a heading loses its words to the next line and a fence its code.
-                open_fence = code_fence(&content);
-                result.push_str(line);
-                result.push('\n');
-            } else {
-                paragraph.open(&indent, &marker, &content);
-            }
-            continue;
-        }
-
-        let is_structural =
-            is_heading(trimmed) || opens_block(trimmed) || trimmed.starts_with('|') || trimmed.starts_with('=');
-
-        if is_structural {
-            paragraph.flush_before_line(&mut result, width);
-
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-
-        if line.trim().is_empty() {
-            let was_plain = paragraph.is_open() && !paragraph.is_item();
-            paragraph.flush(&mut result, width);
-            if !was_plain {
-                result.push('\n');
-            }
-            continue;
-        }
-
-        paragraph.open(&line[..line.len() - trimmed.len()], "", line);
+        wrapper.process_line(line);
     }
-
-    if in_blockquote_paragraph && !blockquote_buffer.is_empty() {
-        result.push_str(&wrap_blockquote_paragraph(
-            &format!("{blockquote_prefix}{blockquote_indent}"),
-            &blockquote_buffer,
-            width,
-        ));
-        result.push('\n');
-    }
-
-    paragraph.flush(&mut result, width);
-
-    result
+    wrapper.finish()
 }
 
 #[cfg(test)]
@@ -420,6 +469,12 @@ mod tests {
         assert_eq!(wrap_at_20("- a\n1990. b\n"), "- a\n1990. b\n");
         assert_eq!(wrap_at_20("1. a\n  2. b\n"), "1. a\n  2. b\n");
         assert_eq!(wrap_at_20("1. a\n\n   p\n  2. b\n"), "1. a\n\n   p\n\n  2. b\n");
+    }
+
+    #[test]
+    fn wrap_markdown_keeps_a_break_after_an_empty_ordered_item() {
+        let markdown = "- a  \n  ===\n  2) ---  \n  1990.  \n  \\>\n";
+        assert_eq!(wrap_at_20(markdown), "- a  \n  ===\n  2) ---  \n  1990.  \n  \\>\n\n");
     }
 
     #[test]

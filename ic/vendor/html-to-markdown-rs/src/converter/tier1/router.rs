@@ -1,7 +1,10 @@
 //! Tier router — decides whether an input goes to Tier-1 or Tier-2.
 
 use crate::converter::prescan::PrescanReport;
-use crate::options::ConversionOptions;
+use crate::options::{
+    CodeBlockStyle, ConversionOptions, HeadingStyle, HighlightStyle, InlineDataMedia, LinkStyle, ListIndentType,
+    NewlineStyle, OutputFormat, PreprocessingPreset, UrlEscapeStyle, WhitespaceMode,
+};
 
 /// The routing decision produced by [`classify`] for a given input + options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,113 +210,89 @@ pub enum RouterDecision {
 /// picture.
 #[must_use]
 pub fn classify(report: &PrescanReport, options: &ConversionOptions) -> RouterDecision {
-    use crate::options::{
-        CodeBlockStyle, HeadingStyle, HighlightStyle, InlineDataMedia, LinkStyle, ListIndentType, NewlineStyle,
-        OutputFormat, PreprocessingPreset, UrlEscapeStyle, WhitespaceMode,
-    };
+    if input_or_mode_requires_tier2(report, options)
+        || structural_options_require_tier2(options)
+        || formatting_options_require_tier2(options)
+        || feature_options_require_tier2(options)
+    {
+        return RouterDecision::Tier2;
+    }
+    RouterDecision::Tier1
+}
 
-    if report.had_cdata
+fn input_or_mode_requires_tier2(report: &PrescanReport, options: &ConversionOptions) -> bool {
+    report.had_cdata
         || report.had_unescaped_lt
         || options.wrap
         || options.convert_as_inline
         || options.preprocessing.preset != PreprocessingPreset::Standard
-        || !options.strip_tags.is_empty()
-        || !options.preserve_tags.is_empty()
         || options.debug
-        // ~keep exclude_selectors: Tier-1 has no CSS selector engine; a configured
-        // ~keep exclusion would silently pass excluded content through untouched.
-        || !options.exclude_selectors.is_empty()
-        // ~keep strip_newlines: Tier-1 never strips \r/\n from text runs.
         || options.strip_newlines
-        // ~keep ── Result-shape gates ─────────────────────────────────────────────────
-        // ~keep include_document_structure: convert_api.rs hardcodes `document: None`
-        // ~keep and `tables: Vec::new()` on the Tier-1 success path — it never builds a
-        // ~keep StructureCollector for that branch — so a caller requesting the
-        // ~keep structured tree (or the tables it feeds) would silently get nothing.
+}
+
+const fn structural_options_require_tier2(options: &ConversionOptions) -> bool {
+    // ~keep Tier-1 has no selector engine and does not build document structure.
+    !options.strip_tags.is_empty()
+        || !options.preserve_tags.is_empty()
+        || !options.exclude_selectors.is_empty()
         || options.include_document_structure
-        // ~keep ── Style-option gates ────────────────────────────────────────────────
-        // ~keep output_format: Tier-1 only produces Markdown; other formats are Tier-2 only.
-        || options.output_format != OutputFormat::Markdown
-        // ~keep heading_style: Tier-1 hardcodes ATX; non-ATX headings differ.
+}
+
+fn formatting_options_require_tier2(options: &ConversionOptions) -> bool {
+    if basic_formatting_differs(options) || escaping_differs(options) {
+        return true;
+    }
+    destination_formatting_differs(options)
+}
+
+fn basic_formatting_differs(options: &ConversionOptions) -> bool {
+    options.output_format != OutputFormat::Markdown
         || options.heading_style != HeadingStyle::Atx
-        // ~keep code_block_style: Tier-1 supports Indented and Backticks (Phase Q.4).
-        // ~keep Tildes still require Tier-2's fence emission.
         || options.code_block_style == CodeBlockStyle::Tildes
-        // ~keep strong_em_symbol: Tier-1 hardcodes `*`/`**`.
         || options.strong_em_symbol != '*'
-        // ~keep bullets: Tier-1 hardcodes the cycle `"-*+"` (the default).  Any
-        // ~keep other configured value would diverge at nested depths.
         || options.bullets != "-*+"
-        // ~keep list_indent_width: Tier-1 hardcodes 2-space indentation per depth level.
         || options.list_indent_width != 2
-        // ~keep list_indent_type: Tier-1 hardcodes spaces for list indentation.
         || options.list_indent_type != ListIndentType::Spaces
-        // ~keep escape_*: Tier-1 does not perform any text escaping. If the caller
-        // ~keep requests escaping, Tier-2 must handle it.
-        || options.escape_asterisks
+        || options.whitespace_mode != WhitespaceMode::Normalized
+        || options.newline_style != NewlineStyle::Spaces
+}
+
+fn escaping_differs(options: &ConversionOptions) -> bool {
+    options.escape_asterisks
         || options.escape_underscores
         || options.escape_misc
         || options.escape_ascii
-        // ~keep whitespace_mode: Tier-1 always normalizes whitespace (collapses runs).
-        || options.whitespace_mode != WhitespaceMode::Normalized
-        // ~keep newline_style: Tier-1 emits `  \n` for `<br>` (two-space style).
-        || options.newline_style != NewlineStyle::Spaces
-        // ~keep default_title: Tier-1 does not insert a default document title.
         || options.default_title
-        // ~keep sub_symbol / sup_symbol: Tier-1 passes <sub>/<sup> content through
-        // ~keep as plain text (no wrapping symbol). Only safe when symbol is empty.
         || !options.sub_symbol.is_empty()
         || !options.sup_symbol.is_empty()
-        // ~keep highlight_style: Tier-1 passes <mark> content through as plain text.
-        // ~keep This is byte-identical to Tier-2 only when style is None (no wrapping).
         || options.highlight_style != HighlightStyle::None
-        // ~keep link_style: Tier-1 always emits inline `[text](href)` links; reference
-        // ~keep style (with a link-reference block at end of document) is Tier-2 only.
-        || options.link_style != LinkStyle::Inline
-        // ~keep url_escape_style: Tier-1 emits hrefs verbatim (no angle-bracket wrapping
-        // ~keep or percent-encoding). This matches Tier-2's Angle behaviour for URLs that
-        // ~keep contain no spaces, but diverges for Percent (which percent-encodes).
-        || options.url_escape_style != UrlEscapeStyle::Angle
-        // ~keep compact_tables: Tier-1 always emits padded `| cell |` GFM tables.
-        // ~keep compact_tables=true would produce `|cell|`, which Tier-1 never does.
-        || options.compact_tables
-        // ~keep inline_data_media: Tier-1 writes every image and inline SVG destination,
-        // ~keep `data:` payload included; the other choices are Tier-2 only.
-        || options.inline_data_media != InlineDataMedia::Keep
-    {
-        return RouterDecision::Tier2;
-    }
+}
 
-    // ~keep visitor: Tier-1 does not fire visitor callbacks. When a visitor is
-    // ~keep registered, route to Tier-2 so element_start/element_end and
-    // ~keep skip_subtree directives are honored.
+fn destination_formatting_differs(options: &ConversionOptions) -> bool {
+    options.link_style != LinkStyle::Inline
+        || options.url_escape_style != UrlEscapeStyle::Angle
+        || options.compact_tables
+        || options.inline_data_media != InlineDataMedia::Keep
+}
+
+const fn feature_options_require_tier2(options: &ConversionOptions) -> bool {
+    let _ = options;
+    // ~keep Tier-1 does not fire visitor callbacks.
     #[cfg(feature = "visitor")]
     if options.visitor.is_some() {
-        return RouterDecision::Tier2;
+        return true;
     }
 
-    // ~keep TIER1-58: extract_metadata — see the doc block above ("supersedes
-    // ~keep the prior M5 decision"). `tier1::run` only produces the YAML
-    // ~keep frontmatter *text* embedded in `result.content`; it never builds the
-    // ~keep structured `HtmlMetadata` `convert_api.rs` returns as
-    // ~keep `result.metadata`, which stays `HtmlMetadata::default()` on every
-    // ~keep Tier-1 success path regardless of this option. Route to Tier-2
-    // ~keep whenever the caller asked for metadata and the struct exists.
+    // ~keep Tier-1 never builds the structured metadata result.
     #[cfg(feature = "metadata")]
     if options.extract_metadata {
-        return RouterDecision::Tier2;
+        return true;
     }
 
-    // ~keep extract_images: convert_api.rs hardcodes `images: Vec::new()` on the
-    // ~keep Tier-1 success path — it never builds an InlineImageCollector for that
-    // ~keep branch — so a caller requesting extracted inline images would silently
-    // ~keep get none. Gated behind the feature: without `inline-images` compiled in,
-    // ~keep both tiers ignore `extract_images` identically (see convert_api.rs
-    // ~keep `wants_images`), so there is nothing to diverge on.
+    // ~keep Tier-1 never builds the extracted-images result.
     #[cfg(feature = "inline-images")]
     if options.extract_images {
-        return RouterDecision::Tier2;
+        return true;
     }
-
-    RouterDecision::Tier1
+    false
 }

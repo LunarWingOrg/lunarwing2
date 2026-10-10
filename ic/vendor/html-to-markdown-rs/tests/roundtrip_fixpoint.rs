@@ -45,7 +45,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use html_to_markdown_rs::{ConversionOptions, NewlineStyle, convert};
+use html_to_markdown_rs::{ConversionOptions, NewlineStyle, PreprocessingOptions, convert};
 
 // ---------------------------------------------------------------------------
 // Corpus plumbing
@@ -468,7 +468,15 @@ fn content_preservation_holds_across_corpus() {
     let files = corpus_files();
     assert!(!files.is_empty(), "corpus must not be empty");
 
-    let options = base_options();
+    // ~keep Deliberate preprocessing removes navigation and other site chrome, so this oracle
+    // ~keep disables it to measure accidental converter loss rather than intentional cleanup.
+    let options = ConversionOptions {
+        preprocessing: PreprocessingOptions {
+            enabled: false,
+            ..PreprocessingOptions::default()
+        },
+        ..base_options()
+    };
     for path in &files {
         let relative = relative_fixture_path(path);
         let html = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {relative}: {e}"));

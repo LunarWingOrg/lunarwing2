@@ -1,6 +1,7 @@
 //! SVG and `MathML` element handling with serialization and base64 encoding.
 
 use crate::converter::main_helpers::{effective_max_depth, tag_name_eq};
+use crate::converter::media::MediaContext;
 use crate::converter::utility::content::normalized_tag_name;
 use crate::converter::utility::escaping::escape_link_label;
 use crate::converter::utility::serialization::escape_html_attribute_value;
@@ -221,17 +222,19 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
 ///
 /// Extracts title from child elements, handles inline image collection,
 /// and outputs either the title text (in inline mode) or a base64-encoded image.
-#[allow(clippy::too_many_arguments)]
 pub fn handle_svg(
     node_handle: &NodeHandle,
     tag: &tl::HTMLTag,
     parser: &Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    context: MediaContext<'_>,
 ) {
+    let MediaContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = context;
     use crate::converter::utility::content::get_text_content;
 
     let mut title = String::from("SVG Image");
@@ -297,17 +300,19 @@ pub fn handle_svg(
 /// Handle `MathML` element conversion to Markdown.
 ///
 /// Serializes `MathML` to HTML comment and outputs text content with escaping.
-#[allow(clippy::too_many_arguments)]
 pub fn handle_math(
     node_handle: &NodeHandle,
     tag: &tl::HTMLTag,
     parser: &Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    context: MediaContext<'_>,
 ) {
+    let MediaContext {
+        options,
+        ctx,
+        depth,
+        dom_ctx,
+    } = context;
     use crate::converter::utility::content::get_text_content;
     use crate::text;
 

@@ -1,5 +1,6 @@
 // ~keep Rust inner attributes below are crate-level attributes, not a shell shebang.
 #![allow(missing_docs)]
+#![cfg(feature = "testkit")]
 
 //! Regression tests for the text on the line after a hard break (issue #651): text that would
 //! interrupt the paragraph there is written as text.

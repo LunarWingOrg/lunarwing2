@@ -9,6 +9,7 @@
 
 use crate::converter::Context;
 use crate::converter::dom_context::DomContext;
+use crate::converter::inline::HandlerContext;
 use crate::converter::inline::wrapped::emit_code_span;
 use crate::converter::main::walk_node;
 use crate::converter::text::dedent_code_block;
@@ -76,107 +77,92 @@ fn min_safe_code_span_delimiter_length(content: &str) -> usize {
 /// - Handling backticks in content by using multiple delimiters
 /// - Invoking visitor callbacks when the visitor feature is enabled
 /// - Generating appropriate markdown output with proper escaping
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
-#[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-pub fn handle_code(
-    node_handle: &tl::NodeHandle,
-    tag: &tl::HTMLTag,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_code(tag: &tl::HTMLTag, mut handler: HandlerContext<'_>) {
     let code_ctx = Context {
         in_code: true,
-        ..ctx.clone()
+        ..handler.context.clone()
     };
-
-    if ctx.in_code {
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, output, options, &code_ctx, depth + 1, dom_ctx);
-            }
-        }
-    } else {
-        let mut content = String::with_capacity(32);
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                walk_node(
-                    child_handle,
-                    parser,
-                    &mut content,
-                    options,
-                    &code_ctx,
-                    depth + 1,
-                    dom_ctx,
-                );
-            }
-        }
-
-        let trimmed = &content;
-
-        // ~keep issue #481: an all-whitespace body is NOT an empty one. `<code> </code>` is a
-        // ~keep code span whose content is a space, and CommonMark spells that exactly --
-        // ~keep `format_inline_code`'s `all_spaces` branch pads with delimiter spaces so the
-        // ~keep span survives the spec's own stripping rule (spec example 138). Testing
-        // ~keep `trim()` here dropped the element outright and joined the words either side.
-        if !content.is_empty() {
-            #[cfg(feature = "visitor")]
-            let code_output = if let Some(ref visitor_handle) = ctx.visitor {
-                use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-                let node_id = node_handle.get_inner();
-                let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-                let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-                let node_ctx = NodeContext::with_lazy_attributes(
-                    NodeType::Code,
-                    Cow::Borrowed("code"),
-                    tag,
-                    depth,
-                    index_in_parent,
-                    parent_tag.map(Cow::Borrowed),
-                    true,
-                );
-
-                let visit_result = {
-                    let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                    visitor.visit_code_inline(&node_ctx, trimmed)
-                };
-                match visit_result {
-                    VisitResult::Continue => None,
-                    VisitResult::Custom(custom) => Some(custom),
-                    VisitResult::Skip => Some(String::new()),
-                    VisitResult::PreserveHtml => Some(serialize_node(node_handle, parser)),
-                    VisitResult::Error(err) => {
-                        if ctx.visitor_error.borrow().is_none() {
-                            *ctx.visitor_error.borrow_mut() = Some(err);
-                        }
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            #[cfg(feature = "visitor")]
-            if let Some(custom_output) = code_output {
-                output.push_str(&custom_output);
-            } else {
-                emit_inline_code(trimmed, output, options, node_handle, parser, dom_ctx);
-            }
-
-            #[cfg(not(feature = "visitor"))]
-            {
-                emit_inline_code(trimmed, output, options, node_handle, parser, dom_ctx);
-            }
-        }
+    if handler.context.in_code {
+        walk_children_to_output(tag, &code_ctx, &mut handler);
+        return;
     }
+    let mut content = String::with_capacity(32);
+    walk_children(tag, &mut content, &code_ctx, &handler);
+    // ~keep An all-whitespace body is a real code span, not an empty element (#481).
+    if content.is_empty() {
+        return;
+    }
+
+    #[cfg(feature = "visitor")]
+    if let Some(custom_output) = visit_inline_code(tag, &content, &handler) {
+        handler.output.push_str(&custom_output);
+        return;
+    }
+    emit_inline_code(
+        &content,
+        handler.output,
+        handler.options,
+        handler.node_handle,
+        handler.parser,
+        handler.dom_context,
+    );
+}
+
+fn walk_children_to_output(tag: &tl::HTMLTag<'_>, context: &Context, handler: &mut HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        walk_node(
+            child_handle,
+            handler.parser,
+            handler.output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
+    }
+}
+
+fn walk_children(tag: &tl::HTMLTag<'_>, output: &mut String, context: &Context, handler: &HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        walk_node(
+            child_handle,
+            handler.parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn visit_inline_code(tag: &tl::HTMLTag<'_>, content: &str, handler: &HandlerContext<'_>) -> Option<String> {
+    use crate::visitor::{NodeContext, NodeType};
+
+    let visitor_handle = handler.context.visitor.as_ref()?;
+    let node_id = handler.node_handle.get_inner();
+    let node_context = NodeContext::with_lazy_attributes(
+        NodeType::Code,
+        Cow::Borrowed("code"),
+        tag,
+        handler.depth,
+        handler.dom_context.get_sibling_index(node_id).unwrap_or(0),
+        handler
+            .dom_context
+            .parent_tag_name(node_id, handler.parser)
+            .map(Cow::Borrowed),
+        true,
+    );
+    let result = visitor_handle
+        .lock()
+        .expect("visitor mutex poisoned")
+        .visit_code_inline(&node_context, content);
+    visitor_output(result, handler)
 }
 
 /// Render a `<code>` element's content as one or more backtick spans, then emit through the
@@ -200,7 +186,7 @@ fn emit_inline_code(
     parser: &tl::Parser,
     dom_ctx: &DomContext,
 ) {
-    let separator = crate::converter::main_helpers::hard_break_marker(options.newline_style);
+    let separator = crate::converter::main_helpers::hard_break_marker(options);
     let mut first = true;
     for segment in content.split('\n').filter(|segment| !segment.is_empty()) {
         if first {
@@ -228,170 +214,151 @@ fn emit_inline_code(
 /// - Supporting multiple code block styles (indented, backticks, tildes)
 /// - Invoking visitor callbacks when the visitor feature is enabled
 /// - Generating appropriate markdown output
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
-#[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-pub fn handle_pre(
-    node_handle: &tl::NodeHandle,
-    tag: &tl::HTMLTag,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle_pre(tag: &tl::HTMLTag, handler: HandlerContext<'_>) {
+    let cell_break_offsets = (handler.context.in_table_cell && handler.options.br_in_tables)
+        .then(|| std::rc::Rc::new(std::cell::RefCell::new(Vec::new())));
     let code_ctx = Context {
         in_code: true,
         in_code_block: true,
-        ..ctx.clone()
+        pre_cell_break_offsets: cell_break_offsets.clone(),
+        ..handler.context.clone()
     };
-
-    #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-    let language: Option<String> = {
-        let mut lang: Option<String> = None;
-
-        if let Some(class_attr) = tag.attributes().get("class") {
-            if let Some(class_bytes) = class_attr {
-                let class_str = crate::text::decode_attribute_value_cow(&class_bytes.as_utf8_str()).into_owned();
-                for cls in class_str.split_whitespace() {
-                    if let Some(stripped) = cls.strip_prefix("language-") {
-                        lang = Some(String::from(stripped));
-                        break;
-                    } else if let Some(stripped) = cls.strip_prefix("lang-") {
-                        lang = Some(String::from(stripped));
-                        break;
-                    }
-                }
-            }
-        }
-
-        if lang.is_none() {
-            let children = tag.children();
-            for child_handle in children.top().iter() {
-                if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                    if child_tag.name() == "code" {
-                        if let Some(class_attr) = child_tag.attributes().get("class") {
-                            if let Some(class_bytes) = class_attr {
-                                let class_str =
-                                    crate::text::decode_attribute_value_cow(&class_bytes.as_utf8_str()).into_owned();
-                                for cls in class_str.split_whitespace() {
-                                    if let Some(stripped) = cls.strip_prefix("language-") {
-                                        lang = Some(String::from(stripped));
-                                        break;
-                                    } else if let Some(stripped) = cls.strip_prefix("lang-") {
-                                        lang = Some(String::from(stripped));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        lang
-    };
-
+    let language = detect_language(tag, handler.parser);
     let mut content = String::with_capacity(256);
-    let children = tag.children();
-    {
-        for child_handle in children.top().iter() {
-            walk_node(
-                child_handle,
-                parser,
-                &mut content,
-                options,
-                &code_ctx,
-                depth + 1,
-                dom_ctx,
-            );
-        }
+    walk_children(tag, &mut content, &code_ctx, &handler);
+    if content.is_empty() {
+        return;
     }
 
-    if !content.is_empty() {
-        let leading_newlines = content.chars().take_while(|&c| c == '\n').count();
-        let trailing_newlines = content.chars().rev().take_while(|&c| c == '\n').count();
-        let core = content.trim_matches('\n');
-        let is_whitespace_only = core.trim().is_empty();
+    let offsets = cell_break_offsets
+        .as_ref()
+        .map(|offsets| offsets.borrow().clone())
+        .unwrap_or_default();
+    let segmented = (!offsets.is_empty()).then(|| content.clone());
+    let processed = process_pre_content(content, handler.options.whitespace_mode);
+    #[cfg(feature = "visitor")]
+    if let Some(custom_output) = visit_code_block(tag, language.as_deref(), &processed, &handler) {
+        handler.output.push_str(&custom_output);
+    } else {
+        format_code_block(
+            segmented.as_deref().unwrap_or(&processed),
+            &offsets,
+            language.as_deref(),
+            handler.output,
+            handler.options,
+            handler.context,
+        );
+    }
+    #[cfg(not(feature = "visitor"))]
+    format_code_block(
+        segmented.as_deref().unwrap_or(&processed),
+        &offsets,
+        language.as_deref(),
+        handler.output,
+        handler.options,
+        handler.context,
+    );
+    if let Some(ref collector) = handler.context.structure_collector {
+        collector.borrow_mut().push_code(&processed, language.as_deref());
+    }
+}
 
-        let processed_content = if options.whitespace_mode == crate::options::WhitespaceMode::Strict {
-            content
-        } else {
-            let mut core_text = dedent_code_block(core);
-
-            if is_whitespace_only {
-                let mut rebuilt = String::new();
-                for _ in 0..leading_newlines {
-                    rebuilt.push('\n');
-                }
-                rebuilt.push_str(&core_text);
-                for _ in 0..trailing_newlines {
-                    rebuilt.push('\n');
-                }
-                rebuilt
-            } else {
-                for _ in 0..trailing_newlines {
-                    core_text.push('\n');
-                }
-                core_text
-            }
-        };
-
-        #[cfg(feature = "visitor")]
-        let code_block_output = if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Pre,
-                Cow::Borrowed("pre"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                false,
-            );
-
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_code_block(&node_ctx, language.as_deref(), &processed_content)
+fn detect_language(tag: &tl::HTMLTag<'_>, parser: &tl::Parser<'_>) -> Option<String> {
+    language_from_class(tag).or_else(|| {
+        tag.children().top().iter().find_map(|child_handle| {
+            let tl::Node::Tag(child_tag) = child_handle.get(parser)? else {
+                return None;
             };
-            match visit_result {
-                VisitResult::Continue => None,
-                VisitResult::Custom(custom) => Some(custom),
-                VisitResult::Skip => Some(String::new()),
-                VisitResult::PreserveHtml => Some(serialize_node(node_handle, parser)),
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    None
-                }
+            (child_tag.name() == "code")
+                .then(|| language_from_class(child_tag))
+                .flatten()
+        })
+    })
+}
+
+fn language_from_class(tag: &tl::HTMLTag<'_>) -> Option<String> {
+    let classes = tag.attributes().get("class")??;
+    let class_text = classes.as_utf8_str();
+    let classes = crate::text::decode_attribute_value_cow(&class_text);
+    classes.split_whitespace().find_map(|class| {
+        class
+            .strip_prefix("language-")
+            .or_else(|| class.strip_prefix("lang-"))
+            .map(str::to_string)
+    })
+}
+
+fn process_pre_content(content: String, whitespace_mode: crate::options::WhitespaceMode) -> String {
+    if whitespace_mode == crate::options::WhitespaceMode::Strict {
+        return content;
+    }
+    let leading_newlines = content.chars().take_while(|&character| character == '\n').count();
+    let trailing_newlines = content.chars().rev().take_while(|&character| character == '\n').count();
+    let core = content.trim_matches('\n');
+    let mut processed = dedent_code_block(core);
+    if core.trim().is_empty() {
+        processed.insert_str(0, &"\n".repeat(leading_newlines));
+    }
+    processed.push_str(&"\n".repeat(trailing_newlines));
+    processed
+}
+
+#[cfg(feature = "visitor")]
+fn visit_code_block(
+    tag: &tl::HTMLTag<'_>,
+    language: Option<&str>,
+    content: &str,
+    handler: &HandlerContext<'_>,
+) -> Option<String> {
+    use crate::visitor::{NodeContext, NodeType};
+
+    let visitor_handle = handler.context.visitor.as_ref()?;
+    let node_id = handler.node_handle.get_inner();
+    let node_context = NodeContext::with_lazy_attributes(
+        NodeType::Pre,
+        Cow::Borrowed("pre"),
+        tag,
+        handler.depth,
+        handler.dom_context.get_sibling_index(node_id).unwrap_or(0),
+        handler
+            .dom_context
+            .parent_tag_name(node_id, handler.parser)
+            .map(Cow::Borrowed),
+        false,
+    );
+    let result =
+        visitor_handle
+            .lock()
+            .expect("visitor mutex poisoned")
+            .visit_code_block(&node_context, language, content);
+    visitor_output(result, handler)
+}
+
+#[cfg(feature = "visitor")]
+fn visitor_output(result: crate::visitor::VisitResult, handler: &HandlerContext<'_>) -> Option<String> {
+    use crate::visitor::VisitResult;
+
+    match result {
+        VisitResult::Continue => None,
+        VisitResult::Custom(custom) => {
+            crate::converter::structure_capture::replace_element(handler.context, Some(&custom));
+            Some(custom)
+        }
+        VisitResult::Skip => {
+            crate::converter::structure_capture::replace_element(handler.context, None);
+            Some(String::new())
+        }
+        VisitResult::PreserveHtml => {
+            let html = serialize_node(handler.node_handle, handler.parser);
+            crate::converter::structure_capture::replace_element(handler.context, Some(&html));
+            Some(html)
+        }
+        VisitResult::Error(error) => {
+            crate::converter::structure_capture::replace_element(handler.context, None);
+            if handler.context.visitor_error.borrow().is_none() {
+                *handler.context.visitor_error.borrow_mut() = Some(error);
             }
-        } else {
             None
-        };
-
-        #[cfg(feature = "visitor")]
-        if let Some(custom_output) = code_block_output {
-            output.push_str(&custom_output);
-        } else {
-            format_code_block(&processed_content, language.as_deref(), output, options, ctx);
-        }
-
-        #[cfg(not(feature = "visitor"))]
-        {
-            format_code_block(&processed_content, language.as_deref(), output, options, ctx);
-        }
-
-        if let Some(ref sc) = ctx.structure_collector {
-            sc.borrow_mut().push_code(&processed_content, language.as_deref());
         }
     }
 }
@@ -402,7 +369,7 @@ pub fn handle_pre(
 /// - Single backticks for normal content
 /// - Double backticks when content contains backticks
 /// - Space padding when needed to avoid backtick adjacency
-fn format_inline_code(content: &str, output: &mut String) {
+pub(in crate::converter) fn format_inline_code(content: &str, output: &mut String) {
     let contains_backtick = content.contains('`');
 
     let needs_delimiter_spaces = {
@@ -448,6 +415,7 @@ fn format_inline_code(content: &str, output: &mut String) {
 /// - Fenced style with tildes (~~~language)
 fn format_code_block(
     content: &str,
+    cell_break_offsets: &[usize],
     language: Option<&str>,
     output: &mut String,
     options: &ConversionOptions,
@@ -462,11 +430,17 @@ fn format_code_block(
         // ~keep shedding their markers in a cell. Line breaks fold to a space rather than to
         // ~keep `<br>` so that the two tiers stay byte-equal. The cell break separates the block
         // ~keep from the cell content before it (issue #645).
-        let content = content.trim_matches('\n');
-        if !content.is_empty() && !ctx.convert_as_inline && !ctx.in_code {
+        let trimmed_content = content.trim_matches('\n');
+        if !trimmed_content.is_empty() && !ctx.convert_as_inline && !ctx.in_code {
             crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
         }
-        output.push_str(crate::text::fold_cell_line_breaks_verbatim_cow(content).as_ref());
+        format_preformatted_cell_content(
+            content,
+            cell_break_offsets,
+            output,
+            options.br_in_tables,
+            options.whitespace_mode == crate::options::WhitespaceMode::Strict,
+        );
         return;
     }
 
@@ -475,63 +449,143 @@ fn format_code_block(
         return;
     }
 
+    separate_code_block(output, ctx);
     match options.code_block_style {
-        crate::options::CodeBlockStyle::Indented => {
-            if !ctx.convert_as_inline && !output.is_empty() && !output.ends_with("\n\n") {
-                if output.ends_with('\n') {
-                    output.push('\n');
-                } else {
-                    output.push_str("\n\n");
-                }
-            }
-
-            let indented = content
-                .lines()
-                .map(|line| {
-                    if line.is_empty() {
-                        String::new()
-                    } else {
-                        format!("    {line}")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            output.push_str(&indented);
-
-            output.push_str("\n\n");
-        }
+        crate::options::CodeBlockStyle::Indented => format_indented_code_block(content, output),
         crate::options::CodeBlockStyle::Backticks | crate::options::CodeBlockStyle::Tildes => {
-            if !ctx.convert_as_inline && !output.is_empty() && !output.ends_with("\n\n") {
-                if output.ends_with('\n') {
-                    output.push('\n');
-                } else {
-                    output.push_str("\n\n");
+            format_fenced_code_block(content, language, output, options);
+        }
+    }
+}
+
+fn separate_code_block(output: &mut String, context: &Context) {
+    if context.convert_as_inline || output.is_empty() || output.ends_with("\n\n") {
+        return;
+    }
+    if output.ends_with('\n') {
+        output.push('\n');
+    } else {
+        output.push_str("\n\n");
+    }
+}
+
+fn format_indented_code_block(content: &str, output: &mut String) {
+    let indented = content
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("    {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    output.push_str(&indented);
+    output.push_str("\n\n");
+}
+
+fn format_fenced_code_block(content: &str, language: Option<&str>, output: &mut String, options: &ConversionOptions) {
+    let fence_char = if options.code_block_style == crate::options::CodeBlockStyle::Backticks {
+        '`'
+    } else {
+        '~'
+    };
+    // ~keep A fence must exceed the longest matching run in the content (CommonMark 4.5).
+    let fence_length = (longest_consecutive_run(content, fence_char) + 1).max(MIN_FENCE_LENGTH);
+    let fence: String = std::iter::repeat_n(fence_char, fence_length).collect();
+    output.push_str(&fence);
+    if let Some(language) = language {
+        output.push_str(language);
+    } else if !options.code_language.is_empty() {
+        output.push_str(&options.code_language);
+    }
+    output.push('\n');
+    output.push_str(content.trim_end_matches('\n'));
+    output.push('\n');
+    output.push_str(&fence);
+    output.push_str("\n\n");
+}
+
+/// Render preformatted table-cell content as code spans, keeping real `<br>` nodes outside. ~keep
+pub(in crate::converter) fn format_preformatted_cell_content(
+    content: &str,
+    break_offsets: &[usize],
+    output: &mut String,
+    br_in_tables: bool,
+    preserve_whitespace: bool,
+) {
+    if !br_in_tables || break_offsets.is_empty() {
+        let normalized = normalize_preformatted_cell_segment(content, preserve_whitespace);
+        let folded = crate::text::fold_cell_line_breaks_verbatim_cow(&normalized);
+        if !folded.is_empty() {
+            format_inline_code(folded.as_ref(), output);
+        }
+        return;
+    }
+
+    let (normalized, break_offsets) = normalize_preformatted_cell_content(content, break_offsets, preserve_whitespace);
+    let mut start = 0;
+    let mut wrote_segment = false;
+    let mut pending_breaks = 0;
+    for offset in break_offsets {
+        if offset < start || !normalized.is_char_boundary(offset) {
+            continue;
+        }
+        let segment = crate::text::fold_cell_line_breaks_verbatim_cow(&normalized[start..offset]);
+        if !segment.is_empty() {
+            if wrote_segment {
+                for _ in 0..pending_breaks {
+                    output.push_str("<br>");
                 }
             }
-
-            let fence_char = if options.code_block_style == crate::options::CodeBlockStyle::Backticks {
-                '`'
-            } else {
-                '~'
-            };
-            // ~keep the fence must be strictly longer than the longest run of the fence
-            // ~keep character inside the content, otherwise the fence terminates early
-            // ~keep and corrupts the rest of the document (CommonMark 4.5).
-            let fence_length = (longest_consecutive_run(content, fence_char) + 1).max(MIN_FENCE_LENGTH);
-            let fence: String = std::iter::repeat_n(fence_char, fence_length).collect();
-
-            output.push_str(&fence);
-            if let Some(lang) = language {
-                output.push_str(lang);
-            } else if !options.code_language.is_empty() {
-                output.push_str(&options.code_language);
-            }
-            output.push('\n');
-            output.push_str(content.trim_end_matches('\n'));
-            output.push('\n');
-            output.push_str(&fence);
-            output.push_str("\n\n");
+            format_inline_code(segment.as_ref(), output);
+            wrote_segment = true;
+            pending_breaks = 0;
         }
+        pending_breaks += 1;
+        start = offset + 1;
+    }
+    let segment = crate::text::fold_cell_line_breaks_verbatim_cow(&normalized[start..]);
+    if !segment.is_empty() {
+        if wrote_segment {
+            for _ in 0..pending_breaks {
+                output.push_str("<br>");
+            }
+        }
+        format_inline_code(segment.as_ref(), output);
+    }
+}
+
+fn normalize_preformatted_cell_content(
+    content: &str,
+    break_offsets: &[usize],
+    preserve_whitespace: bool,
+) -> (String, Vec<usize>) {
+    let core = content.trim_matches('\n');
+    let core_start = content.len() - content.trim_start_matches('\n').len();
+    let normalized = if preserve_whitespace {
+        core.to_string()
+    } else {
+        dedent_code_block(core)
+    };
+    let newline_offsets: Vec<usize> = normalized.match_indices('\n').map(|(offset, _)| offset).collect();
+    let normalized_break_offsets = break_offsets
+        .iter()
+        .filter_map(|&offset| offset.checked_sub(core_start))
+        .filter(|&offset| offset < core.len() && core.as_bytes().get(offset) == Some(&b'\n'))
+        .map(|offset| core[..offset].bytes().filter(|&byte| byte == b'\n').count())
+        .filter_map(|ordinal| newline_offsets.get(ordinal).copied())
+        .collect();
+    (normalized, normalized_break_offsets)
+}
+
+fn normalize_preformatted_cell_segment(content: &str, preserve_whitespace: bool) -> String {
+    let content = content.trim_matches('\n');
+    if preserve_whitespace {
+        content.to_string()
+    } else {
+        dedent_code_block(content)
     }
 }
 
@@ -562,7 +616,7 @@ fn format_code_block_in_list_item(
         in_list_item: false,
         ..ctx.clone()
     };
-    format_code_block(content, language, &mut rendered, options, &plain_ctx);
+    format_code_block(content, &[], language, &mut rendered, options, &plain_ctx);
 
     // ~keep A plain suffix check like `output.ends_with("* ")` also matches the closing
     // ~keep "**"/"*" of `<strong>`/`<em>` immediately followed by a migrated trailing
