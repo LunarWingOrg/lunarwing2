@@ -652,7 +652,8 @@ that are needed before the DB is connected):
 - `DATABASE_BACKEND` (always)
 - `DATABASE_URL` (if postgres)
 - `LIBSQL_PATH` (if libsql)
-- `LIBSQL_URL` (if turso sync)
+- `LIBSQL_URL` (if turso sync — only offered/tested in builds with the
+  non-default `libsql-remote-replica` cargo feature; WI#331)
 - `SECRETS_MASTER_KEY` (if env key source selected in Step 2)
 - `ONBOARD_COMPLETED` (always, "true")
 - Channel/sandbox vars: `CLAUDE_CODE_ENABLED`, `SIGNAL_HTTP_URL`, `SIGNAL_ACCOUNT`, etc. (channel init may precede DB)

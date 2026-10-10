@@ -694,9 +694,16 @@ impl SetupWizard {
             print_info("Which database backend would you like to use?");
             println!();
 
+            // Turso cloud sync requires the non-default `libsql-remote-replica`
+            // cargo feature (WI#331); only advertise it when compiled in.
+            let libsql_desc = if cfg!(feature = "libsql-remote-replica") {
+                "libSQL      - embedded SQLite, zero dependencies, optional Turso cloud sync"
+            } else {
+                "libSQL      - embedded SQLite, zero dependencies"
+            };
             let options = &[
                 "PostgreSQL  - production-grade, requires a running server",
-                "libSQL      - embedded SQLite, zero dependencies, optional Turso cloud sync",
+                libsql_desc,
             ];
             let choice =
                 select_one("Select a database backend:", options).map_err(SetupError::Io)?;
@@ -845,10 +852,16 @@ impl SetupWizard {
 
         let db_path = path_input.unwrap_or(default_path_str.clone());
 
-        // Ask about Turso cloud sync
-        println!();
-        let use_turso =
-            confirm("Enable Turso cloud sync (remote replica)?", false).map_err(SetupError::Io)?;
+        // Ask about Turso cloud sync. Remote replicas require the
+        // non-default `libsql-remote-replica` cargo feature (WI#331), so the
+        // prompt is skipped entirely in builds without it.
+        #[cfg(feature = "libsql-remote-replica")]
+        let use_turso = {
+            println!();
+            confirm("Enable Turso cloud sync (remote replica)?", false).map_err(SetupError::Io)?
+        };
+        #[cfg(not(feature = "libsql-remote-replica"))]
+        let use_turso = false;
 
         let (turso_url, turso_token) = if use_turso {
             print_info("Enter your Turso database URL and auth token.");
@@ -980,9 +993,21 @@ impl SetupWizard {
         let db_path = Path::new(path);
 
         let backend = if let (Some(url), Some(token)) = (turso_url, turso_token) {
-            LibSqlBackend::new_remote_replica(db_path, url, token)
-                .await
-                .map_err(|e| SetupError::Database(format!("Failed to connect: {}", e)))?
+            #[cfg(feature = "libsql-remote-replica")]
+            {
+                LibSqlBackend::new_remote_replica(db_path, url, token)
+                    .await
+                    .map_err(|e| SetupError::Database(format!("Failed to connect: {}", e)))?
+            }
+            #[cfg(not(feature = "libsql-remote-replica"))]
+            {
+                let _ = (url, token);
+                return Err(SetupError::Database(
+                    "libSQL remote replicas (Turso sync) are disabled in this build; rebuild \
+                     with the cargo feature `libsql-remote-replica` or unset LIBSQL_URL (WI#331)"
+                        .to_string(),
+                ));
+            }
         } else {
             LibSqlBackend::new_local(db_path)
                 .await
