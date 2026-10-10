@@ -25,6 +25,7 @@ use crate::bootstrap::lunarwing_base_dir;
 use crate::db::Database;
 use crate::error::OrchestratorError;
 use crate::orchestrator::auth::{CredentialGrant, McpCredentialGrant, TokenStore};
+use crate::orchestrator::harness;
 use crate::sandbox::connect_docker;
 use crate::secrets::SecretsStore;
 use crate::tools::mcp::config::{McpServerConfig, McpServersFile, McpTransportConfig};
@@ -38,6 +39,9 @@ const MCP_SECRET_MARKER: &str = "worker-grant";
 pub enum JobMode {
     /// Standard LunarWing worker with proxied LLM calls.
     Worker,
+    /// LunarWing worker with harness capabilities (WI#326): tmpfs secret
+    /// mounts, read-only workspace injection, staged write-back.
+    Harness,
     /// Delegates to a named external worker (persistent container speaking lunarwing-agent-v1).
     External(String),
 }
@@ -46,6 +50,7 @@ impl JobMode {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Worker => "worker",
+            Self::Harness => "harness",
             Self::External(name) => name.as_str(),
         }
     }
@@ -57,6 +62,7 @@ impl JobMode {
     pub fn db_value(&self) -> String {
         match self {
             Self::Worker => "worker".to_string(),
+            Self::Harness => "harness".to_string(),
             Self::External(name) => format!("external:{name}"),
         }
     }
@@ -64,6 +70,8 @@ impl JobMode {
     pub fn from_db_value(s: &str) -> Self {
         if s == "worker" {
             Self::Worker
+        } else if s == "harness" {
+            Self::Harness
         } else if let Some(name) = s.strip_prefix("external:") {
             Self::External(name.to_string())
         } else {
@@ -76,6 +84,7 @@ impl std::fmt::Display for JobMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Worker => write!(f, "worker"),
+            Self::Harness => write!(f, "harness"),
             Self::External(name) => write!(f, "external:{name}"),
         }
     }
@@ -144,8 +153,22 @@ pub struct ContainerHandle {
     pub worker_iteration: u32,
     /// Completion result from the worker (set when the worker reports done).
     pub completion_result: Option<CompletionResult>,
+    /// Harness capability state (WI#326); `Some` only for harness-mode jobs.
+    pub harness: Option<HarnessJobState>,
     // NOTE: auth_token is intentionally NOT in this struct.
     // It lives only in the TokenStore (never logged, serialized, or persisted).
+}
+
+/// Harness state tracked on a job handle: where staged writes land and what
+/// the promotion pipeline did with them.
+#[derive(Debug, Clone)]
+pub struct HarnessJobState {
+    /// Host staging dir mounted RW at `/harness/workspace_out`.
+    pub staging_dir: Option<PathBuf>,
+    /// Active write-back policy (None = no write-back for this job).
+    pub write_back: Option<harness::WriteBackPolicy>,
+    /// Promotion outcome, filled by `complete_job` after the container stops.
+    pub promotion: Option<harness::PromotionSummary>,
 }
 
 /// Fully bound request for one core Docker worker container.
@@ -159,6 +182,21 @@ pub struct ContainerJobRequest {
     pub mcp_servers: Vec<McpServerConfig>,
     pub mcp_credential_grants: Vec<McpCredentialGrant>,
     pub max_iterations: u32,
+    /// Harness capabilities (WI#326); must be `Some` when mode is Harness.
+    pub harness: Option<HarnessJobRequest>,
+}
+
+/// Prepared harness inputs for one job. Secret values are resolved host-side
+/// and travel only into the tmpfs archive; they are never logged or stored.
+pub struct HarnessJobRequest {
+    /// Secret files to mount under the tmpfs secrets dir.
+    pub resolved_secrets: Vec<harness::ResolvedSecretFile>,
+    /// Prepared injection dir (files + PROVENANCE.json), mounted read-only.
+    pub injection_dir: Option<PathBuf>,
+    /// Write-back policy; presence enables the writable staging mount.
+    pub write_back: Option<harness::WriteBackPolicy>,
+    /// Host staging dir for write-back (created by the caller).
+    pub staging_dir: Option<PathBuf>,
 }
 
 /// Load and sanitize job-worker MCP configuration for one owner.
@@ -420,7 +458,7 @@ fn validate_worker_mcp_request(
     if servers.is_empty() && grants.is_empty() {
         return Ok(());
     }
-    if mode != &JobMode::Worker {
+    if mode.is_external() {
         return Err(invalid(
             "MCP snapshots are supported only by core Docker workers".to_string(),
         ));
@@ -508,6 +546,10 @@ pub struct ContainerJobManager {
     >,
     /// Direct handle to ContextManager for force-completing abandoned jobs.
     context_manager: Option<Arc<crate::context::ContextManager>>,
+    /// Workspace resolver for harness write-back promotion (WI#326).
+    write_back_workspace: Option<Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>>,
+    /// DB handle for the write-back promotion audit event.
+    store: Option<Arc<dyn Database>>,
 }
 
 impl ContainerJobManager {
@@ -519,6 +561,8 @@ impl ContainerJobManager {
             docker: Arc::new(RwLock::new(None)),
             job_event_tx: None,
             context_manager: None,
+            write_back_workspace: None,
+            store: None,
         }
     }
 
@@ -533,6 +577,18 @@ impl ContainerJobManager {
     ) -> Self {
         self.job_event_tx = Some(event_tx);
         self.context_manager = Some(context_manager);
+        self
+    }
+
+    /// Inject write-back promotion dependencies (WI#326). Without a resolver,
+    /// staged writes are never promoted and the job result reports why.
+    pub fn with_write_back_deps(
+        mut self,
+        resolver: Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>,
+        store: Option<Arc<dyn Database>>,
+    ) -> Self {
+        self.write_back_workspace = Some(resolver);
+        self.store = store;
         self
     }
 
@@ -573,8 +629,21 @@ impl ContainerJobManager {
             mcp_servers,
             mcp_credential_grants,
             max_iterations,
+            harness,
         } = request;
         let watcher_owner_id = owner_id.clone();
+        if mode == JobMode::Harness && harness.is_none() {
+            return Err(OrchestratorError::ContainerCreationFailed {
+                job_id,
+                reason: "harness mode requires harness options".to_string(),
+            });
+        }
+        if mode != JobMode::Harness && harness.is_some() {
+            return Err(OrchestratorError::ContainerCreationFailed {
+                job_id,
+                reason: "harness options require harness mode".to_string(),
+            });
+        }
         validate_worker_mcp_request(
             job_id,
             &mode,
@@ -608,6 +677,11 @@ impl ContainerJobManager {
             last_worker_status: None,
             worker_iteration: 0,
             completion_result: None,
+            harness: harness.as_ref().map(|req| HarnessJobState {
+                staging_dir: req.staging_dir.clone(),
+                write_back: req.write_back.clone(),
+                promotion: None,
+            }),
         };
         self.containers.write().await.insert(job_id, handle);
 
@@ -621,6 +695,7 @@ impl ContainerJobManager {
                 max_iterations,
                 require_worker_mcp,
                 watcher_owner_id,
+                harness,
             )
             .await
         {
@@ -628,12 +703,14 @@ impl ContainerJobManager {
             Err(e) => {
                 self.token_store.revoke(job_id).await;
                 self.containers.write().await.remove(&job_id);
+                harness::cleanup_harness_job_dir(job_id);
                 Err(e)
             }
         }
     }
 
     /// Inner implementation of container creation (separated for cleanup).
+    #[allow(clippy::too_many_arguments)]
     async fn create_job_inner(
         &self,
         job_id: Uuid,
@@ -642,6 +719,7 @@ impl ContainerJobManager {
         max_iterations: u32,
         require_worker_mcp: bool,
         watcher_owner_id: String,
+        harness: Option<HarnessJobRequest>,
     ) -> Result<(), OrchestratorError> {
         // Connect to Docker (reuses cached connection)
         let docker = self.docker().await?;
@@ -680,11 +758,71 @@ impl ContainerJobManager {
             env_vec.push("IRONCLAW_WORKSPACE=/workspace".to_string());
         }
 
+        // WI#326 harness mounts: read-only injection, RW write-back staging.
+        // Both live under ~/.lunarwing/projects/.harness/<job_id>/ so the
+        // standard bind-mount validation applies.
+        if let Some(ref harness_req) = harness {
+            env_vec.push("LUNARWING_HARNESS_MODE=1".to_string());
+            if let Some(ref injection_dir) = harness_req.injection_dir {
+                let canonical = validate_bind_mount_path(injection_dir, job_id)?;
+                binds.push(format!(
+                    "{}:{}:ro",
+                    canonical.display(),
+                    harness::HARNESS_INJECTION_CONTAINER_DIR
+                ));
+                env_vec.push(format!(
+                    "LUNARWING_INJECTED_DIR={}",
+                    harness::HARNESS_INJECTION_CONTAINER_DIR
+                ));
+            }
+            if harness_req.write_back.is_some()
+                && let Some(ref staging_dir) = harness_req.staging_dir
+            {
+                let canonical = validate_bind_mount_path(staging_dir, job_id)?;
+                binds.push(format!(
+                    "{}:{}:rw",
+                    canonical.display(),
+                    harness::HARNESS_WRITE_BACK_CONTAINER_DIR
+                ));
+                env_vec.push(format!(
+                    "LUNARWING_WRITE_BACK_DIR={}",
+                    harness::HARNESS_WRITE_BACK_CONTAINER_DIR
+                ));
+            }
+            if !harness_req.resolved_secrets.is_empty() {
+                env_vec.push(format!(
+                    "LUNARWING_SECRETS_DIR={}",
+                    harness::HARNESS_SECRETS_CONTAINER_DIR
+                ));
+            }
+        }
+
         let memory_mb = self.config.memory_limit_mb;
 
         // Create the container
         use bollard::container::{Config, CreateContainerOptions};
         use bollard::models::HostConfig;
+
+        let has_harness_secrets = harness
+            .as_ref()
+            .is_some_and(|req| !req.resolved_secrets.is_empty());
+        let tmpfs_mounts: HashMap<String, String> = if has_harness_secrets {
+            // Docker-secrets pattern: tmpfs is volatile, noexec, and owned by
+            // the worker uid so only the job process can read secret files.
+            [
+                ("/tmp".to_string(), "size=512M".to_string()),
+                (
+                    harness::HARNESS_SECRETS_CONTAINER_DIR.to_string(),
+                    "size=4M,mode=0700,uid=1000,gid=1000,noexec,nosuid".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect()
+        } else {
+            [("/tmp".to_string(), "size=512M".to_string())]
+                .into_iter()
+                .collect()
+        };
 
         let host_config = HostConfig {
             binds: if binds.is_empty() { None } else { Some(binds) },
@@ -695,11 +833,7 @@ impl ContainerJobManager {
             cap_drop: Some(vec!["ALL".to_string()]),
             cap_add: Some(vec!["CHOWN".to_string()]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            tmpfs: Some(
-                [("/tmp".to_string(), "size=512M".to_string())]
-                    .into_iter()
-                    .collect(),
-            ),
+            tmpfs: Some(tmpfs_mounts),
             ..Default::default()
         };
 
@@ -753,6 +887,48 @@ impl ContainerJobManager {
                 job_id,
                 reason: format!("failed to start container: {}", e),
             })?;
+
+        // WI#326: deliver worker-scoped secrets into the tmpfs mount. This
+        // must happen after start (tmpfs exists only at runtime) and before
+        // the worker reads /run/secrets. On failure the container is removed
+        // so a job never runs without its full secret set.
+        if let Some(ref harness_req) = harness
+            && !harness_req.resolved_secrets.is_empty()
+        {
+            let upload = harness::build_secrets_tar(&harness_req.resolved_secrets).map_err(|e| {
+                OrchestratorError::ContainerCreationFailed {
+                    job_id,
+                    reason: format!("failed to build secrets archive: {e}"),
+                }
+            })?;
+            let options = bollard::container::UploadToContainerOptions {
+                path: harness::HARNESS_SECRETS_CONTAINER_DIR.to_string(),
+                ..Default::default()
+            };
+            if let Err(e) = docker
+                .upload_to_container(&container_id, Some(options), upload.into())
+                .await
+            {
+                let _ = docker
+                    .remove_container(
+                        &container_id,
+                        Some(bollard::container::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(OrchestratorError::ContainerCreationFailed {
+                    job_id,
+                    reason: format!("failed to mount harness secrets: {e}"),
+                });
+            }
+            tracing::info!(
+                job_id = %job_id,
+                count = harness_req.resolved_secrets.len(),
+                "Mounted harness secret files on tmpfs"
+            );
+        }
 
         // Clone container_id before moving it into the handle.
         let watcher_container_id = container_id.clone();
@@ -992,13 +1168,118 @@ impl ContainerJobManager {
         }
         self.token_store.revoke(job_id).await;
 
+        // WI#326: promote staged write-back files into tenant memory after the
+        // container is gone but before the result is read. Promotion failures
+        // never fail the job; they are recorded on the handle and in the job
+        // event audit trail.
+        let harness_state = self
+            .containers
+            .read()
+            .await
+            .get(&job_id)
+            .and_then(|handle| handle.harness.clone());
+        if let Some(state) = harness_state
+            && let (Some(policy), Some(staging), Some(owner)) = (
+                state.write_back,
+                state.staging_dir,
+                self.containers
+                    .read()
+                    .await
+                    .get(&job_id)
+                    .map(|h| h.owner_id.clone()),
+            )
+        {
+            let summary = self
+                .promote_write_back(job_id, &owner, &staging, &policy)
+                .await;
+            if let Some(handle) = self.containers.write().await.get_mut(&job_id)
+                && let Some(harness) = &mut handle.harness
+            {
+                harness.promotion = Some(summary);
+            }
+        }
+
         tracing::info!(job_id = %job_id, "Completed worker container");
         Ok(())
+    }
+
+    /// Run the write-back promotion pipeline for a completed harness job:
+    /// screen staged files, write accepted ones into the tenant workspace,
+    /// and persist a `harness_write_back` audit event with the full write set.
+    async fn promote_write_back(
+        &self,
+        job_id: Uuid,
+        owner_id: &str,
+        staging: &std::path::Path,
+        policy: &harness::WriteBackPolicy,
+    ) -> harness::PromotionSummary {
+        let mut summary = harness::PromotionSummary::default();
+        let plan = match harness::plan_promotion(staging, policy) {
+            Ok(plan) => plan,
+            Err(e) => {
+                summary.rejections.push(harness::PromotionRejection {
+                    relative_path: String::new(),
+                    reason: e.to_string(),
+                });
+                return summary;
+            }
+        };
+        summary.rejections.extend(plan.rejections);
+        if plan.accepted.is_empty() {
+            return summary;
+        }
+
+        let Some(resolver) = &self.write_back_workspace else {
+            summary.rejections.push(harness::PromotionRejection {
+                relative_path: String::new(),
+                reason: "no workspace available for write-back promotion".to_string(),
+            });
+            return summary;
+        };
+        let workspace = resolver.resolve(owner_id).await;
+        for write in plan.accepted {
+            match workspace.write(&write.relative_path, &write.content).await {
+                Ok(_) => summary.records.push(harness::PromotionRecord {
+                    relative_path: write.relative_path,
+                    sha256: write.sha256,
+                    size_bytes: write.size_bytes,
+                    job_id,
+                    promoted_at: Utc::now(),
+                }),
+                Err(e) => summary.rejections.push(harness::PromotionRejection {
+                    relative_path: write.relative_path,
+                    reason: format!("workspace write rejected: {e}"),
+                }),
+            }
+        }
+
+        tracing::info!(
+            job_id = %job_id,
+            promoted = summary.records.len(),
+            rejected = summary.rejections.len(),
+            "Harness write-back promotion finished"
+        );
+        if let Some(store) = &self.store
+            && let Err(e) = store
+                .save_job_event(
+                    job_id,
+                    "harness_write_back",
+                    &serde_json::json!({
+                        "promoted": summary.records,
+                        "rejected": summary.rejections,
+                    }),
+                )
+                .await
+        {
+            tracing::warn!(job_id = %job_id, "Failed to persist write-back audit event: {e}");
+        }
+        summary
     }
 
     /// Remove a completed job handle from memory (called after result is read).
     pub async fn cleanup_job(&self, job_id: Uuid) {
         self.containers.write().await.remove(&job_id);
+        harness::cleanup_harness_job_dir(job_id);
     }
 
     /// Update the worker-reported status for a job.
@@ -1134,6 +1415,7 @@ mod tests {
                     last_worker_status: None,
                     worker_iteration: 0,
                     completion_result: None,
+                    harness: None,
                 },
             );
         }

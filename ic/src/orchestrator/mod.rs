@@ -52,11 +52,12 @@ pub use auth::{CredentialGrant, McpCredentialGrant, TokenStore};
 pub use external_worker::{ExternalTaskResult, ExternalWorkerManager};
 pub use harness::{
     HarnessError, HarnessJobOptions, InjectedFileProvenance, InjectionManifest, InjectionSpec,
-    PromotionRecord, PromotionSummary, ResolvedSecretFile, SecretFileMount, WriteBackPolicy,
+    PromotionRecord, PromotionRejection, PromotionSummary, ResolvedSecretFile, SecretFileMount,
+    WriteBackPolicy,
 };
 pub use job_manager::{
     CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager,
-    ContainerJobRequest, JobMode, snapshot_worker_mcp,
+    ContainerJobRequest, HarnessJobRequest, HarnessJobState, JobMode, snapshot_worker_mcp,
 };
 pub use reaper::{ReaperConfig, SandboxReaper, sweep_cli_sandboxes_once};
 
