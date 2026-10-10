@@ -66,6 +66,32 @@ struct TaskProgressPayload {
     done: bool,
 }
 
+/// A structured `cron.tick` event carried into a cron-mode worker job (WI#325).
+///
+/// The host-side cron supervisor attaches this to `TaskContext` on every tick
+/// dispatch so the worker surfaces as a live mission: it learns the mission
+/// id, the schedule it is firing on, the durable goal, and its position in
+/// the tick/re-entry chain — no bespoke worker integration required. Older
+/// workers simply ignore the unknown context field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CronTick {
+    /// Always `"cron.tick"` — lets workers pattern-match the event.
+    pub event: String,
+    /// Stable mission identifier (config `mission_id` or `cron-worker-<name>`).
+    pub mission_id: String,
+    /// Cron expression the mission fires on.
+    pub schedule: String,
+    /// The mission's durable goal text.
+    pub goal: String,
+    /// Monotonic tick counter since daemon start (0-based).
+    pub tick_index: u64,
+    /// Which attempt of this tick this job is (0 = first dispatch,
+    /// >0 = supervisor re-entry after wedge/failure).
+    pub chain_index: u32,
+    /// RFC3339 time the tick fired.
+    pub fired_at: String,
+}
+
 /// Context passed to external workers with task requests.
 ///
 /// All fields are optional with serde defaults for backward compatibility —
@@ -90,6 +116,10 @@ pub struct TaskContext {
     pub user_id: String,
     /// Arbitrary metadata key-value pairs.
     pub metadata: HashMap<String, String>,
+    /// Structured `cron.tick` event; present only on cron-mode dispatches
+    /// (WI#325). Omitted entirely for ordinary task dispatches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_tick: Option<CronTick>,
 }
 
 pub fn build_task_context(
@@ -105,6 +135,7 @@ pub fn build_task_context(
         environment,
         conversation_history,
         metadata,
+        cron_tick: None,
     }
 }
 
@@ -2437,6 +2468,8 @@ mod tests {
                 endpoints: vec![],
                 load_balance: LoadBalanceStrategy::default(),
                 prompt_context: Default::default(),
+                mode: crate::config::ExternalWorkerMode::Task,
+                cron: None,
             },
             ExternalWorkerConfig {
                 name: "pebble".to_string(),
@@ -2446,6 +2479,8 @@ mod tests {
                 endpoints: vec![],
                 load_balance: LoadBalanceStrategy::default(),
                 prompt_context: Default::default(),
+                mode: crate::config::ExternalWorkerMode::Task,
+                cron: None,
             },
         ]);
         assert!(!mgr.is_empty());
@@ -2488,6 +2523,7 @@ mod tests {
             metadata: [("priority".to_string(), "high".to_string())]
                 .into_iter()
                 .collect(),
+            cron_tick: None,
         };
 
         let json = serde_json::to_string(&ctx).unwrap();
@@ -2856,6 +2892,8 @@ mod tests {
             ],
             load_balance: LoadBalanceStrategy::default(),
             prompt_context: Default::default(),
+            mode: crate::config::ExternalWorkerMode::Task,
+            cron: None,
         }]);
 
         let lb = mgr.load_balancers.get("multi").unwrap();

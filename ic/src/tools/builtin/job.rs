@@ -2438,6 +2438,8 @@ mod tests {
             endpoints: vec![],
             load_balance: LoadBalanceStrategy::default(),
             prompt_context: Default::default(),
+            mode: crate::config::ExternalWorkerMode::Task,
+            cron: None,
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
 
@@ -2491,6 +2493,8 @@ mod tests {
             endpoints: vec![],
             load_balance: LoadBalanceStrategy::default(),
             prompt_context: Default::default(),
+            mode: crate::config::ExternalWorkerMode::Task,
+            cron: None,
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
         let error = tool

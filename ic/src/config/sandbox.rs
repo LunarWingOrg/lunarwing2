@@ -214,6 +214,82 @@ pub enum LoadBalanceStrategy {
     LeastConnections,
 }
 
+/// Operating mode for an external worker (WI#325).
+///
+/// - `Task` (default): bounded, on-demand dispatches via `create_job`.
+/// - `Cron`: mission-like, long-running supervised operation. A host-side
+///   supervisor dispatches a structured `cron.tick` job on a cron schedule,
+///   watches heartbeats, and re-dispatches a fresh bounded job when a tick
+///   job dies or wedges. The mission's lifetime is the chain plus the
+///   worker's durable `/workspace` state, never any one process; the
+///   in-process mission lifecycle machine (WI#311/#317) never sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalWorkerMode {
+    #[default]
+    Task,
+    Cron,
+}
+
+/// Cron-mission configuration for an `ExternalWorkerMode::Cron` worker.
+///
+/// All durations are optional; defaults are chosen so a plain
+/// `mode = "cron"` + `cron.schedule` + `cron.goal` block is enough.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronWorkerConfig {
+    /// Cron expression (5, 6, or 7 fields; normalized like routines).
+    pub schedule: String,
+    /// Mission goal — the durable instruction every tick job works toward.
+    pub goal: String,
+    /// Stable mission identifier surfaced in every `cron.tick` event and in
+    /// job metadata. Defaults to `cron-worker-<name>` when absent so the
+    /// herd sees the same mission across daemon restarts.
+    #[serde(default)]
+    pub mission_id: Option<String>,
+    /// Heartbeat watchdog for a tick job (seconds). If a tick job shows no
+    /// genuine progress for this long, the supervisor cancels it and
+    /// re-dispatches a fresh bounded job. Default: 900 (15 min).
+    #[serde(default)]
+    pub heartbeat_timeout_secs: Option<u64>,
+    /// Per-tick job deadline in milliseconds. Replaces the standard bounded
+    /// `timeout_ms` for this mode — the mission itself is unbounded because
+    /// the supervisor always holds the lease and chains fresh jobs.
+    /// Default: the worker's `timeout_ms`.
+    #[serde(default)]
+    pub tick_timeout_ms: Option<u64>,
+    /// Maximum re-dispatches of a single tick after wedge/failure before the
+    /// tick is abandoned (the mission continues at the next scheduled fire).
+    /// Default: 3.
+    #[serde(default)]
+    pub max_reentries: Option<u32>,
+}
+
+impl CronWorkerConfig {
+    pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 900;
+    pub const DEFAULT_MAX_REENTRIES: u32 = 3;
+
+    pub fn heartbeat_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.heartbeat_timeout_secs
+                .unwrap_or(Self::DEFAULT_HEARTBEAT_TIMEOUT_SECS),
+        )
+    }
+
+    pub fn max_reentries(&self) -> u32 {
+        self.max_reentries.unwrap_or(Self::DEFAULT_MAX_REENTRIES)
+    }
+
+    pub fn tick_timeout_ms(&self, worker_timeout_ms: u64) -> u64 {
+        self.tick_timeout_ms.unwrap_or(worker_timeout_ms)
+    }
+
+    pub fn resolved_mission_id(&self, worker_name: &str) -> String {
+        self.mission_id
+            .clone()
+            .unwrap_or_else(|| format!("cron-worker-{worker_name}"))
+    }
+}
+
 /// Configuration for a named external worker endpoint.
 #[derive(Debug, Clone)]
 pub struct ExternalWorkerConfig {
@@ -228,6 +304,12 @@ pub struct ExternalWorkerConfig {
     pub load_balance: LoadBalanceStrategy,
     /// Bounds applied when recent conversation context is requested.
     pub prompt_context: PromptContextLimits,
+    /// Operating mode (default task). `Cron` arms the host-side mission
+    /// supervisor; the worker still accepts ordinary bounded dispatches.
+    pub mode: ExternalWorkerMode,
+    /// Cron-mission settings; required in practice when `mode` is `Cron`
+    /// (a missing or invalid block is logged and the supervisor is skipped).
+    pub cron: Option<CronWorkerConfig>,
 }
 
 impl ExternalWorkerConfig {
@@ -255,6 +337,8 @@ impl ExternalWorkerConfig {
                     endpoints: ew.endpoints.clone(),
                     load_balance: ew.load_balance.clone(),
                     prompt_context,
+                    mode: ew.mode,
+                    cron: ew.cron.clone(),
                 }
             })
             .collect()
@@ -275,6 +359,11 @@ impl ExternalWorkerConfig {
                 weight: None,
             }]
         }
+    }
+
+    /// Whether this worker runs mission-style under the cron supervisor (WI#325).
+    pub fn is_cron(&self) -> bool {
+        self.mode == ExternalWorkerMode::Cron
     }
 }
 
@@ -768,5 +857,83 @@ timeout_ms = 3600000
             endpoints[0].auth_token.as_ref().map(|s| s.expose_secret()),
             Some("tok-legacy")
         );
+    }
+
+    // ── WI#325 cron worker mode ──────────────────────────────────────
+
+    #[test]
+    fn external_worker_mode_defaults_to_task() {
+        let toml_str = r#"
+[[sandbox.external_workers]]
+name = "pebble"
+url = "ws://127.0.0.1:8443/ws/agent"
+"#;
+        let settings: crate::settings::Settings =
+            toml::from_str(toml_str).expect("config must parse");
+        let workers = ExternalWorkerConfig::resolve_from_settings(&settings);
+        assert_eq!(workers[0].mode, ExternalWorkerMode::Task);
+        assert!(!workers[0].is_cron());
+        assert!(workers[0].cron.is_none());
+    }
+
+    #[test]
+    fn external_worker_cron_mode_resolves() {
+        let toml_str = r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10007/ws/agent"
+timeout_ms = 3600000
+mode = "cron"
+
+[sandbox.external_workers.cron]
+schedule = "0 15 10 * * *"
+goal = "Produce the daily PR digest"
+mission_id = "pr-digest"
+heartbeat_timeout_secs = 300
+tick_timeout_ms = 1800000
+max_reentries = 5
+"#;
+        let settings: crate::settings::Settings =
+            toml::from_str(toml_str).expect("cron config must parse");
+        let workers = ExternalWorkerConfig::resolve_from_settings(&settings);
+        assert_eq!(workers.len(), 1);
+        let worker = &workers[0];
+        assert_eq!(worker.mode, ExternalWorkerMode::Cron);
+        assert!(worker.is_cron());
+
+        let cron = worker.cron.as_ref().expect("cron config present");
+        assert_eq!(cron.schedule, "0 15 10 * * *");
+        assert_eq!(cron.goal, "Produce the daily PR digest");
+        assert_eq!(cron.resolved_mission_id("kimi"), "pr-digest");
+        assert_eq!(cron.heartbeat_timeout(), std::time::Duration::from_secs(300));
+        assert_eq!(cron.tick_timeout_ms(worker.timeout_ms), 1_800_000);
+        assert_eq!(cron.max_reentries(), 5);
+    }
+
+    #[test]
+    fn external_worker_cron_defaults_are_applied() {
+        let toml_str = r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10007/ws/agent"
+timeout_ms = 3600000
+mode = "cron"
+
+[sandbox.external_workers.cron]
+schedule = "*/30 * * * *"
+goal = "Watch the herd"
+"#;
+        let settings: crate::settings::Settings =
+            toml::from_str(toml_str).expect("cron config must parse");
+        let workers = ExternalWorkerConfig::resolve_from_settings(&settings);
+        let cron = workers[0].cron.as_ref().expect("cron config present");
+
+        assert_eq!(cron.resolved_mission_id("kimi"), "cron-worker-kimi");
+        assert_eq!(
+            cron.heartbeat_timeout(),
+            std::time::Duration::from_secs(CronWorkerConfig::DEFAULT_HEARTBEAT_TIMEOUT_SECS)
+        );
+        assert_eq!(cron.tick_timeout_ms(3_600_000), 3_600_000);
+        assert_eq!(cron.max_reentries(), CronWorkerConfig::DEFAULT_MAX_REENTRIES);
     }
 }
