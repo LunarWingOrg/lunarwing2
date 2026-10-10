@@ -37,6 +37,7 @@ use crate::channels::web::types::SseEvent;
 use crate::config::{CronWorkerConfig, ExternalWorkerConfig};
 use crate::context::JobState;
 use crate::db::Database;
+use crate::error::OrchestratorError;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::external_worker::{CronTick, ExternalWorkerManager, build_task_context};
 
@@ -122,6 +123,39 @@ impl ExternalWorkerManager {
                 run_cron_mission(manager, worker, cron, mission_id, owner, mission_shutdown).await;
             });
         }
+    }
+
+    /// Fire one cron tick immediately for a cron-mode worker (WI#325).
+    ///
+    /// Runs the same dispatch → watch → re-entry chain the scheduled loop
+    /// uses, with `tick_index` 0 marking it as an operator/test trigger. The
+    /// mission's durable state handoff still goes through the worker's
+    /// `/workspace` mount, so a manual tick composes with scheduled ticks.
+    pub async fn fire_cron_tick_now(
+        self: &Arc<Self>,
+        worker_name: &str,
+        owner_id: &str,
+    ) -> Result<(), OrchestratorError> {
+        let worker = self
+            .get_worker(worker_name)
+            .ok_or_else(|| OrchestratorError::ExternalWorkerNotFound {
+                worker_name: worker_name.to_string(),
+            })?
+            .clone();
+        if !worker.is_cron() {
+            return Err(OrchestratorError::ExternalWorkerNotCron {
+                worker_name: worker_name.to_string(),
+            });
+        }
+        let cron = worker
+            .cron
+            .clone()
+            .ok_or_else(|| OrchestratorError::ExternalWorkerNotCron {
+                worker_name: worker_name.to_string(),
+            })?;
+        let mission_id = cron.resolved_mission_id(&worker.name);
+        run_tick(self, &worker, &cron, &mission_id, 0, owner_id).await;
+        Ok(())
     }
 }
 
@@ -477,8 +511,13 @@ async fn watch_tick_job(
         return TickOutcome::Missing;
     };
     let heartbeat_timeout = cron.heartbeat_timeout();
+    // Poll no coarser than half the heartbeat window (floor 200ms) so short
+    // watchdog configs are still enforced promptly.
+    let poll = WATCH_POLL
+        .min(heartbeat_timeout / 2)
+        .max(Duration::from_millis(200));
     loop {
-        tokio::time::sleep(WATCH_POLL).await;
+        tokio::time::sleep(poll).await;
         let ctx = match cm.get_context(job_id).await {
             Ok(ctx) => ctx,
             Err(_) => return TickOutcome::Missing,

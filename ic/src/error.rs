@@ -408,6 +408,9 @@ pub enum OrchestratorError {
 
     #[error("External worker '{worker_name}' task is already active (job {job_id})")]
     ExternalWorkerTaskAlreadyActive { worker_name: String, job_id: Uuid },
+
+    #[error("External worker '{worker_name}' is not configured for cron mode")]
+    ExternalWorkerNotCron { worker_name: String },
 }
 
 /// Worker errors (container-side execution).
