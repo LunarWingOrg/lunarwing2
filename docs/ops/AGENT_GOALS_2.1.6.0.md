@@ -25,7 +25,15 @@
 3. [ ] audit all crates and ensure there are no security vulnerabilities
 4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298 - Brightdawn confirmed close now
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
+6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325 - DONE (host-side, 100%): cron worker mode implemented on branch sweetiebot/kimi-6-20261010-0905
+  - `mode = "cron"` + `[sandbox.external_workers.cron]` config block (schedule/goal/mission_id/heartbeat_timeout_secs/tick_timeout_ms/max_reentries): `ic/src/config/sandbox.rs`, `ic/src/settings.rs`
+  - Structured `cron.tick` payload on `task_request.context.cron_tick` (mission id, schedule, goal, tick/chain index, fired_at); omitted for ordinary dispatches: `ic/src/orchestrator/external_worker.rs`
+  - Host-side mission supervisor (always holds the lease; per-tick `tick_timeout_ms` instead of the standard bounded deadline; never an engine Mission so no WI#311 Completed-parking): `ic/src/orchestrator/cron_worker.rs`, wired in `ic/src/main.rs`
+  - Re-dispatch/re-entry: heartbeat watchdog (genuine-progress only, WI#263 gate) cancels wedged/stuck tick jobs and re-dispatches fresh bounded jobs up to max_reentries; state handoff via durable /workspace
+  - Logging: structured `cron_tick`/`cron_reentry`/`cron_tick_end` job_events + SSE JobStatus + info!/warn! tracing (answers WI#323 silent-scheduler gap)
+  - `ExternalWorkerManager::fire_cron_tick_now` manual trigger; `OrchestratorError::ExternalWorkerNotCron`
+  - Verified: cargo check clean (lib + tests), clippy -D-warnings clean, cargo fmt clean; 6 new unit tests + 3 new mock-worker integration tests pass; regression: 31/31 external_worker integration, 58/58 lib external_worker, 45/45 job tool tests
+  - Session audio capture not implemented (no audio path in external workers today); documented as out-of-scope in `docs/proposals/EXTERNAL-WORKER-CRON-MODE.md`
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329
