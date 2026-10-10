@@ -390,6 +390,60 @@ assert_eq "proxy enabled + explicit llm-base-url wins" \
   "$(envval LLM_BASE_URL)" "http://custom:9000/v2"
 PROXY_FIXTURE_ENABLED=false
 
+# Case 6: WI#330 — unset worker base URLs inherit the tenant's LLM endpoint.
+# The worker images ship a placeholder endpoint their entrypoints refuse to
+# run, so write_tenant_lunarwing_env must always render OPENCODE_BASE_URL /
+# KIMI_BASE_URL / OPENCODE2_BASE_URL: --llm-base-url wins, else the tenant's
+# TensorZero upstream (path-aware), even when the daemon itself dials the
+# loopback proxy (unreachable from worker containers).
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "")"
+assert_eq "worker default: opencode inherits tensorzero upstream" \
+  "$(envval OPENCODE_BASE_URL)" "http://tz:3030/openai/v1"
+assert_eq "worker default: kimi inherits tensorzero upstream" \
+  "$(envval KIMI_BASE_URL)" "http://tz:3030/openai/v1"
+assert_eq "worker default: opencode2 inherits tensorzero upstream" \
+  "$(envval OPENCODE2_BASE_URL)" "http://tz:3030/openai/v1"
+
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "http://custom:9000/v1")"
+assert_eq "worker default: explicit llm-base-url wins over tensorzero" \
+  "$(envval OPENCODE_BASE_URL)" "http://custom:9000/v1"
+assert_eq "worker default: kimi inherits explicit llm-base-url" \
+  "$(envval KIMI_BASE_URL)" "http://custom:9000/v1"
+assert_eq "worker default: opencode2 inherits explicit llm-base-url" \
+  "$(envval OPENCODE2_BASE_URL)" "http://custom:9000/v1"
+
+PROXY_FIXTURE_ENABLED=true
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "")"
+assert_eq "worker default: daemon dials loopback proxy" \
+  "$(envval LLM_BASE_URL)" "http://127.0.0.1:10004/v1"
+assert_eq "worker default: proxy loopback NOT inherited by workers" \
+  "$(envval OPENCODE_BASE_URL)" "http://tz:3030/openai/v1"
+assert_eq "worker default: kimi gets upstream, not loopback" \
+  "$(envval KIMI_BASE_URL)" "http://tz:3030/openai/v1"
+PROXY_FIXTURE_ENABLED=false
+
+# Explicit per-worker flags beat the inherited default.
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
+  "" "" "" "" "http://oc:4000/v1" "" "http://kimi:4001/v1" "" "" "http://oc2:4002/v1")"
+assert_eq "explicit opencode base url wins" "$(envval OPENCODE_BASE_URL)" "http://oc:4000/v1"
+assert_eq "explicit kimi base url wins"     "$(envval KIMI_BASE_URL)"     "http://kimi:4001/v1"
+assert_eq "explicit opencode2 base url wins" "$(envval OPENCODE2_BASE_URL)" "http://oc2:4002/v1"
+
+# Re-render preserves operator-set worker URLs instead of re-defaulting.
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
+  "" "" "" "" "http://oc:4000/v1" "" "http://kimi:4001/v1" "" "" "http://oc2:4002/v1"
+write_tenant_lunarwing_env fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:9999" ""
+assert_eq "rerun preserves opencode worker url" "$(envval OPENCODE_BASE_URL)" "http://oc:4000/v1"
+assert_eq "rerun preserves kimi worker url"     "$(envval KIMI_BASE_URL)"     "http://kimi:4001/v1"
+assert_eq "rerun preserves opencode2 worker url" "$(envval OPENCODE2_BASE_URL)" "http://oc2:4002/v1"
+
 echo "=== tensorzero_openai_base unit tests ==="
 assert_eq "unit bare root suffixed" \
   "$(tensorzero_openai_base "http://tz:3030")" "http://tz:3030/openai/v1"
