@@ -24,7 +24,11 @@
 
 3. [ ] audit all crates and ensure there are no security vulnerabilities
 4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298 - Brightdawn confirmed close now
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324
+5. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324
+  - WI#324 phase 1 (hub-side) implemented on branch aj/kimi-5-20261010-0600: external workers can invoke allowlisted in-process tenant tools via `tool_call`/`tool_result`/`tool_list` frames on the existing `lunarwing-agent-v1` WS control channel. Dispatch reuses the shared `execute_tool_with_safety` pipeline (validate → per-tool timeout → execute) scoped to the connection's job (job_id + user_id; frame-supplied task_id is never trusted). Per-worker `tool_allowlist` is deny-by-default (`"*"` = opt-in escape hatch); rejected calls return `status: "denied"`, never a silent empty. Every call + outcome is persisted to `job_events` and traced. Secrets never cross the proxy — workers receive only tool results.
+  - Files: `ic/src/orchestrator/external_worker.rs` (protocol types, ToolProxy, handlers, unit tests), `ic/src/orchestrator/mod.rs` + `ic/src/main.rs` (wiring of ToolRegistry + SafetyLayer), `ic/src/settings.rs` + `ic/src/config/sandbox.rs` (`tool_allowlist` config + `allows_tool`), `ic/tests/external_worker_integration.rs` (mock-worker ToolProxy behavior + 4 tests), `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md` (wire contract, security model, worker-side spec).
+  - Verified: `cargo check` clean; `cargo test --test external_worker_integration` 32/32 pass (incl. 4 new WI#324 tests); `cargo test --lib external_worker` 59/59 pass; clippy clean on touched files.
+  - Remaining (noted on the WI): worker-side thin MCP bridge in the worker images (design item 2 — the wire contract is documented in the new doc) and phase-2 hub-mediated cross-thread coordination (KV + locks).
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328

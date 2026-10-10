@@ -2007,8 +2007,10 @@ async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(tools, test_safety());
     let job_id = Uuid::new_v4();
 
-    let mut context = TaskContext::default();
-    context.user_id = "tenant-user".to_string();
+    let context = TaskContext {
+        user_id: "tenant-user".to_string(),
+        ..Default::default()
+    };
     let res = timeout(
         TEST_BOUND,
         mgr.execute_task(job_id, "mock", "task", Some(10_000), true, context),
