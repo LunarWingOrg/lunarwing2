@@ -90,6 +90,34 @@ impl std::fmt::Display for JobMode {
     }
 }
 
+/// Container runtime flavor behind the Docker-compatible API (CV-2).
+///
+/// Podman and Docker accept different tmpfs mount options: Docker takes
+/// `uid=`/`gid=`, while podman's compat API rejects them and instead offers
+/// the `U` option (chown the mount to the container user). Detected once per
+/// manager from `/version` and cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerRuntimeKind {
+    Docker,
+    Podman,
+}
+
+impl WorkerRuntimeKind {
+    /// tmpfs options for the harness secrets mount. Both shapes end with the
+    /// tmpfs owned by the container's worker uid (1000) with mode 0700, so
+    /// only the job process can read secret files.
+    fn secrets_tmpfs_options(self) -> &'static str {
+        match self {
+            // Verified against Docker's TmpfsOptions (uid/gid supported).
+            Self::Docker => "size=4M,mode=0700,uid=1000,gid=1000,noexec,nosuid",
+            // Verified against podman 5.8/6.x via the Docker-compat API:
+            // `uid=` is rejected ("unknown mount option"), `U` chowns the
+            // tmpfs to the container user.
+            Self::Podman => "size=4M,mode=0700,noexec,nosuid,U",
+        }
+    }
+}
+
 /// Configuration for the container job manager.
 #[derive(Debug, Clone)]
 pub struct ContainerJobConfig {
@@ -119,6 +147,11 @@ impl Default for ContainerJobConfig {
 pub enum ContainerState {
     Creating,
     Running,
+    /// Harness write-back only: container stopped, write-back promotion still
+    /// running (CW-7). Waiters must not treat the job as finished — and must
+    /// not clean up the staging dir — until promotion lands and the state
+    /// flips to `Stopped`.
+    Finalizing,
     Stopped,
     Failed,
 }
@@ -128,6 +161,7 @@ impl std::fmt::Display for ContainerState {
         match self {
             Self::Creating => write!(f, "creating"),
             Self::Running => write!(f, "running"),
+            Self::Finalizing => write!(f, "finalizing"),
             Self::Stopped => write!(f, "stopped"),
             Self::Failed => write!(f, "failed"),
         }
@@ -425,6 +459,63 @@ fn validate_bind_mount_path(
     Ok(canonical)
 }
 
+/// Validate a harness injection/staging dir for bind-mounting (CW-3).
+///
+/// Harness state lives under `~/.lunarwing/harness/` — outside the projects
+/// base that any job can mount via an explicit `project_dir` — and the
+/// canonical path must be exactly `<harness_base>/<job_id>/<leaf>` for THIS
+/// job, so one job's mounts can never point at another job's harness state.
+fn validate_harness_mount_path(
+    dir: &std::path::Path,
+    job_id: Uuid,
+) -> Result<PathBuf, OrchestratorError> {
+    let canonical = dir
+        .canonicalize()
+        .map_err(|e| OrchestratorError::ContainerCreationFailed {
+            job_id,
+            reason: format!(
+                "failed to canonicalize harness dir {}: {}",
+                dir.display(),
+                e
+            ),
+        })?;
+
+    let base = harness::ensure_harness_base_dir().map_err(|e| {
+        OrchestratorError::ContainerCreationFailed {
+            job_id,
+            reason: format!("failed to create harness base: {e}"),
+        }
+    })?;
+    let canonical_base =
+        base.canonicalize()
+            .map_err(|e| OrchestratorError::ContainerCreationFailed {
+                job_id,
+                reason: format!(
+                    "failed to canonicalize harness base {}: {}",
+                    base.display(),
+                    e
+                ),
+            })?;
+
+    let expected_parent = canonical_base.join(job_id.to_string());
+    let in_this_job = canonical
+        .parent()
+        .map(|parent| parent == expected_parent)
+        .unwrap_or(false);
+    if !in_this_job {
+        return Err(OrchestratorError::ContainerCreationFailed {
+            job_id,
+            reason: format!(
+                "harness dir {} is outside this job's harness root {}",
+                canonical.display(),
+                expected_parent.display()
+            ),
+        });
+    }
+
+    Ok(canonical)
+}
+
 fn worker_command(
     job_id: Uuid,
     orchestrator_url: &str,
@@ -539,6 +630,8 @@ pub struct ContainerJobManager {
     pub(crate) containers: Arc<RwLock<HashMap<Uuid, ContainerHandle>>>,
     /// Cached Docker connection (created on first use).
     docker: Arc<RwLock<Option<bollard::Docker>>>,
+    /// Cached container-runtime detection (created on first use, CV-2).
+    runtime_kind: Arc<RwLock<Option<WorkerRuntimeKind>>>,
     /// Broadcast channel for emitting job events when a container exits
     /// without calling /complete.
     job_event_tx: Option<
@@ -559,6 +652,7 @@ impl ContainerJobManager {
             token_store,
             containers: Arc::new(RwLock::new(HashMap::new())),
             docker: Arc::new(RwLock::new(None)),
+            runtime_kind: Arc::new(RwLock::new(None)),
             job_event_tx: None,
             context_manager: None,
             write_back_workspace: None,
@@ -607,6 +701,39 @@ impl ContainerJobManager {
             })?;
         *self.docker.write().await = Some(docker.clone());
         Ok(docker)
+    }
+
+    /// Detect the container runtime behind the Docker-compatible API, cached
+    /// per manager (CV-2). Harness secret mounts fail closed when detection
+    /// fails: silently guessing tmpfs options could leave secrets unreadable
+    /// or delivered into the wrong ownership mode.
+    async fn runtime_kind(&self) -> Result<WorkerRuntimeKind, OrchestratorError> {
+        {
+            let guard = self.runtime_kind.read().await;
+            if let Some(kind) = *guard {
+                return Ok(kind);
+            }
+        }
+        let docker = self.docker().await?;
+        let version = docker
+            .version()
+            .await
+            .map_err(|e| OrchestratorError::Docker {
+                reason: format!("failed to detect container runtime version: {e}"),
+            })?;
+        let is_podman = version.components.as_ref().is_some_and(|components| {
+            components
+                .iter()
+                .any(|c| c.name.to_ascii_lowercase().contains("podman"))
+        });
+        let kind = if is_podman {
+            WorkerRuntimeKind::Podman
+        } else {
+            WorkerRuntimeKind::Docker
+        };
+        *self.runtime_kind.write().await = Some(kind);
+        tracing::debug!(runtime = ?kind, "Detected container runtime for harness mounts");
+        Ok(kind)
     }
 
     /// Create and start a new container for a job.
@@ -685,6 +812,23 @@ impl ContainerJobManager {
         };
         self.containers.write().await.insert(job_id, handle);
 
+        // WI#326 CV-2: harness secrets are served to the worker over its
+        // authenticated per-job channel (worker pull), never uploaded into
+        // the container image layers. The token store holds them until the
+        // job finishes so the daemon can also redact them from job events
+        // (CV-7) and scan staged writes for them (CW-10); they are cleared
+        // on every terminal path.
+        if let Some(ref req) = harness
+            && !req.resolved_secrets.is_empty()
+        {
+            let pairs: Vec<(String, secrecy::SecretString)> = req
+                .resolved_secrets
+                .iter()
+                .map(|s| (s.file_name.clone(), s.value_clone()))
+                .collect();
+            self.token_store.store_harness_secrets(job_id, pairs).await;
+        }
+
         // Run the actual container creation. On any failure, revoke the token
         // and remove the handle so we don't leak resources.
         match self
@@ -759,12 +903,13 @@ impl ContainerJobManager {
         }
 
         // WI#326 harness mounts: read-only injection, RW write-back staging.
-        // Both live under ~/.lunarwing/projects/.harness/<job_id>/ so the
-        // standard bind-mount validation applies.
+        // Both live under ~/.lunarwing/harness/<job_id>/ — deliberately
+        // outside the bind-mountable projects base (CW-3) — and validate
+        // against the harness base.
         if let Some(ref harness_req) = harness {
             env_vec.push("LUNARWING_HARNESS_MODE=1".to_string());
             if let Some(ref injection_dir) = harness_req.injection_dir {
-                let canonical = validate_bind_mount_path(injection_dir, job_id)?;
+                let canonical = validate_harness_mount_path(injection_dir, job_id)?;
                 binds.push(format!(
                     "{}:{}:ro",
                     canonical.display(),
@@ -778,7 +923,7 @@ impl ContainerJobManager {
             if harness_req.write_back.is_some()
                 && let Some(ref staging_dir) = harness_req.staging_dir
             {
-                let canonical = validate_bind_mount_path(staging_dir, job_id)?;
+                let canonical = validate_harness_mount_path(staging_dir, job_id)?;
                 binds.push(format!(
                     "{}:{}:rw",
                     canonical.display(),
@@ -794,6 +939,15 @@ impl ContainerJobManager {
                     "LUNARWING_SECRETS_DIR={}",
                     harness::HARNESS_SECRETS_CONTAINER_DIR
                 ));
+                // CV-2: the worker pulls values over its authenticated
+                // channel and fails closed unless exactly this set arrives.
+                // Names only — values never enter the container env.
+                let names: Vec<&str> = harness_req
+                    .resolved_secrets
+                    .iter()
+                    .map(|s| s.file_name.as_str())
+                    .collect();
+                env_vec.push(format!("LUNARWING_SECRET_FILES={}", names.join(",")));
             }
         }
 
@@ -809,11 +963,14 @@ impl ContainerJobManager {
         let tmpfs_mounts: HashMap<String, String> = if has_harness_secrets {
             // Docker-secrets pattern: tmpfs is volatile, noexec, and owned by
             // the worker uid so only the job process can read secret files.
+            // Options are runtime-specific (CV-2): podman's compat API
+            // rejects uid=/gid= and needs `U`; Docker takes uid/gid.
+            let kind = self.runtime_kind().await?;
             [
                 ("/tmp".to_string(), "size=512M".to_string()),
                 (
                     harness::HARNESS_SECRETS_CONTAINER_DIR.to_string(),
-                    "size=4M,mode=0700,uid=1000,gid=1000,noexec,nosuid".to_string(),
+                    kind.secrets_tmpfs_options().to_string(),
                 ),
             ]
             .into_iter()
@@ -888,48 +1045,13 @@ impl ContainerJobManager {
                 reason: format!("failed to start container: {}", e),
             })?;
 
-        // WI#326: deliver worker-scoped secrets into the tmpfs mount. This
-        // must happen after start (tmpfs exists only at runtime) and before
-        // the worker reads /run/secrets. On failure the container is removed
-        // so a job never runs without its full secret set.
-        if let Some(ref harness_req) = harness
-            && !harness_req.resolved_secrets.is_empty()
-        {
-            let upload =
-                harness::build_secrets_tar(&harness_req.resolved_secrets).map_err(|e| {
-                    OrchestratorError::ContainerCreationFailed {
-                        job_id,
-                        reason: format!("failed to build secrets archive: {e}"),
-                    }
-                })?;
-            let options = bollard::container::UploadToContainerOptions {
-                path: harness::HARNESS_SECRETS_CONTAINER_DIR.to_string(),
-                ..Default::default()
-            };
-            if let Err(e) = docker
-                .upload_to_container(&container_id, Some(options), upload.into())
-                .await
-            {
-                let _ = docker
-                    .remove_container(
-                        &container_id,
-                        Some(bollard::container::RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                return Err(OrchestratorError::ContainerCreationFailed {
-                    job_id,
-                    reason: format!("failed to mount harness secrets: {e}"),
-                });
-            }
-            tracing::info!(
-                job_id = %job_id,
-                count = harness_req.resolved_secrets.len(),
-                "Mounted harness secret files on tmpfs"
-            );
-        }
+        // WI#326 CV-2: harness secrets are NOT uploaded into the container.
+        // The tmpfs mount above is empty at start; the worker pulls its
+        // secret values over the authenticated per-job channel and writes
+        // them into the tmpfs itself (0440), failing closed — exiting before
+        // any work — unless the delivered set exactly matches the expected
+        // LUNARWING_SECRET_FILES list. This works identically on Docker and
+        // podman and never lands values in overlay layers on host disk.
 
         // Clone container_id before moving it into the handle.
         let watcher_container_id = container_id.clone();
@@ -976,7 +1098,18 @@ impl ContainerJobManager {
                 let containers = watcher_containers.read().await;
                 containers
                     .get(&job_id)
-                    .map(|h| h.state == ContainerState::Stopped)
+                    .map(|h| {
+                        // /complete sets the result first, then (for harness
+                        // write-back jobs) keeps the handle in Finalizing
+                        // until promotion lands — both mean "being completed",
+                        // so the watcher must not force-complete over it
+                        // (CW-7).
+                        h.completion_result.is_some()
+                            || matches!(
+                                h.state,
+                                ContainerState::Stopped | ContainerState::Finalizing
+                            )
+                    })
                     .unwrap_or(true)
             };
 
@@ -1023,6 +1156,11 @@ impl ContainerJobManager {
                 )
                 .await;
             watcher_token_store.revoke(job_id).await;
+            // CW-8: a crashed harness job never reaches /complete, so its
+            // injection snapshot and staging dir (and any mounted secret
+            // values held for redaction) are cleaned up here.
+            watcher_token_store.clear_harness_secrets(job_id).await;
+            harness::cleanup_harness_job_dir(job_id);
 
             // Update ContextManager so job_status shows the real state.
             if let Some(ref cm) = watcher_context_manager {
@@ -1109,6 +1247,10 @@ impl ContainerJobManager {
         // Revoke the auth token
         self.token_store.revoke(job_id).await;
 
+        // CW-8: stop/cancel is a terminal path — clean up harness state.
+        self.token_store.clear_harness_secrets(job_id).await;
+        harness::cleanup_harness_job_dir(job_id);
+
         tracing::info!(job_id = %job_id, "Stopped worker container");
 
         Ok(())
@@ -1116,25 +1258,49 @@ impl ContainerJobManager {
 
     /// Mark a job as complete with a result. The container is stopped but the
     /// handle is kept so `CreateJobTool` can read the completion message.
+    ///
+    /// Harness write-back jobs (WI#326) transition through
+    /// `ContainerState::Finalizing`: promotion runs detached after container
+    /// teardown is confirmed, and only then does the state flip to `Stopped`
+    /// — so a `wait=true` waiter can never race the promotion or clean up the
+    /// staging dir mid-walk (CW-7). Guards are always dropped before any
+    /// `.write().await`; the MR !1510 shape held a read guard across the
+    /// promotion write lock and deadlocked the whole container map (CV-1).
     pub async fn complete_job(
         &self,
         job_id: Uuid,
         result: CompletionResult,
     ) -> Result<(), OrchestratorError> {
-        // Store the result before stopping
-        {
-            let mut containers = self.containers.write().await;
-            if let Some(handle) = containers.get_mut(&job_id) {
-                handle.completion_result = Some(result);
-                handle.state = ContainerState::Stopped;
-            }
-        }
+        let job_succeeded = result.success;
 
-        // Stop container and revoke token (but keep handle in map)
+        // Store the result before stopping.
+        let needs_promotion = {
+            let mut containers = self.containers.write().await;
+            match containers.get_mut(&job_id) {
+                Some(handle) => {
+                    handle.completion_result = Some(result);
+                    let promote = handle.harness.as_ref().is_some_and(|h| {
+                        h.write_back.is_some() && h.staging_dir.is_some()
+                    });
+                    handle.state = if promote {
+                        ContainerState::Finalizing
+                    } else {
+                        ContainerState::Stopped
+                    };
+                    promote
+                }
+                None => false,
+            }
+        };
+
+        // Stop container and revoke token (but keep handle in map).
+        // Teardown must be confirmed before promotion reads the staging dir:
+        // a live container could keep mutating it (CW-3/CW-7).
         let container_id = {
             let containers = self.containers.read().await;
             containers.get(&job_id).map(|h| h.container_id.clone())
         };
+        let mut teardown_confirmed = true;
         if let Some(cid) = container_id
             && !cid.is_empty()
         {
@@ -1147,6 +1313,7 @@ impl ContainerJobManager {
                         )
                         .await
                     {
+                        teardown_confirmed = false;
                         tracing::warn!(job_id = %job_id, error = %e, "Failed to stop completed container");
                     }
                     if let Err(e) = docker
@@ -1159,127 +1326,38 @@ impl ContainerJobManager {
                         )
                         .await
                     {
+                        teardown_confirmed = false;
                         tracing::warn!(job_id = %job_id, error = %e, "Failed to remove completed container");
                     }
                 }
                 Err(e) => {
+                    teardown_confirmed = false;
                     tracing::warn!(job_id = %job_id, error = %e, "Failed to connect to Docker for container cleanup");
                 }
             }
         }
         self.token_store.revoke(job_id).await;
 
-        // WI#326: promote staged write-back files into tenant memory after the
-        // container is gone but before the result is read. Promotion failures
-        // never fail the job; they are recorded on the handle and in the job
-        // event audit trail.
-        let harness_state = self
-            .containers
-            .read()
-            .await
-            .get(&job_id)
-            .and_then(|handle| handle.harness.clone());
-        if let Some(state) = harness_state
-            && let (Some(policy), Some(staging), Some(owner)) = (
-                state.write_back,
-                state.staging_dir,
-                self.containers
-                    .read()
-                    .await
-                    .get(&job_id)
-                    .map(|h| h.owner_id.clone()),
-            )
-        {
-            let summary = self
-                .promote_write_back(job_id, &owner, &staging, &policy)
-                .await;
-            if let Some(handle) = self.containers.write().await.get_mut(&job_id)
-                && let Some(harness) = &mut handle.harness
-            {
-                harness.promotion = Some(summary);
-            }
+        if needs_promotion {
+            let deps = PromotionDeps {
+                containers: Arc::clone(&self.containers),
+                token_store: self.token_store.clone(),
+                workspace: self.write_back_workspace.clone(),
+                store: self.store.clone(),
+            };
+            tokio::spawn(async move {
+                finalize_harness_job(deps, job_id, job_succeeded, teardown_confirmed).await;
+            });
         }
 
         tracing::info!(job_id = %job_id, "Completed worker container");
         Ok(())
     }
 
-    /// Run the write-back promotion pipeline for a completed harness job:
-    /// screen staged files, write accepted ones into the tenant workspace,
-    /// and persist a `harness_write_back` audit event with the full write set.
-    async fn promote_write_back(
-        &self,
-        job_id: Uuid,
-        owner_id: &str,
-        staging: &std::path::Path,
-        policy: &harness::WriteBackPolicy,
-    ) -> harness::PromotionSummary {
-        let mut summary = harness::PromotionSummary::default();
-        let plan = match harness::plan_promotion(staging, policy) {
-            Ok(plan) => plan,
-            Err(e) => {
-                summary.rejections.push(harness::PromotionRejection {
-                    relative_path: String::new(),
-                    reason: e.to_string(),
-                });
-                return summary;
-            }
-        };
-        summary.rejections.extend(plan.rejections);
-        if plan.accepted.is_empty() {
-            return summary;
-        }
-
-        let Some(resolver) = &self.write_back_workspace else {
-            summary.rejections.push(harness::PromotionRejection {
-                relative_path: String::new(),
-                reason: "no workspace available for write-back promotion".to_string(),
-            });
-            return summary;
-        };
-        let workspace = resolver.resolve(owner_id).await;
-        for write in plan.accepted {
-            match workspace.write(&write.relative_path, &write.content).await {
-                Ok(_) => summary.records.push(harness::PromotionRecord {
-                    relative_path: write.relative_path,
-                    sha256: write.sha256,
-                    size_bytes: write.size_bytes,
-                    job_id,
-                    promoted_at: Utc::now(),
-                }),
-                Err(e) => summary.rejections.push(harness::PromotionRejection {
-                    relative_path: write.relative_path,
-                    reason: format!("workspace write rejected: {e}"),
-                }),
-            }
-        }
-
-        tracing::info!(
-            job_id = %job_id,
-            promoted = summary.records.len(),
-            rejected = summary.rejections.len(),
-            "Harness write-back promotion finished"
-        );
-        if let Some(store) = &self.store
-            && let Err(e) = store
-                .save_job_event(
-                    job_id,
-                    "harness_write_back",
-                    &serde_json::json!({
-                        "promoted": summary.records,
-                        "rejected": summary.rejections,
-                    }),
-                )
-                .await
-        {
-            tracing::warn!(job_id = %job_id, "Failed to persist write-back audit event: {e}");
-        }
-        summary
-    }
-
     /// Remove a completed job handle from memory (called after result is read).
     pub async fn cleanup_job(&self, job_id: Uuid) {
         self.containers.write().await.remove(&job_id);
+        self.token_store.clear_harness_secrets(job_id).await;
         harness::cleanup_harness_job_dir(job_id);
     }
 
@@ -1310,6 +1388,197 @@ impl ContainerJobManager {
     pub fn token_store(&self) -> &TokenStore {
         &self.token_store
     }
+
+    /// Sweep harness dirs that belong to no live container (CW-8 boot path).
+    /// Fail-safe: when the runtime cannot be listed, nothing is removed.
+    pub async fn sweep_orphaned_harness_dirs(&self) {
+        let docker = match self.docker().await {
+            Ok(docker) => docker,
+            Err(e) => {
+                tracing::warn!("Harness dir sweep skipped, no container runtime: {e}");
+                return;
+            }
+        };
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec!["lunarwing.job_id".to_string()]);
+        let options = bollard::container::ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        };
+        let summaries = match docker.list_containers(Some(options)).await {
+            Ok(summaries) => summaries,
+            Err(e) => {
+                tracing::warn!("Harness dir sweep skipped, container list failed: {e}");
+                return;
+            }
+        };
+        let live: std::collections::HashSet<Uuid> = summaries
+            .iter()
+            .filter_map(|s| s.labels.as_ref())
+            .filter_map(|labels| labels.get("lunarwing.job_id"))
+            .filter_map(|value| Uuid::parse_str(value).ok())
+            .collect();
+        let removed =
+            harness::sweep_stale_harness_dirs(&live, std::time::Duration::from_secs(3600));
+        if removed > 0 {
+            tracing::info!(removed, "Swept orphaned harness dirs at startup");
+        }
+    }
+}
+
+/// Cloned dependencies for the detached harness finalization task (CW-7).
+struct PromotionDeps {
+    containers: Arc<RwLock<HashMap<Uuid, ContainerHandle>>>,
+    token_store: TokenStore,
+    workspace: Option<Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>>,
+    store: Option<Arc<dyn Database>>,
+}
+
+/// Detached finalization for a harness write-back job (CW-7/8/9): gate on
+/// job success and confirmed container teardown, run the promotion pipeline,
+/// ALWAYS persist the `harness_write_back` audit event, then flip the handle
+/// to `Stopped` and release the job's mounted secret values.
+async fn finalize_harness_job(
+    deps: PromotionDeps,
+    job_id: Uuid,
+    job_succeeded: bool,
+    teardown_confirmed: bool,
+) {
+    // Read guard scoped to this block — never held across a write (CV-1).
+    let state = {
+        let containers = deps.containers.read().await;
+        containers.get(&job_id).and_then(|handle| {
+            let harness = handle.harness.as_ref()?;
+            Some((
+                harness.write_back.clone()?,
+                harness.staging_dir.clone()?,
+                handle.owner_id.clone(),
+            ))
+        })
+    };
+    let Some((policy, staging, owner_id)) = state else {
+        let mut containers = deps.containers.write().await;
+        if let Some(handle) = containers.get_mut(&job_id) {
+            handle.state = ContainerState::Stopped;
+        }
+        return;
+    };
+
+    let mut summary = harness::PromotionSummary::default();
+    if !job_succeeded {
+        // CW-7: write-back is a success path; a failed job's staging never
+        // reaches tenant memory.
+        summary.skipped = true;
+        summary.skip_reason = Some("job did not complete successfully".to_string());
+    } else if !teardown_confirmed {
+        summary.skipped = true;
+        summary.skip_reason =
+            Some("container teardown could not be confirmed; write-back refused".to_string());
+    } else {
+        summary = run_promotion(&deps, job_id, &owner_id, &staging, &policy).await;
+    }
+
+    tracing::info!(
+        job_id = %job_id,
+        promoted = summary.records.len(),
+        rejected = summary.rejections.len(),
+        skipped = summary.skipped,
+        "Harness write-back promotion finished"
+    );
+
+    // CW-9: every promotion run — accepted, rejection-only, zero-accept, or
+    // skipped — writes an audit event with the full write set and reasons.
+    if let Some(store) = &deps.store
+        && let Err(e) = store
+            .save_job_event(
+                job_id,
+                "harness_write_back",
+                &serde_json::json!({
+                    "promoted": summary.records,
+                    "rejected": summary.rejections,
+                    "dropped_rejections": summary.dropped_rejections,
+                    "skipped": summary.skipped,
+                    "skip_reason": summary.skip_reason,
+                }),
+            )
+            .await
+    {
+        tracing::warn!(job_id = %job_id, "Failed to persist write-back audit event: {e}");
+    }
+
+    {
+        let mut containers = deps.containers.write().await;
+        if let Some(handle) = containers.get_mut(&job_id) {
+            if let Some(harness_state) = &mut handle.harness {
+                harness_state.promotion = Some(summary);
+            }
+            handle.state = ContainerState::Stopped;
+        }
+    }
+    // The job is fully terminal: release the mounted secret values held for
+    // delivery/redaction/scanning.
+    deps.token_store.clear_harness_secrets(job_id).await;
+}
+
+/// Run the write-back promotion pipeline: screen staged files, then write
+/// accepted ones into the tenant workspace, recording the previous content
+/// hash for rollback (CW-9).
+async fn run_promotion(
+    deps: &PromotionDeps,
+    job_id: Uuid,
+    owner_id: &str,
+    staging: &std::path::Path,
+    policy: &harness::WriteBackPolicy,
+) -> harness::PromotionSummary {
+    let mut summary = harness::PromotionSummary::default();
+    // CW-10: scan staged content for the job's own mounted secret values in
+    // addition to the pattern-based leak scan.
+    let redactor = deps.token_store.harness_secret_redactor(job_id).await;
+    let plan = match harness::plan_promotion(staging, policy, redactor.as_ref()) {
+        Ok(plan) => plan,
+        Err(e) => {
+            summary.skipped = true;
+            summary.skip_reason = Some(format!("staging scan failed: {e}"));
+            return summary;
+        }
+    };
+    summary.rejections = plan.rejections;
+    summary.dropped_rejections = plan.dropped_rejections;
+    if plan.accepted.is_empty() {
+        return summary;
+    }
+
+    let Some(resolver) = &deps.workspace else {
+        summary.skipped = true;
+        summary.skip_reason =
+            Some("no workspace available for write-back promotion".to_string());
+        return summary;
+    };
+    let workspace = resolver.resolve(owner_id).await;
+    for write in plan.accepted {
+        let previous_sha256 = workspace
+            .read(&write.relative_path)
+            .await
+            .ok()
+            .map(|doc| harness::sha256_hex(doc.content.as_bytes()));
+        match workspace.write(&write.relative_path, &write.content).await {
+            Ok(_) => summary.records.push(harness::PromotionRecord {
+                relative_path: write.relative_path,
+                sha256: write.sha256,
+                previous_sha256,
+                size_bytes: write.size_bytes,
+                job_id,
+                owner_id: owner_id.to_string(),
+                promoted_at: Utc::now(),
+            }),
+            Err(e) => summary.rejections.push(harness::PromotionRejection {
+                relative_path: write.relative_path,
+                reason: format!("workspace write rejected: {e}"),
+            }),
+        }
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -1598,5 +1867,161 @@ mod tests {
                 .to_string()
                 .contains("duplicate")
         );
+    }
+
+    #[tokio::test]
+    async fn complete_job_with_harness_write_back_does_not_deadlock() {
+        // CV-1 (MR !1510): the let-chain scrutinee held a containers read
+        // guard across the promotion write lock; the first write-back
+        // completion wedged the whole container map. The timeout turns that
+        // regression into a test failure.
+        let mgr = ContainerJobManager::new(ContainerJobConfig::default(), TokenStore::new());
+        let job_id = Uuid::new_v4();
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let staging = tmp.path().join("workspace_out");
+        std::fs::create_dir_all(staging.join("projects")).unwrap(); // safety: test
+        std::fs::write(staging.join("projects/out.md"), "result").unwrap(); // safety: test
+
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                job_id,
+                ContainerHandle {
+                    job_id,
+                    // Empty container id: teardown is skipped, no Docker needed.
+                    container_id: String::new(),
+                    state: ContainerState::Running,
+                    mode: JobMode::Harness,
+                    owner_id: "owner".to_string(),
+                    mcp_servers: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    project_dir: None,
+                    task_description: "harness test".to_string(),
+                    last_worker_status: None,
+                    worker_iteration: 0,
+                    completion_result: None,
+                    harness: Some(HarnessJobState {
+                        staging_dir: Some(staging.clone()),
+                        write_back: Some(harness::WriteBackPolicy::default()),
+                        promotion: None,
+                    }),
+                },
+            );
+        }
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            mgr.complete_job(
+                job_id,
+                CompletionResult {
+                    success: true,
+                    message: None,
+                },
+            ),
+        )
+        .await
+        .expect("complete_job must not deadlock") // safety: regression guard
+        .unwrap(); // safety: test
+
+        // Promotion runs detached (CW-7): wait for the handle to settle.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let summary = loop {
+            let handle = mgr.get_handle(job_id).await.unwrap(); // safety: test
+            if handle.state == ContainerState::Stopped
+                && let Some(harness_state) = &handle.harness
+                && let Some(summary) = &harness_state.promotion
+            {
+                break summary.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached promotion did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        // No workspace resolver is configured in this manager, so the run is
+        // skipped with a recorded reason rather than silently dropped (CW-9).
+        assert!(summary.skipped);
+        assert!(
+            summary
+                .skip_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("no workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_harness_job_skips_write_back_promotion() {
+        // CW-7: promotion is a success-only path; failed jobs keep their
+        // staging out of tenant memory and record the skip.
+        let mgr = ContainerJobManager::new(ContainerJobConfig::default(), TokenStore::new());
+        let job_id = Uuid::new_v4();
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let staging = tmp.path().join("workspace_out");
+        std::fs::create_dir_all(staging.join("projects")).unwrap(); // safety: test
+        std::fs::write(staging.join("projects/out.md"), "result").unwrap(); // safety: test
+
+        {
+            let mut containers = mgr.containers.write().await;
+            containers.insert(
+                job_id,
+                ContainerHandle {
+                    job_id,
+                    container_id: String::new(),
+                    state: ContainerState::Running,
+                    mode: JobMode::Harness,
+                    owner_id: "owner".to_string(),
+                    mcp_servers: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    project_dir: None,
+                    task_description: "harness test".to_string(),
+                    last_worker_status: None,
+                    worker_iteration: 0,
+                    completion_result: None,
+                    harness: Some(HarnessJobState {
+                        staging_dir: Some(staging.clone()),
+                        write_back: Some(harness::WriteBackPolicy::default()),
+                        promotion: None,
+                    }),
+                },
+            );
+        }
+
+        mgr.complete_job(
+            job_id,
+            CompletionResult {
+                success: false,
+                message: Some("worker reported failure".to_string()),
+            },
+        )
+        .await
+        .unwrap(); // safety: test
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let summary = loop {
+            let handle = mgr.get_handle(job_id).await.unwrap(); // safety: test
+            if handle.state == ContainerState::Stopped
+                && let Some(harness_state) = &handle.harness
+                && let Some(summary) = &harness_state.promotion
+            {
+                break summary.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached finalization did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert!(summary.skipped);
+        assert!(
+            summary
+                .skip_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("did not complete successfully")
+        );
+        assert!(summary.records.is_empty());
     }
 }
