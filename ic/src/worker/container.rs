@@ -42,55 +42,110 @@ pub struct WorkerConfig {
 /// Default tmpfs secrets mount for harness jobs (WI#326).
 const DEFAULT_SECRETS_DIR: &str = "/run/secrets";
 
-/// Read harness secret files from the tmpfs mount, returning
-/// `(env_var_name, value)` pairs for child-process injection.
-///
-/// Only regular files with env-var-safe names are read. Names, values, and
-/// errors are never logged beyond a count. Reading only happens when the
-/// orchestrator opted this job into harness mode (LUNARWING_HARNESS_MODE=1),
-/// so a stray host /run/secrets is never picked up.
-fn read_secret_files() -> Vec<(String, String)> {
-    let harness_mode = std::env::var("LUNARWING_HARNESS_MODE")
+/// True when the orchestrator opted this job into harness mode
+/// (LUNARWING_HARNESS_MODE=1), so a stray host /run/secrets is never used.
+fn harness_mode_enabled() -> bool {
+    std::env::var("LUNARWING_HARNESS_MODE")
         .map(|v| v == "1")
-        .unwrap_or(false);
-    if !harness_mode {
-        return Vec::new();
-    }
-    let dir =
-        std::env::var("LUNARWING_SECRETS_DIR").unwrap_or_else(|_| DEFAULT_SECRETS_DIR.to_string());
-    let dir = std::path::Path::new(&dir);
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(read_dir) => read_dir,
-        Err(_) => return Vec::new(),
-    };
-    let mut secrets = Vec::new();
-    for entry in read_dir {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let valid = !name.is_empty()
-            && name
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| matches!(b, b'A'..=b'Z' | b'_') || (i > 0 && b.is_ascii_digit()));
-        if !valid {
-            continue;
+        .unwrap_or(false)
+}
+
+/// Expected secret file names announced by the daemon via
+/// `LUNARWING_SECRET_FILES` (comma-separated; names only, never values).
+fn expected_secret_file_names() -> Vec<String> {
+    std::env::var("LUNARWING_SECRET_FILES")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write one pulled secret value to `<dir>/<name>` with mode 0440 (CV-2).
+///
+/// Bytes are written exactly as delivered — no newline trimming, PEM files
+/// keep their trailing newline (CV-10). The name is re-validated worker-side
+/// against the env-var denylist (CV-4). Permissions are set through the open
+/// fd.
+fn write_secret_file(dir: &std::path::Path, name: &str, value: &str) -> Result<(), WorkerError> {
+    crate::orchestrator::harness::validate_secret_file_name(name).map_err(|e| {
+        WorkerError::ExecutionFailed {
+            reason: format!("harness secret file name rejected worker-side: {e}"),
         }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() || metadata.len() > 64 * 1024 {
-            continue;
-        }
-        match std::fs::read_to_string(entry.path()) {
-            Ok(value) => secrets.push((name.to_string(), value.trim_end_matches('\n').to_string())),
-            Err(_) => tracing::warn!("Failed to read a mounted secret file; skipping it"),
-        }
+    })?;
+    if value.len() > 64 * 1024 {
+        return Err(WorkerError::ExecutionFailed {
+            reason: format!("harness secret file '{name}' exceeds the 64 KiB limit"),
+        });
     }
-    if !secrets.is_empty() {
-        tracing::info!("Loaded {} secret file(s) from tmpfs mount", secrets.len());
+    let path = dir.join(name);
+    let mut file = std::fs::File::create(&path).map_err(|e| WorkerError::ExecutionFailed {
+        reason: format!("cannot write harness secret file '{name}': {e}"),
+    })?;
+    use std::io::Write;
+    file.write_all(value.as_bytes())
+        .map_err(|e| WorkerError::ExecutionFailed {
+            reason: format!("cannot write harness secret file '{name}': {e}"),
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o440))
+            .map_err(|e| WorkerError::ExecutionFailed {
+                reason: format!("cannot chmod harness secret file '{name}': {e}"),
+            })?;
     }
-    secrets
+    Ok(())
+}
+
+/// Pull the job's harness secrets over the authenticated channel and stage
+/// them onto the tmpfs mount (CV-2), then arm the value redactor (CV-7).
+///
+/// Fail-closed: unless the delivered set EXACTLY matches the daemon-announced
+/// `LUNARWING_SECRET_FILES` list, this errors and the worker exits before any
+/// job work — a job never runs with a partial secret set. Values are NEVER
+/// exported to the child-process env (CV-3); the job reads the files.
+async fn setup_harness_secrets(
+    client: &WorkerHttpClient,
+) -> Result<crate::orchestrator::harness::SecretValueRedactor, WorkerError> {
+    use secrecy::SecretString;
+
+    if !harness_mode_enabled() {
+        return Ok(crate::orchestrator::harness::SecretValueRedactor::default());
+    }
+    let expected = expected_secret_file_names();
+    let fetched = client.fetch_harness_secrets().await?;
+
+    let mut expected_set: std::collections::BTreeSet<&str> =
+        expected.iter().map(String::as_str).collect();
+    let fetched_set: std::collections::BTreeSet<&str> =
+        fetched.iter().map(|f| f.file_name.as_str()).collect();
+    if expected_set != fetched_set {
+        return Err(WorkerError::ExecutionFailed {
+            reason: format!(
+                "harness secret delivery mismatch: expected {} file(s), received {} — refusing to run with a partial secret set",
+                expected_set.len(),
+                fetched_set.len()
+            ),
+        });
+    }
+    expected_set.clear();
+
+    let dir = std::env::var("LUNARWING_SECRETS_DIR").unwrap_or_else(|_| DEFAULT_SECRETS_DIR.into());
+    let dir = std::path::PathBuf::from(dir);
+    let mut values = Vec::with_capacity(fetched.len());
+    for file in &fetched {
+        write_secret_file(&dir, &file.file_name, &file.value)?;
+        values.push(SecretString::from(file.value.clone()));
+    }
+    if !values.is_empty() {
+        tracing::info!("Staged {} harness secret file(s) onto tmpfs", values.len());
+    }
+    Ok(crate::orchestrator::harness::SecretValueRedactor::new(&values))
 }
 
 impl Default for WorkerConfig {
@@ -121,6 +176,10 @@ pub struct WorkerRuntime {
     ///
     /// Wrapped in `Arc` to avoid deep-cloning the map on every tool invocation.
     extra_env: Arc<HashMap<String, String>>,
+    /// Value-level redactor armed with the job's harness secrets (WI#326
+    /// CV-7): scrubbed from every job event before it leaves the worker.
+    /// Harness values deliberately do NOT live in `extra_env` (CV-3).
+    secret_redactor: crate::orchestrator::harness::SecretValueRedactor,
 }
 
 impl WorkerRuntime {
@@ -155,6 +214,7 @@ impl WorkerRuntime {
             safety,
             tools,
             extra_env: Arc::new(HashMap::new()),
+            secret_redactor: crate::orchestrator::harness::SecretValueRedactor::default(),
         })
     }
 
@@ -185,12 +245,6 @@ impl WorkerRuntime {
             for cred in &credentials {
                 env_map.insert(cred.env_var.clone(), cred.value.clone());
             }
-            // WI#326: harness jobs may also mount secret files on tmpfs
-            // (Docker-secrets pattern). File names double as env var names;
-            // tmpfs values take precedence over API-fetched credentials.
-            for (name, value) in read_secret_files() {
-                env_map.insert(name, value);
-            }
             self.extra_env = Arc::new(env_map);
         }
         if !credentials.is_empty() {
@@ -199,6 +253,13 @@ impl WorkerRuntime {
                 credentials.len()
             );
         }
+
+        // WI#326 CV-2/CV-3: harness secret files are pulled over the
+        // authenticated channel, staged onto the tmpfs mount (0440), and
+        // NEVER exported to the child-process env — the job reads the files.
+        // A delivery mismatch fails the worker before any job work. The
+        // redactor keeps values out of job events (CV-7).
+        self.secret_redactor = setup_harness_secrets(&self.client).await?;
 
         let owner_id = if job.owner_id.is_empty() {
             "default".to_string()
@@ -288,6 +349,7 @@ Work independently to complete this job. Report when done."#,
                 tools: self.tools.clone(),
                 extra_env: self.extra_env.clone(),
                 owner_id,
+                secret_redactor: self.secret_redactor.clone(),
                 last_output: Mutex::new(String::new()),
                 iteration_tracker: iteration_tracker.clone(),
                 consecutive_text_only: Mutex::new(0),
@@ -420,7 +482,10 @@ Work independently to complete this job. Report when done."#,
     }
 
     /// Post a job event to the orchestrator (fire-and-forget).
+    /// CV-7: harness secret values are scrubbed before anything leaves.
     async fn post_event(&self, event_type: &str, data: serde_json::Value) {
+        let mut data = data;
+        self.secret_redactor.scrub_json(&mut data);
         self.client
             .post_event(&JobEventPayload {
                 event_type: event_type.to_string(),
@@ -440,6 +505,8 @@ struct ContainerDelegate {
     tools: Arc<ToolRegistry>,
     extra_env: Arc<HashMap<String, String>>,
     owner_id: String,
+    /// CV-7 redactor armed with the job's harness secret values.
+    secret_redactor: crate::orchestrator::harness::SecretValueRedactor,
     /// Tracks the last successful tool output for the final response.
     last_output: Mutex<String>,
     /// Tracks the current iteration — shared with the outer `run` method so
@@ -483,6 +550,8 @@ fn is_post_work_chatter(text: &str) -> bool {
 
 impl ContainerDelegate {
     async fn post_event(&self, event_type: &str, data: serde_json::Value) {
+        let mut data = data;
+        self.secret_redactor.scrub_json(&mut data);
         self.client
             .post_event(&JobEventPayload {
                 event_type: event_type.to_string(),
@@ -748,36 +817,50 @@ mod tests {
     }
 
     #[test]
-    fn secret_files_require_harness_mode_and_safe_names() {
+    fn secret_file_write_keeps_exact_bytes_and_restrictive_mode() {
+        // CV-10: no newline trimming (PEM trailing newlines survive);
+        // CV-2: files land with 0440.
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let pem = "-----BEGIN TEST-----\nabc123\n-----END TEST-----\n";
+        write_secret_file(tmp.path(), "TLS_KEY", pem).unwrap(); // safety: test
+        let written = std::fs::read_to_string(tmp.path().join("TLS_KEY")).unwrap(); // safety: test
+        assert_eq!(written, pem, "secret bytes must be written exactly");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path().join("TLS_KEY"))
+                .unwrap() // safety: test
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o440);
+        }
+    }
+
+    #[test]
+    fn secret_file_write_rejects_denylisted_names() {
+        // CV-4 worker-side: even a malicious daemon response cannot land a
+        // value under LD_PRELOAD/PATH-style names or runtime prefixes.
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        for name in ["LD_PRELOAD", "PATH", "LUNARWING_TOKEN", "lower", "A-B"] {
+            assert!(
+                write_secret_file(tmp.path(), name, "value").is_err(),
+                "{name} must be rejected"
+            );
+        }
+        assert!(tmp.path().read_dir().unwrap().next().is_none()); // safety: test
+    }
+
+    #[test]
+    fn expected_secret_file_names_parse() {
         use crate::config::helpers::lock_env;
         let _guard = lock_env();
-
-        let tmp = tempfile::tempdir().unwrap(); // safety: test
-        std::fs::write(tmp.path().join("API_KEY"), "value-one\n").unwrap(); // safety: test
-        std::fs::write(tmp.path().join("lower_bad"), "nope").unwrap(); // safety: test
-        std::fs::write(tmp.path().join(".hidden"), "nope").unwrap(); // safety: test
-
         // Safety: env-var mutation requires unsafe in edition 2024;
         // lock_env() serializes concurrent access from other test threads.
-        unsafe {
-            std::env::remove_var("LUNARWING_HARNESS_MODE");
-            std::env::set_var("LUNARWING_SECRETS_DIR", tmp.path());
-        }
-        assert!(
-            read_secret_files().is_empty(),
-            "secrets are only read for harness-mode jobs"
-        );
-
-        unsafe { std::env::set_var("LUNARWING_HARNESS_MODE", "1") };
-        let secrets = read_secret_files();
-        assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0].0, "API_KEY");
-        assert_eq!(secrets[0].1, "value-one");
-
-        unsafe {
-            std::env::remove_var("LUNARWING_HARNESS_MODE");
-            std::env::remove_var("LUNARWING_SECRETS_DIR");
-        }
+        unsafe { std::env::set_var("LUNARWING_SECRET_FILES", "API_KEY, OTHER_TOKEN ,") };
+        assert_eq!(expected_secret_file_names(), vec!["API_KEY", "OTHER_TOKEN"]);
+        unsafe { std::env::remove_var("LUNARWING_SECRET_FILES") };
+        assert!(expected_secret_file_names().is_empty());
     }
 
     #[test]
