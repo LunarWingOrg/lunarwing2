@@ -130,7 +130,7 @@ class LockDeltaTests(unittest.TestCase):
         self.assertIn('"${PEBBLE_LOCK_SHA256}"', dockerfile)
         self.assertIn("git python3", dockerfile)
         build_script = (ROOT / ".gitlab/scripts/build-worker-image.sh").read_text(encoding="utf-8")
-        self.assertIn("pebble4lunarwing/scripts/verify_upstream_lock.py'", build_script)
+        self.assertIn("pebble4lunarwing/scripts/verify_upstream_lock.py\n", build_script)
         self.assertNotIn("PEBBLE_LOCK_SHA256=", build_script)  # CI uses the reviewed default too.
 
     def test_matching_digest_does_not_authorize_package_addition(self):
@@ -152,6 +152,51 @@ class LockDeltaTests(unittest.TestCase):
                 self.assertEqual(build["context"], "..")
                 self.assertEqual(build["dockerfile"], "pebble4lunarwing/Dockerfile")
                 self.assertNotIn("PEBBLE_LOCK_SHA256", build.get("args", {}))
+
+
+class TaskShellToolchainPathTests(unittest.TestCase):
+    """WI#334: the pebble task shell must keep cargo/go on PATH even when
+    upstream's shell tool resets the environment (login/sanitised shell)."""
+
+    def setUp(self):
+        self.dockerfile = (ROOT / "pebble4lunarwing/Dockerfile").read_text(encoding="utf-8")
+
+    def test_dockerfile_installs_reset_proof_toolchain_anchors(self):
+        # Login shells: /etc/profile.d snippet restores the toolchain env.
+        self.assertIn(
+            "COPY pebble4lunarwing/scripts/toolchain-profile.sh /etc/profile.d/lunarwing-toolchain.sh",
+            self.dockerfile,
+        )
+        # Sanitised shells: real-binary symlinks under /usr/local/bin and a
+        # rustup wrapper that re-exports RUSTUP_HOME/CARGO_HOME.
+        for line in (
+            'ln -s "${toolchain_bins}/cargo" /usr/local/bin/cargo',
+            'ln -s "${toolchain_bins}/rustc" /usr/local/bin/rustc',
+            'ln -s /usr/local/go/bin/go /usr/local/bin/go',
+            "install -m 0755 /usr/local/share/lunarwing/rustup-wrapper.sh /usr/local/bin/rustup",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(line, self.dockerfile)
+        # Build-time proof: a scrubbed login shell still runs the toolchains.
+        self.assertIn("env -i bash -lc 'cargo --version && rustc --version && go version && rustup --version'", self.dockerfile)
+
+    def test_anchor_scripts_exist_with_expected_content(self):
+        profile = (ROOT / "pebble4lunarwing/scripts/toolchain-profile.sh").read_text(encoding="utf-8")
+        for needle in ("/usr/local/cargo/bin", "/usr/local/go/bin", "RUSTUP_HOME", "CARGO_HOME", "GOROOT", "GOPATH"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, profile)
+        wrapper = (ROOT / "pebble4lunarwing/scripts/rustup-wrapper.sh").read_text(encoding="utf-8")
+        self.assertIn('exec /usr/local/cargo/bin/rustup "$@"', wrapper)
+        smoke = (ROOT / "pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh").read_text(encoding="utf-8")
+        for needle in ("env -i bash -lc", "cargo --version", "go version"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, smoke)
+
+    def test_ci_image_build_tracks_the_new_inputs(self):
+        build_script = (ROOT / ".gitlab/scripts/build-worker-image.sh").read_text(encoding="utf-8")
+        for path in ("pebble4lunarwing/scripts/toolchain-profile.sh", "pebble4lunarwing/scripts/rustup-wrapper.sh"):
+            with self.subTest(path=path):
+                self.assertIn(path, build_script)
 
 
 class BuildInputInventoryTests(unittest.TestCase):
