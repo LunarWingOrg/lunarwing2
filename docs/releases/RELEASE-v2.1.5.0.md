@@ -558,7 +558,7 @@ wasm-encoder/wasmparser 0.261.0, wast/wat 261.0.0, among others), and
 patch restored and re-verified.
 
 The crate-security re-audit (see
-[the audit document](docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md)) audited the
+[the audit document](docs/ops/history/v2.1.5.0_CARGO_DENY_AUDIT.md)) audited the
 full `--workspace --all-features` graph — a superset of every CI compile
 graph — plus all 26 satellite manifest roots, with the advisory database at
 `ef6173c` (2026-10-03). The honest posture: **six vulnerability advisories,
