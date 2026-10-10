@@ -1124,9 +1124,11 @@ mode = "cron"
             "per-second schedule must not pass the floor"
         );
         assert!(
-            resolve_cron_worker("schedule = \"* * * * *\"\ngoal = \"g\"").is_none(),
-            "per-minute schedule must not pass the floor"
+            resolve_cron_worker("schedule = \"*/30 * * * * *\"\ngoal = \"g\"").is_none(),
+            "30-second schedule must not pass the floor"
         );
+        // The floor is 60s, so a per-minute schedule is allowed.
+        assert!(resolve_cron_worker("schedule = \"* * * * *\"\ngoal = \"g\"").is_some());
     }
 
     #[test]

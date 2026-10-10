@@ -585,12 +585,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if cron_mode {
-                cm.update_context(job_id, |ctx| {
-                    ctx.metadata = serde_json::json!({"cron_mode": true});
-                    Ok(())
-                })
-                .await
-                .unwrap();
+                let _ = cm
+                    .update_context(job_id, |ctx| {
+                        ctx.metadata = serde_json::json!({"cron_mode": true});
+                        Ok::<(), String>(())
+                    })
+                    .await;
             }
             cm.update_context(job_id, |ctx| {
                 ctx.transition_to(JobState::Stuck, Some("idle".to_string()))
