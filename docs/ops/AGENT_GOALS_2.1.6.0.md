@@ -31,21 +31,21 @@
 
 ## Phase 2 — Features & Polish (for goals referencing work items, read comments on work items as well)
 
-3. [ ] audit all crates and ensure there are no security vulnerabilities
+3. [ ] audit all crates and ensure there are no security vulnerabilities - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1505
 4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298 - Brightdawn confirmed close now
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
-7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326
-8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329
-10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/330
-11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331
+5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1506
+6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1509
+7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1510
+8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1508
+9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1512
+10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/330 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1511
+11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1513
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/332
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
 
-13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/334
-14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/337
+13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/334 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1514
+14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/337 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1515
 15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/338
 16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/339
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/341
