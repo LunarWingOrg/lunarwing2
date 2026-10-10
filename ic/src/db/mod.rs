@@ -82,20 +82,13 @@ pub async fn connect_with_handles(
             let default_path = crate::config::default_libsql_path();
             let db_path = config.libsql_path.as_deref().unwrap_or(&default_path);
 
-            let backend = if let Some(ref url) = config.libsql_url {
-                let token = config.libsql_auth_token.as_ref().ok_or_else(|| {
-                    DatabaseError::Pool(
-                        "LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set".to_string(),
-                    )
-                })?;
-                libsql::LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret())
-                    .await
-                    .map_err(|e| DatabaseError::Pool(e.to_string()))?
-            } else {
-                libsql::LibSqlBackend::new_local(db_path)
-                    .await
-                    .map_err(|e| DatabaseError::Pool(e.to_string()))?
-            };
+            let backend = libsql::LibSqlBackend::from_config_parts(
+                db_path,
+                config.libsql_url.as_deref(),
+                config.libsql_auth_token.as_ref().map(|t| t.expose_secret()),
+            )
+            .await
+            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
             backend.run_migrations().await?;
             tracing::debug!("libSQL database connected and migrations applied");
 
@@ -140,20 +133,13 @@ pub async fn create_secrets_store(
             let default_path = crate::config::default_libsql_path();
             let db_path = config.libsql_path.as_deref().unwrap_or(&default_path);
 
-            let backend = if let Some(ref url) = config.libsql_url {
-                let token = config.libsql_auth_token.as_ref().ok_or_else(|| {
-                    DatabaseError::Pool(
-                        "LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set".to_string(),
-                    )
-                })?;
-                libsql::LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret())
-                    .await
-                    .map_err(|e| DatabaseError::Pool(e.to_string()))?
-            } else {
-                libsql::LibSqlBackend::new_local(db_path)
-                    .await
-                    .map_err(|e| DatabaseError::Pool(e.to_string()))?
-            };
+            let backend = libsql::LibSqlBackend::from_config_parts(
+                db_path,
+                config.libsql_url.as_deref(),
+                config.libsql_auth_token.as_ref().map(|t| t.expose_secret()),
+            )
+            .await
+            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
             backend.run_migrations().await?;
 
             Ok(Arc::new(crate::secrets::LibSqlSecretsStore::new(
@@ -202,20 +188,13 @@ pub async fn connect_without_migrations(
             let default_path = crate::config::default_libsql_path();
             let db_path = config.libsql_path.as_deref().unwrap_or(&default_path);
 
-            let backend = if let Some(ref url) = config.libsql_url {
-                let token = config.libsql_auth_token.as_ref().ok_or_else(|| {
-                    DatabaseError::Pool(
-                        "LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set".to_string(),
-                    )
-                })?;
-                libsql::LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret())
-                    .await
-                    .map_err(|e| DatabaseError::Pool(e.to_string()))?
-            } else {
-                libsql::LibSqlBackend::new_local(db_path)
-                    .await
-                    .map_err(|e| DatabaseError::Pool(e.to_string()))?
-            };
+            let backend = libsql::LibSqlBackend::from_config_parts(
+                db_path,
+                config.libsql_url.as_deref(),
+                config.libsql_auth_token.as_ref().map(|t| t.expose_secret()),
+            )
+            .await
+            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
 
             handles.libsql_db = Some(backend.shared_db());
 
