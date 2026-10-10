@@ -27,7 +27,12 @@
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326
-8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328
+8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328
+  - DONE (daemon + gateway side, 2026-10-10): runtime control channel for RUNNING external worker jobs implemented over the existing per-task `lunarwing-agent-v1` WebSocket — no new worker sockets, worker stays egress-restricted; transport differs from the WI's file-queue sketch but delivers identical semantics (queued, daemon→worker, no mid-frame injection) and matches how the daemon actually talks to workers today.
+  - Protocol: new `task_prompt` envelope (`{task_id, seq, prompt, done}` — monotonic per-job seq, `done` = wrap-up signal) and `task_prompt_ack` receipt (`{task_id, seq, accepted?}`); older workers interop cleanly (unknown types ignored, missing acks tolerated). Documented in `docs/ops/WORKER-CONTAINERS.md`.
+  - Daemon: `ExternalWorkerManager::send_prompt` validates daemon-side (text-only, 16 KiB cap, no NUL), enqueues per-job, delivers from the task read loop; enqueue/deliver/ack all persisted to the job event log (`control_prompt`/`control_ack`); prompts do not extend the job timeout budget. New `ExternalWorkerTaskNotActive` error variant.
+  - Surfaces: `job_prompt` tool now routes `external:` jobs to the control channel instead of rejecting; web gateway `POST /api/jobs/{id}/prompt` routes external jobs likewise and job detail reports `can_prompt` for running external jobs.
+  - Verify: `cargo clippy --all --benches --tests --examples -- -D warnings` clean; 46/46 external_worker tests, 45/45 job tool tests, 30/30 web multi_tenant tests pass (incl. 6 new control-channel unit tests + 1 new web routing test). Worker-bridge consumption of `task_prompt` (pebble/opencode/kimi/harness repos) is follow-up work outside this repo.
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/330
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331
