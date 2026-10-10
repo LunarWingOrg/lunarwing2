@@ -179,6 +179,14 @@ impl SelfRepair for DefaultSelfRepair {
             if let Ok(ctx) = self.context_manager.get_context(job_id).await
                 && matches!(ctx.state, JobState::Stuck | JobState::InProgress)
             {
+                // WI#325: cron tick jobs carry their own heartbeat watchdog in
+                // the cron supervisor (default 900s, well above the self-repair
+                // stuck threshold). Repairing them here would double-cancel the
+                // tick and spam the owner with "Job ... was stuck" notices for a
+                // recovery the supervisor is already performing.
+                if ctx.metadata.get("cron_mode") == Some(&serde_json::Value::Bool(true)) {
+                    continue;
+                }
                 // InProgress jobs detected by threshold need to be transitioned
                 // to Stuck before they can be repaired (attempt_recovery requires
                 // Stuck state). These jobs already passed the threshold check in
@@ -561,6 +569,41 @@ mod tests {
         let stuck = repair.detect_stuck_jobs().await;
         assert_eq!(stuck.len(), 1);
         assert_eq!(stuck[0].job_id, job_id);
+    }
+
+    /// WI#325: cron tick jobs are supervised by the cron mission supervisor's
+    /// own heartbeat watchdog; self-repair must leave them alone.
+    #[tokio::test]
+    async fn detect_stuck_jobs_skips_cron_mode_jobs() {
+        let cm = Arc::new(ContextManager::new(10));
+        let cron_job = cm.create_job("Cron tick", "desc").await.unwrap();
+        let normal_job = cm.create_job("Normal job", "desc").await.unwrap();
+
+        for (job_id, cron_mode) in [(cron_job, true), (normal_job, false)] {
+            cm.update_context(job_id, |ctx| ctx.transition_to(JobState::InProgress, None))
+                .await
+                .unwrap()
+                .unwrap();
+            if cron_mode {
+                cm.update_context(job_id, |ctx| {
+                    ctx.metadata = serde_json::json!({"cron_mode": true});
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+            cm.update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::Stuck, Some("idle".to_string()))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        let repair = DefaultSelfRepair::new(cm, Duration::from_secs(0), 3);
+        let stuck = repair.detect_stuck_jobs().await;
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].job_id, normal_job);
     }
 
     #[tokio::test]
