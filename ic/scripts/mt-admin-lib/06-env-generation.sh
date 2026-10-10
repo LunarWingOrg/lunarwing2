@@ -934,6 +934,23 @@ write_tenant_lunarwing_env() {
   [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$path" KIMI_API_KEY)"
   [[ -n "$opencode2_model" ]]    || opencode2_model="$(_env_existing "$path" OPENCODE2_MODEL)"
   [[ -n "$opencode2_base_url" ]] || opencode2_base_url="$(_env_existing "$path" OPENCODE2_BASE_URL)"
+  # WI#330: the worker images ship a placeholder LLM endpoint their entrypoints
+  # refuse to run, so an unset worker base URL can no longer fall through to a
+  # baked developer-LAN/MagicDNS default. Inherit the tenant's own LLM endpoint
+  # instead: an explicit --llm-base-url (or LUNARWING_MT_LLM_BASE_URL) wins,
+  # else the tenant's TensorZero upstream. The daemon's proxy-loopback default
+  # (llm_base_url_effective) is deliberately NOT used here — worker containers
+  # cannot reach host loopback — and the value must be container-routable
+  # (overlay/LAN IP or public DNS, not a MagicDNS name).
+  local worker_llm_base_default
+  if [[ -n "$llm_base_url" ]]; then
+    worker_llm_base_default="$llm_base_url"
+  else
+    worker_llm_base_default="$(tensorzero_openai_base "$tensorzero_url")"
+  fi
+  [[ -n "$opencode_base_url" ]]  || opencode_base_url="$worker_llm_base_default"
+  [[ -n "$kimi_base_url" ]]      || kimi_base_url="$worker_llm_base_default"
+  [[ -n "$opencode2_base_url" ]] || opencode2_base_url="$worker_llm_base_default"
   study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
   study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
   study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
