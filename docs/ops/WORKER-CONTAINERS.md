@@ -597,6 +597,15 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 
 All worker images use the `lunarwing-agent-v1` WebSocket subprotocol; the legacy `ironclaw-agent-v1` alias is no longer accepted. Messages are JSON envelopes with `id`, `type`, `timestamp`, `payload`. The worker sends `ready` on connect, receives `task_request`, streams `task_progress`, and sends a final `task_result`.
 
+### Runtime control channel (WI#328)
+
+External worker jobs are no longer fire-and-forget: while a task runs, the daemon can deliver follow-up prompts and text directives into it over the same per-task WebSocket connection. Two envelope types extend the protocol:
+
+- `task_prompt` (daemon → worker): `{task_id, seq, prompt, done}`. `prompt` is follow-up instruction text (TEXT directives only — validated daemon-side before enqueue; no shell/exec passthrough, 16 KiB cap, no NUL bytes). `seq` is monotonic per job for ordering and at-least-once dedupe. `done: true` signals "no more prompts coming, wrap up cleanly". Workers should consume queued prompts between turns/LLM calls — never mid-call.
+- `task_prompt_ack` (worker → daemon): `{task_id, seq, accepted?}` — the delivery receipt completing at-least-once semantics.
+
+Interop: older workers that never send `task_prompt_ack` still function — the daemon tolerates missing acks (prompts are delivered over the ordered WebSocket regardless) and ignores unknown message types, and newer workers must likewise ignore `task_prompt` if they do not implement prompting. Enqueued prompts do **not** extend the task's timeout/fuel budget. Every enqueue/deliver/ack is persisted in the job event log (`control_prompt` / `control_ack` event types) for an auditable control history. From the agent side this is surfaced through `job_prompt`, which now routes `external:`-mode jobs to the control channel instead of rejecting them.
+
 ### Upgrade ordering
 
 Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers only `lunarwing-agent-v1` and cannot connect to a worker container that still only accepts the legacy name — every dispatch to such a worker fails the WebSocket upgrade (HTTP 400, no echoed subprotocol) and surfaces as an external-worker connection failure whose reason includes the `lunarwing-agent-v1` / `ironclaw-agent-v1` hint. Workers are protocol-compatible in the other direction (2.1.1 workers accept the primary name only, which pre-2.1.1 daemons also offer), so the safe upgrade order is **workers first, then the daemon**, or — simplest — recreate worker containers in the same maintenance window as the daemon. mt-admin managed upgrades (`build-tenant`, `build-pebble-worker`, `build-opencode-worker`, `build-kimi-worker`) already rebuild and recreate worker containers as part of a tenant upgrade; only manual deployments can strand a legacy-only worker.
