@@ -248,7 +248,14 @@ async fn run_tick(
     loop {
         let job_id = Uuid::new_v4();
         dispatch_tick_job(
-            manager, worker, cron, mission_id, tick_index, chain_index, job_id, owner_id,
+            manager,
+            worker,
+            cron,
+            mission_id,
+            tick_index,
+            chain_index,
+            job_id,
+            owner_id,
         )
         .await;
 

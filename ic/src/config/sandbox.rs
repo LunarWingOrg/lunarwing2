@@ -905,7 +905,10 @@ max_reentries = 5
         assert_eq!(cron.schedule, "0 15 10 * * *");
         assert_eq!(cron.goal, "Produce the daily PR digest");
         assert_eq!(cron.resolved_mission_id("kimi"), "pr-digest");
-        assert_eq!(cron.heartbeat_timeout(), std::time::Duration::from_secs(300));
+        assert_eq!(
+            cron.heartbeat_timeout(),
+            std::time::Duration::from_secs(300)
+        );
         assert_eq!(cron.tick_timeout_ms(worker.timeout_ms), 1_800_000);
         assert_eq!(cron.max_reentries(), 5);
     }
@@ -934,6 +937,9 @@ goal = "Watch the herd"
             std::time::Duration::from_secs(CronWorkerConfig::DEFAULT_HEARTBEAT_TIMEOUT_SECS)
         );
         assert_eq!(cron.tick_timeout_ms(3_600_000), 3_600_000);
-        assert_eq!(cron.max_reentries(), CronWorkerConfig::DEFAULT_MAX_REENTRIES);
+        assert_eq!(
+            cron.max_reentries(),
+            CronWorkerConfig::DEFAULT_MAX_REENTRIES
+        );
     }
 }

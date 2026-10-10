@@ -45,8 +45,7 @@ use uuid::Uuid;
 
 use lunarwing::channels::web::types::SseEvent;
 use lunarwing::config::{
-    CronWorkerConfig, ExternalWorkerConfig, ExternalWorkerMode, LoadBalanceStrategy,
-    WorkerEndpoint,
+    CronWorkerConfig, ExternalWorkerConfig, ExternalWorkerMode, LoadBalanceStrategy, WorkerEndpoint,
 };
 use lunarwing::context::{ContextManager, JobContext, JobState};
 use lunarwing::error::OrchestratorError;
