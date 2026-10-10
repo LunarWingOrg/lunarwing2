@@ -67,8 +67,8 @@
 25. [x] (S) (H MR) release alpha of droid and desk repo projs
 26. [x] (S) RESERVED
 27. [x] (S) RESERVED
-28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5426 for latest master pipeline run and see if anything is not GREEN
-29. [x] (S) RESERVED
+28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5437 for latest master pipeline run and see if anything is not GREEN
+29. [x] (S) (H) MASCOT ANIMS
 30. [x] (S) RESERVED
 31. [x] (S) RESERVED
 32. [x] (S) RESERVED
