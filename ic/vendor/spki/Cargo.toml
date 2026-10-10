@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "spki"
-version = "0.8.0"
+version = "0.8.1"
 authors = ["RustCrypto Developers"]
 build = false
 autolib = false
@@ -95,7 +95,7 @@ optional = true
 default-features = false
 
 [dependencies.der]
-version = "0.8"
+version = "0.8.2"
 features = ["oid"]
 
 [dependencies.digest]
@@ -123,7 +123,6 @@ cast_precision_loss = "warn"
 cast_sign_loss = "warn"
 checked_conversions = "warn"
 doc_markdown = "warn"
-from_iter_instead_of_collect = "warn"
 implicit_saturating_sub = "warn"
 manual_assert = "warn"
 map_unwrap_or = "warn"

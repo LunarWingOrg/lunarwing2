@@ -264,22 +264,21 @@ fn allowlisted_divergence(input: &str, tier1_output: &str, tier2_output: &str, i
     let mut candidate1 = tier1_output.to_string();
     let mut candidate2 = tier2_output.to_string();
 
-    // ~keep Root cause: an `<h1>`-`<h6>` heading whose content includes an `<img>`
-    // ~keep (Tier-2's heading handler renders bare alt text, never `![alt](src)`
-    // ~keep markdown; Tier-1 always emits the full image markdown) and/or a `<br>`
-    // ~keep (Tier-2 leaves the hard-break's two-space prefix with no following
+    // ~keep Root cause: an `<h1>`-`<h6>` heading whose content includes a `<br>`.
+    // ~keep Tier-2 leaves the hard-break's two-space prefix with no following
     // ~keep newline verbatim in the single-line ATX heading; Tier-1 collapses it to
-    // ~keep one space). Scoped to lines starting with `#`.
-    if input.contains("<h1")
-        || input.contains("<h2")
-        || input.contains("<h3")
-        || input.contains("<h4")
-        || input.contains("<h5")
-        || input.contains("<h6")
+    // ~keep one space. Scoped to lines starting with `#`.
+    if input.contains("<br")
+        && (input.contains("<h1")
+            || input.contains("<h2")
+            || input.contains("<h3")
+            || input.contains("<h4")
+            || input.contains("<h5")
+            || input.contains("<h6"))
     {
         candidate1 = canonicalize_heading_lines(&candidate1);
         candidate2 = canonicalize_heading_lines(&candidate2);
-        applied.push("heading-inline-image-and-br");
+        applied.push("heading-br");
     }
 
     // ~keep Root cause: two of {blockquote, `<hr>`, table, top-level list item}
@@ -361,16 +360,12 @@ fn depad_table_row(line: &str) -> String {
 
 fn canonicalize_heading_lines(text: &str) -> String {
     fn canonicalize_heading_line(line: &str) -> String {
-        static IMAGE: OnceLock<regex::Regex> = OnceLock::new();
         static SPACES: OnceLock<regex::Regex> = OnceLock::new();
         if !line.starts_with('#') {
             return line.to_string();
         }
-        let image_re =
-            IMAGE.get_or_init(|| regex::Regex::new(r"!\[([^\]]*)\]\([^)]*\)").expect("image regex compiles"));
-        let alt_only = image_re.replace_all(line, "$1");
         let spaces_re = SPACES.get_or_init(|| regex::Regex::new(r" {2,}").expect("spaces regex compiles"));
-        spaces_re.replace_all(&alt_only, " ").into_owned()
+        spaces_re.replace_all(line, " ").into_owned()
     }
     text.lines()
         .map(canonicalize_heading_line)

@@ -9,13 +9,13 @@
 
 use std::borrow::Cow;
 
+use crate::converter::block::container::HandlerContext;
 use crate::converter::dom_context::DomContext;
 use crate::converter::main_helpers::{has_more_than_one_char, is_ascii_whitespace_only, is_inline_element};
 use crate::converter::utility::siblings::{
     FollowingContent, br_follows_enclosing_elements, following_sibling_content, get_next_sibling_tag,
     get_previous_sibling_tag, next_sibling_is_inline_tag, previous_sibling_is_inline_tag,
 };
-use crate::options::ConversionOptions;
 use crate::text;
 #[cfg(feature = "visitor")]
 use crate::visitor::EMPTY_ATTRS;
@@ -30,467 +30,548 @@ type Context = crate::converter::Context;
 /// - Text escaping with configurable escape modes
 /// - Visitor callbacks (when feature enabled)
 /// - List item indentation
-#[allow(clippy::too_many_lines)]
 #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
 pub fn process_text_node(
     raw: &str,
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
+    handler: HandlerContext<'_>,
 ) {
-    let mut text = text::decode_html_entities_cow(raw);
-
-    if text.is_empty() {
-        return;
+    TextProcessor {
+        node_handle,
+        parser,
+        output,
+        handler,
     }
+    .process(raw);
+}
 
-    let text_ref = text.as_ref();
-    let had_newlines = text_ref.contains('\n');
-    let has_double_newline = text_ref.contains("\n\n") || text_ref.contains("\r\n\r\n");
+struct WhitespaceFacts {
+    had_newlines: bool,
+    has_double_newline: bool,
+    was_fresh_block_start: bool,
+}
 
-    if options.strip_newlines && (text.contains('\r') || text.contains('\n')) {
-        text = Cow::Owned(text.replace(['\r', '\n'], " "));
+struct ProcessedText {
+    output: String,
+    semantic: Option<String>,
+}
+
+impl ProcessedText {
+    fn same(text: String, capture_semantic: bool) -> Self {
+        Self {
+            semantic: capture_semantic.then(|| text.clone()),
+            output: text,
+        }
     }
+}
 
-    // ~keep Captured before any write below flips it: this is the one true "does real
-    // ~keep content already precede this text node" signal (see `Context::at_fresh_block_start`).
-    // ~keep Unlike comparing `output.len()` to `ctx.block_content_start`, it stays correct
-    // ~keep even when `output` is a fresh local `String` an inline wrapper (sub/sup/em/...)
-    // ~keep is building its content into, because it is shared via `Rc<Cell<bool>>` rather
-    // ~keep than inferred from whichever buffer happens to be passed in.
-    let was_fresh_block_start = ctx.at_fresh_block_start.get();
+struct TextProcessor<'dom, 'output, 'handler> {
+    node_handle: &'dom tl::NodeHandle,
+    parser: &'dom tl::Parser<'dom>,
+    output: &'output mut String,
+    handler: HandlerContext<'handler>,
+}
 
-    if text.trim().is_empty() {
-        if ctx.in_code {
-            output.push_str(text.as_ref());
+impl TextProcessor<'_, '_, '_> {
+    fn process(&mut self, raw: &str) {
+        let mut decoded = text::decode_html_entities_cow(raw);
+        if decoded.is_empty() {
             return;
         }
-
-        if options.whitespace_mode == crate::options::WhitespaceMode::Strict {
-            if ctx.convert_as_inline || ctx.in_table_cell || ctx.in_list_item {
-                output.push_str(text.as_ref());
-                return;
-            }
-            if has_double_newline {
-                if !output.ends_with("\n\n") {
-                    output.push('\n');
-                }
-                return;
-            }
-            output.push_str(text.as_ref());
-            return;
-        }
-
-        // ~keep The `block_output_ptr` address check guards against a false match on a
-        // ~keep nested inline wrapper's (em/strong/link) fresh, empty SCRATCH buffer:
-        // ~keep `walk_node` builds each such wrapper's content into its own local `String`
-        // ~keep before splicing it into the real output (see `Context::block_output_ptr`'s
-        // ~keep and `Context::at_fresh_block_start`'s doc comments for the general shape of
-        // ~keep this hazard), so that buffer's length can coincidentally equal the ANCESTOR
-        // ~keep paragraph's `block_content_start` even when real content already precedes
-        // ~keep this point in the actual document -- e.g. `<p>A<i> </i>B</p>`, where the
-        // ~keep space inside `<i>` sees its own buffer at length 0, identical to the
-        // ~keep paragraph's block_content_start of 0, and was wrongly dropped entirely
-        // ~keep rather than surviving as the one space `<i>`'s own whitespace-only handling
-        // ~keep (`chomp_inline`) expects to receive (issue #481). An `inline_depth == 0`
-        // ~keep guard was tried and reverted: it also blocked the legitimate case of a
-        // ~keep genuinely block-level, buffer-sharing paragraph sitting at non-zero
-        // ~keep `inline_depth` because a stray tag-soup `<b>`/`<a>` wraps WHOLE paragraphs
-        // ~keep (Google Docs export artifact) -- `inline_depth` conflates "wrapped by an
-        // ~keep inline ancestor" with "writing into that ancestor's detached scratch
-        // ~keep buffer", and only the latter is what this check needs to exclude.
-        if ctx.in_paragraph
-            && std::ptr::from_ref::<String>(output) as usize == ctx.block_output_ptr
-            && output.len() == ctx.block_content_start
-        {
-            return;
-        }
-
-        // ~keep CommonMark 4.8: leading whitespace at the very start of a block is
-        // ~keep insignificant, with or without a newline in it. `<div>`/unknown tags,
-        // ~keep `<style>`/`<textarea>`, and a stray closing tag never set `in_paragraph`,
-        // ~keep so the check above never protected them — a lone leading space (no
-        // ~keep newline) before e.g. `<div>` fell straight through to the verbatim-push
-        // ~keep fallback below and survived into the output, breaking round-trip
-        // ~keep stability. `in_table_cell`/`in_list_item`/`convert_as_inline` keep their
-        // ~keep existing dedicated handling further down, untouched.
-        if was_fresh_block_start && !ctx.convert_as_inline && !ctx.in_table_cell && !ctx.in_list_item {
-            return;
-        }
-
-        if had_newlines {
-            if output.is_empty() {
-                // ~keep An empty buffer is not always the start of the document: an inline
-                // ~keep wrapper (b/i/span/...) builds its body into a fresh local `String`, so a
-                // ~keep newline-only text node reaching it -- `<b><span>\n</span></b>`,
-                // ~keep `Alpha<i>\n</i>Beta` -- sees length 0 while real content already
-                // ~keep precedes it in the document. Dropping it there welded the words on
-                // ~keep either side together (issue #502). Surface it as the one space a
-                // ~keep whitespace-only body is worth; the wrapper's `chomp_inline` collapses
-                // ~keep it and `emit_wrapped_inline` still suppresses it after an existing
-                // ~keep space. `was_fresh_block_start` is the document-start guard: nothing
-                // ~keep precedes the node then, so nothing needs separating. `inline_depth`
-                // ~keep (raised by emphasis and link handlers) rather than a buffer-address
-                // ~keep test: a table cell or heading also renders into a fresh buffer, and
-                // ~keep a space there is leading whitespace, not a separator -- it made a
-                // ~keep cell's first `<div>` read as a continuation and emit `<br>`.
-                if !was_fresh_block_start && ctx.inline_depth > 0 {
-                    output.push(' ');
-                }
-                return;
-            }
-            if !output.ends_with("\n\n") {
-                // ~keep A run that mixes a newline with a more "significant" Unicode
-                // ~keep whitespace character (a decoded `&nbsp;`, thin space, etc.) is
-                // ~keep still whitespace-only by `str::trim`'s definition, but a compliant
-                // ~keep HTML renderer's own pretty-printing can insert a leading `\n` in
-                // ~keep front of this exact same content at any time (a rendered `<br>` is
-                // ~keep always followed by a literal newline before its next text node).
-                // ~keep Every branch below used to collapse a lone significant character to
-                // ~keep a bare separating space -- or drop it outright when no separator was
-                // ~keep needed -- which meant identical logical content survived or vanished
-                // ~keep depending only on whether the HTML happened to be pretty-printed,
-                // ~keep breaking round-trip stability. A lone significant character now
-                // ~keep survives verbatim in every branch; more than one still collapses to
-                // ~keep a single space.
-                let significant: String = text
-                    .as_ref()
-                    .chars()
-                    .filter(|c| !matches!(c, ' ' | '\t' | '\n' | '\r'))
-                    .collect();
-                let lone_significant_char = (!has_more_than_one_char(&significant))
-                    .then(|| significant.chars().next())
-                    .flatten();
-
-                let next_tag = get_next_sibling_tag(node_handle, parser, dom_ctx);
-                if let Some(next_tag) = next_tag {
-                    if is_inline_element(next_tag) {
-                        if let Some(ch) = lone_significant_char {
-                            output.push(ch);
-                        } else if !output.ends_with(' ') && !output.ends_with('\n') {
-                            output.push(' ');
-                        }
-                        return;
-                    }
-                } else if let Some(ch) = lone_significant_char {
-                    // ~keep This text node has no next sibling at all -- it is the tail of
-                    // ~keep its parent's content -- so there is no "needs a separating
-                    // ~keep space before the next word" question to ask; the lone
-                    // ~keep significant character is preserved unconditionally.
-                    output.push(ch);
-                    return;
-                } else if newline_span_needs_separating_space(node_handle, parser, dom_ctx)
-                    && !output.ends_with(' ')
-                    && !output.ends_with('\n')
-                {
-                    // ~keep issue #430: a lone "\n" inside an inline wrapper (e.g. a
-                    // ~keep <span>) has no in-parent next sibling, but when that wrapper
-                    // ~keep is itself followed by inline content the newline still
-                    // ~keep separates words — collapse it to a single space.
-                    output.push(' ');
-                    return;
-                } else if !significant.is_empty() && !output.ends_with(' ') && !output.ends_with('\n') {
-                    output.push(' ');
-                    return;
-                }
-            }
-            return;
-        }
-
-        // ~keep A single-whitespace-character text node (typically the sole survivor of a
-        // ~keep `<script>`/`<style>` removal that had to insert its own separating space --
-        // ~keep see `preprocessing.rs`'s "neither side already has whitespace" guard --
-        // ~keep landing next to a real, already-emitted trailing space) must still check
-        // ~keep `output.ends_with(' ')` before pushing, exactly like the multi-char run just
-        // ~keep above: otherwise two independently-legitimate single spaces stack into a
-        // ~keep literal double space that only the first Markdown->HTML->Markdown hop
-        // ~keep collapses back down, breaking round-trip stability.
-        // ~keep CommonMark 4.8 / 6.9: a run of ASCII whitespace at the start of a line is
-        // ~keep never content -- at best it is stripped, at worst four of them open an indented
-        // ~keep code block. `<p>P</p><div><span>    </span><img ...></div>` reached the
-        // ~keep verbatim fallbacks below with `output` ending in "\n\n" and rendered
-        // ~keep `    ![A](S)` (issue #501): the #460 guard above is `in_paragraph`-only and
-        // ~keep `<div>` never sets it. Only genuine formatting whitespace is dropped; a run
-        // ~keep carrying a significant character (a decoded `&nbsp;`) still falls through.
-        // ~keep Judged on the block's own buffer only: an inline wrapper's empty scratch
-        // ~keep buffer (`<p>A<ins> </ins>B</p>`) is not a line start, and its one space must
-        // ~keep reach `chomp_inline` (issue #481) -- `emit_wrapped_inline` applies this same
-        // ~keep line-start rule when it splices the wrapper back in.
-        if is_ascii_whitespace_only(text.as_ref())
-            && std::ptr::from_ref::<String>(output) as usize == ctx.block_output_ptr
-            && (output.is_empty() || output.ends_with('\n'))
-        {
-            return;
-        }
-
-        if previous_sibling_is_inline_tag(node_handle, parser, dom_ctx)
-            && next_sibling_is_inline_tag(node_handle, parser, dom_ctx)
-        {
-            if has_more_than_one_char(text.as_ref()) {
-                // ~keep A run collapses to one plain space only when it is genuinely ASCII
-                // ~keep formatting whitespace. A run that is -- or contains -- a decoded
-                // ~keep `&nbsp;`/other significant Unicode whitespace trims to empty under
-                // ~keep `str::trim`'s definition (which is why this whole node reached the
-                // ~keep "whitespace-only" branch), but collapsing it the same way discards
-                // ~keep real, visible content: an `<img>`...`&nbsp;&nbsp;&nbsp;`...`<a>` run
-                // ~keep between two inline siblings must survive verbatim, the same as it
-                // ~keep already does one branch below when the two siblings are not both
-                // ~keep directly adjacent.
-                if is_ascii_whitespace_only(text.as_ref()) {
-                    if !output.ends_with(' ') {
-                        output.push(' ');
-                    }
-                } else {
-                    output.push_str(text.as_ref());
-                }
-            } else if !output.ends_with(' ') {
-                output.push_str(text.as_ref());
-            }
-        } else if !output.ends_with(' ') {
-            // ~keep A multi-character ASCII run collapses to one space here exactly as it does
-            // ~keep between two inline siblings above: `<b>A</b><span>    </span><img>` is one
-            // ~keep space in a browser, and Tier 1 already emits it that way.
-            if has_more_than_one_char(text.as_ref()) && is_ascii_whitespace_only(text.as_ref()) {
-                output.push(' ');
-            } else {
-                output.push_str(text.as_ref());
-            }
-        }
-        return;
-    }
-
-    // ~keep From here on `text` has real, non-whitespace content, so anything still
-    // ~keep downstream of this point in the document is no longer at a fresh block
-    // ~keep start — flip the shared flag before it can leak "is fresh" to a later
-    // ~keep sibling, whichever buffer this particular call happened to write into.
-    ctx.at_fresh_block_start.set(false);
-
-    let processed_text = if (ctx.in_code || ctx.in_ruby) && ctx.in_table_cell {
-        // ~keep Code/ruby content is verbatim by design, but a GFM table cell cannot
-        // ~keep contain a raw newline: fold line breaks to a space without touching any
-        // ~keep other whitespace, and regardless of whitespace_mode — this is a structural
-        // ~keep constraint of the cell, not a stylistic normalization (issue #455).
-        text::fold_cell_line_breaks_verbatim_cow(text.as_ref()).into_owned()
-    } else if ctx.in_code && !ctx.in_code_block {
-        // ~keep A code SPAN gives a raw line ending inside its content no hard-break
-        // ~keep meaning -- CommonMark renders it as a space (code-spans spec section) --
-        // ~keep so a literal source newline (no `<br>` at all) folds the same way a
-        // ~keep table cell's line breaks already do, just outside a cell too (issue
-        // ~keep #487). Gated on `in_code_block`, not `in_code`, because a `<pre>` code
-        // ~keep BLOCK's line endings are real content structure and stay verbatim
-        // ~keep (`ctx.in_code || ctx.in_ruby` below still catches that case). This also
-        // ~keep makes `line_break.rs`'s span-split sound: after this fold, any '\n' that
-        // ~keep survives into a code span's content buffer can only have come from a
-        // ~keep real `<br>`, never from source text, so a bare '\n' is an unambiguous
-        // ~keep split marker with no separate sentinel character needed.
-        text::fold_cell_line_breaks_verbatim_cow(text.as_ref()).into_owned()
-    } else if ctx.in_code || ctx.in_ruby {
-        text.into_owned()
-    } else if ctx.in_table_cell {
-        // ~keep Every escape_* option applies in a cell exactly as outside one (issue #638).
-        // ~keep A `|` is table syntax, so it is escaped even when escape_misc and escape_ascii
-        // ~keep are off; either of those escapes it already, and a second pass would double it.
-        let normalized_text = if options.whitespace_mode == crate::options::WhitespaceMode::Normalized {
-            text::normalize_cell_whitespace_cow(text.as_ref())
-        } else {
-            // ~keep Strict still preserves every other whitespace byte, but a raw newline in a
-            // ~keep GFM cell splits the row across physical lines — a structural impossibility
-            // ~keep rather than a formatting preference, so it folds in every mode (issue #457,
-            // ~keep same reasoning as the verbatim fold above for #455).
-            text::fold_cell_line_breaks_verbatim_cow(text.as_ref())
+        let facts = WhitespaceFacts {
+            had_newlines: decoded.contains('\n'),
+            has_double_newline: decoded.contains("\n\n") || decoded.contains("\r\n\r\n"),
+            was_fresh_block_start: self.handler.ctx.at_fresh_block_start.get(),
         };
-        let src = normalized_text.as_ref();
-        let mut out = String::with_capacity(src.len());
+        if self.handler.options.strip_newlines && (decoded.contains('\r') || decoded.contains('\n')) {
+            decoded = Cow::Owned(decoded.replace(['\r', '\n'], " "));
+        }
+        if decoded.trim().is_empty() {
+            let output_start = self.output.len();
+            self.emit_whitespace(decoded.as_ref(), &facts);
+            if crate::converter::structure_capture::is_text_capture_active(self.handler.ctx) {
+                self.append_semantic_output(output_start);
+            }
+            return;
+        }
+        self.handler.ctx.at_fresh_block_start.set(false);
+        let escape_asterisks = self.escape_asterisks();
+        let capture_semantic = crate::converter::structure_capture::is_text_capture_active(self.handler.ctx);
+        let processed = self.process_content(decoded, escape_asterisks, facts.was_fresh_block_start, capture_semantic);
+        #[cfg(feature = "visitor")]
+        let Some(final_text) = self.apply_visitor(processed) else {
+            return;
+        };
+        #[cfg(not(feature = "visitor"))]
+        let final_text = processed;
+        self.emit_processed(&final_text.output);
+        if let Some(semantic) = final_text.semantic.as_deref() {
+            crate::converter::structure_capture::append_text(self.handler.ctx, semantic);
+        }
+    }
+
+    fn escape_asterisks(&self) -> bool {
+        self.handler.options.escape_asterisks
+            || self
+                .handler
+                .ctx
+                .djot_rule_like_text
+                .as_ref()
+                .is_some_and(crate::converter::context::DjotRuleLikeText::current)
+    }
+
+    fn emit_whitespace(&mut self, value: &str, facts: &WhitespaceFacts) {
+        let ctx = self.handler.ctx;
+        if ctx.in_code {
+            self.output.push_str(value);
+            return;
+        }
+        if self.handler.options.whitespace_mode == crate::options::WhitespaceMode::Strict {
+            self.emit_strict_whitespace(value, facts.has_double_newline);
+            return;
+        }
+        if self.between_adjacent_images() {
+            self.output.push(if facts.had_newlines { '\n' } else { ' ' });
+            return;
+        }
+        if self.at_paragraph_buffer_start() || self.at_fresh_block_start(facts.was_fresh_block_start) {
+            return;
+        }
+        if facts.had_newlines {
+            self.emit_newline_whitespace(value, facts.was_fresh_block_start);
+            return;
+        }
+        if self.ascii_whitespace_at_line_start(value) {
+            return;
+        }
+        self.emit_inline_whitespace(value);
+    }
+
+    fn between_adjacent_images(&self) -> bool {
+        get_previous_sibling_tag(self.node_handle, self.parser, self.handler.dom_ctx) == Some("img")
+            && get_next_sibling_tag(self.node_handle, self.parser, self.handler.dom_ctx) == Some("img")
+    }
+
+    fn emit_strict_whitespace(&mut self, value: &str, has_double_newline: bool) {
+        let ctx = self.handler.ctx;
+        if ctx.convert_as_inline || ctx.in_table_cell || ctx.in_list_item {
+            self.output.push_str(value);
+        } else if has_double_newline {
+            if !self.output.ends_with("\n\n") {
+                self.output.push('\n');
+            }
+        } else {
+            self.output.push_str(value);
+        }
+    }
+
+    fn at_paragraph_buffer_start(&self) -> bool {
+        self.handler.ctx.in_paragraph
+            && std::ptr::from_ref::<String>(self.output) as usize == self.handler.ctx.block_output_ptr
+            && self.output.len() == self.handler.ctx.block_content_start
+    }
+
+    const fn at_fresh_block_start(&self, was_fresh: bool) -> bool {
+        let ctx = self.handler.ctx;
+        was_fresh && !ctx.convert_as_inline && !ctx.in_table_cell && !ctx.in_list_item
+    }
+
+    fn emit_newline_whitespace(&mut self, value: &str, was_fresh: bool) {
+        if self.output.is_empty() {
+            if !was_fresh && self.handler.ctx.inline_depth > 0 {
+                self.output.push(' ');
+            }
+            return;
+        }
+        if self.output.ends_with("\n\n") {
+            return;
+        }
+        let significant: String = value
+            .chars()
+            .filter(|character| !matches!(character, ' ' | '\t' | '\n' | '\r'))
+            .collect();
+        let lone = (!has_more_than_one_char(&significant))
+            .then(|| significant.chars().next())
+            .flatten();
+        self.emit_significant_newline_whitespace(&significant, lone);
+    }
+
+    fn emit_significant_newline_whitespace(&mut self, significant: &str, lone: Option<char>) {
+        if let Some(next_tag) = get_next_sibling_tag(self.node_handle, self.parser, self.handler.dom_ctx) {
+            if is_inline_element(next_tag) {
+                if let Some(character) = lone {
+                    self.output.push(character);
+                } else if !self.output.ends_with(' ') && !self.output.ends_with('\n') {
+                    self.output.push(' ');
+                }
+            }
+            return;
+        }
+        if let Some(character) = lone {
+            self.output.push(character);
+            return;
+        }
+        let needs_space = newline_span_needs_separating_space(self.node_handle, self.parser, self.handler.dom_ctx)
+            || !significant.is_empty();
+        if needs_space && !self.output.ends_with(' ') && !self.output.ends_with('\n') {
+            self.output.push(' ');
+        }
+    }
+
+    fn ascii_whitespace_at_line_start(&self, value: &str) -> bool {
+        is_ascii_whitespace_only(value)
+            && std::ptr::from_ref::<String>(self.output) as usize == self.handler.ctx.block_output_ptr
+            && (self.output.is_empty() || self.output.ends_with('\n'))
+    }
+
+    fn emit_inline_whitespace(&mut self, value: &str) {
+        let between_inline = previous_sibling_is_inline_tag(self.node_handle, self.parser, self.handler.dom_ctx)
+            && next_sibling_is_inline_tag(self.node_handle, self.parser, self.handler.dom_ctx);
+        if self.output.ends_with(' ') {
+            return;
+        }
+        if has_more_than_one_char(value) && is_ascii_whitespace_only(value) {
+            self.output.push(' ');
+        } else if between_inline || !self.output.ends_with(' ') {
+            self.output.push_str(value);
+        }
+    }
+
+    fn process_content(
+        &self,
+        value: Cow<'_, str>,
+        escape_asterisks: bool,
+        was_fresh: bool,
+        capture_semantic: bool,
+    ) -> ProcessedText {
+        let ctx = self.handler.ctx;
+        if ((ctx.in_code && !ctx.in_code_block) || ctx.in_ruby) && ctx.in_table_cell {
+            return ProcessedText::same(
+                text::fold_cell_line_breaks_verbatim_cow(value.as_ref()).into_owned(),
+                capture_semantic,
+            );
+        }
+        if ctx.in_code && !ctx.in_code_block {
+            return ProcessedText::same(
+                text::fold_cell_line_breaks_verbatim_cow(value.as_ref()).into_owned(),
+                capture_semantic,
+            );
+        }
+        if ctx.in_code || ctx.in_ruby {
+            return ProcessedText::same(value.into_owned(), capture_semantic);
+        }
+        if ctx.in_table_cell {
+            return self.process_table_cell(value.as_ref(), escape_asterisks, capture_semantic);
+        }
+        if self.handler.options.whitespace_mode == crate::options::WhitespaceMode::Strict {
+            return self.process_strict(value.as_ref(), escape_asterisks, capture_semantic);
+        }
+        self.process_normalized(value.as_ref(), escape_asterisks, was_fresh, capture_semantic)
+    }
+
+    fn process_table_cell(&self, value: &str, escape_asterisks: bool, capture_semantic: bool) -> ProcessedText {
+        let options = self.handler.options;
+        let normalized = if options.whitespace_mode == crate::options::WhitespaceMode::Normalized {
+            text::normalize_cell_whitespace_cow(value)
+        } else {
+            text::fold_cell_line_breaks_verbatim_cow(value)
+        };
+        let mut output = String::with_capacity(normalized.len());
         text::escape_into(
-            &mut out,
-            src,
+            &mut output,
+            normalized.as_ref(),
             options.escape_misc,
-            options.escape_asterisks,
+            escape_asterisks,
             options.escape_underscores,
             options.escape_ascii,
         );
-        if !options.escape_misc && !options.escape_ascii {
-            if out.contains('|') {
-                out = out.replace('|', r"\|");
-            }
+        if !options.escape_misc && !options.escape_ascii && output.contains('|') {
+            output = output.replace('|', r"\|");
         }
-        out
-    } else if options.whitespace_mode == crate::options::WhitespaceMode::Strict {
-        text::escape(
-            text.as_ref(),
+        let output = crate::converter::utility::escaping::escape_djot_table_cell_literal(
+            &output,
+            options.output_format,
+            self.handler.ctx.in_table_cell,
+        )
+        .into_owned();
+        ProcessedText {
+            output,
+            semantic: capture_semantic.then(|| normalized.into_owned()),
+        }
+    }
+
+    fn process_strict(&self, value: &str, escape_asterisks: bool, capture_semantic: bool) -> ProcessedText {
+        let follows_break = get_next_sibling_tag(self.node_handle, self.parser, self.handler.dom_ctx) == Some("br")
+            || br_follows_enclosing_elements(self.node_handle.get_inner(), self.parser, self.handler.dom_ctx);
+        let trimmed_end = follows_break
+            .then(|| strip_single_trailing_line_ending(value))
+            .flatten()
+            .unwrap_or(value);
+        let preceded_by_break = get_previous_sibling_tag(self.node_handle, self.parser, self.handler.dom_ctx)
+            == Some("br")
+            || (self.handler.ctx.inline_buffer_after_hard_break && self.output.trim_matches([' ', '\t']).is_empty());
+        let strict = preceded_by_break
+            .then(|| strip_single_leading_line_ending(trimmed_end))
+            .flatten()
+            .unwrap_or(trimmed_end);
+        let options = self.handler.options;
+        let output = text::escape(
+            strict,
             options.escape_misc,
-            options.escape_asterisks,
+            escape_asterisks,
             options.escape_underscores,
             options.escape_ascii,
         )
-        .into_owned()
-    } else {
-        let has_double_newline = text.contains("\n\n") || text.contains("\r\n\r\n");
-        let has_trailing_single_newline =
-            text.ends_with('\n') && !text.ends_with("\n\n") && !text.ends_with("\r\n\r\n");
-
-        // ~keep `prefix`/`suffix` presence and the trailing-`"\n\n"` special case are
-        // ~keep unaffected by whitespace collapsing (both only ask "is there any
-        // ~keep whitespace here", not "how much"), so deriving them from the collapsed
-        // ~keep text is safe and keeps `chomp`'s Unicode-aware boundary detection intact.
-        // ~keep The *content* fed to `normalize_block_whitespace_cow` below must be the
-        // ~keep raw, pre-collapse core, though: only once its own leading/trailing
-        // ~keep whitespace is already gone (by trimming the same boundaries `chomp` just
-        // ~keep found) does every remaining `\n`-adjacent run inside it sit strictly
-        // ~keep between two pieces of real content -- never at the text node's own edge,
-        // ~keep where a *different* rule applies (see that function's doc comment).
-        let normalized_text = text::normalize_whitespace_cow(text.as_ref());
-        let (prefix, suffix, _) = text::chomp(normalized_text.as_ref());
-        let core = text::normalize_block_whitespace_cow(text.trim());
-
-        let skip_prefix = (was_fresh_block_start && !ctx.convert_as_inline && !ctx.in_table_cell && !ctx.in_list_item)
-            || output.ends_with("\n\n")
-            || output.ends_with("* ")
-            || output.ends_with("- ")
-            || output.ends_with(". ")
-            || output.ends_with("] ")
-            || (output.ends_with('\n') && prefix == " ")
-            // ~keep In a heading a `<br>` is written as the space itself (`line_break.rs`), so
-            // ~keep the text after it adds no second one: `<h2>a<br> b</h2>` is `## a b`. Only
-            // ~keep after a `<br>`: `<h2><span>a </span> b</h2>` keeps both spaces, as Tier-1 does.
-            || (ctx.in_heading
-                && output.ends_with(' ')
-                && prefix == " "
-                && get_previous_sibling_tag(node_handle, parser, dom_ctx) == Some("br"))
-            || (output.ends_with(' ')
-                && prefix == " "
-                && !previous_sibling_is_inline_tag(node_handle, parser, dom_ctx));
-
-        let mut final_text = String::with_capacity(prefix.len() + core.len() + suffix.len() + 2);
-        if !skip_prefix && !prefix.is_empty() {
-            final_text.push_str(prefix);
+        .into_owned();
+        ProcessedText {
+            output,
+            semantic: capture_semantic.then(|| strict.to_string()),
         }
+    }
 
-        let escaped_core = text::escape(
-            core.as_ref(),
-            options.escape_misc,
-            options.escape_asterisks,
-            options.escape_underscores,
-            options.escape_ascii,
-        );
-        final_text.push_str(&escaped_core);
-
-        if !suffix.is_empty() {
-            final_text.push_str(suffix);
-        } else if has_trailing_single_newline {
-            let safe_start = ctx.block_content_start.min(output.len());
-            let safe_start = crate::converter::utility::content::floor_char_boundary(output, safe_start);
-            let current_block_output = &output[safe_start..];
-            let at_paragraph_break = current_block_output.ends_with("\n\n");
-            if !at_paragraph_break {
-                if has_double_newline {
-                    final_text.push('\n');
-                } else if let Some(next_tag) = get_next_sibling_tag(node_handle, parser, dom_ctx) {
-                    if matches!(next_tag, "span") {
-                    } else if next_tag == "br" {
-                        // ~keep The <br> that follows is this line's ending: its hard-break
-                        // ~keep marker must attach to this text. A '\n' pushed here would
-                        // ~keep strand the marker on a line of its own, which cleanup then
-                        // ~keep turns into a paragraph break (issue #683).
-                    } else if ctx.inline_depth > 0 || ctx.convert_as_inline || ctx.in_paragraph {
-                        final_text.push(' ');
-                    } else {
-                        final_text.push('\n');
-                    }
-                } else if ctx.inline_depth > 0 || ctx.convert_as_inline || ctx.in_paragraph {
-                    final_text.push(' ');
-                } else if br_follows_enclosing_elements(node_handle.get_inner(), parser, dom_ctx) {
-                    // ~keep Same as the `<br>` sibling case above, one element further out:
-                    // ~keep `<span>First\n</span><br>` (issue #683).
-                } else {
-                    final_text.push('\n');
-                }
+    fn process_normalized(
+        &self,
+        value: &str,
+        escape_asterisks: bool,
+        was_fresh: bool,
+        capture_semantic: bool,
+    ) -> ProcessedText {
+        let has_double_newline = value.contains("\n\n") || value.contains("\r\n\r\n");
+        let trailing_single_newline = value.ends_with('\n') && !value.ends_with("\n\n") && !value.ends_with("\r\n\r\n");
+        let normalized = text::normalize_whitespace_cow(value);
+        let (prefix, suffix, _) = text::chomp(normalized.as_ref());
+        let core = text::normalize_block_whitespace_cow(value.trim());
+        let mut output = String::with_capacity(prefix.len() + core.len() + suffix.len() + 2);
+        let mut semantic = capture_semantic.then(|| String::with_capacity(output.capacity()));
+        if !self.skip_prefix(prefix, was_fresh) && !prefix.is_empty() {
+            output.push_str(prefix);
+            if let Some(semantic) = semantic.as_mut() {
+                semantic.push_str(prefix);
             }
         }
+        let options = self.handler.options;
+        output.push_str(&text::escape(
+            core.as_ref(),
+            options.escape_misc,
+            escape_asterisks,
+            options.escape_underscores,
+            options.escape_ascii,
+        ));
+        if let Some(semantic) = semantic.as_mut() {
+            semantic.push_str(core.as_ref());
+        }
+        if !suffix.is_empty() {
+            output.push_str(suffix);
+            if let Some(semantic) = semantic.as_mut() {
+                semantic.push_str(suffix);
+            }
+        } else if trailing_single_newline {
+            let output_end = output.len();
+            self.append_trailing_line_ending(&mut output, has_double_newline);
+            if let Some(semantic) = semantic.as_mut() {
+                semantic.push_str(&output[output_end..]);
+            }
+        }
+        ProcessedText { output, semantic }
+    }
 
-        final_text
-    };
+    fn skip_prefix(&self, prefix: &str, was_fresh: bool) -> bool {
+        let ctx = self.handler.ctx;
+        (was_fresh && !ctx.convert_as_inline && !ctx.in_table_cell && !ctx.in_list_item)
+            || self.output.ends_with("\n\n")
+            || ["* ", "- ", ". ", "] "]
+                .iter()
+                .any(|ending| self.output.ends_with(ending))
+            || (self.output.ends_with('\n') && prefix == " ")
+            || (ctx.in_heading
+                && self.output.ends_with(' ')
+                && prefix == " "
+                && get_previous_sibling_tag(self.node_handle, self.parser, self.handler.dom_ctx) == Some("br"))
+            || (self.output.ends_with(' ')
+                && prefix == " "
+                && !previous_sibling_is_inline_tag(self.node_handle, self.parser, self.handler.dom_ctx))
+    }
+
+    fn append_trailing_line_ending(&self, output: &mut String, has_double_newline: bool) {
+        let safe_start = crate::converter::utility::content::floor_char_boundary(
+            self.output,
+            self.handler.ctx.block_content_start.min(self.output.len()),
+        );
+        if self.output[safe_start..].ends_with("\n\n") {
+            return;
+        }
+        if has_double_newline {
+            output.push('\n');
+            return;
+        }
+        if let Some(next_tag) = get_next_sibling_tag(self.node_handle, self.parser, self.handler.dom_ctx) {
+            self.append_before_next_tag(output, next_tag);
+        } else if self.handler.ctx.inline_depth > 0
+            || self.handler.ctx.convert_as_inline
+            || self.handler.ctx.in_paragraph
+        {
+            output.push(' ');
+        } else if !br_follows_enclosing_elements(self.node_handle.get_inner(), self.parser, self.handler.dom_ctx) {
+            output.push('\n');
+        }
+    }
+
+    fn append_before_next_tag(&self, output: &mut String, next_tag: &str) {
+        if matches!(next_tag, "span" | "br") {
+            return;
+        }
+        let ctx = self.handler.ctx;
+        output.push(if ctx.inline_depth > 0 || ctx.convert_as_inline || ctx.in_paragraph {
+            ' '
+        } else {
+            '\n'
+        });
+    }
 
     #[cfg(feature = "visitor")]
-    let final_text = if let Some(ref visitor_handle) = ctx.visitor {
+    fn apply_visitor(&self, processed: ProcessedText) -> Option<ProcessedText> {
         use crate::visitor::{NodeContext, NodeType, VisitResult};
 
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
+        let Some(visitor_handle) = self.handler.ctx.visitor.as_ref() else {
+            return Some(processed);
+        };
+        let node_id = self.node_handle.get_inner();
+        let parent_tag = self.handler.dom_ctx.parent_tag_name(node_id, self.parser);
         let node_ctx = NodeContext::with_borrowed_attributes(
             NodeType::Text,
             Cow::Borrowed(""),
             &EMPTY_ATTRS,
-            depth,
-            index_in_parent,
+            self.handler.depth,
+            self.handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0),
             parent_tag.map(Cow::Borrowed),
             true,
         );
-
-        let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-        match visitor.visit_text(&node_ctx, &processed_text) {
-            VisitResult::Continue => processed_text,
-            VisitResult::Custom(custom) => {
-                if ctx.inline_depth > 0 || ctx.in_heading {
-                    processed_text
-                } else {
-                    custom
-                }
+        let result = visitor_handle
+            .lock()
+            .expect("visitor mutex poisoned")
+            .visit_text(&node_ctx, &processed.output);
+        match result {
+            VisitResult::Continue | VisitResult::PreserveHtml => Some(processed),
+            VisitResult::Custom(custom) if self.handler.ctx.inline_depth == 0 && !self.handler.ctx.in_heading => {
+                Some(ProcessedText {
+                    semantic: processed.semantic.as_ref().map(|_| custom.clone()),
+                    output: custom,
+                })
             }
-            VisitResult::Skip => return,
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
+            VisitResult::Custom(_) => Some(processed),
+            VisitResult::Skip => None,
+            VisitResult::Error(error) => {
+                if self.handler.ctx.visitor_error.borrow().is_none() {
+                    *self.handler.ctx.visitor_error.borrow_mut() = Some(error);
                 }
-                return;
+                None
             }
-            VisitResult::PreserveHtml => processed_text,
         }
-    } else {
-        processed_text
-    };
+    }
 
-    #[cfg(not(feature = "visitor"))]
-    let final_text = processed_text;
+    fn append_semantic_output(&self, output_start: usize) {
+        if let Some(text) = self.output.get(output_start..) {
+            crate::converter::structure_capture::append_text(self.handler.ctx, text);
+        }
+    }
 
-    // ~keep A text node that starts a fresh, still-unindented physical line inside a list
-    // ~keep item (e.g. sibling text right after a heading, which only emits a single
-    // ~keep trailing newline rather than a blank line) needs the same continuation indent
-    // ~keep every block handler adds before its own first line, or it lands flush left and
-    // ~keep the item derails on re-parse (CommonMark spec example 300). Excluded from verbatim
-    // ~keep contexts (`in_code`/`in_ruby`) and from contexts that build into a detached
-    // ~keep scratch buffer rather than the real document (`in_table_cell`, `convert_as_inline`),
-    // ~keep where `output` is not the list item's own accumulating text and indenting it would
-    // ~keep corrupt literal content instead.
-    crate::converter::list::utils::indent_list_item_line_start(output, ctx, options);
+    fn emit_processed(&mut self, final_text: &str) {
+        let ctx = self.handler.ctx;
+        let options = self.handler.options;
+        crate::converter::list::utils::indent_list_item_line_start(self.output, ctx, options);
+        let text_start = self.output.len();
+        self.push_processed_text(final_text);
+        let writes_to_block = self.writes_to_block();
+        if !ctx.in_code && options.output_format == crate::options::OutputFormat::Markdown {
+            if writes_to_block {
+                crate::converter::utility::escaping::escape_block_start(
+                    self.output,
+                    text_start,
+                    ctx.in_list_item,
+                    next_sibling_is_inline_tag(self.node_handle, self.parser, self.handler.dom_ctx),
+                );
+            }
+            crate::converter::utility::escaping::escape_continuation_line_start(
+                self.output,
+                text_start,
+                ctx.inline_buffer_after_hard_break,
+            );
+        } else if !ctx.in_code && options.output_format == crate::options::OutputFormat::Djot {
+            if writes_to_block {
+                crate::converter::utility::escaping::escape_djot_list_item_start(
+                    self.output,
+                    text_start,
+                    ctx.in_list_item,
+                );
+            }
+            crate::converter::utility::escaping::escape_djot_continuation_line_start(
+                self.output,
+                text_start,
+                ctx.inline_buffer_after_hard_break,
+            );
+        }
+    }
 
-    let text_start = output.len();
-    if ctx.in_list_item && final_text.contains("\n\n") {
+    fn push_processed_text(&mut self, final_text: &str) {
+        let ctx = self.handler.ctx;
+        if !ctx.in_list_item {
+            self.output.push_str(final_text);
+            return;
+        }
+        if final_text.contains('\n') && !final_text.contains("\n\n") {
+            let mut lines = final_text.split_inclusive('\n').peekable();
+            while let Some(line) = lines.next() {
+                self.output.push_str(line);
+                if lines.peek().is_some() {
+                    crate::converter::list::utils::indent_list_item_line_start(self.output, ctx, self.handler.options);
+                }
+            }
+            return;
+        }
+        if !final_text.contains("\n\n") {
+            self.output.push_str(final_text);
+            return;
+        }
         let indent = " ".repeat(4 * ctx.list_depth);
-        let mut first = true;
-        for part in final_text.split("\n\n") {
-            if !first {
-                output.push_str("\n\n");
-                output.push_str(&indent);
+        for (index, part) in final_text.split("\n\n").enumerate() {
+            if index > 0 {
+                self.output.push_str("\n\n");
+                self.output.push_str(&indent);
             }
-            first = false;
-            output.push_str(part.trim());
+            self.output.push_str(part.trim());
         }
-    } else {
-        output.push_str(&final_text);
     }
 
-    // ~keep Code keeps its bytes; a Djot paragraph ends only at a blank line, so no line in it
-    // ~keep needs the escape.
-    if !ctx.in_code && options.output_format == crate::options::OutputFormat::Markdown {
-        crate::converter::utility::escaping::escape_continuation_line_start(output, text_start);
+    fn writes_to_block(&self) -> bool {
+        let ctx = self.handler.ctx;
+        let writes_to_task_marker = ctx.task_item_scope == Some((ctx.list_depth, ctx.blockquote_depth))
+            && ctx
+                .first_writer
+                .as_ref()
+                .is_some_and(crate::converter::list::item::FirstWriter::is_open);
+        !ctx.convert_as_inline
+            && !ctx.in_heading
+            && !ctx.in_table_cell
+            && !ctx.in_marker_text()
+            && !writes_to_task_marker
+            && (ctx.block_output_ptr == 0 || std::ptr::from_ref::<String>(self.output) as usize == ctx.block_output_ptr)
     }
+}
+
+/// Remove one source line ending and its following indentation only when it is not a blank line. ~keep
+fn strip_single_trailing_line_ending(text: &str) -> Option<&str> {
+    let content_end = text.trim_end_matches([' ', '\t']).len();
+    let without_lf = text[..content_end].strip_suffix('\n')?;
+    let without_line_ending = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+    (!without_line_ending.ends_with('\n') && !without_line_ending.ends_with('\r')).then_some(without_line_ending)
+}
+
+/// Remove one leading source line ending only when it does not begin a blank line. ~keep
+fn strip_single_leading_line_ending(text: &str) -> Option<&str> {
+    let without_line_ending = text.strip_prefix("\r\n").or_else(|| text.strip_prefix('\n'))?;
+    (!without_line_ending.starts_with('\n') && !without_line_ending.starts_with('\r')).then_some(without_line_ending)
 }
 
 /// Whether a whitespace-only newline text node with no in-parent next sibling

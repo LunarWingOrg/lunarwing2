@@ -42,6 +42,7 @@ fn assert_items(html: &str, options: &ConversionOptions, expected: &str, items: 
     );
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_start_a_nested_list_whose_first_item_is_empty_after_a_blank_line() {
     for strategy in [TierStrategy::Tier2, TierStrategy::Auto, TierStrategy::Tier1] {
@@ -166,6 +167,7 @@ fn should_keep_a_nested_item_on_the_line_after_its_text_when_it_can_interrupt_it
     );
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_start_an_empty_item_after_text_inside_its_list_after_a_blank_line() {
     for strategy in [TierStrategy::Tier2, TierStrategy::Auto, TierStrategy::Tier1] {

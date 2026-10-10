@@ -18,7 +18,8 @@ pub use crate::metadata::{
 };
 
 pub use crate::options::{
-    CodeBlockStyle, ConversionOptions, ConversionOptionsBuilder, ConversionOptionsUpdate, HeadingStyle, HighlightStyle,
-    InlineDataMedia, LinkStyle, ListIndentType, NewlineStyle, OutputFormat, PreprocessingOptions,
-    PreprocessingOptionsUpdate, PreprocessingPreset, TierStrategy, UrlEscapeStyle, WhitespaceMode,
+    CodeBlockStyle, ConversionOptions, ConversionOptionsBuilder, ConversionOptionsUpdate, DEFAULT_WASM_MAX_INPUT_SIZE,
+    HeadingStyle, HighlightStyle, InlineDataMedia, LinkStyle, ListIndentType, NewlineStyle, OutputFormat,
+    PreprocessingOptions, PreprocessingOptionsUpdate, PreprocessingPreset, TierStrategy, UrlEscapeStyle,
+    WhitespaceMode,
 };

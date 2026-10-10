@@ -16,148 +16,104 @@ pub(crate) fn extract_document_metadata(
     let has_title_element = head_metadata.contains_key("title");
 
     for (raw_key, value) in head_metadata {
-        // ~keep Only the `<title>`, `<base>` and `<link rel="canonical">` elements write these
-        // ~keep keys. A meta tag named `base` or `canonical` arrives as `meta-base` or
-        // ~keep `meta-canonical` and is an ordinary meta tag; one named `title` gives the title
-        // ~keep only on a page without a `<title>` element (#589). The `title` key itself is
-        // ~keep present whenever a title element was seen, even an empty one, so an empty first
-        // ~keep title still counts as a title element and blocks the meta fallback below (#527).
-        match raw_key.as_str() {
-            "title" => {
-                if !value.is_empty() {
-                    doc.title = Some(value);
-                }
-                continue;
-            }
-            "base" => {
-                doc.base_href = Some(value);
-                continue;
-            }
-            "canonical" => {
-                doc.canonical_url = Some(value);
-                continue;
-            }
-            _ => {}
-        }
-
-        let mut key = raw_key.as_str();
-        let mut replaced_key: Option<String> = None;
-
-        if let Some(stripped) = key.strip_prefix("meta-") {
-            key = stripped;
-        }
-
-        if key.as_bytes().contains(&b':') {
-            replaced_key = Some(key.replace(':', "-"));
-            key = replaced_key.as_deref().unwrap_or(key);
-        }
-
-        let lower_key = key.to_ascii_lowercase();
-
-        match lower_key.as_str() {
-            "title" if !has_title_element => doc.title = Some(value),
-            "description" => doc.description = Some(value),
-            "author" | "creator" | "publisher" => {
-                if doc.author.is_none() {
-                    doc.author = Some(value);
-                }
-            }
-            k if k.starts_with("og-") => {
-                let og_key = k.trim_start_matches("og-").replace('-', "_");
-                doc.open_graph.insert(og_key, value);
-            }
-            k if k.starts_with("twitter-") => {
-                let tw_key = k.trim_start_matches("twitter-").replace('-', "_");
-                doc.twitter_card.insert(tw_key, value);
-            }
-            k if k.starts_with("dc.") || k.starts_with("dc-") => {
-                let dc_field = k.trim_start_matches("dc.").trim_start_matches("dc-");
-                match dc_field {
-                    "title" => {
-                        if doc.title.is_none() {
-                            doc.title = Some(value);
-                        }
-                    }
-                    "description" => {
-                        if doc.description.is_none() {
-                            doc.description = Some(value);
-                        }
-                    }
-                    "creator" | "contributor" | "publisher" => {
-                        if doc.author.is_none() {
-                            doc.author = Some(value);
-                        }
-                    }
-                    "subject" | "keywords" => {
-                        if doc.keywords.is_empty() {
-                            doc.keywords = split_keywords(&value);
-                        }
-                    }
-                    _ => {
-                        let meta_key = format!("dc_{}", dc_field.replace('-', "_"));
-                        doc.meta_tags.insert(meta_key, value);
-                    }
-                }
-            }
-            k if k.starts_with("dcterms.") || k.starts_with("dcterms-") => {
-                let dc_field = k.trim_start_matches("dcterms.").trim_start_matches("dcterms-");
-                match dc_field {
-                    "title" | "alternative" => {
-                        if doc.title.is_none() {
-                            doc.title = Some(value);
-                        }
-                    }
-                    "description" | "abstract" => {
-                        if doc.description.is_none() {
-                            doc.description = Some(value);
-                        }
-                    }
-                    "creator" | "contributor" | "publisher" => {
-                        if doc.author.is_none() {
-                            doc.author = Some(value);
-                        }
-                    }
-                    "subject" | "keywords" => {
-                        if doc.keywords.is_empty() {
-                            doc.keywords = split_keywords(&value);
-                        }
-                    }
-                    _ => {
-                        let meta_key = format!("dcterms_{}", dc_field.replace('-', "_"));
-                        doc.meta_tags.insert(meta_key, value);
-                    }
-                }
-            }
-            "keywords" | "news_keywords" | "citation_keywords" | "subject" | "topic" | "category"
-            | "classification" => {
-                if doc.keywords.is_empty() {
-                    doc.keywords = split_keywords(&value);
-                }
-            }
-            _ => {
-                let meta_key = if key.as_ptr() == raw_key.as_ptr() && key.len() == raw_key.len() {
-                    raw_key
-                } else if let Some(replaced) = replaced_key {
-                    replaced
-                } else {
-                    key.to_string()
-                };
-                doc.meta_tags.insert(meta_key, value);
-            }
-        }
+        apply_metadata_entry(&mut doc, raw_key, value, has_title_element);
     }
 
-    if let Some(lang) = lang {
-        doc.language = Some(lang);
-    }
-
-    if let Some(dir) = dir {
-        if let Some(parsed_dir) = TextDirection::parse(&dir) {
-            doc.text_direction = Some(parsed_dir);
-        }
-    }
+    doc.language = lang;
+    doc.text_direction = dir.as_deref().and_then(TextDirection::parse);
 
     doc
+}
+
+fn apply_metadata_entry(doc: &mut DocumentMetadata, raw_key: String, value: String, has_title_element: bool) {
+    // ~keep Only the `<title>`, `<base>` and `<link rel="canonical">` elements write these
+    // ~keep keys. Meta tags with those names carry a `meta-` prefix and stay ordinary metadata.
+    match raw_key.as_str() {
+        "title" => {
+            if !value.is_empty() {
+                doc.title = Some(value);
+            }
+            return;
+        }
+        "base" => {
+            doc.base_href = Some(value);
+            return;
+        }
+        "canonical" => {
+            doc.canonical_url = Some(value);
+            return;
+        }
+        _ => {}
+    }
+
+    let key = raw_key.strip_prefix("meta-").unwrap_or(&raw_key).replace(':', "-");
+    let lower_key = key.to_ascii_lowercase();
+    match lower_key.as_str() {
+        "title" if !has_title_element => doc.title = Some(value),
+        "description" => doc.description = Some(value),
+        "author" | "creator" | "publisher" => set_if_empty(&mut doc.author, value),
+        key if key.starts_with("og-") => {
+            doc.open_graph
+                .insert(key.trim_start_matches("og-").replace('-', "_"), value);
+        }
+        key if key.starts_with("twitter-") => {
+            doc.twitter_card
+                .insert(key.trim_start_matches("twitter-").replace('-', "_"), value);
+        }
+        key if key.starts_with("dc-") || key.starts_with("dc.") => {
+            apply_dc_field(doc, key.trim_start_matches("dc.").trim_start_matches("dc-"), value);
+        }
+        key if key.starts_with("dcterms-") || key.starts_with("dcterms.") => {
+            apply_dcterms_field(
+                doc,
+                key.trim_start_matches("dcterms.").trim_start_matches("dcterms-"),
+                value,
+            );
+        }
+        "keywords" | "news_keywords" | "citation_keywords" | "subject" | "topic" | "category" | "classification" => {
+            set_keywords_if_empty(doc, &value);
+        }
+        _ => {
+            doc.meta_tags.insert(key, value);
+        }
+    }
+}
+
+fn apply_dc_field(doc: &mut DocumentMetadata, field: &str, value: String) {
+    match field {
+        "title" => set_if_empty(&mut doc.title, value),
+        "description" => set_if_empty(&mut doc.description, value),
+        "creator" | "contributor" | "publisher" => set_if_empty(&mut doc.author, value),
+        "subject" | "keywords" => set_keywords_if_empty(doc, &value),
+        _ => {
+            doc.meta_tags.insert(format!("dc_{}", field.replace('-', "_")), value);
+        }
+    }
+}
+
+fn apply_dcterms_field(doc: &mut DocumentMetadata, field: &str, value: String) {
+    match field {
+        "title" | "alternative" => set_if_empty(&mut doc.title, value),
+        "description" | "abstract" => set_if_empty(&mut doc.description, value),
+        "creator" | "contributor" | "publisher" => set_if_empty(&mut doc.author, value),
+        "subject" | "keywords" => set_keywords_if_empty(doc, &value),
+        _ => {
+            doc.meta_tags
+                .insert(format!("dcterms_{}", field.replace('-', "_")), value);
+        }
+    }
+}
+
+fn set_if_empty(target: &mut Option<String>, value: String) {
+    if target.is_none() {
+        *target = Some(value);
+    }
+}
+
+fn set_keywords_if_empty(doc: &mut DocumentMetadata, value: &str) {
+    if doc.keywords.is_empty() {
+        doc.keywords = split_keywords(value);
+    }
 }
 
 /// Split a comma-separated keywords string into a `Vec<String>`.
@@ -297,6 +253,33 @@ mod tests {
 
         assert_eq!(doc.open_graph.get("title"), Some(&"OG Title".to_string()));
         assert_eq!(doc.open_graph.get("description"), Some(&"OG Description".to_string()));
+    }
+
+    #[test]
+    fn should_strip_repeated_open_graph_and_twitter_prefixes() {
+        let mut head_metadata = BTreeMap::new();
+        head_metadata.insert("meta-og-og-title".to_string(), "OG Title".to_string());
+        head_metadata.insert("meta-twitter-twitter-card".to_string(), "summary".to_string());
+
+        let doc = extract_document_metadata(head_metadata, None, None);
+
+        assert_eq!(doc.open_graph.get("title").map(String::as_str), Some("OG Title"));
+        assert_eq!(doc.twitter_card.get("card").map(String::as_str), Some("summary"));
+    }
+
+    #[test]
+    fn should_strip_mixed_dublin_core_prefixes_in_legacy_order() {
+        let mut head_metadata = BTreeMap::new();
+        head_metadata.insert("meta-dc.dc-title".to_string(), "DC Title".to_string());
+        head_metadata.insert(
+            "meta-dcterms.dcterms-description".to_string(),
+            "DCTERMS Description".to_string(),
+        );
+
+        let doc = extract_document_metadata(head_metadata, None, None);
+
+        assert_eq!(doc.title.as_deref(), Some("DC Title"));
+        assert_eq!(doc.description.as_deref(), Some("DCTERMS Description"));
     }
 
     #[test]

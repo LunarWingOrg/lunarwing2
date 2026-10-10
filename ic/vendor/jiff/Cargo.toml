@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.70"
 name = "jiff"
-version = "0.2.37"
+version = "0.2.38"
 authors = ["Andrew Gallant <jamslam@gmail.com>"]
 build = false
 include = [
@@ -35,7 +35,7 @@ A date-time library that encourages you to jump into the pit of success.
 This library is heavily inspired by the Temporal project.
 """
 documentation = "https://docs.rs/jiff"
-readme = false
+readme = "README.md"
 keywords = [
     "date",
     "time",
@@ -158,7 +158,7 @@ version = "0.2"
 optional = true
 
 [dependencies.jiff-tzdb]
-version = "0.1.8"
+version = "0.1.9"
 optional = true
 
 [dependencies.log]
@@ -241,7 +241,7 @@ version = "0.2.70"
 optional = true
 
 [target."cfg(any())".dependencies.jiff-static]
-version = "=0.2.37"
+version = "=0.2.38"
 
 [target.'cfg(any(windows, target_family = "wasm"))'.dependencies.jiff-tzdb-platform]
 version = "0.1.3"

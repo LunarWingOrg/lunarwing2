@@ -131,9 +131,7 @@ fn should_preserve_trailing_hard_break_after_content() {
 
 #[test]
 fn should_keep_hard_break_after_content_but_not_on_a_blank_line() {
-    // ~keep The break after "text" survives; the blank first line keeps no invisible
-    // ~keep trailing spaces, because a hard break needs content on its own line.
-    assert_eq!(convert("<p> <br>text<br> </p>", None).unwrap(), "\ntext  \n");
+    assert_eq!(convert("<p> <br>text<br> </p>", None).unwrap(), "text  \n");
 }
 
 #[test]

@@ -14,6 +14,7 @@ use tl::{NodeHandle, Parser};
 
 type DomContext = crate::converter::DomContext;
 type Context = crate::converter::Context;
+type ConversionOptions = crate::options::ConversionOptions;
 
 /// Where a wrapper is being emitted: its DOM node, the parser and DOM lookup context, and the
 /// conversion `Context` of the buffer it writes into.
@@ -27,6 +28,7 @@ pub struct InlineSite<'p> {
     pub parser: &'p Parser<'p>,
     pub dom_ctx: &'p DomContext,
     pub ctx: &'p Context,
+    pub options: &'p ConversionOptions,
 }
 
 /// Tag names that render with the single `strong_em_symbol` italic delimiter.
@@ -71,6 +73,189 @@ pub struct InlineDelimiters<'a> {
     pub sibling_tag_names: &'a [&'a str],
 }
 
+/// ~keep Wrap every non-empty Markdown block in its own delimiter pair so a blank line cannot
+/// split one inline delimiter run into literal markers (issue #724).
+pub fn wrap_block_runs(content: &str, open: &str, close: &str) -> String {
+    let (prefix, suffix, trimmed) = crate::converter::chomp_inline(content);
+    let mut wrapped = String::with_capacity(content.len() + open.len() + close.len());
+    wrapped.push_str(prefix);
+
+    for (index, block) in trimmed.split("\n\n").enumerate() {
+        if index > 0 {
+            wrapped.push_str("\n\n");
+        }
+        if block.trim_matches([' ', '\t']).is_empty() {
+            wrapped.push_str(block);
+        } else {
+            let body_start = markdown_block_prefix_len(block);
+            let body_end = block.trim_end_matches([' ', '\t']).len();
+            if body_end <= body_start {
+                wrapped.push_str(block);
+                continue;
+            }
+            wrapped.push_str(&block[..body_start]);
+            wrapped.push_str(open);
+            wrapped.push_str(&block[body_start..body_end]);
+            wrapped.push_str(close);
+            wrapped.push_str(&block[body_end..]);
+        }
+    }
+
+    wrapped.push_str(suffix);
+    wrapped
+}
+
+/// ~keep General inline handlers split only plain paragraph-like runs. Structured Markdown
+/// remains on its established path because moving a delimiter across nested list/quote syntax
+/// changes the block tree; legend opts into that explicitly for its pinned list behavior.
+pub fn block_runs_are_plain(content: &str) -> bool {
+    block_runs_are_single_line(content)
+        && content.split("\n\n").all(|block| {
+            let indentation = block.bytes().take_while(|byte| matches!(byte, b' ' | b'\t')).count();
+            markdown_block_prefix_len(block) == indentation
+        })
+}
+
+/// ~keep Multi-line structured blocks need tree-aware delimiter placement; the shared wrapper
+/// safely handles single-line blocks while preserving their Markdown prefixes.
+pub fn block_runs_are_single_line(content: &str) -> bool {
+    content.split("\n\n").all(|block| !block.contains('\n'))
+}
+
+/// ~keep A block quote that is a task item's first content keeps its opener outside inline
+/// delimiters, so the checkbox line cannot turn the opener into literal text (#643). Other
+/// block-like children retain their established inline-wrapper behavior.
+pub fn emit_first_block_wrapped(
+    output: &mut String,
+    content: &str,
+    open: &str,
+    close: &str,
+    ctx: &Context,
+    parser: &Parser<'_>,
+) -> bool {
+    if open.is_empty()
+        || !ctx
+            .first_writer
+            .as_ref()
+            .is_some_and(|first_writer| first_writer.starts_with_blockquote(parser))
+        || !block_runs_are_single_line(content.trim_end_matches('\n'))
+        || !crate::converter::utility::escaping::opens_block(content.trim_start())
+    {
+        return false;
+    }
+
+    output.push_str(&wrap_block_runs(content, open, close));
+    true
+}
+
+// ~keep Markdown block syntax stays outside the inline delimiters: `* **x**` remains a list,
+// ~keep whereas `*** x**` is an ambiguous delimiter run rather than a bold list item.
+fn markdown_block_prefix_len(block: &str) -> usize {
+    let bytes = block.as_bytes();
+    let mut position = bytes.iter().take_while(|byte| matches!(byte, b' ' | b'\t')).count();
+
+    while bytes.get(position..position + 2) == Some(b"> ") {
+        position += 2;
+    }
+
+    if matches!(bytes.get(position), Some(b'-' | b'+' | b'*')) && matches!(bytes.get(position + 1), Some(b' ' | b'\t'))
+    {
+        return position + 2;
+    }
+
+    let digits_start = position;
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+    }
+    if position > digits_start
+        && matches!(bytes.get(position), Some(b'.' | b')'))
+        && matches!(bytes.get(position + 1), Some(b' ' | b'\t'))
+    {
+        return position + 2;
+    }
+
+    let heading_start = position;
+    while bytes.get(position) == Some(&b'#') && position - heading_start < 6 {
+        position += 1;
+    }
+    if position > heading_start && bytes.get(position) == Some(&b' ') {
+        return position + 1;
+    }
+
+    digits_start
+}
+
+fn move_leading_hard_breaks<'a>(
+    output: &mut String,
+    content: &'a str,
+    ctx: &Context,
+    options: &ConversionOptions,
+) -> &'a str {
+    // ~keep Table-cell block boundaries are normalized by the cell renderer; hoisting one from
+    // ~keep an inline wrapper turns the folded separator into literal hard-break syntax (#645).
+    if ctx.in_table_cell {
+        return content;
+    }
+
+    let mut after_breaks = content;
+    loop {
+        let candidate = after_breaks.trim_start_matches([' ', '\t']);
+        let Some(rest) = ["\\\n", "\n"]
+            .into_iter()
+            .find_map(|marker| candidate.strip_prefix(marker))
+        else {
+            break;
+        };
+        after_breaks = rest;
+    }
+    // ~keep A break-only wrapper separates adjacent words instead of authoring a hard break (#502).
+    if after_breaks.trim().is_empty() {
+        return content;
+    }
+
+    // ~keep The bare newline is an internal sentinel from a break at the start of a detached
+    // ~keep wrapper. It becomes a hard break only when real paragraph content precedes the
+    // ~keep wrapper; hoisting it into the paragraph's own empty block buffer recreates the
+    // ~keep leading break that issue #572 drops before unwrapped text.
+    let drop_at_paragraph_start = ctx.in_paragraph
+        && output.len() == ctx.block_content_start
+        && std::ptr::from_ref::<String>(output) as usize == ctx.block_output_ptr;
+    let mut remaining = content;
+    let mut moved = false;
+    loop {
+        let candidate = remaining.trim_start_matches([' ', '\t']);
+        let Some((marker, rest)) = ["\\\n", "\n"]
+            .into_iter()
+            .find_map(|marker| candidate.strip_prefix(marker).map(|rest| (marker, rest)))
+        else {
+            break;
+        };
+        if !drop_at_paragraph_start {
+            let starts_on_empty_line = output.ends_with('\n');
+            crate::converter::list::utils::indent_list_item_line_start(output, ctx, options);
+            let marker = if marker == "\n" {
+                crate::converter::main_helpers::hard_break_marker(options)
+            } else {
+                marker
+            };
+            output.push_str(if marker == "  \n" && starts_on_empty_line {
+                "\\\n"
+            } else {
+                marker
+            });
+        }
+        remaining = rest;
+        moved = true;
+    }
+    if moved && !drop_at_paragraph_start {
+        crate::converter::list::utils::indent_list_item_line_start(output, ctx, options);
+    }
+    if moved {
+        remaining = remaining.trim_start_matches([' ', '\t']);
+    }
+    remaining
+}
+
 /// Emit `content` wrapped in `delimiters`, handling delimiter-run adjacency with a preceding
 /// sibling and a body that is non-empty but entirely whitespace.
 pub fn emit_wrapped_inline(
@@ -84,6 +269,7 @@ pub fn emit_wrapped_inline(
         parser,
         dom_ctx,
         ctx,
+        options,
     } = site;
     let InlineDelimiters {
         open,
@@ -94,6 +280,7 @@ pub fn emit_wrapped_inline(
     use crate::converter::utility::siblings::get_previous_sibling_tag;
     use crate::converter::{append_inline_suffix, chomp_inline, merge_adjacent_emphasis};
 
+    let content = move_leading_hard_breaks(output, content, ctx, options);
     let (prefix, suffix, trimmed) = chomp_inline(content);
     if content.trim().is_empty() {
         if content.is_empty() {

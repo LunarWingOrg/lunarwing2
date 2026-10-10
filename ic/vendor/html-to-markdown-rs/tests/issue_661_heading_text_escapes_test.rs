@@ -1,5 +1,6 @@
 // ~keep Rust inner attributes below are crate-level attributes, not a shell shebang.
 #![allow(missing_docs)]
+#![cfg(feature = "testkit")]
 
 //! Regression tests for heading text that changes its heading (issue #661): a `#` run at the end
 //! of an ATX heading's text, and underlined heading text that reads as a link reference definition.

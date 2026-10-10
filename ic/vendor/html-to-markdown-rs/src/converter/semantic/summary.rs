@@ -27,25 +27,22 @@ pub fn handle_details(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
         #[cfg(feature = "visitor")]
-        if let Some(ref visitor_handle) = ctx.visitor {
+        if let Some(ref visitor_handle) = handler.ctx.visitor {
             use crate::visitor::{NodeContext, NodeType, VisitResult};
 
             let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
+            let parent_tag = handler.dom_ctx.parent_tag_name(node_id, parser);
+            let index_in_parent = handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0);
             let open = tag.attributes().get("open").is_some();
             let node_ctx = NodeContext::with_lazy_attributes(
                 NodeType::Details,
                 Cow::Borrowed("details"),
                 tag,
-                depth,
+                handler.depth,
                 index_in_parent,
                 parent_tag.map(Cow::Borrowed),
                 false,
@@ -71,15 +68,15 @@ pub fn handle_details(
                     return;
                 }
                 VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
+                    if handler.ctx.visitor_error.borrow().is_none() {
+                        *handler.ctx.visitor_error.borrow_mut() = Some(err);
                     }
                     return;
                 }
             }
         }
 
-        crate::converter::block::div::handle(node_handle, parser, output, options, ctx, depth, dom_ctx);
+        crate::converter::block::div::handle(node_handle, parser, output, handler);
     }
 }
 
@@ -106,10 +103,7 @@ pub fn handle_summary(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
         let mut content = String::with_capacity(64);
@@ -118,17 +112,17 @@ pub fn handle_summary(
         // ~keep when the resulting Context would be byte-identical to ctx —
         // ~keep either convert_as_inline (block path inactive) or already
         // ~keep in_strong upstream.
-        let want_strong = !ctx.convert_as_inline;
+        let want_strong = !handler.ctx.convert_as_inline;
         let summary_ctx_owned;
-        let summary_ctx = if want_strong && !ctx.in_strong {
+        let summary_ctx = if want_strong && !handler.ctx.in_strong {
             summary_ctx_owned = super::Context {
                 in_strong: true,
                 text_in_markers: true,
-                ..ctx.clone()
+                ..handler.ctx.clone()
             };
             &summary_ctx_owned
         } else {
-            ctx
+            handler.ctx
         };
 
         let children = tag.children();
@@ -138,10 +132,12 @@ pub fn handle_summary(
                     child_handle,
                     parser,
                     &mut content,
-                    options,
-                    summary_ctx,
-                    depth + 1,
-                    dom_ctx,
+                    crate::converter::block::container::HandlerContext::new(
+                        handler.options,
+                        summary_ctx,
+                        handler.depth + 1,
+                        handler.dom_ctx,
+                    ),
                 );
             }
         }
@@ -152,7 +148,7 @@ pub fn handle_summary(
         // ~keep `paragraph.rs` closes its own (issue #464 follow-up).
         crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer(
             &mut content,
-            options.newline_style,
+            handler.options.newline_style,
         );
 
         let trimmed = content.trim();
@@ -161,61 +157,91 @@ pub fn handle_summary(
         }
 
         #[cfg(feature = "visitor")]
-        if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Summary,
-                Cow::Borrowed("summary"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                false,
-            );
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_summary(&node_ctx, trimmed)
-            };
-            match visit_result {
-                VisitResult::Continue => {}
-                VisitResult::Skip => return,
-                VisitResult::Custom(custom) => {
-                    if ctx.convert_as_inline {
-                        output.push_str(&custom);
-                    } else {
-                        output.push_str(&custom);
-                        if !custom.ends_with('\n') {
-                            output.push_str("\n\n");
-                        }
-                    }
-                    return;
-                }
-                VisitResult::PreserveHtml => {
-                    use crate::converter::utility::serialization::serialize_node;
-                    output.push_str(&serialize_node(node_handle, parser));
-                    return;
-                }
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    return;
-                }
-            }
+        if visit_summary(tag, node_handle, parser, output, trimmed, handler) {
+            return;
         }
 
-        if ctx.convert_as_inline {
+        if handler.ctx.convert_as_inline {
             output.push_str(trimmed);
         } else {
-            let mut symbol = String::with_capacity(2);
-            symbol.push(options.strong_em_symbol);
-            symbol.push(options.strong_em_symbol);
-            let bold = format!("{symbol}{trimmed}{symbol}");
-            crate::converter::block::div::push_block(output, options, ctx, &bold);
+            render_summary_block(output, trimmed, node_handle, parser, handler);
+        }
+    }
+}
+
+fn render_summary_block(
+    output: &mut String,
+    content: &str,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    handler: super::HandlerContext<'_>,
+) {
+    let mut bold = String::with_capacity(content.len() + 4);
+    crate::converter::inline::emphasis::emit_strong_wrapped(
+        &mut bold,
+        content,
+        crate::converter::inline::wrapped::InlineSite {
+            node_handle,
+            parser,
+            dom_ctx: handler.dom_ctx,
+            ctx: handler.ctx,
+            options: handler.options,
+        },
+    );
+    crate::converter::block::div::push_block(output, handler.options, handler.ctx, &bold);
+}
+
+#[cfg(feature = "visitor")]
+fn visit_summary(
+    tag: &tl::HTMLTag<'_>,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    content: &str,
+    handler: super::HandlerContext<'_>,
+) -> bool {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let Some(visitor_handle) = handler.ctx.visitor.as_ref() else {
+        return false;
+    };
+    let node_id = node_handle.get_inner();
+    let parent_tag = handler.dom_ctx.parent_tag_name(node_id, parser);
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Summary,
+        Cow::Borrowed("summary"),
+        tag,
+        handler.depth,
+        handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0),
+        parent_tag.map(Cow::Borrowed),
+        false,
+    );
+    let result = visitor_handle
+        .lock()
+        .expect("visitor mutex poisoned")
+        .visit_summary(&node_ctx, content);
+    match result {
+        VisitResult::Continue => false,
+        VisitResult::Skip => true,
+        VisitResult::Custom(custom) => {
+            output.push_str(&custom);
+            if !handler.ctx.convert_as_inline && !custom.ends_with('\n') {
+                output.push_str("\n\n");
+            }
+            true
+        }
+        VisitResult::PreserveHtml => {
+            output.push_str(&crate::converter::utility::serialization::serialize_node(
+                node_handle,
+                parser,
+            ));
+            true
+        }
+        VisitResult::Error(error) => {
+            if handler.ctx.visitor_error.borrow().is_none() {
+                *handler.ctx.visitor_error.borrow_mut() = Some(error);
+            }
+            true
         }
     }
 }
@@ -228,14 +254,11 @@ pub fn handle(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    handler: super::HandlerContext<'_>,
 ) {
     match tag_name {
-        "details" => handle_details(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
-        "summary" => handle_summary(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx),
+        "details" => handle_details(tag_name, node_handle, parser, output, handler),
+        "summary" => handle_summary(tag_name, node_handle, parser, output, handler),
         _ => {}
     }
 }

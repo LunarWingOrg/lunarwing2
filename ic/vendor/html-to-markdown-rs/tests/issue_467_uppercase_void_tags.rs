@@ -13,8 +13,8 @@
 //! asserted across both tiers: the library picks a tier automatically, and these inputs are
 //! exactly the shape that made one document convert two ways.
 
-#![cfg(feature = "testkit")]
 #![allow(missing_docs)]
+#![cfg(feature = "testkit")]
 
 use html_to_markdown_rs::prescan::PrescanReport;
 use html_to_markdown_rs::tier1;

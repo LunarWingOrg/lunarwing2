@@ -6,9 +6,10 @@
 use std::borrow::Cow;
 
 use super::cell::{collect_table_cells, get_colspan};
-use super::cells::{CellTextCache, RowEnv, append_layout_row, collect_row_cell_widths, convert_table_row};
+use super::cells::{CellTextCache, RowEnv, RowRender, append_layout_row, collect_row_cell_widths, convert_table_row};
 use super::scanner::{TableScan, scan_table};
 use super::utils::{is_tag_name, normalized_tag_name};
+use crate::converter::block::container::HandlerContext;
 
 /// Return the content cell of a one-cell layout wrapper containing a nested table.
 /// Stop at that cell, so nested data headers do not give the wrapper table semantics.
@@ -62,38 +63,50 @@ pub fn table_total_columns(
     let mut cells = Vec::new();
 
     if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
-        let children = tag.children();
-        for child_handle in children.top().iter() {
-            if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                let tag_name = dom_ctx
-                    .tag_name_for(*child_handle, parser)
-                    .unwrap_or_else(|| normalized_tag_name(child_tag.name().as_utf8_str()));
-                match tag_name.as_ref() {
-                    "thead" | "tbody" | "tfoot" => {
-                        for row_handle in child_tag.children().top().iter() {
-                            if is_tag_name(row_handle, parser, dom_ctx, "tr") {
-                                collect_table_cells(row_handle, parser, dom_ctx, &mut cells);
-                                let col_count = cells
-                                    .iter()
-                                    .fold(0usize, |acc, h| acc.saturating_add(get_colspan(h, parser)));
-                                max_cols = max_cols.max(col_count);
-                            }
-                        }
-                    }
-                    "tr" | "row" => {
-                        collect_table_cells(child_handle, parser, dom_ctx, &mut cells);
-                        let col_count = cells
-                            .iter()
-                            .fold(0usize, |acc, h| acc.saturating_add(get_colspan(h, parser)));
-                        max_cols = max_cols.max(col_count);
-                    }
-                    _ => {}
-                }
-            }
+        for child_handle in tag.children().top().iter() {
+            max_cols = max_cols.max(table_child_columns(child_handle, parser, dom_ctx, &mut cells));
         }
     }
 
     max_cols.clamp(1, MAX_TABLE_COLS)
+}
+
+fn table_child_columns(
+    child_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    dom_ctx: &super::super::super::DomContext,
+    cells: &mut Vec<tl::NodeHandle>,
+) -> usize {
+    let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) else {
+        return 0;
+    };
+    let tag_name = dom_ctx
+        .tag_name_for(*child_handle, parser)
+        .unwrap_or_else(|| normalized_tag_name(child_tag.name().as_utf8_str()));
+    match tag_name.as_ref() {
+        "thead" | "tbody" | "tfoot" => child_tag
+            .children()
+            .top()
+            .iter()
+            .filter(|row_handle| is_tag_name(row_handle, parser, dom_ctx, "tr"))
+            .map(|row_handle| row_columns(row_handle, parser, dom_ctx, cells))
+            .max()
+            .unwrap_or(0),
+        "tr" | "row" => row_columns(child_handle, parser, dom_ctx, cells),
+        _ => 0,
+    }
+}
+
+fn row_columns(
+    row_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    dom_ctx: &super::super::super::DomContext,
+    cells: &mut Vec<tl::NodeHandle>,
+) -> usize {
+    collect_table_cells(row_handle, parser, dom_ctx, cells);
+    cells.iter().fold(0usize, |count, handle| {
+        count.saturating_add(get_colspan(handle, parser))
+    })
 }
 
 /// Whether each cell's markdown may be rendered once in the width pre-pass and reused
@@ -128,6 +141,463 @@ const fn cell_text_reuse_allowed(ctx: &super::super::super::Context, table_scan:
     true
 }
 
+/// ~keep Ragged row widths alone do not imply layout: the regular renderer pads them. Layout
+/// ~keep requires stronger evidence such as nested tables, borderless spans, blanks, or dense links.
+fn is_layout_table(tag: &tl::HTMLTag<'_>, scan: &TableScan, wrapper_cell: Option<(tl::NodeHandle, usize)>) -> bool {
+    if wrapper_cell.is_some() || scan.has_header || scan.has_caption {
+        return false;
+    }
+    let has_border_zero = tag
+        .attributes()
+        .get("border")
+        .is_some_and(|value| value.as_ref().is_some_and(|border| border.as_utf8_str() == "0"));
+    let looks_like_layout = scan.nested_table_count > 1 || (scan.has_span && has_border_zero);
+    looks_like_layout || !scan.has_text || (scan.row_counts.len() <= 2 && scan.link_count >= 3)
+}
+
+fn render_layout_table(tag: &tl::HTMLTag<'_>, parser: &tl::Parser, output: &mut String, handler: HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        render_layout_child(child_handle, parser, output, handler);
+    }
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+}
+
+fn render_layout_child(
+    child_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+) {
+    let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) else {
+        return;
+    };
+    let tag_name = normalized_tag_name(child_tag.name().as_utf8_str());
+    let env = RowEnv {
+        parser,
+        options: handler.options,
+        ctx: handler.ctx,
+        dom_ctx: handler.dom_ctx,
+    };
+    match tag_name.as_ref() {
+        "thead" | "tbody" | "tfoot" => {
+            for row_handle in child_tag.children().top().iter() {
+                if is_tag_name(row_handle, parser, handler.dom_ctx, "tr") {
+                    append_layout_row(row_handle, output, env, handler.depth + 1);
+                }
+            }
+        }
+        "tr" | "row" => append_layout_row(child_handle, output, env, handler.depth + 1),
+        "colgroup" | "col" => {}
+        _ => super::super::super::walk_node(
+            child_handle,
+            parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.ctx,
+                handler.depth + 1,
+                handler.dom_ctx,
+            ),
+        ),
+    }
+}
+
+fn render_wrapper_cell(
+    cell_handle: tl::NodeHandle,
+    cell_depth: usize,
+    parser: &tl::Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+) {
+    let Some(tl::Node::Tag(cell)) = cell_handle.get(parser) else {
+        return;
+    };
+    for child in cell.children().top().iter() {
+        super::super::super::walk_node(
+            child,
+            parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.ctx,
+                handler.depth + cell_depth + 1,
+                handler.dom_ctx,
+            ),
+        );
+    }
+}
+
+struct DataTableState {
+    row_index: usize,
+    total_cols: usize,
+    rowspan_tracker: Vec<Option<usize>>,
+    cell_cache: CellTextCache,
+    deferred_tables: Vec<String>,
+    col_widths: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct DataEnv<'a> {
+    parser: &'a tl::Parser<'a>,
+    handler: HandlerContext<'a>,
+    scan: &'a TableScan,
+}
+
+fn render_data_table(
+    node_handle: &tl::NodeHandle,
+    tag: &tl::HTMLTag<'_>,
+    parser: &tl::Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+    scan: &TableScan,
+) {
+    let total_cols = table_total_columns(node_handle, parser, handler.dom_ctx);
+    let reuse_cell_text = !handler.options.compact_tables && cell_text_reuse_allowed(handler.ctx, scan);
+    let mut cell_cache = CellTextCache::new(reuse_cell_text);
+    let col_widths = column_widths(tag, parser, handler, total_cols, reuse_cell_text, &mut cell_cache);
+    let mut state = DataTableState {
+        row_index: 0,
+        total_cols,
+        rowspan_tracker: vec![None; total_cols],
+        cell_cache,
+        deferred_tables: Vec::new(),
+        col_widths,
+    };
+    let env = DataEnv { parser, handler, scan };
+    for child_handle in tag.children().top().iter() {
+        render_data_child(child_handle, output, env, &mut state);
+    }
+    append_deferred_tables(output, &state.deferred_tables);
+}
+
+/// ~keep Width measurement is an internal walk. When rendered text cannot be reused, collectors
+/// ~keep are detached so the pre-pass cannot duplicate caller-visible metadata or structure.
+fn column_widths(
+    tag: &tl::HTMLTag<'_>,
+    parser: &tl::Parser,
+    handler: HandlerContext<'_>,
+    total_cols: usize,
+    reuse_cell_text: bool,
+    cell_cache: &mut CellTextCache,
+) -> Vec<usize> {
+    if handler.options.compact_tables {
+        return Vec::new();
+    }
+    let mut prepass_ctx = super::super::super::Context {
+        skip_visitor_hooks: true,
+        measure_width_only: true,
+        ..handler.ctx.clone()
+    };
+    if !reuse_cell_text {
+        #[cfg(feature = "metadata")]
+        {
+            prepass_ctx.metadata_collector = None;
+        }
+        prepass_ctx.structure_collector = None;
+        #[cfg(feature = "inline-images")]
+        {
+            prepass_ctx.inline_collector = None;
+        }
+    }
+    let env = RowEnv {
+        parser,
+        options: handler.options,
+        ctx: &prepass_ctx,
+        dom_ctx: handler.dom_ctx,
+    };
+    let mut state = WidthState {
+        widths: Vec::new(),
+        rowspan: vec![None; total_cols],
+        cell_cache,
+    };
+    for child_handle in tag.children().top().iter() {
+        collect_width_child(child_handle, env, handler.depth + 1, &mut state);
+    }
+    state.widths
+}
+
+struct WidthState<'a> {
+    widths: Vec<usize>,
+    rowspan: Vec<Option<usize>>,
+    cell_cache: &'a mut CellTextCache,
+}
+
+fn collect_width_child(child_handle: &tl::NodeHandle, env: RowEnv<'_>, depth: usize, state: &mut WidthState<'_>) {
+    let Some(tl::Node::Tag(child_tag)) = child_handle.get(env.parser) else {
+        return;
+    };
+    let tag_name = normalized_tag_name(child_tag.name().as_utf8_str());
+    match tag_name.as_ref() {
+        "thead" | "tbody" | "tfoot" => {
+            for row_handle in child_tag.children().top().iter() {
+                if is_tag_name(row_handle, env.parser, env.dom_ctx, "tr") {
+                    collect_width_row(row_handle, env, depth, state);
+                }
+            }
+        }
+        "tr" | "row" => collect_width_row(child_handle, env, depth, state),
+        _ => {}
+    }
+}
+
+fn collect_width_row(row_handle: &tl::NodeHandle, env: RowEnv<'_>, depth: usize, state: &mut WidthState<'_>) {
+    collect_row_cell_widths(
+        row_handle,
+        env,
+        &mut state.widths,
+        &mut state.rowspan,
+        state.cell_cache,
+        depth,
+    );
+}
+
+fn render_data_child(child_handle: &tl::NodeHandle, output: &mut String, env: DataEnv<'_>, state: &mut DataTableState) {
+    let Some(tl::Node::Tag(child_tag)) = child_handle.get(env.parser) else {
+        return;
+    };
+    let tag_name = env
+        .handler
+        .dom_ctx
+        .tag_info(child_handle.get_inner(), env.parser)
+        .map_or_else(
+            || normalized_tag_name(child_tag.name().as_utf8_str()).into_owned().into(),
+            |info| Cow::Borrowed(info.name.as_str()),
+        );
+    match tag_name.as_ref() {
+        "caption" => render_caption(child_tag, output, env),
+        "thead" | "tbody" | "tfoot" => {
+            let is_header = tag_name.as_ref() == "thead";
+            for row_handle in child_tag.children().top().iter() {
+                if is_tag_name(row_handle, env.parser, env.handler.dom_ctx, "tr") {
+                    render_data_row(row_handle, output, env, state, is_header);
+                }
+            }
+        }
+        "tr" | "row" => render_data_row(child_handle, output, env, state, state.row_index == 0),
+        "colgroup" | "col" => {}
+        _ => super::super::super::walk_node(
+            child_handle,
+            env.parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                env.handler.options,
+                env.handler.ctx,
+                env.handler.depth + 1,
+                env.handler.dom_ctx,
+            ),
+        ),
+    }
+}
+
+fn render_caption(tag: &tl::HTMLTag<'_>, output: &mut String, env: DataEnv<'_>) {
+    let caption_ctx = super::super::super::Context {
+        text_in_markers: true,
+        escapes_hyphens: true,
+        ..env.handler.ctx.clone()
+    };
+    let mut text = String::new();
+    for child_handle in tag.children().top().iter() {
+        super::super::super::walk_node(
+            child_handle,
+            env.parser,
+            &mut text,
+            crate::converter::block::container::HandlerContext::new(
+                env.handler.options,
+                &caption_ctx,
+                env.handler.depth + 1,
+                env.handler.dom_ctx,
+            ),
+        );
+    }
+    let text = text.trim();
+    if !text.is_empty() {
+        output.push('*');
+        output.push_str(&text.replace('-', r"\-"));
+        output.push_str("*\n\n");
+    }
+}
+
+fn render_data_row(
+    row_handle: &tl::NodeHandle,
+    output: &mut String,
+    env: DataEnv<'_>,
+    state: &mut DataTableState,
+    is_header: bool,
+) {
+    let emitted = convert_table_row(
+        row_handle,
+        output,
+        RowEnv {
+            parser: env.parser,
+            options: env.handler.options,
+            ctx: env.handler.ctx,
+            dom_ctx: env.handler.dom_ctx,
+        },
+        &mut RowRender {
+            row_index: state.row_index,
+            has_span: env.scan.has_span,
+            rowspan_tracker: &mut state.rowspan_tracker,
+            total_cols: state.total_cols,
+            header_cols: state.total_cols,
+            depth: env.handler.depth + 1,
+            is_header,
+            col_widths: &state.col_widths,
+            cell_cache: &mut state.cell_cache,
+            deferred_tables: &mut state.deferred_tables,
+        },
+    );
+    if emitted {
+        state.row_index += 1;
+    }
+}
+
+/// ~keep GFM cannot nest tables, so a nested table from a single-cell row is emitted as a
+/// ~keep separate table after its enclosing table instead of being flattened (issues #469/#484).
+fn append_deferred_tables(output: &mut String, deferred_tables: &[String]) {
+    for nested in deferred_tables {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        if !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        output.push_str(nested);
+        output.push('\n');
+    }
+}
+
+#[cfg(feature = "visitor")]
+struct TableVisitorState {
+    output_start: usize,
+    custom_start: Option<String>,
+}
+
+#[cfg(feature = "visitor")]
+fn begin_table_visit(
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    tag: &tl::HTMLTag<'_>,
+    handler: HandlerContext<'_>,
+) -> Option<TableVisitorState> {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let output_start = output.len();
+    let Some(ref visitor_handle) = handler.ctx.visitor else {
+        return Some(TableVisitorState {
+            output_start,
+            custom_start: None,
+        });
+    };
+    let node_id = node_handle.get_inner();
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Table,
+        Cow::Borrowed("table"),
+        tag,
+        handler.depth,
+        handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0),
+        handler.dom_ctx.parent_tag_name(node_id, parser).map(Cow::Borrowed),
+        false,
+    );
+    let result = visitor_handle
+        .lock()
+        .expect("visitor mutex poisoned")
+        .visit_table_start(&node_ctx);
+    match result {
+        VisitResult::Continue => Some(TableVisitorState {
+            output_start,
+            custom_start: None,
+        }),
+        VisitResult::Custom(custom) => Some(TableVisitorState {
+            output_start,
+            custom_start: Some(custom),
+        }),
+        VisitResult::Skip => None,
+        VisitResult::Error(err) => {
+            if handler.ctx.visitor_error.borrow().is_none() {
+                *handler.ctx.visitor_error.borrow_mut() = Some(err);
+            }
+            None
+        }
+        VisitResult::PreserveHtml => {
+            output.push_str(&super::super::super::serialize_node(node_handle, parser));
+            None
+        }
+    }
+}
+
+#[cfg(feature = "visitor")]
+fn finish_table_visit(
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    tag: &tl::HTMLTag<'_>,
+    handler: HandlerContext<'_>,
+    state: TableVisitorState,
+) {
+    use crate::visitor::{NodeContext, NodeType};
+
+    let Some(ref visitor_handle) = handler.ctx.visitor else {
+        return;
+    };
+    let node_id = node_handle.get_inner();
+    let node_ctx = NodeContext::with_lazy_attributes(
+        NodeType::Table,
+        Cow::Borrowed("table"),
+        tag,
+        handler.depth,
+        handler.dom_ctx.get_sibling_index(node_id).unwrap_or(0),
+        handler.dom_ctx.parent_tag_name(node_id, parser).map(Cow::Borrowed),
+        false,
+    );
+    let result = visitor_handle
+        .lock()
+        .expect("visitor mutex poisoned")
+        .visit_table_end(&node_ctx, &output[state.output_start..]);
+    apply_table_visit_result(result, node_handle, parser, output, handler, state);
+}
+
+#[cfg(feature = "visitor")]
+fn apply_table_visit_result(
+    result: crate::visitor::VisitResult,
+    node_handle: &tl::NodeHandle,
+    parser: &tl::Parser,
+    output: &mut String,
+    handler: HandlerContext<'_>,
+    state: TableVisitorState,
+) {
+    use crate::visitor::VisitResult;
+
+    match result {
+        VisitResult::Continue => {
+            if let Some(custom_start) = state.custom_start {
+                output.insert_str(state.output_start, &custom_start);
+            }
+        }
+        VisitResult::Custom(custom) => {
+            let rows_output = output[state.output_start..].to_string();
+            output.truncate(state.output_start);
+            if let Some(custom_start) = state.custom_start {
+                output.push_str(&custom_start);
+            }
+            output.push_str(&rows_output);
+            output.push_str(&custom);
+        }
+        VisitResult::Skip => output.truncate(state.output_start),
+        VisitResult::Error(err) => {
+            if handler.ctx.visitor_error.borrow().is_none() {
+                *handler.ctx.visitor_error.borrow_mut() = Some(err);
+            }
+        }
+        VisitResult::PreserveHtml => {
+            output.truncate(state.output_start);
+            output.push_str(&super::super::super::serialize_node(node_handle, parser));
+        }
+    }
+}
+
 /// Convert an entire table element to Markdown.
 ///
 /// Main entry point for table conversion. Analyzes table structure to determine
@@ -148,464 +618,32 @@ pub fn handle_table(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::super::super::Context,
-    dom_ctx: &super::super::super::DomContext,
-    depth: usize,
+    handler: HandlerContext<'_>,
 ) {
-    if let Some(tl::Node::Tag(tag)) = node_handle.get(parser) {
-        #[cfg(feature = "visitor")]
-        let table_output_start = output.len();
-
-        #[cfg(feature = "visitor")]
-        let mut table_start_custom: Option<String> = None;
-
-        #[cfg(feature = "visitor")]
-        if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Table,
-                Cow::Borrowed("table"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                false,
-            );
-
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_table_start(&node_ctx)
-            };
-            match visit_result {
-                VisitResult::Continue => {}
-                VisitResult::Skip => return,
-                VisitResult::Custom(custom) => {
-                    table_start_custom = Some(custom);
-                }
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                    return;
-                }
-                VisitResult::PreserveHtml => {
-                    output.push_str(&super::super::super::serialize_node(node_handle, parser));
-                    return;
-                }
-            }
+    let Some(tl::Node::Tag(tag)) = node_handle.get(parser) else {
+        return;
+    };
+    #[cfg(feature = "visitor")]
+    let Some(visitor_state) = begin_table_visit(node_handle, parser, output, tag, handler) else {
+        return;
+    };
+    let table_scan = scan_table(node_handle, parser, handler.dom_ctx, handler.options.br_in_tables);
+    let wrapper_cell = nested_table_wrapper_cell(tag, parser, &table_scan).filter(|(_, cell_depth)| {
+        handler.depth + cell_depth + 1 < crate::converter::main_helpers::effective_max_depth(handler.options)
+    });
+    if is_layout_table(tag, &table_scan, wrapper_cell) {
+        if table_scan.has_text || table_scan.link_count > 0 {
+            render_layout_table(tag, parser, output, handler);
         }
-
-        let table_scan = scan_table(node_handle, parser, dom_ctx, options.br_in_tables);
-        // Keep the normal table renderer at the traversal boundary: it emits the
-        // truncated table structure and records the usual depth-limit warning.
-        let wrapper_cell = nested_table_wrapper_cell(tag, parser, &table_scan).filter(|(_, cell_depth)| {
-            depth + cell_depth + 1 < crate::converter::main_helpers::effective_max_depth(options)
-        });
-        let row_count = table_scan.row_counts.len();
-
-        let has_border_zero = tag
-            .attributes()
-            .get("border")
-            .is_some_and(|v| v.as_ref().is_some_and(|b| b.as_utf8_str() == "0"));
-        // ~keep issue #500: ragged row lengths (rows with differing cell counts) used to be
-        // ~keep treated as layout on their own. A headerless table with ragged rows is
-        // ~keep ordinary tabular data far more often than it is an email-signature-style
-        // ~keep layout table, and the regular renderer already pads short rows to the table's
-        // ~keep column count (issue #13), so ragged rows alone no longer classify a table as
-        // ~keep layout. Layout still triggers on nested tables, colspan/rowspan combined with
-        // ~keep `border="0"`, a blank table, or a short table dense with links.
-        let looks_like_layout = table_scan.nested_table_count > 1 || (table_scan.has_span && has_border_zero);
-        let link_count = table_scan.link_count;
-        let is_blank_table = !table_scan.has_text;
-
-        if wrapper_cell.is_none()
-            && !table_scan.has_header
-            && !table_scan.has_caption
-            && (looks_like_layout || is_blank_table || (row_count <= 2 && link_count >= 3))
-        {
-            if is_blank_table && link_count == 0 {
-                return;
-            }
-
-            let table_children = tag.children();
-            for child_handle in table_children.top().iter() {
-                if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                    let tag_name = normalized_tag_name(child_tag.name().as_utf8_str());
-                    match tag_name.as_ref() {
-                        "thead" | "tbody" | "tfoot" => {
-                            for row_handle in child_tag.children().top().iter() {
-                                if let Some(tl::Node::Tag(row_tag)) = row_handle.get(parser) {
-                                    let row_tag_name = normalized_tag_name(row_tag.name().as_utf8_str());
-                                    if matches!(row_tag_name.as_ref(), "tr" | "row") {
-                                        append_layout_row(
-                                            row_handle,
-                                            output,
-                                            RowEnv {
-                                                parser,
-                                                options,
-                                                ctx,
-                                                dom_ctx,
-                                            },
-                                            depth + 1,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        "tr" | "row" => {
-                            append_layout_row(
-                                child_handle,
-                                output,
-                                RowEnv {
-                                    parser,
-                                    options,
-                                    ctx,
-                                    dom_ctx,
-                                },
-                                depth + 1,
-                            );
-                        }
-                        "colgroup" | "col" => {}
-                        _ => {
-                            // ~keep Handle non-table-structure elements (like <a>, <img>, etc.) that may be
-                            // ~keep direct children of layout tables (e.g., Blogger table wrappers)
-                            super::super::super::walk_node(
-                                child_handle,
-                                parser,
-                                output,
-                                options,
-                                ctx,
-                                depth + 1,
-                                dom_ctx,
-                            );
-                        }
-                    }
-                }
-            }
-            if !output.ends_with('\n') {
-                output.push('\n');
-            }
-            return;
-        }
-
-        if let Some((cell_handle, cell_depth)) = wrapper_cell {
-            if let Some(tl::Node::Tag(cell)) = cell_handle.get(parser) {
-                for child in cell.children().top().iter() {
-                    super::super::super::walk_node(
-                        child,
-                        parser,
-                        output,
-                        options,
-                        ctx,
-                        depth + cell_depth + 1,
-                        dom_ctx,
-                    );
-                }
-            }
-        } else {
-            let mut row_index = 0;
-            // ~keep The header separator row's column count must cover every row's width, not
-            // ~keep just the first row: a later row with more actual cells than the header
-            // ~keep ("ragged" table) would otherwise render a separator declaring fewer columns
-            // ~keep than that row provides, and GFM-compliant renderers silently drop cells past
-            // ~keep the declared column count (issue #13).
-            let total_cols = table_total_columns(node_handle, parser, dom_ctx);
-            let mut rowspan_tracker = vec![None; total_cols];
-
-            let reuse_cell_text = !options.compact_tables && cell_text_reuse_allowed(ctx, &table_scan);
-            let mut cell_cache = CellTextCache::new(reuse_cell_text);
-            // ~keep Populated by `convert_table_row` when a row's sole cell holds a nested
-            // ~keep table (issue #484): rendered separately, after this table, instead of
-            // ~keep being flattened into a line of escaped pipes.
-            let mut deferred_tables: Vec<String> = Vec::new();
-
-            // ~keep Pre-pass: compute per-column max content widths for aligned padding.
-            // ~keep Uses a rowspan tracker so spanned columns are skipped just as they
-            // ~keep are in the render pass, keeping column indices correctly aligned.
-            // ~keep Skipped entirely when compact_tables is true — passing an empty slice
-            // ~keep to convert_table_row disables all padding and reduces separator dashes
-            // ~keep to the GFM minimum (---).
-            let col_widths: Vec<usize> = if options.compact_tables {
-                Vec::new()
-            } else {
-                // ~keep Exactly one walk of a cell may reach each collector, and the context's
-                // ~keep collector handles are `Rc`s that `..ctx.clone()` shares rather than copies.
-                // ~keep With reuse on, the render pass emits this pass's cached markdown without
-                // ~keep walking the cell again, so this pass is that one walk and keeps the handles.
-                // ~keep With reuse off the render pass walks and records, so the handles are detached
-                // ~keep here — the width measurement is an internal detail and must not be visible in
-                // ~keep `ConversionResult`. Detaching propagates to the whole subtree because every
-                // ~keep nested context is built from this one by `..clone()`.
-                // ~keep For the structure and inline-image collectors the reuse-on branch is
-                // ~keep unreachable rather than merely unused: `cell_text_reuse_allowed` returns false
-                // ~keep whenever either is set, so neither can ever be the pass that records. The
-                // ~keep guard is kept so the two rules stay coupled if that function changes.
-                let mut prepass_ctx = super::super::super::Context {
-                    skip_visitor_hooks: true,
-                    measure_width_only: true,
-                    ..ctx.clone()
-                };
-                if !reuse_cell_text {
-                    #[cfg(feature = "metadata")]
-                    {
-                        prepass_ctx.metadata_collector = None;
-                    }
-                    prepass_ctx.structure_collector = None;
-                    #[cfg(feature = "inline-images")]
-                    {
-                        prepass_ctx.inline_collector = None;
-                    }
-                }
-                let mut widths: Vec<usize> = Vec::new();
-                let mut prepass_rowspan: Vec<Option<usize>> = vec![None; total_cols];
-                let children = tag.children();
-                for child_handle in children.top().iter() {
-                    if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                        let tag_name = normalized_tag_name(child_tag.name().as_utf8_str());
-                        match tag_name.as_ref() {
-                            "thead" | "tbody" | "tfoot" => {
-                                for row_handle in child_tag.children().top().iter() {
-                                    if is_tag_name(row_handle, parser, dom_ctx, "tr") {
-                                        collect_row_cell_widths(
-                                            row_handle,
-                                            RowEnv {
-                                                parser,
-                                                options,
-                                                ctx: &prepass_ctx,
-                                                dom_ctx,
-                                            },
-                                            &mut widths,
-                                            &mut prepass_rowspan,
-                                            &mut cell_cache,
-                                            depth + 1,
-                                        );
-                                    }
-                                }
-                            }
-                            "tr" | "row" => {
-                                collect_row_cell_widths(
-                                    child_handle,
-                                    RowEnv {
-                                        parser,
-                                        options,
-                                        ctx: &prepass_ctx,
-                                        dom_ctx,
-                                    },
-                                    &mut widths,
-                                    &mut prepass_rowspan,
-                                    &mut cell_cache,
-                                    depth + 1,
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                widths
-            };
-
-            let children = tag.children();
-            {
-                for child_handle in children.top().iter() {
-                    if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-                        let tag_name: Cow<'_, str> = dom_ctx.tag_info(child_handle.get_inner(), parser).map_or_else(
-                            || normalized_tag_name(child_tag.name().as_utf8_str()).into_owned().into(),
-                            |info| Cow::Borrowed(info.name.as_str()),
-                        );
-
-                        match tag_name.as_ref() {
-                            "caption" => {
-                                let mut text = String::new();
-                                let grandchildren = child_tag.children();
-                                {
-                                    let caption_ctx = super::super::super::Context {
-                                        text_in_markers: true,
-                                        escapes_hyphens: true,
-                                        ..ctx.clone()
-                                    };
-                                    for grandchild_handle in grandchildren.top().iter() {
-                                        super::super::super::walk_node(
-                                            grandchild_handle,
-                                            parser,
-                                            &mut text,
-                                            options,
-                                            &caption_ctx,
-                                            depth + 1,
-                                            dom_ctx,
-                                        );
-                                    }
-                                }
-                                let text = text.trim();
-                                if !text.is_empty() {
-                                    let escaped_text = text.replace('-', r"\-");
-                                    output.push('*');
-                                    output.push_str(&escaped_text);
-                                    output.push_str("*\n\n");
-                                }
-                            }
-
-                            "thead" | "tbody" | "tfoot" => {
-                                let is_header_section = tag_name.as_ref() == "thead";
-                                let section_children = child_tag.children();
-                                {
-                                    for row_handle in section_children.top().iter() {
-                                        if let Some(tl::Node::Tag(row_tag)) = row_handle.get(parser) {
-                                            let row_tag_name = dom_ctx
-                                                .tag_name_for(*row_handle, parser)
-                                                .unwrap_or_else(|| normalized_tag_name(row_tag.name().as_utf8_str()));
-                                            if matches!(row_tag_name.as_ref(), "tr" | "row") {
-                                                let row_emitted = convert_table_row(
-                                                    row_handle,
-                                                    parser,
-                                                    output,
-                                                    options,
-                                                    ctx,
-                                                    row_index,
-                                                    table_scan.has_span,
-                                                    &mut rowspan_tracker,
-                                                    total_cols,
-                                                    total_cols,
-                                                    dom_ctx,
-                                                    depth + 1,
-                                                    is_header_section,
-                                                    &col_widths,
-                                                    &mut cell_cache,
-                                                    &mut deferred_tables,
-                                                );
-                                                // ~keep Only advance the row counter for a row
-                                                // ~keep that actually emitted output -- a
-                                                // ~keep cell-less row (issue #489) must not
-                                                // ~keep consume the header slot.
-                                                if row_emitted {
-                                                    row_index += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            "tr" | "row" => {
-                                let row_emitted = convert_table_row(
-                                    child_handle,
-                                    parser,
-                                    output,
-                                    options,
-                                    ctx,
-                                    row_index,
-                                    table_scan.has_span,
-                                    &mut rowspan_tracker,
-                                    total_cols,
-                                    total_cols,
-                                    dom_ctx,
-                                    depth + 1,
-                                    row_index == 0,
-                                    &col_widths,
-                                    &mut cell_cache,
-                                    &mut deferred_tables,
-                                );
-                                // ~keep Only advance the row counter for a row that actually
-                                // ~keep emitted output -- a cell-less row (issue #489) must
-                                // ~keep not consume the header slot.
-                                if row_emitted {
-                                    row_index += 1;
-                                }
-                            }
-
-                            "colgroup" | "col" => {}
-
-                            _ => {
-                                super::super::super::walk_node(
-                                    child_handle,
-                                    parser,
-                                    output,
-                                    options,
-                                    ctx,
-                                    depth + 1,
-                                    dom_ctx,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ~keep Render each deferred nested table (issue #484) as its own separate GFM
-            // ~keep table, immediately after this one. GFM cannot express real nesting, so
-            // ~keep this is the closest usable substitute to what 3.8.3 rendered before the
-            // ~keep escaped-flatten fallback (issue #469) took over this shape too.
-            for nested in &deferred_tables {
-                if !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                if !output.ends_with("\n\n") {
-                    output.push('\n');
-                }
-                output.push_str(nested);
-                output.push('\n');
-            }
-        }
-
-        #[cfg(feature = "visitor")]
-        if let Some(ref visitor_handle) = ctx.visitor {
-            use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-            let node_id = node_handle.get_inner();
-            let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-            let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-            let node_ctx = NodeContext::with_lazy_attributes(
-                NodeType::Table,
-                Cow::Borrowed("table"),
-                tag,
-                depth,
-                index_in_parent,
-                parent_tag.map(Cow::Borrowed),
-                false,
-            );
-
-            let table_content = &output[table_output_start..];
-
-            let visit_result = {
-                let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
-                visitor.visit_table_end(&node_ctx, table_content)
-            };
-            match visit_result {
-                VisitResult::Continue => {
-                    if let Some(custom_start) = table_start_custom {
-                        output.insert_str(table_output_start, &custom_start);
-                    }
-                }
-                VisitResult::Custom(custom) => {
-                    let rows_output = output[table_output_start..].to_string();
-                    output.truncate(table_output_start);
-                    if let Some(custom_start) = table_start_custom {
-                        output.push_str(&custom_start);
-                    }
-                    output.push_str(&rows_output);
-                    output.push_str(&custom);
-                }
-                VisitResult::Skip => {
-                    output.truncate(table_output_start);
-                }
-                VisitResult::Error(err) => {
-                    if ctx.visitor_error.borrow().is_none() {
-                        *ctx.visitor_error.borrow_mut() = Some(err);
-                    }
-                }
-                VisitResult::PreserveHtml => {
-                    output.truncate(table_output_start);
-                    output.push_str(&super::super::super::serialize_node(node_handle, parser));
-                }
-            }
-        }
+        return;
     }
+    if let Some((cell_handle, cell_depth)) = wrapper_cell {
+        render_wrapper_cell(cell_handle, cell_depth, parser, output, handler);
+    } else {
+        render_data_table(node_handle, tag, parser, output, handler, &table_scan);
+    }
+    #[cfg(feature = "visitor")]
+    finish_table_visit(node_handle, parser, output, tag, handler, visitor_state);
 }
 
 #[cfg(test)]

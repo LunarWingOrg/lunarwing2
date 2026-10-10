@@ -44,6 +44,7 @@ fn assert_lists(html: &str, options: &ConversionOptions, expected: &str, tag: &s
     assert_eq!(rendered.matches(tag).count(), lists, "{html}: {rendered:?}");
 }
 
+#[cfg(feature = "testkit")]
 #[test]
 fn should_keep_two_ordered_lists_next_to_each_other_apart() {
     for strategy in [TierStrategy::Tier2, TierStrategy::Auto, TierStrategy::Tier1] {

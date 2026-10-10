@@ -70,7 +70,9 @@ pub fn run(html: &str, report: &PrescanReport, options: &ConversionOptions) -> R
     run_with_base(html, report, options, None, document_base_href.as_deref())
 }
 
-/// Same as [`run`], but resolves relative `href`/`src` destinations against
+/// Run Tier-1 with caller-resolved URL context.
+///
+/// This is the same as [`run`], but resolves relative `href`/`src` destinations against
 /// `effective_base` (see `converter::url_resolve::resolve_attribute_url`) and takes the
 /// document's `<base href>` from the caller. Used by `convert_api.rs`'s production
 /// conversion path.
@@ -79,7 +81,7 @@ pub fn run(html: &str, report: &PrescanReport, options: &ConversionOptions) -> R
 ///
 /// Returns `Err(BailReason::*)` when the scanner encounters a construct it cannot
 /// handle.  The dispatcher falls back to Tier-2 transparently.
-pub(crate) fn run_with_base(
+pub fn run_with_base(
     html: &str,
     report: &PrescanReport,
     options: &ConversionOptions,

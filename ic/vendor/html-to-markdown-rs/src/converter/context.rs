@@ -4,9 +4,7 @@
 //! HTML to Markdown. It tracks nesting levels, element types, and feature-specific collectors
 //! that are passed through the conversion pipeline.
 
-use std::cell::Cell;
-#[cfg(any(feature = "inline-images", feature = "visitor"))]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[cfg(feature = "metadata")]
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -30,6 +28,70 @@ pub type InlineCollectorHandle = ();
 #[cfg(feature = "metadata")]
 pub type ImageMetadataPayload = (BTreeMap<String, String>, Option<u32>, Option<u32>);
 
+pub struct ContextParameters {
+    pub inline_collector: Option<InlineCollectorHandle>,
+    #[cfg(feature = "metadata")]
+    pub metadata_collector: Option<crate::metadata::MetadataCollectorHandle>,
+    #[cfg(feature = "visitor")]
+    pub visitor: Option<crate::visitor::VisitorHandle>,
+    pub structure_collector: Option<StructureCollectorHandle>,
+    pub reference_collector: Option<ReferenceCollectorHandle>,
+    pub base_url: Option<Rc<url::Url>>,
+}
+
+#[cfg(feature = "metadata")]
+struct MetadataPreferences {
+    document: bool,
+    headers: bool,
+    links: bool,
+    images: bool,
+    structured_data: bool,
+}
+
+#[cfg(feature = "metadata")]
+fn metadata_preferences(collector: Option<&crate::metadata::MetadataCollectorHandle>) -> MetadataPreferences {
+    let Some(collector) = collector else {
+        return MetadataPreferences {
+            document: false,
+            headers: false,
+            links: false,
+            images: false,
+            structured_data: false,
+        };
+    };
+    let guard = collector.borrow();
+    MetadataPreferences {
+        document: guard.wants_document(),
+        headers: guard.wants_headers(),
+        links: guard.wants_links(),
+        images: guard.wants_images(),
+        structured_data: guard.wants_structured_data(),
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct DjotRuleLikeText {
+    lines: Rc<[bool]>,
+    current_line: Rc<Cell<usize>>,
+}
+
+impl DjotRuleLikeText {
+    pub(super) fn new(lines: Vec<bool>) -> Self {
+        Self {
+            lines: lines.into(),
+            current_line: Rc::new(Cell::new(0)),
+        }
+    }
+
+    pub(super) fn current(&self) -> bool {
+        self.lines.get(self.current_line.get()).copied().unwrap_or(false)
+    }
+
+    pub(super) fn advance(&self) {
+        self.current_line.set(self.current_line.get().saturating_add(1));
+    }
+}
+
 /// Conversion context that tracks state during HTML to Markdown conversion.
 ///
 /// This context is passed through the recursive tree walker and maintains information
@@ -49,6 +111,8 @@ pub struct Context {
     /// SPAN must split the span in two rather than embed a newline inside the backticks
     /// (issue #487). ~keep
     pub(crate) in_code_block: bool,
+    /// Output offsets of real `<br>` nodes while a table-cell `<pre>` is collected. ~keep
+    pub(crate) pre_cell_break_offsets: Option<Rc<RefCell<Vec<usize>>>>,
     /// Current list item counter for ordered lists.
     ///
     /// Signed so a negative `start` attribute (permitted by the HTML spec and honored by
@@ -100,6 +164,8 @@ pub struct Context {
     /// say): a list marker at the start of the empty buffer is written at that column, not at
     /// the start of a line.
     pub(crate) inline_buffer_column: Option<usize>,
+    /// ~keep Whether an inline wrapper's detached buffer starts immediately after a hard break.
+    pub(crate) inline_buffer_after_hard_break: bool,
     /// Whether the current output buffer escapes every `-` once it is written (a table
     /// caption): a `-` list marker there is text.
     pub(crate) escapes_hyphens: bool,
@@ -144,6 +210,10 @@ pub struct Context {
     /// The element of a task item whose render writes the item's first content, or `None`
     /// outside a task item.
     pub(crate) first_writer: Option<crate::converter::list::item::FirstWriter>,
+    /// ~keep List and blockquote depths of the task item whose children are being collected into
+    /// the detached `task_text` buffer. Text at this exact scope is later placed after the
+    /// checkbox marker; nested list items and blockquotes keep normal block-start escaping.
+    pub(crate) task_item_scope: Option<(usize, usize)>,
     /// Unordered list nesting depth (for bullet cycling)
     pub(crate) ul_depth: usize,
     /// Are we inside any list (ul or ol)?
@@ -166,6 +236,10 @@ pub struct Context {
     pub(crate) link_allow_inline_images: bool,
     /// Are we inside a paragraph element?
     pub(crate) in_paragraph: bool,
+    /// ~keep `None` before a Djot text container is classified, then the rule-like status of
+    /// each logical line. Inline descendants share the cursor so DOM segmentation cannot change
+    /// which literal stars are escaped, while a `<br>` can start an ordinary following line.
+    pub(super) djot_rule_like_text: Option<DjotRuleLikeText>,
     /// Output buffer position where the current block's content starts.
     /// Used to distinguish paragraph-break newlines from a previous block
     /// vs. newlines generated within the current block.
@@ -289,45 +363,14 @@ impl Context {
     }
 
     /// Create a new conversion context from options and optional collectors.
-    #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(
-        any(not(feature = "inline-images"), not(feature = "metadata"), not(feature = "visitor")),
-        allow(unused_variables)
-    )]
-    pub fn new(
-        options: &crate::options::ConversionOptions,
-        inline_collector: Option<InlineCollectorHandle>,
-        #[cfg(feature = "metadata")] metadata_collector: Option<crate::metadata::MetadataCollectorHandle>,
-        #[cfg(not(feature = "metadata"))] _metadata_collector: Option<()>,
-        #[cfg(feature = "visitor")] visitor: Option<crate::visitor::VisitorHandle>,
-        #[cfg(not(feature = "visitor"))] _visitor: Option<()>,
-        structure_collector: Option<StructureCollectorHandle>,
-        reference_collector: Option<ReferenceCollectorHandle>,
-        base_url: Option<Rc<url::Url>>,
-    ) -> Self {
+    pub(crate) fn new(options: &crate::options::ConversionOptions, parameters: ContextParameters) -> Self {
         #[cfg(feature = "metadata")]
-        let (
-            metadata_wants_document,
-            metadata_wants_headers,
-            metadata_wants_links,
-            metadata_wants_images,
-            metadata_wants_structured_data,
-        ) = if let Some(ref collector) = metadata_collector {
-            let guard = collector.borrow();
-            (
-                guard.wants_document(),
-                guard.wants_headers(),
-                guard.wants_links(),
-                guard.wants_images(),
-                guard.wants_structured_data(),
-            )
-        } else {
-            (false, false, false, false, false)
-        };
+        let metadata = metadata_preferences(parameters.metadata_collector.as_ref());
 
         Self {
             in_code: false,
             in_code_block: false,
+            pre_cell_break_offsets: None,
             list_counter: 0,
             in_ordered_list: false,
             blockquote_depth: 0,
@@ -340,6 +383,7 @@ impl Context {
             text_in_markers: false,
             in_marker_span: false,
             inline_buffer_column: None,
+            inline_buffer_after_hard_break: false,
             escapes_hyphens: false,
             list_depth: 0,
             list_indent_columns: 0,
@@ -350,6 +394,7 @@ impl Context {
             ordered_delimiter: None,
             item_lines: crate::converter::list::utils::ItemLineScan::default(),
             first_writer: None,
+            task_item_scope: None,
             ul_depth: 0,
             in_list: false,
             loose_list: false,
@@ -359,6 +404,7 @@ impl Context {
             cell_allow_inline_images: false,
             link_allow_inline_images: false,
             in_paragraph: false,
+            djot_rule_like_text: None,
             block_content_start: 0,
             block_output_ptr: 0,
             at_fresh_block_start: Rc::new(Cell::new(true)),
@@ -372,28 +418,28 @@ impl Context {
             depth_limit_reached: Rc::new(Cell::new(false)),
             inline_data_replaced: Rc::new(Cell::new(false)),
             #[cfg(feature = "inline-images")]
-            inline_collector,
+            inline_collector: parameters.inline_collector,
             #[cfg(feature = "metadata")]
-            metadata_collector,
+            metadata_collector: parameters.metadata_collector,
             #[cfg(feature = "metadata")]
-            metadata_wants_document,
+            metadata_wants_document: metadata.document,
             #[cfg(feature = "metadata")]
-            metadata_wants_headers,
+            metadata_wants_headers: metadata.headers,
             #[cfg(feature = "metadata")]
-            metadata_wants_links,
+            metadata_wants_links: metadata.links,
             #[cfg(feature = "metadata")]
-            metadata_wants_images,
+            metadata_wants_images: metadata.images,
             #[cfg(feature = "metadata")]
-            metadata_wants_structured_data,
+            metadata_wants_structured_data: metadata.structured_data,
             #[cfg(feature = "visitor")]
-            visitor: visitor.clone(),
+            visitor: parameters.visitor,
             #[cfg(feature = "visitor")]
             visitor_error: Rc::new(RefCell::new(None)),
-            structure_collector,
-            reference_collector,
+            structure_collector: parameters.structure_collector,
+            reference_collector: parameters.reference_collector,
             skip_visitor_hooks: false,
             measure_width_only: false,
-            base_url,
+            base_url: parameters.base_url,
         }
     }
 
@@ -425,6 +471,11 @@ impl Context {
             } else {
                 Some(indent_column + line[indent_length..].chars().count())
             },
+            inline_buffer_after_hard_break: if output.is_empty() {
+                self.inline_buffer_after_hard_break
+            } else {
+                crate::converter::utility::escaping::ends_with_hard_break(output)
+            },
             ..self.clone()
         }
     }
@@ -445,7 +496,16 @@ impl Context {
     /// Returns `None` (meaning: use the original text unchanged) whenever `base_url`
     /// is unset, `value` is empty, already absolute, or fails to resolve. See
     /// `converter::url_resolve::resolve_attribute_url` for the full contract.
-    pub(crate) fn resolve_url(&self, value: &str) -> Option<String> {
+    pub(crate) fn resolve_url(
+        &self,
+        value: &str,
+        node_handle: &tl::NodeHandle,
+        parser: &tl::Parser,
+        dom_ctx: &crate::converter::DomContext,
+    ) -> Option<String> {
+        if dom_ctx.has_raw_text_ancestor(node_handle.get_inner(), parser) {
+            return None;
+        }
         crate::converter::url_resolve::resolve_attribute_url(self.base_url.as_deref()?, value)
     }
 }

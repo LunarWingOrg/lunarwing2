@@ -323,7 +323,12 @@ fn cell_ancestor_state_for(tag_name: &str, inherited: bool) -> bool {
 /// - **Aggressive**: All of Standard, plus: drops `<footer>`, `<aside>`, `<noscript>`
 ///   unconditionally. Drops ANY element with navigation hints in class/id/role
 ///   (e.g. `<div class="sidebar">`). Drops elements with noise-related classes/roles.
-pub fn should_drop_for_preprocessing(tag_name: &str, tag: &tl::HTMLTag, options: &ConversionOptions) -> bool {
+pub fn should_drop_for_preprocessing(
+    tag_name: &str,
+    tag: &tl::HTMLTag,
+    options: &ConversionOptions,
+    is_page_header: bool,
+) -> bool {
     use crate::options::PreprocessingPreset;
 
     if !options.preprocessing.enabled {
@@ -358,7 +363,7 @@ pub fn should_drop_for_preprocessing(tag_name: &str, tag: &tl::HTMLTag, options:
     }
 
     if tag_name == "header" {
-        return has_nav_hint;
+        return is_page_header || has_nav_hint;
     }
 
     if tag_name == "footer" || tag_name == "aside" {
@@ -376,6 +381,21 @@ pub fn should_drop_for_preprocessing(tag_name: &str, tag: &tl::HTMLTag, options:
     }
 
     false
+}
+
+pub fn is_page_header(node_handle: &tl::NodeHandle, parser: &tl::Parser, dom_ctx: &DomContext) -> bool {
+    let mut ancestor = dom_ctx.parent_of(node_handle.get_inner());
+    let mut in_document_body = false;
+    while let Some(node_id) = ancestor {
+        if let Some(info) = dom_ctx.tag_info(node_id, parser) {
+            if matches!(info.name.as_str(), "article" | "section" | "main") {
+                return false;
+            }
+            in_document_body |= info.name == "body";
+        }
+        ancestor = dom_ctx.parent_of(node_id);
+    }
+    in_document_body
 }
 
 /// Check if an element has noise-related hints (ads, cookie banners, social sharing).

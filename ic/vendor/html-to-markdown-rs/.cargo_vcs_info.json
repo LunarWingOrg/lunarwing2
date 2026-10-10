@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "695ce726d09f253565b6c16e58a953c701dec60e"
+    "sha1": "430dba0c325615760e7601130c25a4a41a2f4dd5"
   },
   "path_in_vcs": "crates/html-to-markdown"
 }

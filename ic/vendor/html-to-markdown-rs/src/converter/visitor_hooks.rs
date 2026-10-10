@@ -114,9 +114,9 @@ pub fn handle_visitor_element_end(
     state: &VisitorElementState<'_>,
     tag: &tl::HTMLTag,
     end: VisitorElementEndContext<'_>,
-) {
+) -> VisitAction {
     if matches!(tag_name, "table") {
-        return;
+        return VisitAction::Continue;
     }
 
     let node_ctx = state.build_node_ctx(tag_name, tag, end.depth);
@@ -127,20 +127,22 @@ pub fn handle_visitor_element_end(
 
     let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
     match visitor.visit_element_end(&node_ctx, element_content) {
-        VisitResult::Continue => {}
+        VisitResult::Continue | VisitResult::PreserveHtml => VisitAction::Continue,
         VisitResult::Custom(custom) => {
             end.output.truncate(safe_start);
             end.output.push_str(&custom);
+            VisitAction::Custom
         }
         VisitResult::Skip => {
             end.output.truncate(safe_start);
+            VisitAction::Skip
         }
         VisitResult::Error(err) => {
             if end.ctx.visitor_error.borrow().is_none() {
                 *end.ctx.visitor_error.borrow_mut() = Some(err);
             }
+            VisitAction::Error
         }
-        VisitResult::PreserveHtml => {}
     }
 }
 

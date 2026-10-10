@@ -10,13 +10,10 @@
 //! what `converter::main`'s walk dispatches to; this module's own `<code>` arm was a second,
 //! silently divergent implementation that nothing ever reached. ~keep
 
-use crate::converter::inline::wrapped::emit_code_span;
-use crate::options::ConversionOptions;
+use crate::converter::inline::{HandlerContext, wrapped::InlineSite, wrapped::emit_code_span};
 use crate::text;
-use tl::{NodeHandle, Parser};
 
 type Context = crate::converter::Context;
-type DomContext = crate::converter::DomContext;
 
 /// Handler for code-related inline elements: code, kbd (keyboard), and samp (sample output).
 ///
@@ -30,20 +27,9 @@ type DomContext = crate::converter::DomContext;
 /// # Note
 /// This function references helper functions and `walk_node` from converter.rs
 /// which must be accessible (pub(crate)) for this module to work correctly.
-pub fn handle(
-    tag_name: &str,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
+pub fn handle(tag_name: &str, context: HandlerContext<'_>) {
     match tag_name {
-        "kbd" | "samp" => {
-            handle_kbd_samp(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
-        }
+        "kbd" | "samp" => handle_kbd_samp(context),
         _ => {}
     }
 }
@@ -53,20 +39,14 @@ pub fn handle(
 /// These elements are rendered as inline code with:
 /// - Whitespace normalization (via `text::normalize_whitespace`)
 /// - Chomp inline handling for prefix/suffix spacing
-/// - Simple single backtick wrapping (no smart escaping for keyboard/sample)
-fn handle_kbd_samp(
-    _tag_name: &str,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    use crate::converter::{append_inline_suffix, chomp_inline, walk_node};
+/// - The same delimiter selection and padding as `<code>` ~keep
+fn handle_kbd_samp(mut handler: HandlerContext<'_>) {
+    use crate::converter::{append_inline_suffix, chomp_inline};
 
-    let Some(node) = node_handle.get(parser) else { return };
+    let site = handler.inline_site();
+    let Some(node) = handler.node_handle.get(handler.parser) else {
+        return;
+    };
 
     let tag = match node {
         tl::Node::Tag(tag) => tag,
@@ -74,12 +54,12 @@ fn handle_kbd_samp(
     };
 
     let children = tag.children();
-    if ctx.in_code {
+    if handler.context.in_code {
         // ~keep A nested `<code>` renders transparently inside an outer code span
         // ~keep (`handlers::code_block::handle_code`); `<kbd>`/`<samp>` wrapped their own
         // ~keep backticks anyway, so the outer span grew a second, nested pair.
         for child_handle in children.top().iter() {
-            walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
+            walk_child(child_handle, handler.output, handler.context, handler.depth, site);
         }
         return;
     }
@@ -87,18 +67,10 @@ fn handle_kbd_samp(
     let mut content = String::with_capacity(32);
     let code_ctx = Context {
         in_code: true,
-        ..ctx.clone()
+        ..handler.context.clone()
     };
     for child_handle in children.top().iter() {
-        walk_node(
-            child_handle,
-            parser,
-            &mut content,
-            options,
-            &code_ctx,
-            depth + 1,
-            dom_ctx,
-        );
+        walk_child(child_handle, &mut content, &code_ctx, handler.depth, site);
     }
 
     let normalized = text::normalize_whitespace(&content);
@@ -119,17 +91,31 @@ fn handle_kbd_samp(
     let emit_prefix = if trimmed.is_empty() { "" } else { prefix };
     let emit_suffix = if trimmed.is_empty() { "" } else { suffix };
 
-    output.push_str(emit_prefix);
-    emit_kbd_samp_segments(
-        body,
-        emit_prefix.is_empty(),
-        output,
-        options,
-        node_handle,
-        parser,
-        dom_ctx,
+    handler.output.push_str(emit_prefix);
+    emit_kbd_samp_segments(body, emit_prefix.is_empty(), &mut handler);
+    append_inline_suffix(
+        handler.output,
+        emit_suffix,
+        !body.is_empty(),
+        handler.node_handle,
+        handler.parser,
+        handler.dom_context,
     );
-    append_inline_suffix(output, emit_suffix, !body.is_empty(), node_handle, parser, dom_ctx);
+}
+
+fn walk_child(
+    child_handle: &tl::NodeHandle,
+    output: &mut String,
+    context: &Context,
+    depth: usize,
+    site: InlineSite<'_>,
+) {
+    crate::converter::walk_node(
+        child_handle,
+        site.parser,
+        output,
+        crate::converter::block::container::HandlerContext::new(site.options, context, depth + 1, site.dom_ctx),
+    );
 }
 
 /// Render `body` as one or more backtick spans, split on the `'\n'` internal split marker
@@ -138,43 +124,32 @@ fn handle_kbd_samp(
 /// verbatim by `<kbd>`/`<samp>` here). `may_merge_first` is false whenever `emit_prefix` was
 /// non-empty (the caller already pushed literal prefix text, so the first span can no longer
 /// be adjacent to a preceding sibling's closing backtick). ~keep
-fn emit_kbd_samp_segments(
-    body: &str,
-    may_merge_first: bool,
-    output: &mut String,
-    options: &ConversionOptions,
-    node_handle: &NodeHandle,
-    parser: &Parser,
-    dom_ctx: &DomContext,
-) {
-    let separator = crate::converter::main_helpers::hard_break_marker(options.newline_style);
+fn emit_kbd_samp_segments(body: &str, may_merge_first: bool, handler: &mut HandlerContext<'_>) {
+    let separator = crate::converter::main_helpers::hard_break_marker(handler.options);
     let mut first = true;
     for segment in body.split('\n').filter(|segment| !segment.is_empty()) {
         if first {
             let mut span = String::with_capacity(segment.len() + 2);
-            render_code_span(segment, &mut span);
+            crate::converter::handlers::code_block::format_inline_code(segment, &mut span);
             if may_merge_first {
-                emit_code_span(&span, segment, output, node_handle, parser, dom_ctx);
+                emit_code_span(
+                    &span,
+                    segment,
+                    handler.output,
+                    handler.node_handle,
+                    handler.parser,
+                    handler.dom_context,
+                );
             } else {
-                output.push_str(&span);
+                handler.output.push_str(&span);
             }
         } else {
             // ~keep Only the first segment may merge into a preceding sibling span
             // ~keep (issue #483): every later segment is preceded by our own
             // ~keep separator, never a bare closing backtick.
-            output.push_str(separator);
-            render_code_span(segment, output);
+            handler.output.push_str(separator);
+            crate::converter::handlers::code_block::format_inline_code(segment, handler.output);
         }
         first = false;
     }
-}
-
-/// Render `body` as an inline code span.
-///
-/// No delimiter-space padding: `CommonMark` strips one space from each end of a code span only
-/// when the content is not entirely spaces, so an all-spaces body round-trips as written. ~keep
-fn render_code_span(body: &str, span: &mut String) {
-    span.push('`');
-    span.push_str(body);
-    span.push('`');
 }

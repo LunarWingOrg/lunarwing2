@@ -7,10 +7,9 @@
 //! - Visitor callback integration
 
 use crate::converter::Context;
-use crate::converter::dom_context::DomContext;
+use crate::converter::inline::HandlerContext;
 use crate::converter::main::walk_node;
 use crate::converter::main_helpers::strip_trailing_backslash_breaks_from_fresh_buffer;
-use crate::options::ConversionOptions;
 
 #[cfg(feature = "visitor")]
 use crate::converter::utility::serialization::serialize_node_to_html;
@@ -25,268 +24,253 @@ use std::borrow::Cow;
 /// - Processing citation URLs from cite attribute
 /// - Invoking visitor callbacks when the visitor feature is enabled
 /// - Adding proper spacing and blockquote prefix formatting
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
-#[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-pub fn handle_blockquote(
-    node_handle: &tl::NodeHandle,
-    tag: &tl::HTMLTag,
-    parser: &tl::Parser,
-    output: &mut String,
-    options: &ConversionOptions,
-    ctx: &Context,
-    depth: usize,
-    dom_ctx: &DomContext,
-) {
-    if ctx.convert_as_inline {
-        let children = tag.children();
-        {
-            for child_handle in children.top().iter() {
-                walk_node(child_handle, parser, output, options, ctx, depth + 1, dom_ctx);
-            }
-        }
+pub fn handle_blockquote(tag: &tl::HTMLTag, mut handler: HandlerContext<'_>) {
+    if handler.context.in_heading && !handler.context.in_table_cell {
+        render_heading_quote(tag, &mut handler);
+        return;
+    }
+    if handler.context.convert_as_inline {
+        walk_children_to_output(tag, &mut handler);
         return;
     }
 
-    // ~keep Resolved like every other destination the converter renders: a relative `cite`
-    // is useless once the markdown leaves the page it came from. `resolve_url` returns
-    // `None` for an already-absolute or unresolvable reference, which then passes through.
+    // ~keep Relative citations must remain meaningful after the Markdown leaves its source page.
     let cite = crate::converter::utility::attributes::decoded_attribute(tag, "cite")
         .map(std::borrow::Cow::into_owned)
-        .map(|value| ctx.resolve_url(&value).unwrap_or(value));
+        .map(|value| {
+            handler
+                .context
+                .resolve_url(&value, handler.node_handle, handler.parser, handler.dom_context)
+                .unwrap_or(value)
+        });
+    let content = collect_quote_content(tag, &handler);
+    let trimmed = content.trim();
 
-    // ~keep The quote writes the indent of the list items around it on each of its lines, so its
-    // ~keep children start at column 0 of a container of their own, outside the item: a list in
-    // ~keep the quote counts only its own markers, and every line of an item in the quote gets
-    // ~keep the same column (issue #654). Bold or italic around the item holding the quote does
-    // ~keep not make a list in the quote text: its items open. Under the markers of a caption, a
-    // ~keep summary or an inline wrapper that does not count in the inline depth (a highlight, a
-    // ~keep deletion, a subscript), a list in the quote is still judged by where its markers fall,
-    // ~keep as outside it.
-    // ~keep A quote right after an opening inline marker starts on that marker's line, so its
-    // ~keep first line is text between the markers.
-    let first_line_follows_markers = output.is_empty() && ctx.in_marker_text();
-    let blockquote_ctx = Context {
-        blockquote_depth: ctx.blockquote_depth + 1,
+    #[cfg(feature = "visitor")]
+    if visit_blockquote(tag, trimmed, &mut handler) {
+        return;
+    }
+    if handler.context.in_table_cell {
+        render_table_cell_quote(trimmed, cite.as_deref(), &mut handler);
+    } else {
+        render_quote(trimmed, cite.as_deref(), &mut handler);
+    }
+}
+
+fn walk_children_to_output(tag: &tl::HTMLTag<'_>, handler: &mut HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        walk_node(
+            child_handle,
+            handler.parser,
+            handler.output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                handler.context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
+        );
+    }
+}
+
+fn render_heading_quote(tag: &tl::HTMLTag<'_>, handler: &mut HandlerContext<'_>) {
+    let mut content = String::new();
+    walk_children(tag, &mut content, handler.context, handler);
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !handler.output.is_empty() && !handler.output.ends_with(char::is_whitespace) {
+        handler.output.push(' ');
+    }
+    handler.output.push_str("> ");
+    handler.output.push_str(trimmed);
+    handler.output.push(' ');
+}
+
+fn collect_quote_content(tag: &tl::HTMLTag<'_>, handler: &HandlerContext<'_>) -> String {
+    // ~keep Quote children start in a container of their own; surrounding list columns do not
+    // alter nested lists, but an opening inline marker remains active on the first line (#654).
+    let follows_markers = handler.output.is_empty() && handler.context.in_marker_text();
+    let quote_context = Context {
+        blockquote_depth: handler.context.blockquote_depth + 1,
         in_list_item: false,
         in_list: false,
         list_indent_columns: 0,
         real_item_columns: 0,
         inline_buffer_column: None,
-        inline_depth: if first_line_follows_markers {
-            ctx.inline_depth
+        inline_depth: if follows_markers {
+            handler.context.inline_depth
         } else {
             0
         },
-        quote_starts_after_markers: first_line_follows_markers,
+        quote_starts_after_markers: follows_markers,
         item_lines: crate::converter::list::utils::ItemLineScan::new_item(),
-        ..ctx.clone()
+        ..handler.context.clone()
     };
-
     let mut content = String::with_capacity(256);
-    let children = tag.children();
-    {
-        for child_handle in children.top().iter() {
-            walk_node(
-                child_handle,
-                parser,
-                &mut content,
-                options,
-                &blockquote_ctx,
-                depth + 1,
-                dom_ctx,
-            );
-        }
-    }
+    walk_children(tag, &mut content, &quote_context, handler);
+    // ~keep No later dispatch can close a trailing `<br>` run at the end of this buffer (#464).
+    strip_trailing_backslash_breaks_from_fresh_buffer(&mut content, handler.options.newline_style);
+    content
+}
 
-    // ~keep A trailing <br> run with no following sibling has no next dispatch to catch it
-    // in `walk_node`'s pre-block-dispatch strip, since the blockquote's content is
-    // simply finished here — so this closes its own trailing run the same way
-    // `paragraph.rs` closes its own (issue #464 follow-up).
-    strip_trailing_backslash_breaks_from_fresh_buffer(&mut content, options.newline_style);
-
-    let trimmed_content = content.trim();
-
-    #[cfg(feature = "visitor")]
-    if let Some(ref visitor) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
-
-        let node_id = node_handle.get_inner();
-        let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
-        let index_in_parent = dom_ctx.get_sibling_index(node_id).unwrap_or(0);
-
-        let node_ctx = NodeContext::with_lazy_attributes(
-            NodeType::Blockquote,
-            Cow::Borrowed("blockquote"),
-            tag,
-            depth,
-            index_in_parent,
-            parent_tag.map(Cow::Borrowed),
-            false,
+fn walk_children(tag: &tl::HTMLTag<'_>, output: &mut String, context: &Context, handler: &HandlerContext<'_>) {
+    for child_handle in tag.children().top().iter() {
+        walk_node(
+            child_handle,
+            handler.parser,
+            output,
+            crate::converter::block::container::HandlerContext::new(
+                handler.options,
+                context,
+                handler.depth + 1,
+                handler.dom_context,
+            ),
         );
+    }
+}
 
-        let mut visitor_ref = visitor.lock().expect("visitor mutex poisoned");
-        match visitor_ref.visit_blockquote(&node_ctx, trimmed_content, ctx.blockquote_depth) {
-            VisitResult::Continue => {}
-            VisitResult::Custom(custom) => {
-                output.push_str(&custom);
-                return;
-            }
-            VisitResult::Skip => return,
-            VisitResult::PreserveHtml => {
-                let mut html_output = String::new();
-                serialize_node_to_html(node_handle, parser, &mut html_output);
-                output.push_str(&html_output);
-                return;
-            }
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                return;
+#[cfg(feature = "visitor")]
+fn visit_blockquote(tag: &tl::HTMLTag<'_>, content: &str, handler: &mut HandlerContext<'_>) -> bool {
+    use crate::visitor::{NodeContext, NodeType, VisitResult};
+
+    let Some(visitor) = handler.context.visitor.as_ref() else {
+        return false;
+    };
+    let node_id = handler.node_handle.get_inner();
+    let node_context = NodeContext::with_lazy_attributes(
+        NodeType::Blockquote,
+        Cow::Borrowed("blockquote"),
+        tag,
+        handler.depth,
+        handler.dom_context.get_sibling_index(node_id).unwrap_or(0),
+        handler
+            .dom_context
+            .parent_tag_name(node_id, handler.parser)
+            .map(Cow::Borrowed),
+        false,
+    );
+    let result = visitor.lock().expect("visitor mutex poisoned").visit_blockquote(
+        &node_context,
+        content,
+        handler.context.blockquote_depth,
+    );
+    match result {
+        VisitResult::Continue => return false,
+        VisitResult::Custom(custom) => handler.output.push_str(&custom),
+        VisitResult::Skip => {}
+        VisitResult::PreserveHtml => serialize_node_to_html(handler.node_handle, handler.parser, handler.output),
+        VisitResult::Error(error) => {
+            if handler.context.visitor_error.borrow().is_none() {
+                *handler.context.visitor_error.borrow_mut() = Some(error);
             }
         }
     }
+    true
+}
 
-    if ctx.in_table_cell {
-        // ~keep A cell holds one line, so a quote in it sheds its marker as a heading, a list and
-        // ~keep a code block do there, and the cell break separates it like any block (issue #647).
-        if !trimmed_content.is_empty() {
-            // ~keep In code the quote keeps the line ends it writes there, which the cell folds.
-            if ctx.in_code {
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
-                }
-            } else {
-                crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
-            }
-            output.push_str(trimmed_content);
-            if ctx.in_code {
-                output.push('\n');
-            }
-            if let Some(url) = cite {
-                crate::converter::main_helpers::separate_block_in_cell(output, options.br_in_tables);
-                output.push_str("— <");
-                output.push_str(&url);
-                output.push('>');
-            }
-        }
+fn render_table_cell_quote(content: &str, cite: Option<&str>, handler: &mut HandlerContext<'_>) {
+    if content.is_empty() {
         return;
     }
-
-    if !trimmed_content.is_empty() {
-        let list_indent = if ctx.in_list_item {
-            crate::converter::list::utils::continuation_indent_string(
-                crate::converter::list::utils::block_columns(ctx, options),
-                options,
-            )
-        } else {
-            None
-        };
-
-        // ~keep A blockquote that continues already-started list item content needs its
-        // first quoted line indented too; one that is the item's first content
-        // instead sits right after the marker, which already provides that column
-        // (see `block/paragraph.rs`'s `is_list_continuation` for the identical
-        // first-line distinction, applied there to paragraphs only).
-        // A plain suffix check like `output.ends_with("* ")` also matches the closing
-        // "**"/"*" of `<strong>`/`<em>` immediately followed by a migrated trailing
-        // space (e.g. `<strong>bold</strong> <blockquote>` leaves output ending in
-        // "**bold** "), which is indistinguishable from a real bare bullet by suffix
-        // alone. That false positive misclassified this blockquote as sitting right
-        // after the marker (skipping the continuation indent) when real inline
-        // content actually preceded it, leaving the quoted line unindented and
-        // dropping it (and the rest of the list) out of the item on reparse. See
-        // `list::utils::line_is_bare_list_marker`'s doc comment for the full
-        // rationale; it decomposes the WHOLE line instead of checking a fixed suffix.
-        let is_list_continuation = list_indent.is_some()
-            && !output.is_empty()
-            && !crate::converter::list::utils::line_is_bare_list_marker(output);
-
-        // ~keep The quote is the item's first content: it starts on the marker line. A line
-        // ~keep break after the marker left the item empty and the quote outside it, also in a
-        // ~keep quote that holds the list (issue #617).
-        let at_bare_marker =
-            ctx.in_list_item && crate::converter::list::utils::trim_whitespace_after_bare_marker(output);
-        if at_bare_marker {
-            // ~keep Nothing to separate: the marker line is the quote's first line.
-        } else if ctx.blockquote_depth > 0 && !ctx.in_list_item {
-            if !output.is_empty() {
-                while output.ends_with('\n') {
-                    output.truncate(output.len() - 1);
-                }
-                output.push_str("\n\n");
-            }
-        } else if !output.is_empty() {
-            // ~keep The quote writes its own list indent below, so the one `walk_node` put at
-            // ~keep the start of this line inside a list item goes first.
-            if ctx.in_list_item {
-                crate::converter::trim_trailing_whitespace(output);
-            }
-            if output.ends_with("\n\n") {
-                output.truncate(output.len() - 1);
-            } else if ctx.in_list_item {
-                // ~keep A blockquote directly following this item's own leading text (no
-                // explicit <p>, e.g. `<li>a<blockquote>`, which the preceding text
-                // handler ends with a single '\n' since it looks ahead to the next
-                // block-level sibling) still legally interrupts that text per
-                // CommonMark's "blockquote can interrupt a paragraph" rule -- no blank
-                // line is required for the reparse to recover the same two-block split.
-                // Forcing one here anyway (as the two branches below still do for the
-                // top-level, non-list case, and for `output` already ending in a full
-                // blank line) instead makes THIS specific text parse back as its own
-                // `<p>` on reparse, which flips the whole list loose and desyncs the
-                // next conversion pass from this one (spec examples 320, 321).
-                if !output.ends_with('\n') {
-                    output.push('\n');
-                }
-            } else if !output.ends_with('\n') {
-                output.push_str("\n\n");
-            } else if !output.ends_with("\n\n") {
-                output.push('\n');
-            }
+    // ~keep Table cells shed the quote marker; code preserves physical breaks for later folding (#647).
+    if handler.context.in_code {
+        if !handler.output.is_empty() && !handler.output.ends_with('\n') {
+            handler.output.push('\n');
         }
+    } else {
+        crate::converter::main_helpers::separate_block_in_cell(handler.output, handler.options.br_in_tables);
+    }
+    handler.output.push_str(content);
+    if handler.context.in_code {
+        handler.output.push('\n');
+    }
+    if let Some(url) = cite {
+        crate::converter::main_helpers::separate_block_in_cell(handler.output, handler.options.br_in_tables);
+        handler.output.push_str("— <");
+        handler.output.push_str(url);
+        handler.output.push('>');
+    }
+}
 
-        let prefix = "> ";
-
-        // ~keep Only blank-out whitespace-only lines; preserve leading whitespace on
-        // real content lines (code block indentation, nested list markers) so
-        // quoted block children keep their structural meaning (issue #13).
-        //
-        // ~keep Every physical line also needs the list item's own continuation indent
-        // when this blockquote is inside a list item — CommonMark's list container
-        // match is per physical line, so an unindented "> " line drops the rest of
-        // the quote (and the item) out of the list on re-parse (spec example 263).
-        for (index, line) in trimmed_content.lines().enumerate() {
-            if let Some(ref indent) = list_indent {
-                if index > 0 || is_list_continuation {
-                    output.push_str(indent);
-                }
-            }
-            output.push_str(prefix);
-            if !line.trim().is_empty() {
-                output.push_str(line);
-            }
-            output.push('\n');
+fn render_quote(content: &str, cite: Option<&str>, handler: &mut HandlerContext<'_>) {
+    if content.is_empty() {
+        return;
+    }
+    let list_indent = handler.context.in_list_item.then(|| {
+        crate::converter::list::utils::continuation_indent_string(
+            crate::converter::list::utils::block_columns(handler.context, handler.options),
+            handler.options,
+        )
+    });
+    let list_indent = list_indent.flatten();
+    let continuation = list_indent.is_some()
+        && !handler.output.is_empty()
+        && !crate::converter::list::utils::line_is_bare_list_marker(handler.output);
+    separate_before_quote(handler.output, handler.context);
+    emit_quote_lines(content, list_indent.as_deref(), continuation, handler.output);
+    if let Some(url) = cite {
+        handler.output.push('\n');
+        if let Some(indent) = list_indent.as_deref() {
+            handler.output.push_str(indent);
         }
-
-        if let Some(url) = cite {
-            output.push('\n');
-            if let Some(ref indent) = list_indent {
-                output.push_str(indent);
-            }
-            output.push_str("— <");
-            output.push_str(&url);
-            output.push_str(">\n\n");
+        handler.output.push_str("— <");
+        handler.output.push_str(url);
+        handler.output.push_str(">\n\n");
+    }
+    if !handler.context.in_list_item {
+        while handler.output.ends_with('\n') {
+            handler.output.truncate(handler.output.len() - 1);
         }
+        handler.output.push_str("\n\n");
+    }
+}
 
-        // ~keep Add trailing newlines only when appropriate for proper spacing
-        // (matching paragraph conditional logic for CommonMark compliance)
-        if !ctx.convert_as_inline && !ctx.in_list_item {
+fn separate_before_quote(output: &mut String, context: &Context) {
+    // ~keep A quote that is the item's first content starts on the marker line (#617).
+    if context.in_list_item && crate::converter::list::utils::trim_whitespace_after_bare_marker(output) {
+        return;
+    }
+    if context.blockquote_depth > 0 && !context.in_list_item {
+        if !output.is_empty() {
             while output.ends_with('\n') {
                 output.truncate(output.len() - 1);
             }
             output.push_str("\n\n");
         }
+        return;
+    }
+    if output.is_empty() {
+        return;
+    }
+    if context.in_list_item {
+        crate::converter::trim_trailing_whitespace(output);
+    }
+    if output.ends_with("\n\n") {
+        output.truncate(output.len() - 1);
+    } else if context.in_list_item {
+        // ~keep CommonMark lets a quote interrupt list-item text without a blank line (examples 320–321).
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    } else if !output.ends_with('\n') {
+        output.push_str("\n\n");
+    } else if !output.ends_with("\n\n") {
+        output.push('\n');
+    }
+}
+
+fn emit_quote_lines(content: &str, indent: Option<&str>, continuation: bool, output: &mut String) {
+    // ~keep Every physical quote line needs the list continuation indent to remain in the item (#13).
+    for (index, line) in content.lines().enumerate() {
+        if (index > 0 || continuation) && indent.is_some() {
+            output.push_str(indent.unwrap_or_default());
+        }
+        output.push_str("> ");
+        if !line.trim().is_empty() {
+            output.push_str(line);
+        }
+        output.push('\n');
     }
 }

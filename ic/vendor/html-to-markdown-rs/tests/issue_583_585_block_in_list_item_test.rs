@@ -513,7 +513,7 @@ fn should_keep_a_term_at_the_marker_and_the_rule_after_it_on_the_fast_path() {
 }
 
 #[test]
-fn should_not_write_the_content_column_inside_a_container_once_the_item_has_ended() {
+fn should_keep_rules_out_of_code_blocks_inside_containers() {
     let tabs = ConversionOptions {
         list_indent_type: ListIndentType::Tabs,
         ..tier2_options()
@@ -522,8 +522,6 @@ fn should_not_write_the_content_column_inside_a_container_once_the_item_has_ende
         wrap: true,
         ..tier2_options()
     };
-    // ~keep A figure is written at the start of the line, so the item has ended: nothing
-    // ~keep rendered inside a container after it may get the column.
     for (html, options) in [
         (
             r#"<ol start="10"><li>X<figure><p>a</p></figure><dl><dt>t</dt><dd><p>x</p><hr></dd></dl></li></ol>"#,
@@ -564,7 +562,7 @@ fn should_not_write_the_content_column_inside_a_container_once_the_item_has_ende
         let out = convert_with(html, options);
         let rendered = render(&out);
         assert!(
-            !rendered.contains("<pre>") && rendered.ends_with("<hr />\n"),
+            !rendered.contains("<pre>") && rendered.contains("<hr />"),
             "{html:?}: the rule was lost inside the container: {out:?} renders {rendered:?}"
         );
     }
@@ -590,10 +588,10 @@ fn should_not_write_the_content_column_inside_a_container_once_the_item_has_ende
             "<table><caption><ul><li>x<dl><dd><hr></dd></dl></li></ul></caption></table>",
             "*\\- x \\-\\-\\-*\n",
         ),
-        // ~keep A figure ends the item; a rule after the text after it gets no column either.
+        // ~keep A figure preserves the item, so following text and rules keep the content column.
         (
             "<ul><li>X<figure><p>a</p></figure>t<br><hr></li></ul>",
-            "- X\n\na\n\nt  \n\n---\n",
+            "- X\n\n\ta\n\n\tt  \n\n\t---\n",
         ),
         // ~keep A rule at the marker stays in the item, so the text and the rule after it do.
         ("<ul><li><hr>t<br><hr></li></ul>", "- ___\n\n\tt  \n\n\t---\n"),

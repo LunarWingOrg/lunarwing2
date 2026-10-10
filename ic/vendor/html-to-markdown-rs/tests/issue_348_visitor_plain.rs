@@ -90,3 +90,42 @@ fn test_visitor_skip_end_result_honoured_for_plain_output() {
     assert!(!output.contains("drop this"), "got: {output:?}");
     assert!(output.contains("keep"), "got: {output:?}");
 }
+
+#[test]
+fn should_report_preformatted_text_at_one_child_depth_in_plain_output() {
+    #[derive(Debug)]
+    struct TextDepthVisitor {
+        depths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl HtmlVisitor for TextDepthVisitor {
+        fn visit_text(&mut self, ctx: &NodeContext, text: &str) -> VisitResult {
+            if text == "text" {
+                self.depths
+                    .lock()
+                    .expect("depth collector mutex must not be poisoned")
+                    .push(ctx.depth);
+            }
+            VisitResult::Continue
+        }
+    }
+
+    let depths = Arc::new(Mutex::new(Vec::new()));
+    let options = ConversionOptions {
+        output_format: OutputFormat::Plain,
+        visitor: Some(Arc::new(Mutex::new(TextDepthVisitor {
+            depths: Arc::clone(&depths),
+        }))),
+        ..Default::default()
+    };
+
+    html_to_markdown_rs::convert("<pre>text</pre>", Some(options)).expect("conversion must not fail");
+
+    assert_eq!(
+        depths
+            .lock()
+            .expect("depth collector mutex must not be poisoned")
+            .as_slice(),
+        &[1, 1]
+    );
+}

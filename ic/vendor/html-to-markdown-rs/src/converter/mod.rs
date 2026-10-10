@@ -100,6 +100,7 @@ pub mod head_metadata;
 pub mod inline;
 pub mod list;
 pub mod main;
+mod main_dispatch;
 mod main_helpers;
 pub mod media;
 mod metadata;
@@ -108,6 +109,7 @@ pub mod preprocessing_helpers;
 pub mod prescan;
 pub mod reference_collector;
 pub mod semantic;
+mod structure_capture;
 pub mod text;
 mod text_node;
 pub mod tier1;
@@ -122,6 +124,7 @@ pub use self::dom_context::DomContext;
 
 pub use self::main::{convert_html_impl, walk_node};
 pub use self::main_helpers::document_head;
+pub use self::main_helpers::repair_head_content_before_explicit_head;
 pub use self::main_helpers::{emit_table_cell_break, strip_trailing_backslash_breaks, trim_trailing_whitespace};
 
 pub use crate::converter::utility::content::{

@@ -61,6 +61,53 @@ fn should_resolve_relative_link_against_base_url_on_both_tiers() {
 }
 
 #[test]
+fn should_not_report_caller_base_url_as_document_frontmatter() {
+    let html = r#"<html><head></head><body><a href="child.html">child</a></body></html>"#;
+
+    for tier_strategy in [TierStrategy::Tier1, TierStrategy::Tier2] {
+        let options = ConversionOptions {
+            base_url: Some("https://example.com/blog/index.html".to_string()),
+            extract_metadata: true,
+            tier_strategy,
+            ..ConversionOptions::default()
+        };
+        let output = convert(html, Some(options))
+            .expect("conversion should succeed")
+            .content
+            .unwrap_or_default();
+
+        assert_eq!(
+            output, "[child](https://example.com/blog/child.html)\n",
+            "tier: {tier_strategy:?}"
+        );
+    }
+}
+
+#[test]
+fn should_report_the_effective_document_base_in_frontmatter() {
+    let html = r#"<html><head><base href="/other/"></head><body><a href="x">x</a></body></html>"#;
+
+    for tier_strategy in [TierStrategy::Tier1, TierStrategy::Tier2] {
+        let options = ConversionOptions {
+            base_url: Some("https://example.com/docs/index.html".to_string()),
+            tier_strategy,
+            ..ConversionOptions::default()
+        };
+        let output = convert(html, Some(options))
+            .expect("conversion should succeed")
+            .content
+            .unwrap_or_default();
+
+        let expected = match tier_strategy {
+            TierStrategy::Tier1 => "---\nbase: https://example.com/other/\n---\n\n[x](https://example.com/other/x)\n",
+            TierStrategy::Tier2 => "---\nbase: https://example.com/other/\n---\n[x](https://example.com/other/x)\n",
+            TierStrategy::Auto => unreachable!("the test enumerates forced tiers only"),
+        };
+        assert_eq!(output, expected, "tier: {tier_strategy:?}");
+    }
+}
+
+#[test]
 fn should_resolve_absolute_path_link_against_base_url_on_both_tiers() {
     let html = r#"<a href="/about">about</a>"#;
     let out = assert_tier1_matches_tier2(html, "https://example.com/blog/index.html");
@@ -192,4 +239,48 @@ fn should_render_a_cited_blockquote_identically_on_both_tiers_without_a_base_url
         tier1.contains("https://other.example/s.html"),
         "a blockquote citation must reach the markdown, got {tier1:?}"
     );
+}
+
+#[test]
+fn should_not_resolve_link_like_text_inside_textarea() {
+    let html = r#"<textarea>see <a href="x.html">here</a> <img src="pic.png" alt="pic"></textarea><p><a href="real.html">real</a></p>"#;
+    let out = convert_with(html, Some("https://example.com/dir/page.html"), TierStrategy::Tier2);
+
+    assert_eq!(
+        out,
+        "see [here](x.html) ![pic](pic.png)\n\n[real](https://example.com/dir/real.html)\n"
+    );
+}
+
+#[test]
+fn should_not_resolve_link_like_text_inside_other_raw_text_elements() {
+    for (element, expected) in [
+        ("xmp", "see [here](x.html)\n\nafter\n"),
+        ("iframe", "after\n"),
+        ("noscript", "after\n"),
+        ("noembed", "see [here](x.html)\n\nafter\n"),
+        ("noframes", "see [here](x.html)\n\nafter\n"),
+    ] {
+        let html = format!(r#"<{element}>see <a href="x.html">here</a></{element}><p>after</p>"#);
+        let out = convert_with(&html, Some("https://example.com/dir/page.html"), TierStrategy::Tier2);
+
+        assert_eq!(out, expected, "element: {element}");
+    }
+}
+
+#[test]
+fn should_keep_title_script_and_style_contents_outside_url_resolution() {
+    let html = r#"
+        <html>
+          <head>
+            <title>see <a href="title.html">title</a></title>
+            <script>const link = '<a href="script.html">script</a>';</script>
+            <style>.x { background: url("style.html"); }</style>
+          </head>
+          <body><p><a href="real.html">real</a></p></body>
+        </html>
+    "#;
+    let out = convert_with(html, Some("https://example.com/dir/page.html"), TierStrategy::Tier2);
+
+    assert_eq!(out, "[real](https://example.com/dir/real.html)\n");
 }

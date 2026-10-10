@@ -348,6 +348,19 @@ impl DomContext {
         self.tag_info(parent_id, parser).map(|info| info.name.as_str())
     }
 
+    pub(crate) fn has_raw_text_ancestor(&self, node_id: u32, parser: &tl::Parser) -> bool {
+        let mut current_id = node_id;
+        while let Some(parent_id) = self.parent_of(current_id) {
+            if self.tag_info(parent_id, parser).is_some_and(|info| {
+                crate::converter::tier1::tags::lookup(info.name.as_bytes()).is_some_and(|spec| spec.is_rawtext)
+            }) {
+                return true;
+            }
+            current_id = parent_id;
+        }
+        false
+    }
+
     /// Get the index of a node among its siblings.
     ///
     /// Returns the 0-based index if the node has siblings,

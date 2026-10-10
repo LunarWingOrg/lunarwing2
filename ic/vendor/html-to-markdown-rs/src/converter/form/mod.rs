@@ -24,10 +24,18 @@
 
 pub mod elements;
 
+pub use super::Context;
 pub use super::walk_node;
-pub use super::{Context, DomContext};
 
 pub use elements::handle as handle_form_elements;
+
+#[derive(Clone, Copy)]
+pub struct FormContext<'a> {
+    pub options: &'a crate::options::ConversionOptions,
+    pub ctx: &'a super::Context,
+    pub depth: usize,
+    pub dom_ctx: &'a super::DomContext,
+}
 
 /// Dispatches form element handling to the appropriate handler.
 ///
@@ -61,15 +69,12 @@ pub fn dispatch_form_handler(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     output: &mut String,
-    options: &crate::options::ConversionOptions,
-    ctx: &super::Context,
-    depth: usize,
-    dom_ctx: &super::DomContext,
+    context: FormContext<'_>,
 ) -> bool {
     match tag_name {
         "form" | "fieldset" | "legend" | "label" | "input" | "textarea" | "select" | "option" | "optgroup"
         | "button" | "progress" | "meter" | "output" | "datalist" => {
-            handle_form_elements(tag_name, node_handle, parser, output, options, ctx, depth, dom_ctx);
+            handle_form_elements(tag_name, node_handle, parser, output, context);
             true
         }
         _ => false,
