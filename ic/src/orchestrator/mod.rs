@@ -86,12 +86,18 @@ pub struct OrchestratorSetup {
 
 /// Detect Docker availability, create the container job manager, and start
 /// the orchestrator internal API in the background.
+///
+/// `tools` + `safety` wire the WI#324 proxied tool path: when both are
+/// present, external workers may invoke their allowlisted in-process tools
+/// over the task WebSocket control channel.
 pub async fn setup_orchestrator(
     config: &crate::config::Config,
     llm: &Arc<dyn LlmProvider>,
     db: Option<&Arc<dyn Database>>,
     secrets_store: Option<&Arc<dyn SecretsStore + Send + Sync>>,
     context_manager: Option<Arc<crate::context::ContextManager>>,
+    tools: Option<Arc<crate::tools::ToolRegistry>>,
+    safety: Option<Arc<crate::safety::SafetyLayer>>,
 ) -> OrchestratorSetup {
     let prompt_queue = Arc::new(Mutex::new(
         HashMap::<Uuid, VecDeque<api::PendingPrompt>>::new(),
@@ -179,6 +185,9 @@ pub async fn setup_orchestrator(
         }
         if let Some(store) = db {
             mgr = mgr.with_store(Arc::clone(store));
+        }
+        if let (Some(tools), Some(safety)) = (tools, safety) {
+            mgr = mgr.with_tool_proxy(tools, safety);
         }
         Some(Arc::new(mgr))
     } else {
