@@ -3075,6 +3075,7 @@ mod tests {
                     credential_grants: vec![],
                     mcp_servers: vec![],
                     max_iterations: DEFAULT_WORKER_ITERATIONS,
+                    harness: None,
                 },
                 &JobContext::default(),
             )
@@ -4011,5 +4012,116 @@ mod tests {
         let cm = ContextManager::new(5);
         let result = resolve_job_id("not-hex-at-all!", &cm).await;
         assert!(result.is_err()); // safety: test
+    }
+
+    // ── WI#326 harness mode ─────────────────────────────────────────────
+
+    fn sandbox_tool() -> CreateJobTool {
+        let manager = Arc::new(ContextManager::new(5));
+        let jm = Arc::new(ContainerJobManager::new(
+            crate::orchestrator::job_manager::ContainerJobConfig::default(),
+            crate::orchestrator::TokenStore::new(),
+        ));
+        CreateJobTool::new(manager).with_sandbox(jm, None)
+    }
+
+    #[test]
+    fn harness_schema_exposes_mode_and_capability_params() {
+        let tool = sandbox_tool();
+        let schema = tool.parameters_schema();
+        let props = schema["properties"].as_object().unwrap(); // safety: test
+        let modes = props["mode"]["enum"].as_array().unwrap(); // safety: test
+        assert!(modes.iter().any(|m| m == "worker"));
+        assert!(modes.iter().any(|m| m == "harness"));
+        assert!(props.contains_key("worker_secrets"));
+        assert!(props.contains_key("inject_files"));
+        assert!(props.contains_key("allow_identity_injection"));
+        assert!(props.contains_key("write_back"));
+    }
+
+    #[test]
+    fn harness_options_require_at_least_one_capability() {
+        let params = serde_json::json!({"title": "t", "description": "d"});
+        let err = harness_options_from_params(&params).unwrap_err(); // safety: test
+        assert!(err.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn harness_options_parse_and_validate() {
+        let params = serde_json::json!({
+            "worker_secrets": {"github_token": "GITHUB_TOKEN"},
+            "inject_files": ["MEMORY.md", {"source": "projects/x/notes.md", "target": "notes.md"}],
+            "write_back": {"allowed_roots": ["projects/"], "max_files": 10},
+        });
+        let options = harness_options_from_params(&params).unwrap().unwrap(); // safety: test
+        assert_eq!(options.worker_secrets.len(), 1);
+        assert_eq!(options.injections.len(), 2);
+        let policy = options.write_back.unwrap(); // safety: test
+        assert_eq!(policy.allowed_roots, vec!["projects/".to_string()]);
+        assert_eq!(policy.max_files, 10);
+    }
+
+    #[test]
+    fn harness_options_reject_identity_injection_by_default() {
+        let params = serde_json::json!({"inject_files": ["SOUL.md"]});
+        assert!(harness_options_from_params(&params).is_err());
+
+        let opted_in = serde_json::json!({
+            "inject_files": ["SOUL.md"],
+            "allow_identity_injection": true,
+        });
+        assert!(harness_options_from_params(&opted_in).is_ok());
+    }
+
+    #[test]
+    fn harness_options_reject_bad_secret_file_names() {
+        let params = serde_json::json!({"worker_secrets": {"tok": "not-ok-name"}});
+        assert!(harness_options_from_params(&params).is_err());
+    }
+
+    #[tokio::test]
+    async fn harness_mode_requires_sandbox() {
+        let manager = Arc::new(ContextManager::new(5));
+        let tool = CreateJobTool::new(manager);
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "title": "t",
+                    "description": "d",
+                    "mode": "harness",
+                    "write_back": true,
+                }),
+                &JobContext::default(),
+            )
+            .await;
+        let err = result.unwrap_err(); // safety: test
+        assert!(err.to_string().contains("requires the Docker sandbox"));
+    }
+
+    #[tokio::test]
+    async fn harness_params_rejected_for_plain_worker_mode() {
+        let tool = sandbox_tool();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "title": "t",
+                    "description": "d",
+                    "mode": "worker",
+                    "write_back": true,
+                }),
+                &JobContext::default(),
+            )
+            .await;
+        let err = result.unwrap_err(); // safety: test
+        assert!(err.to_string().contains("require mode 'harness'"));
+    }
+
+    #[test]
+    fn harness_mode_db_roundtrip() {
+        let mode = JobMode::Harness;
+        assert_eq!(mode.db_value(), "harness");
+        assert_eq!(JobMode::from_db_value("harness"), JobMode::Harness);
+        assert!(!mode.is_external());
+        assert_eq!(mode.to_string(), "harness");
     }
 }

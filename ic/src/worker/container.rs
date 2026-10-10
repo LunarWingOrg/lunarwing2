@@ -39,6 +39,63 @@ pub struct WorkerConfig {
     pub require_worker_mcp: bool,
 }
 
+/// Default tmpfs secrets mount for harness jobs (WI#326).
+const DEFAULT_SECRETS_DIR: &str = "/run/secrets";
+
+/// Read harness secret files from the tmpfs mount, returning
+/// `(env_var_name, value)` pairs for child-process injection.
+///
+/// Only regular files with env-var-safe names are read. Names, values, and
+/// errors are never logged beyond a count. Reading only happens when the
+/// orchestrator opted this job into harness mode (LUNARWING_HARNESS_MODE=1),
+/// so a stray host /run/secrets is never picked up.
+fn read_secret_files() -> Vec<(String, String)> {
+    let harness_mode = std::env::var("LUNARWING_HARNESS_MODE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !harness_mode {
+        return Vec::new();
+    }
+    let dir = std::env::var("LUNARWING_SECRETS_DIR")
+        .unwrap_or_else(|_| DEFAULT_SECRETS_DIR.to_string());
+    let dir = std::path::Path::new(&dir);
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(_) => return Vec::new(),
+    };
+    let mut secrets = Vec::new();
+    for entry in read_dir {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let valid = !name.is_empty()
+            && name
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| matches!(b, b'A'..=b'Z' | b'_') || (i > 0 && b.is_ascii_digit()));
+        if !valid {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > 64 * 1024 {
+            continue;
+        }
+        match std::fs::read_to_string(entry.path()) {
+            Ok(value) => secrets.push((name.to_string(), value.trim_end_matches('\n').to_string())),
+            Err(_) => tracing::warn!("Failed to read a mounted secret file; skipping it"),
+        }
+    }
+    if !secrets.is_empty() {
+        tracing::info!(
+            "Loaded {} secret file(s) from tmpfs mount",
+            secrets.len()
+        );
+    }
+    secrets
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
@@ -130,6 +187,12 @@ impl WorkerRuntime {
             let mut env_map = HashMap::new();
             for cred in &credentials {
                 env_map.insert(cred.env_var.clone(), cred.value.clone());
+            }
+            // WI#326: harness jobs may also mount secret files on tmpfs
+            // (Docker-secrets pattern). File names double as env var names;
+            // tmpfs values take precedence over API-fetched credentials.
+            for (name, value) in read_secret_files() {
+                env_map.insert(name, value);
             }
             self.extra_env = Arc::new(env_map);
         }
@@ -685,6 +748,39 @@ mod tests {
     #[test]
     fn test_truncate_within_limit() {
         assert_eq!(truncate_for_preview("hello", 10), "hello");
+    }
+
+    #[test]
+    fn secret_files_require_harness_mode_and_safe_names() {
+        use crate::config::helpers::lock_env;
+        let _guard = lock_env();
+
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        std::fs::write(tmp.path().join("API_KEY"), "value-one\n").unwrap(); // safety: test
+        std::fs::write(tmp.path().join("lower_bad"), "nope").unwrap(); // safety: test
+        std::fs::write(tmp.path().join(".hidden"), "nope").unwrap(); // safety: test
+
+        // Safety: env-var mutation requires unsafe in edition 2024;
+        // lock_env() serializes concurrent access from other test threads.
+        unsafe {
+            std::env::remove_var("LUNARWING_HARNESS_MODE");
+            std::env::set_var("LUNARWING_SECRETS_DIR", tmp.path());
+        }
+        assert!(
+            read_secret_files().is_empty(),
+            "secrets are only read for harness-mode jobs"
+        );
+
+        unsafe { std::env::set_var("LUNARWING_HARNESS_MODE", "1") };
+        let secrets = read_secret_files();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].0, "API_KEY");
+        assert_eq!(secrets[0].1, "value-one");
+
+        unsafe {
+            std::env::remove_var("LUNARWING_HARNESS_MODE");
+            std::env::remove_var("LUNARWING_SECRETS_DIR");
+        }
     }
 
     #[test]

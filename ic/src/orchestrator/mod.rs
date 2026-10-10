@@ -98,6 +98,7 @@ pub async fn setup_orchestrator(
     db: Option<&Arc<dyn Database>>,
     secrets_store: Option<&Arc<dyn SecretsStore + Send + Sync>>,
     context_manager: Option<Arc<crate::context::ContextManager>>,
+    workspace_resolver: Option<Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>>,
 ) -> OrchestratorSetup {
     let prompt_queue = Arc::new(Mutex::new(
         HashMap::<Uuid, VecDeque<api::PendingPrompt>>::new(),
@@ -150,6 +151,12 @@ pub async fn setup_orchestrator(
         let mut jm_inner = ContainerJobManager::new(job_config, token_store.clone());
         if let (Some(etx), Some(cm)) = (&job_event_tx, &context_manager) {
             jm_inner = jm_inner.with_completion_deps(etx.clone(), Arc::clone(cm));
+        }
+        // WI#326: harness write-back promotion needs the tenant workspace;
+        // the audit event persists to the sandbox job event log when a DB
+        // is available.
+        if let Some(resolver) = workspace_resolver {
+            jm_inner = jm_inner.with_write_back_deps(resolver, db.cloned());
         }
         let jm = Arc::new(jm_inner);
 
