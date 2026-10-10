@@ -132,6 +132,14 @@ PY
   else
     log "Config linked: /app/config/opencode.json -> $WORKSPACE_ROOT/.opencode/opencode.json"
   fi
+  # WI#330: the baked config ships a placeholder baseURL on the .invalid TLD
+  # (guaranteed NXDOMAIN). mt-admin always renders OPENCODE_BASE_URL —
+  # defaulting to the tenant's own LLM endpoint — so a placeholder that
+  # survives to the runtime config means a hand-rolled deployment forgot the
+  # override. Fail loudly at startup instead of at the first LLM request.
+  if grep -q 'set-opencode-base-url\.invalid' "$WORKSPACE_ROOT/.opencode/opencode.json" 2>/dev/null; then
+    die "OPENCODE_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-opencode <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
+  fi
 fi
 
 # ── optional Paseo MCP integration ────────────────────────────────────────────
