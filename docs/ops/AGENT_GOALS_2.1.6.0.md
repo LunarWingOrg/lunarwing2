@@ -30,7 +30,13 @@
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/330
-11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331
+11. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331
+    - DONE (2026-10-10, branch `aj/kimi-11-20261010-1200`): all three WI#331 asks completed.
+    - libsql legacy chain (RUSTSEC-2026-0049/-0098/-0099/-0104, RUSTSEC-2026-0258): cleared from default builds by mitigation — libsql dep now uses only `core`; Turso remote replicas moved behind new non-default cargo feature `libsql-remote-replica` (ic/Cargo.toml, ic/src/db/libsql/mod.rs, ic/src/db/mod.rs, ic/src/setup/wizard.rs). Verified: `cargo tree -i rustls-webpki@0.102.8` and `-i h2@0.3.27` report "did not match any packages" with default features.
+    - rsa (RUSTSEC-2023-0071): keep accepted, track upstream — advisory still `patched = []` (checked 2026-10-10); rsa 0.10.0-rc.19 published but not marked patched; russh 0.64.1 still pins `rsa =0.10.0-rc.18`, so a russh bump clears nothing.
+    - failure/rental (RUSTSEC-2019-0036/2020-0036/2021-0134): keep accepted; porting vendored libsignal-protocol off failure (52 uses / 23 files) documented as dedicated follow-up work.
+    - Every `reason` string in ic/deny.toml now references WI#331 with re-verified 2026-10-10 exposure notes; decision record at docs/ops/v2.1.6.0_WI331_ADVISORY_CLEARING.md; setup README updated.
+    - Verified: cargo check default / libsql-only(+tests) / all-features pass; clippy -D warnings (libsql-only + all-features --lib) clean; cargo-deny CI wrapper green (advisories/bans/licenses/sources ok, advisory-db 2026-10-09); lockfile-only advisory guard ok; cargo fmt clean.
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/332
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
