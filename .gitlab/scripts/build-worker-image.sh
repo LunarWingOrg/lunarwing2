@@ -46,7 +46,9 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         dockerfile_dir=opencode2.4lunarwing
         input_files='opencode2.4lunarwing/Dockerfile
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
-opencode2.4lunarwing/scripts/path_expand_test.ts'
+opencode2.4lunarwing/scripts/path_expand_test.ts
+opencode2.4lunarwing/scripts/sdk_surface.ts
+opencode2.4lunarwing/scripts/sdk_surface_assert.ts'
         source_ref=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
         build_args="OPENCODE_VERSION=v2.0.24
 OPENCODE_REF=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
