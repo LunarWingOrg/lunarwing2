@@ -2275,6 +2275,70 @@ mod tests {
     use lunarwing_common::PromptContextRole;
 
     #[test]
+    fn tool_allowlist_gate_is_deny_by_default() {
+        // WI#324: empty allowlist rejects everything; exact names and "*"
+        // opt in; non-matching names stay rejected.
+        let empty: &[String] = &[];
+        assert!(!tool_name_allowed(empty, "memory_read"));
+
+        let named: Vec<String> = vec!["memory_read".to_string(), "knowledge_search".to_string()];
+        assert!(tool_name_allowed(&named, "memory_read"));
+        assert!(tool_name_allowed(&named, "knowledge_search"));
+        assert!(!tool_name_allowed(&named, "memory_write"));
+        assert!(!tool_name_allowed(&named, "shell"));
+
+        let all: Vec<String> = vec!["*".to_string()];
+        assert!(tool_name_allowed(&all, "shell"));
+    }
+
+    #[test]
+    fn config_allows_tool_matches_gate() {
+        let mut config = ExternalWorkerConfig {
+            name: "w".to_string(),
+            url: "ws://localhost:1".to_string(),
+            auth_token: None,
+            timeout_ms: 1_000,
+            endpoints: vec![],
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
+            tool_allowlist: vec![],
+        };
+        assert!(!config.allows_tool("memory_read"));
+        config.tool_allowlist = vec!["memory_read".to_string()];
+        assert!(config.allows_tool("memory_read"));
+        assert!(!config.allows_tool("memory_write"));
+        config.tool_allowlist = vec!["*".to_string()];
+        assert!(config.allows_tool("shell"));
+    }
+
+    #[test]
+    fn tool_result_envelope_shape() {
+        // The worker correlates replies by call_id; status is one of
+        // success/error/denied. Serialize the envelope and inspect the wire
+        // shape a worker-side bridge would parse.
+        let env = tool_result_envelope("call-7", "denied", String::new(), Some("nope".to_string()));
+        let json = serde_json::to_string(&env).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["type"], "tool_result");
+        assert_eq!(parsed["payload"]["call_id"], "call-7");
+        assert_eq!(parsed["payload"]["status"], "denied");
+        assert_eq!(parsed["payload"]["error"], "nope");
+    }
+
+    #[test]
+    fn tool_call_payload_deserializes_with_defaults() {
+        // `arguments` and `task_id` are optional on the wire.
+        let payload: ToolCallPayload = serde_json::from_str(
+            r#"{"call_id":"c1","name":"memory_read"}"#,
+        )
+        .expect("minimal payload");
+        assert_eq!(payload.call_id, "c1");
+        assert_eq!(payload.name, "memory_read");
+        assert!(payload.arguments.is_null());
+        assert!(payload.task_id.is_none());
+    }
+
+    #[test]
     fn floor_char_boundary_is_utf8_safe() {
         // ASCII passes through unchanged.
         assert_eq!(floor_char_boundary("hello", 3), 3);
