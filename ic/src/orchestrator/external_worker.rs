@@ -397,7 +397,9 @@ impl ExternalWorkerManager {
             return Err(not_active("prompt exceeds 16 KiB control-channel limit"));
         }
         if trimmed.contains('\0') {
-            return Err(not_active("prompt contains NUL bytes; text directives only"));
+            return Err(not_active(
+                "prompt contains NUL bytes; text directives only",
+            ));
         }
 
         let handles = self.active_handles.read().await;
@@ -1782,11 +1784,12 @@ async fn deliver_control_prompt(
             "done": control.done,
         }),
     );
-    let json =
-        serde_json::to_string(&env).map_err(|e| OrchestratorError::ExternalWorkerProtocolError {
+    let json = serde_json::to_string(&env).map_err(|e| {
+        OrchestratorError::ExternalWorkerProtocolError {
             worker_name: worker_name.to_string(),
             reason: format!("failed to serialize task_prompt: {e}"),
-        })?;
+        }
+    })?;
     tokio::time::timeout(
         CONTROL_SEND_TIMEOUT,
         write.send(tokio_tungstenite::tungstenite::Message::Text(json.into())),
@@ -2696,10 +2699,7 @@ mod tests {
             .await;
         let error = result.unwrap_err();
         assert!(
-            matches!(
-                error,
-                OrchestratorError::ExternalWorkerTaskNotActive { .. }
-            ),
+            matches!(error, OrchestratorError::ExternalWorkerTaskNotActive { .. }),
             "expected TaskNotActive, got: {error}"
         );
     }
