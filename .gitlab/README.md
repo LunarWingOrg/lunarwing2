@@ -278,7 +278,7 @@ candidate job — the scan can only succeed after a candidate publishes
   root-package `--all-features` check/clippy jobs — including the vendored
   libsignal path deps); a root-package default query misses crates such as
   openssl and `lunarwing_health_metrics`. Two companion full-validation jobs
-  complete the advisory surface (see `docs/ops/v2.1.5.0_CARGO_DENY_AUDIT.md`):
+  complete the advisory surface (see `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`):
   `satellite-advisory-sweep` runs
   `.gitlab/scripts/check-satellite-advisories.sh`, which discovers every
   tracked `Cargo.lock` via `git ls-files` and applies the pinned cargo-deny

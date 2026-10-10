@@ -70,9 +70,11 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
 ## Planning and active ledgers
 
 - The current `AGENT_GOALS_*.md` file is the active pre-release checklist.
-- Current v2.1.5.0 release evidence:
-  [`v2.1.5.0_CARGO_DENY_AUDIT.md`](v2.1.5.0_CARGO_DENY_AUDIT.md) (dependency
-  advisory audit and accepted-findings dispositions) and
+- Current v2.1.6.0 release evidence:
+  [`v2.1.6.0_CARGO_DENY_AUDIT.md`](v2.1.6.0_CARGO_DENY_AUDIT.md) (dependency
+  advisory audit and accepted-findings dispositions; v2.1.5.0 audit archived
+  at [`history/v2.1.5.0_CARGO_DENY_AUDIT.md`](history/v2.1.5.0_CARGO_DENY_AUDIT.md))
+  and
   [`v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md`](v2.1.5.0_OPEN_WORK_ITEMS_STATUS.md)
   (open work-item audit with per-item repository disposition).
 - [`ROADMAP_2026.md`](ROADMAP_2026.md) and
