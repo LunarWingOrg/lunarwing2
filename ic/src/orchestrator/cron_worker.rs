@@ -524,9 +524,15 @@ async fn watch_tick_job(
         };
         match ctx.state {
             JobState::Completed | JobState::Accepted => return TickOutcome::Completed,
-            JobState::Failed | JobState::Stuck => {
+            JobState::Failed => {
                 return TickOutcome::Failed(format!("job entered {} state", ctx.state));
             }
+            // Stuck means the idle detector already flagged this job as
+            // wedged; route it through the lapse path so the supervisor
+            // cancels before re-dispatching (a stuck job may otherwise
+            // recover later — WI#263 Stuck→Completed — and double-run the
+            // tick alongside its replacement).
+            JobState::Stuck => return TickOutcome::HeartbeatLapse,
             JobState::Cancelled => return TickOutcome::Cancelled,
             JobState::Pending | JobState::InProgress | JobState::Submitted => {}
         }
