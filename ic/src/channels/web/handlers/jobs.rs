@@ -503,6 +503,9 @@ pub async fn jobs_restart_handler(
                     mcp_servers,
                     mcp_credential_grants,
                     max_iterations: lunarwing_common::DEFAULT_WORKER_ITERATIONS,
+                    // Restarts re-run as plain worker jobs; harness options
+                    // (WI#326) are per-dispatch and not persisted.
+                    harness: None,
                 })
                 .await
                 .map_err(|e| {
