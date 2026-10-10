@@ -2437,6 +2437,7 @@ mod tests {
                 endpoints: vec![],
                 load_balance: LoadBalanceStrategy::default(),
                 prompt_context: Default::default(),
+                tool_allowlist: vec![],
             },
             ExternalWorkerConfig {
                 name: "pebble".to_string(),
@@ -2446,6 +2447,7 @@ mod tests {
                 endpoints: vec![],
                 load_balance: LoadBalanceStrategy::default(),
                 prompt_context: Default::default(),
+                tool_allowlist: vec![],
             },
         ]);
         assert!(!mgr.is_empty());
@@ -2856,6 +2858,7 @@ mod tests {
             ],
             load_balance: LoadBalanceStrategy::default(),
             prompt_context: Default::default(),
+            tool_allowlist: vec![],
         }]);
 
         let lb = mgr.load_balancers.get("multi").unwrap();

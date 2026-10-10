@@ -2438,6 +2438,7 @@ mod tests {
             endpoints: vec![],
             load_balance: LoadBalanceStrategy::default(),
             prompt_context: Default::default(),
+            tool_allowlist: vec![],
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
 
@@ -2491,6 +2492,7 @@ mod tests {
             endpoints: vec![],
             load_balance: LoadBalanceStrategy::default(),
             prompt_context: Default::default(),
+            tool_allowlist: vec![],
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
         let error = tool
