@@ -5408,8 +5408,7 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             .get_usage(&ctx.user_id, "mission_create")
             .await;
         assert_eq!(
-            usage,
-            None,
+            usage, None,
             "an aggregate-refused call must not record per-verb usage: {usage:?}"
         );
 
