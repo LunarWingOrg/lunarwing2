@@ -1,13 +1,13 @@
 //! Shared rate limiter for built-in and WASM tool invocations.
 //!
-//! Provides per-tool, per-user rate limiting using a sliding window counter.
+//! Provides per-tool, per-user rate limiting using fixed window counters.
 //! Built-in tools (shell, http, file write, etc.) are throttled here before
 //! `tool.execute()` is called in the agent loop. WASM tools re-export these
 //! types for HTTP-level rate limiting inside host functions.
 //!
 //! # Rate Limit Algorithm
 //!
-//! Uses a simplified sliding window counter:
+//! Uses fixed minute and hour windows:
 //! - Track request counts for current minute and hour windows
 //! - Reset counters when window expires
 //! - Increment counter and check against limits
@@ -143,9 +143,18 @@ impl RateLimiter {
         config: &ToolRateLimitConfig,
         record: bool,
     ) -> RateLimitResult {
-        let key = (user_id.to_string(), tool_name.to_string());
-
         let mut state = self.state.write().await;
+        Self::check_state(&mut state, user_id, tool_name, config, record)
+    }
+
+    fn check_state(
+        state: &mut HashMap<(String, String), ToolRateLimitState>,
+        user_id: &str,
+        tool_name: &str,
+        config: &ToolRateLimitConfig,
+        record: bool,
+    ) -> RateLimitResult {
+        let key = (user_id.to_string(), tool_name.to_string());
         let tool_state = state.entry(key).or_insert_with(ToolRateLimitState::new);
 
         // Reset windows if expired.
@@ -195,6 +204,34 @@ impl RateLimiter {
         config: &ToolRateLimitConfig,
     ) -> RateLimitResult {
         self.check_internal(user_id, tool_name, config, true).await
+    }
+
+    /// Atomically reserve all buckets, or charge none. The error identifies
+    /// the first refused bucket. Repeated keys are checked against every
+    /// supplied config but charged once.
+    pub async fn check_and_record_all(
+        &self,
+        user_id: &str,
+        buckets: &[(&str, &ToolRateLimitConfig)],
+    ) -> Result<(), (usize, RateLimitResult)> {
+        let mut state = self.state.write().await;
+        for (index, (key, config)) in buckets.iter().enumerate() {
+            let result = Self::check_state(&mut state, user_id, key, config, false);
+            if !result.is_allowed() {
+                return Err((index, result));
+            }
+        }
+        // No await or lock release between the checks and reservations.
+        for (index, (key, _)) in buckets.iter().enumerate() {
+            if buckets[..index].iter().any(|(previous, _)| previous == key) {
+                continue;
+            }
+            if let Some(bucket) = state.get_mut(&(user_id.to_string(), key.to_string())) {
+                bucket.minute_window.count += 1;
+                bucket.hour_window.count += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Check without recording (for preview/estimation).
@@ -261,6 +298,40 @@ impl From<RateLimitResult> for Result<(), RateLimitError> {
 mod tests {
     use super::*;
     use crate::tools::tool::ToolRateLimitConfig;
+
+    #[tokio::test]
+    async fn multi_bucket_rejection_charges_neither_bucket() {
+        let limiter = RateLimiter::new();
+        let verb = ToolRateLimitConfig::new(20, 200);
+        for aggregate in [
+            ToolRateLimitConfig::new(1, 10),
+            ToolRateLimitConfig::new(10, 1),
+        ] {
+            limiter.clear_all().await;
+            assert!(
+                limiter
+                    .check_and_record_all("owner", &[("fire", &verb), ("aggregate", &aggregate)])
+                    .await
+                    .is_ok()
+            );
+            assert!(matches!(
+                limiter
+                    .check_and_record_all("owner", &[("create", &verb), ("aggregate", &aggregate)])
+                    .await,
+                Err((1, RateLimitResult::Limited { .. }))
+            ));
+            assert_eq!(limiter.get_usage("owner", "create").await, Some((0, 0)));
+            assert_eq!(limiter.get_usage("owner", "aggregate").await, Some((1, 1)));
+        }
+        let exhausted = ToolRateLimitConfig::new(0, 0);
+        assert!(matches!(
+            limiter
+                .check_and_record_all("owner", &[("pause", &exhausted), ("aggregate", &verb)])
+                .await,
+            Err((0, RateLimitResult::Limited { .. }))
+        ));
+        assert_eq!(limiter.get_usage("owner", "aggregate").await, Some((1, 1)));
+    }
 
     #[tokio::test]
     async fn test_allowed_within_limits() {

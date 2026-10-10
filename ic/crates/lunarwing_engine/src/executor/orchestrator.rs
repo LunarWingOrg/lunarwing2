@@ -1222,7 +1222,7 @@ async fn handle_execute_action(
                     EventKind::ApprovalRequested {
                         action_name: name.clone(),
                         call_id: call_id.clone(),
-                        parameters: Some(params.clone()),
+                        parameters: Some(crate::types::event::redact_event_params(&params)),
                         description: None,
                         allow_always: None,
                         gate_name: None,
@@ -1327,7 +1327,7 @@ async fn handle_execute_action(
                 EventKind::ApprovalRequested {
                     action_name: name.clone(),
                     call_id: call_id.clone(),
-                    parameters: Some((*parameters).clone()),
+                    parameters: Some(crate::types::event::redact_event_params(&parameters)),
                     description: None,
                     allow_always: match resume_kind.as_ref() {
                         crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),
@@ -1583,7 +1583,7 @@ async fn handle_execute_actions_parallel(
                         EventKind::ApprovalRequested {
                             action_name: pc.name.clone(),
                             call_id: pc.call_id.clone(),
-                            parameters: Some(pc.params.clone()),
+                            parameters: Some(crate::types::event::redact_event_params(&pc.params)),
                             description: None,
                             allow_always: None,
                             gate_name: None,
@@ -1865,7 +1865,12 @@ async fn execute_single_action(
             let event = EventKind::ApprovalRequested {
                 action_name: name.to_string(),
                 call_id: call_id.to_string(),
-                parameters: Some((*parameters).clone()),
+                // WI#352 (run-33 AQ-4): the persisted event history is a
+                // display record, not the resume path — store the redacted
+                // copy so ApprovalRequested.parameters no longer holds a
+                // webhook_secret (scoped so, run-51 CJ-9: message previews
+                // and thread transcripts are separate at-rest classes).
+                parameters: Some(crate::types::event::redact_event_params(&parameters)),
                 description: None,
                 allow_always: match resume_kind.as_ref() {
                     crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),
@@ -4428,6 +4433,40 @@ mod tests {
         executions: AtomicUsize,
     }
 
+    struct MissionGateEffects {
+        preflight: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for MissionGateEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            parameters: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            Err(EngineError::GatePaused {
+                gate_name: "approval".into(),
+                action_name: action_name.into(),
+                call_id: "call_1".into(),
+                parameters: Box::new(parameters),
+                resume_kind: Box::new(crate::gate::ResumeKind::Approval { allow_always: true }),
+                resume_output: None,
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![ActionDef {
+                requires_approval: self.preflight,
+                ..test_action_def("mission_create")
+            }])
+        }
+    }
+
     struct ExhaustLeaseEffects {
         leases: Arc<LeaseManager>,
         executions: AtomicUsize,
@@ -4678,6 +4717,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_requested_event_redacts_sensitive_params_but_result_keeps_raw() {
+        // Run-51 CJ-8 (orchestrator tier): the ApprovalRequested
+        // construction site must record only the redacted display copy in
+        // thread.events, while the returned per-call result keeps the raw
+        // parameters for resume.
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(CountingEffects {
+            actions: vec![approval_action_def("mission_create")],
+            executions: AtomicUsize::new(0),
+        });
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let args = vec![json_to_monty(&serde_json::json!([
+            {
+                "name": "mission_create",
+                "params": {"name": "digest", "webhook_secret": "super-secret-value"},
+                "call_id": "call_1"
+            }
+        ]))];
+
+        let mut actions_this_step = 0;
+        let returned = handle_execute_actions_parallel(
+            &args,
+            &mut thread,
+            &effects,
+            &leases,
+            &Arc::new(PolicyEngine::new()),
+            &mut actions_this_step,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The per-call result carries the raw parameters — resume needs them.
+        let ExtFunctionResult::Return(value) = returned else {
+            panic!("expected a returned results list, got {returned:?}");
+        };
+        let results = monty_to_json(&value);
+        assert_eq!(
+            results[0]["parameters"]["webhook_secret"],
+            "super-secret-value"
+        );
+
+        // The recorded event holds only the redacted display copy.
+        let redacted = thread
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::ApprovalRequested {
+                    parameters: Some(parameters),
+                    ..
+                } => Some(parameters),
+                _ => None,
+            })
+            .expect("an ApprovalRequested event");
+        assert_eq!(redacted["webhook_secret"], "[REDACTED]");
+        assert_eq!(redacted["name"], "digest");
+        assert!(!redacted.to_string().contains("super-secret-value"));
+    }
+
+    #[tokio::test]
     async fn single_action_does_not_execute_after_lease_consumption_failure() {
         let mut thread = Thread::new(
             "goal",
@@ -4725,6 +4834,86 @@ mod tests {
         assert!(thread.events.iter().any(|event| {
             matches!(event.kind, EventKind::ActionFailed { ref call_id, .. } if call_id == "echo-call")
         }));
+    }
+
+    #[tokio::test]
+    async fn mission_gate_redacts_events_in_single_and_parallel_paths() {
+        for preflight in [true, false] {
+            for parallel in [false, true] {
+                let mut thread = Thread::new(
+                    "goal",
+                    ThreadType::Foreground,
+                    ProjectId::new(),
+                    "user",
+                    ThreadConfig::default(),
+                );
+                let effects: Arc<dyn EffectExecutor> = Arc::new(MissionGateEffects { preflight });
+                let leases = Arc::new(LeaseManager::new());
+                leases
+                    .grant(thread.id, "tools", GrantedActions::All, None, None)
+                    .await
+                    .unwrap();
+                let params =
+                    serde_json::json!({"name":"digest", "webhook_secret":"super-secret-value"});
+                let policy = Arc::new(PolicyEngine::new());
+                let mut count = 0;
+                let returned = if parallel {
+                    let args = vec![json_to_monty(
+                        &serde_json::json!([{"name":"mission_create", "params":params, "call_id":"call_1"}]),
+                    )];
+                    handle_execute_actions_parallel(
+                        &args,
+                        &mut thread,
+                        &effects,
+                        &leases,
+                        &policy,
+                        &mut count,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                } else {
+                    let args = vec![
+                        MontyObject::String("mission_create".into()),
+                        json_to_monty(&params),
+                    ];
+                    handle_execute_action(
+                        HostCallArguments {
+                            args: &args,
+                            kwargs: &[],
+                        },
+                        &mut thread,
+                        &effects,
+                        &leases,
+                        &policy,
+                        &mut count,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                };
+                let ExtFunctionResult::Return(value) = returned else {
+                    panic!("expected gate result")
+                };
+                let raw = monty_to_json(&value);
+                let raw = if parallel { &raw[0] } else { &raw };
+                assert_eq!(raw["parameters"]["webhook_secret"], "super-secret-value");
+                let display = thread
+                    .events
+                    .iter()
+                    .find_map(|event| match &event.kind {
+                        EventKind::ApprovalRequested {
+                            parameters: Some(parameters),
+                            ..
+                        } => Some(parameters),
+                        _ => None,
+                    })
+                    .expect("approval event");
+                assert_eq!(display["webhook_secret"], "[REDACTED]");
+                assert_eq!(display["name"], "digest");
+                assert!(!display.to_string().contains("super-secret-value"));
+            }
+        }
     }
 
     #[tokio::test]

@@ -1004,7 +1004,25 @@ verbs keep the registry path's deny-the-grant fallback); supervised mode
 pauses every verb for human approval with `allow_always: false` (a
 capability action has no always-approval grant to persist, so the dialog
 does not offer one) and an approved resume re-enters with the grant and
-executes; a per-user per-verb rate limit (20/minute, 200/hour) applies; and
+executes; a per-user per-verb rate limit (20/minute, 200/hour) applies,
+plus an aggregate per-user bucket across the four run-spawning verbs
+(create, fire, resume, update — 60/minute, 600/hour; WI#352 AQ-12) so
+their per-verb budgets cannot sum to 80 run-spawning mutations/minute.
+The stop verbs pause/delete use per-verb **caller-class** buckets: Mission
+threads cannot spend Foreground stop tokens, while each class still has a
+20/minute, 200/hour cap for each stop verb. Caller class comes from the host
+execution context, not tool parameters. Read-only verbs stay per-verb only
+so inspection cannot starve a mutation budget. Per user, total dispatches
+are bounded at 180/minute (60 aggregate + 40 stop calls per permitted caller
+class, Foreground and Mission + 20 each for list/history); with only one
+caller class the bound remains 140/minute. Multi-bucket admission checks
+and records under one write lock: a refused call spends no tokens in any
+bucket, and concurrent batches cannot overshoot either cap. Both limiters
+use fixed windows (a window boundary can briefly admit up to 2x the
+minute budget) and reset on restart. AQ-12 deliberately leaves open:
+`mission_create` alone still allows 200 creates/hour (its per-verb
+hour budget), there is no active-mission cap, and `max_threads_per_day=0`
+(unlimited) remains accepted on create and update; and
 `ToolCall` hooks run with `webhook_secret` redacted (the approval prompt's
 display parameters are redacted the same way, while the persisted gate keeps
 the real parameters for execution). The approval-tier gates deliberately do
@@ -1017,6 +1035,27 @@ non-Foreground-`Always` and needs-prompt gates stay off, and the pre-flight
 auth gate is a no-op for capability actions, which hold no credential
 registrations. The coordination gate (a disabled agent executes nothing)
 applies to mission calls as before.
+
+Related secret-handling and webhook-ownership rules (WI#352, the !1462
+run-33 residual): the generic fallback of `summarize_params` skips values
+under a sensitive-key deny list (`webhook_secret`, `api_key`, `auth_token`,
+`password`, `secret`, `token` — the named-tool branches are unchanged), so
+a verb's `webhook_secret` cannot surface in the ToolStarted/ToolCompleted
+channel status summary (AQ-5); the persisted `ApprovalRequested` thread
+event stores display parameters with the same deny list redacted rather
+than the raw call parameters — the pending gate still holds the raw copy
+for resume, and the thread transcript's action arguments remain a
+pre-existing at-rest class (AQ-4); the webhook single-owner rule (a fire
+matches every Active mission on a path, so an active path may only have
+one owner) is enforced — per project, not globally — on create, on an
+update that sets a Webhook cadence, changes the path, or adds a nonempty
+secret to a dormant secret-less claim, and on resume
+(AO-1); updates that leave the claim untouched are not re-checked, so
+under a legacy two-owner conflict either owner can still rotate a leaked
+secret or lower a budget; and create-dedup compares webhook cadences by
+path only, so a rotated secret is not a spurious cadence difference (AO-7)
+— the dedup hit discards the supplied secret and flags
+`webhook_secret_applied: false` with a pointer to `mission_update`.
 
 Two scope properties follow and are stated deliberately (WI#308 asked for
 the supervised-mode consequence, not just the gate ordering). First,
