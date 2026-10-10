@@ -26,7 +26,14 @@
 4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298 - Brightdawn confirmed close now
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
-7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326
+7. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326 - Harness as optional external worker: secrets mounting (tmpfs) + file/memory injection + staged write-back — implemented 2026-10-10 (rarity/kimi-7-20261010-0901)
+  - New `ic/src/orchestrator/harness.rs`: capability types + validation (worker_secrets env-safe file names, inject_files workspace-relative paths, identity opt-in), SHA-256 provenance manifest (PROVENANCE.json), promotion pipeline (path allowlist default `projects/`, identity/engine/backup exclusions per WI#322, size/count limits, UTF-8 + LeakDetector scan), audit `PromotionRecord`s. 14 unit tests.
+  - `JobMode::Harness` registered in the create_job mode registry; harness jobs dispatch async by default (wait=false), reuse `~/.lunarwing/projects/` mounting, persist mode `harness` in the sandbox job record.
+  - tmpfs secrets: `/run/secrets` tmpfs (mode=0700,uid/gid=1000,noexec,nosuid) + post-start tar upload (files 0440); values resolved host-side, never in env/logs/job context; worker consumes them gated on `LUNARWING_HARNESS_MODE=1`.
+  - Injection: workspace docs snapshotted to `projects/.harness/<job_id>/injected/`, mounted RO at `/harness/injected`; identity files need `allow_identity_injection=true`.
+  - Write-back: RW staging at `/harness/workspace_out`; promoted on `/complete` via workspace resolver into tenant memory; full write set + rejections persisted as `harness_write_back` job event and surfaced in wait=true results.
+  - Verified: `cargo check` clean (lib+bins+tests), `cargo clippy` clean (lib+bins+tests), targeted tests pass (harness 14, job tool 53 incl. 8 new, orchestrator 120, worker 7).
+  - Docs: `docs/architecture/HARNESS_WORKER_CAPABILITIES.md`. Out of scope (noted in doc): external-worker secrets mounting, write-back conflict policy beyond Workspace::write semantics, harness restart via web gateway.
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/330
