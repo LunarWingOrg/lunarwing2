@@ -295,8 +295,10 @@ fn harness_injection_specs(params: &serde_json::Value) -> Result<Vec<InjectionSp
     Ok(specs)
 }
 
-/// Parse `write_back`: `true` enables the default policy; an object overrides
-/// individual limits. Absent or `false` disables write-back.
+/// Parse `write_back`: `true` enables the default policy; an object may
+/// NARROW the operator-fixed roots (`projects/**`) or LOWER the limits —
+/// ceilings and the root set are enforced server-side (CW-1/CW-6). Absent or
+/// `false` disables write-back.
 fn harness_write_back_policy(
     params: &serde_json::Value,
 ) -> Result<Option<WriteBackPolicy>, ToolError> {
@@ -393,16 +395,20 @@ fn harness_task_prompt(task: &str, request: &HarnessJobRequest) -> String {
     }
     if !request.resolved_secrets.is_empty() {
         out.push_str(&format!(
-            "- Secret files are mounted at {} (also exported as env vars for child \
-             processes). Never print or exfiltrate their contents.\n",
-            harness::HARNESS_SECRETS_CONTAINER_DIR
+            "- Secret files are mounted read-only on tmpfs at {}. When a command needs a \
+             secret, reference the file WITHOUT printing it (e.g. `curl -H \"Authorization: \
+             Bearer $(cat {}/NAME)\" ...`). Never cat, echo, env-export, or otherwise reveal \
+             their contents; values are redacted from job events.\n",
+            harness::HARNESS_SECRETS_CONTAINER_DIR,
+            harness::HARNESS_SECRETS_CONTAINER_DIR,
         ));
     }
     if let Some(policy) = &request.write_back {
         out.push_str(&format!(
             "- To persist results into workspace memory, write files under {} under an \
              allowed root ({}). They are promoted only after secret scanning and \
-             allowlist checks; identity and engine-managed paths are never promoted.\n",
+             allowlist checks; identity, system-prompt, daily/, lorebooks/, context/, \
+             backups/, and engine-managed paths are never promoted.\n",
             harness::HARNESS_WRITE_BACK_CONTAINER_DIR,
             policy.allowed_roots.join(", ")
         ));
@@ -764,6 +770,10 @@ impl CreateJobTool {
         user_id: &str,
         options: HarnessJobOptions,
     ) -> Result<HarnessJobRequest, ToolError> {
+        // Harness state lives outside the bind-mountable projects base (CW-3).
+        harness::ensure_harness_base_dir()
+            .map_err(|e| ToolError::ExecutionFailed(format!("harness base dir: {e}")))?;
+
         let mut resolved_secrets = Vec::with_capacity(options.worker_secrets.len());
         if !options.worker_secrets.is_empty() {
             let secrets = self.secrets_store.as_ref().ok_or_else(|| {
@@ -783,6 +793,15 @@ impl CreateJobTool {
                             mount.secret_name, e
                         ))
                     })?;
+                // CV-8: same usage-audit posture as the /credentials endpoint.
+                if let Ok(secret) = secrets.get(user_id, &mount.secret_name).await
+                    && let Err(e) = secrets.record_usage(secret.id).await
+                {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        "Failed to record harness secret usage: {}", e
+                    );
+                }
                 resolved_secrets.push(ResolvedSecretFile::new(
                     mount.file_name.clone(),
                     secrecy::SecretString::from(decrypted.expose().to_string()),
@@ -801,11 +820,16 @@ impl CreateJobTool {
             let workspace = resolver.resolve(user_id).await;
             let mut entries = Vec::with_capacity(options.injections.len());
             for spec in &options.injections {
-                let document = workspace.read(&spec.source).await.map_err(|e| {
-                    ToolError::InvalidParameters(format!("cannot inject '{}': {}", spec.source, e))
+                // CW-5: read and record the NORMALIZED source path — the
+                // raw param is never used after validation.
+                let normalized = spec
+                    .normalized_source()
+                    .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
+                let document = workspace.read(&normalized).await.map_err(|e| {
+                    ToolError::InvalidParameters(format!("cannot inject '{normalized}': {e}"))
                 })?;
                 entries.push(harness::InjectionEntry {
-                    source_path: spec.source.clone(),
+                    source_path: normalized,
                     target_name: spec
                         .resolved_target_name()
                         .map_err(|e| ToolError::InvalidParameters(e.to_string()))?,
@@ -879,6 +903,32 @@ impl CreateJobTool {
         })?;
 
         let job_id = Uuid::new_v4();
+        // CW-3: an explicit project_dir must belong to a job owned by THIS
+        // user — otherwise a prompt-injected call could mount another user's
+        // job workspace (cross-user read/write in multi-user daemons).
+        if let Some(ref dir) = explicit_dir
+            && let Some(store) = &self.store
+        {
+            let dir_job_id = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| Uuid::parse_str(n).ok());
+            let owner_ok = match dir_job_id {
+                Some(id) => store
+                    .get_sandbox_job(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.user_id == ctx.user_id),
+                None => false,
+            };
+            if !owner_ok {
+                return Err(ToolError::NotAuthorized(
+                    "explicit project_dir must belong to a job owned by the current user"
+                        .to_string(),
+                ));
+            }
+        }
         let (project_dir, browse_id) = resolve_project_dir(explicit_dir, job_id)?;
         let project_dir_str = project_dir.display().to_string();
 
@@ -1068,7 +1118,10 @@ impl CreateJobTool {
             match jm.get_handle(job_id).await {
                 Some(handle) => match handle.state {
                     crate::orchestrator::job_manager::ContainerState::Running
-                    | crate::orchestrator::job_manager::ContainerState::Creating => {
+                    | crate::orchestrator::job_manager::ContainerState::Creating
+                    // CW-7: harness write-back promotion still running; the
+                    // staging dir must not be cleaned up yet.
+                    | crate::orchestrator::job_manager::ContainerState::Finalizing => {
                         tokio::time::sleep(poll_interval).await;
                     }
                     crate::orchestrator::job_manager::ContainerState::Stopped => {
@@ -1494,6 +1547,12 @@ const DANGEROUS_ENV_VARS: &[&str] = &[
     "RUST_LOG",
 ];
 
+/// True when `name` is on the env-var denylist (shared with the harness
+/// secret-file-name validation, WI#326 CV-4).
+pub(crate) fn is_dangerous_env_var_name(name: &str) -> bool {
+    DANGEROUS_ENV_VARS.contains(&name)
+}
+
 /// Validate that an env var name is safe for container injection.
 fn validate_env_var_name(name: &str) -> Result<(), ToolError> {
     if name.is_empty() {
@@ -1563,9 +1622,18 @@ fn resolve_project_dir(
                     e
                 ))
             })?;
-            if !canonical.starts_with(&canonical_base) {
+            // CW-3: explicit dirs must be exactly `projects/<uuid>` — never
+            // the base itself, nested subtrees, or sibling state such as the
+            // harness dirs (which live outside projects/ as of WI#326).
+            let is_direct_uuid_child = canonical.parent() == Some(canonical_base.as_path())
+                && canonical
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| Uuid::parse_str(n).ok())
+                    .is_some();
+            if !is_direct_uuid_child {
                 return Err(ToolError::InvalidParameters(format!(
-                    "project directory must be under {}",
+                    "project directory must be a job directory under {} (projects/<uuid>)",
                     canonical_base.display()
                 )));
             }
@@ -1774,10 +1842,14 @@ impl Tool for CreateJobTool {
             if self.sandbox_enabled() {
                 props["worker_secrets"] = serde_json::json!({
                     "type": "object",
-                    "description": "Harness mode only. Map of secret names to file names mounted on \
-                                    tmpfs at /run/secrets/<NAME> (also exported as env vars to child \
-                                    processes). Values never enter the container environment, job \
-                                    context, or logs.",
+                    "description": "Harness mode only. Map of secret names to file names mounted \
+                                    read-only on tmpfs at /run/secrets/<NAME>. The worker pulls \
+                                    values at start and fails closed on mismatch. Values never \
+                                    enter the container environment, job context, logs, or job \
+                                    events; the job reads the files when a command needs them. \
+                                    File names must match [A-Z_][A-Z0-9_]* and must not be on the \
+                                    env-var denylist or use LUNARWING_/IRONCLAW_ prefixes. \
+                                    Requires explicit approval.",
                     "additionalProperties": { "type": "string" }
                 });
                 props["inject_files"] = serde_json::json!({
@@ -1785,24 +1857,32 @@ impl Tool for CreateJobTool {
                     "description": "Harness mode only. Workspace memory documents to snapshot into a \
                                     read-only mount at /harness/injected with a provenance manifest. \
                                     Entries are workspace paths (e.g. 'MEMORY.md', 'projects/x/notes.md') \
-                                    or {source, target} objects. Identity documents require \
-                                    allow_identity_injection=true.",
+                                    or {source, target} objects. Paths must be in canonical form \
+                                    (no whitespace padding, '.', '..', or backslashes). Identity \
+                                    documents require allow_identity_injection=true; backups/, \
+                                    engine/, and quarantined daily logs are never injectable.",
                     "items": { "type": ["string", "object"] }
                 });
                 props["allow_identity_injection"] = serde_json::json!({
                     "type": "boolean",
                     "default": false,
                     "description": "Harness mode only. Allow injecting identity documents (SOUL.md, \
-                                    USER.md, IDENTITY.md). Off by default."
+                                    USER.md, IDENTITY.md, AGENTS.md, TOOLS.md, BOOTSTRAP.md). Off by \
+                                    default. Requires explicit approval."
                 });
                 props["write_back"] = serde_json::json!({
                     "type": ["boolean", "object"],
                     "default": false,
                     "description": "Harness mode only. Enable a writable staging mount at \
-                                    /harness/workspace_out; on completion, staged files are promoted \
-                                    into workspace memory after path allowlist (default projects/), \
-                                    size/count, and secret-scan checks. An object may override \
-                                    allowed_roots, max_files, max_file_bytes, max_total_bytes."
+                                    /harness/workspace_out; on successful completion, staged files \
+                                    are promoted into workspace memory after allowlist, size/count, \
+                                    and secret-scan checks. The allowed roots are operator-fixed to \
+                                    projects/** — an object may only NARROW them \
+                                    (allowed_roots: ['projects/sub']) or LOWER the limits \
+                                    (max_files, max_file_bytes, max_total_bytes, capped at \
+                                    256 / 1 MiB / 8 MiB). Identity, system-prompt, daily/, \
+                                    lorebooks/, context/, backups/, and engine/ paths are never \
+                                    promoted. Requires explicit approval."
                 });
             }
 
@@ -1870,7 +1950,16 @@ impl Tool for CreateJobTool {
 
         // WI#326: harness mode runs the conventional worker container with
         // tmpfs secrets, read-only workspace injection, and staged write-back.
-        if mode_str == "harness" {
+        // CV-9: an external worker literally named "harness" stays reachable
+        // on deployments WITHOUT the Docker sandbox (built-in mode wins when
+        // the sandbox is enabled).
+        let harness_routes_external = mode_str == "harness"
+            && !self.sandbox_enabled()
+            && self
+                .external_worker_manager
+                .as_ref()
+                .is_some_and(|m| m.get_worker("harness").is_some());
+        if mode_str == "harness" && !harness_routes_external {
             if !self.sandbox_enabled() {
                 return Err(ToolError::InvalidParameters(
                     "harness mode requires the Docker sandbox".to_string(),
@@ -1919,6 +2008,14 @@ impl Tool for CreateJobTool {
 
         // Route to external worker if requested and available
         if mode_str != "worker" {
+            if has_harness_params(&params) {
+                // CV-9: never silently drop harness options on external modes.
+                return Err(ToolError::InvalidParameters(
+                    "worker_secrets, inject_files, allow_identity_injection, and write_back \
+                     require mode 'harness' (Docker sandbox)"
+                        .to_string(),
+                ));
+            }
             if params.get("mcp_servers").is_some() {
                 return Err(ToolError::InvalidParameters(
                     "mcp_servers is supported only by the Docker worker".to_string(),
@@ -2036,7 +2133,30 @@ impl Tool for CreateJobTool {
         }
     }
 
-    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+    fn requires_approval(&self, params: &serde_json::Value) -> ApprovalRequirement {
+        // WI#326 CW-4: harness capabilities that touch tenant secrets or
+        // tenant memory sit ABOVE the auto-approve tiers — an agent must not
+        // silently mutate its own memory substrate via a job side-channel,
+        // and identity injection / secret mounts must be explicitly approved.
+        // The approval prompt renders the params, which carry the resolved
+        // (narrowed) write-back roots and the mounted secret names.
+        if params.get("mode").and_then(|v| v.as_str()) == Some("harness") {
+            let has_secrets = params
+                .get("worker_secrets")
+                .and_then(|v| v.as_object())
+                .is_some_and(|obj| !obj.is_empty());
+            let has_identity_injection = params
+                .get("allow_identity_injection")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // write_back: true or an options object both enable promotion.
+            let has_write_back = params
+                .get("write_back")
+                .is_some_and(|v| v.as_bool().unwrap_or(true));
+            if has_secrets || has_identity_injection || has_write_back {
+                return ApprovalRequirement::Always;
+            }
+        }
         ApprovalRequirement::UnlessAutoApproved
     }
 
