@@ -593,6 +593,53 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
+## LLM endpoints for LLM-backed workers (WI#330)
+
+The opencode, opencode2, and kimi worker images bake **placeholder** LLM
+endpoints (`set-opencode-base-url.invalid`, `set-opencode2-base-url.invalid`,
+`set-kimi-base-url.invalid` — the `.invalid` TLD is guaranteed NXDOMAIN).
+Earlier images baked developer-network endpoints (an RFC1918 LAN address and
+a NetBird MagicDNS name) that are unreachable from any other host, and
+MagicDNS names never resolve inside rootless containers at all. Each
+entrypoint now **refuses to start** when the placeholder survives to the
+runtime config, with a message naming the missing env var, instead of dying
+at the first LLM request after N retries.
+
+mt-admin renders `OPENCODE_BASE_URL` / `KIMI_BASE_URL` / `OPENCODE2_BASE_URL`
+into every tenant's `lunarwing.env`, so managed deployments never see the
+placeholder. Resolution order per worker:
+
+1. Explicit per-worker flag (`add-tenant --opencode-base-url` /
+   `--kimi-base-url` / `--opencode2-base-url`).
+2. An existing value in `lunarwing.env` (preserved across re-renders).
+3. The tenant's explicit LLM endpoint (`--llm-base-url` or fleet
+   `LUNARWING_MT_LLM_BASE_URL`).
+4. The tenant's TensorZero upstream (`--tensorzero-url` or fleet
+   `LUNARWING_MT_TENSORZERO_URL`), normalized to its `/openai/v1` surface.
+
+The daemon's own proxy-loopback default (`http://127.0.0.1:<proxy>/v1`) is
+deliberately **not** inherited: worker containers publish ports on host
+loopback but dial out over the container bridge, so `127.0.0.1` inside the
+container is the container itself. Whatever URL a worker gets must be
+reachable from inside a rootless container — use a numeric overlay/LAN IP or
+a public DNS name, never host loopback or a MagicDNS name.
+
+Override knobs (no image rebuild; restart the worker afterwards):
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-opencode  <name> --base-url <url>
+sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi      <name> --base-url <url>
+sudo ic/scripts/lunarwing-mt-admin.sh configure-opencode2 <name> --base-url <url>
+```
+
+**Upgrade note:** `upgrade-tenant` patches env files rather than re-rendering
+them, so tenants provisioned before this change only gain the rendered worker
+URLs on the next `add-tenant` re-run (which is idempotent and preserves
+operator-set values). After rebuilding worker images onto this change, any
+tenant whose `lunarwing.env` still lacks a `*_BASE_URL` for an enabled worker
+will fail that worker's entrypoint loudly; fix it with one `configure-*`
+call above (or an `add-tenant` re-run) — no manual per-container env edits.
+
 ## Shared Protocol
 
 All worker images use the `lunarwing-agent-v1` WebSocket subprotocol; the legacy `ironclaw-agent-v1` alias is no longer accepted. Messages are JSON envelopes with `id`, `type`, `timestamp`, `payload`. The worker sends `ready` on connect, receives `task_request`, streams `task_progress`, and sends a final `task_result`.
