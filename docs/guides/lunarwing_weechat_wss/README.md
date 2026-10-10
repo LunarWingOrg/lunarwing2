@@ -8,14 +8,15 @@ LunarWing reaches IRC networks through a per-instance WeeChat relay. The current
 
 The adapter-to-WeeChat hop is WebSocket; the sandboxed channel-to-adapter hop is HTTP. See [`../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md`](../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md) for the current message flow, configuration precedence, sender principals, latency model, and known limitations.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** Source/registry paths,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-10 (v2.1.6.0).** Source/registry paths,
 capability schema, mt-admin bootstrap/recovery commands, and the preflight
 script were re-checked against the current tree; no changes were needed (the
 2.1.2.0 release only bumped the channel crate/registry versions to 0.2.9;
 the 2.1.3.0 release again only bumped them to 0.2.10; the 2.1.4.0 release
 bumped the registry manifest to 0.2.11 and the WASM channel crate to the
 workspace `2.1.4` version; the 2.1.5.0 release bumped the registry manifest
-to 0.2.12 and the WASM channel crate to `2.1.5`).
+to 0.2.12 and the WASM channel crate to `2.1.5`; the 2.1.6.0 release bumped
+the registry manifest to 0.2.13 and the WASM channel crate to `2.1.6`).
 
 ## Source and Registry
 
