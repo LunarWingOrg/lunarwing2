@@ -2422,13 +2422,15 @@ async fn persisted_disabled_reason(
 /// WI#322 guard (open WI; MR !1506 review CQ-1 scenario C): until the memory
 /// tools reserve the engine projects tree themselves, the proxied path
 /// refuses `memory_write` into `engine/projects/**` mission records so a
-/// compromised worker cannot widen the forge surface.
+/// compromised worker cannot widen the forge surface. `memory_write` carries
+/// the destination in its `target` parameter (named targets like "memory"
+/// resolve outside the mission tree and pass).
 fn mission_path_guard_reason(name: &str, params: &serde_json::Value) -> Option<String> {
     if name != "memory_write" {
         return None;
     }
-    let path = params.get("path").and_then(|v| v.as_str())?;
-    is_mission_path(&normalize_path(path)).then(|| {
+    let target = params.get("target").and_then(|v| v.as_str())?;
+    is_mission_path(&normalize_path(target)).then(|| {
         "proxied memory_write may not write engine/projects/** mission records (WI#322)".to_string()
     })
 }
@@ -2914,9 +2916,9 @@ mod tests {
         let raw: Vec<String> = vec![
             "memory_read".to_string(),
             "*".to_string(),
-            "shell".to_string(),
             "restart".to_string(),
             "create_job".to_string(),
+            "secret_list".to_string(),
             "not a tool".to_string(),
             "line\nbreak".to_string(),
         ];
