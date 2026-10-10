@@ -10,7 +10,7 @@ exclude = [
 
 [package]
 name = "lunarwing"
-version = "2.1.5"
+version = "2.1.6"
 edition = "2024"
 rust-version = "1.96.1"
 description = "Secure, privacy-first AI agent with XMPP/OMEMO, Gotify, and open-protocol channels"
@@ -98,12 +98,12 @@ tokio-util = { version = "0.7", features = ["compat"] }
 cron = "0.17"
 
 # Internal crates
-lunarwing_common = { path = "crates/lunarwing_common", version = "2.1.5" }
-lunarwing_engine = { path = "crates/lunarwing_engine", version = "2.1.5" }
-lunarwing_skills = { path = "crates/lunarwing_skills", version = "2.1.5" }
+lunarwing_common = { path = "crates/lunarwing_common", version = "2.1.6" }
+lunarwing_engine = { path = "crates/lunarwing_engine", version = "2.1.6" }
+lunarwing_skills = { path = "crates/lunarwing_skills", version = "2.1.6" }
 
 # Safety/sanitization
-lunarwing_safety = { path = "crates/lunarwing_safety", version = "2.1.5" }
+lunarwing_safety = { path = "crates/lunarwing_safety", version = "2.1.6" }
 regex = "1"
 unicode-normalization = "0.1"
 
