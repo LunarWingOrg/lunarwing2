@@ -837,7 +837,6 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-
         let resp = router.oneshot(req).await.unwrap();
         // 404 because no container exists for this job_id, but NOT 401.
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -880,7 +879,7 @@ mod tests {
             .header("Authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         token_store
@@ -898,7 +897,7 @@ mod tests {
             .header("Authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

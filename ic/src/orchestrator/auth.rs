@@ -444,7 +444,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_grants_are_isolated_and_revoked() {        let store = TokenStore::new();
+    async fn mcp_grants_are_isolated_and_revoked() {
+        let store = TokenStore::new();
         let job_a = Uuid::new_v4();
         let job_b = Uuid::new_v4();
         store

@@ -3676,14 +3676,22 @@ mod tests {
     fn test_resolve_project_dir_explicit_under_base() {
         let base = projects_base();
         std::fs::create_dir_all(&base).unwrap(); // safety: test
-        let explicit = base.join("test_explicit_project");
+        // CW-3: explicit dirs must be exactly `projects/<uuid>` — a plain
+        // named dir under the base is no longer accepted.
+        let named = base.join("test_explicit_project");
+        std::fs::create_dir_all(&named).unwrap(); // safety: test
+        let project_id = Uuid::new_v4();
+        assert!(resolve_project_dir(Some(named.clone()), project_id).is_err());
+        let _ = std::fs::remove_dir_all(&named);
+
+        let prior_job = Uuid::new_v4();
+        let explicit = base.join(prior_job.to_string());
         // Explicit paths must already exist (no auto-create).
         std::fs::create_dir_all(&explicit).unwrap(); // safety: test
-        let project_id = Uuid::new_v4();
 
         let (dir, browse_id) = resolve_project_dir(Some(explicit.clone()), project_id).unwrap(); // safety: test
         assert!(dir.exists()); // safety: test
-        assert_eq!(browse_id, "test_explicit_project"); // safety: test
+        assert_eq!(browse_id, prior_job.to_string()); // safety: test
 
         let canonical_base = base.canonicalize().unwrap(); // safety: test
         assert!(dir.starts_with(&canonical_base)); // safety: test
@@ -3720,8 +3728,8 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             /* safety: test */
-            err.contains("must be under"),
-            "expected 'must be under' error, got: {}",
+            err.contains("must be a job directory under"),
+            "expected 'must be a job directory under' error, got: {}",
             err
         );
     }
@@ -4170,14 +4178,76 @@ mod tests {
         let params = serde_json::json!({
             "worker_secrets": {"github_token": "GITHUB_TOKEN"},
             "inject_files": ["MEMORY.md", {"source": "projects/x/notes.md", "target": "notes.md"}],
-            "write_back": {"allowed_roots": ["projects/"], "max_files": 10},
+            "write_back": {"allowed_roots": ["projects"], "max_files": 10},
         });
         let options = harness_options_from_params(&params).unwrap().unwrap(); // safety: test
         assert_eq!(options.worker_secrets.len(), 1);
         assert_eq!(options.injections.len(), 2);
         let policy = options.write_back.unwrap(); // safety: test
-        assert_eq!(policy.allowed_roots, vec!["projects/".to_string()]);
+        assert_eq!(policy.allowed_roots, vec!["projects".to_string()]);
         assert_eq!(policy.max_files, 10);
+
+        // CW-1: roots may only NARROW the operator-fixed projects/** set, and
+        // must be canonical (no trailing slash, no whitespace tricks).
+        for bad in ["MEMORY.md", "engine", "projects/", " projects", "/projects"] {
+            let params = serde_json::json!({"write_back": {"allowed_roots": [bad]}});
+            assert!(
+                harness_options_from_params(&params).is_err(),
+                "root '{bad}' must be rejected"
+            );
+        }
+        // CW-6: limits may only be lowered, never raised past the ceilings.
+        let raised = serde_json::json!({"write_back": {"max_files": 999_999}});
+        assert!(harness_options_from_params(&raised).is_err());
+    }
+
+    #[test]
+    fn harness_capabilities_require_explicit_approval() {
+        // CW-4: secrets, identity injection, and write-back sit above the
+        // auto-approve tiers; a plain injection-only harness job does not.
+        let tool = sandbox_tool();
+        let base = serde_json::json!({
+            "title": "t",
+            "description": "d",
+            "mode": "harness",
+            "inject_files": ["MEMORY.md"],
+        });
+        assert_eq!(
+            tool.requires_approval(&base),
+            ApprovalRequirement::UnlessAutoApproved
+        );
+        for extra in [
+            serde_json::json!({"worker_secrets": {"tok": "TOKEN"}}),
+            serde_json::json!({"write_back": true}),
+            serde_json::json!({"write_back": {"max_files": 1}}),
+            serde_json::json!({"allow_identity_injection": true}),
+        ] {
+            let mut params = base.clone();
+            params
+                .as_object_mut()
+                .unwrap() // safety: test
+                .extend(extra.as_object().unwrap().clone()); // safety: test
+            assert_eq!(
+                tool.requires_approval(&params),
+                ApprovalRequirement::Always,
+                "{params}"
+            );
+        }
+        // write_back: false keeps the default tier.
+        let mut off = base.clone();
+        off.as_object_mut()
+            .unwrap() // safety: test
+            .insert("write_back".to_string(), serde_json::json!(false));
+        assert_eq!(
+            tool.requires_approval(&off),
+            ApprovalRequirement::UnlessAutoApproved
+        );
+        // Non-harness modes never elevate through these params here.
+        let worker = serde_json::json!({"title": "t", "description": "d", "mode": "worker"});
+        assert_eq!(
+            tool.requires_approval(&worker),
+            ApprovalRequirement::UnlessAutoApproved
+        );
     }
 
     #[test]

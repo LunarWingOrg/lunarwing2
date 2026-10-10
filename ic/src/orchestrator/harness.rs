@@ -172,9 +172,7 @@ pub fn normalize_harness_path(raw: &str) -> Result<String, HarnessError> {
         }
         if segment != segment.trim()
             || segment.chars().any(|c| c.is_control())
-            || segment.chars().any(|c| {
-                c.is_whitespace() && !c.is_ascii()
-            })
+            || segment.chars().any(|c| c.is_whitespace() && !c.is_ascii())
         {
             return Err(HarnessError::InvalidPolicy(format!(
                 "path '{raw}' has a segment with leading/trailing whitespace or control characters"
@@ -478,9 +476,9 @@ impl WriteBackPolicy {
     /// True when a normalized staging-relative path falls under an allowed
     /// root. The hard-deny set ([`write_back_deny_reason`]) always wins.
     pub fn root_allows(&self, normalized_path: &str) -> bool {
-        self.allowed_roots.iter().any(|root| {
-            normalized_path == root || normalized_path.starts_with(&format!("{root}/"))
-        })
+        self.allowed_roots
+            .iter()
+            .any(|root| normalized_path == root || normalized_path.starts_with(&format!("{root}/")))
     }
 }
 
@@ -641,7 +639,11 @@ pub fn write_injection_dir(
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| HarnessError::Io(format!("serialize manifest: {e}")))?;
-    write_file_no_follow(&dir.join(INJECTION_MANIFEST_NAME), manifest_json.as_bytes(), 0o444)?;
+    write_file_no_follow(
+        &dir.join(INJECTION_MANIFEST_NAME),
+        manifest_json.as_bytes(),
+        0o444,
+    )?;
     Ok(manifest)
 }
 
@@ -953,7 +955,9 @@ pub fn plan_promotion(
     let mut plan = PromotionPlan::default();
     let mut total_bytes = 0u64;
     let detector = crate::safety::LeakDetector::new();
-    let canonical_staging = staging.canonicalize().unwrap_or_else(|_| staging.to_path_buf());
+    let canonical_staging = staging
+        .canonicalize()
+        .unwrap_or_else(|_| staging.to_path_buf());
 
     for (path, lstat_size) in files {
         if plan.accepted.len() >= policy.max_files {
@@ -1066,8 +1070,8 @@ struct ScreenInput<'a> {
 }
 
 fn screen_staged_file(input: ScreenInput<'_>) -> Result<StagedWrite, String> {
-    let relative = normalize_harness_path(input.relative)
-        .map_err(|e| format!("invalid staged path: {e}"))?;
+    let relative =
+        normalize_harness_path(input.relative).map_err(|e| format!("invalid staged path: {e}"))?;
     if let Some(reason) = write_back_deny_reason(&relative) {
         return Err(reason.to_string());
     }
@@ -1662,8 +1666,8 @@ mod tests {
         ]);
         let values = vec![SecretString::from("ghp_abcdefghijklmnop12345".to_string())];
         let redactor = SecretValueRedactor::new(&values);
-        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor))
-            .unwrap(); // safety: test
+        let plan =
+            plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
         assert_eq!(plan.accepted.len(), 1);
         assert_eq!(plan.accepted[0].relative_path, "projects/clean.md");
         assert!(
@@ -1781,8 +1785,7 @@ mod tests {
 
         // Zero grace: every non-live dir is old enough to sweep.
         let live_set = std::collections::HashSet::from([live]);
-        let removed =
-            sweep_harness_dirs_in(tmp.path(), &live_set, std::time::Duration::ZERO);
+        let removed = sweep_harness_dirs_in(tmp.path(), &live_set, std::time::Duration::ZERO);
         assert_eq!(removed, 2);
         assert!(tmp.path().join(live.to_string()).exists());
         assert!(!tmp.path().join(stale_a.to_string()).exists());

@@ -145,7 +145,9 @@ async fn setup_harness_secrets(
     if !values.is_empty() {
         tracing::info!("Staged {} harness secret file(s) onto tmpfs", values.len());
     }
-    Ok(crate::orchestrator::harness::SecretValueRedactor::new(&values))
+    Ok(crate::orchestrator::harness::SecretValueRedactor::new(
+        &values,
+    ))
 }
 
 impl Default for WorkerConfig {

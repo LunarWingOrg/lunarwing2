@@ -1279,9 +1279,10 @@ impl ContainerJobManager {
             match containers.get_mut(&job_id) {
                 Some(handle) => {
                     handle.completion_result = Some(result);
-                    let promote = handle.harness.as_ref().is_some_and(|h| {
-                        h.write_back.is_some() && h.staging_dir.is_some()
-                    });
+                    let promote = handle
+                        .harness
+                        .as_ref()
+                        .is_some_and(|h| h.write_back.is_some() && h.staging_dir.is_some());
                     handle.state = if promote {
                         ContainerState::Finalizing
                     } else {
@@ -1551,8 +1552,7 @@ async fn run_promotion(
 
     let Some(resolver) = &deps.workspace else {
         summary.skipped = true;
-        summary.skip_reason =
-            Some("no workspace available for write-back promotion".to_string());
+        summary.skip_reason = Some("no workspace available for write-back promotion".to_string());
         return summary;
     };
     let workspace = resolver.resolve(owner_id).await;

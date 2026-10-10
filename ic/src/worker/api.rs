@@ -481,7 +481,9 @@ impl WorkerHttpClient {
     /// Returns an empty vec when the job mounts no secrets (204/404). The
     /// caller verifies the delivered set against LUNARWING_SECRET_FILES and
     /// fails closed on any mismatch.
-    pub async fn fetch_harness_secrets(&self) -> Result<Vec<HarnessSecretFileResponse>, WorkerError> {
+    pub async fn fetch_harness_secrets(
+        &self,
+    ) -> Result<Vec<HarnessSecretFileResponse>, WorkerError> {
         let resp = self
             .client
             .get(self.url("harness-secrets"))
