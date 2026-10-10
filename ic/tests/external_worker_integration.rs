@@ -47,9 +47,10 @@ use lunarwing::channels::web::types::SseEvent;
 use lunarwing::config::{ExternalWorkerConfig, LoadBalanceStrategy, WorkerEndpoint};
 use lunarwing::context::{ContextManager, JobContext, JobState};
 use lunarwing::error::OrchestratorError;
+use lunarwing::hooks::HookRegistry;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
-    ConversationMessage, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
+    ConversationMessage, ExternalTaskStatus, SUBPROTOCOL, TaskContext, ToolProxy,
 };
 use lunarwing::tools::Tool;
 use lunarwing::tools::builtin::CreateJobTool;
@@ -1977,6 +1978,10 @@ fn test_safety() -> Arc<lunarwing::safety::SafetyLayer> {
     ))
 }
 
+fn test_proxy(tools: Arc<lunarwing::tools::ToolRegistry>) -> ToolProxy {
+    ToolProxy::new(tools, test_safety(), Arc::new(HookRegistry::new()))
+}
+
 #[tokio::test]
 async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
     // WI#324 acceptance: an allowlisted tool round-trips through the tenant's
@@ -2004,7 +2009,7 @@ async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
 
     let mut config = config_for(&url);
     config.tool_allowlist = vec!["probe_echo".to_string()];
-    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(tools, test_safety());
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
     let job_id = Uuid::new_v4();
 
     let context = TaskContext {
@@ -2069,7 +2074,7 @@ async fn tool_call_denied_when_allowlist_empty() {
     .await;
 
     let mgr =
-        ExternalWorkerManager::new(vec![config_for(&url)]).with_tool_proxy(tools, test_safety());
+        ExternalWorkerManager::new(vec![config_for(&url)]).with_tool_proxy(test_proxy(tools));
 
     let res = timeout(
         TEST_BOUND,
@@ -2111,7 +2116,7 @@ async fn tool_call_unknown_allowlisted_tool_is_an_error_not_a_hang() {
 
     let mut config = config_for(&url);
     config.tool_allowlist = vec!["ghost_tool".to_string()];
-    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(tools, test_safety());
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
 
     let res = timeout(
         TEST_BOUND,

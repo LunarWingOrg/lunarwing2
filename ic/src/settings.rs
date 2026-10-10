@@ -912,8 +912,11 @@ pub struct ExternalWorkerSettings {
     /// (WI#324). Names of in-process tools this worker may invoke over the
     /// WebSocket control channel (e.g. "memory_read", "memory_write",
     /// "knowledge_search"). Deny-by-default: an empty list means the worker
-    /// gets a hard reject for every `tool_call`. `"*"` opts in to all tools.
-    /// Secrets never cross the proxy — only tool results.
+    /// gets a hard reject for every `tool_call`. Exact names only — `"*"`
+    /// and autonomous-denylisted names are dropped at load, and the whole
+    /// list is stripped for cleartext `ws://` endpoints on non-loopback
+    /// hosts. Tools must additionally pass the daemon's autonomous-execution
+    /// gates, and secrets never cross the proxy — only sanitized results.
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
 }

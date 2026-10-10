@@ -22,9 +22,18 @@ use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
 use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::Database;
 use crate::error::OrchestratorError;
+use crate::hooks::{HookError, HookEvent, HookOutcome, HookRegistry};
 use crate::safety::SafetyLayer;
-use crate::tools::ToolRegistry;
 use crate::tools::execute::execute_tool_with_safety;
+use crate::tools::permissions::{
+    PermissionState, gitlab_permission_alias_conflict, permission_setting_keys,
+};
+use crate::tools::rate_limiter::RateLimitResult;
+use crate::tools::{
+    ApprovalContext, Tool, ToolRegistry, is_autonomous_tool_denylisted, prepare_tool_params,
+    redact_params,
+};
+use crate::workspace::{is_mission_path, normalize_path};
 
 // ── Protocol types ──────────────────────────────────────────────────
 
@@ -178,18 +187,28 @@ struct TaskResultPayload {
 
 /// Tenant tool surface exposed to external workers over the existing WS
 /// control channel (WI#324 "capability proxy"). Holds the in-process tool
-/// registry and safety layer so a worker's `tool_call` frame is dispatched
-/// exactly like an in-process call — the worker never receives credentials,
-/// only tool results.
+/// registry, safety layer, and hook registry so a worker's `tool_call` frame
+/// is dispatched with the same autonomous-execution hard gates as the other
+/// background paths (jobs/routines) — the worker never receives credentials,
+/// only sanitized tool results.
 #[derive(Clone)]
 pub struct ToolProxy {
     tools: Arc<ToolRegistry>,
     safety: Arc<SafetyLayer>,
+    hooks: Arc<HookRegistry>,
 }
 
 impl ToolProxy {
-    pub fn new(tools: Arc<ToolRegistry>, safety: Arc<SafetyLayer>) -> Self {
-        Self { tools, safety }
+    pub fn new(
+        tools: Arc<ToolRegistry>,
+        safety: Arc<SafetyLayer>,
+        hooks: Arc<HookRegistry>,
+    ) -> Self {
+        Self {
+            tools,
+            safety,
+            hooks,
+        }
     }
 }
 
@@ -203,8 +222,9 @@ struct ToolCallPayload {
     /// Tool arguments (validated by the safety layer before execution).
     #[serde(default)]
     arguments: serde_json::Value,
-    /// Task the call belongs to. Informational only — scoping always comes
-    /// from the connection's job, never from the frame.
+    /// Task the call belongs to. Required and must equal the connection's
+    /// job id (MR !1506 review CQ-7): pooled sockets are reused across jobs,
+    /// so every call must bind itself to the job it claims to serve.
     #[serde(default)]
     task_id: Option<String>,
 }
@@ -216,6 +236,15 @@ struct ToolCatalogEntry {
     name: String,
     description: String,
     parameters: serde_json::Value,
+}
+
+/// Per-task binding for the proxied tool path (WI#324): the shared proxy
+/// (registry/safety/hooks) plus the worker's sanitized allowlist. Bundled so
+/// `run_external_task` does not grow a parameter per new proxy concern.
+#[derive(Clone)]
+struct ToolProxyBinding {
+    proxy: Option<ToolProxy>,
+    allowlist: Arc<[String]>,
 }
 
 // ── External job handle ─────────────────────────────────────────────
@@ -253,29 +282,36 @@ pub struct ExternalWorkerManager {
 impl ExternalWorkerManager {
     pub fn new(configs: Vec<ExternalWorkerConfig>) -> Self {
         let mut load_balancers = HashMap::new();
-        for config in &configs {
-            for endpoint in config.endpoints() {
-                if let Some(host) = extract_host(&endpoint.url)
-                    && endpoint.url.starts_with("ws://")
-                    && !is_loopback(&host)
-                {
-                    tracing::warn!(
-                        "External worker '{}' endpoint uses cleartext ws:// for non-loopback host '{}'. \
-                         Credentials and task data will be sent unencrypted. Use wss:// for remote workers.",
-                        config.name,
-                        host
-                    );
+        let mut workers = HashMap::new();
+        for mut config in configs {
+            let cleartext_remote = config.endpoints().iter().any(|endpoint| {
+                endpoint.url.starts_with("ws://")
+                    && extract_host(&endpoint.url).is_some_and(|host| !is_loopback(&host))
+            });
+            if cleartext_remote {
+                for endpoint in config.endpoints() {
+                    if let Some(host) = extract_host(&endpoint.url)
+                        && endpoint.url.starts_with("ws://")
+                        && !is_loopback(&host)
+                    {
+                        tracing::warn!(
+                            "External worker '{}' endpoint uses cleartext ws:// for non-loopback host '{}'. \
+                             Credentials and task data will be sent unencrypted. Use wss:// for remote workers.",
+                            config.name,
+                            host
+                        );
+                    }
                 }
             }
+            config.tool_allowlist =
+                sanitize_tool_allowlist(&config.name, &config.tool_allowlist, cleartext_remote);
             let endpoints = config.endpoints();
             load_balancers.insert(
                 config.name.clone(),
                 LoadBalancer::new(endpoints, config.load_balance.clone()),
             );
+            workers.insert(config.name.clone(), config);
         }
-
-        let workers: HashMap<String, ExternalWorkerConfig> =
-            configs.into_iter().map(|c| (c.name.clone(), c)).collect();
 
         if !workers.is_empty() {
             tracing::info!(
@@ -313,8 +349,8 @@ impl ExternalWorkerManager {
 
     /// Wire the proxied tool path (WI#324): workers may then invoke
     /// allowlisted in-process tools via `tool_call` frames on the task WS.
-    pub fn with_tool_proxy(mut self, tools: Arc<ToolRegistry>, safety: Arc<SafetyLayer>) -> Self {
-        self.tool_proxy = Some(ToolProxy::new(tools, safety));
+    pub fn with_tool_proxy(mut self, proxy: ToolProxy) -> Self {
+        self.tool_proxy = Some(proxy);
         self
     }
 
@@ -418,8 +454,10 @@ impl ExternalWorkerManager {
         let event_tx = self.job_event_tx.clone();
         let context_manager = self.context_manager.clone();
         let store = self.store.clone();
-        let tool_proxy = self.tool_proxy.clone();
-        let tool_allowlist: Arc<[String]> = Arc::from(config.tool_allowlist.as_slice());
+        let tool_binding = ToolProxyBinding {
+            proxy: self.tool_proxy.clone(),
+            allowlist: Arc::from(config.tool_allowlist.as_slice()),
+        };
         let active_handles = Arc::clone(&self.active_handles);
         let pool = Arc::clone(&self.pool);
 
@@ -509,8 +547,7 @@ impl ExternalWorkerManager {
                     store.as_ref(),
                     cancel_rx.clone(),
                     context.clone(),
-                    tool_proxy.clone(),
-                    Arc::clone(&tool_allowlist),
+                    tool_binding.clone(),
                     &pool,
                     &attempt_pool_key,
                 )
@@ -570,8 +607,7 @@ impl ExternalWorkerManager {
                     store.as_ref(),
                     cancel_rx,
                     context,
-                    tool_proxy,
-                    tool_allowlist,
+                    tool_binding,
                     &pool,
                     &pool_key,
                 )
@@ -1168,8 +1204,7 @@ async fn run_external_task(
     store: Option<&Arc<dyn Database>>,
     cancel_rx: watch::Receiver<bool>,
     context: TaskContext,
-    tool_proxy: Option<ToolProxy>,
-    tool_allowlist: Arc<[String]>,
+    tool_binding: ToolProxyBinding,
     pool: &WorkerConnectionPool,
     pool_key: &str,
 ) -> Result<ExternalTaskResult, OrchestratorError> {
@@ -1250,6 +1285,9 @@ async fn run_external_task(
     let mut accumulated_output = String::new();
     let mut cancel_rx = cancel_rx;
     let task_start = tokio::time::Instant::now();
+    // MR !1506 review (CQ-3): bound the number of proxied tool calls a single
+    // job may issue, independent of the per-tool rate limiter.
+    let mut tool_calls_used: u32 = 0;
 
     let result = tokio::time::timeout(task_timeout, async {
         loop {
@@ -1401,38 +1439,82 @@ async fn run_external_task(
                         // WI#324: proxied tool path. The worker invokes an
                         // allowlisted in-process tool; the reply rides the
                         // same WS control channel. Handled inline: the call
-                        // carries its own per-tool timeout, and the outer
-                        // task deadline still bounds the whole loop.
+                        // carries its own per-tool timeout plus a cancel
+                        // race, and the outer task deadline still bounds the
+                        // whole loop.
                         "tool_call" => {
-                            let reply = match serde_json::from_value::<ToolCallPayload>(env.payload) {
-                                Ok(call) => {
-                                    handle_tool_call(
-                                        tool_proxy.as_ref(),
-                                        &tool_allowlist,
-                                        call,
-                                        job_id,
-                                        worker_name,
-                                        &event_user_id,
-                                        store,
-                                    )
-                                    .await
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Malformed tool_call from '{}': {}", worker_name, e
-                                    );
-                                    tool_result_envelope(
-                                        "",
-                                        "error",
-                                        String::new(),
-                                        Some(format!("malformed tool_call frame: {e}")),
-                                    )
+                            let reply = if text.len() > MAX_TOOL_CALL_FRAME_BYTES {
+                                // CQ-3: bound frame size before any parsing,
+                                // persisting, or logging of worker-controlled
+                                // fields.
+                                record_tool_result(
+                                    store,
+                                    job_id,
+                                    "unknown",
+                                    false,
+                                    "tool_call frame rejected: too large",
+                                )
+                                .await;
+                                tool_result_envelope(
+                                    "",
+                                    "error",
+                                    String::new(),
+                                    Some(format!(
+                                        "tool_call frame exceeds {MAX_TOOL_CALL_FRAME_BYTES} bytes"
+                                    )),
+                                )
+                            } else {
+                                match serde_json::from_value::<ToolCallPayload>(env.payload) {
+                                    Ok(call) => {
+                                        let call_ctx = ToolCallCtx {
+                                            proxy: tool_binding.proxy.as_ref(),
+                                            allowlist: &tool_binding.allowlist,
+                                            context_manager,
+                                            store,
+                                            job_id,
+                                            worker_name,
+                                            user_id: &event_user_id,
+                                        };
+                                        handle_tool_call(
+                                            &call_ctx,
+                                            call,
+                                            &mut tool_calls_used,
+                                            &cancel_rx,
+                                        )
+                                        .await
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Malformed tool_call from '{}': {}",
+                                            worker_name,
+                                            log_safe(&e.to_string(), 200)
+                                        );
+                                        record_tool_result(
+                                            store,
+                                            job_id,
+                                            "unknown",
+                                            false,
+                                            "malformed tool_call frame",
+                                        )
+                                        .await;
+                                        tool_result_envelope(
+                                            "",
+                                            "error",
+                                            String::new(),
+                                            Some(format!("malformed tool_call frame: {e}")),
+                                        )
+                                    }
                                 }
                             };
                             send_reply_envelope(&mut write, &reply, worker_name).await;
                         }
                         "tool_list" => {
-                            let reply = build_tool_catalog(tool_proxy.as_ref(), &tool_allowlist).await;
+                            let reply = build_tool_catalog(
+                                tool_binding.proxy.as_ref(),
+                                &tool_binding.allowlist,
+                                &event_user_id,
+                            )
+                            .await;
                             send_reply_envelope(&mut write, &reply, worker_name).await;
                         }
                         "pong" => {}
@@ -1462,7 +1544,8 @@ async fn run_external_task(
                         .saturating_sub(elapsed)
                         .min(CANCEL_ACK_TIMEOUT);
                     if let Some(result) =
-                        wait_for_cancel_ack(&mut read, job_id, worker_name, ack_budget).await
+                        wait_for_cancel_ack(&mut read, &mut write, job_id, worker_name, ack_budget)
+                            .await
                     {
                         return Ok(result);
                     }
@@ -1488,7 +1571,9 @@ async fn run_external_task(
             // Bounded handoff on the timeout path too (WI#149): give the worker
             // the same window to acknowledge before the connection is torn
             // down, so its cancel processing isn't racing socket cleanup.
-            let _ = wait_for_cancel_ack(&mut read, job_id, worker_name, CANCEL_ACK_TIMEOUT).await;
+            let _ =
+                wait_for_cancel_ack(&mut read, &mut write, job_id, worker_name, CANCEL_ACK_TIMEOUT)
+                    .await;
             // WI#263: the streamed investigation is real work. Persist a
             // bounded evidence snapshot and a fallback-deliverable marker so
             // the partial result survives the timeout instead of vanishing
@@ -1699,9 +1784,12 @@ async fn send_cancel_envelope(write: &mut WsWrite, job_id: Uuid) {
 ///
 /// Frame parsing is best-effort by design: progress/pong frames are skipped,
 /// and malformed frames don't abort the wait, since all we need is either the
-/// terminal frame or the socket's end.
+/// terminal frame or the socket's end. `tool_call` frames arriving during the
+/// handoff are answered with an `error` reply (MR !1506 review CQ-8): the
+/// daemon always answers, and a cancelled job must not start new tool work.
 async fn wait_for_cancel_ack(
     read: &mut WsRead,
+    write: &mut WsWrite,
     job_id: Uuid,
     worker_name: &str,
     budget: Duration,
@@ -1722,6 +1810,22 @@ async fn wait_for_cancel_ack(
             let Ok(env) = serde_json::from_str::<Envelope>(text) else {
                 continue;
             };
+            if env.msg_type == "tool_call" {
+                let call_id = env
+                    .payload
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let reply = tool_result_envelope(
+                    &call_id,
+                    "error",
+                    String::new(),
+                    Some("job is being cancelled; tool call rejected".to_string()),
+                );
+                send_reply_envelope(write, &reply, worker_name).await;
+                continue;
+            }
             if env.msg_type != "task_result" {
                 continue;
             }
@@ -1797,11 +1901,108 @@ async fn persist_event(
 
 // ── Proxied tool path helpers (WI#324) ──────────────────────────────
 
+// Bounds for the proxied tool path (MR !1506 review CQ-3): the worker is an
+// untrusted container, so every worker-controlled field is validated and
+// capped before it is parsed, persisted, or logged.
+/// Maximum serialized size of one `tool_call` WS frame.
+const MAX_TOOL_CALL_FRAME_BYTES: usize = 256 * 1024;
+/// Maximum proxied tool calls a single job may issue.
+const MAX_TOOL_CALLS_PER_JOB: u32 = 100;
+/// Tool names are validated as bounded identifiers before use.
+const MAX_TOOL_NAME_BYTES: usize = 128;
+/// Worker-chosen correlation ids get the same treatment.
+const MAX_CALL_ID_BYTES: usize = 128;
+
 /// Whether `name` is permitted by a worker's tool allowlist. Deny-by-default:
-/// an empty list rejects everything; `"*"` opts in to all registered tools;
-/// otherwise exact name match. Mirrors `ExternalWorkerConfig::allows_tool`.
+/// an empty list rejects everything; exact name match only. There is
+/// deliberately no `"*"` wildcard (MR !1506 review CQ-1): a wildcard on an
+/// untrusted container is a full tenant-admin grant.
 fn tool_name_allowed(allowlist: &[String], name: &str) -> bool {
-    allowlist.iter().any(|entry| entry == "*" || entry == name)
+    allowlist.iter().any(|entry| entry == name)
+}
+
+/// Sanitize a worker's configured `tool_allowlist` when the manager takes the
+/// config (MR !1506 review CQ-1/CQ-7). Dropped entries are config errors worth
+/// surfacing, so each is logged:
+/// - `"*"` is not honored — it was the rejected MR's full-admin escape hatch;
+/// - names on the autonomous denylist can never pass the execution gates;
+/// - entries that are not valid tool identifiers are useless;
+/// - a cleartext `ws://` endpoint to a non-loopback host strips the whole
+///   allowlist: tool authority must never ride a channel an on-path attacker
+///   can inject frames into.
+fn sanitize_tool_allowlist(
+    worker_name: &str,
+    allowlist: &[String],
+    cleartext_remote: bool,
+) -> Vec<String> {
+    if cleartext_remote && !allowlist.is_empty() {
+        tracing::error!(
+            worker = worker_name,
+            "tool_allowlist stripped: cleartext ws:// to a non-loopback host may not carry \
+             proxied tool authority; use wss:// or a loopback endpoint"
+        );
+        return Vec::new();
+    }
+    let mut sanitized = Vec::with_capacity(allowlist.len());
+    for entry in allowlist {
+        if entry == "*" {
+            tracing::warn!(
+                worker = worker_name,
+                "tool_allowlist entry \"*\" is not supported and was dropped; list tools by name"
+            );
+            continue;
+        }
+        if !is_valid_frame_ident(entry, MAX_TOOL_NAME_BYTES) {
+            tracing::warn!(
+                worker = worker_name,
+                entry = %log_safe(entry, 64),
+                "tool_allowlist entry is not a valid tool identifier and was dropped"
+            );
+            continue;
+        }
+        if is_autonomous_tool_denylisted(entry) {
+            tracing::warn!(
+                worker = worker_name,
+                entry = %entry.as_str(),
+                "tool_allowlist entry is on the autonomous denylist and was dropped"
+            );
+            continue;
+        }
+        sanitized.push(entry.clone());
+    }
+    sanitized
+}
+
+/// Whether a worker-supplied frame field is a bounded identifier
+/// (`[A-Za-z0-9_-]`, 1..=max bytes). Applied before the value is persisted
+/// or logged so newlines/control characters cannot forge log lines or
+/// poison job_events rows (MR !1506 review CQ-3).
+fn is_valid_frame_ident(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Render an untrusted string safe for a single log line: control characters
+/// become spaces and the result is truncated.
+fn log_safe(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max_chars)
+        .collect()
+}
+
+/// Truncate a string for the canonical job_events preview shape (the
+/// in-process worker path previews tool input/output at 500 chars).
+fn preview(value: &str, max_chars: usize) -> String {
+    let mut out: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 /// Build the daemon → worker reply for a `tool_call`. `status` is
@@ -1840,58 +2041,156 @@ async fn send_reply_envelope(write: &mut WsWrite, env: &Envelope, worker_name: &
     }
 }
 
-/// Handle one worker `tool_call` frame: capability gate (deny-by-default) →
-/// tenant-scoped dispatch through the in-process registry → `job_events`
-/// records for both the call and its outcome.
-///
-/// Scoping always comes from the connection's job (`job_id` + `user_id`),
-/// never from frame fields — a `task_id` that disagrees with the connection's
-/// job is a hard error. Secrets never cross the proxy: the worker receives
-/// only the tool's result.
-async fn handle_tool_call(
-    proxy: Option<&ToolProxy>,
-    allowlist: &[String],
-    call: ToolCallPayload,
-    job_id: Uuid,
-    worker_name: &str,
-    user_id: &str,
+/// Persist a structured job event. Unlike `persist_event`, which wraps a
+/// free-form string as `{content}`, this stores the value verbatim so
+/// `tool_use`/`tool_result` rows match the schema the web renderer and the
+/// orchestrator API already understand (MR !1506 review CQ-4).
+async fn persist_event_value(
     store: Option<&Arc<dyn Database>>,
-) -> Envelope {
-    if let Some(task_id) = call.task_id.as_deref()
-        && task_id != job_id.to_string()
+    job_id: Uuid,
+    event_type: &str,
+    value: serde_json::Value,
+) {
+    if let Some(db) = store
+        && let Err(error) = db.save_job_event(job_id, event_type, &value).await
     {
+        tracing::warn!(
+            %job_id,
+            event_type,
+            "Failed to persist external worker event: {error}"
+        );
+    }
+}
+
+/// Record a proxied call in the canonical `tool_use {tool_name,input}` shape
+/// (same schema as `worker/job.rs`).
+async fn record_tool_use(
+    store: Option<&Arc<dyn Database>>,
+    job_id: Uuid,
+    tool_name: &str,
+    input: &serde_json::Value,
+) {
+    persist_event_value(
+        store,
+        job_id,
+        "tool_use",
+        serde_json::json!({
+            "tool_name": tool_name,
+            "input": preview(&input.to_string(), 500),
+        }),
+    )
+    .await;
+}
+
+/// Record the outcome in the canonical `tool_result {tool_name,success,
+/// output}` shape. `success: false` is load-bearing: the web renderer
+/// computes `data.success !== false`, so denied/failed proxied calls must
+/// carry it explicitly or they render as green checkmarks (CQ-4).
+async fn record_tool_result(
+    store: Option<&Arc<dyn Database>>,
+    job_id: Uuid,
+    tool_name: &str,
+    success: bool,
+    output: &str,
+) {
+    persist_event_value(
+        store,
+        job_id,
+        "tool_result",
+        serde_json::json!({
+            "tool_name": tool_name,
+            "success": success,
+            "output": preview(output, 500),
+        }),
+    )
+    .await;
+}
+
+/// Everything dispatching one `tool_call` needs that the frame itself must
+/// never supply: scoping comes from the connection's job, never from
+/// worker-controlled frame fields.
+struct ToolCallCtx<'a> {
+    proxy: Option<&'a ToolProxy>,
+    allowlist: &'a [String],
+    context_manager: Option<&'a Arc<ContextManager>>,
+    store: Option<&'a Arc<dyn Database>>,
+    job_id: Uuid,
+    worker_name: &'a str,
+    user_id: &'a str,
+}
+
+/// Handle one worker `tool_call` frame: job binding → identifier/call-cap
+/// checks → capability gate → tenant-scoped dispatch with the repo's
+/// autonomous-execution hard gates → sanitized reply. Every outcome
+/// (success, denial, error, malformed) is persisted in the canonical
+/// `tool_use`/`tool_result` job_events shape (MR !1506 review CQ-4).
+async fn handle_tool_call(
+    ctx: &ToolCallCtx<'_>,
+    call: ToolCallPayload,
+    calls_used: &mut u32,
+    cancel_rx: &watch::Receiver<bool>,
+) -> Envelope {
+    // CQ-7: bind the frame to this connection's job. `task_id` is required
+    // and must match — a leftover worker process on a pooled socket must not
+    // run calls in the next job's scope.
+    let job_id_str = ctx.job_id.to_string();
+    if call.task_id.as_deref() != Some(job_id_str.as_str()) {
+        record_tool_result(
+            ctx.store,
+            ctx.job_id,
+            "unknown",
+            false,
+            "tool_call rejected: task_id missing or mismatched",
+        )
+        .await;
         return tool_result_envelope(
             &call.call_id,
             "error",
             String::new(),
             Some(format!(
-                "task_id mismatch: this connection serves job {job_id}"
+                "task_id must equal this connection's job id ({job_id_str})"
             )),
         );
     }
 
-    persist_event(
-        store,
-        job_id,
-        "tool_call",
-        &format!(
-            "worker '{worker_name}' invoked '{}' (call_id={})",
-            call.name, call.call_id
-        ),
-    )
-    .await;
-
-    if !tool_name_allowed(allowlist, &call.name) {
-        tracing::warn!(
-            worker = worker_name,
-            tool = %call.name,
-            "Denied proxied tool call: not in worker tool_allowlist"
+    // CQ-3: validate worker-controlled identifiers before they are persisted
+    // or logged (raw newlines would forge log lines / poison event rows).
+    if !is_valid_frame_ident(&call.call_id, MAX_CALL_ID_BYTES) {
+        record_tool_result(
+            ctx.store,
+            ctx.job_id,
+            "unknown",
+            false,
+            "tool_call rejected: invalid call_id",
+        )
+        .await;
+        return tool_result_envelope("", "error", String::new(), Some("invalid call_id".to_string()));
+    }
+    if !is_valid_frame_ident(&call.name, MAX_TOOL_NAME_BYTES) {
+        record_tool_result(
+            ctx.store,
+            ctx.job_id,
+            "unknown",
+            false,
+            "tool_call rejected: invalid tool name",
+        )
+        .await;
+        return tool_result_envelope(
+            &call.call_id,
+            "error",
+            String::new(),
+            Some("invalid tool name".to_string()),
         );
-        persist_event(
-            store,
-            job_id,
-            "tool_result",
-            &format!("'{}' DENIED (not in worker tool_allowlist)", call.name),
+    }
+
+    // CQ-3: per-job call cap, independent of the per-tool rate limiter.
+    if *calls_used >= MAX_TOOL_CALLS_PER_JOB {
+        record_tool_result(
+            ctx.store,
+            ctx.job_id,
+            &call.name,
+            false,
+            "tool_call denied: per-job call cap reached",
         )
         .await;
         return tool_result_envelope(
@@ -1899,63 +2198,361 @@ async fn handle_tool_call(
             "denied",
             String::new(),
             Some(format!(
-                "tool '{}' is not in worker '{worker_name}' tool_allowlist (deny-by-default)",
-                call.name
+                "per-job proxied tool call cap ({MAX_TOOL_CALLS_PER_JOB}) reached"
             )),
         );
     }
+    *calls_used += 1;
 
-    let Some(proxy) = proxy else {
-        return tool_result_envelope(
-            &call.call_id,
-            "error",
-            String::new(),
-            Some("tool proxy is not configured on this daemon".to_string()),
+    // CQ-4: canonical audit trail — the call itself first, then exactly one
+    // result row for every outcome below.
+    record_tool_use(ctx.store, ctx.job_id, &call.name, &call.arguments).await;
+
+    // Deny-by-default capability gate (exact names only — no wildcard).
+    if !tool_name_allowed(ctx.allowlist, &call.name) {
+        let reason = format!(
+            "tool '{}' is not in worker '{}' tool_allowlist (deny-by-default)",
+            call.name, ctx.worker_name
+        );
+        return deny_tool_call(ctx, &call, reason).await;
+    }
+
+    let Some(proxy) = ctx.proxy else {
+        return fail_tool_call(
+            ctx,
+            &call,
+            "tool proxy is not configured on this daemon".to_string(),
+        )
+        .await;
+    };
+
+    match preflight_gates(ctx, proxy, &call).await {
+        Ok(prepared) => execute_proxied_call(ctx, proxy, &call, prepared, cancel_rx).await,
+        Err(reply) => reply,
+    }
+}
+
+/// Record a denied call and build its reply (status "denied": policy forbids
+/// the tool for this worker, regardless of the invocation's validity).
+async fn deny_tool_call(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload, reason: String) -> Envelope {
+    tracing::warn!(
+        worker = ctx.worker_name,
+        tool = %call.name,
+        %reason,
+        "Denied proxied tool call"
+    );
+    record_tool_result(ctx.store, ctx.job_id, &call.name, false, &reason).await;
+    tool_result_envelope(&call.call_id, "denied", String::new(), Some(reason))
+}
+
+/// Record a failed call and build its reply (status "error": the invocation
+/// itself could not be carried out).
+async fn fail_tool_call(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload, reason: String) -> Envelope {
+    record_tool_result(ctx.store, ctx.job_id, &call.name, false, &reason).await;
+    tool_result_envelope(&call.call_id, "error", String::new(), Some(reason))
+}
+
+/// A call that passed every preflight gate: the real job context, the
+/// resolved (alias-aware) tool name, and the normalized, possibly
+/// hook-modified parameters.
+struct PreparedCall {
+    job_ctx: JobContext,
+    resolved_name: String,
+    params: serde_json::Value,
+}
+
+/// Run every preflight gate the repo's other autonomous paths enforce
+/// (MR !1506 review CQ-1): real job context, user-scoped tool resolution,
+/// autonomous hard gates, persisted `Disabled` permission, the WI#322
+/// mission-path guard, per-tool rate limit, and `BeforeToolCall` hooks.
+/// Returns the prepared call or the reply to send back.
+async fn preflight_gates(
+    ctx: &ToolCallCtx<'_>,
+    proxy: &ToolProxy,
+    call: &ToolCallPayload,
+) -> Result<PreparedCall, Envelope> {
+    // Real job context (CQ-6): a fabricated `InProgress` context would run
+    // calls for cancelled/terminal jobs.
+    let job_ctx = match load_job_context(ctx, call).await {
+        Ok(c) => c,
+        Err(reason) => return Err(fail_tool_call(ctx, call, reason).await),
+    };
+    if job_ctx.state.is_terminal() {
+        return Err(
+            fail_tool_call(
+                ctx,
+                call,
+                format!("job {} is {:?}; no new tool calls", ctx.job_id, job_ctx.state),
+            )
+            .await,
+        );
+    }
+
+    // User-scoped resolution (CQ-6): alias handling plus visibility —
+    // another user's MCP/extension tools are NotFound, not leaked.
+    let Some((resolved_name, tool)) = proxy
+        .tools
+        .get_resolved_for_user(&call.name, &job_ctx.user_id)
+        .await
+    else {
+        return Err(
+            fail_tool_call(ctx, call, format!("tool '{}' is not registered", call.name)).await,
         );
     };
 
-    let mut job_ctx = JobContext::with_user(
-        user_id,
-        format!("external worker '{worker_name}' proxied tool call"),
-        format!("proxied '{}' call (call_id={})", call.name, call.call_id),
-    );
-    job_ctx.job_id = job_id;
-    job_ctx.state = JobState::InProgress;
+    let params = prepare_tool_params(tool.as_ref(), &call.arguments);
 
+    // Autonomous hard gates (CQ-1): the allowlist acts as the approval
+    // grant, but the hard exclusions still hold — per-tool autonomous
+    // opt-outs and the AUTONOMOUS_TOOL_DENYLIST (shell, ssh, restart,
+    // create_job, secret_*, tool_install, job_prompt, ...).
+    let requirement = tool.requires_approval(&params);
+    let approval = Some(ApprovalContext::autonomous_with_tools(
+        ctx.allowlist.iter().cloned(),
+    ));
+    if !tool.allows_autonomous_execution()
+        || ApprovalContext::is_blocked_or_default(&approval, &resolved_name, requirement)
+    {
+        return Err(
+            deny_tool_call(
+                ctx,
+                call,
+                crate::tools::autonomous_unavailable_message(&resolved_name, &job_ctx.user_id),
+            )
+            .await,
+        );
+    }
+
+    // Persisted `Disabled` permission (CQ-1): a user who disabled a tool
+    // must not have it executed by a worker. Fails closed on read errors.
+    if let Some(reason) =
+        persisted_disabled_reason(ctx.store, &proxy.tools, &resolved_name, &job_ctx.user_id).await
+    {
+        return Err(deny_tool_call(ctx, call, reason).await);
+    }
+
+    // WI#322 (open): memory_write can forge engine mission records. Until
+    // that WI lands, the proxied path refuses writes into the mission tree.
+    if let Some(reason) = mission_path_guard_reason(&resolved_name, &params) {
+        return Err(deny_tool_call(ctx, call, reason).await);
+    }
+
+    // Per-tool rate limit keyed on the job's user (CQ-3).
+    if let Some(reason) = rate_limit_reason(proxy, &resolved_name, tool.as_ref(), &job_ctx.user_id)
+        .await
+    {
+        return Err(fail_tool_call(ctx, call, reason).await);
+    }
+
+    // BeforeToolCall hooks (CQ-1): operator policy may reject or rewrite.
+    match run_before_tool_hooks(proxy, &resolved_name, tool.as_ref(), params, &job_ctx).await {
+        Ok(params) => Ok(PreparedCall {
+            job_ctx,
+            resolved_name,
+            params,
+        }),
+        Err(reason) => Err(deny_tool_call(ctx, call, reason).await),
+    }
+}
+
+/// Load the real job context (MR !1506 review CQ-1/CQ-6). With a context
+/// manager wired this is authoritative — a missing context fails closed.
+/// Harnesses without a context manager fall back to the connection's scope
+/// (user_id from the host-side `TaskContext`, state `InProgress`).
+async fn load_job_context(ctx: &ToolCallCtx<'_>, call: &ToolCallPayload) -> Result<JobContext, String> {
+    match ctx.context_manager {
+        Some(cm) => cm
+            .get_context(ctx.job_id)
+            .await
+            .map_err(|e| format!("job context unavailable: {e}")),
+        None => {
+            let mut job_ctx = JobContext::with_user(
+                ctx.user_id,
+                format!("external worker '{}' proxied tool call", ctx.worker_name),
+                format!("proxied '{}' call (call_id={})", call.name, call.call_id),
+            );
+            job_ctx.job_id = ctx.job_id;
+            job_ctx.state = JobState::InProgress;
+            Ok(job_ctx)
+        }
+    }
+}
+
+/// Persisted `Disabled` check against the settings store (MR !1506 review
+/// CQ-1), mirroring the engine v2 gate. `None` store = no persisted state to
+/// check (harness). Returns the denial reason when the tool may not run.
+async fn persisted_disabled_reason(
+    store: Option<&Arc<dyn Database>>,
+    tools: &Arc<ToolRegistry>,
+    name: &str,
+    user_id: &str,
+) -> Option<String> {
+    let store = store?;
+    let alias_conflict = matches!(name, "gitlab_tool" | "gitlab-tool")
+        && gitlab_permission_alias_conflict(tools).await;
+    let mut keys = if alias_conflict {
+        vec![format!("tool_permissions.{name}")]
+    } else {
+        permission_setting_keys(name)
+    };
+    if let Some(alias) = crate::extensions::naming::legacy_extension_alias(name)
+        && !matches!(name, "gitlab_tool" | "gitlab-tool")
+    {
+        keys.push(format!("tool_permissions.{alias}"));
+    }
+    for key in keys {
+        match store.get_setting(user_id, &key).await {
+            Ok(Some(value)) => {
+                let state: Option<PermissionState> = serde_json::from_value(value).ok();
+                return (state == Some(PermissionState::Disabled)).then(|| {
+                    format!("tool '{name}' is disabled for this user in tool permissions")
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Fail closed: an unreadable store may be hiding a persisted
+                // `disabled` (mirrors the WI#308 mission gate).
+                return Some(format!("tool permissions could not be read: {error}"));
+            }
+        }
+    }
+    None
+}
+
+/// WI#322 guard (open WI; MR !1506 review CQ-1 scenario C): until the memory
+/// tools reserve the engine projects tree themselves, the proxied path
+/// refuses `memory_write` into `engine/projects/**` mission records so a
+/// compromised worker cannot widen the forge surface.
+fn mission_path_guard_reason(name: &str, params: &serde_json::Value) -> Option<String> {
+    if name != "memory_write" {
+        return None;
+    }
+    let path = params.get("path").and_then(|v| v.as_str())?;
+    is_mission_path(&normalize_path(path)).then(|| {
+        "proxied memory_write may not write engine/projects/** mission records (WI#322)".to_string()
+    })
+}
+
+/// Per-tool rate limit, keyed on the job's user (MR !1506 review CQ-3): the
+/// limiter the in-process paths consult applies to proxied calls too.
+async fn rate_limit_reason(
+    proxy: &ToolProxy,
+    name: &str,
+    tool: &dyn Tool,
+    user_id: &str,
+) -> Option<String> {
+    let config = tool.rate_limit_config()?;
+    match proxy
+        .tools
+        .rate_limiter()
+        .check_and_record(user_id, name, &config)
+        .await
+    {
+        RateLimitResult::Limited { retry_after, .. } => Some(format!(
+            "tool '{name}' rate limit exceeded; retry after {retry_after:?}"
+        )),
+        RateLimitResult::Allowed { .. } => None,
+    }
+}
+
+/// Run `BeforeToolCall` hooks with redacted params (CQ-1): operator hook
+/// policy applies to proxied calls exactly as to job/routine calls. Hook
+/// modifications are re-normalized before use.
+async fn run_before_tool_hooks(
+    proxy: &ToolProxy,
+    name: &str,
+    tool: &dyn Tool,
+    params: serde_json::Value,
+    job_ctx: &JobContext,
+) -> Result<serde_json::Value, String> {
+    let hook_params = redact_params(&params, tool.sensitive_params());
+    let event = HookEvent::ToolCall {
+        tool_name: name.to_string(),
+        parameters: hook_params,
+        user_id: job_ctx.user_id.clone(),
+        context: format!("job:{}", job_ctx.job_id),
+    };
+    match proxy.hooks.run(&event).await {
+        Err(HookError::Rejected { reason }) => Err(format!(
+            "Blocked by hook: {reason}. This call cannot succeed unchanged; choose an allowed tool or parameters, or ask the user/operator to change policy."
+        )),
+        Err(err) => Err(format!(
+            "Blocked by hook failure mode: {err}. This call cannot succeed unchanged; choose an allowed tool or parameters, or ask the user/operator to repair the hook policy."
+        )),
+        Ok(HookOutcome::Continue {
+            modified: Some(new_params),
+        }) => match serde_json::from_str(&new_params) {
+            Ok(parsed) => Ok(prepare_tool_params(tool, &parsed)),
+            Err(e) => {
+                tracing::warn!(
+                    tool = %name,
+                    "Hook returned non-JSON modification for ToolCall, ignoring: {}",
+                    log_safe(&e.to_string(), 200)
+                );
+                Ok(params)
+            }
+        },
+        _ => Ok(params),
+    }
+}
+
+/// Execute a prepared call and build the sanitized reply (MR !1506 review
+/// CQ-2): output and error text pass through `sanitize_tool_output` (size
+/// cap + LeakDetector + policy) before they are sent to the worker or
+/// persisted. The execution races the job's cancel watch (CQ-8) so a cancel
+/// is never queued behind a long tool timeout.
+async fn execute_proxied_call(
+    ctx: &ToolCallCtx<'_>,
+    proxy: &ToolProxy,
+    call: &ToolCallPayload,
+    prepared: PreparedCall,
+    cancel_rx: &watch::Receiver<bool>,
+) -> Envelope {
     let started = tokio::time::Instant::now();
-    let result = execute_tool_with_safety(
+    let mut cancel_watch = cancel_rx.clone();
+    let execution = execute_tool_with_safety(
         &proxy.tools,
         &proxy.safety,
-        &call.name,
-        call.arguments,
-        &job_ctx,
-    )
-    .await;
+        &prepared.resolved_name,
+        prepared.params,
+        &prepared.job_ctx,
+    );
+    tokio::pin!(execution);
+    let result = tokio::select! {
+        res = &mut execution => Ok(res),
+        _ = wait_for_cancellation(&mut cancel_watch) => Err("job cancelled".to_string()),
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
+
     let (status, output, error) = match result {
-        Ok(out) => ("success", out, None),
-        Err(e) => ("error", String::new(), Some(e.to_string())),
+        Ok(Ok(out)) => {
+            let sanitized = proxy
+                .safety
+                .sanitize_tool_output(&prepared.resolved_name, &out);
+            ("success", sanitized.content, None)
+        }
+        Ok(Err(e)) => {
+            let sanitized = proxy
+                .safety
+                .sanitize_tool_output(&prepared.resolved_name, &format!("Error: {e}"));
+            ("error", String::new(), Some(sanitized.content))
+        }
+        Err(reason) => ("error", String::new(), Some(reason)),
     };
     tracing::info!(
-        worker = worker_name,
-        tool = %call.name,
+        worker = ctx.worker_name,
+        tool = %prepared.resolved_name,
         status,
         elapsed_ms,
         output_bytes = output.len(),
         "Proxied tool call completed"
     );
-    persist_event(
-        store,
-        job_id,
-        "tool_result",
-        &format!(
-            "'{}' {} ({} bytes, {}ms{})",
-            call.name,
-            status.to_uppercase(),
-            output.len(),
-            elapsed_ms,
-            error.as_deref().map(|e| format!(", error: {e}")).unwrap_or_default(),
-        ),
+    record_tool_result(
+        ctx.store,
+        ctx.job_id,
+        &prepared.resolved_name,
+        status == "success",
+        error.as_deref().unwrap_or(&output),
     )
     .await;
 
@@ -1963,24 +2560,41 @@ async fn handle_tool_call(
 }
 
 /// Build the `tool_catalog` reply for a worker `tool_list` request: the
-/// definitions of exactly the tools this worker's allowlist permits, so a
-/// worker-side MCP bridge can expose a truthful `tools/list`.
-async fn build_tool_catalog(proxy: Option<&ToolProxy>, allowlist: &[String]) -> Envelope {
-    let tools: Vec<ToolCatalogEntry> = match proxy {
-        Some(p) => p
-            .tools
-            .tool_definitions()
-            .await
-            .into_iter()
-            .filter(|d| tool_name_allowed(allowlist, &d.name))
-            .map(|d| ToolCatalogEntry {
-                name: d.name,
-                description: d.description,
-                parameters: d.parameters,
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+/// definitions of exactly the tools this worker could actually call —
+/// allowlisted, visible to the job's user, and not excluded by the
+/// autonomous hard gates (MR !1506 review CQ-6) — so a worker-side MCP
+/// bridge exposes a truthful `tools/list`.
+async fn build_tool_catalog(
+    proxy: Option<&ToolProxy>,
+    allowlist: &[String],
+    user_id: &str,
+) -> Envelope {
+    let mut tools: Vec<ToolCatalogEntry> = Vec::new();
+    if let Some(p) = proxy {
+        let approval = Some(ApprovalContext::autonomous_with_tools(
+            allowlist.iter().cloned(),
+        ));
+        let mut seen = std::collections::HashSet::new();
+        for name in allowlist {
+            let Some((resolved, tool)) = p.tools.get_resolved_for_user(name, user_id).await else {
+                continue;
+            };
+            if !seen.insert(resolved.clone()) {
+                continue;
+            }
+            let requirement = tool.requires_approval(&serde_json::Value::Null);
+            if tool.allows_autonomous_execution()
+                && !ApprovalContext::is_blocked_or_default(&approval, &resolved, requirement)
+            {
+                tools.push(ToolCatalogEntry {
+                    name: resolved,
+                    description: tool.description().to_string(),
+                    parameters: tool.parameters_schema(),
+                });
+            }
+        }
+        tools.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    }
     Envelope::new("tool_catalog", serde_json::json!({ "tools": tools }))
 }
 
@@ -2276,8 +2890,9 @@ mod tests {
 
     #[test]
     fn tool_allowlist_gate_is_deny_by_default() {
-        // WI#324: empty allowlist rejects everything; exact names and "*"
-        // opt in; non-matching names stay rejected.
+        // WI#324 + MR !1506 review (CQ-1): empty allowlist rejects
+        // everything; exact names opt in; non-matching names stay rejected.
+        // There is no "*" wildcard — it was a full tenant-admin grant.
         let empty: &[String] = &[];
         assert!(!tool_name_allowed(empty, "memory_read"));
 
@@ -2287,28 +2902,52 @@ mod tests {
         assert!(!tool_name_allowed(&named, "memory_write"));
         assert!(!tool_name_allowed(&named, "shell"));
 
-        let all: Vec<String> = vec!["*".to_string()];
-        assert!(tool_name_allowed(&all, "shell"));
+        let wildcard: Vec<String> = vec!["*".to_string()];
+        assert!(!tool_name_allowed(&wildcard, "shell"));
     }
 
     #[test]
-    fn config_allows_tool_matches_gate() {
-        let mut config = ExternalWorkerConfig {
-            name: "w".to_string(),
-            url: "ws://localhost:1".to_string(),
-            auth_token: None,
-            timeout_ms: 1_000,
-            endpoints: vec![],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: Default::default(),
-            tool_allowlist: vec![],
-        };
-        assert!(!config.allows_tool("memory_read"));
-        config.tool_allowlist = vec!["memory_read".to_string()];
-        assert!(config.allows_tool("memory_read"));
-        assert!(!config.allows_tool("memory_write"));
-        config.tool_allowlist = vec!["*".to_string()];
-        assert!(config.allows_tool("shell"));
+    fn allowlist_sanitizer_drops_wildcard_denylisted_and_invalid_entries() {
+        // MR !1506 review (CQ-1): denylisted names can never pass the
+        // execution gates, wildcards are not honored, and non-identifier
+        // entries are useless — all are dropped at manager load.
+        let raw: Vec<String> = vec![
+            "memory_read".to_string(),
+            "*".to_string(),
+            "shell".to_string(),
+            "restart".to_string(),
+            "create_job".to_string(),
+            "not a tool".to_string(),
+            "line\nbreak".to_string(),
+        ];
+        let sanitized = sanitize_tool_allowlist("w", &raw, false);
+        assert_eq!(sanitized, vec!["memory_read".to_string()]);
+    }
+
+    #[test]
+    fn allowlist_sanitizer_strips_everything_on_cleartext_remote() {
+        // MR !1506 review (CQ-7): cleartext ws:// to a non-loopback host may
+        // not carry tool authority — an on-path attacker could inject
+        // tool_call frames. Loopback cleartext keeps its allowlist.
+        let raw: Vec<String> = vec!["memory_read".to_string()];
+        assert!(sanitize_tool_allowlist("w", &raw, true).is_empty());
+        assert_eq!(
+            sanitize_tool_allowlist("w", &raw, false),
+            vec!["memory_read".to_string()]
+        );
+    }
+
+    #[test]
+    fn frame_ident_validation_rejects_control_and_oversized() {
+        assert!(is_valid_frame_ident("memory_read", MAX_TOOL_NAME_BYTES));
+        assert!(is_valid_frame_ident("gitlab-tool", MAX_TOOL_NAME_BYTES));
+        assert!(!is_valid_frame_ident("", MAX_TOOL_NAME_BYTES));
+        assert!(!is_valid_frame_ident("has space", MAX_TOOL_NAME_BYTES));
+        assert!(!is_valid_frame_ident("line\nbreak", MAX_TOOL_NAME_BYTES));
+        assert!(!is_valid_frame_ident("dot.name", MAX_TOOL_NAME_BYTES));
+        let oversized = "a".repeat(MAX_TOOL_NAME_BYTES + 1);
+        assert!(!is_valid_frame_ident(&oversized, MAX_TOOL_NAME_BYTES));
+        assert_eq!(log_safe("a\nb\rc", 16), "a b c");
     }
 
     #[test]
@@ -2327,7 +2966,8 @@ mod tests {
 
     #[test]
     fn tool_call_payload_deserializes_with_defaults() {
-        // `arguments` and `task_id` are optional on the wire.
+        // `arguments` and `task_id` are optional at the serde layer; the
+        // handler still requires `task_id` to equal the connection's job id.
         let payload: ToolCallPayload = serde_json::from_str(
             r#"{"call_id":"c1","name":"memory_read"}"#,
         )
