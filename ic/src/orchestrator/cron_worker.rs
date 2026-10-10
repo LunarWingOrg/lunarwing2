@@ -247,14 +247,14 @@ impl ExternalWorkerManager {
                 }
             });
 
-            let controls = Arc::clone(&self.cron_controls);
             let control = CronMissionControl {
                 owner_id: owner_id.to_string(),
                 tx: cmd_tx,
             };
-            tokio::spawn(async move {
-                controls.write().await.insert(registered_name, control);
-            });
+            self.cron_controls
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(registered_name, control);
         }
     }
 
@@ -318,7 +318,10 @@ impl ExternalWorkerManager {
         command: CronCommand,
     ) -> Result<(), OrchestratorError> {
         let tx = {
-            let controls = self.cron_controls.read().await;
+            let controls = self
+                .cron_controls
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match controls.get(worker_name) {
                 Some(control) if control.owner_id == owner_id => control.tx.clone(),
                 Some(_) => {
@@ -1069,10 +1072,17 @@ async fn watch_tick_job(
         match job_ctx.state {
             JobState::Completed | JobState::Accepted => return Some(TickOutcome::Completed),
             JobState::Failed => {
-                return Some(TickOutcome::Failed(format!(
-                    "job entered {} state",
-                    job_ctx.state
-                )));
+                // Carry the transition reason so the chain can classify busy
+                // workspace rejections (retry without spending budget) and
+                // protocol-validation rejections (non-retryable).
+                let reason = job_ctx
+                    .transitions
+                    .iter()
+                    .rev()
+                    .find(|t| t.to == JobState::Failed)
+                    .and_then(|t| t.reason.clone())
+                    .unwrap_or_else(|| format!("job entered {} state", job_ctx.state));
+                return Some(TickOutcome::Failed(reason));
             }
             // Stuck means the idle detector already flagged this job as
             // wedged; route it through the lapse path so the supervisor

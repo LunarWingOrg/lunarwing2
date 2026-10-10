@@ -292,8 +292,11 @@ pub struct ExternalWorkerManager {
     store: Option<Arc<dyn Database>>,
     active_handles: Arc<RwLock<HashMap<Uuid, ExternalJobHandle>>>,
     /// Owner-scoped control channels of running cron mission supervisors
-    /// (WI#325), keyed by worker name. Registered by `spawn_cron_supervisors`.
-    pub(crate) cron_controls: Arc<RwLock<HashMap<String, CronMissionControl>>>,
+    /// (WI#325), keyed by worker name. Registered synchronously by
+    /// `spawn_cron_supervisors` (std lock: only brief, await-free sections
+    /// touch it) so a command issued right after spawn never races
+    /// registration.
+    pub(crate) cron_controls: Arc<std::sync::RwLock<HashMap<String, CronMissionControl>>>,
 }
 
 impl ExternalWorkerManager {
@@ -338,7 +341,7 @@ impl ExternalWorkerManager {
             context_manager: None,
             store: None,
             active_handles: Arc::new(RwLock::new(HashMap::new())),
-            cron_controls: Arc::new(RwLock::new(HashMap::new())),
+            cron_controls: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
