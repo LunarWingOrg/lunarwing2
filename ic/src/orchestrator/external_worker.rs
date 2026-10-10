@@ -307,6 +307,27 @@ impl ExternalWorkerManager {
         self.workers.is_empty()
     }
 
+    /// Configs of workers running in cron (mission) mode (WI#325).
+    pub(crate) fn cron_worker_configs(&self) -> Vec<ExternalWorkerConfig> {
+        self.workers
+            .values()
+            .filter(|worker| worker.is_cron())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn context_manager_handle(&self) -> Option<&Arc<ContextManager>> {
+        self.context_manager.as_ref()
+    }
+
+    pub(crate) fn store_handle(&self) -> Option<&Arc<dyn Database>> {
+        self.store.as_ref()
+    }
+
+    pub(crate) fn event_tx_handle(&self) -> Option<&broadcast::Sender<(Uuid, String, SseEvent)>> {
+        self.job_event_tx.as_ref()
+    }
+
     /// Reserve a job ID before exposing its context or DB record to cancellation callers.
     pub async fn reserve_task(
         &self,
