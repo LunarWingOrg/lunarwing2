@@ -513,6 +513,83 @@ mod tests {
         assert_eq!(normalized, Some("123456789".to_string())); // safety: test-only assertion
     }
 
+    /// WI#331 / MR !1513 review CZ-3: without the `libsql-remote-replica`
+    /// feature, a fully configured remote replica must fail closed and name
+    /// the cargo feature — never silently fall back to a local-only database
+    /// (that fallback is the data-divergence failure this gate exists to
+    /// prevent). No network is needed: the code errors before connecting.
+    #[tokio::test]
+    #[cfg(not(feature = "libsql-remote-replica"))]
+    async fn test_from_config_parts_remote_replica_fails_closed_without_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replica.db");
+
+        let result = LibSqlBackend::from_config_parts(
+            &db_path,
+            Some("libsql://example.turso.io"),
+            Some("test-token"),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("remote replica config must fail without the feature"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("libsql-remote-replica"),
+            "error must name the cargo feature, got: {msg}"
+        );
+        // The mutation reviewed under CZ-3 (falling back to new_local) would
+        // have created a local database file; fail-closed must not.
+        assert!(
+            !db_path.exists(),
+            "fail-closed path must not create a local database file"
+        );
+    }
+
+    /// WI#331 / MR !1513 review CZ-3: LIBSQL_URL without LIBSQL_AUTH_TOKEN is
+    /// an error in every build, independent of the cargo feature.
+    #[tokio::test]
+    #[cfg(not(feature = "libsql-remote-replica"))]
+    async fn test_from_config_parts_url_without_token_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replica.db");
+
+        let result =
+            LibSqlBackend::from_config_parts(&db_path, Some("libsql://example.turso.io"), None)
+                .await;
+
+        let err = match result {
+            Ok(_) => panic!("URL without token must error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("LIBSQL_AUTH_TOKEN"),
+            "error must name the missing token, got: {err}"
+        );
+    }
+
+    /// WI#331 / MR !1513 review CZ-3: a local-only configuration (no
+    /// LIBSQL_URL) must still open a working local database in builds without
+    /// the feature.
+    #[tokio::test]
+    #[cfg(not(feature = "libsql-remote-replica"))]
+    async fn test_from_config_parts_local_only_opens_local_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("local.db");
+
+        let backend = LibSqlBackend::from_config_parts(&db_path, None, Some("ignored-token"))
+            .await
+            .expect("local-only config must open a local database");
+
+        backend
+            .connect()
+            .await
+            .expect("local database must accept connections");
+    }
+
+
     #[test]
     fn test_parse_timestamp_accepts_rfc3339_and_legacy_naive_formats() {
         let expected = Utc.with_ymd_and_hms(2026, 3, 7, 12, 34, 56).unwrap();

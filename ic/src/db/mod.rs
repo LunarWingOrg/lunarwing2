@@ -87,8 +87,7 @@ pub async fn connect_with_handles(
                 config.libsql_url.as_deref(),
                 config.libsql_auth_token.as_ref().map(|t| t.expose_secret()),
             )
-            .await
-            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            .await?;
             backend.run_migrations().await?;
             tracing::debug!("libSQL database connected and migrations applied");
 
@@ -138,8 +137,7 @@ pub async fn create_secrets_store(
                 config.libsql_url.as_deref(),
                 config.libsql_auth_token.as_ref().map(|t| t.expose_secret()),
             )
-            .await
-            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            .await?;
             backend.run_migrations().await?;
 
             Ok(Arc::new(crate::secrets::LibSqlSecretsStore::new(
@@ -193,8 +191,7 @@ pub async fn connect_without_migrations(
                 config.libsql_url.as_deref(),
                 config.libsql_auth_token.as_ref().map(|t| t.expose_secret()),
             )
-            .await
-            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            .await?;
 
             handles.libsql_db = Some(backend.shared_db());
 
