@@ -33,7 +33,7 @@ use crate::tools::{
     ApprovalContext, Tool, ToolRegistry, is_autonomous_tool_denylisted, prepare_tool_params,
     redact_params,
 };
-use crate::workspace::{is_mission_path, normalize_path};
+use crate::workspace::{is_engine_internal_path, normalize_path};
 
 // ── Protocol types ──────────────────────────────────────────────────
 
@@ -1918,6 +1918,35 @@ const MAX_TOOL_NAME_BYTES: usize = 128;
 /// Worker-chosen correlation ids get the same treatment.
 const MAX_CALL_ID_BYTES: usize = 128;
 
+/// Proxy-level hard denylist (MR !1521 DD-4): tools that must NEVER be
+/// reachable from an untrusted worker container, enforced both at allowlist
+/// load and at dispatch time. These names are NOT on the engine's
+/// `AUTONOMOUS_TOOL_DENYLIST` (which targets jobs/routines), so without this
+/// list an operator entry like `tool_allowlist = ["shell"]` would pass every
+/// gate and hand the container command execution on the daemon host (direct
+/// exec when the Docker sandbox is unavailable). The proxied path is
+/// phase-1 scoped to the WI#324 capability set (`memory_*`, `knowledge_*`,
+/// `gitlab_tool`); host-execution and cross-plane tools stay out of it.
+const PROXY_TOOL_DENYLIST: &[&str] = &[
+    // Host command/file execution on the daemon.
+    "shell",
+    "write_file",
+    "apply_patch",
+    // Outbound HTTP with daemon-side credentials.
+    "http",
+    // Cross-channel messaging and job control planes.
+    "message",
+    "cancel_job",
+];
+
+/// Whether a tool name is hard-denied for the proxied path (MR !1521 DD-4).
+/// Alias-aware callers pass the resolved name; the check is deliberately
+/// independent of the autonomous gates so it cannot be unlocked by an
+/// allowlist grant.
+fn is_proxy_denied_tool(name: &str) -> bool {
+    PROXY_TOOL_DENYLIST.contains(&name)
+}
+
 /// Whether `name` is permitted by a worker's tool allowlist. Deny-by-default:
 /// an empty list rejects everything; exact name match only. There is
 /// deliberately no `"*"` wildcard (MR !1506 review CQ-1): a wildcard on an
@@ -1927,10 +1956,12 @@ fn tool_name_allowed(allowlist: &[String], name: &str) -> bool {
 }
 
 /// Sanitize a worker's configured `tool_allowlist` when the manager takes the
-/// config (MR !1506 review CQ-1/CQ-7). Dropped entries are config errors worth
-/// surfacing, so each is logged:
+/// config (MR !1506 review CQ-1/CQ-7, MR !1521 DD-4). Dropped entries are
+/// config errors worth surfacing, so each is logged:
 /// - `"*"` is not honored — it was the rejected MR's full-admin escape hatch;
 /// - names on the autonomous denylist can never pass the execution gates;
+/// - names on the proxy denylist (`PROXY_TOOL_DENYLIST`: host-execution and
+///   cross-plane tools) must never be reachable from an untrusted container;
 /// - entries that are not valid tool identifiers are useless;
 /// - a cleartext `ws://` endpoint to a non-loopback host strips the whole
 ///   allowlist: tool authority must never ride a channel an on-path attacker
@@ -1970,6 +2001,14 @@ fn sanitize_tool_allowlist(
                 worker = worker_name,
                 entry = %entry.as_str(),
                 "tool_allowlist entry is on the autonomous denylist and was dropped"
+            );
+            continue;
+        }
+        if is_proxy_denied_tool(entry) {
+            tracing::warn!(
+                worker = worker_name,
+                entry = %entry.as_str(),
+                "tool_allowlist entry is on the proxy denylist (host-execution/cross-plane) and was dropped"
             );
             continue;
         }
@@ -2143,6 +2182,15 @@ async fn handle_tool_call(
 ) -> Envelope {
     if let Some(reply) = frame_binding_rejection(ctx, &call, calls_used).await {
         return reply;
+    }
+
+    // MR !1521 DD-6: a proxied call is job activity. A tool-only worker that
+    // never updates `last_activity_at` looks wedged to stuck-job detection
+    // (and to a heartbeat watchdog on the same signal) after the idle
+    // threshold, so every accepted call refreshes it — mirroring what a
+    // genuine `task_progress` delta does in the read loop.
+    if let Some(cm) = ctx.context_manager {
+        let _ = cm.update_context(ctx.job_id, |c| c.note_activity()).await;
     }
 
     // CQ-4: canonical audit trail — the call itself first, then exactly one
@@ -2335,10 +2383,30 @@ async fn preflight_gates(
 
     let params = prepare_tool_params(tool.as_ref(), &call.arguments);
 
+    // Proxy denylist (MR !1521 DD-4): host-execution and cross-plane tools
+    // (shell, write_file, apply_patch, http, message, cancel_job) must never
+    // execute for an untrusted container. Enforced at runtime as well as at
+    // allowlist load so a registry-side alias or a later-registered tool
+    // under a denied name cannot slip through.
+    if is_proxy_denied_tool(&resolved_name) {
+        return Err(deny_tool_call(
+            ctx,
+            call,
+            format!(
+                "tool '{resolved_name}' is on the proxied-path denylist (host-execution/cross-plane tools are never worker-callable)"
+            ),
+        )
+        .await);
+    }
+
     // Autonomous hard gates (CQ-1): the allowlist acts as the approval
     // grant, but the hard exclusions still hold — per-tool autonomous
-    // opt-outs and the AUTONOMOUS_TOOL_DENYLIST (shell, ssh, restart,
-    // create_job, secret_*, tool_install, job_prompt, ...).
+    // opt-outs and the AUTONOMOUS_TOOL_DENYLIST (routine_*, event_emit,
+    // create_job, job_prompt, restart, tool_*, skill_*, secret_list,
+    // secret_delete, ssh, ssh_git). Note: the seeded `AskEachTime`
+    // permission default is NOT an approval prompt on this path (a worker
+    // cannot answer prompts) — the operator's allowlist entry IS the grant;
+    // only a persisted `Disabled` still blocks (checked below).
     let requirement = tool.requires_approval(&params);
     let approval = Some(ApprovalContext::autonomous_with_tools(
         ctx.allowlist.iter().cloned(),
@@ -2362,9 +2430,11 @@ async fn preflight_gates(
         return Err(deny_tool_call(ctx, call, reason).await);
     }
 
-    // WI#322 (open): memory_write can forge engine mission records. Until
-    // that WI lands, the proxied path refuses writes into the mission tree.
-    if let Some(reason) = mission_path_guard_reason(&resolved_name, &params) {
+    // WI#322 (open): memory_write can plant engine-internal state (mission
+    // records, project/knowledge docs the engine reloads into its trusted
+    // store at boot). Until that WI lands, the proxied path refuses writes
+    // into the whole `engine/**` tree.
+    if let Some(reason) = engine_path_guard_reason(&resolved_name, &params) {
         return Err(deny_tool_call(ctx, call, reason).await);
     }
 
@@ -2453,19 +2523,24 @@ async fn persisted_disabled_reason(
     None
 }
 
-/// WI#322 guard (open WI; MR !1506 review CQ-1 scenario C): until the memory
-/// tools reserve the engine projects tree themselves, the proxied path
-/// refuses `memory_write` into `engine/projects/**` mission records so a
-/// compromised worker cannot widen the forge surface. `memory_write` carries
-/// the destination in its `target` parameter (named targets like "memory"
-/// resolve outside the mission tree and pass).
-fn mission_path_guard_reason(name: &str, params: &serde_json::Value) -> Option<String> {
+/// WI#322 guard (open WI; MR !1506 review CQ-1 scenario C, widened per
+/// !1521 DD-3): until the memory tools reserve the engine tree themselves,
+/// the proxied path refuses `memory_write` into **any** engine-internal path
+/// (`engine/**` — not just the missions family). The engine reloads
+/// `engine/projects/**` and `engine/knowledge/**` from the owner workspace at
+/// boot, so a worker writable there could plant project/knowledge documents
+/// into the trusted in-process engine's store and prompts, not only forge
+/// mission records. `memory_write` carries the destination in its `target`
+/// parameter (named targets like "memory" resolve outside the engine tree
+/// and pass).
+fn engine_path_guard_reason(name: &str, params: &serde_json::Value) -> Option<String> {
     if name != "memory_write" {
         return None;
     }
     let target = params.get("target").and_then(|v| v.as_str())?;
-    is_mission_path(&normalize_path(target)).then(|| {
-        "proxied memory_write may not write engine/projects/** mission records (WI#322)".to_string()
+    is_engine_internal_path(&normalize_path(target)).then(|| {
+        "proxied memory_write may not write engine-internal paths (engine/**) (WI#322)"
+            .to_string()
     })
 }
 
