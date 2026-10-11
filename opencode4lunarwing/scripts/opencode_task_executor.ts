@@ -8,6 +8,7 @@
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import {
   buildTaskPrompt,
+  type TaskPrompt,
   type TaskRequest,
   type TaskProgress,
   type TaskResult,
@@ -92,6 +93,7 @@ export async function executeTask(
   onResult: ResultCallback,
   abortSignal?: AbortSignal,
   sdkOverride?: OpencodeClient,
+  followups?: TaskPrompt[],
 ): Promise<void> {
   const startTime = Date.now()
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
@@ -223,9 +225,10 @@ export async function executeTask(
     closeEvents = () => void eventIterator.return?.()
     let finalPromptData: Awaited<ReturnType<typeof sdk.session.prompt>>["data"] | undefined
 
+    let nextPrompt = buildTaskPrompt(request)
     for (let attempt = 0; ; attempt++) {
       let sessionErrorMsg = ""
-      const promptText = attempt === 0 ? buildTaskPrompt(request) : RETRY_PROMPT
+      const promptText = nextPrompt
       // Attach rejection handling immediately so a provider/API error cannot
       // become an unhandled rejection while the SSE loop is still draining.
       const promptPromise = sdk.session
@@ -342,6 +345,19 @@ export async function executeTask(
         sessionErrorMsg
 
       if (!promptError) {
+        // Turn finished cleanly. A queued follow-up prompt (WI#328 runtime
+        // control channel) continues the SAME session instead of resolving
+        // the task: the daemon pushed it while the worker was busy and it is
+        // injected only here, at a turn boundary — never mid-call.
+        const followup = followups?.shift()
+        if (followup) {
+          emitProgress(
+            `[control] Follow-up prompt received (seq=${followup.seq}${followup.done ? ", wrap-up requested" : ""})`,
+          )
+          nextPrompt = followup.prompt
+          attempt = -1 // each follow-up turn gets its own transient-retry budget
+          continue
+        }
         finalPromptData = promptData
         break
       }
@@ -357,6 +373,8 @@ export async function executeTask(
       output += `ERROR: ${promptError}\n${delta}\n`
       emitProgress(delta)
       console.warn(`[opencode_task_executor] task ${request.task_id}: ${delta} ${promptError}`)
+
+      nextPrompt = RETRY_PROMPT
 
       const delayResult = await Promise.race([
         new Promise<undefined>((resolve) => setTimeout(resolve, retryDelayMs)),

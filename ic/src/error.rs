@@ -408,6 +408,20 @@ pub enum OrchestratorError {
 
     #[error("External worker '{worker_name}' task is already active (job {job_id})")]
     ExternalWorkerTaskAlreadyActive { worker_name: String, job_id: Uuid },
+
+    #[error("External job {job_id} cannot receive control messages: {reason}")]
+    ExternalWorkerTaskNotActive { job_id: Uuid, reason: String },
+
+    #[error("External job {job_id} rejected control prompt: {reason}")]
+    ExternalWorkerInvalidControlPrompt { job_id: Uuid, reason: String },
+
+    #[error(
+        "External job {job_id} cannot receive control messages: worker '{worker_name}' does not advertise the task_prompt capability"
+    )]
+    ExternalWorkerControlUnsupported { job_id: Uuid, worker_name: String },
+
+    #[error("External job {job_id} control channel is at capacity: {reason}")]
+    ExternalWorkerControlQueueFull { job_id: Uuid, reason: String },
 }
 
 /// Worker errors (container-side execution).

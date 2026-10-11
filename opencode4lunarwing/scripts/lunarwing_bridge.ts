@@ -16,7 +16,9 @@ import {
   SUBPROTOCOL,
   WORKER_ID,
   WORKER_VERSION,
+  CAPABILITY_TASK_PROMPT,
   type Envelope,
+  type TaskPrompt,
   type TaskRequest,
   type WsState,
 } from "./lunarwing_runtime"
@@ -49,6 +51,11 @@ type ActiveTask = { controller: AbortController; socket: BridgeSocket; workspace
 const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
+// WI#328 runtime control channel: queued `task_prompt` follow-ups per running
+// task. The executor drains a task's queue at turn boundaries (session idle),
+// never mid-call — mirroring the daemon's "no mid-prompt injection" contract.
+const activePromptQueues = new Map<string, TaskPrompt[]>()
+
 function taskWorkspace(request: TaskRequest): string {
   return resolve(expandWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT))
 }
@@ -68,6 +75,10 @@ function sendReady(ws: BridgeSocket): void {
     worker_id: WORKER_ID,
     version: WORKER_VERSION,
     mode: "websocket",
+    // WI#328: this worker consumes task_prompt follow-ups. Workers that omit
+    // the capability get an explicit daemon-side rejection instead of
+    // silently dropping the frame.
+    capabilities: [CAPABILITY_TASK_PROMPT],
   })
   ws.send(JSON.stringify(msg))
 }
@@ -91,6 +102,10 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
 
       case "cancel":
         handleCancel(envelope.payload as { task_id: string })
+        break
+
+      case "task_prompt":
+        handleTaskPrompt(envelope.payload as TaskPrompt, ws)
         break
 
       case "ping":
@@ -155,6 +170,8 @@ async function handleTaskRequest(
   const controller = new AbortController()
   activeTasks.set(request.task_id, { controller, socket: ws, workspace })
   activeWorkspaces.set(workspace, request.task_id)
+  const promptQueue: TaskPrompt[] = []
+  activePromptQueues.set(request.task_id, promptQueue)
 
   try {
     await executeTask(
@@ -169,9 +186,12 @@ async function handleTaskRequest(
         console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
       },
       controller.signal,
+      undefined,
+      promptQueue,
     )
   } finally {
     activeTasks.delete(request.task_id)
+    activePromptQueues.delete(request.task_id)
     if (activeWorkspaces.get(workspace) === request.task_id) activeWorkspaces.delete(workspace)
   }
 }
@@ -184,6 +204,35 @@ function handleCancel(payload: { task_id: string }): void {
   } else {
     console.warn(`[bridge] cancel: task ${payload.task_id} not found`)
   }
+}
+
+/**
+ * WI#328: queue a daemon follow-up prompt for a running task and ack it.
+ * The ack means "the worker received and queued it" — the executor injects
+ * queued prompts at the next turn boundary (session idle), never mid-call.
+ * Prompts for unknown/finished tasks are acked with accepted=false so the
+ * daemon's audit log reflects the drop instead of a false delivery.
+ */
+function handleTaskPrompt(payload: TaskPrompt, ws: BridgeSocket): void {
+  const taskId = typeof payload?.task_id === "string" ? payload.task_id : ""
+  const seq = typeof payload?.seq === "number" ? payload.seq : 0
+  const queue = taskId ? activePromptQueues.get(taskId) : undefined
+  const accepted =
+    queue !== undefined &&
+    typeof payload.prompt === "string" &&
+    payload.prompt.trim().length > 0 &&
+    typeof payload.done === "boolean"
+  if (accepted) {
+    queue!.push({ task_id: taskId, seq, prompt: payload.prompt, done: payload.done })
+    console.log(`[bridge] task ${taskId}: follow-up prompt seq=${seq} queued`)
+  } else {
+    console.warn(`[bridge] task_prompt rejected (unknown/finished task or invalid payload)`)
+  }
+  ws.send(
+    JSON.stringify(
+      createEnvelope("task_prompt_ack", { task_id: taskId, seq, accepted } as TaskPromptAck),
+    ),
+  )
 }
 
 // ── Server Role ───────────────────────────────────────────────────────────────
