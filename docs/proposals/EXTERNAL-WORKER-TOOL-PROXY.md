@@ -1,8 +1,9 @@
 # External Worker Tool Proxy (WI#324)
 
-Status: phase 1 (hub-side) implemented, hardened per the MR !1506 (CQ-1..CQ-9)
-and MR !1521 (DD-1..DD-10) adversarial reviews. Worker-side bridge support is
-the remaining piece and lives in the worker images (kimi / pebble / opencode).
+Status: phase 1 (hub-side) implemented, hardened per the MR !1506
+(CQ-1..CQ-9), MR !1521 (DD-1..DD-10), and MR !1533 (DP-1..DP-6)
+adversarial reviews. Worker-side bridge support is the remaining piece and
+lives in the worker images (kimi / pebble / opencode).
 
 ## What this is
 
@@ -43,11 +44,17 @@ All frames are the standard envelope `{id, type, timestamp, payload}`.
 - `call_id` is required and echoed verbatim in the reply.
 - `arguments` defaults to `null`; it is validated by the daemon's safety layer
   before execution.
-- Frames larger than 256 KiB are rejected with `error` before their payload
-  is parsed: the read loop identifies an oversized `tool_call` with a
-  zero-allocation borrowed type probe, so a huge frame never becomes a heap
-  `Value` (MR !1521 DD-5). Other frame types are unaffected — a legitimate
-  `task_result`/`task_progress` payload may be larger than a tool call.
+- Frames larger than 256 KiB are rejected with `error` before dispatch: the
+  read loop first probes an oversized frame's `type` with a `Cow` field (so a
+  type spelled with a JSON escape — `"tool_call"` — still classifies;
+  serde_json cannot borrow an escaped string, MR !1533 DP-1), and re-checks
+  the bound inside the `tool_call` arm so an oversized frame never reaches
+  audit/persist/dispatch even after the envelope parse ran. Below the frame
+  layer, the socket itself is configured with `max_message_size = 1 MiB`, so
+  a frame past that is never materialized at all — it fails the job as a
+  protocol error (fail-loud, never silently truncated). Other frame types
+  under 1 MiB are unaffected — a legitimate `task_result`/`task_progress`
+  payload may be larger than a tool call.
 
 ### `tool_result` (daemon → worker)
 
@@ -92,10 +99,13 @@ present it must equal the connection's job id, same binding rule as
 ```
 
 containing exactly the tools the worker could actually call: allowlisted,
-registered, visible to the job's user, and excluded by neither the proxy
-denylist nor the autonomous gates (MR !1506 CQ-6) — so a worker-side MCP
-bridge exposes a truthful `tools/list`. An error reply keeps the
-`tool_catalog` type with an empty `tools` array plus an `error` string.
+registered, visible to the job's user, inside the phase-1 capability set and
+not hard-denied (the catalog applies the same `is_proxy_callable` predicate
+as dispatch, MR !1533 DP-6a), and not excluded by the autonomous gates
+(MR !1506 CQ-6) — so a worker-side MCP bridge exposes a truthful
+`tools/list`. A malformed `tool_list` payload (e.g. a numeric `task_id`)
+fails closed with an error catalog (MR !1533 DP-6b). An error reply keeps
+the `tool_catalog` type with an empty `tools` array plus an `error` string.
 
 ## Capability allowlist (deny-by-default)
 
@@ -125,15 +135,28 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
     `restart`, `tool_install`, `skill_install`, `secret_list`,
     `secret_delete`, `ssh`, `ssh_git`, `routine_*`, …) are removed — they can
     never pass the execution gates;
-  - names on the **proxy denylist** (`shell`, `write_file`, `apply_patch`,
-    `http`, `message`, `cancel_job`) are removed (MR !1521 DD-4) — these are
-    NOT on the engine's autonomous denylist, and without the proxy-level list
-    they would pass every gate: an untrusted container would get command
-    execution on the daemon host (direct exec when the Docker sandbox is
-    unavailable), host file writes, credentialed outbound HTTP, or the
-    cross-channel/job control planes. The runtime gate enforces the same
-    list, so a registry alias or later-registered tool under a denied name
-    cannot slip through;
+  - names on the **proxy denylist** (`shell`, `read_file`, `write_file`,
+    `list_dir`, `apply_patch`, `attachment_store`, `http`, `message`,
+    `cancel_job`, `job_events`, `job_status`, `list_jobs`) are removed
+    (MR !1521 DD-4, extended MR !1533 DP-2) — these are NOT on the engine's
+    autonomous denylist, and without the proxy-level list they would pass
+    every gate: an untrusted container would get command execution on the
+    daemon host (direct exec when the Docker sandbox is unavailable),
+    arbitrary host file reads/writes as the daemon user (the dev file tools
+    have no `base_dir`; `validate_path` accepts any absolute path), host
+    attachment-store access, credentialed outbound HTTP, or the
+    cross-channel/job control and observation planes;
+  - **names outside the phase-1 capability set are removed** (MR !1533 DP-2):
+    the proxied surface is a *positive* list — `memory_read`, `memory_write`,
+    `knowledge_search`, `knowledge_submit_note`, `knowledge_get_topic`,
+    `gitlab_tool`, and read-only `mission_status`/`mission_history`/
+    `mission_list` (mission writes stay gated behind the mission lifecycle
+    fixes #311/#317). A denylist alone cannot deliver the phase-1 scoping:
+    unlisted and future host tools would be exposed by default. The dispatch
+    gate and the `tool_catalog` apply the same positive predicate on the
+    resolved name, so a registry alias or a later-registered tool under an
+    excluded name cannot slip through, and the denylist stays as defense in
+    depth;
   - entries that are not valid tool identifiers are removed;
   - a worker reached over cleartext `ws://` on a **non-loopback** host has
     its whole allowlist stripped (MR !1506 CQ-7): tool authority must never
@@ -142,6 +165,10 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
     unparseable URLs (MR !1521 DD-9): `ws://localhost:9000@host.example/x`
     connects to `host.example` and is correctly classified non-loopback. Use
     `wss://` or loopback.
+- Entries are matched by literal (canonical) tool name at load and by
+  resolved name at dispatch; an alias spelling in the config (e.g.
+  `gitlab-tool` for `gitlab_tool`) fails closed — use the canonical name
+  (MR !1533 DP-6e).
 - The allowlist is the approval boundary for the proxy: in-process approval
   prompts cannot reach a worker, so listing a write tool (e.g.
   `memory_write`) is the operator's explicit grant. The seeded `AskEachTime`
@@ -158,9 +185,10 @@ autonomous paths (jobs, routines) enforce, in this order:
 2. **User-scoped resolution** — `get_resolved_for_user`: legacy alias
    handling plus per-user visibility (another user's MCP/extension tools are
    NotFound, not leaked).
-3. **Proxy denylist** (MR !1521 DD-4) — `shell`, `write_file`, `apply_patch`,
-   `http`, `message`, `cancel_job` are hard-denied at dispatch (in addition
-   to the load-time strip), regardless of the allowlist.
+3. **Proxy capability gate** (MR !1521 DD-4, MR !1533 DP-2) — the resolved
+   name must be inside the phase-1 capability set and not on the proxy
+   denylist; enforced at dispatch (in addition to the load-time strip),
+   regardless of the allowlist.
 4. **Autonomous hard gates** — `allows_autonomous_execution()` and
    `ApprovalContext::is_blocked_or_default` with the allowlist as the
    approval grant. The allowlist cannot unlock denylisted or opt-out tools.
@@ -186,14 +214,24 @@ gates and execution (MR !1521 DD-8) — scoped by the **connection's** job
 read loop (sequential per job in phase 1); the execution races the job's
 cancel watch so a cancel is never queued behind a long tool timeout. Every
 accepted call also refreshes the job's `last_activity_at` (MR !1521 DD-6) so
-a tool-only worker is not mistaken for a wedged one by stuck-job detection.
+a tool-only worker is not mistaken for a wedged one by stuck-job detection;
+the refresh happens before the capability gate, so allowlist-denied calls
+count as activity too — bounded by the same 100-frame per-job cap (MR !1533
+DP-6c).
 
-Per-job bounds (MR !1506 CQ-3, MR !1521 DD-5): at most 100 proxied control
-frames per job — every `tool_call`-typed frame counts, accepted, rejected,
-or malformed (a rejected-frame flood is capped too), and `tool_list` shares
-the budget; worker `name`/`call_id` fields are validated as bounded
-identifiers before they are persisted or logged. Rejection rows stop once
-the cap is crossed (one marker row is kept).
+A note on `knowledge_submit_note` (MR !1533 DP-6d): it is a phase-1 write
+tool, and its `scope` parameter accepts `"shared"`, which writes the
+herd-shared knowledge scope rather than the agent's own. Operators granting
+it to a worker should treat that worker as able to plant notes other tenants
+of the herd may read; withhold the entry if that is not intended.
+
+Per-job bounds (MR !1506 CQ-3, MR !1521 DD-5, MR !1533 DP-3): at most 100
+proxied control frames per job — every `tool_call`-typed frame counts,
+accepted, rejected, or malformed (a rejected-frame flood is capped too), and
+`tool_list` shares the budget; worker `name`/`call_id` fields are validated
+as bounded identifiers before they are persisted or echoed — including on
+the cap path, which falls back to `unknown`/`""` for invalid values.
+Rejection rows stop once the cap is crossed (one marker row is kept).
 
 ## Observability (MR !1506 CQ-4)
 
@@ -241,8 +279,10 @@ for multi-threaded missions.
 
 - `ic/src/orchestrator/external_worker.rs` unit tests: allowlist gate
   (deny-by-default, exact names, no wildcard), allowlist sanitizer
-  (wildcard/denylisted/invalid dropped, cleartext strips all), frame
-  identifier validation, wire shapes.
+  (wildcard/denylisted/proxy-denylisted/non-phase-1/invalid dropped,
+  cleartext strips all), the phase-1 capability predicate (positive set
+  callable; host tools, stores, job planes, unlisted names, and mission
+  writes denied), frame identifier validation, wire shapes.
 - `ic/tests/external_worker_integration.rs`: mock-worker round trips over a
   real loopback WS —
   - allowlisted call succeeds with tenant scoping asserted; non-allowlisted
@@ -250,16 +290,39 @@ for multi-threaded missions.
     unknown-but-allowlisted tool is an `error` (not a hang); unwired proxy
     replies `error` rather than dropping the frame;
   - AC1: real `memory_write` → `memory_read` round-trip through the proxy
-    (LibSqlBackend workspace), plus the WI#322 mission-path guard;
+    (LibSqlBackend workspace), plus the WI#322 engine-tree guard for both
+    `engine/projects/**/missions/**` and `engine/projects/**` documents
+    (MR !1521 DD-3, pinned per MR !1533 DP-5);
   - AC4: canonical `tool_use`/`tool_result` events asserted against a real
     store (`success: false` persisted for denied calls);
-  - autonomous opt-out tool denied; denylisted entry (`create_job`) never
-    executes; persisted `Disabled` permission denied; terminal (Cancelled)
-    job refused;
+  - autonomous opt-out tool denied; autonomous-denylisted (`create_job`) and
+    proxy-denylisted (`read_file`) entries never execute; persisted
+    `Disabled` permission denied; terminal (Cancelled) job refused;
   - secret-shaped tool output never reaches the worker verbatim (CQ-2/AC5);
   - `tool_catalog` advertises only callable tools (CQ-6);
-  - missing/mismatched `task_id` rejected (CQ-7).
+  - missing/mismatched `task_id` rejected (CQ-7);
+  - MR !1533 DP pins: oversized `tool_call` frames rejected with `error`
+    both plain and with a JSON-escaped `type` (DP-1), a frame past the 1 MiB
+    socket cap fails the job as a protocol error (DP-1), and a 103-frame
+    flood executes exactly 100 calls, denies the rest, persists exactly one
+    cap marker row, and never persists/echoes unvalidated identifiers from
+    the cap path (DD-5/DP-3).
 
 Open acceptance items: AC2 (`knowledge_search` real hits through the proxy)
 and the worker-side bridge itself (design item 2) — the wire contract above
 is the bridge's specification.
+
+## Land-order note (MR !1533 run-67 review)
+
+This branch and MR !1531 (WI#325) both touch the task read loop's cancel
+watch: this MR's `handle_tool_call`/`execute_proxied_call` take
+`&watch::Receiver<bool>`, while !1531 widens the read loop's watch to
+`watch::Receiver<Option<CancelReason>>`. Whichever lands second must thread
+`Option<CancelReason>` through the two proxy call sites (the select arm
+ignores the reason) and resolve the three-file conflict
+(`config/sandbox.rs`, `settings.rs`,
+`ic/tests/external_worker_integration.rs` — keep both sides, one
+`impl Default for ExternalWorkerConfig` carrying `mode`, `cron` and
+`tool_allowlist`). MR !1532's wiring conflict (`main.rs`,
+`orchestrator/mod.rs`) is trivial: keep both trailing `setup_orchestrator`
+parameters in matching order.
