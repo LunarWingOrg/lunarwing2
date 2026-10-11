@@ -2011,21 +2011,23 @@ mod tests {
         }
     }
 
+    /// MR !1531 DN-6 (rewritten for DQ-1/DR-1): capacity rejections must not
+    /// persist anything — no sandbox-job row and no last-job pointer — and a
+    /// pause landing during the busy-retry backoff must end the tick without
+    /// writing events for a job that never fired. Goes through the Database
+    /// trait only (architecture-boundaries Check 1); surviving job_events
+    /// rows cannot pin the no-orphan-event half because the FK rejects them,
+    /// so that half is asserted by the recording-store follow-up in WI#370.
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn capacity_retry_then_pause_never_writes_an_orphan_event() {
-        let dir = tempfile::tempdir().unwrap();
-        let backend = crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("capacity.db"))
-            .await
-            .unwrap();
-        backend.run_migrations().await.unwrap();
-        let conn = backend.shared_db().connect().unwrap();
+    async fn capacity_retry_then_pause_persists_nothing() {
+        let (store, _dir) = crate::testing::test_db().await;
         let worker = ExternalWorkerConfig::default();
         let (events, _) = broadcast::channel(8);
         let manager = Arc::new(
             ExternalWorkerManager::new(vec![worker.clone()])
                 .with_event_deps(events, Arc::new(crate::context::ContextManager::new(0)))
-                .with_store(Arc::new(backend)),
+                .with_store(store.clone()),
         );
         let cron = test_cron();
         let last = Arc::new(std::sync::Mutex::new(None));
@@ -2046,14 +2048,9 @@ mod tests {
                 .unwrap(),
             Some(TickEnd::Resolved)
         ));
-        let mut rows = conn
-            .query("SELECT COUNT(*) FROM job_events", ())
-            .await
-            .unwrap();
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-            0
-        );
+        // DN-6: reserve failed before persist, so no job row may exist and no
+        // last-job pointer may have been recorded.
+        assert!(store.list_sandbox_jobs().await.unwrap().is_empty());
         assert!(last_tick_job(&ctx).is_none());
     }
 
