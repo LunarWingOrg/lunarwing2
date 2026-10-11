@@ -1204,6 +1204,8 @@ async fn async_main() -> anyhow::Result<()> {
 
     if let Some(ref mgr) = external_worker_manager {
         mgr.spawn_eviction_task(shutdown_tx.subscribe());
+        // WI#325: mission supervisors for cron-mode external workers.
+        mgr.spawn_cron_supervisors(&config.owner_id, shutdown_tx.subscribe());
     }
 
     // Bundled MCP gateway control plane (opt-in via environment; see
