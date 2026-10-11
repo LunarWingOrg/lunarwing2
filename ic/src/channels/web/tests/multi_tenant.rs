@@ -780,7 +780,10 @@ mod jobs_isolation {
     /// WI#328 (MR !1525 DI-9): the job detail payload reports `can_prompt`
     /// for a running external job only when the worker's handshake actually
     /// advertised the `task_prompt` capability.
-    async fn assert_can_prompt(capability: crate::orchestrator::external_worker::ControlCapability, expected: bool) {
+    async fn assert_can_prompt(
+        capability: crate::orchestrator::external_worker::ControlCapability,
+        expected: bool,
+    ) {
         use crate::config::ExternalWorkerConfig;
         use crate::orchestrator::ExternalWorkerManager;
 

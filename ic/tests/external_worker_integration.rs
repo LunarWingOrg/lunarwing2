@@ -2231,9 +2231,12 @@ async fn control_channel_persists_delivery_and_ack_rows() {
     // event log, and the ack row carries the worker's `accepted` flag.
     let (store, _db_guard) = test_store().await;
     let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (url, _count) =
-        spawn_mock_worker_async(MockBehavior::ControlChannel { messages: message_tx }).await;
-    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]).with_store(store.clone()));
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ControlChannel {
+        messages: message_tx,
+    })
+    .await;
+    let mgr =
+        Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]).with_store(store.clone()));
     let job_id = Uuid::new_v4();
     seed_agent_job(&store, job_id).await;
     mgr.reserve_task(job_id, "mock", "user")
@@ -2315,7 +2318,8 @@ async fn control_channel_ignores_forged_ack() {
         forged_ack_seq: Some(999),
     })
     .await;
-    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]).with_store(store.clone()));
+    let mgr =
+        Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]).with_store(store.clone()));
     let job_id = Uuid::new_v4();
     seed_agent_job(&store, job_id).await;
     mgr.reserve_task(job_id, "mock", "user")
@@ -2427,7 +2431,10 @@ async fn control_channel_cancel_closes_queue_immediately() {
     // poll briefly for the rejection.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
     let rejection = loop {
-        match mgr.send_prompt(job_id, "user", "during cancel", false).await {
+        match mgr
+            .send_prompt(job_id, "user", "during cancel", false)
+            .await
+        {
             Err(error) => break error,
             Ok(_) => {
                 assert!(
@@ -2465,4 +2472,3 @@ async fn control_channel_cancel_closes_queue_immediately() {
         }
     }
 }
-

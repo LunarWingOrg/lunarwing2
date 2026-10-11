@@ -299,8 +299,9 @@ impl ExternalWorkerConfig {
     pub fn test_config(name: &str, url: &str) -> Self {
         // `{name:?}`/`{url:?}` render valid TOML basic strings for the plain
         // identifier/URL values tests pass here.
-        let toml_src =
-            format!("[[sandbox.external_workers]]\nname = {name:?}\nurl = {url:?}\ntimeout_ms = 300000\n");
+        let toml_src = format!(
+            "[[sandbox.external_workers]]\nname = {name:?}\nurl = {url:?}\ntimeout_ms = 300000\n"
+        );
         let settings: crate::settings::Settings =
             toml::from_str(&toml_src).expect("test worker config must parse"); // safety: test
         Self::resolve_from_settings(&settings)
