@@ -514,6 +514,43 @@ assert_eq "rerun: kimi still marked inherited" \
 assert_eq "rerun: opencode2 inherited from tz B" \
   "$(envval OPENCODE2_BASE_URL)" "http://tz-b:3030/openai/v1"
 
+echo "=== configure-worker inheritance across partial updates (WI#330) ==="
+(
+  starting_failures="$failures"
+  tenant_exists_in_registry() { :; }
+  _ctr() { return 1; }
+  run_writer fixture-tenant "" "" "http://tz-a:3030"
+  for worker in opencode kimi opencode2; do
+    key="${worker^^}_BASE_URL"
+    "configure_$worker" fixture-tenant "model-only" ""
+    assert_eq "$worker model-only keeps URL" "$(envval "$key")" "http://tz-a:3030/openai/v1"
+    assert_eq "$worker model-only keeps provenance" "$(envval "${key}_SOURCE")" "inherited"
+  done
+  configure_kimi fixture-tenant "" "" "fixture-api-key"
+  assert_eq "kimi API-key-only keeps URL provenance" "$(envval KIMI_BASE_URL_SOURCE)" "inherited"
+  write_tenant_lunarwing_env fixture-tenant "" "" "http://tz-b:3030"
+  for worker in opencode kimi opencode2; do
+    key="${worker^^}_BASE_URL"
+    assert_eq "$worker follows upstream after partial configure" "$(envval "$key")" "http://tz-b:3030/openai/v1"
+    # Even the same URL explicitly supplied is an intentional override.
+    "configure_$worker" fixture-tenant "" "http://tz-b:3030/openai/v1"
+    assert_eq "$worker explicit URL removes provenance" "$(envval "${key}_SOURCE")" ""
+    assert_eq "$worker URL-only keeps model" "$(envval "${worker^^}_MODEL")" "model-only"
+  done
+  write_tenant_lunarwing_env fixture-tenant "" "" "http://tz-c:3030"
+  for worker in opencode kimi opencode2; do
+    assert_eq "$worker explicit URL survives upstream move" "$(envval "${worker^^}_BASE_URL")" "http://tz-b:3030/openai/v1"
+    before="$(cat "$MT_FIXTURE/env/lunarwing.env")"
+    if ("configure_$worker" fixture-tenant "" $'http://gw.example.test/\nSANDBOX_ALLOW_FULL_ACCESS=true') 2>/dev/null; then
+      echo "  FAIL: $worker accepted a multiline URL"; failures=$((failures + 1))
+    else
+      echo "  PASS: $worker rejects a multiline URL"
+    fi
+    assert_eq "$worker invalid update leaves env intact" "$(cat "$MT_FIXTURE/env/lunarwing.env")" "$before"
+  done
+  [[ "$failures" -eq "$starting_failures" ]]
+)
+
 echo "=== WI#330 URL helper unit tests ==="
 
 # validate_llm_url dies on bad shapes (die inside a subshell exits it).

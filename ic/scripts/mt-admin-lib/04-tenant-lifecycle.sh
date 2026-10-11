@@ -1494,6 +1494,11 @@ upgrade_tenant_locked() {
   [[ "$migrations_type" == "tree" ]] \
     || die "target ref '$target' has no ic/migrations directory (tenant was not stopped)"
 
+  # WI#330: validate/backfill enabled worker endpoints before stopping the
+  # working tenant, not just before rebuilding placeholder-refusing images.
+  # An unresolvable endpoint is an operator-fixable preflight failure.
+  backfill_tenant_worker_base_urls "$name"
+
   previous_commit="$("${tgit[@]}" rev-parse --verify HEAD)" \
     || die "failed to record current tenant commit"
   stop_tenant "$name"
@@ -1525,10 +1530,6 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" opencode2; then
     with_opencode2="true"
   fi
-  # WI#330: the rebuilt worker images refuse their placeholder endpoints, so an
-  # enabled worker without a resolvable base URL must fail the upgrade BEFORE
-  # the images rebuild. Idempotent; patch_tenant_env re-runs it post-build.
-  backfill_tenant_worker_base_urls "$name"
   build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" "$with_opencode2" \
     || die "build failed for $name; aborting upgrade (tenant left stopped at $target_commit; fix the build and re-run upgrade-tenant)"
 

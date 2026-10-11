@@ -181,6 +181,20 @@ else
   fail "upgrade target-collision error lacked details: $output"
 fi
 
+# WI#330: an unresolved endpoint must not turn a failed upgrade into downtime.
+printf 'LLM_BASE_URL=http://127.0.0.1:10004/v1\n' >"$repo/env/lunarwing.env"
+if output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"; then
+  fail 'upgrade should reject enabled workers with no usable endpoint'
+elif [[ -e "$stopped_marker" || -e "$build_args_file" ]]; then
+  fail 'upgrade stopped or rebuilt tenant before worker endpoint preflight'
+elif [[ "$output" == *'no container-reachable LLM endpoint'* ]] \
+  && [[ "$(git -C "$repo" rev-parse HEAD)" == "$target" ]]; then
+  pass 'upgrade rejects missing worker endpoint before stop, checkout, or build'
+else
+  fail "upgrade endpoint preflight returned wrong error: $output"
+fi
+printf 'LLM_BASE_URL=http://tz-fixture:3030/openai/v1\n' >"$repo/env/lunarwing.env"
+
 fail_checkout=true
 if output="$(upgrade_tenant fixture checkout-failure '' false false 2>&1)"; then
   fail 'upgrade should reject failed checkout'

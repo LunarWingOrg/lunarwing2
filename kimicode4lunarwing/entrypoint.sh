@@ -101,11 +101,6 @@ def toml_string(value):
     return '"' + ''.join(escapes.get(char, f"\\u{ord(char):04x}" if ord(char) < 0x20 or ord(char) == 0x7f else char) for char in value) + '"'
 
 def replace_setting(config, name, value, required):
-    # WI#330: a whitespace-only override (e.g. KIMI_BASE_URL=' ') must behave
-    # as unset so the placeholder base_url survives to the entrypoint guard
-    # instead of materializing a garbage endpoint.
-    if value:
-        value = value.strip()
     if not value:
         return config
     pattern = re.compile(rf'^(\s*{re.escape(name)}\s*=).*$' , re.MULTILINE)
@@ -131,7 +126,7 @@ def retarget_model_entry(config, old_alias, new_model):
         config = config[:body.start()] + f'{body.group(1)} {toml_string(new_model)}' + config[body.end():]
     return config
 
-kimi_model = os.environ.get("KIMI_MODEL", "")
+kimi_model = os.environ.get("KIMI_MODEL", "").strip()
 old_alias = ""
 if kimi_model:
     try:
@@ -141,7 +136,10 @@ if kimi_model:
 text = replace_setting(text, "default_model", kimi_model, False)
 if kimi_model and old_alias and old_alias != kimi_model:
     text = retarget_model_entry(text, old_alias, kimi_model)
-text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", ""), True)
+# Whitespace-only URLs are unset (the placeholder guard must still fire).
+# Normalize the model once above so alias retargeting uses the same value;
+# API keys remain byte-for-byte as supplied.
+text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", "").strip(), True)
 text = replace_setting(text, "api_key", os.environ.get("KIMI_API_KEY", ""), True)
 
 # WI#206 fail-closed policy enforcement. Whatever the source config said
