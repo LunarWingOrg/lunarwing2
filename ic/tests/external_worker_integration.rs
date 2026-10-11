@@ -2846,6 +2846,24 @@ async fn cron_pause_and_tick_counter_survive_restart() {
         .pause_cron_mission("mock", "owner-1")
         .await
         .expect("pause");
+    // pause_cron_mission returns when the command is queued, not applied:
+    // wait until status reflects the pause (which is ordered after the
+    // persisted write in the supervisor's command handling) before teardown,
+    // so the shutdown broadcast cannot win the select race against it.
+    timeout(TEST_BOUND, async {
+        loop {
+            let status = mgr_a
+                .cron_mission_status("mock", "owner-1")
+                .await
+                .expect("status");
+            if status.paused {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("pause was never applied");
     let _ = shutdown_a.send(());
     drop(mgr_a);
     drop(request_rx);

@@ -498,6 +498,8 @@ async fn run_cron_mission(
 
 /// Service one command while the mission is paused. Returns false when the
 /// supervisor should exit (command channel closed or daemon shutdown).
+/// `biased`: a queued owner command is applied before shutdown is observed,
+/// so an acknowledged pause/resume is never lost to a same-instant shutdown.
 async fn paused_turn(
     ctx: &TickCtx<'_>,
     state: &mut MissionState,
@@ -506,6 +508,7 @@ async fn paused_turn(
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> bool {
     let command = tokio::select! {
+        biased;
         command = cmd_rx.recv() => command,
         _ = shutdown_rx.recv() => return false,
     };
@@ -519,22 +522,27 @@ async fn paused_turn(
 }
 
 /// Wait for the next scheduled fire, an owner command, or shutdown. Returns
-/// `None` on shutdown / closed command channel.
+/// `None` on shutdown / closed command channel. `biased`: a queued owner
+/// command is applied before shutdown is observed (see `paused_turn`).
 async fn next_wake(
     wait: Duration,
     cmd_rx: &mut mpsc::Receiver<CronCommand>,
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> Option<Wake> {
     tokio::select! {
-        _ = tokio::time::sleep(wait) => Some(Wake::Tick),
+        biased;
         command = cmd_rx.recv() => command.map(Wake::Command),
         _ = shutdown_rx.recv() => None,
+        _ = tokio::time::sleep(wait) => Some(Wake::Tick),
     }
 }
 
 /// Run one tick to resolution while still servicing owner commands, so a
 /// multi-hour chain does not starve pause/resume/status (MR !1522 DE-3).
-/// Returns false when daemon shutdown interrupted the tick.
+/// Returns false when daemon shutdown interrupted the tick: `run_tick`
+/// observes shutdown on the shared receiver at every internal await point
+/// (watch, backoff, terminal wait) and cancels the in-flight link with the
+/// shutdown reason, so this loop only needs to service commands alongside.
 async fn drive_tick(
     ctx: &TickCtx<'_>,
     state: &mut MissionState,
@@ -543,24 +551,18 @@ async fn drive_tick(
     cmd_rx: &mut mpsc::Receiver<CronCommand>,
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> bool {
-    let mut tick_shutdown = shutdown_rx.resubscribe();
-    let tick = run_tick(ctx, tick_index, &mut tick_shutdown, pause_flag);
+    let tick = run_tick(ctx, tick_index, shutdown_rx, pause_flag);
     tokio::pin!(tick);
     let end = loop {
+        // biased: a finished tick completes its bookkeeping first.
         tokio::select! {
+            biased;
             end = &mut tick => break end,
             command = cmd_rx.recv() => {
                 let Some(command) = command else {
                     return false;
                 };
                 handle_active_command(ctx, state, pause_flag, command).await;
-            }
-            _ = shutdown_rx.recv() => {
-                // The tick's own resubscription observes the same signal and
-                // cancels the in-flight link with the shutdown reason; awaiting
-                // it lets that cleanup finish before the supervisor exits.
-                let _ = tick.await;
-                return false;
             }
         }
     };
