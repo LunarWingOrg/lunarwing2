@@ -1422,6 +1422,20 @@ impl MissionManager {
                 {
                     continue;
                 }
+                // WI#338: thread_history rides the agent-writable mission
+                // record (WI#322); only resume threads this mission actually
+                // fired — a planted foreign id must not resume under this
+                // mission's outcome watcher.
+                if thread.project_id != mission.project_id
+                    || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
+                {
+                    warn!(
+                        %mission_id,
+                        %thread_id,
+                        "skipping checkpoint resume for a history thread that fails the mission/thread parity checks"
+                    );
+                    continue;
+                }
                 if thread.metadata.get("runtime_checkpoint").is_none() {
                     continue;
                 }
@@ -2668,6 +2682,19 @@ impl MissionManager {
                 if thread.thread_type != ThreadType::Mission {
                     continue;
                 }
+                // WI#338: thread_history rides the agent-writable mission
+                // record (WI#322); a planted foreign id must not re-arm a
+                // retry as this mission with the marker's payload.
+                if thread.project_id != mission.project_id
+                    || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
+                {
+                    warn!(
+                        %mission_id,
+                        %thread_id,
+                        "skipping retry recovery for a history thread that fails the mission/thread parity checks"
+                    );
+                    continue;
+                }
                 if admitted.contains(&thread.id) {
                     break;
                 }
@@ -2874,6 +2901,26 @@ impl MissionManager {
             self.store.save_mission(mission).await?;
             return Ok(true);
         };
+        // WI#338: the stamp rides mission metadata, which stays agent-writable
+        // until WI#322 lands — never act on a thread this mission did not
+        // fire. Mirrors `record_restart_interrupted_thread`'s type/project/
+        // owner parity checks plus history membership; a mismatch clears the
+        // stamp without writing a marker or emitting a notice.
+        if thread.thread_type != ThreadType::Mission
+            || thread.project_id != mission.project_id
+            || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
+            || !mission.thread_history.contains(&thread_id)
+        {
+            warn!(
+                mission_id = %mission.id,
+                %thread_id,
+                "pending shutdown interruption stamp failed the mission/thread parity checks; clearing it without acting"
+            );
+            clear_shutdown_interruption_stamp(mission);
+            mission.updated_at = Utc::now();
+            self.store.save_mission(mission).await?;
+            return Ok(true);
+        }
         match thread.state {
             ThreadState::Failed if thread.is_failed_by_restart() => {
                 clear_shutdown_interruption_stamp(mission);
