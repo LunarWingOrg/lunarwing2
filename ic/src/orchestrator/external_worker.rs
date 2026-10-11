@@ -2697,8 +2697,7 @@ fn engine_path_guard_reason(name: &str, params: &serde_json::Value) -> Option<St
     }
     let target = params.get("target").and_then(|v| v.as_str())?;
     is_engine_internal_path(&normalize_path(target)).then(|| {
-        "proxied memory_write may not write engine-internal paths (engine/**) (WI#322)"
-            .to_string()
+        "proxied memory_write may not write engine-internal paths (engine/**) (WI#322)".to_string()
     })
 }
 
@@ -4173,7 +4172,9 @@ mod tests {
         assert!(!is_cleartext_non_loopback("ws://localhost/path"));
         assert!(!is_cleartext_non_loopback("ws://[::1]:9000/kimi"));
         // TLS is never "cleartext".
-        assert!(!is_cleartext_non_loopback("wss://worker.example.com:443/ws"));
+        assert!(!is_cleartext_non_loopback(
+            "wss://worker.example.com:443/ws"
+        ));
         // Remote cleartext strips the allowlist.
         assert!(is_cleartext_non_loopback("ws://worker.example.com/ws"));
         assert!(is_cleartext_non_loopback("ws://192.168.1.100:9000"));
