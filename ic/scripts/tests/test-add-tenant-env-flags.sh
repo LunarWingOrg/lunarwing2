@@ -914,6 +914,7 @@ echo "=== CLI dispatch parsing smoke check ==="
 # WI#330 CX-1: with no tenant/fleet endpoint at all, add-tenant must fail
 # loudly instead of rendering an unreachable default. (The fleet default is
 # unset in the subshell to simulate a host without LUNARWING_MT_TENSORZERO_URL.)
+# shellcheck disable=SC2034  # read by main() inside the same subshell
 no_url_err="$(
   ( require_root() { :; }; DEFAULT_TENSORZERO_URL=""; DEFAULT_LLM_BASE_URL=""; main add-tenant fixture-no-url ) 2>&1 || true
 )"
@@ -924,6 +925,7 @@ else
   echo "        $no_url_err"
   failures=$((failures + 1))
 fi
+# shellcheck disable=SC2034  # read by main() inside the same subshell
 no_url_proxy_err="$(
   ( require_root() { :; }; DEFAULT_TENSORZERO_URL=""; main add-tenant fixture-no-url --enable-proxy --llm-base-url http://custom:9000/v1 ) 2>&1 || true
 )"

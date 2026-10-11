@@ -882,12 +882,13 @@ ensure_ssh_config() { :; }
 provision_tenant_ssh_key() { :; }
 warn_if_sshd_unreachable() { :; }
 
-# Run add_tenant with success-mode bootstrap
+# Run add_tenant with success-mode bootstrap (WI#330: arg 5 is the required
+# TensorZero endpoint — there is no built-in default anymore).
 : >"$call_order_log"
 DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
   VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
   DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
-  add_tenant "auto-boot-tenant" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  add_tenant "auto-boot-tenant" "" "" "" "http://tz:3030" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
   >/dev/null 2>&1 || true
 
 # Verify ordering: env-created before weechat-bootstrap before postgres
@@ -936,7 +937,7 @@ sandbox_image_fixture="custom-sandbox:v2"
 DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
   VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
   DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
-  add_tenant "custom-sandbox-tenant" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  add_tenant "custom-sandbox-tenant" "" "" "" "http://tz:3030" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
   >"$MT_FIXTURE/custom-sandbox.out" 2>&1 || true
 sandbox_image_fixture=""
 if ! grep -q 'sandbox-image-built\|sandbox-image-distributed' "$call_order_log" \
@@ -954,7 +955,7 @@ sandbox_build_fail_mode="true"
 DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
   VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
   DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
-  add_tenant "sandbox-build-fail" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  add_tenant "sandbox-build-fail" "" "" "" "http://tz:3030" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
   >"$MT_FIXTURE/sandbox-build-fail.out" 2>&1 || true
 sandbox_build_fail_mode=""
 if grep -q 'postgres' "$call_order_log" \
@@ -971,7 +972,7 @@ bootstrap_fail_mode="fail"
 DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
   VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
   DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
-  add_tenant "auto-boot-fail" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  add_tenant "auto-boot-fail" "" "" "" "http://tz:3030" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
   >/dev/null 2>&1 || true
 
 # postgres should still be called (base provisioning continues)
@@ -996,7 +997,7 @@ WEECHAT_BOOTSTRAP_OPT_OUT=true
 DEFAULT_SSH_ENABLED="false" SSH_OPT_OUT="true" CONTAINER_RT="podman" \
   VISION_SIDECAR_IMAGE="dummy" INIT_SYSTEM="systemd" \
   DEFAULT_HEALTH_ENABLED="false" HEALTH_OPT_OUT="true" \
-  add_tenant "auto-boot-disabled" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
+  add_tenant "auto-boot-disabled" "" "" "" "http://tz:3030" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" \
   >"$MT_FIXTURE/disabled-output" 2>&1 || true
 
 assert_fail "opt-out does not invoke WeeChat bootstrap" \
