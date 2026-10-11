@@ -2220,8 +2220,13 @@ impl Tool for JobEventsTool {
 /// polls for queued prompts between turns and feeds them into the next
 /// `claude --resume` invocation, enabling interactive multi-turn sessions
 /// with long-running sandbox jobs.
+///
+/// `prompt_queue` is `None` on sandbox-disabled deployments (the tool stays
+/// registered so external-worker jobs remain promptable via the control
+/// channel — WI#328); the local path then rejects honestly instead of
+/// queueing into a buffer nothing drains (MR !1525 DI-6).
 pub struct JobPromptTool {
-    prompt_queue: PromptQueue,
+    prompt_queue: Option<PromptQueue>,
     context_manager: Arc<ContextManager>,
     store: Option<Arc<dyn Database>>,
     external_worker_manager: Option<Arc<ExternalWorkerManager>>,
@@ -2238,7 +2243,7 @@ pub type PromptQueue = Arc<
 >;
 
 impl JobPromptTool {
-    pub fn new(prompt_queue: PromptQueue, context_manager: Arc<ContextManager>) -> Self {
+    pub fn new(prompt_queue: Option<PromptQueue>, context_manager: Arc<ContextManager>) -> Self {
         Self {
             prompt_queue,
             context_manager,
@@ -2269,11 +2274,12 @@ impl Tool for JobPromptTool {
     fn description(&self) -> &str {
         "Send a follow-up prompt to a running job. For Claude Code sandbox jobs the prompt is \
          queued and delivered on the next poll cycle. For external workers (opencode, harness, \
-         etc.) the prompt travels over the runtime control channel and the worker holds it until \
-         its current turn ends; only workers that advertise the `task_prompt` capability accept \
-         it — others reject with an explicit error. Use this to give the sub-agent additional \
-         instructions, answer its questions, or tell it to wrap up. \
-         This does not cancel work; use cancel_job for cancellation."
+         etc.) the prompt travels over the runtime control channel: the worker applies it after \
+         its current turn ends, never mid-call, and only workers that advertise the \
+         `task_prompt` capability accept it — others reject with an explicit error. Use this to \
+         give the sub-agent additional instructions, answer its questions, or tell it to wrap \
+         up. A wrap-up (done=true) applies after the current turn and closes the channel to \
+         further prompts. This does not cancel work; use cancel_job for cancellation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2403,8 +2409,19 @@ impl Tool for JobPromptTool {
             done,
         };
 
+        // MR !1525 DI-6: on sandbox-disabled deployments the tool is
+        // registered for the external control channel only and carries no
+        // real queue — reject local jobs honestly instead of a false
+        // "Prompt queued" into a buffer nothing drains.
+        let Some(ref prompt_queue) = self.prompt_queue else {
+            return Err(ToolError::ExecutionFailed(format!(
+                "job {job_id} is not an external worker job and this deployment has no local \
+                 prompt queue (sandbox is disabled); follow-up prompts are not possible for it"
+            )));
+        };
+
         {
-            let mut queue = self.prompt_queue.lock().await;
+            let mut queue = prompt_queue.lock().await;
             queue.entry(job_id).or_default().push_back(prompt);
         }
 
@@ -3344,7 +3361,7 @@ mod tests {
 
     fn test_prompt_tool(queue: PromptQueue) -> JobPromptTool {
         let cm = Arc::new(ContextManager::new(5));
-        JobPromptTool::new(queue, cm)
+        JobPromptTool::new(Some(queue), cm)
     }
 
     #[tokio::test]
@@ -3357,7 +3374,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(Arc::clone(&queue), cm);
+        let tool = JobPromptTool::new(Some(Arc::clone(&queue)), cm);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string(),
@@ -3488,7 +3505,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(queue, cm);
+        let tool = JobPromptTool::new(Some(queue), cm);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string(),
@@ -3537,7 +3554,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(queue, cm).with_external_workers(ewm);
+        let tool = JobPromptTool::new(Some(queue), cm).with_external_workers(ewm);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string(),
@@ -3576,7 +3593,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(queue, cm).with_external_workers(ewm);
+        let tool = JobPromptTool::new(Some(queue), cm).with_external_workers(ewm);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string(),
@@ -3637,7 +3654,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(Arc::clone(&queue), cm)
+        let tool = JobPromptTool::new(Some(Arc::clone(&queue)), cm)
             .with_external_workers(ewm)
             .with_store(store);
 
@@ -3673,7 +3690,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(queue, cm);
+        let tool = JobPromptTool::new(Some(queue), cm);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string(),
@@ -3688,6 +3705,32 @@ mod tests {
             err.contains("cannot receive follow-up prompts"),
             "expected completed-job rejection, got: {}",
             err
+        );
+    }
+
+    /// WI#328 (MR !1525 DI-6): on a sandbox-disabled deployment the tool
+    /// carries no real prompt queue (registered only for the external control
+    /// channel). A prompt for a local job must fail honestly instead of
+    /// reporting "Prompt queued" into a buffer nothing drains.
+    #[tokio::test]
+    async fn test_job_prompt_tool_queueless_rejects_local_job() {
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = cm
+            .create_job_for_user("default", "Local Job", "desc")
+            .await
+            .unwrap(); // safety: test
+
+        let tool = JobPromptTool::new(None, cm);
+
+        let params = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "content": "hello",
+        });
+        let ctx = JobContext::default();
+        let err = tool.execute(params, &ctx).await.unwrap_err().to_string(); // safety: test
+        assert!(
+            err.contains("no local prompt queue"),
+            "expected queueless rejection, got: {err}"
         );
     }
 

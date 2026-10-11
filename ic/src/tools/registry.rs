@@ -708,10 +708,11 @@ impl ToolRegistry {
         // Register the prompt tool when a queue is available OR external
         // workers exist (WI#328, MR !1508 review CT-7): in external-only
         // deployments (sandbox disabled) the control channel is the only
-        // prompt path, and a fresh queue is simply never drained.
+        // prompt path. The tool keeps the queue Optional (MR !1525 DI-6) so
+        // the local path can reject honestly when no queue exists instead of
+        // reporting "Prompt queued" into a buffer nothing drains.
         if prompt_queue.is_some() || ewm_for_prompt.is_some() {
-            let pq = prompt_queue.unwrap_or_default();
-            let mut prompt_tool = JobPromptTool::new(pq, Arc::clone(&context_manager));
+            let mut prompt_tool = JobPromptTool::new(prompt_queue, Arc::clone(&context_manager));
             if let Some(ewm) = ewm_for_prompt {
                 prompt_tool = prompt_tool.with_external_workers(ewm);
             }

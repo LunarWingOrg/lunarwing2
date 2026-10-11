@@ -252,9 +252,11 @@ struct TaskPromptAckPayload {
     task_id: String,
     seq: u64,
     /// Whether the worker accepted the prompt (vs. dropping it, e.g. because
-    /// the task was already wrapping up). Informational only — the ack
-    /// itself is the delivery receipt.
-    #[allow(dead_code)]
+    /// the task was already wrapping up). Absent on pre-WI#328-ack workers;
+    /// the ack frame itself is the delivery receipt, so a missing flag is
+    /// recorded as accepted=true. The value is persisted on the `control_ack`
+    /// row so a refused prompt does not masquerade as delivered in the audit
+    /// trail (MR !1525 DI-8).
     accepted: Option<bool>,
 }
 
@@ -480,7 +482,8 @@ impl ExternalWorkerManager {
     /// log (`control_prompt` rows carry a SHA-256 digest and length so the
     /// audit trail shows exactly what a credentialed worker was told without
     /// logging prompt text). Workers that understand the channel ack with
-    /// `task_prompt_ack` (persisted as `control_ack`); acks for seqs the
+    /// `task_prompt_ack` (persisted as `control_ack` with the worker's
+    /// `accepted` flag, absent counting as accepted); acks for seqs the
     /// daemon never delivered are ignored.
     ///
     /// Rejections are explicit: unknown owner (same "no active task" shape
@@ -523,8 +526,14 @@ impl ExternalWorkerManager {
 
         // The seq assignment and the queue send share one write-lock critical
         // section, so concurrent senders (web UI + agent tool) cannot interleave
-        // seq N+1 into the FIFO ahead of seq N (MR !1508 review CT-10), and the
-        // persisted "enqueued" event always precedes any "delivered" row.
+        // seq N+1 into the FIFO ahead of seq N (MR !1508 review CT-10). The
+        // event-log writes happen AFTER the lock is dropped (MR !1525 DI-5):
+        // holding the global handle lock across DB writes would stall
+        // cancel/reserve/dispatch for every job on a slow pool. Correlate
+        // control_prompt rows by seq rather than insertion order — a fast
+        // read loop can record "delivered seq=N" before this sender persists
+        // "enqueued seq=N".
+        let digest = sha2::Sha256::digest(trimmed.as_bytes());
         let mut handles = self.active_handles.write().await;
         let handle = handles
             .get_mut(&job_id)
@@ -566,23 +575,15 @@ impl ExternalWorkerManager {
         }
 
         let seq = handle.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let digest = sha2::Sha256::digest(trimmed.as_bytes());
-        persist_event(
-            self.store.as_ref(),
-            job_id,
-            "control_prompt",
-            &format!(
-                "enqueued seq={seq} done={done} len={} sha256={digest:x}",
-                trimmed.len()
-            ),
-        )
-        .await;
         let prompt = ControlPrompt {
             seq,
             prompt: trimmed.to_string(),
             done,
         };
-        if let Err(error) = handle.prompt_tx.try_send(prompt) {
+        let send_outcome = handle.prompt_tx.try_send(prompt);
+        drop(handles);
+
+        if let Err(error) = send_outcome {
             let reason = match error {
                 mpsc::error::TrySendError::Full(_) => {
                     queue_full("control queue filled between check and send")
@@ -600,7 +601,17 @@ impl ExternalWorkerManager {
             .await;
             return Err(reason);
         }
-        drop(handles);
+
+        persist_event(
+            self.store.as_ref(),
+            job_id,
+            "control_prompt",
+            &format!(
+                "enqueued seq={seq} done={done} len={} sha256={digest:x}",
+                trimmed.len()
+            ),
+        )
+        .await;
 
         emit_event(
             self.job_event_tx.as_ref(),
@@ -1701,7 +1712,10 @@ async fn run_external_task(
                             // prompt. Only seqs this loop actually delivered
                             // are recorded; anything else (forged, duplicated,
                             // or for another task) is ignored — older workers
-                            // never send acks at all.
+                            // never send acks at all. The row carries the
+                            // worker's `accepted` flag (absent = true) so a
+                            // refused prompt is auditable as such (MR !1525
+                            // DI-8).
                             if let Ok(ack) =
                                 serde_json::from_value::<TaskPromptAckPayload>(env.payload)
                                 && ack.task_id == job_id.to_string()
@@ -1711,7 +1725,11 @@ async fn run_external_task(
                                         store,
                                         job_id,
                                         "control_ack",
-                                        &format!("seq={}", ack.seq),
+                                        &format!(
+                                            "seq={} accepted={}",
+                                            ack.seq,
+                                            ack.accepted.unwrap_or(true)
+                                        ),
                                     )
                                     .await;
                                 } else {
@@ -1746,6 +1764,12 @@ async fn run_external_task(
                     .await;
                 }
                 _ = wait_for_cancellation(&mut cancel_rx) => {
+                    // MR !1525 DI-7: close the control queue FIRST. The
+                    // bounded handoff below never drains the queue, so
+                    // prompts submitted during it must get an explicit
+                    // rejection (and anything still queued is recorded as
+                    // dropped) instead of a false "queued".
+                    close_control_queue(job_id, prompt_rx, store).await;
                     send_cancel_envelope(&mut write, job_id).await;
                     // Bounded handoff (WI#149): wait for the worker's terminal
                     // frame (a `task_result` for this job) or socket close
@@ -1781,6 +1805,13 @@ async fn run_external_task(
         }
     })
     .await;
+
+    // MR !1525 DI-7: close the control queue the moment the read loop exits
+    // (any reason — result, protocol error, cancel, or timeout), before the
+    // post-loop transition/DB writes below. Prompts sent in that window get
+    // an explicit rejection instead of a false "queued", and anything still
+    // buffered is recorded as dropped.
+    close_control_queue(job_id, prompt_rx, store).await;
 
     let task_result = match result {
         Ok(r) => r?,
@@ -1966,12 +1997,17 @@ async fn run_external_task(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Close a finished task's control queue and record anything still queued as
-/// dropped (WI#328). Closing the receiver makes every subsequent `try_send`
-/// fail, so prompts submitted after the read loop exits get an explicit
-/// `ExternalWorkerTaskNotActive` instead of a false "queued" — and prompts
-/// that raced the exit are visible in the job event log instead of vanishing
-/// (MR !1508 review CT-2; delivery is at-most-once).
+/// Close a task's control queue and record anything still queued as dropped
+/// (WI#328). Closing the receiver makes every subsequent `try_send` fail, so
+/// prompts submitted afterwards get an explicit `ExternalWorkerTaskNotActive`
+/// instead of a false "queued" — and prompts that raced the exit are visible
+/// in the job event log instead of vanishing (MR !1508 review CT-2; delivery
+/// is at-most-once).
+///
+/// Called at the top of the cancel arm and immediately after the read loop
+/// exits (MR !1525 DI-7), and again by `execute_task` for the pre-loop
+/// failure paths (connect/handshake) that never enter the loop. Idempotent:
+/// `close` on a closed receiver is a no-op and the drain finds nothing.
 async fn close_control_queue(
     job_id: Uuid,
     prompt_rx: &mut mpsc::Receiver<ControlPrompt>,
