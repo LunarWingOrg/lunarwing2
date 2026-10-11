@@ -457,7 +457,22 @@ impl CronWorkerConfig {
         }
         for component in path.components() {
             match component {
-                std::path::Component::Normal(_) => {}
+                std::path::Component::Normal(part) => {
+                    // MR !1531 DS-5: the TS bridges' containment predicate
+                    // rejects any residual starting with `..` (creating the
+                    // directory first and then failing the tick), while pebble
+                    // accepts it. Refuse `..x` names at load so every bridge
+                    // agrees and nothing is created.
+                    if part.as_encoded_bytes().starts_with(b"..") {
+                        return Err(bad("a component starting with `..`"));
+                    }
+                    // MR !1531 DQ-3: components longer than NAME_MAX pass this
+                    // validation but fail on the worker (a long
+                    // `mission_id`-derived default can hit it); reject at load.
+                    if part.len() > 255 {
+                        return Err(bad("a component over 255 bytes"));
+                    }
+                }
                 std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                     return Err(bad("absolute"));
                 }
@@ -474,6 +489,10 @@ impl CronWorkerConfig {
         if dir.split('/').any(|part| part.is_empty() || part == ".") {
             return Err(bad("not a sequence of nonempty normal components"));
         }
+        // MR !1531 DQ-3: `project_dir` components must be plain directories —
+        // the bridges create them descriptor-relative with O_NOFOLLOW and
+        // refuse any pre-existing symlink component (ENOTDIR), even when it
+        // points inside the root.
         Ok(())
     }
 }
@@ -1410,6 +1429,37 @@ goal = "g"
                 "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nmission_id = \"../x\""
             )
             .is_none()
+        );
+        // MR !1531 DS-5: `..`-prefixed normal components are refused at load
+        // so all bridges agree (previously the TS bridges created the
+        // directory and then rejected it as an escape; pebble accepted it).
+        for dir in ["..missions/pr-digest", "missions/..digest"] {
+            assert!(
+                resolve_cron_worker(&format!(
+                    "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nproject_dir = \"{dir}\""
+                ))
+                .is_none(),
+                "project_dir {dir:?} must be rejected at load"
+            );
+        }
+        // MR !1531 DQ-3: a component over NAME_MAX (255 bytes) passes
+        // validation but fails on the worker; refuse it at load. Exactly 255
+        // bytes stays valid.
+        let over = "m".repeat(256);
+        assert!(
+            resolve_cron_worker(&format!(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nproject_dir = \"missions/{over}\""
+            ))
+            .is_none(),
+            "project_dir with a >255-byte component must be rejected at load"
+        );
+        let at_max = "m".repeat(255);
+        assert!(
+            resolve_cron_worker(&format!(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nproject_dir = \"missions/{at_max}\""
+            ))
+            .is_some(),
+            "a 255-byte component must remain valid"
         );
     }
 
