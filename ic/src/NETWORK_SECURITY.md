@@ -70,6 +70,14 @@ manager's independent mission-owner gate. POST accepts only a typed
 `pause|resume|status` action and rejects unknown JSON fields; callers cannot
 choose their identity. Query-string bearer tokens are not accepted on this
 route. Existing CORS/body limits apply, and waits are bounded to 10 seconds.
+Enqueue and status-reply are separate phases within that budget: if the
+command was accepted by the supervisor queue but not confirmed in time, the
+route answers `202 Accepted` (`queued: true`) rather than a misleading 504 —
+the mutation may already be applied or still queued, so re-query status
+before retrying (pause/resume are idempotent; a repeated resume resets the
+circuit breaker again and writes a duplicate audit row). 504 means the
+command never entered the queue. Lifecycle audit rows record the origin
+(`owner_api` here versus `owner_tool` for the `cron_mission` LLM tool).
 The route works independently of Engine V1/V2 and creates no tool/worker
 credential bypass. See `handlers/cron_workers.rs` and the cron-mode design doc.
 

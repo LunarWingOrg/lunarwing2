@@ -27,7 +27,9 @@ use crate::db::Database;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::ExternalWorkerManager;
 use crate::orchestrator::auth::{CredentialGrant, SandboxJobGrants};
-use crate::orchestrator::external_worker::{ExternalTaskStatus, build_task_context};
+use crate::orchestrator::external_worker::{
+    CronCommandOrigin, ExternalTaskStatus, build_task_context,
+};
 use crate::orchestrator::job_manager::{
     ContainerJobManager, ContainerJobRequest, JobMode, MAX_WORKER_MCP_SERVERS, snapshot_worker_mcp,
 };
@@ -2145,11 +2147,11 @@ impl Tool for CronMissionTool {
         };
         match action {
             "pause" => manager
-                .pause_cron_mission(worker, &ctx.user_id)
+                .pause_cron_mission(worker, &ctx.user_id, CronCommandOrigin::OwnerTool)
                 .await
                 .map_err(as_tool_error)?,
             "resume" => manager
-                .resume_cron_mission(worker, &ctx.user_id)
+                .resume_cron_mission(worker, &ctx.user_id, CronCommandOrigin::OwnerTool)
                 .await
                 .map_err(as_tool_error)?,
             "status" => {}

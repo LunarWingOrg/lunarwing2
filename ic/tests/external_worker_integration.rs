@@ -51,7 +51,7 @@ use lunarwing::context::{ContextManager, JobContext, JobState};
 use lunarwing::error::OrchestratorError;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
-    ConversationMessage, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
+    ConversationMessage, CronCommandOrigin, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
 };
 use lunarwing::tools::Tool;
 use lunarwing::tools::builtin::CreateJobTool;
@@ -2464,7 +2464,7 @@ async fn cron_mission_pause_resume_status_owner_gated() {
     assert!(!status.paused);
 
     // Pause persists in live state.
-    mgr.pause_cron_mission("mock", "owner-1")
+    mgr.pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
         .await
         .expect("pause");
     let status = mgr
@@ -2475,7 +2475,7 @@ async fn cron_mission_pause_resume_status_owner_gated() {
 
     // A different owner may not drive the mission.
     let err = mgr
-        .pause_cron_mission("mock", "someone-else")
+        .pause_cron_mission("mock", "someone-else", CronCommandOrigin::OwnerTool)
         .await
         .expect_err("owner gate");
     assert!(matches!(err, OrchestratorError::CronMissionNotOwned { .. }));
@@ -2486,7 +2486,7 @@ async fn cron_mission_pause_resume_status_owner_gated() {
     assert!(matches!(err, OrchestratorError::CronMissionNotOwned { .. }));
 
     // Resume clears the pause.
-    mgr.resume_cron_mission("mock", "owner-1")
+    mgr.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
         .await
         .expect("resume");
     let status = mgr
@@ -2604,7 +2604,7 @@ async fn cron_status_and_pause_answer_during_running_tick() {
     assert!(!status.paused);
 
     // Pause during the running tick applies immediately...
-    timeout(TEST_BOUND, mgr.pause_cron_mission("mock", "owner-1"))
+    timeout(TEST_BOUND, mgr.pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool))
         .await
         .expect("pause starved by the running tick")
         .expect("pause");
@@ -2615,7 +2615,7 @@ async fn cron_status_and_pause_answer_during_running_tick() {
     assert!(status.paused);
 
     // ...and resume restores it (also immediately).
-    timeout(TEST_BOUND, mgr.resume_cron_mission("mock", "owner-1"))
+    timeout(TEST_BOUND, mgr.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool))
         .await
         .expect("resume starved")
         .expect("resume");
@@ -2644,7 +2644,7 @@ async fn cron_pause_stops_pending_reentries() {
         .expect("tick errored");
     request_rx.recv().await.expect("link 1 captured");
 
-    mgr.pause_cron_mission("mock", "owner-1")
+    mgr.pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
         .await
         .expect("pause");
 
@@ -2714,7 +2714,7 @@ async fn cron_non_retryable_abandons_and_breaker_trips() {
     );
 
     // Owner resume clears the breaker (and is how the mission recovers).
-    mgr.resume_cron_mission("mock", "owner-1")
+    mgr.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
         .await
         .expect("resume");
     let status = mgr
@@ -2864,7 +2864,7 @@ async fn cron_pause_and_tick_counter_survive_restart() {
             .expect("persisted tick reached worker");
     }
     mgr_a
-        .pause_cron_mission("mock", "owner-1")
+        .pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
         .await
         .expect("pause");
     // pause_cron_mission returns when the command is queued, not applied:
@@ -2918,7 +2918,7 @@ async fn cron_pause_and_tick_counter_survive_restart() {
             .unwrap(),
     )
     .unwrap();
-    mgr_b.resume_cron_mission("mock", "owner-1").await.unwrap();
+    mgr_b.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool).await.unwrap();
     assert!(
         !mgr_b
             .cron_mission_status("mock", "owner-1")

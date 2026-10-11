@@ -56,7 +56,7 @@ use crate::db::Database;
 use crate::error::OrchestratorError;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::external_worker::{
-    CancelReason, CronCommand, CronMissionControl, CronMissionStatus, CronTick,
+    CancelReason, CronCommand, CronCommandOrigin, CronMissionControl, CronMissionStatus, CronTick,
     ExternalWorkerManager, build_task_context,
 };
 
@@ -304,23 +304,27 @@ impl ExternalWorkerManager {
     }
 
     /// Pause a cron mission at runtime (WI#325). Persisted: a paused mission
-    /// stays paused across daemon restarts until resumed.
+    /// stays paused across daemon restarts until resumed. `origin` is
+    /// recorded on the audit row (MR !1531 DQ-5).
     pub async fn pause_cron_mission(
         &self,
         worker_name: &str,
         owner_id: &str,
+        origin: CronCommandOrigin,
     ) -> Result<(), OrchestratorError> {
-        self.send_cron_command(worker_name, owner_id, CronCommand::Pause)
+        self.send_cron_command(worker_name, owner_id, CronCommand::Pause(origin))
             .await
     }
 
-    /// Resume a paused cron mission and reset its circuit breaker.
+    /// Resume a paused cron mission and reset its circuit breaker. `origin`
+    /// is recorded on the audit row (MR !1531 DQ-5).
     pub async fn resume_cron_mission(
         &self,
         worker_name: &str,
         owner_id: &str,
+        origin: CronCommandOrigin,
     ) -> Result<(), OrchestratorError> {
-        self.send_cron_command(worker_name, owner_id, CronCommand::Resume)
+        self.send_cron_command(worker_name, owner_id, CronCommand::Resume(origin))
             .await
     }
 
@@ -601,12 +605,12 @@ async fn handle_idle_command(
             tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, "Manual cron tick fired");
             IdleAction::FireNow
         }
-        CronCommand::Pause => {
-            apply_owner_pause(ctx, state, pause_flag).await;
+        CronCommand::Pause(origin) => {
+            apply_owner_pause(ctx, state, pause_flag, origin).await;
             IdleAction::Continue
         }
-        CronCommand::Resume => {
-            apply_owner_resume(ctx, state, pause_flag).await;
+        CronCommand::Resume(origin) => {
+            apply_owner_resume(ctx, state, pause_flag, origin).await;
             IdleAction::Continue
         }
         CronCommand::Status(reply) => {
@@ -635,8 +639,8 @@ async fn handle_active_command(
                  (a mission never overlaps itself)"
             );
         }
-        CronCommand::Pause => apply_owner_pause(ctx, state, pause_flag).await,
-        CronCommand::Resume => apply_owner_resume(ctx, state, pause_flag).await,
+        CronCommand::Pause(origin) => apply_owner_pause(ctx, state, pause_flag, origin).await,
+        CronCommand::Resume(origin) => apply_owner_resume(ctx, state, pause_flag, origin).await,
         CronCommand::Status(reply) => reply_status(ctx, state, reply),
     }
 }
@@ -663,6 +667,7 @@ async fn apply_owner_pause(
     ctx: &TickCtx<'_>,
     state: &mut MissionState,
     pause_flag: &Arc<AtomicBool>,
+    origin: CronCommandOrigin,
 ) {
     state.paused = true;
     pause_flag.store(true, Ordering::SeqCst);
@@ -673,7 +678,7 @@ async fn apply_owner_pause(
         "cron_paused",
         serde_json::json!({
             "mission_id": ctx.mission_id,
-            "origin": "owner_command",
+            "origin": origin.as_str(),
         }),
         format!("cron mission {} paused by owner", ctx.mission_id),
     )
@@ -685,6 +690,7 @@ async fn apply_owner_resume(
     ctx: &TickCtx<'_>,
     state: &mut MissionState,
     pause_flag: &Arc<AtomicBool>,
+    origin: CronCommandOrigin,
 ) {
     state.paused = false;
     state.consecutive_abandoned = 0;
@@ -696,7 +702,7 @@ async fn apply_owner_resume(
         "cron_resumed",
         serde_json::json!({
             "mission_id": ctx.mission_id,
-            "origin": "owner_command",
+            "origin": origin.as_str(),
         }),
         format!("cron mission {} resumed by owner", ctx.mission_id),
     )
@@ -1979,11 +1985,14 @@ mod tests {
         for _ in 0..64 {
             let (commands, mut rx) = mpsc::channel(2);
             let (shutdown, mut shutdown_rx) = broadcast::channel(1);
-            commands.send(CronCommand::Pause).await.unwrap();
+            commands
+                .send(CronCommand::Pause(CronCommandOrigin::OwnerTool))
+                .await
+                .unwrap();
             shutdown.send(()).unwrap();
             assert!(matches!(
                 next_wake(Duration::ZERO, &mut rx, &mut shutdown_rx).await,
-                Some(Wake::Command(CronCommand::Pause))
+                Some(Wake::Command(CronCommand::Pause(_)))
             ));
             assert!(
                 next_wake(Duration::from_secs(60), &mut rx, &mut shutdown_rx)
@@ -2008,7 +2017,10 @@ mod tests {
                 paused: true,
                 ..Default::default()
             };
-            commands.send(CronCommand::Resume).await.unwrap();
+            commands
+                .send(CronCommand::Resume(CronCommandOrigin::OwnerTool))
+                .await
+                .unwrap();
             shutdown.send(()).unwrap();
             assert!(paused_turn(&ctx, &mut state, &pause, &mut rx, &mut shutdown_rx).await);
             assert!(!state.paused);

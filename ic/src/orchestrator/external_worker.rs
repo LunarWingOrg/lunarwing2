@@ -239,11 +239,31 @@ pub enum CronCommand {
     FireNow,
     /// Pause the mission: scheduled fires are skipped until resumed. The
     /// pause is persisted and survives daemon restarts.
-    Pause,
+    Pause(CronCommandOrigin),
     /// Resume a paused mission and reset the circuit breaker.
-    Resume,
+    Resume(CronCommandOrigin),
     /// Query mission status (reply carries the persisted + live state).
     Status(tokio::sync::oneshot::Sender<CronMissionStatus>),
+}
+
+/// Where an owner cron command entered the system (MR !1531 DQ-5). The
+/// `cron_paused`/`cron_resumed` audit rows carry it so the trail can tell
+/// the LLM tool apart from the HTTP recovery route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronCommandOrigin {
+    /// The `cron_mission` builtin tool inside an LLM turn.
+    OwnerTool,
+    /// The `POST /api/workers/{worker}/cron` web-gateway route.
+    OwnerApi,
+}
+
+impl CronCommandOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerTool => "owner_tool",
+            Self::OwnerApi => "owner_api",
+        }
+    }
 }
 
 /// Live + persisted state of one cron mission (WI#325).
