@@ -63,7 +63,13 @@ pub async fn run_status_command() -> anyhow::Result<()> {
                 .unwrap_or_else(crate::config::default_libsql_path);
             if path.exists() {
                 let turso = if crate::config::env_or_override("LIBSQL_URL").is_some() {
-                    " + Turso sync"
+                    // WI#331: without the cargo feature the daemon refuses
+                    // this config at startup — say so instead of "+ Turso sync".
+                    if cfg!(feature = "libsql-remote-replica") {
+                        " + Turso sync"
+                    } else {
+                        " + Turso sync (configured but not compiled in: daemon will refuse to start; rebuild with `libsql-remote-replica`)"
+                    }
                 } else {
                     ""
                 };

@@ -3,7 +3,8 @@
 //! Provides an embedded SQLite-compatible database using Turso's libSQL fork.
 //! Supports three modes:
 //! - Local embedded (file-based, no server needed)
-//! - Turso cloud with embedded replica (sync to cloud)
+//! - Turso cloud with embedded replica (sync to cloud) — only in builds with
+//!   the non-default `libsql-remote-replica` cargo feature (WI#331)
 //! - In-memory (for testing)
 
 mod conversations;
@@ -94,6 +95,12 @@ impl LibSqlBackend {
     }
 
     /// Create with Turso cloud sync (embedded replica).
+    ///
+    /// Only available with the non-default `libsql-remote-replica` cargo
+    /// feature (WI#331): the libsql 0.6.0 remote chain pins rustls-webpki
+    /// 0.102 / h2 0.3, which carry accepted RustSec advisories, so the code
+    /// is kept out of default builds.
+    #[cfg(feature = "libsql-remote-replica")]
     pub async fn new_remote_replica(
         path: &Path,
         url: &str,
@@ -111,6 +118,51 @@ impl LibSqlBackend {
             .map_err(|e| DatabaseError::Pool(format!("Failed to open remote replica: {}", e)))?;
 
         Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Open the standard libSQL connection for the given config trio:
+    /// a local database at `path`, or a Turso remote replica when `url` is
+    /// set (which then requires `auth_token`).
+    ///
+    /// Without the `libsql-remote-replica` cargo feature, requesting a remote
+    /// replica fails with a clear error instead of silently going local-only
+    /// (WI#331).
+    pub async fn from_config_parts(
+        path: &Path,
+        url: Option<&str>,
+        auth_token: Option<&str>,
+    ) -> Result<Self, DatabaseError> {
+        match (url, auth_token) {
+            (Some(url), Some(token)) => Self::remote_replica(path, url, token).await,
+            (Some(_), None) => Err(DatabaseError::Pool(
+                "LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set".to_string(),
+            )),
+            (None, _) => Self::new_local(path).await,
+        }
+    }
+
+    #[cfg(feature = "libsql-remote-replica")]
+    async fn remote_replica(
+        path: &Path,
+        url: &str,
+        auth_token: &str,
+    ) -> Result<Self, DatabaseError> {
+        Self::new_remote_replica(path, url, auth_token).await
+    }
+
+    #[cfg(not(feature = "libsql-remote-replica"))]
+    async fn remote_replica(
+        _path: &Path,
+        _url: &str,
+        _auth_token: &str,
+    ) -> Result<Self, DatabaseError> {
+        Err(DatabaseError::Pool(
+            "LIBSQL_URL is set but libSQL remote replicas (Turso sync) are disabled in this \
+             build: rebuild with the cargo feature `libsql-remote-replica` to enable them \
+             (WI#331: the libsql 0.6.0 remote chain carries accepted RustSec advisories; \
+             see ic/deny.toml)"
+                .to_string(),
+        ))
     }
 
     /// Get a shared reference to the underlying database handle.
@@ -459,6 +511,83 @@ mod tests {
         assert_eq!(normalize_notify_user(Some("default".to_string())), None); // safety: test-only assertion
         let normalized = normalize_notify_user(Some("123456789".to_string()));
         assert_eq!(normalized, Some("123456789".to_string())); // safety: test-only assertion
+    }
+
+    /// WI#331 / MR !1513 review CZ-3: without the `libsql-remote-replica`
+    /// feature, a fully configured remote replica must fail closed and name
+    /// the cargo feature — never silently fall back to a local-only database
+    /// (that fallback is the data-divergence failure this gate exists to
+    /// prevent). No network is needed: the code errors before connecting.
+    #[tokio::test]
+    #[cfg(not(feature = "libsql-remote-replica"))]
+    async fn test_from_config_parts_remote_replica_fails_closed_without_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replica.db");
+
+        let result = LibSqlBackend::from_config_parts(
+            &db_path,
+            Some("libsql://example.turso.io"),
+            Some("test-token"),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("remote replica config must fail without the feature"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("libsql-remote-replica"),
+            "error must name the cargo feature, got: {msg}"
+        );
+        // The mutation reviewed under CZ-3 (falling back to new_local) would
+        // have created a local database file; fail-closed must not.
+        assert!(
+            !db_path.exists(),
+            "fail-closed path must not create a local database file"
+        );
+    }
+
+    /// WI#331 / MR !1513 review CZ-3: LIBSQL_URL without LIBSQL_AUTH_TOKEN is
+    /// an error in every build, independent of the cargo feature.
+    #[tokio::test]
+    async fn test_from_config_parts_url_without_token_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replica.db");
+
+        let result =
+            LibSqlBackend::from_config_parts(&db_path, Some("libsql://example.turso.io"), None)
+                .await;
+
+        let err = match result {
+            Ok(_) => panic!("URL without token must error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("LIBSQL_AUTH_TOKEN"),
+            "error must name the missing token, got: {err}"
+        );
+        assert!(
+            !db_path.exists(),
+            "invalid config must not create a local DB"
+        );
+    }
+
+    /// WI#331 / MR !1513 review CZ-3: a local-only configuration (no
+    /// LIBSQL_URL) must still open a working local database in either build.
+    #[tokio::test]
+    async fn test_from_config_parts_local_only_opens_local_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("local.db");
+
+        let backend = LibSqlBackend::from_config_parts(&db_path, None, Some("ignored-token"))
+            .await
+            .expect("local-only config must open a local database");
+
+        backend
+            .connect()
+            .await
+            .expect("local database must accept connections");
     }
 
     #[test]

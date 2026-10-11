@@ -694,9 +694,16 @@ impl SetupWizard {
             print_info("Which database backend would you like to use?");
             println!();
 
+            // Turso cloud sync requires the non-default `libsql-remote-replica`
+            // cargo feature (WI#331); only advertise it when compiled in.
+            let libsql_desc = if cfg!(feature = "libsql-remote-replica") {
+                "libSQL      - embedded SQLite, zero dependencies, optional Turso cloud sync"
+            } else {
+                "libSQL      - embedded SQLite, zero dependencies"
+            };
             let options = &[
                 "PostgreSQL  - production-grade, requires a running server",
-                "libSQL      - embedded SQLite, zero dependencies, optional Turso cloud sync",
+                libsql_desc,
             ];
             let choice =
                 select_one("Select a database backend:", options).map_err(SetupError::Io)?;
@@ -845,10 +852,16 @@ impl SetupWizard {
 
         let db_path = path_input.unwrap_or(default_path_str.clone());
 
-        // Ask about Turso cloud sync
-        println!();
-        let use_turso =
-            confirm("Enable Turso cloud sync (remote replica)?", false).map_err(SetupError::Io)?;
+        // Ask about Turso cloud sync. Remote replicas require the
+        // non-default `libsql-remote-replica` cargo feature (WI#331), so the
+        // prompt is skipped entirely in builds without it.
+        #[cfg(feature = "libsql-remote-replica")]
+        let use_turso = {
+            println!();
+            confirm("Enable Turso cloud sync (remote replica)?", false).map_err(SetupError::Io)?
+        };
+        #[cfg(not(feature = "libsql-remote-replica"))]
+        let use_turso = false;
 
         let (turso_url, turso_token) = if use_turso {
             print_info("Enter your Turso database URL and auth token.");
@@ -977,17 +990,21 @@ impl SetupWizard {
         use crate::db::libsql::LibSqlBackend;
         use std::path::Path;
 
-        let db_path = Path::new(path);
-
-        let backend = if let (Some(url), Some(token)) = (turso_url, turso_token) {
-            LibSqlBackend::new_remote_replica(db_path, url, token)
-                .await
-                .map_err(|e| SetupError::Database(format!("Failed to connect: {}", e)))?
-        } else {
-            LibSqlBackend::new_local(db_path)
-                .await
-                .map_err(|e| SetupError::Database(format!("Failed to open database: {}", e)))?
-        };
+        // Use the runtime's config validation, including URL-without-token.
+        // Testing a local fallback would let setup accept a config that startup
+        // rejects, and could write to a stale Turso replica (WI#331 / CZ-3).
+        let backend = LibSqlBackend::from_config_parts(Path::new(path), turso_url, turso_token)
+            .await
+            .map_err(|e| {
+                let hint = if turso_url.is_some() {
+                    " Unsetting LIBSQL_URL instead is NOT a safe fallback: the existing replica \
+                     file becomes a diverging standalone database whose writes never reach the \
+                     Turso primary."
+                } else {
+                    ""
+                };
+                SetupError::Database(format!("Failed to connect: {e}.{hint}"))
+            })?;
 
         self.db_backend = Some(backend);
         Ok(())
@@ -3509,6 +3526,90 @@ mod tests {
 
     use super::*;
     use crate::config::helpers::lock_env;
+
+    /// WI#331 / MR !1513 review CZ-3: build a wizard without touching
+    /// bootstrap settings or instance assets.
+    #[cfg(feature = "libsql")]
+    fn bare_wizard_for_fail_closed_tests() -> SetupWizard {
+        SetupWizard {
+            config: SetupConfig::default(),
+            settings: Settings::default(),
+            owner_id: "test".to_string(),
+            session_manager: None,
+            #[cfg(feature = "postgres")]
+            db_pool: None,
+            db_backend: None,
+            secrets_crypto: None,
+            llm_api_key: None,
+        }
+    }
+
+    /// WI#331 / MR !1513 review CZ-3: without the `libsql-remote-replica`
+    /// feature, a configured Turso remote replica must fail closed and name
+    /// the cargo feature — never silently fall back to a local-only database
+    /// (that fallback is the data-divergence failure this gate exists to
+    /// prevent).
+    #[tokio::test]
+    #[cfg(all(feature = "libsql", not(feature = "libsql-remote-replica")))]
+    async fn libsql_remote_replica_configured_fails_closed_without_feature() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("replica.db").to_string_lossy().to_string();
+        let mut wizard = bare_wizard_for_fail_closed_tests();
+
+        let result = wizard
+            .test_database_connection_libsql(
+                &db_path,
+                Some("libsql://example.turso.io"),
+                Some("test-token"),
+            )
+            .await;
+
+        let err = result.expect_err("remote replica config must fail without the feature");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("libsql-remote-replica"),
+            "error must name the cargo feature, got: {msg}"
+        );
+        assert!(wizard.db_backend.is_none());
+        assert!(!std::path::Path::new(&db_path).exists());
+        assert!(msg.contains("diverging standalone database"));
+    }
+
+    /// URL-without-token is an error even in remote-capable builds; the
+    /// wizard must neither create a local replica nor install a backend.
+    #[tokio::test]
+    #[cfg(feature = "libsql")]
+    async fn libsql_url_without_token_fails_closed() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("replica.db").to_string_lossy().to_string();
+        let mut wizard = bare_wizard_for_fail_closed_tests();
+
+        let err = wizard
+            .test_database_connection_libsql(&db_path, Some("libsql://example.turso.io"), None)
+            .await
+            .expect_err("URL without token must not test a local fallback");
+
+        assert!(err.to_string().contains("LIBSQL_AUTH_TOKEN"));
+        assert!(err.to_string().contains("diverging standalone database"));
+        assert!(wizard.db_backend.is_none());
+        assert!(!std::path::Path::new(&db_path).exists());
+    }
+
+    /// A local-only configuration (no LIBSQL_URL) works in either build.
+    #[tokio::test]
+    #[cfg(feature = "libsql")]
+    async fn libsql_local_only_opens_local_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("local.db").to_string_lossy().to_string();
+        let mut wizard = bare_wizard_for_fail_closed_tests();
+
+        wizard
+            .test_database_connection_libsql(&db_path, None, Some("ignored-token"))
+            .await
+            .expect("local-only config must still open a local database");
+
+        assert!(wizard.db_backend.is_some());
+    }
 
     #[test]
     #[cfg(feature = "libsql")]

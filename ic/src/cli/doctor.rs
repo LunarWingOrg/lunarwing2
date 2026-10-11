@@ -303,6 +303,19 @@ async fn check_database() -> CheckResult {
                 .map(PathBuf::from)
                 .unwrap_or_else(crate::config::default_libsql_path);
 
+            // WI#331: a configured Turso remote replica without the cargo
+            // feature means the daemon will refuse to start — report that
+            // instead of a healthy-looking pass.
+            #[cfg(not(feature = "libsql-remote-replica"))]
+            if crate::config::env_or_override("LIBSQL_URL").is_some() {
+                return CheckResult::Fail(
+                    "LIBSQL_URL is set but libSQL remote replicas (Turso sync) are not compiled \
+                     into this build: the daemon will refuse to start. Rebuild with the cargo \
+                     feature `libsql-remote-replica` (WI#331)."
+                        .into(),
+                );
+            }
+
             if path.exists() {
                 CheckResult::Pass(format!("libSQL database exists ({})", path.display()))
             } else {
