@@ -53,7 +53,12 @@ chmod 600 "$env_file"
 
 configure_kimi root new-model '' ''
 assert_contains "$env_file" 'KIMI_MODEL=new-model' 'configure-kimi updates selected model'
-assert_contains "$env_file" 'KIMI_BASE_URL=https://old.example/v1' 'configure-kimi preserves omitted base URL'
+# WI#330: base URLs are written with the production quoting; decode to compare.
+if [[ "$(_read_env_value "$env_file" KIMI_BASE_URL)" == 'https://old.example/v1' ]]; then
+  pass 'configure-kimi preserves omitted base URL'
+else
+  fail 'configure-kimi preserves omitted base URL'
+fi
 if [[ "$(_read_env_value "$env_file" KIMI_API_KEY)" == 'old%key' ]]; then
   pass 'configure-kimi preserves omitted API key'
 else
@@ -234,7 +239,9 @@ chmod 600 "$fixture/kimi-api-key"
 CAPTURED_KIMI_KEY=''
 add_tenant() { CAPTURED_KIMI_KEY="${22:-}"; }
 with_tenant_lifecycle_lock() { shift; "$@"; }
-main add-tenant root --kimi-api-key-file "$fixture/kimi-api-key"
+# WI#330: add-tenant refuses to run with no LLM endpoint at all, so the
+# api-key-file lane passes an explicit one.
+main add-tenant root --kimi-api-key-file "$fixture/kimi-api-key" --tensorzero-url http://tz:3030
 if [[ "$CAPTURED_KIMI_KEY" == 'file-only-secret' ]]; then
   pass 'add-tenant reads Kimi API key from file'
 else

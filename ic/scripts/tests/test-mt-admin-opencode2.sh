@@ -57,7 +57,12 @@ EOF
 # ── configure-opencode2 ──────────────────────────────────────────────────────
 configure_opencode2 root new-model '' 
 assert_contains "$env_file" 'OPENCODE2_MODEL=new-model' 'configure-opencode2 updates selected model'
-assert_contains "$env_file" 'OPENCODE2_BASE_URL=https://old.example/v1' 'configure-opencode2 preserves omitted base URL'
+# WI#330: base URLs are written with the production quoting; decode to compare.
+if [[ "$(_read_env_value "$env_file" OPENCODE2_BASE_URL)" == 'https://old.example/v1' ]]; then
+  pass 'configure-opencode2 preserves omitted base URL'
+else
+  fail 'configure-opencode2 preserves omitted base URL'
+fi
 assert_not_contains "$env_file" 'OPENCODE2_MODEL=old-model' 'configure-opencode2 replaces prior model'
 
 # ── ensure_external_worker_config gating ─────────────────────────────────────

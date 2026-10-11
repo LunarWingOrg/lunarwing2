@@ -11,6 +11,11 @@ ADMIN_SCRIPT="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$ADMIN_SCRIPT"
 
+# WI#330: mt-admin no longer ships a built-in TensorZero default, so the env
+# writer needs SOME endpoint. Stand in for the fleet env var exactly the way a
+# real host's LUNARWING_MT_TENSORZERO_URL would.
+DEFAULT_TENSORZERO_URL="http://tz-fleet:3030"
+
 failures=0
 assert_eq() {  # <label> <actual> <expected>
   if [[ "$2" == "$3" ]]; then
@@ -114,8 +119,10 @@ run_writer() {  # <args...> — invokes write_tenant_lunarwing_env, prints the f
   write_tenant_lunarwing_env "$@"
 }
 
-envval() {  # <key> — extract value from the last-written fixture env
-  grep -m1 "^$1=" "$MT_FIXTURE/env/lunarwing.env" | cut -d= -f2-
+envval() {  # <key> — extract DECODED value from the last-written fixture env
+  # WI#330: worker base URLs are written with _quote_env_value; read through
+  # the same decoder production readers use.
+  _read_env_value "$MT_FIXTURE/env/lunarwing.env" "$1"
 }
 
 # Case 1: defaults (no flags) on first write
@@ -364,9 +371,9 @@ out="$(run_writer fixture-tenant \
 assert_eq "trailing slash stripped before suffix" \
   "$(envval LLM_BASE_URL)" "http://tz:3030/openai/v1"
 out="$(run_writer fixture-tenant \
-  "fixture-tenant@xmpp.localhost" "" "http://192.168.1.157:3000/openai/v1" "")"
+  "fixture-tenant@xmpp.localhost" "" "http://192.0.2.1:3000/openai/v1" "")"
 assert_eq "already-suffixed tensorzero URL unchanged" \
-  "$(envval LLM_BASE_URL)" "http://192.168.1.157:3000/openai/v1"
+  "$(envval LLM_BASE_URL)" "http://192.0.2.1:3000/openai/v1"
 out="$(run_writer fixture-tenant \
   "fixture-tenant@xmpp.localhost" "" "https://gw.example.test/tz" "")"
 assert_eq "reverse-proxy prefix kept" \
@@ -389,6 +396,189 @@ out="$(run_writer fixture-tenant \
 assert_eq "proxy enabled + explicit llm-base-url wins" \
   "$(envval LLM_BASE_URL)" "http://custom:9000/v2"
 PROXY_FIXTURE_ENABLED=false
+
+# Case 6: WI#330 — unset worker base URLs inherit the tenant's LLM endpoint.
+# The worker images ship a placeholder endpoint their entrypoints refuse to
+# run, so write_tenant_lunarwing_env must always render OPENCODE_BASE_URL /
+# KIMI_BASE_URL / OPENCODE2_BASE_URL when it has a container-reachable source:
+# --llm-base-url wins, else the tenant's TensorZero upstream (path-aware),
+# even when the daemon itself dials the loopback proxy (unreachable from
+# worker containers).
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "")"
+assert_eq "worker default: opencode inherits tensorzero upstream" \
+  "$(envval OPENCODE_BASE_URL)" "http://tz:3030/openai/v1"
+assert_eq "worker default: kimi inherits tensorzero upstream" \
+  "$(envval KIMI_BASE_URL)" "http://tz:3030/openai/v1"
+assert_eq "worker default: opencode2 inherits tensorzero upstream" \
+  "$(envval OPENCODE2_BASE_URL)" "http://tz:3030/openai/v1"
+# Inherited values carry a provenance marker (re-derived on re-render, skipped
+# by export-tenant) and are written with the production quoting.
+assert_eq "worker default: opencode marked inherited" \
+  "$(envval OPENCODE_BASE_URL_SOURCE)" "inherited"
+assert_eq "worker default: kimi marked inherited" \
+  "$(envval KIMI_BASE_URL_SOURCE)" "inherited"
+assert_eq "worker default: opencode2 marked inherited" \
+  "$(envval OPENCODE2_BASE_URL_SOURCE)" "inherited"
+assert_eq "worker default: value written quoted" \
+  "$(grep -m1 '^OPENCODE_BASE_URL=' "$MT_FIXTURE/env/lunarwing.env")" \
+  'OPENCODE_BASE_URL="http://tz:3030/openai/v1"'
+
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "http://custom:9000/v1")"
+assert_eq "worker default: explicit llm-base-url wins over tensorzero" \
+  "$(envval OPENCODE_BASE_URL)" "http://custom:9000/v1"
+assert_eq "worker default: kimi inherits explicit llm-base-url" \
+  "$(envval KIMI_BASE_URL)" "http://custom:9000/v1"
+assert_eq "worker default: opencode2 inherits explicit llm-base-url" \
+  "$(envval OPENCODE2_BASE_URL)" "http://custom:9000/v1"
+
+PROXY_FIXTURE_ENABLED=true
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "")"
+assert_eq "worker default: daemon dials loopback proxy" \
+  "$(envval LLM_BASE_URL)" "http://127.0.0.1:10004/v1"
+assert_eq "worker default: proxy loopback NOT inherited by workers" \
+  "$(envval OPENCODE_BASE_URL)" "http://tz:3030/openai/v1"
+assert_eq "worker default: kimi gets upstream, not loopback" \
+  "$(envval KIMI_BASE_URL)" "http://tz:3030/openai/v1"
+PROXY_FIXTURE_ENABLED=false
+
+# CX-6: an explicit loopback --llm-base-url is a legitimate daemon endpoint but
+# must NOT be inherited by worker containers — fall through to the upstream.
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "http://127.0.0.1:9000/v1")"
+assert_eq "loopback llm-base-url: daemon keeps it" \
+  "$(envval LLM_BASE_URL)" "http://127.0.0.1:9000/v1"
+assert_eq "loopback llm-base-url: workers skip to tensorzero upstream" \
+  "$(envval OPENCODE_BASE_URL)" "http://tz:3030/openai/v1"
+assert_eq "loopback llm-base-url: kimi skips to tensorzero upstream" \
+  "$(envval KIMI_BASE_URL)" "http://tz:3030/openai/v1"
+
+# CX-6: an overlay MagicDNS endpoint is unusable from rootless containers.
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" \
+  "http://node1.netbird.selfhosted:3000/openai/v1")"
+assert_eq "MagicDNS llm-base-url: daemon keeps it" \
+  "$(envval LLM_BASE_URL)" "http://node1.netbird.selfhosted:3000/openai/v1"
+assert_eq "MagicDNS llm-base-url: workers skip to tensorzero upstream" \
+  "$(envval OPENCODE_BASE_URL)" "http://tz:3030/openai/v1"
+
+# CX-1: a MagicDNS TensorZero URL with no llm-base-url leaves workers with NO
+# rendered endpoint (workers are disabled in this fixture, so nothing dies) —
+# never a silent developer-network fallback.
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://node1.netbird.selfhosted:3000" "")"
+assert_eq "MagicDNS tensorzero: daemon still derives its endpoint" \
+  "$(envval LLM_BASE_URL)" "http://node1.netbird.selfhosted:3000/openai/v1"
+assert_eq "MagicDNS tensorzero: no opencode worker URL rendered" \
+  "$(grep -c '^OPENCODE_BASE_URL=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+assert_eq "MagicDNS tensorzero: no kimi worker URL rendered" \
+  "$(grep -c '^KIMI_BASE_URL=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+assert_eq "MagicDNS tensorzero: no opencode2 worker URL rendered" \
+  "$(grep -c '^OPENCODE2_BASE_URL=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+
+# Explicit per-worker flags beat the inherited default and carry no marker.
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
+  "" "" "" "" "http://oc:4000/v1" "" "http://kimi:4001/v1" "" "" "http://oc2:4002/v1")"
+assert_eq "explicit opencode base url wins" "$(envval OPENCODE_BASE_URL)" "http://oc:4000/v1"
+assert_eq "explicit kimi base url wins"     "$(envval KIMI_BASE_URL)"     "http://kimi:4001/v1"
+assert_eq "explicit opencode2 base url wins" "$(envval OPENCODE2_BASE_URL)" "http://oc2:4002/v1"
+assert_eq "explicit opencode url carries no inherited marker" \
+  "$(grep -c '^OPENCODE_BASE_URL_SOURCE=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+
+# Re-render: operator-set (unmarked) worker URLs survive; INHERITED values
+# re-derive from the tenant's current endpoint (CX-3 — a TensorZero move must
+# reach the workers without a per-worker configure-* call).
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz-a:3030" "" "" \
+  "" "" "" "" "http://oc:4000/v1"
+assert_eq "first render: explicit opencode kept" \
+  "$(envval OPENCODE_BASE_URL)" "http://oc:4000/v1"
+assert_eq "first render: kimi inherited from tz A" \
+  "$(envval KIMI_BASE_URL)" "http://tz-a:3030/openai/v1"
+assert_eq "first render: kimi marked inherited" \
+  "$(envval KIMI_BASE_URL_SOURCE)" "inherited"
+write_tenant_lunarwing_env fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz-b:3030" ""
+assert_eq "rerun: explicit opencode preserved" \
+  "$(envval OPENCODE_BASE_URL)" "http://oc:4000/v1"
+assert_eq "rerun: explicit opencode still unmarked" \
+  "$(grep -c '^OPENCODE_BASE_URL_SOURCE=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+assert_eq "rerun: inherited kimi re-derived to tz B" \
+  "$(envval KIMI_BASE_URL)" "http://tz-b:3030/openai/v1"
+assert_eq "rerun: kimi still marked inherited" \
+  "$(envval KIMI_BASE_URL_SOURCE)" "inherited"
+assert_eq "rerun: opencode2 inherited from tz B" \
+  "$(envval OPENCODE2_BASE_URL)" "http://tz-b:3030/openai/v1"
+
+echo "=== WI#330 URL helper unit tests ==="
+
+# validate_llm_url dies on bad shapes (die inside a subshell exits it).
+if (validate_llm_url "http://gw.example.test:3000/openai/v1" "--tensorzero-url"); then
+  echo "  PASS: validate accepts a normal https URL"
+else
+  echo "  FAIL: validate rejected a normal URL"; failures=$((failures + 1))
+fi
+for bad in "ftp://gw.example.test" "http://gw.example.test/has space" \
+  "http://user:pw@gw.example.test/v1" "http://gw.example.test/100%/v1" \
+  "https:///no-host" $'http://gw.example.test/inject\nSANDBOX_ALLOW_FULL_ACCESS=true'; do
+  if (validate_llm_url "$bad" "--tensorzero-url") 2>/dev/null; then
+    echo "  FAIL: validate accepted [$bad]"; failures=$((failures + 1))
+  else
+    echo "  PASS: validate rejects [$bad]"
+  fi
+done
+
+# worker_llm_url_container_ok: loopback and overlay MagicDNS are unreachable.
+for unreachable in "http://127.0.0.1:3000/v1" "http://localhost:3000" \
+  "http://[::1]:3000/" "http://node1.netbird.selfhosted:3000" \
+  "https://host.tail1234.ts.net/" "http://x.netbird.cloud"; do
+  if worker_llm_url_container_ok "$unreachable"; then
+    echo "  FAIL: container-ok accepted [$unreachable]"; failures=$((failures + 1))
+  else
+    echo "  PASS: container-ok rejects [$unreachable]"
+  fi
+done
+for reachable in "http://10.0.0.5:3000/openai/v1" "https://gw.example.test/" \
+  "http://tz:3030"; do
+  if worker_llm_url_container_ok "$reachable"; then
+    echo "  PASS: container-ok accepts [$reachable]"
+  else
+    echo "  FAIL: container-ok rejected [$reachable]"; failures=$((failures + 1))
+  fi
+done
+
+# derive_worker_llm_base_url precedence + fall-through.
+assert_eq "derive: llm-base-url wins" \
+  "$(derive_worker_llm_base_url "http://custom:9000/v1" "http://tz:3030")" \
+  "http://custom:9000/v1"
+assert_eq "derive: loopback llm falls through to tensorzero" \
+  "$(derive_worker_llm_base_url "http://127.0.0.1:10004/v1" "http://tz:3030")" \
+  "http://tz:3030/openai/v1"
+assert_eq "derive: MagicDNS tensorzero unusable -> empty" \
+  "$(derive_worker_llm_base_url "" "http://node1.netbird.selfhosted:3000" || true)" ""
+assert_eq "derive: nothing usable -> empty" \
+  "$(derive_worker_llm_base_url "" "" || true)" ""
+
+# require_tenant_llm_endpoint: fail loudly instead of rendering nothing.
+if (require_tenant_llm_endpoint "" "" "false") 2>/dev/null; then
+  echo "  FAIL: no endpoint accepted"; failures=$((failures + 1))
+else
+  echo "  PASS: no tensorzero + no llm-base-url rejected"
+fi
+if (require_tenant_llm_endpoint "" "http://custom:9000/v1" "false") 2>/dev/null; then
+  echo "  PASS: llm-base-url alone suffices without the proxy"
+else
+  echo "  FAIL: llm-base-url-only tenant rejected"; failures=$((failures + 1))
+fi
+if (require_tenant_llm_endpoint "" "http://custom:9000/v1" "true") 2>/dev/null; then
+  echo "  FAIL: proxy tenant without tensorzero accepted"; failures=$((failures + 1))
+else
+  echo "  PASS: proxy tenant without tensorzero rejected"
+fi
 
 echo "=== tensorzero_openai_base unit tests ==="
 assert_eq "unit bare root suffixed" \
@@ -658,7 +848,103 @@ else
   echo "  PASS: ports_enable_worker rejects unknown worker"
 fi
 
+echo "=== backfill_tenant_worker_base_urls (WI#330 upgrade path) ==="
+
+# upgrade-tenant/patch-env backfill: an enabled worker with no base URL must
+# inherit the tenant's endpoint BEFORE the placeholder-refusing images start.
+WORKERS_REG_WI330="$MT_FIXTURE/ports-wi330.json"
+PORTS_REGISTRY="$WORKERS_REG_WI330"
+cat >"$WORKERS_REG_WI330" <<JSON
+{"tenants":{"fixture-tenant":{"base_port":10040,"workers":{"opencode":true,"kimi":true,"opencode2":false}}}}
+JSON
+
+# A: loopback LLM_BASE_URL (proxy tenant) -> inherit the proxy.env upstream,
+# marked inherited; the disabled worker stays untouched.
+cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
+LLM_BASE_URL=http://127.0.0.1:10004/v1
+EOF
+cat >"$MT_FIXTURE/env/proxy.env" <<'EOF'
+TENSORZERO_URL=http://tz-upstream:3030
+EOF
+backfill_tenant_worker_base_urls fixture-tenant
+assert_eq "backfill: opencode inherits proxy upstream" \
+  "$(envval OPENCODE_BASE_URL)" "http://tz-upstream:3030/openai/v1"
+assert_eq "backfill: opencode marked inherited" \
+  "$(envval OPENCODE_BASE_URL_SOURCE)" "inherited"
+assert_eq "backfill: kimi inherits proxy upstream" \
+  "$(envval KIMI_BASE_URL)" "http://tz-upstream:3030/openai/v1"
+assert_eq "backfill: disabled opencode2 untouched" \
+  "$(grep -c '^OPENCODE2_BASE_URL=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+
+# B: a non-loopback LLM_BASE_URL (direct-endpoint tenant) is the source, and an
+# operator-set value (no marker) is never overwritten.
+cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
+LLM_BASE_URL=http://direct:9000/v1
+OPENCODE_BASE_URL=http://operator-set:4100/v1
+EOF
+backfill_tenant_worker_base_urls fixture-tenant
+assert_eq "backfill: operator-set opencode preserved" \
+  "$(envval OPENCODE_BASE_URL)" "http://operator-set:4100/v1"
+assert_eq "backfill: kimi inherits direct LLM_BASE_URL" \
+  "$(envval KIMI_BASE_URL)" "http://direct:9000/v1"
+
+# C: nothing derivable + an enabled worker -> die loudly (before image rebuilds).
+cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
+LLM_BASE_URL=http://127.0.0.1:10004/v1
+EOF
+rm -f "$MT_FIXTURE/env/proxy.env"
+if (backfill_tenant_worker_base_urls fixture-tenant) >/dev/null 2>&1; then
+  echo "  FAIL: backfill succeeded with no derivable endpoint"; failures=$((failures + 1))
+else
+  echo "  PASS: backfill dies when no endpoint is derivable"
+fi
+assert_eq "backfill: failed run wrote nothing" \
+  "$(grep -c '^OPENCODE_BASE_URL=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+
+# D: no enabled workers + nothing derivable -> no-op, no failure.
+cat >"$WORKERS_REG_WI330" <<JSON
+{"tenants":{"fixture-tenant":{"base_port":10040,"workers":{"opencode":false,"kimi":false,"opencode2":false}}}}
+JSON
+backfill_tenant_worker_base_urls fixture-tenant
+assert_eq "backfill: all-disabled tenant gets no worker keys" \
+  "$(grep -cE '^(OPENCODE|KIMI|OPENCODE2)_BASE_URL=' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
+
 echo "=== CLI dispatch parsing smoke check ==="
+
+# WI#330 CX-1: with no tenant/fleet endpoint at all, add-tenant must fail
+# loudly instead of rendering an unreachable default. (The fleet default is
+# unset in the subshell to simulate a host without LUNARWING_MT_TENSORZERO_URL.)
+no_url_err="$(
+  ( require_root() { :; }; DEFAULT_TENSORZERO_URL=""; DEFAULT_LLM_BASE_URL=""; main add-tenant fixture-no-url ) 2>&1 || true
+)"
+if echo "$no_url_err" | grep -q 'requires an LLM endpoint'; then
+  echo "  PASS: add-tenant without any endpoint fails loudly"
+else
+  echo "  FAIL: add-tenant without any endpoint did not fail loudly"
+  echo "        $no_url_err"
+  failures=$((failures + 1))
+fi
+no_url_proxy_err="$(
+  ( require_root() { :; }; DEFAULT_TENSORZERO_URL=""; main add-tenant fixture-no-url --enable-proxy --llm-base-url http://custom:9000/v1 ) 2>&1 || true
+)"
+if echo "$no_url_proxy_err" | grep -q 'proxy needs an upstream'; then
+  echo "  PASS: proxy tenant without --tensorzero-url fails loudly"
+else
+  echo "  FAIL: proxy tenant without --tensorzero-url did not fail loudly"
+  echo "        $no_url_proxy_err"
+  failures=$((failures + 1))
+fi
+# Malformed URLs are rejected at the same gate.
+bad_url_err="$(
+  ( require_root() { :; }; main add-tenant fixture-bad-url --tensorzero-url 'ftp://tz:3030' ) 2>&1 || true
+)"
+if echo "$bad_url_err" | grep -q 'must be an http(s) URL'; then
+  echo "  PASS: non-http(s) --tensorzero-url rejected"
+else
+  echo "  FAIL: non-http(s) --tensorzero-url accepted"
+  echo "        $bad_url_err"
+  failures=$((failures + 1))
+fi
 
 # Verify the dispatch block recognizes the new flags by invoking the script
 # directly with a deliberately-bad tenant name AFTER the flags; if the flags
