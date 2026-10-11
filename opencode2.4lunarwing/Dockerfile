@@ -231,12 +231,14 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 # resolve — the client build above is best-effort, so verify the exact import
 # the worker depends on. scripts/sdk_surface_assert.ts constructs a client
 # (pure construction — no server contact) and asserts typeof for every method
-# path the bridge calls, driven by the one committed list in
-# scripts/sdk_surface.ts that also drives the executor self-test's mock
-# parity check (WI#329) — so upstream SDK drift like WI#320 F7
+# path the bridge calls, plus asserts every event name the bridge matches on
+# is still a literal in the pinned @opencode source shipped above — both
+# driven by the one committed list in scripts/sdk_surface.ts that the
+# executor self-test also binds to the executor's real call sites and event
+# literals (WI#329) — so upstream SDK drift like WI#320 F7
 # (session.message.list / session.permission.reply do not exist; both are
-# top-level groups) fails the image build instead of dying at runtime
-# (WI#303).
+# top-level groups) or an event rename fails the image build instead of
+# dying at runtime (WI#303).
 #
 # Build-time self-tests run under a throwaway HOME rooted in the trap-cleaned
 # TMPDIR: OpenCode 2 appends a timestamped, randomly-IDed line to
