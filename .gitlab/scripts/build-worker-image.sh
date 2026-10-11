@@ -48,7 +48,9 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts
-opencode2.4lunarwing/scripts/sdk_surface_assert.ts'
+opencode2.4lunarwing/scripts/sdk_surface_assert.ts
+opencode2.4lunarwing/scripts/opencode_task_executor.ts
+opencode2.4lunarwing/scripts/opencode_task_executor_test.ts'
         source_ref=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
         build_args="OPENCODE_VERSION=v2.0.24
 OPENCODE_REF=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
