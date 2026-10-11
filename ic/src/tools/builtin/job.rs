@@ -3599,12 +3599,9 @@ mod tests {
         use crate::config::ExternalWorkerConfig;
         use crate::orchestrator::ExternalWorkerManager;
 
-        let dir = tempfile::tempdir().expect("temp dir"); // safety: test
-        let backend = crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("test.db"))
-            .await
-            .expect("test db"); // safety: test
-        backend.run_migrations().await.expect("migrations"); // safety: test
-        let store: Arc<dyn crate::db::Database> = Arc::new(backend);
+        // Routed through crate::testing::test_db() so no new direct
+        // db::libsql usage appears outside db/testing (check-boundaries).
+        let (store, _db_guard) = crate::testing::test_db().await;
 
         let cm = Arc::new(ContextManager::new(5));
         let job_id = cm
