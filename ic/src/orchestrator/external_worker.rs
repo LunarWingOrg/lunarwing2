@@ -1579,18 +1579,35 @@ async fn run_external_task(
                             match serde_json::from_value::<ToolCallPayload>(env.payload)
                             {
                                 Ok(call) if tool_calls_used > MAX_TOOL_CALLS_PER_JOB => {
+                                    // MR !1533 DP-3: this path never reaches
+                                    // frame_binding_rejection, so the
+                                    // worker-controlled fields are
+                                    // unvalidated — validate before they are
+                                    // persisted or echoed (control characters
+                                    // would forge log lines / poison
+                                    // job_events rows).
+                                    let cap_name = if is_valid_frame_ident(&call.name, MAX_TOOL_NAME_BYTES) {
+                                        call.name.as_str()
+                                    } else {
+                                        "unknown"
+                                    };
+                                    let cap_call_id = if is_valid_frame_ident(&call.call_id, MAX_CALL_ID_BYTES) {
+                                        call.call_id.as_str()
+                                    } else {
+                                        ""
+                                    };
                                     if tool_calls_used == MAX_TOOL_CALLS_PER_JOB + 1 {
                                         record_tool_result(
                                             store,
                                             job_id,
-                                            &call.name,
+                                            cap_name,
                                             false,
                                             "tool_call denied: per-job call cap reached",
                                         )
                                         .await;
                                     }
                                     tool_result_envelope(
-                                        &call.call_id,
+                                        cap_call_id,
                                         "denied",
                                         String::new(),
                                         Some(format!(
@@ -1656,11 +1673,17 @@ async fn run_external_task(
                                     "per-job proxied tool call cap ({MAX_TOOL_CALLS_PER_JOB}) reached"
                                 ))
                             } else {
+                                // MR !1533 DP-6b: a malformed payload (e.g. a
+                                // numeric task_id) fails CLOSED — the binding
+                                // rule cannot be evaluated, so the catalog is
+                                // not served.
                                 let task_id_ok =
-                                    serde_json::from_value::<ToolListPayload>(env.payload)
-                                        .ok()
-                                        .and_then(|p| p.task_id)
-                                        .is_none_or(|tid| tid == job_id.to_string());
+                                    match serde_json::from_value::<ToolListPayload>(env.payload) {
+                                        Ok(p) => p
+                                            .task_id
+                                            .is_none_or(|tid| tid == job_id.to_string()),
+                                        Err(_) => false,
+                                    };
                                 if task_id_ok {
                                     build_tool_catalog(
                                         tool_binding.proxy.as_ref(),
@@ -2104,25 +2127,65 @@ const MAX_CALL_ID_BYTES: usize = 128;
 /// during a cancel handoff (MR !1521 CQ-4 follow-up: auditable, but bounded).
 const MAX_HANDOFF_TOOL_RESULT_ROWS: u32 = 5;
 
-/// Proxy-level hard denylist (MR !1521 DD-4): tools that must NEVER be
-/// reachable from an untrusted worker container, enforced both at allowlist
-/// load and at dispatch time. These names are NOT on the engine's
-/// `AUTONOMOUS_TOOL_DENYLIST` (which targets jobs/routines), so without this
-/// list an operator entry like `tool_allowlist = ["shell"]` would pass every
-/// gate and hand the container command execution on the daemon host (direct
-/// exec when the Docker sandbox is unavailable). The proxied path is
-/// phase-1 scoped to the WI#324 capability set (`memory_*`, `knowledge_*`,
-/// `gitlab_tool`); host-execution and cross-plane tools stay out of it.
+/// Proxy-level positive capability set (MR !1533 DP-2): the WI#324 phase-1
+/// tools — memory read+write, knowledge search/submit/get-topic, gitlab, and
+/// read-only mission status/history/list — are the ONLY tools that may ever
+/// be reachable from an untrusted worker container. Enforced at allowlist
+/// load and again at dispatch on the resolved name. A denylist cannot
+/// deliver this scoping: the dev file tools (`read_file`/`list_dir` with no
+/// `base_dir` accept any absolute host path, handing the container daemon-
+/// user reads of config, env, DB and key material) and every future
+/// host-side registration would be exposed by default. The denylist below
+/// stays as defense in depth for the worst offenders and to produce a
+/// precise load-time message for them.
+const PROXY_TOOL_ALLOWLIST: &[&str] = &[
+    "memory_read",
+    "memory_write",
+    "knowledge_search",
+    "knowledge_submit_note",
+    "knowledge_get_topic",
+    "gitlab_tool",
+    // mission_* read-only in phase 1; mission writes stay gated behind the
+    // mission lifecycle fixes (#311/#317).
+    "mission_status",
+    "mission_history",
+    "mission_list",
+];
+
+/// Whether a tool name is in the WI#324 phase-1 proxy capability set
+/// (MR !1533 DP-2).
+fn is_proxy_phase1_tool(name: &str) -> bool {
+    PROXY_TOOL_ALLOWLIST.contains(&name)
+}
+
+/// Proxy-level hard denylist (MR !1521 DD-4, extended MR !1533 DP-2): tools
+/// that must NEVER be reachable from an untrusted worker container, enforced
+/// both at allowlist load and at dispatch time. These names are NOT on the
+/// engine's `AUTONOMOUS_TOOL_DENYLIST` (which targets jobs/routines), so
+/// without this list an operator entry like `tool_allowlist = ["shell"]`
+/// would pass every gate and hand the container command execution on the
+/// daemon host (direct exec when the Docker sandbox is unavailable). The
+/// proxied path is phase-1 scoped to the WI#324 capability set (see
+/// `PROXY_TOOL_ALLOWLIST`); this list remains as defense in depth so a
+/// registry-side alias or a later-registered tool under one of these names
+/// is still refused even if the phase-1 set is ever widened carelessly.
 const PROXY_TOOL_DENYLIST: &[&str] = &[
-    // Host command/file execution on the daemon.
+    // Host command/file execution or arbitrary host reads as the daemon user.
     "shell",
+    "read_file",
     "write_file",
+    "list_dir",
     "apply_patch",
+    // Host-side stores.
+    "attachment_store",
     // Outbound HTTP with daemon-side credentials.
     "http",
-    // Cross-channel messaging and job control planes.
+    // Cross-channel messaging and job control/observation planes.
     "message",
     "cancel_job",
+    "job_events",
+    "job_status",
+    "list_jobs",
 ];
 
 /// Whether a tool name is hard-denied for the proxied path (MR !1521 DD-4).
@@ -2131,6 +2194,14 @@ const PROXY_TOOL_DENYLIST: &[&str] = &[
 /// allowlist grant.
 fn is_proxy_denied_tool(name: &str) -> bool {
     PROXY_TOOL_DENYLIST.contains(&name)
+}
+
+/// Whether a tool name may ever cross the proxied path (MR !1533 DP-2):
+/// inside the phase-1 capability set AND not hard-denied. Alias-aware
+/// callers pass the resolved name. This is the dispatch/catalog predicate;
+/// the load-time sanitizer reports the two failure modes separately.
+fn is_proxy_callable(name: &str) -> bool {
+    is_proxy_phase1_tool(name) && !is_proxy_denied_tool(name)
 }
 
 /// Whether `name` is permitted by a worker's tool allowlist. Deny-by-default:
@@ -2142,16 +2213,23 @@ fn tool_name_allowed(allowlist: &[String], name: &str) -> bool {
 }
 
 /// Sanitize a worker's configured `tool_allowlist` when the manager takes the
-/// config (MR !1506 review CQ-1/CQ-7, MR !1521 DD-4). Dropped entries are
-/// config errors worth surfacing, so each is logged:
+/// config (MR !1506 review CQ-1/CQ-7, MR !1521 DD-4, MR !1533 DP-2). Dropped
+/// entries are config errors worth surfacing, so each is logged:
 /// - `"*"` is not honored — it was the rejected MR's full-admin escape hatch;
 /// - names on the autonomous denylist can never pass the execution gates;
-/// - names on the proxy denylist (`PROXY_TOOL_DENYLIST`: host-execution and
-///   cross-plane tools) must never be reachable from an untrusted container;
+/// - names on the proxy denylist (`PROXY_TOOL_DENYLIST`: host-execution,
+///   host-read, store and cross-plane tools) must never be reachable from an
+///   untrusted container;
+/// - names outside the WI#324 phase-1 capability set (`PROXY_TOOL_ALLOWLIST`)
+///   are dropped — the proxied surface is a positive list, so unlisted and
+///   future host tools are excluded by default;
 /// - entries that are not valid tool identifiers are useless;
 /// - a cleartext `ws://` endpoint to a non-loopback host strips the whole
 ///   allowlist: tool authority must never ride a channel an on-path attacker
 ///   can inject frames into.
+///
+/// Entries are matched by literal (canonical) name; an alias spelling fails
+/// closed here and at dispatch (MR !1533 DP-6e) — use the canonical name.
 fn sanitize_tool_allowlist(
     worker_name: &str,
     allowlist: &[String],
@@ -2195,6 +2273,14 @@ fn sanitize_tool_allowlist(
                 worker = worker_name,
                 entry = %entry.as_str(),
                 "tool_allowlist entry is on the proxy denylist (host-execution/cross-plane) and was dropped"
+            );
+            continue;
+        }
+        if !is_proxy_phase1_tool(entry) {
+            tracing::warn!(
+                worker = worker_name,
+                entry = %entry.as_str(),
+                "tool_allowlist entry is outside the WI#324 phase-1 proxy capability set and was dropped"
             );
             continue;
         }
@@ -2588,17 +2674,17 @@ async fn preflight_gates(
 
     let params = prepare_tool_params(tool.as_ref(), &call.arguments);
 
-    // Proxy denylist (MR !1521 DD-4): host-execution and cross-plane tools
-    // (shell, write_file, apply_patch, http, message, cancel_job) must never
-    // execute for an untrusted container. Enforced at runtime as well as at
-    // allowlist load so a registry-side alias or a later-registered tool
-    // under a denied name cannot slip through.
-    if is_proxy_denied_tool(&resolved_name) {
+    // Proxy capability gate (MR !1521 DD-4, MR !1533 DP-2): only the WI#324
+    // phase-1 set may execute for an untrusted container, and the hard
+    // denylist is re-checked as defense in depth. Enforced at runtime on the
+    // resolved name as well as at allowlist load so a registry-side alias or
+    // a later-registered tool under an excluded name cannot slip through.
+    if !is_proxy_callable(&resolved_name) {
         return Err(deny_tool_call(
             ctx,
             call,
             format!(
-                "tool '{resolved_name}' is on the proxied-path denylist (host-execution/cross-plane tools are never worker-callable)"
+                "tool '{resolved_name}' is outside the proxied-path phase-1 capability set (or hard-denied); only the WI#324 phase-1 tools are worker-callable"
             ),
         )
         .await);
@@ -2921,7 +3007,9 @@ fn tool_catalog_error(message: &str) -> Envelope {
 
 /// Build the `tool_catalog` reply for a worker `tool_list` request: the
 /// definitions of exactly the tools this worker could actually call —
-/// allowlisted, visible to the job's user, and not excluded by the
+/// allowlisted, visible to the job's user, inside the phase-1 capability set
+/// and not hard-denied (MR !1533 DP-6a: the catalog applies the same
+/// `is_proxy_callable` predicate as dispatch), and not excluded by the
 /// autonomous hard gates (MR !1506 review CQ-6) — so a worker-side MCP
 /// bridge exposes a truthful `tools/list`.
 async fn build_tool_catalog(
@@ -2940,6 +3028,9 @@ async fn build_tool_catalog(
                 continue;
             };
             if !seen.insert(resolved.clone()) {
+                continue;
+            }
+            if !is_proxy_callable(&resolved) {
                 continue;
             }
             let requirement = tool.requires_approval(&serde_json::Value::Null);

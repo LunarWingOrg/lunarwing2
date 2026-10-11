@@ -2008,14 +2008,29 @@ async fn auth_wrong_token_rejected() {
 /// Test tool standing in for an in-process tenant tool. Records the
 /// JobContext it was invoked with so the test can assert tenant scoping
 /// (user_id + job_id come from the connection's job, never from the frame).
+/// The name is configurable (MR !1533 DP-2): the proxy only dispatches the
+/// WI#324 phase-1 capability set, so probes meant to execute register under
+/// a phase-1 name (e.g. "knowledge_search") — the test registry is empty
+/// apart from the probe, so the name resolves to the probe itself.
 struct ProbeEchoTool {
+    tool_name: String,
     seen: std::sync::Mutex<Vec<(String, Uuid)>>,
+}
+
+impl ProbeEchoTool {
+    /// A probe registered under the phase-1 name `knowledge_search`.
+    fn phase1() -> Arc<Self> {
+        Arc::new(Self {
+            tool_name: "knowledge_search".to_string(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
 }
 
 #[async_trait::async_trait]
 impl Tool for ProbeEchoTool {
     fn name(&self) -> &str {
-        "probe_echo"
+        &self.tool_name
     }
     fn description(&self) -> &str {
         "Echoes params back; records the job context"
@@ -2060,16 +2075,14 @@ async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
     // WI#324 acceptance: an allowlisted tool round-trips through the tenant's
     // in-process registry; a non-allowlisted tool is a hard "denied" reject,
     // never a silent empty result.
-    let probe = Arc::new(ProbeEchoTool {
-        seen: std::sync::Mutex::new(Vec::new()),
-    });
+    let probe = ProbeEchoTool::phase1();
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools.register(probe.clone()).await;
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
         calls: vec![
-            ("probe_echo".to_string(), serde_json::json!({ "k": "v" })),
+            ("knowledge_search".to_string(), serde_json::json!({ "k": "v" })),
             // Registered nowhere AND not allowlisted -> denied.
             (
                 "memory_write".to_string(),
@@ -2081,7 +2094,7 @@ async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
     .await;
 
     let mut config = config_for(&url);
-    config.tool_allowlist = vec!["probe_echo".to_string()];
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
     let job_id = Uuid::new_v4();
 
@@ -2134,6 +2147,7 @@ async fn tool_call_denied_when_allowlist_empty() {
     // Deny-by-default: no tool_allowlist configured at all -> every tool_call
     // is rejected, even one naming a registered tool.
     let probe = Arc::new(ProbeEchoTool {
+        tool_name: "probe_echo".to_string(),
         seen: std::sync::Mutex::new(Vec::new()),
     });
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
@@ -2177,17 +2191,20 @@ async fn tool_call_denied_when_allowlist_empty() {
 async fn tool_call_unknown_allowlisted_tool_is_an_error_not_a_hang() {
     // Allowlisted but not registered: the registry miss must come back as a
     // tool_result error frame, not a dropped reply (the worker blocks on it).
+    // The name must be inside the phase-1 set (else the load-time sanitizer
+    // drops it and the call never reaches resolution), so use a phase-1 tool
+    // this test registry deliberately does not register.
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
-        calls: vec![("ghost_tool".to_string(), serde_json::json!({}))],
+        calls: vec![("knowledge_search".to_string(), serde_json::json!({}))],
         replies: reply_tx,
     })
     .await;
 
     let mut config = config_for(&url);
-    config.tool_allowlist = vec!["ghost_tool".to_string()];
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
 
     let res = timeout(
@@ -2350,9 +2367,7 @@ async fn tool_call_missing_or_mismatched_task_id_is_rejected() {
     // MR !1506 review (CQ-7): `task_id` is required and must equal the
     // connection's job id — a leftover worker process on a pooled socket must
     // not run calls in the next job's scope.
-    let probe = Arc::new(ProbeEchoTool {
-        seen: std::sync::Mutex::new(Vec::new()),
-    });
+    let probe = ProbeEchoTool::phase1();
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools.register(probe.clone()).await;
 
@@ -2362,14 +2377,14 @@ async fn tool_call_missing_or_mismatched_task_id_is_rejected() {
             // Missing task_id entirely.
             (
                 "tool_call".to_string(),
-                serde_json::json!({"call_id": "c-missing", "name": "probe_echo"}),
+                serde_json::json!({"call_id": "c-missing", "name": "knowledge_search"}),
             ),
             // Mismatched task_id.
             (
                 "tool_call".to_string(),
                 serde_json::json!({
                     "call_id": "c-wrong",
-                    "name": "probe_echo",
+                    "name": "knowledge_search",
                     "task_id": "00000000-0000-0000-0000-000000000000",
                 }),
             ),
@@ -2378,7 +2393,7 @@ async fn tool_call_missing_or_mismatched_task_id_is_rejected() {
                 "tool_call".to_string(),
                 serde_json::json!({
                     "call_id": "c-right",
-                    "name": "probe_echo",
+                    "name": "knowledge_search",
                     "task_id": "@task_id@",
                 }),
             ),
@@ -2388,7 +2403,7 @@ async fn tool_call_missing_or_mismatched_task_id_is_rejected() {
     .await;
 
     let mut config = config_for(&url);
-    config.tool_allowlist = vec!["probe_echo".to_string()];
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
 
     let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 3).await;
@@ -2414,11 +2429,12 @@ async fn tool_call_missing_or_mismatched_task_id_is_rejected() {
 async fn tool_catalog_lists_only_callable_allowlisted_tools() {
     // MR !1506 review (CQ-6): the catalog is built from the allowlist through
     // user-scoped resolution and the autonomous gates — unknown names and
-    // autonomous opt-outs are not advertised.
+    // autonomous opt-outs are not advertised. Names must be inside the
+    // phase-1 set (MR !1533 DP-2) to survive the load-time sanitizer.
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools
         .register(Arc::new(GateProbeTool {
-            tool_name: "probe_echo".to_string(),
+            tool_name: "knowledge_search".to_string(),
             output: "ok".to_string(),
             autonomous: true,
             calls: AtomicUsize::new(0),
@@ -2426,7 +2442,7 @@ async fn tool_catalog_lists_only_callable_allowlisted_tools() {
         .await;
     tools
         .register(Arc::new(GateProbeTool {
-            tool_name: "interactive_only_probe".to_string(),
+            tool_name: "knowledge_get_topic".to_string(),
             output: "ok".to_string(),
             autonomous: false,
             calls: AtomicUsize::new(0),
@@ -2442,9 +2458,10 @@ async fn tool_catalog_lists_only_callable_allowlisted_tools() {
 
     let mut config = config_for(&url);
     config.tool_allowlist = vec![
-        "probe_echo".to_string(),
-        "interactive_only_probe".to_string(),
-        "ghost_tool".to_string(),
+        "knowledge_search".to_string(),
+        "knowledge_get_topic".to_string(),
+        // Phase-1 name this registry never registered: a resolution ghost.
+        "gitlab_tool".to_string(),
     ];
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
 
@@ -2457,7 +2474,7 @@ async fn tool_catalog_lists_only_callable_allowlisted_tools() {
         .collect();
     assert_eq!(
         names,
-        vec!["probe_echo"],
+        vec!["knowledge_search"],
         "catalog must contain only allowlisted, registered, autonomous-capable tools"
     );
 }
@@ -2465,9 +2482,11 @@ async fn tool_catalog_lists_only_callable_allowlisted_tools() {
 #[tokio::test]
 async fn tool_call_autonomous_opt_out_is_denied() {
     // MR !1506 review (CQ-1): a tool that opts out of autonomous execution
-    // must be refused even when it is named in the worker allowlist.
+    // must be refused even when it is named in the worker allowlist. The
+    // probe uses a phase-1 name so it reaches the autonomous gate rather than
+    // being dropped by the load-time sanitizer (MR !1533 DP-2).
     let probe = Arc::new(GateProbeTool {
-        tool_name: "interactive_only_probe".to_string(),
+        tool_name: "knowledge_get_topic".to_string(),
         output: "ok".to_string(),
         autonomous: false,
         calls: AtomicUsize::new(0),
@@ -2477,13 +2496,13 @@ async fn tool_call_autonomous_opt_out_is_denied() {
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
-        calls: vec![("interactive_only_probe".to_string(), serde_json::json!({}))],
+        calls: vec![("knowledge_get_topic".to_string(), serde_json::json!({}))],
         replies: reply_tx,
     })
     .await;
 
     let mut config = config_for(&url);
-    config.tool_allowlist = vec!["interactive_only_probe".to_string()];
+    config.tool_allowlist = vec!["knowledge_get_topic".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
 
     let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
@@ -2533,27 +2552,25 @@ async fn tool_call_disabled_permission_is_denied() {
     let (db, _tmp) = test_db().await;
     db.set_setting(
         "tenant-user",
-        "tool_permissions.probe_echo",
+        "tool_permissions.knowledge_search",
         &serde_json::json!("disabled"),
     )
     .await
     .expect("seed permission");
 
-    let probe = Arc::new(ProbeEchoTool {
-        seen: std::sync::Mutex::new(Vec::new()),
-    });
+    let probe = ProbeEchoTool::phase1();
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools.register(probe.clone()).await;
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
-        calls: vec![("probe_echo".to_string(), serde_json::json!({}))],
+        calls: vec![("knowledge_search".to_string(), serde_json::json!({}))],
         replies: reply_tx,
     })
     .await;
 
     let mut config = config_for(&url);
-    config.tool_allowlist = vec!["probe_echo".to_string()];
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config])
         .with_tool_proxy(test_proxy(tools))
         .with_store(db);
@@ -2580,16 +2597,14 @@ async fn proxied_calls_persist_canonical_tool_events() {
     // with success:false so they cannot render as green checkmarks.
     let (db, _tmp) = test_db().await;
 
-    let probe = Arc::new(ProbeEchoTool {
-        seen: std::sync::Mutex::new(Vec::new()),
-    });
+    let probe = ProbeEchoTool::phase1();
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools.register(probe.clone()).await;
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
         calls: vec![
-            ("probe_echo".to_string(), serde_json::json!({ "k": "v" })),
+            ("knowledge_search".to_string(), serde_json::json!({ "k": "v" })),
             ("memory_write".to_string(), serde_json::json!({})),
         ],
         replies: reply_tx,
@@ -2597,7 +2612,7 @@ async fn proxied_calls_persist_canonical_tool_events() {
     .await;
 
     let mut config = config_for(&url);
-    config.tool_allowlist = vec!["probe_echo".to_string()];
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config])
         .with_tool_proxy(test_proxy(tools))
         .with_store(db.clone());
@@ -2638,7 +2653,7 @@ async fn proxied_calls_persist_canonical_tool_events() {
     );
 
     assert_eq!(tool_events[0].event_type, "tool_use");
-    assert_eq!(tool_events[0].data["tool_name"], "probe_echo");
+    assert_eq!(tool_events[0].data["tool_name"], "knowledge_search");
     assert!(
         tool_events[0].data["input"]
             .as_str()
@@ -2649,7 +2664,7 @@ async fn proxied_calls_persist_canonical_tool_events() {
     );
 
     assert_eq!(tool_events[1].event_type, "tool_result");
-    assert_eq!(tool_events[1].data["tool_name"], "probe_echo");
+    assert_eq!(tool_events[1].data["tool_name"], "knowledge_search");
     assert_eq!(tool_events[1].data["success"], true);
 
     assert_eq!(tool_events[2].event_type, "tool_use");
@@ -2670,7 +2685,7 @@ async fn tool_output_is_sanitized_before_reaching_worker() {
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools
         .register(Arc::new(GateProbeTool {
-            tool_name: "probe_echo".to_string(),
+            tool_name: "knowledge_search".to_string(),
             output: "aws key: AKIAIOSFODNN7EXAMPLE".to_string(),
             autonomous: true,
             calls: AtomicUsize::new(0),
@@ -2679,13 +2694,13 @@ async fn tool_output_is_sanitized_before_reaching_worker() {
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
-        calls: vec![("probe_echo".to_string(), serde_json::json!({}))],
+        calls: vec![("knowledge_search".to_string(), serde_json::json!({}))],
         replies: reply_tx,
     })
     .await;
 
     let mut config = config_for(&url);
-    config.tool_allowlist = vec!["probe_echo".to_string()];
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
 
     let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
@@ -2703,15 +2718,13 @@ async fn tool_call_rejected_for_terminal_job() {
     // MR !1506 review (CQ-1/CQ-6): with a context manager wired, the real job
     // context is authoritative — a Cancelled (terminal) job gets no new tool
     // calls even if its worker socket is still streaming frames.
-    let probe = Arc::new(ProbeEchoTool {
-        seen: std::sync::Mutex::new(Vec::new()),
-    });
+    let probe = ProbeEchoTool::phase1();
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools.register(probe.clone()).await;
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
-        calls: vec![("probe_echo".to_string(), serde_json::json!({}))],
+        calls: vec![("knowledge_search".to_string(), serde_json::json!({}))],
         replies: reply_tx,
     })
     .await;
@@ -2727,7 +2740,7 @@ async fn tool_call_rejected_for_terminal_job() {
     let (tx, _rx) = tokio::sync::broadcast::channel(8);
 
     let mut config = config_for(&url);
-    config.tool_allowlist = vec!["probe_echo".to_string()];
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config])
         .with_event_deps(tx, cm)
         .with_tool_proxy(test_proxy(tools));
