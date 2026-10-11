@@ -36,6 +36,22 @@ lockfile-only-advisory-guard:
   script:
     - bash .gitlab/scripts/check-lockfile-only-advisories.sh
 
+# The WI#331 mitigation keeps the libsql 0.6.0 legacy chain (rustls-webpki
+# 0.102.8, h2 0.3.27) out of default-feature builds behind the opt-in
+# libsql-remote-replica cargo feature. Every deny gate queries
+# --workspace --all-features with ID-keyed ignores, so none of them can see
+# this regression; this guard pins the default-feature production graph
+# clean (MR !1513 review CZ-1).
+default-graph-advisory-guard:
+  extends:
+    - .rust-job
+    - .full-validation-context
+  stage: security
+  needs:
+    - cargo-metadata
+  script:
+    - bash .gitlab/scripts/check-default-graph-advisories.sh
+
 secret-detection:
   extends: .gitleaks-job
   stage: security
