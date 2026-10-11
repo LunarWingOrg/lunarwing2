@@ -2671,8 +2671,7 @@ async fn cron_non_retryable_abandons_and_breaker_trips() {
             .expect("dispatch timed out")
             .expect("dispatch captured");
         assert_eq!(
-            request["payload"]["context"]["cron_tick"]["chain_index"],
-            0,
+            request["payload"]["context"]["cron_tick"]["chain_index"], 0,
             "tick {tick}: a non-retryable rejection must not re-dispatch"
         );
         // No second link for this tick (a wrong re-dispatch would land after

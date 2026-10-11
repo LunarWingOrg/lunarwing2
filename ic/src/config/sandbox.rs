@@ -344,9 +344,9 @@ impl CronWorkerConfig {
     /// `missions/<mission_id>` so a default mission never shares the worker
     /// root with ordinary dispatches.
     pub fn resolved_project_dir(&self, worker_name: &str) -> String {
-        self.project_dir.clone().unwrap_or_else(|| {
-            format!("missions/{}", self.resolved_mission_id(worker_name))
-        })
+        self.project_dir
+            .clone()
+            .unwrap_or_else(|| format!("missions/{}", self.resolved_mission_id(worker_name)))
     }
 
     /// Validate the cron block against runaway-guard limits (WI#325).
@@ -442,7 +442,9 @@ impl CronWorkerConfig {
         let dir = self.resolved_project_dir(worker_name);
         let path = std::path::Path::new(&dir);
         let bad = |why: &str| {
-            format!("cron.project_dir {dir:?} is {why}; use a relative path under the worker's WORKSPACE_ROOT")
+            format!(
+                "cron.project_dir {dir:?} is {why}; use a relative path under the worker's WORKSPACE_ROOT"
+            )
         };
         if dir.trim().is_empty() {
             return Err(bad("empty"));
@@ -572,10 +574,7 @@ impl ExternalWorkerConfig {
 
     /// Whether the cron block of a cron-mode worker passes validation and its
     /// mission id is unique. Logs the precise reason at `error!` when not.
-    fn cron_block_valid(
-        &self,
-        seen_mission_ids: &mut std::collections::HashSet<String>,
-    ) -> bool {
+    fn cron_block_valid(&self, seen_mission_ids: &mut std::collections::HashSet<String>) -> bool {
         let Some(cron) = &self.cron else {
             tracing::error!(
                 worker = %self.name,
@@ -1347,7 +1346,10 @@ goal = "g"
         .expect("config must parse");
         let workers = ExternalWorkerConfig::resolve_from_settings(&settings);
         let cron = workers[0].cron.as_ref().expect("cron block");
-        assert_eq!(cron.tick_timeout_ms(), CronWorkerConfig::MAX_TICK_TIMEOUT_MS);
+        assert_eq!(
+            cron.tick_timeout_ms(),
+            CronWorkerConfig::MAX_TICK_TIMEOUT_MS
+        );
     }
 
     #[test]
@@ -1396,8 +1398,10 @@ goal = "g"
         }
         // A hostile mission_id cannot smuggle a traversal into the default dir.
         assert!(
-            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nmission_id = \"../x\"")
-                .is_none()
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nmission_id = \"../x\""
+            )
+            .is_none()
         );
     }
 

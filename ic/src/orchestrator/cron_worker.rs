@@ -405,6 +405,14 @@ fn validate_cron_schedule(schedule: &str, timezone: Option<&str>) -> Result<(), 
     }
 }
 
+/// What woke the mission loop out of its idle wait.
+enum Wake {
+    /// The scheduled fire time arrived.
+    Tick,
+    /// An owner command arrived first.
+    Command(CronCommand),
+}
+
 /// The per-mission loop: wait for each scheduled fire, then run the tick's
 /// job chain to resolution before computing the next fire. Owner commands are
 /// serviced while the loop waits AND while a tick chain runs (MR !1522 DE-3),
@@ -440,23 +448,14 @@ async fn run_cron_mission(
     }
     loop {
         if state.paused {
-            let command = tokio::select! {
-                command = cmd_rx.recv() => command,
-                _ = shutdown_rx.recv() => return MissionExit::Shutdown,
-            };
-            let Some(command) = command else {
-                return MissionExit::Shutdown;
-            };
-            if handle_idle_command(&ctx, &mut state, &pause_flag, command).await
-                == IdleAction::FireNow
-                && !drive_tick(&ctx, &mut state, &pause_flag, 0, &mut cmd_rx, &mut shutdown_rx)
-                    .await
-            {
+            if !paused_turn(&ctx, &mut state, &pause_flag, &mut cmd_rx, &mut shutdown_rx).await {
                 return MissionExit::Shutdown;
             }
             continue;
         }
-        let Some(fire_at) = next_fire_or_log(&worker.name, &cron.schedule, cron.timezone.as_deref()) else {
+        let Some(fire_at) =
+            next_fire_or_log(&worker.name, &cron.schedule, cron.timezone.as_deref())
+        else {
             return MissionExit::ScheduleExhausted;
         };
         let wait = (fire_at - Utc::now()).to_std().unwrap_or_default();
@@ -466,32 +465,14 @@ async fn run_cron_mission(
             next_fire_at = %fire_at.to_rfc3339(),
             "Cron mission awaiting next tick"
         );
-        enum Wake {
-            Tick,
-            Command(CronCommand),
-        }
-        let wake = tokio::select! {
-            _ = tokio::time::sleep(wait) => Wake::Tick,
-            command = cmd_rx.recv() => match command {
-                Some(command) => Wake::Command(command),
-                None => return MissionExit::Shutdown,
-            },
-            _ = shutdown_rx.recv() => {
-                tracing::info!(
-                    worker = %worker.name,
-                    %mission_id,
-                    "Cron mission supervisor shutting down"
-                );
-                return MissionExit::Shutdown;
-            }
-        };
-        let tick_index = match wake {
-            Wake::Tick => {
+        let tick_index = match next_wake(wait, &mut cmd_rx, &mut shutdown_rx).await {
+            None => return MissionExit::Shutdown,
+            Some(Wake::Tick) => {
                 state.tick_index += 1;
                 persist_tick_counter(ctx.manager, &owner_id, &mission_id, state.tick_index).await;
                 state.tick_index
             }
-            Wake::Command(command) => {
+            Some(Wake::Command(command)) => {
                 match handle_idle_command(&ctx, &mut state, &pause_flag, command).await {
                     IdleAction::Continue => continue,
                     // Manual fires use tick_index 0 as a manual/test trigger
@@ -512,6 +493,42 @@ async fn run_cron_mission(
         {
             return MissionExit::Shutdown;
         }
+    }
+}
+
+/// Service one command while the mission is paused. Returns false when the
+/// supervisor should exit (command channel closed or daemon shutdown).
+async fn paused_turn(
+    ctx: &TickCtx<'_>,
+    state: &mut MissionState,
+    pause_flag: &Arc<AtomicBool>,
+    cmd_rx: &mut mpsc::Receiver<CronCommand>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> bool {
+    let command = tokio::select! {
+        command = cmd_rx.recv() => command,
+        _ = shutdown_rx.recv() => return false,
+    };
+    let Some(command) = command else {
+        return false;
+    };
+    if handle_idle_command(ctx, state, pause_flag, command).await == IdleAction::FireNow {
+        return drive_tick(ctx, state, pause_flag, 0, cmd_rx, shutdown_rx).await;
+    }
+    true
+}
+
+/// Wait for the next scheduled fire, an owner command, or shutdown. Returns
+/// `None` on shutdown / closed command channel.
+async fn next_wake(
+    wait: Duration,
+    cmd_rx: &mut mpsc::Receiver<CronCommand>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> Option<Wake> {
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => Some(Wake::Tick),
+        command = cmd_rx.recv() => command.map(Wake::Command),
+        _ = shutdown_rx.recv() => None,
     }
 }
 
@@ -705,8 +722,7 @@ async fn record_lifecycle_event(
 
 /// The mission's most recent tick job, if any.
 fn last_tick_job(ctx: &TickCtx<'_>) -> Option<Uuid> {
-    *ctx
-        .last_tick_job_id
+    *ctx.last_tick_job_id
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -809,8 +825,7 @@ async fn run_tick(
     pause_flag: &Arc<AtomicBool>,
 ) -> Option<TickEnd> {
     let manager = ctx.manager;
-    let cron = ctx.cron;
-    let max_reentries = cron.max_reentries();
+    let max_reentries = ctx.cron.max_reentries();
     let mut chain_index: u32 = 0;
     let mut busy_retries: u32 = 0;
     let mut last_link: Option<Uuid> = None;
@@ -819,55 +834,21 @@ async fn run_tick(
         // always dispatches its first link (the escape hatch works on a
         // paused mission), but no re-entry fires once paused.
         if last_link.is_some() && pause_flag.load(Ordering::SeqCst) {
-            // Owner paused mid-tick: stop the chain at this boundary. The
-            // resolved link's events are already persisted; record the
-            // pause-induced end against it so the tick does not look lost.
-            if let Some(job_id) = last_link {
-                persist_cron_event(
-                    manager.store_handle(),
-                    job_id,
-                    "cron_tick_end",
-                    serde_json::json!({
-                        "mission_id": ctx.mission_id,
-                        "tick_index": tick_index,
-                        "chain_index": chain_index,
-                        "outcome": "paused",
-                    }),
-                )
-                .await;
-            }
-            tracing::info!(
-                worker = %ctx.worker.name,
-                mission_id = %ctx.mission_id,
-                tick_index,
-                "Cron tick chain stopped at link boundary: mission paused"
-            );
-            return Some(TickEnd::Resolved);
+            return Some(pause_chain(ctx, tick_index, chain_index, last_link).await);
         }
         let job_id = Uuid::new_v4();
         last_link = Some(job_id);
-        match dispatch_tick_job(ctx, tick_index, chain_index, job_id).await {
-            DispatchOutcome::Fired => {}
-            DispatchOutcome::Capacity(reason) => {
-                match busy_retry_step(
-                    ctx,
-                    tick_index,
-                    chain_index,
-                    None,
-                    &reason,
-                    &mut busy_retries,
-                    "capacity_retry",
-                )
-                .await
-                {
-                    BusyAction::Retry => {
-                        if !backoff_sleep(busy_retries, shutdown_rx).await {
-                            return None;
-                        }
-                        continue;
+        if let Some(action) =
+            dispatch_or_busy(ctx, tick_index, chain_index, job_id, &mut busy_retries).await
+        {
+            match action {
+                BusyAction::Retry => {
+                    if !backoff_sleep(busy_retries, shutdown_rx).await {
+                        return None;
                     }
-                    BusyAction::Skip(end) => return Some(end),
+                    continue;
                 }
+                BusyAction::Skip(end) => return Some(end),
             }
         }
 
@@ -883,20 +864,17 @@ async fn run_tick(
         if let Some(end) = resolve_terminal(ctx, tick_index, chain_index, job_id, &outcome).await {
             return Some(end);
         }
-        if let TickOutcome::Failed(reason) = &outcome
-            && is_busy(reason)
+        if let Some(action) = watch_busy_step(
+            ctx,
+            tick_index,
+            chain_index,
+            job_id,
+            &outcome,
+            &mut busy_retries,
+        )
+        .await
         {
-            match busy_retry_step(
-                ctx,
-                tick_index,
-                chain_index,
-                Some(job_id),
-                reason,
-                &mut busy_retries,
-                "busy_retry",
-            )
-            .await
-            {
+            match action {
                 BusyAction::Retry => {
                     if !backoff_sleep(busy_retries, shutdown_rx).await {
                         return None;
@@ -926,6 +904,96 @@ async fn run_tick(
             Reentry::Abandon(end) => return Some(end),
         }
     }
+}
+
+/// Record the pause-induced tick end against the last link so the tick does
+/// not look lost, and report the chain stop as resolved (owner pause is not
+/// mission failure evidence).
+async fn pause_chain(
+    ctx: &TickCtx<'_>,
+    tick_index: u64,
+    chain_index: u32,
+    last_link: Option<Uuid>,
+) -> TickEnd {
+    if let Some(job_id) = last_link {
+        persist_cron_event(
+            ctx.manager.store_handle(),
+            job_id,
+            "cron_tick_end",
+            serde_json::json!({
+                "mission_id": ctx.mission_id,
+                "tick_index": tick_index,
+                "chain_index": chain_index,
+                "outcome": "paused",
+            }),
+        )
+        .await;
+    }
+    tracing::info!(
+        worker = %ctx.worker.name,
+        mission_id = %ctx.mission_id,
+        tick_index,
+        "Cron tick chain stopped at link boundary: mission paused"
+    );
+    TickEnd::Resolved
+}
+
+/// Dispatch one link; on a dispatch-time capacity failure run the busy-retry
+/// path (no job row exists yet, so its events are log-only). Returns `None`
+/// when the job was fired and the caller should watch it.
+async fn dispatch_or_busy(
+    ctx: &TickCtx<'_>,
+    tick_index: u64,
+    chain_index: u32,
+    job_id: Uuid,
+    busy_retries: &mut u32,
+) -> Option<BusyAction> {
+    match dispatch_tick_job(ctx, tick_index, chain_index, job_id).await {
+        DispatchOutcome::Fired => None,
+        DispatchOutcome::Capacity(reason) => Some(
+            busy_retry_step(
+                ctx,
+                tick_index,
+                chain_index,
+                None,
+                &reason,
+                busy_retries,
+                "capacity_retry",
+            )
+            .await,
+        ),
+    }
+}
+
+/// Worker busy rejections (workspace lock held, concurrency cap) retry the
+/// same chain link without spending re-entry budget. Returns `None` for
+/// non-busy outcomes.
+async fn watch_busy_step(
+    ctx: &TickCtx<'_>,
+    tick_index: u64,
+    chain_index: u32,
+    job_id: Uuid,
+    outcome: &TickOutcome,
+    busy_retries: &mut u32,
+) -> Option<BusyAction> {
+    let TickOutcome::Failed(reason) = outcome else {
+        return None;
+    };
+    if !is_busy(reason) {
+        return None;
+    }
+    Some(
+        busy_retry_step(
+            ctx,
+            tick_index,
+            chain_index,
+            Some(job_id),
+            reason,
+            busy_retries,
+            "busy_retry",
+        )
+        .await,
+    )
 }
 
 /// Terminal outcomes: persist `cron_tick_end` inline, evict the tick job's
@@ -1271,7 +1339,15 @@ async fn dispatch_tick_job(
         return DispatchOutcome::Capacity(reason);
     }
 
-    persist_tick_record(manager, worker, job_id, owner_id, &description, &project_dir).await;
+    persist_tick_record(
+        manager,
+        worker,
+        job_id,
+        owner_id,
+        &description,
+        &project_dir,
+    )
+    .await;
     // Record the link as the mission's most recent job so owner-command
     // audit events (cron_paused/cron_resumed) have a job row to key to.
     ctx.last_tick_job_id
@@ -1302,7 +1378,14 @@ async fn dispatch_tick_job(
         format!("cron tick #{tick_index} (mission {mission_id}) dispatched"),
     );
 
-    let context = build_tick_context(cron, mission_id, owner_id, tick_index, chain_index, &project_dir);
+    let context = build_tick_context(
+        cron,
+        mission_id,
+        owner_id,
+        tick_index,
+        chain_index,
+        &project_dir,
+    );
     if let Err(error) = manager
         .execute_task(
             job_id,
@@ -1354,7 +1437,10 @@ async fn register_tick_job(
         ctx.manager.release_task_reservation(job_id).await;
         return DispatchOutcome::Capacity("no context manager registered".to_string());
     };
-    if let Err(error) = cm.register_sandbox_job(job_id, ctx.owner_id, title, description).await {
+    if let Err(error) = cm
+        .register_sandbox_job(job_id, ctx.owner_id, title, description)
+        .await
+    {
         tracing::warn!(%job_id, "Failed to register cron tick job: {error}");
         ctx.manager.release_task_reservation(job_id).await;
         return DispatchOutcome::Capacity(format!("job registration failed: {error}"));
@@ -1690,9 +1776,7 @@ mod tests {
         assert!(validate_cron_schedule("0 0 15 10 * *", None).is_ok());
         assert!(validate_cron_schedule("0 0 15 10 * * *", None).is_ok());
         // Timezone-qualified schedules validate the same way routines do.
-        assert!(
-            validate_cron_schedule("0 15 10 * * *", Some("America/New_York")).is_ok()
-        );
+        assert!(validate_cron_schedule("0 15 10 * * *", Some("America/New_York")).is_ok());
     }
 
     #[test]
@@ -1738,7 +1822,9 @@ mod tests {
     /// cap, pebble's wrapped resolution error, the shared escape wording).
     #[test]
     fn busy_and_non_retryable_markers_classify() {
-        assert!(is_busy("Workspace /workspace is already being modified by task x"));
+        assert!(is_busy(
+            "Workspace /workspace is already being modified by task x"
+        ));
         assert!(is_busy("Worker concurrency limit reached"));
         assert!(!is_busy("worker exploded"));
 
