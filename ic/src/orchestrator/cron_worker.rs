@@ -87,17 +87,26 @@ const MAX_BUSY_RETRIES: u32 = 5;
 /// Consecutive abandoned ticks before the circuit breaker pauses the mission.
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
-/// Worker-reported markers that a dispatch rejection is a workspace-busy
-/// collision (kimi, pebble, and opencode bridges share this wording).
-const BUSY_MARKER: &str = "already being modified";
+/// Worker-reported markers that a dispatch rejection is a workspace-busy /
+/// concurrency collision, not a mission failure (MR !1522 DE-2/DE-5): the
+/// kimi and pebble bridges share the "already being modified" wording for the
+/// per-workspace lock, and kimi additionally rejects with its connection
+/// concurrency cap wording.
+const BUSY_MARKERS: &[&str] = &["already being modified", "Worker concurrency limit reached"];
 
 /// Worker-reported markers for protocol/config rejections that retrying can
-/// never fix (bad timeout, unresolvable project_dir, empty prompt).
+/// never fix (bad timeout, unresolvable/escaping project_dir, empty prompt).
+/// Covers both shipped bridges (MR !1522 DE-5): pebble wraps a missing dir as
+/// "could not be resolved under WORKSPACE_ROOT", kimi's realpathSync surfaces
+/// a raw "ENOENT: … realpath …" error, and both use the same
+/// "Workspace path escapes WORKSPACE_ROOT" wording for traversal.
 const NON_RETRYABLE_MARKERS: &[&str] = &[
     "timeout_ms must be",
     "could not be resolved under WORKSPACE_ROOT",
+    "Workspace path escapes WORKSPACE_ROOT",
     "Invalid workspace path",
     "Missing or invalid prompt",
+    "realpath",
 ];
 
 /// Outcome of watching one tick job to resolution (or to a heartbeat lapse).
@@ -126,10 +135,17 @@ impl TickOutcome {
 /// How a resolved tick feeds back into the mission loop's circuit breaker.
 #[derive(Debug)]
 enum TickEnd {
-    /// The tick resolved (completed, or cancelled by the owner).
+    /// The tick resolved (completed, cancelled by the owner, or its chain was
+    /// stopped at a link boundary by an owner pause).
     Resolved,
     /// The tick exhausted its re-entry budget or hit a non-retryable error.
     Abandoned { job_id: Uuid, reason: String },
+    /// The tick was skipped because the workspace stayed busy / the context
+    /// manager stayed at capacity through the whole busy-retry budget
+    /// (MR !1522 DE-2): ordinary contention, NOT mission failure — the
+    /// circuit breaker must not count it, and the next scheduled fire
+    /// retries normally.
+    SkippedBusy,
 }
 
 /// Why the mission supervisor loop exited.
@@ -188,7 +204,7 @@ impl ExternalWorkerManager {
                 );
                 continue;
             };
-            if let Err(reason) = validate_cron_schedule(&cron.schedule) {
+            if let Err(reason) = validate_cron_schedule(&cron.schedule, cron.timezone.as_deref()) {
                 tracing::error!(
                     worker = %worker.name,
                     schedule = %cron.schedule,
@@ -356,12 +372,15 @@ impl ExternalWorkerManager {
     }
 }
 
-/// Validate that a cron expression parses under the same normalization the
-/// routine engine applies (5/6/7-field expressions).
-fn validate_cron_schedule(schedule: &str) -> Result<(), String> {
-    crate::agent::routine::next_cron_fire(schedule, None)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+/// Validate that a cron expression parses and yields fire times under the
+/// same normalization the routine engine applies (5/6/7-field expressions,
+/// optional IANA timezone — WI#325, MR !1522 DE-8).
+fn validate_cron_schedule(schedule: &str, timezone: Option<&str>) -> Result<(), String> {
+    match crate::agent::routine::next_cron_fire(schedule, timezone) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err("schedule yields no future fire times".to_string()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// The per-mission loop: wait for each scheduled fire, then run the tick's
@@ -415,7 +434,7 @@ async fn run_cron_mission(
             }
             continue;
         }
-        let Some(fire_at) = next_fire_or_log(&worker.name, &cron.schedule) else {
+        let Some(fire_at) = next_fire_or_log(&worker.name, &cron.schedule, cron.timezone.as_deref()) else {
             return MissionExit::ScheduleExhausted;
         };
         let wait = (fire_at - Utc::now()).to_std().unwrap_or_default();
@@ -670,8 +689,9 @@ fn last_tick_job(ctx: &TickCtx<'_>) -> Option<Uuid> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Update circuit-breaker state after a scheduled tick resolves; trips into
-/// a persisted pause after `CIRCUIT_BREAKER_THRESHOLD` consecutive abandons.
+/// Update circuit-breaker state after a tick resolves; trips into a
+/// persisted pause after `CIRCUIT_BREAKER_THRESHOLD` consecutive abandons.
+/// Busy/capacity skips leave the breaker untouched (MR !1522 DE-2).
 async fn after_tick(
     ctx: &TickCtx<'_>,
     state: &mut MissionState,
@@ -680,6 +700,9 @@ async fn after_tick(
 ) {
     match end {
         TickEnd::Resolved => state.consecutive_abandoned = 0,
+        // Ordinary busy/capacity contention must not trip the breaker
+        // (MR !1522 DE-2): the mission simply retries at the next fire.
+        TickEnd::SkippedBusy => {}
         TickEnd::Abandoned { job_id, reason } => {
             state.consecutive_abandoned += 1;
             if state.consecutive_abandoned >= CIRCUIT_BREAKER_THRESHOLD {
@@ -721,9 +744,14 @@ async fn after_tick(
 
 /// Compute the next fire time, logging and ending the mission loop when the
 /// schedule stops yielding one (a previously-validated schedule should not
-/// do this; treat as a hard config error if it does).
-fn next_fire_or_log(worker_name: &str, schedule: &str) -> Option<chrono::DateTime<Utc>> {
-    match crate::agent::routine::next_cron_fire(schedule, None) {
+/// do this; treat as a hard config error if it does). The optional IANA
+/// timezone is resolved exactly like routines (MR !1522 DE-8).
+fn next_fire_or_log(
+    worker_name: &str,
+    schedule: &str,
+    timezone: Option<&str>,
+) -> Option<chrono::DateTime<Utc>> {
+    match crate::agent::routine::next_cron_fire(schedule, timezone) {
         Ok(Some(fire_at)) => Some(fire_at),
         Ok(None) => {
             tracing::error!(
@@ -793,7 +821,30 @@ async fn run_tick(
         }
         let job_id = Uuid::new_v4();
         last_link = Some(job_id);
-        dispatch_tick_job(ctx, tick_index, chain_index, job_id).await;
+        match dispatch_tick_job(ctx, tick_index, chain_index, job_id).await {
+            DispatchOutcome::Fired => {}
+            DispatchOutcome::Capacity(reason) => {
+                match busy_retry_step(
+                    ctx,
+                    tick_index,
+                    chain_index,
+                    None,
+                    &reason,
+                    &mut busy_retries,
+                    "capacity_retry",
+                )
+                .await
+                {
+                    BusyAction::Retry => {
+                        if !backoff_sleep(busy_retries, shutdown_rx).await {
+                            return None;
+                        }
+                        continue;
+                    }
+                    BusyAction::Skip(end) => return Some(end),
+                }
+            }
+        }
 
         let Some(outcome) = watch_tick_job(ctx, job_id, shutdown_rx).await else {
             // Shutdown mid-tick: cancel the in-flight link with the shutdown
@@ -807,24 +858,27 @@ async fn run_tick(
         if let Some(end) = resolve_terminal(ctx, tick_index, chain_index, job_id, &outcome).await {
             return Some(end);
         }
-        if let Some(action) = handle_busy_rejection(
-            ctx,
-            tick_index,
-            chain_index,
-            job_id,
-            &outcome,
-            &mut busy_retries,
-        )
-        .await
+        if let TickOutcome::Failed(reason) = &outcome
+            && is_busy(reason)
         {
-            match action {
+            match busy_retry_step(
+                ctx,
+                tick_index,
+                chain_index,
+                Some(job_id),
+                reason,
+                &mut busy_retries,
+                "busy_retry",
+            )
+            .await
+            {
                 BusyAction::Retry => {
                     if !backoff_sleep(busy_retries, shutdown_rx).await {
                         return None;
                     }
                     continue;
                 }
-                BusyAction::Abandon(end) => return Some(end),
+                BusyAction::Skip(end) => return Some(end),
             }
         }
         match prepare_reentry(
@@ -889,59 +943,86 @@ async fn resolve_terminal(
     Some(TickEnd::Resolved)
 }
 
-/// Busy-rejection handling (CU-1): the old link may still hold the worker's
-/// workspace lock, so retry the same chain link with backoff instead of
-/// spending re-entry budget. Bounded by `MAX_BUSY_RETRIES`.
-async fn handle_busy_rejection(
+/// Busy/capacity retry bookkeeping shared by worker busy rejections and
+/// dispatch-time capacity failures (MR !1522 DE-2): contention is not
+/// mission failure, so exhausting the budget SKIPS the tick without tripping
+/// the circuit breaker — the next scheduled fire retries normally.
+///
+/// `job_id` is `None` when the dispatch never produced a persisted job row
+/// (capacity failure before registration): events are log-only then because
+/// `job_events.job_id` references `agent_jobs`.
+async fn busy_retry_step(
     ctx: &TickCtx<'_>,
     tick_index: u64,
     chain_index: u32,
-    job_id: Uuid,
-    outcome: &TickOutcome,
+    job_id: Option<Uuid>,
+    reason: &str,
     busy_retries: &mut u32,
-) -> Option<BusyAction> {
-    let TickOutcome::Failed(reason) = outcome else {
-        return None;
-    };
-    if !reason.contains(BUSY_MARKER) {
-        return None;
-    }
+    kind: &str,
+) -> BusyAction {
     *busy_retries += 1;
     if *busy_retries > MAX_BUSY_RETRIES {
-        let reason = format!("workspace still busy after {MAX_BUSY_RETRIES} retries");
-        return Some(BusyAction::Abandon(
-            abandon_tick(ctx, tick_index, chain_index, job_id, reason).await,
-        ));
+        let reason = format!("workspace still busy after {MAX_BUSY_RETRIES} retries: {reason}");
+        tracing::error!(
+            worker = %ctx.worker.name,
+            mission_id = %ctx.mission_id,
+            tick_index,
+            chain_index,
+            %reason,
+            "Cron tick skipped: workspace busy; retrying at the next scheduled fire \
+             (circuit breaker not affected — contention is not mission failure)"
+        );
+        if let Some(job_id) = job_id {
+            persist_cron_event(
+                ctx.manager.store_handle(),
+                job_id,
+                "cron_tick_end",
+                serde_json::json!({
+                    "mission_id": ctx.mission_id,
+                    "tick_index": tick_index,
+                    "chain_index": chain_index,
+                    "outcome": "skipped_busy",
+                    "reason": reason,
+                }),
+            )
+            .await;
+            evict_tick_context(ctx.manager, job_id).await;
+        }
+        return BusyAction::Skip(TickEnd::SkippedBusy);
     }
     tracing::warn!(
         worker = %ctx.worker.name,
         mission_id = %ctx.mission_id,
         tick_index,
         chain_index,
-        %job_id,
+        ?job_id,
         busy_retry = *busy_retries,
-        "Cron tick rejected: workspace busy; backing off without spending re-entry budget"
+        %reason,
+        "Cron tick not dispatched: workspace busy / at capacity; backing off \
+         without spending re-entry budget"
     );
-    persist_cron_event(
-        ctx.manager.store_handle(),
-        job_id,
-        "cron_reentry",
-        serde_json::json!({
-            "mission_id": ctx.mission_id,
-            "tick_index": tick_index,
-            "chain_index": chain_index,
-            "kind": "busy_retry",
-            "busy_retry": *busy_retries,
-        }),
-    )
-    .await;
-    evict_tick_context(ctx.manager, job_id).await;
-    Some(BusyAction::Retry)
+    if let Some(job_id) = job_id {
+        persist_cron_event(
+            ctx.manager.store_handle(),
+            job_id,
+            "cron_reentry",
+            serde_json::json!({
+                "mission_id": ctx.mission_id,
+                "tick_index": tick_index,
+                "chain_index": chain_index,
+                "kind": kind,
+                "busy_retry": *busy_retries,
+            }),
+        )
+        .await;
+        evict_tick_context(ctx.manager, job_id).await;
+    }
+    BusyAction::Retry
 }
 
 enum BusyAction {
     Retry,
-    Abandon(TickEnd),
+    Skip(TickEnd),
 }
 
 /// Decide whether the chain re-dispatches or abandons. A heartbeat lapse is
@@ -1049,6 +1130,12 @@ async fn abandon_tick(
     TickEnd::Abandoned { job_id, reason }
 }
 
+/// Whether a worker rejection is a workspace-busy / concurrency collision
+/// (MR !1522 DE-2/DE-5): transient contention, never mission failure.
+fn is_busy(reason: &str) -> bool {
+    BUSY_MARKERS.iter().any(|marker| reason.contains(marker))
+}
+
 /// Whether a worker rejection can never be fixed by re-dispatching (CU-4):
 /// protocol validation (timeout above the bridge cap, bad project_dir) is a
 /// config error, not a transient failure.
@@ -1124,50 +1211,42 @@ async fn await_terminal(
     }
 }
 
+/// How a tick dispatch attempt ended before any worker contact.
+enum DispatchOutcome {
+    /// The job was registered, persisted, and fired at the worker.
+    Fired,
+    /// The job could not be reserved/registered (context manager at
+    /// capacity, duplicate reservation). No DB row exists for it, so any
+    /// events are log-only (`job_events.job_id` references `agent_jobs`).
+    Capacity(String),
+}
+
 /// Dispatch one bounded tick job: reserve, register, persist, then fire the
 /// task on the worker with the structured `cron.tick` context attached.
-async fn dispatch_tick_job(ctx: &TickCtx<'_>, tick_index: u64, chain_index: u32, job_id: Uuid) {
+async fn dispatch_tick_job(
+    ctx: &TickCtx<'_>,
+    tick_index: u64,
+    chain_index: u32,
+    job_id: Uuid,
+) -> DispatchOutcome {
     let TickCtx {
         manager,
         worker,
         cron,
         mission_id,
         owner_id,
-        last_tick_job_id: _,
+        ..
     } = *ctx;
-    if let Err(error) = manager.reserve_task(job_id, &worker.name).await {
-        tracing::warn!(%job_id, worker = %worker.name, "Cron tick reservation failed: {error}");
-        return;
-    }
-
+    let project_dir = cron.resolved_project_dir(&worker.name);
     let title = format!("{mission_id} tick #{tick_index}");
-    let description = build_tick_prompt(cron, mission_id, tick_index, chain_index);
-    if let Some(cm) = manager.context_manager_handle()
-        && let Err(error) = cm
-            .register_sandbox_job(job_id, owner_id, &title, &description)
-            .await
+    let description = build_tick_prompt(cron, mission_id, tick_index, chain_index, &project_dir);
+    if let DispatchOutcome::Capacity(reason) =
+        register_tick_job(ctx, tick_index, chain_index, job_id, &title, &description).await
     {
-        tracing::warn!(%job_id, "Failed to register cron tick job: {error}");
-        manager.release_task_reservation(job_id).await;
-        return;
-    }
-    if let Some(cm) = manager.context_manager_handle() {
-        let mission = mission_id.to_string();
-        let schedule = cron.schedule.clone();
-        let _ = cm
-            .update_context(job_id, |ctx| {
-                ctx.metadata = serde_json::json!({
-                    "mission_id": mission,
-                    "cron_schedule": schedule,
-                    "tick_index": tick_index,
-                    "chain_index": chain_index,
-                    "cron_mode": true,
-                });
-            })
-            .await;
+        return DispatchOutcome::Capacity(reason);
     }
 
-    persist_tick_record(manager, worker, cron, job_id, owner_id, &description).await;
+    persist_tick_record(manager, worker, job_id, owner_id, &description, &project_dir).await;
     // Record the link as the mission's most recent job so owner-command
     // audit events (cron_paused/cron_resumed) have a job row to key to.
     ctx.last_tick_job_id
@@ -1175,28 +1254,7 @@ async fn dispatch_tick_job(ctx: &TickCtx<'_>, tick_index: u64, chain_index: u32,
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .replace(job_id);
 
-    let fired_at = Utc::now().to_rfc3339();
-    let mut context = build_task_context(
-        owner_id,
-        cron.project_dir.as_deref(),
-        HashMap::new(),
-        Vec::new(),
-        HashMap::from([
-            ("mission_id".to_string(), mission_id.to_string()),
-            ("cron_mode".to_string(), "true".to_string()),
-        ]),
-    );
-    context.cron_tick = Some(CronTick {
-        event: "cron.tick".to_string(),
-        mission_id: mission_id.to_string(),
-        schedule: cron.schedule.clone(),
-        goal: cron.goal.clone(),
-        tick_index,
-        chain_index,
-        fired_at: fired_at.clone(),
-    });
-
-    let tick_timeout_ms = cron.tick_timeout_ms(worker.timeout_ms);
+    let tick_timeout_ms = cron.tick_timeout_ms();
     persist_cron_event(
         manager.store_handle(),
         job_id,
@@ -1207,7 +1265,7 @@ async fn dispatch_tick_job(ctx: &TickCtx<'_>, tick_index: u64, chain_index: u32,
             "goal": cron.goal,
             "tick_index": tick_index,
             "chain_index": chain_index,
-            "fired_at": fired_at,
+            "fired_at": Utc::now().to_rfc3339(),
             "tick_timeout_ms": tick_timeout_ms,
         }),
     )
@@ -1219,6 +1277,7 @@ async fn dispatch_tick_job(ctx: &TickCtx<'_>, tick_index: u64, chain_index: u32,
         format!("cron tick #{tick_index} (mission {mission_id}) dispatched"),
     );
 
+    let context = build_tick_context(cron, mission_id, owner_id, tick_index, chain_index, &project_dir);
     if let Err(error) = manager
         .execute_task(
             job_id,
@@ -1246,6 +1305,81 @@ async fn dispatch_tick_job(ctx: &TickCtx<'_>, tick_index: u64, chain_index: u32,
                 .await;
         }
     }
+    DispatchOutcome::Fired
+}
+
+/// Reserve and register the tick job and tag its metadata. Returns
+/// `DispatchOutcome::Capacity` when the job never materialized (no context
+/// manager, reservation conflict, or registration failure).
+async fn register_tick_job(
+    ctx: &TickCtx<'_>,
+    tick_index: u64,
+    chain_index: u32,
+    job_id: Uuid,
+    title: &str,
+    description: &str,
+) -> DispatchOutcome {
+    if let Err(error) = ctx.manager.reserve_task(job_id, &ctx.worker.name).await {
+        tracing::warn!(%job_id, worker = %ctx.worker.name, "Cron tick reservation failed: {error}");
+        return DispatchOutcome::Capacity(format!("task reservation failed: {error}"));
+    }
+    let Some(cm) = ctx.manager.context_manager_handle() else {
+        // Without a context manager the watcher can never observe the job;
+        // treat as capacity-class so the tick retries instead of vanishing.
+        ctx.manager.release_task_reservation(job_id).await;
+        return DispatchOutcome::Capacity("no context manager registered".to_string());
+    };
+    if let Err(error) = cm.register_sandbox_job(job_id, ctx.owner_id, title, description).await {
+        tracing::warn!(%job_id, "Failed to register cron tick job: {error}");
+        ctx.manager.release_task_reservation(job_id).await;
+        return DispatchOutcome::Capacity(format!("job registration failed: {error}"));
+    }
+    let mission = ctx.mission_id.to_string();
+    let schedule = ctx.cron.schedule.clone();
+    let _ = cm
+        .update_context(job_id, |ctx| {
+            ctx.metadata = serde_json::json!({
+                "mission_id": mission,
+                "cron_schedule": schedule,
+                "tick_index": tick_index,
+                "chain_index": chain_index,
+                "cron_mode": true,
+            });
+        })
+        .await;
+    DispatchOutcome::Fired
+}
+
+/// Build the task context for one tick link: the structured `cron.tick`
+/// event plus the mission metadata, confined to the mission's workspace dir.
+fn build_tick_context(
+    cron: &CronWorkerConfig,
+    mission_id: &str,
+    owner_id: &str,
+    tick_index: u64,
+    chain_index: u32,
+    project_dir: &str,
+) -> crate::orchestrator::external_worker::TaskContext {
+    let mut context = build_task_context(
+        owner_id,
+        Some(project_dir),
+        HashMap::new(),
+        Vec::new(),
+        HashMap::from([
+            ("mission_id".to_string(), mission_id.to_string()),
+            ("cron_mode".to_string(), "true".to_string()),
+        ]),
+    );
+    context.cron_tick = Some(CronTick {
+        event: "cron.tick".to_string(),
+        mission_id: mission_id.to_string(),
+        schedule: cron.schedule.clone(),
+        goal: cron.goal.clone(),
+        tick_index,
+        chain_index,
+        fired_at: Utc::now().to_rfc3339(),
+    });
+    context
 }
 
 /// Persist the sandbox-job row for a tick job so it survives restarts and is
@@ -1253,10 +1387,10 @@ async fn dispatch_tick_job(ctx: &TickCtx<'_>, tick_index: u64, chain_index: u32,
 async fn persist_tick_record(
     manager: &ExternalWorkerManager,
     worker: &ExternalWorkerConfig,
-    cron: &CronWorkerConfig,
     job_id: Uuid,
     owner_id: &str,
     description: &str,
+    project_dir: &str,
 ) {
     let Some(store) = manager.store_handle() else {
         return;
@@ -1267,7 +1401,7 @@ async fn persist_tick_record(
         task: description.to_string(),
         status: "running".to_string(),
         user_id: owner_id.to_string(),
-        project_dir: cron.project_dir.clone().unwrap_or_default(),
+        project_dir: project_dir.to_string(),
         success: None,
         failure_reason: None,
         created_at: now,
@@ -1489,12 +1623,12 @@ fn build_tick_prompt(
     mission_id: &str,
     tick_index: u64,
     chain_index: u32,
+    project_dir: &str,
 ) -> String {
-    let state_dir = cron.project_dir.as_deref().unwrap_or("/workspace");
     format!(
         "You are the resident worker for mission '{mission_id}', firing on cron schedule \
          '{schedule}'.\n\nMISSION GOAL:\n{goal}\n\nThis is tick #{tick_index} (attempt \
-         {attempt}). Mission state is durable in your workspace directory ({state_dir}): read \
+         {attempt}). Mission state is durable in your workspace directory ({project_dir}): read \
          prior state at the start of the tick and write updated state before you finish. The \
          host supervisor holds the mission lease — if this job dies or goes silent, a fresh job \
          is dispatched and resumes from the workspace. Work the mission goal for this tick, then \
@@ -1519,42 +1653,50 @@ mod tests {
             max_reentries: Some(2),
             allow_subminute_schedule: None,
             project_dir: None,
+            timezone: None,
         }
     }
 
     #[test]
     fn valid_schedules_pass_validation() {
         // 5-field, 6-field, and 7-field forms all normalize.
-        assert!(validate_cron_schedule("0 15 10 * * *").is_ok());
-        assert!(validate_cron_schedule("*/5 * * * *").is_ok());
-        assert!(validate_cron_schedule("0 0 15 10 * *").is_ok());
-        assert!(validate_cron_schedule("0 0 15 10 * * *").is_ok());
+        assert!(validate_cron_schedule("0 15 10 * * *", None).is_ok());
+        assert!(validate_cron_schedule("*/5 * * * *", None).is_ok());
+        assert!(validate_cron_schedule("0 0 15 10 * *", None).is_ok());
+        assert!(validate_cron_schedule("0 0 15 10 * * *", None).is_ok());
+        // Timezone-qualified schedules validate the same way routines do.
+        assert!(
+            validate_cron_schedule("0 15 10 * * *", Some("America/New_York")).is_ok()
+        );
     }
 
     #[test]
     fn invalid_schedules_fail_validation() {
-        assert!(validate_cron_schedule("not a schedule").is_err());
-        assert!(validate_cron_schedule("61 * * * *").is_err());
-        assert!(validate_cron_schedule("").is_err());
+        assert!(validate_cron_schedule("not a schedule", None).is_err());
+        assert!(validate_cron_schedule("61 * * * *", None).is_err());
+        assert!(validate_cron_schedule("", None).is_err());
     }
 
     #[test]
     fn tick_prompt_carries_mission_context() {
         let cron = test_cron();
-        let prompt = build_tick_prompt(&cron, "pr-digest", 7, 1);
+        let project_dir = cron.resolved_project_dir("kimi");
+        let prompt = build_tick_prompt(&cron, "pr-digest", 7, 1, &project_dir);
         assert!(prompt.contains("pr-digest"));
         assert!(prompt.contains("Produce the daily PR digest"));
         assert!(prompt.contains("tick #7"));
         assert!(prompt.contains("attempt 2"));
-        assert!(prompt.contains("/workspace"));
+        // Default mission workspace: missions/<mission_id> (MR !1522 DE-2).
+        assert!(prompt.contains("missions/pr-digest"));
     }
 
     #[test]
     fn tick_prompt_uses_mission_project_dir_when_configured() {
         let mut cron = test_cron();
-        cron.project_dir = Some("missions/pr-digest".to_string());
-        let prompt = build_tick_prompt(&cron, "pr-digest", 1, 0);
-        assert!(prompt.contains("missions/pr-digest"));
+        cron.project_dir = Some("missions/custom".to_string());
+        let project_dir = cron.resolved_project_dir("kimi");
+        let prompt = build_tick_prompt(&cron, "pr-digest", 1, 0, &project_dir);
+        assert!(prompt.contains("missions/custom"));
     }
 
     #[test]
@@ -1566,14 +1708,29 @@ mod tests {
         assert!(!TickOutcome::Cancelled.is_retryable());
     }
 
+    /// MR !1522 DE-5: busy and non-retryable classification must cover BOTH
+    /// shipped worker bridges' wordings (kimi realpath/ENOENT + concurrency
+    /// cap, pebble's wrapped resolution error, the shared escape wording).
     #[test]
     fn busy_and_non_retryable_markers_classify() {
-        assert!("Workspace /workspace is already being modified by task x".contains(BUSY_MARKER));
+        assert!(is_busy("Workspace /workspace is already being modified by task x"));
+        assert!(is_busy("Worker concurrency limit reached"));
+        assert!(!is_busy("worker exploded"));
+
         assert!(is_non_retryable(
             "timeout_ms must be an integer between 1 and 14400000"
         ));
+        // pebble: missing mission dir.
         assert!(is_non_retryable(
             "project_dir 'missions/x' could not be resolved under WORKSPACE_ROOT: ENOENT"
+        ));
+        // kimi: missing mission dir (raw realpathSync failure).
+        assert!(is_non_retryable(
+            "ENOENT: no such file or directory, realpath '/workspace/missions/x'"
+        ));
+        // both bridges: traversal out of WORKSPACE_ROOT.
+        assert!(is_non_retryable(
+            "Workspace path escapes WORKSPACE_ROOT: ../etc"
         ));
         assert!(!is_non_retryable("worker exploded"));
     }

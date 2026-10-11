@@ -235,7 +235,10 @@ pub enum ExternalWorkerMode {
 ///
 /// All durations are optional; defaults are chosen so a plain
 /// `mode = "cron"` + `cron.schedule` + `cron.goal` block is enough.
+/// Unknown keys are rejected (`deny_unknown_fields`) so a misspelled setting
+/// cannot silently fall back to defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CronWorkerConfig {
     /// Cron expression (5, 6, or 7 fields; normalized like routines).
     pub schedule: String,
@@ -254,7 +257,9 @@ pub struct CronWorkerConfig {
     /// Per-tick job deadline in milliseconds. Replaces the standard bounded
     /// `timeout_ms` for this mode — the mission itself is unbounded because
     /// the supervisor always holds the lease and chains fresh jobs.
-    /// Default: the worker's `timeout_ms`.
+    /// Default: [`Self::MAX_TICK_TIMEOUT_MS`] (the worker bridge cap, 4h), so
+    /// a tick link genuinely outlives the worker's ordinary bounded deadline;
+    /// the heartbeat watchdog bounds *silence*, not work.
     #[serde(default)]
     pub tick_timeout_ms: Option<u64>,
     /// Maximum re-dispatches of a single tick after wedge/failure before the
@@ -268,14 +273,26 @@ pub struct CronWorkerConfig {
     /// growth, so the floor is enforced unless this is set.
     #[serde(default)]
     pub allow_subminute_schedule: Option<bool>,
-    /// Optional per-mission workspace directory sent as the tick job's
+    /// Per-mission workspace directory sent as the tick job's
     /// `context.project_dir` (WI#325). Relative paths resolve under the
     /// worker's `WORKSPACE_ROOT`; the directory must already exist — both
     /// shipped workers (kimi bridge, pebble) canonicalize the path and
-    /// reject a missing one before the task starts. When unset, tick jobs
-    /// use the worker root like any other dispatch.
+    /// reject a missing one before the task starts. Default:
+    /// `missions/<mission_id>`, so a mission never shares the worker root
+    /// with ordinary dispatches unless the operator opts into that.
+    /// Host-side validated at load: must be a relative path with no `..`
+    /// segments. Note the kimi/pebble workspace lock treats nested paths as
+    /// overlapping, so ordinary dispatches that use the worker root still
+    /// contend with this mission — give ordinary tasks their own
+    /// non-overlapping `project_dir` on a cron-mode worker.
     #[serde(default)]
     pub project_dir: Option<String>,
+    /// IANA timezone for the schedule (e.g. "America/New_York"), resolved
+    /// with the same normalization the routine engine applies
+    /// (`agent::routine::next_cron_fire`). Default: UTC. An unparseable zone
+    /// rejects the worker at load.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 impl CronWorkerConfig {
@@ -309,8 +326,12 @@ impl CronWorkerConfig {
         self.max_reentries.unwrap_or(Self::DEFAULT_MAX_REENTRIES)
     }
 
-    pub fn tick_timeout_ms(&self, worker_timeout_ms: u64) -> u64 {
-        self.tick_timeout_ms.unwrap_or(worker_timeout_ms)
+    /// Per-link tick deadline. Defaults to the worker bridge cap so a tick
+    /// genuinely outlives the worker's ordinary bounded `timeout_ms`
+    /// (WI#325 "infinite deadline participation": the lease is the chain,
+    /// and each link is as long as the wire protocol allows).
+    pub fn tick_timeout_ms(&self) -> u64 {
+        self.tick_timeout_ms.unwrap_or(Self::MAX_TICK_TIMEOUT_MS)
     }
 
     pub fn resolved_mission_id(&self, worker_name: &str) -> String {
@@ -319,29 +340,52 @@ impl CronWorkerConfig {
             .unwrap_or_else(|| format!("cron-worker-{worker_name}"))
     }
 
+    /// The mission's workspace directory: the explicit `project_dir`, or
+    /// `missions/<mission_id>` so a default mission never shares the worker
+    /// root with ordinary dispatches.
+    pub fn resolved_project_dir(&self, worker_name: &str) -> String {
+        self.project_dir.clone().unwrap_or_else(|| {
+            format!("missions/{}", self.resolved_mission_id(worker_name))
+        })
+    }
+
     /// Validate the cron block against runaway-guard limits (WI#325).
     ///
     /// Fails loudly at config resolution: an invalid block means the worker
     /// is rejected from the resolved config entirely, so a typo can never
     /// silently leave the worker with no mission.
-    pub fn validate(&self, worker_timeout_ms: u64) -> Result<(), String> {
+    pub fn validate(&self, worker_name: &str) -> Result<(), String> {
         if self.goal.trim().is_empty() {
             return Err("cron.goal must not be empty".to_string());
         }
         self.validate_schedule()?;
         self.validate_heartbeat()?;
         self.validate_reentries()?;
-        self.validate_tick_timeout(worker_timeout_ms)
+        self.validate_tick_timeout()?;
+        self.validate_timezone()?;
+        self.validate_project_dir(worker_name)
+    }
+
+    fn validate_timezone(&self) -> Result<(), String> {
+        if let Some(tz) = &self.timezone
+            && crate::timezone::parse_timezone(tz).is_none()
+        {
+            return Err(format!(
+                "cron.timezone {tz:?} is not a parseable IANA timezone"
+            ));
+        }
+        Ok(())
     }
 
     fn validate_schedule(&self) -> Result<(), String> {
-        crate::agent::routine::next_cron_fire(&self.schedule, None)
+        let timezone = self.timezone.as_deref();
+        crate::agent::routine::next_cron_fire(&self.schedule, timezone)
             .map_err(|e| format!("cron.schedule does not parse: {e}"))?
             .ok_or_else(|| "cron.schedule yields no future fire times".to_string())?;
         if self.allow_subminute_schedule == Some(true) {
             return Ok(());
         }
-        match crate::agent::routine::cron_min_fire_gap_secs(&self.schedule, None) {
+        match crate::agent::routine::cron_min_fire_gap_secs(&self.schedule, timezone) {
             Ok(Some(gap)) if gap < Self::MIN_SCHEDULE_INTERVAL_SECS => Err(format!(
                 "cron.schedule fires every {gap}s, below the {}s floor; set \
                  allow_subminute_schedule = true to override",
@@ -375,8 +419,8 @@ impl CronWorkerConfig {
         Ok(())
     }
 
-    fn validate_tick_timeout(&self, worker_timeout_ms: u64) -> Result<(), String> {
-        let tick_timeout_ms = self.tick_timeout_ms(worker_timeout_ms);
+    fn validate_tick_timeout(&self) -> Result<(), String> {
+        let tick_timeout_ms = self.tick_timeout_ms();
         if !(Self::MIN_TICK_TIMEOUT_MS..=Self::MAX_TICK_TIMEOUT_MS).contains(&tick_timeout_ms) {
             return Err(format!(
                 "cron.tick_timeout_ms {tick_timeout_ms} outside {}..={} (ms); the upper bound \
@@ -384,6 +428,44 @@ impl CronWorkerConfig {
                 Self::MIN_TICK_TIMEOUT_MS,
                 Self::MAX_TICK_TIMEOUT_MS
             ));
+        }
+        Ok(())
+    }
+
+    /// Host-side `project_dir` validation (MR !1522 DE-5): the worker bridges
+    /// reject bad paths with *wording that differs per bridge*, so the host
+    /// refuses obviously-invalid values at load and the supervisor only has
+    /// to classify the "directory does not exist on the worker" case.
+    /// Validates the *effective* directory (explicit or `missions/<id>`
+    /// default), which also confines a hostile `mission_id`.
+    fn validate_project_dir(&self, worker_name: &str) -> Result<(), String> {
+        let dir = self.resolved_project_dir(worker_name);
+        let path = std::path::Path::new(&dir);
+        let bad = |why: &str| {
+            format!("cron.project_dir {dir:?} is {why}; use a relative path under the worker's WORKSPACE_ROOT")
+        };
+        if dir.trim().is_empty() {
+            return Err(bad("empty"));
+        }
+        if dir.contains('\0') {
+            return Err(bad("NUL-containing"));
+        }
+        if dir.starts_with('~') {
+            return Err(bad("home-relative (`~`)"));
+        }
+        for component in path.components() {
+            match component {
+                std::path::Component::Normal(_) => {}
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    return Err(bad("absolute"));
+                }
+                std::path::Component::ParentDir => {
+                    return Err(bad("a `..` traversal"));
+                }
+                std::path::Component::CurDir => {
+                    return Err(bad("a `.` segment"));
+                }
+            }
         }
         Ok(())
     }
@@ -404,7 +486,12 @@ pub struct ExternalWorkerConfig {
     /// Bounds applied when recent conversation context is requested.
     pub prompt_context: PromptContextLimits,
     /// Operating mode (default task). `Cron` arms the host-side mission
-    /// supervisor; the worker still accepts ordinary bounded dispatches.
+    /// supervisor. The worker still accepts ordinary bounded dispatches, but
+    /// the kimi/pebble workspace lock treats nested paths as overlapping, so
+    /// an ordinary dispatch that shares the worker root contends with a
+    /// running tick (whose `project_dir` defaults to `missions/<mission_id>`)
+    /// — give ordinary tasks on a cron-mode worker their own non-overlapping
+    /// `project_dir`, or expect busy rejections while a tick runs.
     pub mode: ExternalWorkerMode,
     /// Cron-mission settings; required when `mode` is `Cron`. A missing or
     /// invalid block rejects the worker at config resolution (logged at
@@ -414,6 +501,10 @@ pub struct ExternalWorkerConfig {
 
 impl ExternalWorkerConfig {
     pub fn resolve_from_settings(settings: &crate::settings::Settings) -> Vec<Self> {
+        // WI#325 (MR !1522 DE-7): two cron workers sharing a mission id would
+        // share the persisted `cron-mission:<id>:*` settings keys and corrupt
+        // each other's durable state, so the duplicate is rejected loudly.
+        let mut seen_mission_ids = std::collections::HashSet::new();
         settings
             .sandbox
             .external_workers
@@ -442,7 +533,7 @@ impl ExternalWorkerConfig {
                 };
                 // WI#325: reject invalid cron configs loudly at load instead
                 // of booting a worker whose mission supervisor can never run.
-                if config.is_cron() && !config.cron_block_valid() {
+                if config.is_cron() && !config.cron_block_valid(&mut seen_mission_ids) {
                     return None;
                 }
                 Some(config)
@@ -450,9 +541,12 @@ impl ExternalWorkerConfig {
             .collect()
     }
 
-    /// Whether the cron block of a cron-mode worker passes validation.
-    /// Logs the precise reason at `error!` when it does not.
-    fn cron_block_valid(&self) -> bool {
+    /// Whether the cron block of a cron-mode worker passes validation and its
+    /// mission id is unique. Logs the precise reason at `error!` when not.
+    fn cron_block_valid(
+        &self,
+        seen_mission_ids: &mut std::collections::HashSet<String>,
+    ) -> bool {
         let Some(cron) = &self.cron else {
             tracing::error!(
                 worker = %self.name,
@@ -460,10 +554,20 @@ impl ExternalWorkerConfig {
             );
             return false;
         };
-        if let Err(reason) = cron.validate(self.timeout_ms) {
+        if let Err(reason) = cron.validate(&self.name) {
             tracing::error!(
                 worker = %self.name,
                 "Invalid cron config for cron-mode worker; worker rejected: {reason}"
+            );
+            return false;
+        }
+        let mission_id = cron.resolved_mission_id(&self.name);
+        if !seen_mission_ids.insert(mission_id.clone()) {
+            tracing::error!(
+                worker = %self.name,
+                %mission_id,
+                "Duplicate cron mission_id (persisted mission state is keyed by it); \
+                 worker rejected — set a unique cron.mission_id"
             );
             return false;
         }
@@ -1035,7 +1139,7 @@ max_reentries = 5
             cron.heartbeat_timeout(),
             std::time::Duration::from_secs(300)
         );
-        assert_eq!(cron.tick_timeout_ms(worker.timeout_ms), 1_800_000);
+        assert_eq!(cron.tick_timeout_ms(), 1_800_000);
         assert_eq!(cron.max_reentries(), 5);
     }
 
@@ -1062,7 +1166,13 @@ goal = "Watch the herd"
             cron.heartbeat_timeout(),
             std::time::Duration::from_secs(CronWorkerConfig::DEFAULT_HEARTBEAT_TIMEOUT_SECS)
         );
-        assert_eq!(cron.tick_timeout_ms(3_600_000), 3_600_000);
+        // Default per-link deadline is the worker bridge cap (4h), not the
+        // worker's ordinary timeout: a tick link must outlive the standard
+        // bounded deadline by default (WI#325, MR !1522 CU-3).
+        assert_eq!(
+            cron.tick_timeout_ms(),
+            CronWorkerConfig::MAX_TICK_TIMEOUT_MS
+        );
         assert_eq!(
             cron.max_reentries(),
             CronWorkerConfig::DEFAULT_MAX_REENTRIES
@@ -1134,10 +1244,12 @@ mode = "cron"
 
     #[test]
     fn subminute_schedule_passes_with_explicit_override() {
+        // MR !1522 DE-6: must use a genuinely sub-60s schedule — a per-minute
+        // expression passes the floor without the override and cannot regress.
         let worker = resolve_cron_worker(
-            "schedule = \"* * * * *\"\ngoal = \"g\"\nallow_subminute_schedule = true",
+            "schedule = \"* * * * * *\"\ngoal = \"g\"\nallow_subminute_schedule = true",
         )
-        .expect("override must allow the fast schedule");
+        .expect("override must allow the per-second schedule");
         assert!(worker.is_cron());
     }
 
@@ -1188,7 +1300,8 @@ mode = "cron"
             )
             .is_some()
         );
-        // A worker default timeout above the cap also fails validation.
+        // The worker's ordinary timeout no longer feeds the tick deadline:
+        // the default tick deadline is the bridge cap regardless.
         let settings: crate::settings::Settings = toml::from_str(
             r#"
 [[sandbox.external_workers]]
@@ -1203,7 +1316,9 @@ goal = "g"
 "#,
         )
         .expect("config must parse");
-        assert!(ExternalWorkerConfig::resolve_from_settings(&settings).is_empty());
+        let workers = ExternalWorkerConfig::resolve_from_settings(&settings);
+        let cron = workers[0].cron.as_ref().expect("cron block");
+        assert_eq!(cron.tick_timeout_ms(), CronWorkerConfig::MAX_TICK_TIMEOUT_MS);
     }
 
     #[test]
@@ -1214,5 +1329,118 @@ goal = "g"
         .expect("valid cron config with project_dir");
         let cron = worker.cron.as_ref().expect("cron block");
         assert_eq!(cron.project_dir.as_deref(), Some("missions/pr-digest"));
+    }
+
+    /// MR !1522 DE-2: the mission workspace defaults to `missions/<id>` so a
+    /// default mission never shares the worker root with ordinary dispatches.
+    #[test]
+    fn mission_project_dir_defaults_to_missions_subdir() {
+        let worker = resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"")
+            .expect("valid cron config");
+        let cron = worker.cron.as_ref().expect("cron block");
+        assert_eq!(cron.project_dir, None);
+        assert_eq!(
+            cron.resolved_project_dir("kimi"),
+            "missions/cron-worker-kimi"
+        );
+    }
+
+    /// MR !1522 DE-5: obviously-invalid project dirs are refused at load on
+    /// the host instead of being classified from per-bridge error wording.
+    #[test]
+    fn mission_project_dir_rejects_absolute_and_traversal() {
+        for dir in [
+            "/etc",
+            "../escape",
+            "missions/../../escape",
+            "~/rooted",
+            "./dot",
+            "white space/..",
+        ] {
+            assert!(
+                resolve_cron_worker(&format!(
+                    "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nproject_dir = \"{dir}\""
+                ))
+                .is_none(),
+                "project_dir {dir:?} must be rejected at load"
+            );
+        }
+        // A hostile mission_id cannot smuggle a traversal into the default dir.
+        assert!(
+            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nmission_id = \"../x\"")
+                .is_none()
+        );
+    }
+
+    /// MR !1522 DE-7: two cron workers sharing a mission id would share the
+    /// persisted `cron-mission:<id>:*` settings keys; the duplicate loses.
+    #[test]
+    fn duplicate_mission_id_is_rejected() {
+        let settings: crate::settings::Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi-a"
+url = "ws://127.0.0.1:10007/ws/agent"
+mode = "cron"
+[sandbox.external_workers.cron]
+schedule = "0 15 10 * * *"
+goal = "g"
+mission_id = "shared"
+
+[[sandbox.external_workers]]
+name = "kimi-b"
+url = "ws://127.0.0.1:10008/ws/agent"
+mode = "cron"
+[sandbox.external_workers.cron]
+schedule = "0 16 10 * * *"
+goal = "g"
+mission_id = "shared"
+"#,
+        )
+        .expect("config must parse");
+        let workers = ExternalWorkerConfig::resolve_from_settings(&settings);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].name, "kimi-a");
+    }
+
+    /// MR !1522 DE-8: schedules honor a configured IANA timezone, resolved
+    /// with the same normalization as routines; a bad zone rejects at load.
+    #[test]
+    fn cron_timezone_is_validated() {
+        assert!(
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\ntimezone = \"America/New_York\""
+            )
+            .is_some()
+        );
+        assert!(
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\ntimezone = \"Not/AZone\""
+            )
+            .is_none()
+        );
+    }
+
+    /// MR !1522 DE-10: unknown keys in the cron block are a load error, not a
+    /// silent fallback to defaults.
+    #[test]
+    fn cron_block_rejects_unknown_keys() {
+        let settings: Result<crate::settings::Settings, _> = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10007/ws/agent"
+mode = "cron"
+
+[sandbox.external_workers.cron]
+schedule = "0 15 10 * * *"
+goal = "g"
+hearbeat_timeout_secs = 300
+"#,
+        );
+        assert!(
+            settings.is_err(),
+            "a misspelled cron key must fail TOML deserialization"
+        );
     }
 }

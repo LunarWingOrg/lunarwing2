@@ -2053,6 +2053,7 @@ fn cron_config_with_schedule(
             max_reentries: Some(max_reentries),
             allow_subminute_schedule: None,
             project_dir: None,
+            timezone: None,
         }),
     }
 }
@@ -2107,12 +2108,15 @@ async fn cron_tick_reaches_worker_with_structured_tick_context() {
             .as_str()
             .is_some_and(|value| !value.is_empty())
     );
-    // The prompt carries the mission goal and the /workspace handoff contract.
+    // The prompt carries the mission goal and the workspace handoff contract.
     let prompt = request["payload"]["prompt"].as_str().expect("prompt");
     assert!(prompt.contains("Watch the herd"));
-    assert!(prompt.contains("/workspace"));
-    // No per-mission project_dir configured → the field is omitted entirely.
-    assert!(request["payload"]["context"].get("project_dir").is_none());
+    // No explicit project_dir → the default missions/<mission_id> is sent.
+    assert_eq!(
+        request["payload"]["context"]["project_dir"].as_str(),
+        Some("missions/test-mission")
+    );
+    assert!(prompt.contains("missions/test-mission"));
 }
 
 /// The re-entry supervisor (WI#325 ask 3): when a tick job wedges (no
