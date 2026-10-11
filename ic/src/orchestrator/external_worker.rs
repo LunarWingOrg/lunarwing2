@@ -2572,22 +2572,13 @@ mod tests {
                 url: "ws://localhost:9090/ws/agent".to_string(),
                 auth_token: Some(secrecy::SecretString::from("tok")),
                 timeout_ms: 300_000,
-                endpoints: vec![],
-                load_balance: LoadBalanceStrategy::default(),
-                prompt_context: Default::default(),
-                mode: crate::config::ExternalWorkerMode::Task,
-                cron: None,
+                ..Default::default()
             },
             ExternalWorkerConfig {
                 name: "pebble".to_string(),
                 url: "ws://localhost:8443".to_string(),
-                auth_token: None,
                 timeout_ms: 600_000,
-                endpoints: vec![],
-                load_balance: LoadBalanceStrategy::default(),
-                prompt_context: Default::default(),
-                mode: crate::config::ExternalWorkerMode::Task,
-                cron: None,
+                ..Default::default()
             },
         ]);
         assert!(!mgr.is_empty());
@@ -2997,10 +2988,7 @@ mod tests {
                     weight: None,
                 },
             ],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: Default::default(),
-            mode: crate::config::ExternalWorkerMode::Task,
-            cron: None,
+            ..Default::default()
         }]);
 
         let lb = mgr.load_balancers.get("multi").unwrap();

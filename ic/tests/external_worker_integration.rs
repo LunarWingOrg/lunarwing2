@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use lunarwing::channels::web::types::SseEvent;
 use lunarwing::config::{
-    CronWorkerConfig, ExternalWorkerConfig, ExternalWorkerMode, LoadBalanceStrategy, WorkerEndpoint,
+    CronWorkerConfig, ExternalWorkerConfig, ExternalWorkerMode, WorkerEndpoint,
 };
 use lunarwing::context::{ContextManager, JobContext, JobState};
 use lunarwing::error::OrchestratorError;
@@ -660,17 +660,15 @@ fn config_for(url: &str) -> ExternalWorkerConfig {
     ExternalWorkerConfig {
         name: "mock".to_string(),
         url: url.to_string(),
-        auth_token: None,
         timeout_ms: 30_000,
         endpoints: vec![WorkerEndpoint {
             url: url.to_string(),
             auth_token: None,
             weight: None,
         }],
-        load_balance: LoadBalanceStrategy::RoundRobin,
-        prompt_context: Default::default(),
-        mode: lunarwing::config::ExternalWorkerMode::Task,
-        cron: None,
+        // `..Default::default()` so sibling-MR fields (e.g. tool_allowlist)
+        // never break this literal outside Git's conflict markers (DE-4).
+        ..Default::default()
     }
 }
 
@@ -687,10 +685,7 @@ fn config_for_with_auth(url: &str, token: &str) -> ExternalWorkerConfig {
             auth_token: Some(SecretString::from(token)),
             weight: None,
         }],
-        load_balance: LoadBalanceStrategy::RoundRobin,
-        prompt_context: Default::default(),
-        mode: lunarwing::config::ExternalWorkerMode::Task,
-        cron: None,
+        ..Default::default()
     }
 }
 
@@ -2034,15 +2029,12 @@ fn cron_config_with_schedule(
     ExternalWorkerConfig {
         name: "mock".to_string(),
         url: url.to_string(),
-        auth_token: None,
         timeout_ms: 30_000,
         endpoints: vec![WorkerEndpoint {
             url: url.to_string(),
             auth_token: None,
             weight: None,
         }],
-        load_balance: LoadBalanceStrategy::RoundRobin,
-        prompt_context: Default::default(),
         mode: ExternalWorkerMode::Cron,
         cron: Some(CronWorkerConfig {
             schedule: schedule.to_string(),
@@ -2055,6 +2047,7 @@ fn cron_config_with_schedule(
             project_dir: None,
             timezone: None,
         }),
+        ..Default::default()
     }
 }
 

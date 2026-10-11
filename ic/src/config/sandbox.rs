@@ -499,6 +499,26 @@ pub struct ExternalWorkerConfig {
     pub cron: Option<CronWorkerConfig>,
 }
 
+/// Sensible defaults for tests and partial construction (MR !1522 DE-4):
+/// every literal should use `..Default::default()` so a sibling MR adding a
+/// field does not break compilation outside Git's conflict markers.
+impl Default for ExternalWorkerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            auth_token: None,
+            // Mirrors `default_external_worker_timeout` in settings.rs.
+            timeout_ms: 3_600_000,
+            endpoints: Vec::new(),
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: PromptContextLimits::default(),
+            mode: ExternalWorkerMode::default(),
+            cron: None,
+        }
+    }
+}
+
 impl ExternalWorkerConfig {
     pub fn resolve_from_settings(settings: &crate::settings::Settings) -> Vec<Self> {
         // WI#325 (MR !1522 DE-7): two cron workers sharing a mission id would
