@@ -58,7 +58,7 @@ pub(crate) fn workspace_paths_overlap(left: &Path, right: &Path) -> bool {
 /// Linux workers provide /proc/self/fd; `O_NOFOLLOW` rejects symlink components
 /// before the next mkdir, including swaps by another task in the workspace.
 fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
-    use std::fs::{create_dir, OpenOptions};
+    use std::fs::{OpenOptions, create_dir};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -73,6 +73,14 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "expected relative directory components",
+        ));
+    }
+    // DS-6: fail explicitly when the descriptor-walk transport is unavailable
+    // (e.g. a sandbox masking /proc) instead of a misleading mkdir ENOENT.
+    if !Path::new("/proc/self/fd").exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "/proc/self/fd is not available (required for symlink-safe directory creation)",
         ));
     }
     let root = workspace_root.canonicalize()?;
@@ -95,6 +103,19 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
     resolve_workspace_path(path, &root)
 }
 
+/// DS-2: only validation, a non-directory component (ENOTDIR), a symlink loop
+/// (ELOOP), permission denials (EACCES/EPERM) and containment failures are
+/// permanent. Everything else (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the
+/// first mkdir, ENOENT/EINVAL from a swap race) is transient and the host
+/// supervisor may re-dispatch. `Unsupported` marks the missing-/proc preflight.
+fn is_non_retryable_bootstrap(error: &io::Error) -> bool {
+    use io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
+    if matches!(error.kind(), InvalidInput | PermissionDenied | Unsupported) {
+        return true;
+    }
+    matches!(error.raw_os_error(), Some(code) if code == libc::ENOTDIR || code == libc::ELOOP)
+}
+
 pub(crate) fn resolve_task_workspace(
     context: &crate::protocol::TaskContext,
     workspace_root: &Path,
@@ -108,10 +129,17 @@ pub(crate) fn resolve_task_workspace(
         == Some("cron.tick")
     {
         create_cron_workspace(path, workspace_root).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("Invalid workspace path for cron tick: {error}"),
-            )
+            // DS-2: the wrapper text is the host supervisor's retry signal —
+            // "Invalid workspace path" abandons the tick, "Transient workspace
+            // error" re-dispatches (checked before any marker substring, so a
+            // wrapped "could not be resolved under WORKSPACE_ROOT" cannot
+            // misclassify a transient failure).
+            let wrapper = if is_non_retryable_bootstrap(&error) {
+                format!("Invalid workspace path for cron tick: {error}")
+            } else {
+                format!("Transient workspace error for cron tick: {error}")
+            };
+            io::Error::new(error.kind(), wrapper)
         })
     } else {
         resolve_workspace_path(path, workspace_root)
@@ -241,6 +269,33 @@ mod tests {
             Path::new("/workspace/project"),
             Path::new("/workspace/project-a")
         ));
+    }
+
+    #[test]
+    fn cron_bootstrap_error_classification() {
+        // Validation, permission denials and the missing-/proc preflight are
+        // permanent; so are a non-directory component and a symlink loop.
+        for error in [
+            io::Error::new(io::ErrorKind::InvalidInput, "bad components"),
+            io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+            io::Error::new(io::ErrorKind::Unsupported, "no /proc/self/fd"),
+            io::Error::from_raw_os_error(libc::ENOTDIR),
+            io::Error::from_raw_os_error(libc::ELOOP),
+            io::Error::from_raw_os_error(libc::EACCES),
+        ] {
+            assert!(is_non_retryable_bootstrap(&error), "permanent: {error}");
+        }
+        // Transient errnos are worth a re-dispatch (DS-2).
+        for error in [
+            io::Error::from_raw_os_error(libc::EMFILE),
+            io::Error::from_raw_os_error(libc::ENFILE),
+            io::Error::from_raw_os_error(libc::ENOMEM),
+            io::Error::from_raw_os_error(libc::ENOSPC),
+            io::Error::from_raw_os_error(libc::EIO),
+            io::Error::from_raw_os_error(libc::ENOENT),
+        ] {
+            assert!(!is_non_retryable_bootstrap(&error), "transient: {error}");
+        }
     }
 
     #[test]

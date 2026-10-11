@@ -77,3 +77,19 @@ test("cron bootstrap creates a missing default dir, preserves state, and confine
     rmSync(outside, { recursive: true, force: true })
   }
 })
+
+test("cron bootstrap: a non-directory component is permanent and names the component", () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-file-"))
+  try {
+    writeFileSync(join(root, "missions"), "not a directory")
+    const context = { project_dir: "missions/pr-digest", cron_tick: { event: "cron.tick" } }
+    // ENOTDIR is in the permanent set (DS-2), so the host abandons the tick
+    // instead of retrying; the wrap names the failing component (DS-7).
+    assert.throws(
+      () => resolveTaskWorkspace(context, root),
+      /Invalid workspace path for cron tick:.*component 'missions'.*ENOTDIR/,
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})

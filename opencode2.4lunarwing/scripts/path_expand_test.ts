@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -36,6 +36,19 @@ try {
     assert.throws(() => resolveTaskWorkspace({ ...cron, project_dir }, root), /Invalid workspace path/)
   }
   assert.equal(existsSync(join(project, "new")), false)
+  // DS-3: assert the actual escape target was not created, not just a decoy.
+  assert.equal(existsSync(join(tmpdir(), "cron-escape")), false)
+  // DS-2/DS-7: a non-directory component is a permanent failure naming the component.
+  const fileRoot = mkdtempSync(join(tmpdir(), "oc2-cron-file-"))
+  try {
+    writeFileSync(join(fileRoot, "missions"), "not a directory")
+    assert.throws(
+      () => resolveTaskWorkspace({ project_dir: "missions/x", cron_tick: { event: "cron.tick" } }, fileRoot),
+      /Invalid workspace path for cron tick:.*component 'missions'.*ENOTDIR/,
+    )
+  } finally {
+    rmSync(fileRoot, { recursive: true, force: true })
+  }
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

@@ -32,7 +32,7 @@
         "payload": {
           "task_id":     "string — unique task identifier",
           "prompt":      "string — natural-language task description",
-          "context":     "object — optional TaskContext. conversation_history contains bounded user/assistant messages used only as untrusted JSON reference context; metadata, environment, and user_id are never added to model prompts. cron_tick.event = cron.tick enables creation of a relative project_dir under WORKSPACE_ROOT without following symlinks; ordinary tasks do not create directories",
+          "context":     "object — optional TaskContext. conversation_history contains bounded user/assistant messages used only as untrusted JSON reference context; metadata, environment, and user_id are never added to model prompts. cron_tick.event = cron.tick enables creation of a relative project_dir under WORKSPACE_ROOT; creation is descriptor-relative and never creates through a symlink component (the returned path is re-resolved and confined to the root); ordinary tasks do not create directories",
           "timeout_ms":  "integer — hard deadline for the task (default 14400000)"
         }
       },

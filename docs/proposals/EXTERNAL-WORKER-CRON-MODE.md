@@ -48,10 +48,22 @@ max_reentries = 3                 # optional; default 3; hard cap 16
 **Workspace prerequisite:** `WORKSPACE_ROOT` must already exist and be writable.
 Updated Kimi, OpenCode, OpenCode2 and Pebble bridges create missing mission
 directories before executing a `cron.tick`. Creation is component-by-component,
-relative to held directory descriptors, rejecting symlinks, absolute paths,
-`..`, `.` and `~`. Existing mission files are preserved across ticks. Ordinary
+relative to held directory descriptors: a symlink (or file/FIFO) component is
+refused rather than created through, and absolute paths, `..`, `.` and `~` are
+rejected up front. After creation the returned path is re-resolved with
+realpath and re-checked for containment — symlink-safe creation, not a
+guarantee that a racing swap cannot redirect the *returned* path to another
+in-root directory (DS-1; no privilege boundary is crossed: bridge, CLI and
+agent share one uid). Components must be plain directories, not pre-existing
+symlinks (DQ-3). Existing mission files are preserved across ticks. Ordinary
 tasks do not gain directory creation. These bridges run in Linux containers
-with `/proc/self/fd` available. **Older images require the directory to pre-exist**
+with `/proc/self/fd` available; a missing `/proc/self/fd` is detected up front
+and reported as a non-retryable environment error (DS-6). Bootstrap failures
+split into permanent (`Invalid workspace path for cron tick: …` — validation,
+ENOTDIR/ELOOP, EACCES/EPERM, containment) and transient (`Transient workspace
+error for cron tick: …` — EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO, swap-race
+ENOENT/EINVAL), and the host re-dispatches only the transient ones (DS-2).
+**Older images require the directory to pre-exist**
 (for example, create `missions/pr-digest` inside their workspace mount before
 enabling this example). Upgrade/recreate workers with the daemon changes;
 rolling back to an older worker image requires pre-creating each mission dir.
@@ -59,7 +71,8 @@ rolling back to an older worker image requires pre-creating each mission dir.
 **Semantic validation fails loudly at load**: an invalid cron block (unparseable or
 sub-60s schedule without the override, empty goal, heartbeat below the floor,
 re-entry count above the cap, tick timeout outside the bounded range, a
-`project_dir` that is absolute/`..`-traversal/`~`-rooted, an unparseable
+`project_dir` that is absolute/`..`-traversal/`~`-rooted, has a `..`-prefixed
+or over-255-byte component, an unparseable
 `timezone`, a duplicate `mission_id` — or a missing `[cron]`
 block on a `mode = "cron"` worker) rejects the worker from the resolved config
 with an `error!` naming the reason. A schedule typo can never boot a silently
@@ -275,7 +288,10 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   `cron_tick_reaches_worker_with_structured_tick_context` asserts the on-wire
   payload. Missing-directory startup is additionally covered through the real
   Kimi bridge with a mock CLI, Pebble bridge dispatch, and all four workspace
-  helpers. Production model execution and older images are not covered by
+  helpers — those bridge suites are author-run (no MR CI lane runs them;
+  the Kimi image build runs `npm test`, OpenCode2's build runs
+  `path_expand_test.ts`, the OpenCode v1 and Pebble builds run neither — the
+  CI gap is tracked as follow-up). Production model execution and older images are not covered by
   those tests; older images need the documented pre-creation step.
 - [x] The run outlives the standard bounded deadline without being killed —
   per-link `tick_timeout_ms` defaults to the host's 4h limit (longer than any
@@ -310,7 +326,13 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
 `POST /api/workers/{worker}/cron` accepts `{"action":"pause"}` or
 `{"action":"resume"}` (also `status`). Responses contain `action` and
 `mission` (`mission_id`, `worker_name`, `paused`, `tick_index`,
-`consecutive_abandoned`). Mutations read status after the command is applied.
+`consecutive_abandoned`). Mutations enqueue the command and then read status,
+so a 200 reflects the applied command. If the command was accepted by the
+supervisor queue but not confirmed within the 10-second bound, the response is
+`202 Accepted` with `queued: true` — re-query status before retrying
+(pause/resume are idempotent); a 504 means the command never entered the
+queue (DQ-4). Lifecycle audit rows record `origin` (`owner_api` for this
+route, `owner_tool` for the `cron_mission` tool) (DQ-5).
 
 Both routes use the existing gateway bearer authentication and require the
 authenticated user to match the configured daemon owner before any lookup.

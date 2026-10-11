@@ -102,6 +102,11 @@ const BUSY_MARKERS: &[&str] = &["already being modified", "Worker concurrency li
 /// pre-DN-2 images the kimi/opencode bridges surface Node's raw realpathSync
 /// failure — which names the failing syscall `lstat`, not `realpath`
 /// (MR !1531 DQ-2).
+/// Bridges mark genuinely transient workspace-bootstrap failures with this
+/// wrapper text (MR !1531 DS-2) so the supervisor re-dispatches instead of
+/// abandoning the tick on e.g. EMFILE or a swap-race ENOENT.
+const TRANSIENT_MARKER: &str = "Transient workspace error for cron tick";
+
 const NON_RETRYABLE_MARKERS: &[&str] = &[
     "timeout_ms must be",
     "could not be resolved under WORKSPACE_ROOT",
@@ -1251,7 +1256,17 @@ fn is_busy(reason: &str) -> bool {
 /// Whether a worker rejection can never be fixed by re-dispatching (CU-4):
 /// protocol validation (timeout above the bridge cap, bad project_dir) is a
 /// config error, not a transient failure.
+///
+/// MR !1531 DS-2: the bridges wrap genuinely transient bootstrap errnos
+/// (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on first mkdir, ENOENT/EINVAL
+/// from a swap race) under `TRANSIENT_MARKER`; that explicit signal is
+/// checked first so a wrapped OS string that happens to contain a
+/// non-retryable substring (pebble's "could not be resolved under
+/// WORKSPACE_ROOT") cannot misclassify a transient failure.
 fn is_non_retryable(reason: &str) -> bool {
+    if reason.contains(TRANSIENT_MARKER) {
+        return false;
+    }
     NON_RETRYABLE_MARKERS
         .iter()
         .any(|marker| reason.contains(marker))
@@ -1908,6 +1923,23 @@ mod tests {
         assert!(!is_non_retryable("worker exploded"));
         assert!(!is_non_retryable(
             "realpath failed during the user's build; retry after checkout"
+        ));
+        // MR !1531 DS-2: bridges wrap transient bootstrap errnos under an
+        // explicit marker that wins even over an incidental non-retryable
+        // substring in the wrapped OS error text.
+        assert!(!is_non_retryable(
+            "Transient workspace error for cron tick: EMFILE: too many open files, open '/proc/self/fd/21/missions'"
+        ));
+        assert!(!is_non_retryable(
+            "Transient workspace error for cron tick: project_dir 'missions/x' could not be resolved under WORKSPACE_ROOT: ENOENT"
+        ));
+        assert!(is_non_retryable(
+            "Invalid workspace path for cron tick: ENOTDIR: not a directory, open '/proc/self/fd/21/missions'"
+        ));
+        // DS-6: a missing /proc/self/fd is detected up front and reported as
+        // a non-retryable environment error, not a misleading mkdir ENOENT.
+        assert!(is_non_retryable(
+            "Invalid workspace path for cron tick: /proc/self/fd is not available"
         ));
     }
 
