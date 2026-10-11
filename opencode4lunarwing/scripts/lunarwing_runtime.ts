@@ -121,10 +121,35 @@ export interface TaskResult {
   duration_ms: number
 }
 
+// ── Runtime control channel (WI#328) ─────────────────────────────────────────
+
+/** Capability string advertised in `ready` by workers that consume `task_prompt`. */
+export const CAPABILITY_TASK_PROMPT = "task_prompt"
+
+/** Agent → Worker: follow-up prompt/directive for a RUNNING task. */
+export interface TaskPrompt {
+  task_id: string
+  /** Monotonic per-job sequence number assigned by the daemon. */
+  seq: number
+  prompt: string
+  /** True signals "no more prompts coming; wrap up cleanly". */
+  done: boolean
+}
+
+/** Worker → Agent: receipt for a `task_prompt` frame. */
+export interface TaskPromptAck {
+  task_id: string
+  seq: number
+  /** False when the task was already finished/wrapping up. */
+  accepted: boolean
+}
+
 export interface ReadyPayload {
   worker_id: string
   version: string
   mode: string
+  /** Optional capability advertisement (WI#328); absent means none. */
+  capabilities?: string[]
 }
 
 // ── State File (IPC with health_server.py) ────────────────────────────────────

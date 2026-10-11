@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 
 import { executeTask } from "./opencode_task_executor.ts"
-import type { TaskRequest } from "./lunarwing_runtime.ts"
+import type { TaskPrompt, TaskRequest } from "./lunarwing_runtime.ts"
 
 interface MockOptions {
   events?: unknown[]
@@ -394,5 +394,61 @@ fix it`,
 })
 assert.equal(contextPromptArgs[1].throwOnError, true)
 assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
+
+// WI#328: a queued follow-up prompt continues the SAME opencode session at
+// the turn boundary (session idle) instead of resolving the task — never
+// mid-call. The second prompt must carry the follow-up text verbatim.
+const followupSdk = makeSdk({
+  events: [
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+})
+const followupQueue: TaskPrompt[] = [
+  { task_id: "task-followup", seq: 1, prompt: "also fix the tests", done: true },
+]
+const followupProgress: string[] = []
+const followupResults: Array<{ status: string; output: string; error: string | null }> = []
+await executeTask(
+  { task_id: "task-followup", prompt: "do the main thing" },
+  (progress) => followupProgress.push(progress.delta),
+  (result) => followupResults.push(result),
+  undefined,
+  followupSdk.sdk,
+  followupQueue,
+)
+assert.equal(followupResults.length, 1)
+assert.equal(followupResults[0]!.status, "success")
+assert.equal(followupSdk.promptArgs.length, 2)
+const followupArgs = followupSdk.promptArgs[1] as [
+  unknown,
+  { throwOnError: boolean; signal: AbortSignal },
+]
+assert.deepEqual(followupArgs[0], {
+  sessionID: "session-1",
+  parts: [{ type: "text", text: "also fix the tests" }],
+})
+assert.ok(
+  followupProgress.some((d) => d.includes("seq=1") && d.includes("wrap-up requested")),
+  "follow-up progress note must carry the seq and wrap-up marker",
+)
+assert.equal(followupQueue.length, 0, "consumed follow-up leaves the queue empty")
+
+// WI#328: with no queued follow-ups the first idle resolves the task exactly
+// as before (regression guard for the turn-boundary check).
+const noFollowupSdk = makeSdk()
+const noFollowupQueue: TaskPrompt[] = []
+const noFollowupResults: Array<{ status: string }> = []
+await executeTask(
+  { task_id: "task-no-followup", prompt: "test" },
+  () => {},
+  (result) => noFollowupResults.push(result),
+  undefined,
+  noFollowupSdk.sdk,
+  noFollowupQueue,
+)
+assert.equal(noFollowupResults.length, 1)
+assert.equal(noFollowupResults[0]!.status, "success")
+assert.equal(noFollowupSdk.promptArgs.length, 1)
 
 console.log("opencode task executor self-check passed")
