@@ -408,7 +408,7 @@ def _configure_workers(config: TenantConfig) -> None:
 
 def _configure_llm(config: TenantConfig) -> None:
     config.llm_base_url = _q_text(
-        "Daemon LLM base URL override (optional)",
+        "LLM base URL (daemon; workers inherit it when container-reachable)",
         default=config.llm_base_url,
     )
     idx = _q_select(
@@ -476,7 +476,7 @@ def _show_summary(config: TenantConfig) -> bool:
         ", ".join(WORKER_LABELS[w] for w in config.workers) or "none",
     )
     table.add_row("Toolchains", str(config.toolchains))
-    table.add_row("Daemon LLM base URL", config.llm_base_url or "automatic")
+    table.add_row("LLM base URL", config.llm_base_url or "automatic")
     table.add_row("LLM model", config.llm_model)
     table.add_row(
         "Secrets master key",

@@ -758,6 +758,42 @@ for source_local_url in \
   fi
 done
 
+echo "=== worker endpoint provenance survives production export (WI#330) ==="
+for url_source in inherited explicit; do
+  sed -i -e '/^OPENCODE_BASE_URL\(_SOURCE\)\?=/d' -e '/^KIMI_BASE_URL\(_SOURCE\)\?=/d' "$source_env"
+  cat >>"$source_env" <<'ENV'
+OPENCODE_BASE_URL="https://opencode.example.test/v1"
+KIMI_BASE_URL="https://kimi.example.test/v1"
+ENV
+  if [[ "$url_source" == inherited ]]; then
+    # Quoted markers are valid too: export must use the env decoder.
+    printf '%s\n' 'OPENCODE_BASE_URL_SOURCE="inherited"' "KIMI_BASE_URL_SOURCE='inherited'" >>"$source_env"
+  fi
+  worker_out="$tmp/worker-export-$url_source"
+  mkdir -m 700 "$worker_out"
+  PATH="$tmp/export-bin:$PATH" KAWARIMI_TEST_WORK="$tmp" \
+    LUNARWING_MT_ADMIN="$tmp/export-mt-admin.sh" \
+    LUNARWING_PORTS_REGISTRY="$tmp/export-ports.json" \
+    KAWARIMI_PASS="$full_passphrase" \
+    bash "$EXPORT_SRC" alpha --out-dir "$worker_out" >"$tmp/worker-export.log" 2>&1 || {
+      cat "$tmp/worker-export.log"
+      fail "worker $url_source endpoint export"
+      exit 1
+    }
+  worker_bundle="$(printf '%s\n' "$worker_out/"*.7z)"
+  printf '%s\n' "$full_passphrase" | 7z x -o"$worker_out/extracted" "$worker_bundle" -y >/dev/null 2>&1
+  worker_manifest="$(find "$worker_out/extracted" -name manifest-lunarwing.env -print -quit)"
+  for worker in OPENCODE KIMI; do
+    if [[ "$url_source" == inherited ]]; then
+      assert_file_not_contains "export omits inherited $worker endpoint" "$worker_manifest" "${worker}_BASE_URL="
+    else
+      assert_file_contains "export carries explicit $worker endpoint" "$worker_manifest" \
+        "${worker}_BASE_URL=https://${worker,,}.example.test/v1"
+    fi
+    assert_file_not_contains "export omits $worker provenance marker" "$worker_manifest" "${worker}_BASE_URL_SOURCE="
+  done
+done
+
 echo ""
 if [[ "$failures" -eq 0 ]]; then
   echo "ALL TESTS PASSED"

@@ -71,7 +71,11 @@ OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
 OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
-DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000/openai/v1}"
+# WI#330: no built-in default — the historical developer-LAN address was
+# unreachable from every other host and silently defeated the worker images'
+# placeholder guards. add-tenant fails loudly when neither --tensorzero-url
+# nor this fleet default (nor --llm-base-url for non-proxy tenants) is set.
+DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-}"
 # Fleet-wide default VL (vision-language) backend URL the OCR sidecar proxies to.
 # Empty = sidecar comes up with VL disabled (vl_available=false), preserving the
 # pre-VL behavior for deployments without a local vision server. Override with
@@ -257,8 +261,16 @@ Commands:
     --xmpp-password <pass>        XMPP password (generated if omitted)
     --llm-api-key <key>            API key for the LLM backend provider
     --llm-base-url <url>           LLM endpoint the daemon dials (LLM_BASE_URL).
-                                   Default: this tenant's local TensorZero proxy
-    --tensorzero-url <url>         Upstream TensorZero URL
+                                   Default: this tenant's local TensorZero proxy.
+                                   External workers inherit it when it is
+                                   reachable from inside a container (not host
+                                   loopback, not an overlay MagicDNS name)
+    --tensorzero-url <url>         Upstream TensorZero URL. REQUIRED unless
+                                   LUNARWING_MT_TENSORZERO_URL is set — or
+                                   --llm-base-url is given and --enable-proxy
+                                   is not (WI#330: there is no built-in
+                                   default; the old one was a developer-LAN
+                                   address unreachable from any other host)
     --gotify-url <url>             Custom Gotify server URL (e.g. https://gotify.example.com)
     --no-health                    Don't enable the host-global health/self-heal pipeline
     --no-ssh                       Don't provision SSH harness (key pair, config, agent)
@@ -640,6 +652,9 @@ main() {
       # Leave empty when --xmpp-jid is absent: add_tenant preserves the tenant's
       # existing JID and only defaults to <name>@xmpp.localhost on a first write.
       name="$(sanitize_name "$name")"
+      # WI#330: fail loudly here (before any tenant state exists) rather than
+      # rendering an unreachable built-in endpoint.
+      require_tenant_llm_endpoint "$tz_url" "$llm_base_url" "$enable_proxy"
       with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override" "$with_study_mcp" "$study_mcp_home" "$with_opencode2" "$opencode2_model" "$opencode2_base_url"
       ;;
 
@@ -687,6 +702,8 @@ main() {
         esac
       done
       [[ -n "$names_csv" ]] || die "usage: add-tenants <name1,name2,...> [--docker-group]"
+      # WI#330: same endpoint requirement as add-tenant, checked once up front.
+      require_tenant_llm_endpoint "$tz_url" "$llm_base_url" "$enable_proxy"
 
       local IFS=','
       local names_array

@@ -23,6 +23,11 @@ x-worker-base: &worker-base
   environment: &worker-env
     TENSORZERO_API_KEY: ${TENSORZERO_API_KEY:-dummy}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    # WI#330: the image's baked baseURL is a placeholder the entrypoint refuses
+    # to run; forward these so `.env` / the shell can override (mt-admin-managed
+    # deployments inject them via env_file instead).
+    OPENCODE_MODEL: ${OPENCODE_MODEL:-}
+    OPENCODE_BASE_URL: ${OPENCODE_BASE_URL:-}
     OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:-}
     OPENCODE_SERVER_USERNAME: ${OPENCODE_SERVER_USERNAME:-opencode}
     OPENCODE_PROVIDER_MAX_RETRIES: ${OPENCODE_PROVIDER_MAX_RETRIES:-2}

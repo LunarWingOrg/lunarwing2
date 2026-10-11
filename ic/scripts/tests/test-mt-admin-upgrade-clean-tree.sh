@@ -62,6 +62,10 @@ git -C "$repo" push -q origin HEAD:refs/heads/checkout-failure
 
 printf 'build-regenerated lock\n' >"$lockfile"
 mkdir -p "$repo/env" "$repo/opencode-workspace" "$repo/state"
+# WI#330: the fixture tenant has opencode+kimi enabled (see tenant_worker_enabled
+# below), and upgrade-tenant now backfills missing worker LLM base URLs before
+# rebuilding images — give it a derivable tenant endpoint to inherit.
+printf 'LLM_BASE_URL=http://tz-fixture:3030/openai/v1\n' >"$repo/env/lunarwing.env"
 printf 'runtime data\n' >"$repo/state/runtime.txt"
 if output="$(prepare_tenant_checkout fixture "$repo" HEAD 2>&1)"; then
   pass 'build-regenerated Cargo.lock is accepted'
@@ -177,6 +181,20 @@ else
   fail "upgrade target-collision error lacked details: $output"
 fi
 
+# WI#330: an unresolved endpoint must not turn a failed upgrade into downtime.
+printf 'LLM_BASE_URL=http://127.0.0.1:10004/v1\n' >"$repo/env/lunarwing.env"
+if output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"; then
+  fail 'upgrade should reject enabled workers with no usable endpoint'
+elif [[ -e "$stopped_marker" || -e "$build_args_file" ]]; then
+  fail 'upgrade stopped or rebuilt tenant before worker endpoint preflight'
+elif [[ "$output" == *'no container-reachable LLM endpoint'* ]] \
+  && [[ "$(git -C "$repo" rev-parse HEAD)" == "$target" ]]; then
+  pass 'upgrade rejects missing worker endpoint before stop, checkout, or build'
+else
+  fail "upgrade endpoint preflight returned wrong error: $output"
+fi
+printf 'LLM_BASE_URL=http://tz-fixture:3030/openai/v1\n' >"$repo/env/lunarwing.env"
+
 fail_checkout=true
 if output="$(upgrade_tenant fixture checkout-failure '' false false 2>&1)"; then
   fail 'upgrade should reject failed checkout'
@@ -204,6 +222,17 @@ if [[ -f "$build_args_file" ]] \
   pass 'upgrade rebuilds selected OpenCode and Kimi workers with strict WASM build'
 else
   fail "upgrade forwarded wrong build flags: $(cat "$build_args_file" 2>/dev/null || true)"
+fi
+# WI#330 CX-2: the pre-build backfill gave both enabled workers an inherited
+# base URL from the tenant's endpoint (the placeholder-refusing images would
+# otherwise kill them on first start after the upgrade).
+if [[ "$(sed -n 's/^OPENCODE_BASE_URL=//p' "$repo/env/lunarwing.env" | tail -1)" == '"http://tz-fixture:3030/openai/v1"' ]] \
+  && [[ "$(sed -n 's/^KIMI_BASE_URL=//p' "$repo/env/lunarwing.env" | tail -1)" == '"http://tz-fixture:3030/openai/v1"' ]] \
+  && grep -q '^OPENCODE_BASE_URL_SOURCE=inherited$' "$repo/env/lunarwing.env" \
+  && grep -q '^KIMI_BASE_URL_SOURCE=inherited$' "$repo/env/lunarwing.env"; then
+  pass 'upgrade backfills inherited worker base URLs before rebuilding images'
+else
+  fail "upgrade did not backfill worker base URLs: $(grep -E 'BASE_URL' "$repo/env/lunarwing.env" || true)"
 fi
 if [[ ! -e "$health_refresh_log" ]]; then
   pass 'upgrade leaves a removed host-global health pipeline uninstalled'

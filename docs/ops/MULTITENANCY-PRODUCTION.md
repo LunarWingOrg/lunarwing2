@@ -598,7 +598,7 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 | `LUNARWING_MT_PROFILE` | `release` | Build profile. Keep `release` for production and routine verification; do not use full debug builds. |
 | `LUNARWING_MT_BUILD_JOBS` | `$(nproc)` | Explicit Cargo job cap for tenant builds |
 | `LUNARWING_MT_SOURCE_REPO` | repository root | Source checkout cloned for each tenant |
-| `LUNARWING_MT_TENSORZERO_URL` | `http://192.168.1.157:3000/openai/v1` | Upstream LLM URL and proxy upstream default |
+| `LUNARWING_MT_TENSORZERO_URL` | (empty — required at `add-tenant` since WI#330) | Upstream LLM URL and proxy upstream default |
 | `LUNARWING_MT_LLM_BASE_URL` | empty | Fleet default `LLM_BASE_URL`; empty selects the local proxy when enabled, otherwise `LUNARWING_MT_TENSORZERO_URL` |
 | `LUNARWING_MT_BACKUP_DIR` | `/var/lib/lunarwing-backups` | PostgreSQL dump root |
 | `LUNARWING_MT_BACKUP_KEEP` | `7` | Dumps retained per tenant; `0` keeps all |

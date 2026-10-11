@@ -22,6 +22,14 @@ Then rebuild:
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker --no-cache
 ```
 
+**Note (WI#330):** the baked `base_url` is a placeholder
+(`http://set-kimi-base-url.invalid/openai/v1`) that `entrypoint.sh` refuses
+to run. Every tenant gets `KIMI_BASE_URL` rendered by mt-admin (default: the
+tenant's own LLM endpoint), so the placeholder only reaches a runtime config
+in hand-rolled deployments. Do not replace it with a real network-specific
+address — keep it a placeholder and set per-tenant values via
+`configure-kimi --base-url`.
+
 ## Per-tenant overrides (without rebuild)
 
 Two mechanisms:

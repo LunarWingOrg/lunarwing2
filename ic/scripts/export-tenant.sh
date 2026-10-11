@@ -639,15 +639,23 @@ else
   else
     note "LLM_BASE_URL is host-local ($llm_url) — NOT carried"
   fi
-  opencode_url="$(sed -n 's/^OPENCODE_BASE_URL=//p' "$ENVF" | head -1)"; opencode_url="${opencode_url%$'\r'}"
-  if [[ -n "$opencode_url" ]] && ! is_loopback_url "$opencode_url"; then
+  # WI#330: a worker base URL marked <KEY>_SOURCE=inherited was derived from
+  # the tenant's own endpoint, not chosen by the operator — skip it so the
+  # target host re-derives it from ITS tenant endpoint (carried LLM_BASE_URL
+  # or --tensorzero-url) instead of pinning the source host's address.
+  opencode_url="$(read_env_value "$ENVF" OPENCODE_BASE_URL)"
+  if [[ "$(read_env_value "$ENVF" OPENCODE_BASE_URL_SOURCE)" == "inherited" ]]; then
+    note "OPENCODE_BASE_URL is inherited from the tenant's endpoint (re-derived on the target) — NOT carried"
+  elif [[ -n "$opencode_url" ]] && ! is_loopback_url "$opencode_url"; then
     printf 'OPENCODE_BASE_URL=%s\n' "$opencode_url" >> "$WORK/manifest-lunarwing.env"
     note "carrying custom OPENCODE_BASE_URL"
   elif [[ -n "$opencode_url" ]]; then
     note "OPENCODE_BASE_URL is host-local ($opencode_url) — NOT carried"
   fi
-  kimi_url="$(sed -n 's/^KIMI_BASE_URL=//p' "$ENVF" | head -1)"; kimi_url="${kimi_url%$'\r'}"
-  if [[ -n "$kimi_url" ]] && ! is_loopback_url "$kimi_url"; then
+  kimi_url="$(read_env_value "$ENVF" KIMI_BASE_URL)"
+  if [[ "$(read_env_value "$ENVF" KIMI_BASE_URL_SOURCE)" == "inherited" ]]; then
+    note "KIMI_BASE_URL is inherited from the tenant's endpoint (re-derived on the target) — NOT carried"
+  elif [[ -n "$kimi_url" ]] && ! is_loopback_url "$kimi_url"; then
     printf 'KIMI_BASE_URL=%s\n' "$kimi_url" >> "$WORK/manifest-lunarwing.env"
     note "carrying custom KIMI_BASE_URL"
   elif [[ -n "$kimi_url" ]]; then

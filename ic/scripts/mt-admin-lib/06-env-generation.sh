@@ -840,6 +840,140 @@ tensorzero_openai_base() {
   esac
 }
 
+# ── LLM endpoint validation + worker inheritance (WI#330) ─────────────────────
+# Worker images ship placeholder endpoints their entrypoints refuse to run, so
+# every URL mt-admin renders for a worker must be both well-formed and
+# reachable from inside a rootless container. These helpers are the single
+# funnel: add-tenant/add-tenants, the env writer, patch_tenant_env, and the
+# configure-* commands all go through them.
+
+# Shape-check an operator-supplied LLM endpoint. Dies on any violation.
+# Call directly (never inside $(...)) so die aborts the caller.
+validate_llm_url() {  # <url> <label>
+  local url="$1" label="$2"
+  [[ "$url" =~ ^https?:// ]] \
+    || die "$label must be an http(s) URL: $url"
+  # Whitespace/control characters would inject extra lines into env files.
+  [[ "$url" != *[[:space:][:cntrl:]]* ]] \
+    || die "$label must not contain whitespace or control characters"
+  # Credentials do not belong in a URL that is copied into untrusted worker
+  # containers and logged by worker entrypoints; use the API-key settings.
+  [[ "${url#*://}" != *@* ]] \
+    || die "$label must not embed userinfo (user@host); pass credentials via the API-key settings"
+  # Tenant envs feed systemd unit renders, where '%' introduces a specifier.
+  [[ "$url" != *%* ]] \
+    || die "$label must not contain '%' (systemd specifier expansion)"
+  # A host is required.
+  local rest="${url#*://}"
+  [[ -n "${rest%%[:/]*}" ]] \
+    || die "$label has no host: $url"
+}
+
+# True when <url> points at host loopback. Canonical mt-admin copy; the
+# standalone export-tenant.sh keeps an equivalent local copy (it does not
+# source this library).
+is_loopback_url() {  # <url>
+  local lower="${1,,}"
+  [[ "$lower" =~ ^https?://(localhost|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|\[::1\]|\[0:0:0:0:0:0:0:1\])(:[0-9]+)?(/|$) ]]
+}
+
+# True when <url> is usable from inside a rootless worker container. Host
+# loopback is the container itself, and overlay MagicDNS names (NetBird
+# *.netbird.selfhosted / *.netbird.cloud, Tailscale *.ts.net) do not resolve
+# inside rootless containers on the MT hosts.
+worker_llm_url_container_ok() {  # <url>
+  local url="$1"
+  ! is_loopback_url "$url" || return 1
+  local host="${url#*://}"
+  host="${host%%[:/]*}"
+  host="${host,,}"
+  case "$host" in
+    *.netbird.selfhosted|*.netbird.cloud|*.ts.net|*.tailscale.net) return 1 ;;
+  esac
+  return 0
+}
+
+# Echo the LLM base URL a worker container should inherit for a tenant:
+# an explicit --llm-base-url (or LUNARWING_MT_LLM_BASE_URL) when a container
+# can reach it, else the tenant's TensorZero upstream normalized to its
+# /openai/v1 surface. The daemon's proxy-loopback default is deliberately NOT
+# consulted — worker containers cannot reach host loopback. Prints nothing and
+# returns 1 when neither source is container-reachable.
+derive_worker_llm_base_url() {  # <llm_base_url-or-empty> <tensorzero_url-or-empty>
+  local llm_base_url="${1:-}" tensorzero_url="${2:-}"
+  if [[ -n "$llm_base_url" ]] && worker_llm_url_container_ok "$llm_base_url"; then
+    printf '%s\n' "$llm_base_url"
+    return 0
+  fi
+  if [[ -n "$tensorzero_url" ]] && worker_llm_url_container_ok "$tensorzero_url"; then
+    tensorzero_openai_base "$tensorzero_url"
+    return 0
+  fi
+  return 1
+}
+
+# WI#330: resolve one external worker's LLM base URL for a lunarwing.env
+# (re)render. Precedence: an explicit per-worker flag > an operator-set value
+# already in the env (anything without a <KEY>_SOURCE=inherited marker) > the
+# tenant's inherited endpoint. Inherited values are re-derived on EVERY render
+# so a TensorZero move reaches the workers without a manual configure-* per
+# worker, and they carry <KEY>_SOURCE=inherited so export-tenant does not pin
+# a migrated tenant to the source host's endpoint. Sets the two nameref outputs
+# (<out_source> is "explicit" | "inherited" | "").
+_resolve_worker_base_url() {  # <env_path> <KEY> <flag_value> <inherited_default> <out_url_var> <out_source_var>
+  local env_path="$1" key="$2" flag_value="$3" inherited="$4"
+  local -n _worker_url_ref="$5" _worker_source_ref="$6"
+  _worker_url_ref=""
+  _worker_source_ref=""
+  if [[ -n "$flag_value" ]]; then
+    validate_llm_url "$flag_value" "--$(printf '%s' "$key" | tr 'A-Z_' 'a-z-')"
+    _worker_url_ref="$flag_value"
+    _worker_source_ref="explicit"
+    return 0
+  fi
+  local existing existing_source
+  existing="$(_env_existing "$env_path" "$key")"
+  existing_source="$(_env_existing "$env_path" "${key}_SOURCE")"
+  if [[ -n "$existing" && "$existing_source" != "inherited" ]]; then
+    _worker_url_ref="$existing"
+    _worker_source_ref="explicit"
+    return 0
+  fi
+  if [[ -n "$inherited" ]]; then
+    _worker_url_ref="$inherited"
+    _worker_source_ref="inherited"
+  fi
+  return 0
+}
+
+# An enabled worker must never render an empty base URL: the image placeholder
+# guard would kill the worker at startup. Fail the render with the fix instead.
+_require_enabled_worker_url() {  # <tenant> <worker> <KEY> <resolved_url>
+  local name="$1" worker="$2" key="$3" url="$4"
+  [[ -z "$url" ]] || return 0
+  tenant_worker_enabled "$name" "$worker" || return 0
+  die "tenant '$name' has the $worker worker enabled but no container-reachable LLM endpoint to inherit (host loopback and overlay MagicDNS names are unreachable from worker containers). Pass --llm-base-url/--tensorzero-url with a reachable address, or set one explicitly: $0 configure-$worker $name --base-url <url>"
+}
+
+# WI#330: there is no built-in LLM endpoint default — the historical
+# developer-LAN default was unreachable from every other host, and rendering it
+# silently defeated the worker placeholder guards. A new tenant therefore must
+# be given an endpoint: --tensorzero-url (or fleet LUNARWING_MT_TENSORZERO_URL)
+# always satisfies this; --llm-base-url (or LUNARWING_MT_LLM_BASE_URL) suffices
+# only when the tenant does not run the local TensorZero proxy (the proxy still
+# needs its upstream). Call directly (never inside $(...)) so die aborts.
+require_tenant_llm_endpoint() {  # <tensorzero_url> <llm_base_url> <enable_proxy>
+  local tensorzero_url="${1:-}" llm_base_url="${2:-}" enable_proxy="${3:-false}"
+  if [[ -n "$tensorzero_url" ]]; then
+    validate_llm_url "$tensorzero_url" "--tensorzero-url"
+  elif [[ "$enable_proxy" == "true" ]]; then
+    die "add-tenant requires --tensorzero-url <url> (or LUNARWING_MT_TENSORZERO_URL): the tenant's TensorZero proxy needs an upstream, and there is no built-in default (WI#330)"
+  elif [[ -z "$llm_base_url" ]]; then
+    die "add-tenant requires an LLM endpoint: pass --tensorzero-url <url> (or LUNARWING_MT_TENSORZERO_URL), or --llm-base-url <url> for a direct non-proxy endpoint; there is no built-in default (WI#330)"
+  fi
+  [[ -z "$llm_base_url" ]] || validate_llm_url "$llm_base_url" "--llm-base-url"
+}
+
 write_tenant_lunarwing_env() {
   local name="$1"
   # Empty $2 means "caller supplied none" -> preserve an existing JID (see
@@ -928,12 +1062,23 @@ write_tenant_lunarwing_env() {
   # else mint a fresh one (first-time provision).
   [[ -n "$xmpp_password" ]] || { xmpp_password="$(_env_existing "$path" XMPP_PASSWORD)"; xmpp_password="${xmpp_password:-$(generate_token | cut -c1-32)}"; }
   [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
-  [[ -n "$opencode_base_url" ]] || opencode_base_url="$(_env_existing "$path" OPENCODE_BASE_URL)"
   [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$path" KIMI_MODEL)"
-  [[ -n "$kimi_base_url" ]]     || kimi_base_url="$(_env_existing "$path" KIMI_BASE_URL)"
   [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$path" KIMI_API_KEY)"
   [[ -n "$opencode2_model" ]]    || opencode2_model="$(_env_existing "$path" OPENCODE2_MODEL)"
-  [[ -n "$opencode2_base_url" ]] || opencode2_base_url="$(_env_existing "$path" OPENCODE2_BASE_URL)"
+  # WI#330: the worker images ship a placeholder LLM endpoint their entrypoints
+  # refuse to run, so an unset worker base URL can no longer fall through to a
+  # baked default. Each worker URL resolves as: explicit per-worker flag >
+  # operator-set value already in lunarwing.env > inherited from the tenant's
+  # own LLM endpoint (re-derived every render, marked <KEY>_SOURCE=inherited).
+  local worker_llm_base_default
+  worker_llm_base_default="$(derive_worker_llm_base_url "$llm_base_url" "$tensorzero_url" || true)"
+  local opencode_base_url_source kimi_base_url_source opencode2_base_url_source
+  _resolve_worker_base_url "$path" OPENCODE_BASE_URL "$opencode_base_url" "$worker_llm_base_default" opencode_base_url opencode_base_url_source
+  _resolve_worker_base_url "$path" KIMI_BASE_URL "$kimi_base_url" "$worker_llm_base_default" kimi_base_url kimi_base_url_source
+  _resolve_worker_base_url "$path" OPENCODE2_BASE_URL "$opencode2_base_url" "$worker_llm_base_default" opencode2_base_url opencode2_base_url_source
+  _require_enabled_worker_url "$name" opencode OPENCODE_BASE_URL "$opencode_base_url"
+  _require_enabled_worker_url "$name" kimi KIMI_BASE_URL "$kimi_base_url"
+  _require_enabled_worker_url "$name" opencode2 OPENCODE2_BASE_URL "$opencode2_base_url"
   study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
   study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
   study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
@@ -1370,13 +1515,29 @@ ENVEOF
       "$transcription_enabled" "$transcription_provider" "$transcription_model" >> "$path"
   fi
   [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$path"
-  [[ -n "$opencode_base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$opencode_base_url" >> "$path"
+  # WI#330: worker base URLs are operator/tenant-supplied, so quote them like
+  # the other validated values. An inherited value carries a SOURCE marker so
+  # the next render re-derives it and export-tenant does not carry it as a
+  # custom override; explicit/operator values carry no marker.
+  if [[ -n "$opencode_base_url" ]]; then
+    printf 'OPENCODE_BASE_URL=%s\n' "$(_quote_env_value "$opencode_base_url")" >> "$path"
+    [[ "$opencode_base_url_source" != "inherited" ]] \
+      || printf 'OPENCODE_BASE_URL_SOURCE=inherited\n' >> "$path"
+  fi
   [[ -n "$kimi_model" ]]        && printf '\nKIMI_MODEL=%s\n'        "$kimi_model"        >> "$path"
-  [[ -n "$kimi_base_url" ]]     && printf 'KIMI_BASE_URL=%s\n'     "$kimi_base_url"     >> "$path"
+  if [[ -n "$kimi_base_url" ]]; then
+    printf 'KIMI_BASE_URL=%s\n' "$(_quote_env_value "$kimi_base_url")" >> "$path"
+    [[ "$kimi_base_url_source" != "inherited" ]] \
+      || printf 'KIMI_BASE_URL_SOURCE=inherited\n' >> "$path"
+  fi
   [[ -n "$kimi_api_key" ]] \
     && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$kimi_api_key")" >> "$path"
   [[ -n "$opencode2_model" ]]    && printf '\nOPENCODE2_MODEL=%s\n'    "$opencode2_model"     >> "$path"
-  [[ -n "$opencode2_base_url" ]] && printf 'OPENCODE2_BASE_URL=%s\n' "$opencode2_base_url" >> "$path"
+  if [[ -n "$opencode2_base_url" ]]; then
+    printf 'OPENCODE2_BASE_URL=%s\n' "$(_quote_env_value "$opencode2_base_url")" >> "$path"
+    [[ "$opencode2_base_url_source" != "inherited" ]] \
+      || printf 'OPENCODE2_BASE_URL_SOURCE=inherited\n' >> "$path"
+  fi
   if [[ -n "$study_notes_home" ]]; then
     printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
       "$study_notes_home" >> "$path"
@@ -2473,6 +2634,37 @@ patch_tenant_coordination_env() {
   fi
 }
 
+# WI#330: backfill the LLM base URL of every ENABLED external worker whose
+# lunarwing.env lacks one (tenants provisioned before the worker images
+# started refusing their placeholder endpoints). The value is inherited from
+# the tenant's own endpoint — LLM_BASE_URL when a worker container can reach
+# it, else the proxy.env TensorZero upstream — and marked
+# <KEY>_SOURCE=inherited so full renders re-derive it and export-tenant skips
+# it. Dies when an enabled worker's URL cannot be derived: rebuilding worker
+# images onto a tenant that cannot start them must fail here, not at the
+# worker's first LLM call. Idempotent; existing values are never touched.
+backfill_tenant_worker_base_urls() {  # <tenant>
+  local name="$1"
+  local env_path proxy_env llm_base_url tensorzero_url derived
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path"
+  llm_base_url="$(_read_env_value "$env_path" LLM_BASE_URL)"
+  tensorzero_url=""
+  proxy_env="$(tenant_env_dir "$name")/proxy.env"
+  [[ ! -f "$proxy_env" ]] || tensorzero_url="$(_read_env_value "$proxy_env" TENSORZERO_URL)"
+  derived="$(derive_worker_llm_base_url "$llm_base_url" "$tensorzero_url" || true)"
+  local worker key
+  for worker in opencode kimi opencode2; do
+    key="$(printf '%s_BASE_URL' "${worker^^}")"
+    tenant_worker_enabled "$name" "$worker" || continue
+    [[ -z "$(_read_env_value "$env_path" "$key")" ]] || continue
+    [[ -n "$derived" ]] \
+      || die "tenant '$name' has the $worker worker enabled but no container-reachable LLM endpoint to inherit (LLM_BASE_URL is unset/loopback and proxy.env has no usable TENSORZERO_URL). Set one explicitly: $0 configure-$worker $name --base-url <url>"
+    printf '%s=%s\n%s_SOURCE=inherited\n' "$key" "$(_quote_env_value "$derived")" "$key" >>"$env_path"
+    say "added $key (inherited from the tenant's LLM endpoint) to $env_path"
+  done
+}
+
 patch_tenant_env() {
   local name="$1"
   name="$(sanitize_name "$name")"
@@ -2611,6 +2803,10 @@ patch_tenant_env() {
       fi
     fi
   fi
+
+  # WI#330: enabled workers must have a base URL before the tenant starts on
+  # the placeholder-refusing images.
+  backfill_tenant_worker_base_urls "$name"
 
   # Wire supported external workers into config.toml so
   # existing tenants get create_job(mode: ...) routing without a hand-edited

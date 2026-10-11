@@ -53,7 +53,10 @@ Options (all also settable via the matching ENV var):
   --xmpp-domain <domain>    domain for the derived JID   (default: xmpp.sobe.world)
   --xmpp-password <pw>      XMPP password    (default: mt-admin generates one)
   --llm-api-key <key>       LLM/provider key (default: token-<name> via TensorZero)
-  --llm-base-url <url>      LLM endpoint (LLM_BASE_URL)  (default: tenant's local proxy)
+  --llm-base-url <url>      LLM endpoint (LLM_BASE_URL)  (WI#330: required unless
+                            --tensorzero-url/LUNARWING_MT_TENSORZERO_URL is set —
+                            there is no built-in default anymore)
+  --tensorzero-url <url>    Upstream TensorZero URL (WI#330: no built-in default)
   --gotify-url <url>        custom Gotify URL            (default: none)
   --[no-]docker-group       add user to docker group     (default: on)
   --[no-]pebble             build pebble worker image    (default: on)
@@ -75,6 +78,7 @@ XMPP_DOMAIN="${XMPP_DOMAIN:-xmpp.sobe.world}"
 XMPP_PASSWORD="${XMPP_PASSWORD:-}"
 LLM_API_KEY="${LLM_API_KEY:-}"
 LLM_BASE_URL="${LLM_BASE_URL:-}"
+TENSORZERO_URL="${TENSORZERO_URL:-}"
 GOTIFY_URL="${GOTIFY_URL:-}"
 DOCKER_GROUP="${DOCKER_GROUP:-true}"
 WITH_PEBBLE="${WITH_PEBBLE:-true}"
@@ -89,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --xmpp-password)        XMPP_PASSWORD="$2"; shift 2 ;;
     --llm-api-key)          LLM_API_KEY="$2"; shift 2 ;;
     --llm-base-url)         LLM_BASE_URL="$2"; shift 2 ;;
+    --tensorzero-url)       TENSORZERO_URL="$2"; shift 2 ;;
     --gotify-url)           GOTIFY_URL="$2"; shift 2 ;;
     --docker-group)         DOCKER_GROUP=true; shift ;;
     --no-docker-group)      DOCKER_GROUP=false; shift ;;
@@ -168,7 +173,7 @@ banner "Plan: create tenant '$TENANT'"
 say "  XMPP JID:         $XMPP_JID"
 say "  XMPP password:    $([[ -n "$XMPP_PASSWORD" ]] && echo '(provided)' || echo '(auto-generated)')"
 say "  LLM API key:      $([[ -n "$LLM_API_KEY" ]] && echo '(provided)' || echo "token-$TENANT default")"
-say "  LLM base URL:     ${LLM_BASE_URL:-(tenant local proxy)}"
+say "  LLM base URL:     ${LLM_BASE_URL:-${TENSORZERO_URL:-(unset — add-tenant will refuse without one)}}"
 say "  Gotify URL:       ${GOTIFY_URL:-(none)}"
 say "  docker group:     $DOCKER_GROUP"
 say "  linger:           auto-enabled by add-tenant (systemd)"
@@ -185,6 +190,7 @@ add_args=( add-tenant "$TENANT" --xmpp-jid "$XMPP_JID" )
 [[ -n "$XMPP_PASSWORD" ]] && add_args+=( --xmpp-password "$XMPP_PASSWORD" )
 [[ -n "$LLM_API_KEY" ]] && add_args+=( --llm-api-key "$LLM_API_KEY" )
 [[ -n "$LLM_BASE_URL" ]] && add_args+=( --llm-base-url "$LLM_BASE_URL" )
+[[ -n "$TENSORZERO_URL" ]] && add_args+=( --tensorzero-url "$TENSORZERO_URL" )
 [[ -n "$GOTIFY_URL" ]] && add_args+=( --gotify-url "$GOTIFY_URL" )
 "$MT" "${add_args[@]}"
 

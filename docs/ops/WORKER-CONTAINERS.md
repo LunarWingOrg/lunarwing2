@@ -637,6 +637,86 @@ Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
 `curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
 (`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
+## LLM endpoints for LLM-backed workers (WI#330)
+
+The opencode, opencode2, and kimi worker images bake **placeholder** LLM
+endpoints (`set-opencode-base-url.invalid`, `set-opencode2-base-url.invalid`,
+`set-kimi-base-url.invalid` — the `.invalid` TLD is guaranteed NXDOMAIN).
+Earlier images baked developer-network endpoints (an RFC1918 LAN address and a
+NetBird MagicDNS name) that are unreachable from any other host; the MagicDNS
+name also did not resolve inside the rootless worker containers on the MT
+hosts where this was observed. Each entrypoint now **refuses to start** when
+the placeholder survives to the effective runtime config (for opencode2 that
+is `$OPENCODE_CONFIG` when the operator sets it), with a message naming the
+missing env var, instead of dying at the first LLM request after N retries.
+
+Multi-tenant provisioning has **no built-in LLM endpoint default**: `add-tenant`
+fails loudly unless it is given `--tensorzero-url` (or fleet
+`LUNARWING_MT_TENSORZERO_URL`), or `--llm-base-url` for a non-proxy tenant.
+The tenant's TensorZero proxy units render the tenant's own `TENSORZERO_URL`
+from `proxy.env`, not a fleet literal.
+
+mt-admin renders `OPENCODE_BASE_URL` / `KIMI_BASE_URL` / `OPENCODE2_BASE_URL`
+into the tenant's `lunarwing.env`. Resolution order per worker:
+
+1. Explicit per-worker flag (`add-tenant --opencode-base-url` /
+   `--kimi-base-url` / `--opencode2-base-url`) or a later
+   `configure-* --base-url` call.
+2. An operator-set value already in `lunarwing.env` (any value without a
+   `<KEY>_SOURCE=inherited` marker) — preserved across re-renders.
+3. Inherited from the tenant's LLM endpoint: `--llm-base-url` /
+   `LUNARWING_MT_LLM_BASE_URL` when container-reachable, else the tenant's
+   TensorZero upstream normalized to `/openai/v1`. Inherited values are marked
+   `<KEY>_SOURCE=inherited`, **re-derived on every render** (a TensorZero move
+   reaches the workers without a per-worker `configure-*` call), and skipped
+   by `export-tenant` so a migrated tenant re-derives them on the target host.
+4. If none of those yields a URL and the worker is
+   enabled, the render/upgrade fails loudly naming the fix — an unreachable
+   default is never rendered.
+
+Automatic inheritance excludes host loopback (`127.0.0.1`, `localhost`,
+`[::1]` — inside a rootless container that is the container itself, and the
+daemon's own proxy-loopback default is therefore never inherited) and known
+overlay MagicDNS suffixes (`*.netbird.selfhosted`, `*.netbird.cloud`,
+`*.ts.net`, `*.tailscale.net`). Use a numeric overlay/LAN IP or a public DNS
+name. This is a hostname filter, not a network probe; operators must ensure
+their chosen endpoint (including explicit per-worker overrides) is reachable.
+Supplied URLs are shape-validated (http/https only, no whitespace or control
+characters, no userinfo, no `%`) at `add-tenant` and `configure-*` time, and
+written quoted.
+
+**Upgrade note:** `upgrade-tenant` (and `patch-env`) backfills a missing
+`*_BASE_URL` for every *enabled* worker from the tenant's endpoint —
+`LLM_BASE_URL` when container-reachable, else the `proxy.env`
+`TENSORZERO_URL`. Upgrade performs this preflight before stopping the tenant
+or rebuilding worker images, and fails with services still running when no
+endpoint is derivable. Pre-existing tenants therefore keep their workers
+through the placeholder rollout; a tenant whose daemon endpoint
+is itself loopback-only needs one explicit `configure-*` call.
+
+Override knobs (no image rebuild; restart the worker afterwards):
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-opencode  <name> --base-url <url>
+sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi      <name> --base-url <url>
+sudo ic/scripts/lunarwing-mt-admin.sh configure-opencode2 <name> --base-url <url>
+```
+
+All three `configure-*` commands preserve omitted model/base URL values and
+the URL's inherited marker. Model-only or Kimi API-key-only changes therefore
+still follow future tenant endpoint changes and remain omitted from export;
+only an explicit `--base-url` turns an inherited URL into an operator override.
+Kimi trims model/URL overrides consistently while preserving API-key bytes.
+For the standalone docker-compose developer path, the three `docker-compose.yml` files forward
+the `*_MODEL`/`*_BASE_URL` keys from `.env`/the shell into the container; an
+unset key still fails the entrypoint guard loudly.
+
+The MR shell-harness lane exercises all three real entrypoint configuration
+sections against the baked configs in isolated temporary directories (unset,
+empty, whitespace, model-only, explicit URL, mounted config, and OpenCode 2's
+effective `OPENCODE_CONFIG`). These checks stop before health/CLI startup;
+whole-image builds remain the protected worker publication gate.
+
 ## Shared Protocol
 
 All worker images use the `lunarwing-agent-v1` WebSocket subprotocol; the legacy `ironclaw-agent-v1` alias is no longer accepted. Messages are JSON envelopes with `id`, `type`, `timestamp`, `payload`. The worker sends `ready` on connect, receives `task_request`, streams `task_progress`, and sends a final `task_result`.
