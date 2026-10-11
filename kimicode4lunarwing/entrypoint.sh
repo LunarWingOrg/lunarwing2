@@ -101,6 +101,11 @@ def toml_string(value):
     return '"' + ''.join(escapes.get(char, f"\\u{ord(char):04x}" if ord(char) < 0x20 or ord(char) == 0x7f else char) for char in value) + '"'
 
 def replace_setting(config, name, value, required):
+    # WI#330: a whitespace-only override (e.g. KIMI_BASE_URL=' ') must behave
+    # as unset so the placeholder base_url survives to the entrypoint guard
+    # instead of materializing a garbage endpoint.
+    if value:
+        value = value.strip()
     if not value:
         return config
     pattern = re.compile(rf'^(\s*{re.escape(name)}\s*=).*$' , re.MULTILINE)
@@ -205,6 +210,15 @@ PY
   else
     log "Config copied: $KIMI_CONFIG_SOURCE -> $KIMI_CODE_HOME/config.toml"
   fi
+fi
+
+# WI#330: the baked config ships a placeholder base_url on the .invalid TLD
+# (guaranteed NXDOMAIN). mt-admin always renders KIMI_BASE_URL — defaulting to
+# the tenant's own LLM endpoint — so a placeholder that survives to the
+# runtime config means a hand-rolled deployment forgot the override. Fail
+# loudly at startup instead of at the first LLM request.
+if grep -q 'set-kimi-base-url\.invalid' "$KIMI_CODE_HOME/config.toml" 2>/dev/null; then
+  die "KIMI_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-kimi <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
 fi
 
 # ── always start the health server in the background ──────────────────────────
