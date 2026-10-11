@@ -10,10 +10,12 @@ const entrypointPath = fileURLToPath(new URL("../entrypoint.sh", import.meta.url
 const entrypoint = readFileSync(entrypointPath, "utf8")
 const configSectionEnd = entrypoint.indexOf("# ── always start the health server")
 
-test("baked Kimi defaults use the NetBird FrontierCODEK provider", () => {
+test("baked Kimi defaults use the placeholder provider endpoint (WI#330)", () => {
   const config = readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8")
   assert.match(config, /^default_model = "tensorzero\/FrontierCODEK"$/m)
-  assert.match(config, /^base_url = "http:\/\/cotterhomelab3\.netbird\.selfhosted:3000\/openai\/v1"$/m)
+  // The baked base_url is a guaranteed-NXDOMAIN placeholder that
+  // entrypoint.sh refuses to run; mt-admin renders KIMI_BASE_URL per tenant.
+  assert.match(config, /^base_url = "http:\/\/set-kimi-base-url\.invalid\/openai\/v1"$/m)
   assert.match(config, /^\[models\."tensorzero\/FrontierCODEK"\]$/m)
   assert.match(config, /^model = "tensorzero::function_name::FrontierCODEK"$/m)
   assert.match(config, /^dangerous_command_guard = true$/m)
@@ -94,7 +96,7 @@ test("entrypoint retargets the baked model entry when KIMI_MODEL is a new model 
 
 [providers.tensorzero]
 type = "openai"
-base_url = "http://100.88.232.146:3000/openai/v1"
+base_url = "http://tensorzero.example.test:3000/openai/v1"
 api_key = ""
 
 [models."tensorzero/FrontierCODE"]
@@ -120,7 +122,7 @@ capabilities = ["tool_use"]
   assert.match(config, /model = "tensorzero::function_name::baud"/)
   assert.match(config, /provider = "tensorzero"/)
   // provider/base_url lines untouched, exactly one model entry renamed
-  assert.match(config, /base_url = "http:\/\/100\.88\.232\.146:3000\/openai\/v1"/)
+  assert.match(config, /base_url = "http:\/\/tensorzero\.example\.test:3000\/openai\/v1"/)
   assert.equal(config.match(/\[models\./g)?.length, 1)
 })
 
@@ -196,16 +198,74 @@ api_key = "k"
   assert.match(injected, /headless_command_guard\.mjs/)
 
   // With the full baked policy present, generation preserves both as-is.
+  // The baked config's base_url is the WI#330 placeholder, so this lane sets
+  // KIMI_BASE_URL the way mt-admin does for a real tenant.
   writeFileSync(
     source,
     readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
   )
   const ok = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
     encoding: "utf8",
-    env: { ...process.env, KIMI_CODE_HOME: home, KIMI_CONFIG_SOURCE: source },
+    env: {
+      ...process.env,
+      KIMI_CODE_HOME: home,
+      KIMI_CONFIG_SOURCE: source,
+      KIMI_BASE_URL: "http://tensorzero.example.test/openai/v1",
+    },
   })
   assert.equal(ok.status, 0, ok.stderr)
   const baked = readFileSync(join(home, "config.toml"), "utf8")
   assert.equal(baked.match(/dangerous_command_guard = true/g)?.length, 1)
   assert.equal(baked.match(/headless_command_guard\.mjs/g)?.length, 1)
+  assert.match(baked, /base_url = "http:\/\/tensorzero\.example\.test\/openai\/v1"/)
+})
+
+test("entrypoint refuses to run the baked placeholder base_url (WI#330)", () => {
+  assert.ok(configSectionEnd > 0)
+  const root = mkdtempSync(join(tmpdir(), "kimi-placeholder-"))
+  const home = join(root, "home")
+  const source = join(root, "source.toml")
+  // The real baked config with no KIMI_BASE_URL override must fail loudly
+  // instead of dialing a guaranteed-NXDOMAIN placeholder at LLM time.
+  writeFileSync(
+    source,
+    readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
+  )
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    KIMI_CODE_HOME: home,
+    KIMI_CONFIG_SOURCE: source,
+  }
+  delete env.KIMI_BASE_URL
+
+  const refused = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env,
+  })
+  assert.notEqual(refused.status, 0)
+  assert.match(refused.stderr, /KIMI_BASE_URL is unset and the baked config is a placeholder/)
+
+  // A whitespace-only KIMI_BASE_URL is NOT an override: the placeholder must
+  // survive and the guard must still fire (whitespace bypass regression).
+  const whitespace = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env: { ...env, KIMI_BASE_URL: "  " },
+  })
+  assert.notEqual(whitespace.status, 0)
+  assert.match(whitespace.stderr, /KIMI_BASE_URL is unset and the baked config is a placeholder/)
+
+  // A custom source config with its own endpoint is not the placeholder and
+  // must start normally without KIMI_BASE_URL.
+  writeFileSync(source, `default_model = "m"
+
+[providers.p]
+type = "openai"
+base_url = "http://127.0.0.1:1/v1"
+api_key = "k"
+`)
+  const custom = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env,
+  })
+  assert.equal(custom.status, 0, custom.stderr)
 })

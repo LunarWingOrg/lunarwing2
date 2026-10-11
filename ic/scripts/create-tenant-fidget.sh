@@ -32,6 +32,9 @@ TENANT="fidget"
 XMPP_JID="${XMPP_JID:-fidget@xmpp.sobe.world}"   # <-- confirm your XMPP domain
 XMPP_PASSWORD="${XMPP_PASSWORD:-}"              # blank -> mt-admin generates one
 LLM_API_KEY="${LLM_API_KEY:-}"                 # blank -> defaults to token-fidget (TensorZero proxy)
+# WI#330: no built-in endpoint default — set one (or LUNARWING_MT_TENSORZERO_URL
+# for mt-admin) or add-tenant refuses to provision.
+TENSORZERO_URL="${TENSORZERO_URL:-}"
 GOTIFY_URL="${GOTIFY_URL:-}"                    # optional, e.g. https://gotify.example.com
 DOCKER_GROUP="${DOCKER_GROUP:-false}"          # set true ONLY if fidget runs Docker sandbox/workers
                                                #   (docker group is ~root-equivalent — opt in deliberately)
@@ -76,6 +79,7 @@ add_args=( add-tenant "$TENANT" --xmpp-jid "$XMPP_JID" )
 [[ "$DOCKER_GROUP" == true ]] && add_args+=( --docker-group )
 [[ -n "$XMPP_PASSWORD" ]] && add_args+=( --xmpp-password "$XMPP_PASSWORD" )
 [[ -n "$LLM_API_KEY" ]] && add_args+=( --llm-api-key "$LLM_API_KEY" )
+[[ -n "$TENSORZERO_URL" ]] && add_args+=( --tensorzero-url "$TENSORZERO_URL" )
 [[ -n "$GOTIFY_URL" ]] && add_args+=( --gotify-url "$GOTIFY_URL" )
 "$MT" "${add_args[@]}"
 

@@ -543,6 +543,9 @@ add_tenant() {
       die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/opencode2-/weechat-/weechat-adapter-); choose another name" ;;
   esac
 
+  # WI#330: never render an unreachable built-in endpoint; require a real one.
+  require_tenant_llm_endpoint "$tensorzero_url" "$llm_base_url" "$enable_proxy"
+
   # Resolve after sanitize_name so a preserved/default JID keys off the real name.
   local xmpp_jid_prev
   xmpp_jid_prev="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)"
@@ -1490,6 +1493,11 @@ upgrade_tenant_locked() {
   migrations_type="$("${tgit[@]}" cat-file -t "${target_commit}:ic/migrations" 2>/dev/null || true)"
   [[ "$migrations_type" == "tree" ]] \
     || die "target ref '$target' has no ic/migrations directory (tenant was not stopped)"
+
+  # WI#330: validate/backfill enabled worker endpoints before stopping the
+  # working tenant, not just before rebuilding placeholder-refusing images.
+  # An unresolvable endpoint is an operator-fixable preflight failure.
+  backfill_tenant_worker_base_urls "$name"
 
   previous_commit="$("${tgit[@]}" rev-parse --verify HEAD)" \
     || die "failed to record current tenant commit"

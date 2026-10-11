@@ -843,16 +843,30 @@ configure_opencode() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   [[ -n "$model" || -n "$base_url" ]] \
     || die "configure-opencode: pass --model <model> and/or --base-url <url>"
+  [[ -z "$base_url" ]] || validate_llm_url "$base_url" "--base-url"
 
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
 
-  local tmp
+  # Preserve omitted values (configure-opencode2/configure-kimi already do):
+  # stripping an unset flag's key used to be harmless while the image baked a
+  # reachable default; with the WI#330 placeholder images it bricks the worker.
+  local tmp existing_model existing_base_url base_url_source=""
+  existing_model="$(_read_env_value "$env_path" OPENCODE_MODEL)"
+  existing_base_url="$(_read_env_value "$env_path" OPENCODE_BASE_URL)"
+  [[ -n "$model" ]] || model="$existing_model"
+  if [[ -z "$base_url" ]]; then
+    base_url="$existing_base_url"
+    base_url_source="$(_read_env_value "$env_path" OPENCODE_BASE_URL_SOURCE)"
+  fi
   tmp="$(mktemp)"
-  grep -v -e '^OPENCODE_MODEL=' -e '^OPENCODE_BASE_URL=' "$env_path" >"$tmp" || true
+  # Only an explicit URL becomes operator-owned; a model-only update preserves
+  # URL provenance so later renders and exports still handle inheritance.
+  grep -v -e '^OPENCODE_MODEL=' -e '^OPENCODE_BASE_URL=' -e '^OPENCODE_BASE_URL_SOURCE=' "$env_path" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'OPENCODE_MODEL=%s\n'    "$model"    >>"$tmp"
-  [[ -n "$base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$base_url" >>"$tmp"
+  [[ -n "$base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$(_quote_env_value "$base_url")" >>"$tmp"
+  [[ "$base_url_source" != inherited ]] || printf 'OPENCODE_BASE_URL_SOURCE=inherited\n' >>"$tmp"
   cat "$tmp" >"$env_path"
   rm -f "$tmp"
   chown "$name:$name" "$env_path"
@@ -875,20 +889,26 @@ configure_opencode2() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   [[ -n "$model" || -n "$base_url" ]] \
     || die "configure-opencode2: pass --model <model> and/or --base-url <url>"
+  [[ -z "$base_url" ]] || validate_llm_url "$base_url" "--base-url"
 
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
 
-  local tmp existing_model existing_base_url
+  local tmp existing_model existing_base_url base_url_source=""
   existing_model="$(_read_env_value "$env_path" OPENCODE2_MODEL)"
   existing_base_url="$(_read_env_value "$env_path" OPENCODE2_BASE_URL)"
   [[ -n "$model" ]] || model="$existing_model"
-  [[ -n "$base_url" ]] || base_url="$existing_base_url"
+  if [[ -z "$base_url" ]]; then
+    base_url="$existing_base_url"
+    base_url_source="$(_read_env_value "$env_path" OPENCODE2_BASE_URL_SOURCE)"
+  fi
   tmp="$(mktemp)"
-  grep -v -e '^OPENCODE2_MODEL=' -e '^OPENCODE2_BASE_URL=' "$env_path" >"$tmp" || true
+  # Only an explicit URL becomes operator-owned (WI#330).
+  grep -v -e '^OPENCODE2_MODEL=' -e '^OPENCODE2_BASE_URL=' -e '^OPENCODE2_BASE_URL_SOURCE=' "$env_path" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'OPENCODE2_MODEL=%s\n'    "$model"    >>"$tmp"
-  [[ -n "$base_url" ]] && printf 'OPENCODE2_BASE_URL=%s\n' "$base_url" >>"$tmp"
+  [[ -n "$base_url" ]] && printf 'OPENCODE2_BASE_URL=%s\n' "$(_quote_env_value "$base_url")" >>"$tmp"
+  [[ "$base_url_source" != inherited ]] || printf 'OPENCODE2_BASE_URL_SOURCE=inherited\n' >>"$tmp"
   cat "$tmp" >"$env_path"
   rm -f "$tmp"
   chown "$name:$name" "$env_path"
@@ -1586,22 +1606,29 @@ configure_kimi() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   [[ -n "$model" || -n "$base_url" || -n "$api_key" ]] \
     || die "configure-kimi: pass --model <model>, --base-url <url>, or --api-key-file <path>"
+  [[ -z "$base_url" ]] || validate_llm_url "$base_url" "--base-url"
 
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
 
-  local tmp existing_model existing_base_url existing_api_key
+  local tmp existing_model existing_base_url existing_api_key base_url_source=""
   existing_model="$(_read_env_value "$env_path" KIMI_MODEL)"
   existing_base_url="$(_read_env_value "$env_path" KIMI_BASE_URL)"
   existing_api_key="$(_read_env_value "$env_path" KIMI_API_KEY)"
   [[ -n "$model" ]] || model="$existing_model"
-  [[ -n "$base_url" ]] || base_url="$existing_base_url"
+  if [[ -z "$base_url" ]]; then
+    base_url="$existing_base_url"
+    base_url_source="$(_read_env_value "$env_path" KIMI_BASE_URL_SOURCE)"
+  fi
   [[ -n "$api_key" ]] || api_key="$existing_api_key"
   tmp="$(mktemp)"
-  grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_API_KEY=' "$env_path" >"$tmp" || true
+  # Model/API-key-only updates retain URL provenance; only --base-url takes
+  # ownership of an inherited endpoint (WI#330).
+  grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_BASE_URL_SOURCE=' -e '^KIMI_API_KEY=' "$env_path" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'KIMI_MODEL=%s\n'    "$model"    >>"$tmp"
-  [[ -n "$base_url" ]] && printf 'KIMI_BASE_URL=%s\n' "$base_url" >>"$tmp"
+  [[ -n "$base_url" ]] && printf 'KIMI_BASE_URL=%s\n' "$(_quote_env_value "$base_url")" >>"$tmp"
+  [[ "$base_url_source" != inherited ]] || printf 'KIMI_BASE_URL_SOURCE=inherited\n' >>"$tmp"
   [[ -n "$api_key" ]] \
     && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$api_key")" >>"$tmp"
   cat "$tmp" >"$env_path"

@@ -52,7 +52,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-native-certs = { version = "0.8", optional = true }
 
 # Database - libSQL/Turso (optional embedded database)
-libsql = { version = "0.6", optional = true, default-features = false, features = ["core", "replication", "remote", "tls"] }
+# Only the local/embedded surface is enabled here. The remote-replica (Turso
+# sync) surface (`remote`, `replication`, `tls`) is enabled by the separate
+# `libsql-remote-replica` cargo feature — see [features] and WI#331: that
+# chain pins rustls-webpki 0.102 / h2 0.3 with accepted RustSec advisories,
+# so it is kept out of default builds by construction.
+libsql = { version = "0.6", optional = true, default-features = false, features = ["core"] }
 
 # Error handling
 thiserror = "2"
@@ -252,6 +257,18 @@ postgres = [
     "rust_decimal/db-tokio-postgres",
 ]
 libsql = ["dep:libsql"]
+# Opt-in libSQL remote replicas (Turso cloud sync). NOT in `default` since
+# v2.1.6.0 (WI#331): libsql 0.6.0's remote/replication/tls chain pins
+# rustls-webpki 0.102.8 and h2 0.3.27, which carry accepted RustSec
+# advisories (see ic/deny.toml). Keeping the feature off means default
+# builds do not compile the vulnerable validator at all. Builds that need
+# Turso sync must opt in explicitly.
+libsql-remote-replica = [
+    "libsql",
+    "libsql/remote",
+    "libsql/replication",
+    "libsql/tls",
+]
 # Opt-in feature for especially heavy integration-test targets that run in a
 # dedicated CI job instead of the default Rust test matrix.
 integration = []

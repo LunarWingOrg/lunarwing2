@@ -24,6 +24,11 @@ x-worker-base: &worker-base
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-kimi-01}
     KIMI_API_KEY: ${KIMI_API_KEY:-}
     TENSORZERO_API_KEY: ${TENSORZERO_API_KEY:-}
+    # WI#330: the image's baked base_url is a placeholder the entrypoint refuses
+    # to run; forward these so `.env` / the shell can override (mt-admin-managed
+    # deployments inject them via env_file instead).
+    KIMI_MODEL: ${KIMI_MODEL:-}
+    KIMI_BASE_URL: ${KIMI_BASE_URL:-}
     WORKSPACE_ROOT: /workspace
     KIMI_CODE_HOME: /home/kimi/.kimi-code
     FILE_UMASK: ${FILE_UMASK:-0002}

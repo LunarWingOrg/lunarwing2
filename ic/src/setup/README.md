@@ -293,8 +293,15 @@ Both features compiled?
 
 **libSQL path:**
 1. Offer local path (default: `~/.lunarwing/lunarwing.db`)
-2. Optional Turso cloud sync (URL + auth token)
-3. Test connection via `connect_without_migrations()`
+2. Optional Turso cloud sync (URL + auth token) — only offered in builds with
+   the non-default `libsql-remote-replica` cargo feature (WI#331); without
+   the feature the prompt is skipped, and a Turso URL arriving via
+   `LIBSQL_URL` fails the connection test closed (no silent local fallback)
+3. `test_database_connection_libsql()` delegates to
+   `LibSqlBackend::from_config_parts()`, sharing startup's validation. A URL
+   without an auth token fails in every build before opening a local file;
+   a token without a URL remains a local-only configuration. Remote-config
+   errors warn that removing the URL can make an existing replica diverge.
 4. Always run migrations (idempotent CREATE IF NOT EXISTS)
 
 **Invariant:** After Step 1, `self.db` is `Some(Arc<dyn Database>)`.
@@ -652,7 +659,8 @@ that are needed before the DB is connected):
 - `DATABASE_BACKEND` (always)
 - `DATABASE_URL` (if postgres)
 - `LIBSQL_PATH` (if libsql)
-- `LIBSQL_URL` (if turso sync)
+- `LIBSQL_URL` (if turso sync — only offered/tested in builds with the
+  non-default `libsql-remote-replica` cargo feature; WI#331)
 - `SECRETS_MASTER_KEY` (if env key source selected in Step 2)
 - `ONBOARD_COMPLETED` (always, "true")
 - Channel/sandbox vars: `CLAUDE_CODE_ENABLED`, `SIGNAL_HTTP_URL`, `SIGNAL_ACCOUNT`, etc. (channel init may precede DB)

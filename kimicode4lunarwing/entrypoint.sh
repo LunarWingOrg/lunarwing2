@@ -126,7 +126,7 @@ def retarget_model_entry(config, old_alias, new_model):
         config = config[:body.start()] + f'{body.group(1)} {toml_string(new_model)}' + config[body.end():]
     return config
 
-kimi_model = os.environ.get("KIMI_MODEL", "")
+kimi_model = os.environ.get("KIMI_MODEL", "").strip()
 old_alias = ""
 if kimi_model:
     try:
@@ -136,7 +136,10 @@ if kimi_model:
 text = replace_setting(text, "default_model", kimi_model, False)
 if kimi_model and old_alias and old_alias != kimi_model:
     text = retarget_model_entry(text, old_alias, kimi_model)
-text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", ""), True)
+# Whitespace-only URLs are unset (the placeholder guard must still fire).
+# Normalize the model once above so alias retargeting uses the same value;
+# API keys remain byte-for-byte as supplied.
+text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", "").strip(), True)
 text = replace_setting(text, "api_key", os.environ.get("KIMI_API_KEY", ""), True)
 
 # WI#206 fail-closed policy enforcement. Whatever the source config said
@@ -205,6 +208,15 @@ PY
   else
     log "Config copied: $KIMI_CONFIG_SOURCE -> $KIMI_CODE_HOME/config.toml"
   fi
+fi
+
+# WI#330: the baked config ships a placeholder base_url on the .invalid TLD
+# (guaranteed NXDOMAIN). mt-admin always renders KIMI_BASE_URL — defaulting to
+# the tenant's own LLM endpoint — so a placeholder that survives to the
+# runtime config means a hand-rolled deployment forgot the override. Fail
+# loudly at startup instead of at the first LLM request.
+if grep -q 'set-kimi-base-url\.invalid' "$KIMI_CODE_HOME/config.toml" 2>/dev/null; then
+  die "KIMI_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-kimi <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
 fi
 
 # ── always start the health server in the background ──────────────────────────

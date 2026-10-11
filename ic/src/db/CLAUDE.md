@@ -35,6 +35,28 @@ are optional overrides.
   `routines`, `sandbox`, `settings`, `tool_failures`, `users`, `workspace`.
 - Migrations: `ic/src/db/libsql_migrations.rs`.
 
+## libSQL remote replicas / Turso sync (WI#331, v2.1.6.0)
+
+- The `libsql` dependency is compiled with `features = ["core"]` only.
+  Turso remote replicas live behind the non-default
+  **`libsql-remote-replica`** cargo feature (`libsql/remote +
+  libsql/replication + libsql/tls`): the libsql 0.6.0 remote chain pins
+  rustls-webpki 0.102.8 / h2 0.3.27 (accepted RustSec advisories,
+  `ic/deny.toml`), so it stays out of default builds. The default-feature
+  graph is pinned clean by
+  `.gitlab/scripts/check-default-graph-advisories.sh`.
+- Connection-mode selection is centralized in
+  `LibSqlBackend::from_config_parts(path, url, token)`
+  (`ic/src/db/libsql/mod.rs`); all `db/mod.rs` connect paths and the setup
+  wizard's libSQL connection test route through it. A URL without an auth
+  token is rejected in every build before a local database is opened.
+  Without the feature, a configured remote replica fails closed with an
+  error naming the feature — never a silent local-only fallback (a local
+  replica file without sync diverges from the Turso primary).
+- `new_remote_replica` exists only under `#[cfg(feature =
+  "libsql-remote-replica")]`; keep new remote-replica call sites behind the
+  same cfg and route config-driven connections through `from_config_parts`.
+
 ## Rules
 
 - Add new DB operations to the shared `Database` trait first, then implement

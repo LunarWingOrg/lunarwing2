@@ -2,10 +2,13 @@
 # Overridden per-tenant by KIMI_MODEL / KIMI_BASE_URL env vars in entrypoint.sh.
 #
 # The default provider is the LunarWing TensorZero gateway (OpenAI-compatible
-# endpoint). It is reached over the NetBird overlay at
-# cotterhomelab3.netbird.selfhosted. The managed Kimi Code
-# service (api.kimi.com) is no longer the default: since kimi-code 0.37.2,
-# worker prompts against it fail.
+# endpoint). WI#330: the baked base_url is a placeholder on the .invalid TLD —
+# it can never resolve, and entrypoint.sh refuses to start when it survives to
+# the runtime config. mt-admin renders KIMI_BASE_URL for every tenant (default:
+# the tenant's own LLM endpoint); the URL must be reachable from inside the
+# container (no host loopback, no overlay MagicDNS names). The managed Kimi
+# Code service (api.kimi.com) is no longer the default: since kimi-code
+# 0.37.2, worker prompts against it fail.
 
 default_model = "tensorzero/FrontierCODEK"
 # Print mode (kimi -p) forces the auto permission policy regardless of this
@@ -38,7 +41,7 @@ timeout = 10
 
 [providers.tensorzero]
 type = "openai"
-base_url = "http://cotterhomelab3.netbird.selfhosted:3000/openai/v1"
+base_url = "http://set-kimi-base-url.invalid/openai/v1"
 # Non-secret placeholder: the gateway on the private overlay accepts any bearer,
 # and kimi-code refuses to run with an empty api_key. entrypoint.sh overwrites
 # this with KIMI_API_KEY / TENSORZERO_API_KEY when either is provisioned.
