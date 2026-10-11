@@ -1422,6 +1422,22 @@ impl MissionManager {
                 {
                     continue;
                 }
+                // WI#338 (defense in depth, not the fix): thread_history rides
+                // the agent-writable mission record (WI#322). Skip a planted id
+                // whose thread belongs to another project or user (a partial
+                // forgery). A forger who also rewrites the mission's
+                // user_id/project_id still passes, because both sides of the
+                // comparison then come from the forged record; WI#322 is the fix.
+                if thread.project_id != mission.project_id
+                    || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
+                {
+                    warn!(
+                        %mission_id,
+                        %thread_id,
+                        "skipping checkpoint resume for a history thread that fails the mission/thread parity checks"
+                    );
+                    continue;
+                }
                 if thread.metadata.get("runtime_checkpoint").is_none() {
                     continue;
                 }
@@ -2668,6 +2684,21 @@ impl MissionManager {
                 if thread.thread_type != ThreadType::Mission {
                     continue;
                 }
+                // WI#338 (defense in depth, not the fix): thread_history rides
+                // the agent-writable mission record (WI#322). Skip a planted id
+                // whose thread belongs to another project or user (a partial
+                // forgery). A forger who also rewrites the mission's
+                // user_id/project_id still passes; WI#322 is the fix.
+                if thread.project_id != mission.project_id
+                    || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
+                {
+                    warn!(
+                        %mission_id,
+                        %thread_id,
+                        "skipping retry recovery for a history thread that fails the mission/thread parity checks"
+                    );
+                    continue;
+                }
                 if admitted.contains(&thread.id) {
                     break;
                 }
@@ -2874,6 +2905,31 @@ impl MissionManager {
             self.store.save_mission(mission).await?;
             return Ok(true);
         };
+        // WI#338 (defense in depth, not the fix): the stamp rides mission
+        // metadata, which stays agent-writable until WI#322 lands. Mirrors
+        // `record_restart_interrupted_thread`'s type/project/owner parity
+        // checks plus history membership; a mismatch clears the stamp without
+        // writing a marker or emitting a notice. This stops partial forgeries
+        // (only the stamp or `thread_history` edited) and store corruption. It
+        // does NOT stop a forger who rewrites the whole record (`user_id`,
+        // `project_id`, `thread_history`): every mission-side value compared
+        // here comes from that record. WI#322 removes the input; a mission id
+        // stamped on the thread row would be the unforgeable side.
+        if thread.thread_type != ThreadType::Mission
+            || thread.project_id != mission.project_id
+            || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
+            || !mission.thread_history.contains(&thread_id)
+        {
+            warn!(
+                mission_id = %mission.id,
+                %thread_id,
+                "pending shutdown interruption stamp failed the mission/thread parity checks; clearing it without acting"
+            );
+            clear_shutdown_interruption_stamp(mission);
+            mission.updated_at = Utc::now();
+            self.store.save_mission(mission).await?;
+            return Ok(true);
+        }
         match thread.state {
             ThreadState::Failed if thread.is_failed_by_restart() => {
                 clear_shutdown_interruption_stamp(mission);
@@ -11682,6 +11738,227 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
         assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        mgr.shutdown().await;
+    }
+
+    /// WI#338: the stamp rides the agent-writable mission record (WI#322).
+    /// A stamp naming another user's thread — even one the forged record
+    /// also lists in `thread_history` — is cleared without acting: no retry
+    /// marker on the foreign thread, no notification carrying its id.
+    #[tokio::test]
+    async fn boot_resolution_ignores_a_stamp_naming_a_foreign_users_thread() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        let mut foreign = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            thread.project_id,
+            "victim-user",
+            ThreadConfig::default(),
+        );
+        foreign
+            .transition_to(ThreadState::Running, None)
+            .expect("created -> running");
+        foreign
+            .transition_to(
+                ThreadState::Failed,
+                Some(crate::types::thread::EXECUTION_STOPPED_REASON.to_string()),
+            )
+            .expect("running -> failed");
+        store.save_thread(&foreign).await.unwrap();
+        let mut forged = store.load_mission(mission.id).await.unwrap().unwrap();
+        forged.thread_history.push(foreign.id);
+        forged.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: {
+            "thread_id": foreign.id,
+            "recorded_at": Utc::now().to_rfc3339(),
+        }});
+        store.save_mission(&forged).await.unwrap();
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let foreign_after = store.load_thread(foreign.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&foreign_after.metadata).is_none(),
+            "no retry marker may be written on the foreign thread"
+        );
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            stamped_interrupted_thread(&saved_mission).is_none(),
+            "the forged stamp is cleared"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no notification may carry the foreign thread"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#338: a stamp naming a non-Mission thread of the same user is
+    /// cleared without acting.
+    #[tokio::test]
+    async fn boot_resolution_ignores_a_stamp_naming_a_non_mission_thread() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        let mut foreground = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            thread.project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        foreground
+            .transition_to(ThreadState::Running, None)
+            .expect("created -> running");
+        foreground
+            .transition_to(
+                ThreadState::Failed,
+                Some(crate::types::thread::EXECUTION_STOPPED_REASON.to_string()),
+            )
+            .expect("running -> failed");
+        store.save_thread(&foreground).await.unwrap();
+        let mut forged = store.load_mission(mission.id).await.unwrap().unwrap();
+        forged.thread_history.push(foreground.id);
+        forged.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: {
+            "thread_id": foreground.id,
+            "recorded_at": Utc::now().to_rfc3339(),
+        }});
+        store.save_mission(&forged).await.unwrap();
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let foreground_after = store.load_thread(foreground.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&foreground_after.metadata).is_none());
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(rx.try_recv().is_err());
+        mgr.shutdown().await;
+    }
+
+    /// WI#338: a stamp naming one of the owner's own Mission threads that
+    /// the mission never fired (absent from `thread_history`) is cleared
+    /// without acting.
+    #[tokio::test]
+    async fn boot_resolution_ignores_a_stamp_naming_a_thread_outside_history() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        let mut other = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            thread.project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        other
+            .transition_to(ThreadState::Running, None)
+            .expect("created -> running");
+        other
+            .transition_to(
+                ThreadState::Failed,
+                Some(crate::types::thread::EXECUTION_STOPPED_REASON.to_string()),
+            )
+            .expect("running -> failed");
+        store.save_thread(&other).await.unwrap();
+        let mut forged = store.load_mission(mission.id).await.unwrap().unwrap();
+        forged.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: {
+            "thread_id": other.id,
+            "recorded_at": Utc::now().to_rfc3339(),
+        }});
+        store.save_mission(&forged).await.unwrap();
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let other_after = store.load_thread(other.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&other_after.metadata).is_none());
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(rx.try_recv().is_err());
+        mgr.shutdown().await;
+    }
+
+    /// WI#338: retry recovery scans `thread_history` from the same
+    /// agent-writable record — a planted foreign thread carrying a retry
+    /// marker must not arm a retry as this mission, and its marker is left
+    /// untouched.
+    #[tokio::test]
+    async fn retry_recovery_skips_a_history_thread_failing_parity() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "pending",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let mut foreign = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "victim-user",
+            ThreadConfig::default(),
+        );
+        foreign.state = ThreadState::Failed;
+        let pending = PendingMissionRetry::new(
+            mission.id,
+            "victim-user",
+            1,
+            None,
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        foreign.metadata = serde_json::json!({RetryState::METADATA_KEY: pending.to_retry_state()});
+        mission.thread_history.push(foreign.id);
+        store.save_thread(&foreign).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a foreign history thread must not arm a retry"
+        );
+        let after = store.load_thread(foreign.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&after.metadata).is_some(),
+            "the foreign thread's marker is left untouched"
+        );
         mgr.shutdown().await;
     }
 
