@@ -47,8 +47,10 @@ are optional overrides.
   `.gitlab/scripts/check-default-graph-advisories.sh`.
 - Connection-mode selection is centralized in
   `LibSqlBackend::from_config_parts(path, url, token)`
-  (`ic/src/db/libsql/mod.rs`); all `db/mod.rs` connect paths route through
-  it. Without the feature, a configured `LIBSQL_URL` fails closed with an
+  (`ic/src/db/libsql/mod.rs`); all `db/mod.rs` connect paths and the setup
+  wizard's libSQL connection test route through it. A URL without an auth
+  token is rejected in every build before a local database is opened.
+  Without the feature, a configured remote replica fails closed with an
   error naming the feature — never a silent local-only fallback (a local
   replica file without sync diverges from the Turso primary).
 - `new_remote_replica` exists only under `#[cfg(feature =

@@ -551,7 +551,6 @@ mod tests {
     /// WI#331 / MR !1513 review CZ-3: LIBSQL_URL without LIBSQL_AUTH_TOKEN is
     /// an error in every build, independent of the cargo feature.
     #[tokio::test]
-    #[cfg(not(feature = "libsql-remote-replica"))]
     async fn test_from_config_parts_url_without_token_errors() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("replica.db");
@@ -568,13 +567,15 @@ mod tests {
             err.to_string().contains("LIBSQL_AUTH_TOKEN"),
             "error must name the missing token, got: {err}"
         );
+        assert!(
+            !db_path.exists(),
+            "invalid config must not create a local DB"
+        );
     }
 
     /// WI#331 / MR !1513 review CZ-3: a local-only configuration (no
-    /// LIBSQL_URL) must still open a working local database in builds without
-    /// the feature.
+    /// LIBSQL_URL) must still open a working local database in either build.
     #[tokio::test]
-    #[cfg(not(feature = "libsql-remote-replica"))]
     async fn test_from_config_parts_local_only_opens_local_database() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("local.db");

@@ -8,10 +8,9 @@ default-feature production graph. The ID-keyed cargo-deny ignores cannot see
 that regression because every deny gate queries --workspace --all-features
 (MR !1513 review CZ-1).
 
-These tests drive the real script with stub git/taskset/cargo shims so all
-three contract branches stay pinned: pinned-in-lock + absent-from-default-
-graph passes; reachable-in-default-graph fails; pin-missing-from-lock fails
-as stale instead of passing vacuously.
+These tests drive the real script with stub git/taskset/cargo shims: safe
+resolved graphs pass, unsafe graphs and failed resolution fail closed, and
+missing pins fail as stale. Both roots must use their vendored, locked graph.
 """
 
 import os
@@ -48,26 +47,25 @@ shift 2
 exec "$@"
 """
 
-# Emulates `cargo tree --locked -e normal --target all -i crate@version`.
+# Emulates the forward default graph from `cargo tree`.
 # FAKE_REACHABLE lists crate@version pins visible in the default-feature
-# graph; anything else prints cargo's real absent marker so the script's
-# stdout inspection is what decides.
+# graph. The default graph includes newer versions of the guarded names,
+# ensuring the script checks exact pins instead of rejecting safe versions.
 FAKE_CARGO = """#!/usr/bin/env bash
-pin=""
-prev=""
-for arg in "$@"; do
-    if [[ "$prev" == "-i" ]]; then
-        pin="$arg"
-    fi
-    prev="$arg"
-done
-if [[ -n "$pin" && ",$FAKE_REACHABLE," == *",$pin,"* ]]; then
-    echo "$pin v0.0.0"
-    echo "└── fixture-parent v0.0.0"
-    exit 0
+printf '%s|%s\\n' "$PWD" "$*" >> "$FAKE_ROOT/cargo-calls"
+if [[ -n "$FAKE_ERROR" ]]; then
+    echo "$FAKE_ERROR" >&2
+    exit 101
 fi
-echo "error: package ID specification \\`$pin\\` did not match any packages" >&2
-exit 101
+echo "fixture v0.1.0 ($PWD)"
+echo "h2 v0.4.20"
+echo "rustls-webpki v0.103.15"
+if [[ -z "$FAKE_REACHABLE_ROOT" || "$PWD" == "$FAKE_ROOT/$FAKE_REACHABLE_ROOT" ]]; then
+    IFS=, read -ra pins <<< "$FAKE_REACHABLE"
+    for pin in "${pins[@]}"; do
+        echo "${pin%@*} v${pin#*@}"
+    done
+fi
 """
 
 
@@ -95,11 +93,13 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
             LOCK_TEMPLATE.format(entries=entries), encoding="utf-8"
         )
 
-    def run_guard(self, reachable=()):
+    def run_guard(self, reachable=(), error="", reachable_root=""):
         env = dict(os.environ)
         env["PATH"] = f"{self.root / 'bin'}{os.pathsep}{env['PATH']}"
         env["FAKE_ROOT"] = str(self.root)
         env["FAKE_REACHABLE"] = ",".join(reachable)
+        env["FAKE_ERROR"] = error
+        env["FAKE_REACHABLE_ROOT"] = reachable_root
         return subprocess.run(
             ["bash", str(self.root / ".gitlab" / "scripts" / SCRIPT.name)],
             capture_output=True,
@@ -123,6 +123,21 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
         result = self.run_guard()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("default-graph advisory guard: ok", result.stdout)
+
+    def test_each_root_uses_locked_offline_default_graph_and_own_cargo_config(self):
+        self.real_ic_lock_pins()
+        result = self.run_guard()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.root / "cargo-calls").read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        for call, root in zip(calls, ("ic", "ic/bridges/xmpp-bridge")):
+            cwd, args = call.split("|", 1)
+            self.assertEqual(cwd, str(self.root / root))
+            self.assertIn("--locked --offline", args)
+            self.assertIn("-e normal --target all", args)
+            self.assertIn(f"--manifest-path {cwd}/Cargo.toml", args)
+            self.assertNotIn("--all-features", args)
+            self.assertNotIn("--no-default-features", args)
 
     def test_legacy_chain_in_default_graph_fails(self):
         # The CZ-1 regression: something re-enables libsql's remote surface
@@ -150,6 +165,27 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("stale", result.stderr)
         self.assertIn("h2@0.3.27", result.stderr)
+
+    def test_bridge_only_regression_fails(self):
+        self.real_ic_lock_pins()
+        result = self.run_guard(reachable=("h2@0.3.27",), reachable_root="ic/bridges/xmpp-bridge")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("h2@0.3.27 is reachable", result.stderr)
+        self.assertIn("xmpp-bridge's DEFAULT-feature", result.stderr)
+
+    def test_resolver_failure_is_not_an_absent_package(self):
+        self.real_ic_lock_pins()
+        result = self.run_guard(error="error: lock file needs to be updated but --locked was passed")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("failed to inspect", result.stderr)
+        self.assertIn("lock file needs to be updated", result.stderr)
+        self.assertNotIn("guard: ok", result.stdout)
+
+    def test_error_containing_absence_marker_still_fails(self):
+        self.real_ic_lock_pins()
+        result = self.run_guard(error="error: failed to resolve graph: nothing to print")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("failed to inspect", result.stderr)
 
 
 if __name__ == "__main__":

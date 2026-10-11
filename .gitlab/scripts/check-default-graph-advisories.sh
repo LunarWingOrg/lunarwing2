@@ -20,8 +20,8 @@
 #     If the pin ever leaves the lock (the chain is really cleared), the
 #     guard fails loudly as stale instead of passing vacuously — the entry
 #     and the matching ic/deny.toml ignores must then be removed together.
-#   * `cargo tree --locked -e normal --target all -i crate@version` over the
-#     DEFAULT-feature graph must report the pin absent, at both build roots:
+#   * A successful `cargo tree --locked --offline -e normal --target all`
+#     over the DEFAULT-feature graph must not contain the pin at either root:
 #     the ic workspace and the xmpp-bridge satellite (the bridge builds
 #     lunarwing with default features, so its graph is exactly what ships in
 #     tenant bridge binaries).
@@ -45,11 +45,6 @@ lock_roots=(
     "$repo_root/ic/bridges/xmpp-bridge"
 )
 
-# `cargo tree -i crate@version` errors with "did not match any packages"
-# when the pin never resolved, and prints "nothing to print" when it matched
-# nothing invertible; both mean "not in this graph".
-absent_markers="nothing to print|did not match any packages"
-
 failed=0
 
 for entry in "${guarded[@]}"; do
@@ -60,13 +55,27 @@ for entry in "${guarded[@]}"; do
         echo "ERROR: default-graph guard entry for '$pin' is stale: not pinned in ic/Cargo.lock." >&2
         echo "       If the libsql legacy chain was really cleared, remove this entry and the matching ic/deny.toml ignores together." >&2
         failed=1
+    fi
+done
+
+for root in "${lock_roots[@]}"; do
+    # Cargo discovers .cargo/config.toml from the working directory, not
+    # --manifest-path. Enter each root to honor ic/vendor source replacement.
+    # Inspect a successful forward graph: resolver errors must never count
+    # as evidence that a vulnerable package is absent.
+    if ! out=$(cd "$root" && taskset -c 0-11 cargo tree --locked --offline \
+        -e normal --target all --prefix none --format '{p}' \
+        --manifest-path "$root/Cargo.toml" 2>&1); then
+        echo "ERROR: failed to inspect $root's DEFAULT-feature production graph." >&2
+        printf '%s\n' "$out" >&2
+        failed=1
         continue
     fi
-
-    for root in "${lock_roots[@]}"; do
-        out=$(taskset -c 0-11 cargo tree --locked -e normal --target all \
-            -i "$pin" --manifest-path "$root/Cargo.toml" 2>&1 || true)
-        if ! grep -qE "$absent_markers" <<<"$out"; then
+    for entry in "${guarded[@]}"; do
+        IFS='|' read -r crate version advisories explanation <<<"$entry"
+        pin="$crate@$version"
+        if awk -v crate="$crate" -v version="v$version" \
+            '$1 == crate && $2 == version { found = 1 } END { exit !found }' <<<"$out"; then
             echo "ERROR: $pin is reachable in $root's DEFAULT-feature production graph — $advisories apply ($explanation)." >&2
             echo "       Default builds must not compile the legacy chain; check libsql's enabled features and any new hyper-rustls 0.25 dependents." >&2
             failed=1

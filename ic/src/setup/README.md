@@ -297,7 +297,11 @@ Both features compiled?
    the non-default `libsql-remote-replica` cargo feature (WI#331); without
    the feature the prompt is skipped, and a Turso URL arriving via
    `LIBSQL_URL` fails the connection test closed (no silent local fallback)
-3. Test connection via `connect_without_migrations()`
+3. `test_database_connection_libsql()` delegates to
+   `LibSqlBackend::from_config_parts()`, sharing startup's validation. A URL
+   without an auth token fails in every build before opening a local file;
+   a token without a URL remains a local-only configuration. Remote-config
+   errors warn that removing the URL can make an existing replica diverge.
 4. Always run migrations (idempotent CREATE IF NOT EXISTS)
 
 **Invariant:** After Step 1, `self.db` is `Some(Arc<dyn Database>)`.
