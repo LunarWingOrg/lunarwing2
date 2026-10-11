@@ -616,8 +616,9 @@ mod jobs_isolation {
 
     #[tokio::test]
     async fn test_jobs_prompt_routes_external_job_to_control_channel() {
-        use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+        use crate::config::ExternalWorkerConfig;
         use crate::orchestrator::ExternalWorkerManager;
+        use crate::orchestrator::external_worker::ControlCapability;
 
         let (db, _dir) = test_db().await;
 
@@ -631,17 +632,16 @@ mod jobs_isolation {
             .await
             .unwrap();
 
-        // Manager with the job reserved (as create_job would before dispatch).
-        let ewm = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
-            name: "harness".to_string(),
-            url: "ws://127.0.0.1:9/ws/agent".to_string(),
-            auth_token: None,
-            timeout_ms: 900_000,
-            endpoints: vec![],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: Default::default(),
-        }]));
-        ewm.reserve_task(alice_job.id, "harness").await.unwrap();
+        // Manager with the job reserved (as create_job would before dispatch)
+        // and the worker capability handshake marked as completed.
+        let ewm = Arc::new(ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
+        ]));
+        ewm.reserve_task(alice_job.id, "harness", "alice")
+            .await
+            .unwrap();
+        ewm.force_control_capability(alice_job.id, ControlCapability::Supported)
+            .await;
 
         let state = build_state_ex(Some(db), None, Some(ewm));
         let auth = two_user_auth();
@@ -668,6 +668,111 @@ mod jobs_isolation {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["status"], "queued");
         assert_eq!(body["seq"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_jobs_prompt_external_rejects_other_user() {
+        use crate::config::ExternalWorkerConfig;
+        use crate::orchestrator::ExternalWorkerManager;
+        use crate::orchestrator::external_worker::ControlCapability;
+
+        let (db, _dir) = test_db().await;
+
+        // Running external worker job owned by alice.
+        let mut alice_job = make_sandbox_job("alice", "alice external");
+        alice_job.status = "running".to_string();
+        alice_job.success = None;
+        alice_job.completed_at = None;
+        db.save_sandbox_job(&alice_job).await.unwrap();
+        db.update_sandbox_job_mode(alice_job.id, "external:harness")
+            .await
+            .unwrap();
+
+        let ewm = Arc::new(ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
+        ]));
+        ewm.reserve_task(alice_job.id, "harness", "alice")
+            .await
+            .unwrap();
+        ewm.force_control_capability(alice_job.id, ControlCapability::Supported)
+            .await;
+
+        let state = build_state_ex(Some(db), None, Some(Arc::clone(&ewm)));
+        let auth = two_user_auth();
+        let app = jobs_router(state, auth);
+
+        // Bob tries to prompt alice's external job (MR !1508 review CT-5).
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/jobs/{}/prompt", alice_job.id))
+            .header("Authorization", "Bearer tok-bob")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({"content": "sneaky"})).unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "bob should not be able to prompt alice's external job"
+        );
+
+        // The rejection consumed no control-channel sequence number: alice's
+        // own next prompt is still seq=1.
+        let seq = ewm
+            .send_prompt(alice_job.id, "alice", "legitimate", false)
+            .await
+            .unwrap();
+        assert_eq!(seq, 1);
+    }
+
+    #[tokio::test]
+    async fn test_jobs_prompt_external_without_capability_is_explicit_400() {
+        use crate::config::ExternalWorkerConfig;
+        use crate::orchestrator::ExternalWorkerManager;
+        use crate::orchestrator::external_worker::ControlCapability;
+
+        let (db, _dir) = test_db().await;
+
+        let mut alice_job = make_sandbox_job("alice", "external unsupported");
+        alice_job.status = "running".to_string();
+        alice_job.success = None;
+        alice_job.completed_at = None;
+        db.save_sandbox_job(&alice_job).await.unwrap();
+        db.update_sandbox_job_mode(alice_job.id, "external:harness")
+            .await
+            .unwrap();
+
+        let ewm = Arc::new(ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
+        ]));
+        ewm.reserve_task(alice_job.id, "harness", "alice")
+            .await
+            .unwrap();
+        // Worker completed its handshake WITHOUT the task_prompt capability.
+        ewm.force_control_capability(alice_job.id, ControlCapability::Unsupported)
+            .await;
+
+        let state = build_state_ex(Some(db), None, Some(ewm));
+        let auth = two_user_auth();
+        let app = jobs_router(state, auth);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/jobs/{}/prompt", alice_job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({"content": "status?"})).unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unsupported worker must produce an explicit 400, not a false queued"
+        );
     }
 
     #[tokio::test]

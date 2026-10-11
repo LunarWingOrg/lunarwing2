@@ -192,11 +192,18 @@ pub async fn jobs_detail_handler(
 
             let mode = store.get_sandbox_job_mode(job.id).await.ok().flatten();
             // WI#328: running external worker jobs are promptable via the
-            // runtime control channel; other sandbox modes remain
-            // non-promptable from the web UI.
+            // runtime control channel only when the worker actually
+            // advertised the `task_prompt` capability (MR !1508 review CT-1);
+            // other sandbox modes remain non-promptable from the web UI.
             let can_prompt = job.status == "running"
                 && mode.as_deref().is_some_and(|m| m.starts_with("external:"))
-                && state.external_worker_manager.is_some();
+                && match state.external_worker_manager.as_ref() {
+                    Some(ewm) => matches!(
+                        ewm.control_capability(job.id).await,
+                        Some(crate::orchestrator::external_worker::ControlCapability::Supported)
+                    ),
+                    None => false,
+                };
 
             return Ok(Json(JobDetailResponse {
                 id: job.id,
@@ -635,8 +642,11 @@ pub async fn jobs_prompt_handler(
         }
 
         // External worker jobs accept follow-up prompts over the runtime
-        // control channel (WI#328) — delivered as `task_prompt` between
-        // worker turns, no mid-call injection.
+        // control channel (WI#328) — delivered as `task_prompt` frames the
+        // worker holds until its current turn ends. Validation errors are
+        // client errors (400), a full queue is transient (429), and a worker
+        // that never advertised the capability is an explicit 400 rather than
+        // a false "queued" (MR !1508 review CT-1/CT-4/CT-6).
         let mode = s
             .get_sandbox_job_mode(job_id)
             .await
@@ -649,7 +659,21 @@ pub async fn jobs_prompt_handler(
             let seq = manager
                 .send_prompt(job_id, &user.user_id, &content, done)
                 .await
-                .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+                .map_err(|e| {
+                    use crate::error::OrchestratorError;
+                    match &e {
+                        OrchestratorError::ExternalWorkerInvalidControlPrompt { .. } => {
+                            (StatusCode::BAD_REQUEST, e.to_string())
+                        }
+                        OrchestratorError::ExternalWorkerControlUnsupported { .. } => {
+                            (StatusCode::BAD_REQUEST, e.to_string())
+                        }
+                        OrchestratorError::ExternalWorkerControlQueueFull { .. } => {
+                            (StatusCode::TOO_MANY_REQUESTS, e.to_string())
+                        }
+                        _ => (StatusCode::CONFLICT, e.to_string()),
+                    }
+                })?;
             return Ok(Json(serde_json::json!({
                 "status": "queued",
                 "job_id": job_id.to_string(),

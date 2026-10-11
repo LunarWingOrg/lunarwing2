@@ -49,7 +49,7 @@ use lunarwing::context::{ContextManager, JobContext, JobState};
 use lunarwing::error::OrchestratorError;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
-    ConversationMessage, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
+    ConversationMessage, ControlCapability, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
 };
 use lunarwing::tools::Tool;
 use lunarwing::tools::builtin::CreateJobTool;
@@ -107,9 +107,27 @@ enum MockBehavior {
         progress: Vec<String>,
         result_output: String,
     },
+    /// WI#328: worker that advertises the `task_prompt` capability. Captures
+    /// the `task_request`, then holds the task open until a `task_prompt`
+    /// arrives, acks it (`task_prompt_ack`), and finishes successfully. Every
+    /// inbound envelope is forwarded to `messages` so the test can observe
+    /// what the worker saw and in what order.
+    ControlChannel {
+        messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    },
     /// Complete the WebSocket upgrade but close without sending `ready`
     /// (drives a protocol error).
     CloseBeforeReady,
+}
+
+impl MockBehavior {
+    /// Capabilities advertised in the mock's `ready` payload (WI#328).
+    fn capabilities(&self) -> Vec<&'static str> {
+        match self {
+            MockBehavior::ControlChannel { .. } => vec!["task_prompt"],
+            _ => vec![],
+        }
+    }
 }
 
 /// Which subprotocol names the mock worker accepts, simulating current and
@@ -294,10 +312,15 @@ async fn handle_connection(
         return;
     }
 
-    // Send `ready`.
+    // Send `ready`, advertising any scripted capabilities (WI#328).
     let ready = envelope(
         "ready",
-        serde_json::json!({ "worker_id": "mock-1", "version": "test", "mode": "job" }),
+        serde_json::json!({
+            "worker_id": "mock-1",
+            "version": "test",
+            "mode": "job",
+            "capabilities": behavior.capabilities(),
+        }),
     );
     if ws.send(Message::Text(ready.into())).await.is_err() {
         return;
@@ -495,6 +518,62 @@ async fn handle_connection(
                 return; // timed-out tasks are not pooled
             }
             MockBehavior::CloseBeforeReady => unreachable!("handled above"),
+            MockBehavior::ControlChannel { ref messages } => {
+                // WI#328 shape: capture the task_request, then hold the task
+                // open until the daemon's control frame arrives; ack it and
+                // finish. The read loop stays live, so `task_prompt` arrives
+                // mid-task exactly as it would for a real capable worker.
+                let _ = messages.send(req_envelope.clone());
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let Ok(msg_env) = serde_json::from_str::<serde_json::Value>(text) else {
+                        continue;
+                    };
+                    let msg_type = msg_env.get("type").and_then(|value| value.as_str());
+                    if msg_type == Some("ping") {
+                        let pong = envelope("pong", serde_json::json!({}));
+                        if ws.send(Message::Text(pong.into())).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let _ = messages.send(msg_env.clone());
+                    if msg_type != Some("task_prompt") {
+                        continue;
+                    }
+                    let task_id = msg_env["payload"]["task_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let seq = msg_env["payload"]["seq"].as_u64().unwrap_or(0);
+                    let ack = envelope(
+                        "task_prompt_ack",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "seq": seq,
+                            "accepted": true,
+                        }),
+                    );
+                    if ws.send(Message::Text(ack.into())).await.is_err() {
+                        return;
+                    }
+                    let r = envelope(
+                        "task_result",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "status": "success",
+                            "output": "done after follow-up prompt",
+                            "error": null,
+                            "duration_ms": 5,
+                        }),
+                    );
+                    let _ = ws.send(Message::Text(r.into())).await;
+                    break;
+                }
+                // Loop: the connection may be pooled and reused.
+            }
         }
     }
 }
@@ -1536,7 +1615,7 @@ async fn cancellation_before_dispatch_is_preserved() {
     let mgr = ExternalWorkerManager::new(vec![config_for(&url)]);
     let job_id = Uuid::new_v4();
 
-    mgr.reserve_task(job_id, "mock")
+    mgr.reserve_task(job_id, "mock", "user")
         .await
         .expect("reserve task");
     assert!(mgr.cancel_task(job_id).await);
@@ -1853,4 +1932,163 @@ async fn auth_wrong_token_rejected() {
         !reason.contains("ironclaw-agent-v1"),
         "auth rejection must not carry the worker-upgrade hint (see !893 follow-up): {reason}"
     );
+}
+
+// ── WI#328 runtime control channel ───────────────────────────────────
+
+#[tokio::test]
+async fn control_channel_delivers_prompt_and_records_ack() {
+    // End-to-end over the real WS path: a worker advertising `task_prompt`
+    // receives the follow-up envelope while the task is running, acks it, and
+    // the daemon records delivery + ack and completes the task normally.
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ControlChannel {
+        messages: message_tx,
+    })
+    .await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
+    let job_id = Uuid::new_v4();
+    mgr.reserve_task(job_id, "mock", "user")
+        .await
+        .expect("reserve task");
+
+    let mgr_c = Arc::clone(&mgr);
+    let task = tokio::spawn(async move {
+        mgr_c
+            .execute_task(
+                job_id,
+                "mock",
+                "do the thing",
+                Some(10_000),
+                true,
+                TaskContext::default(),
+            )
+            .await
+    });
+
+    // The capability is published once the handshake completes; polling beats
+    // sleeping a fixed guess.
+    let mut attempts = 0;
+    loop {
+        if matches!(
+            mgr.control_capability(job_id).await,
+            Some(ControlCapability::Supported)
+        ) {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 1000, "capability handshake never completed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let seq = mgr
+        .send_prompt(job_id, "user", "wrap up and report", true)
+        .await
+        .expect("send_prompt");
+    assert_eq!(seq, 1);
+
+    let res = timeout(TEST_BOUND, task)
+        .await
+        .expect("test timed out")
+        .expect("task panicked")
+        .expect("execute_task errored")
+        .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    // The worker saw the task_request, then the task_prompt with the exact
+    // envelope fields the WI specifies.
+    let first = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("task_request timed out")
+        .expect("channel closed");
+    assert_eq!(first["type"], "task_request");
+    let second = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("task_prompt timed out")
+        .expect("channel closed");
+    assert_eq!(second["type"], "task_prompt");
+    assert_eq!(second["payload"]["task_id"], job_id.to_string());
+    assert_eq!(second["payload"]["seq"], 1);
+    assert_eq!(second["payload"]["prompt"], "wrap up and report");
+    assert_eq!(second["payload"]["done"], true);
+
+    // After the task ends, the queue is closed and late senders are rejected.
+    let err = mgr
+        .send_prompt(job_id, "user", "too late", false)
+        .await
+        .expect_err("post-completion prompt must fail");
+    assert!(
+        matches!(err, OrchestratorError::ExternalWorkerTaskNotActive { .. }),
+        "expected TaskNotActive, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn control_channel_rejects_prompt_when_worker_lacks_capability() {
+    // CT-1: a worker that never advertises `task_prompt` (every pre-WI#328
+    // worker) gets the explicit rejection — never a false "queued".
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::WaitForCancel {
+        messages: message_tx,
+    })
+    .await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
+    let job_id = Uuid::new_v4();
+    mgr.reserve_task(job_id, "mock", "user")
+        .await
+        .expect("reserve task");
+
+    let mgr_c = Arc::clone(&mgr);
+    let task = tokio::spawn(async move {
+        mgr_c
+            .execute_task(job_id, "mock", "task", Some(10_000), true, TaskContext::default())
+            .await
+    });
+
+    let mut attempts = 0;
+    loop {
+        if matches!(
+            mgr.control_capability(job_id).await,
+            Some(ControlCapability::Unsupported)
+        ) {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 1000, "capability handshake never completed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let err = mgr
+        .send_prompt(job_id, "user", "hello?", false)
+        .await
+        .expect_err("unsupported worker must reject");
+    assert!(
+        matches!(
+            err,
+            OrchestratorError::ExternalWorkerControlUnsupported { .. }
+        ),
+        "expected ControlUnsupported, got: {err}"
+    );
+
+    // The worker saw nothing after its task_request — no task_prompt frame
+    // was ever pushed (WaitForCancel forwards every post-request envelope).
+    assert!(
+        message_rx.try_recv().is_err(),
+        "no task_prompt may be sent to an unsupported worker"
+    );
+
+    // Clean up the still-running task.
+    assert!(mgr.cancel_task(job_id).await);
+    let res = timeout(TEST_BOUND, task)
+        .await
+        .expect("test timed out")
+        .expect("task panicked")
+        .expect("execute_task errored")
+        .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Cancelled);
+    let cancel = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("cancel envelope timed out")
+        .expect("channel closed");
+    assert_eq!(cancel["type"], "cancel");
 }
