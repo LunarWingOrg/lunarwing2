@@ -4,6 +4,7 @@
 //! External workers are persistent containers (Pebble, OpenCode, Kimi Code, etc.) that the
 //! orchestrator connects to on demand rather than creating per-job.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -205,13 +206,17 @@ struct TaskResultPayload {
     duration_ms: u64,
 }
 
-/// Zero-allocation probe of an inbound frame's `type` field, borrowed from
-/// the raw text (MR !1521 DD-5): lets the read loop reject an oversized
-/// `tool_call` frame BEFORE its payload is parsed into a heap `Value`.
+/// Probe of an inbound frame's `type` field (MR !1521 DD-5): lets the read
+/// loop reject an oversized `tool_call` frame BEFORE its payload is parsed
+/// into a heap `Value`. `Cow` rather than `&str` (MR !1533 DP-1): serde_json
+/// cannot borrow a string containing a JSON escape from the raw text, so a
+/// borrowed probe misclassifies a frame whose type is spelled with an escape
+/// (`"tool_call"`) and lets it fall through to the full `Envelope` parse.
+/// With `Cow` the escaped spelling still classifies.
 #[derive(Deserialize)]
 struct TypeProbe<'a> {
-    #[serde(rename = "type")]
-    msg_type: &'a str,
+    #[serde(rename = "type", borrow)]
+    msg_type: Cow<'a, str>,
 }
 
 /// Optional `tool_list` payload (MR !1521 DD-10): when the worker sends a
@@ -967,6 +972,15 @@ type WsRead = futures::stream::SplitStream<WsStream>;
 
 const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Socket-level bound on any single inbound WS message from a worker
+/// (MR !1533 DP-1): the read loop's 256 KiB `tool_call` probe runs on text
+/// tungstenite has already fully assembled, so without this cap a frame up
+/// to the tungstenite default (64 MiB) is materialized before any check
+/// runs. 1 MiB leaves ample room for legitimate `task_result` outputs while
+/// bounding per-frame allocation; an oversized frame surfaces as a protocol
+/// error that fails the job (fail-loud, never silently truncated).
+const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
+
 /// How long the daemon waits for a worker's terminal frame (`task_result` for
 /// the cancelled job) or socket close after sending a `cancel` envelope before
 /// tearing the connection down (WI#149). Workers that received the WI#101
@@ -1157,9 +1171,11 @@ async fn connect_and_handshake(
             })?;
 
     let connect_timeout = Duration::from_secs(15);
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES));
     let (ws_stream, _response) = tokio::time::timeout(
         connect_timeout,
-        tokio_tungstenite::connect_async(ws_request),
+        tokio_tungstenite::connect_async_with_config(ws_request, Some(ws_config), false),
     )
     .await
     .map_err(|_| OrchestratorError::ExternalWorkerConnectionFailed {
@@ -1366,14 +1382,20 @@ async fn run_external_task(
 
                     // MR !1521 DD-5: an oversized `tool_call` frame is
                     // rejected BEFORE its payload is parsed into a heap
-                    // `Value` (the probe borrows from `text`; no
-                    // allocation), and every tool_call-typed frame —
+                    // `Value` when the probe can read the frame's `type`
+                    // (`Cow` so an escaped `"type"` string still
+                    // classifies, MR !1533 DP-1), and every
+                    // tool_call-typed frame —
                     // accepted or rejected — counts toward the per-job cap
                     // so rejected-frame floods are bounded too. Rejection
                     // rows stop at the cap so a flood cannot spam
                     // job_events. Oversized frames of other types (a
                     // legitimate large task_result/progress payload) are
-                    // unaffected.
+                    // unaffected. Two further layers bound what the probe
+                    // cannot see: the socket-level `max_message_size`
+                    // (frame never materializes) and the in-arm size
+                    // re-check below (a classified-elsewhere oversized
+                    // frame never dispatches).
                     if text.len() > MAX_TOOL_CALL_FRAME_BYTES
                         && matches!(
                             serde_json::from_str::<TypeProbe<'_>>(text),
@@ -1526,10 +1548,35 @@ async fn run_external_task(
                             // MR !1521 DD-5: every tool_call-typed frame
                             // counts toward the per-job cap, accepted or not;
                             // rejection rows stop once the cap is crossed (one
-                            // marker row is kept). Oversized frames were
-                            // already rejected pre-parse above.
+                            // marker row is kept).
                             tool_calls_used += 1;
-                            let reply = match serde_json::from_value::<ToolCallPayload>(env.payload)
+                            // MR !1533 DP-1: belt-and-braces size re-check.
+                            // The pre-parse probe above rejects oversized
+                            // frames it can classify, and the socket cap
+                            // bounds what arrives at all — but once the
+                            // `Envelope` parse ran, a >256 KiB frame must
+                            // still never proceed to audit/persist/dispatch.
+                            let reply = if text.len() > MAX_TOOL_CALL_FRAME_BYTES {
+                                if tool_calls_used <= MAX_TOOL_CALLS_PER_JOB {
+                                    record_tool_result(
+                                        store,
+                                        job_id,
+                                        "unknown",
+                                        false,
+                                        "tool_call frame rejected: too large",
+                                    )
+                                    .await;
+                                }
+                                tool_result_envelope(
+                                    "",
+                                    "error",
+                                    String::new(),
+                                    Some(format!(
+                                        "tool_call frame exceeds {MAX_TOOL_CALL_FRAME_BYTES} bytes"
+                                    )),
+                                )
+                            } else {
+                            match serde_json::from_value::<ToolCallPayload>(env.payload)
                             {
                                 Ok(call) if tool_calls_used > MAX_TOOL_CALLS_PER_JOB => {
                                     if tool_calls_used == MAX_TOOL_CALLS_PER_JOB + 1 {
@@ -1594,6 +1641,7 @@ async fn run_external_task(
                                         Some(format!("malformed tool_call frame: {e}")),
                                     )
                                 }
+                            }
                             };
                             send_reply_envelope(&mut write, &reply, worker_name).await;
                         }
