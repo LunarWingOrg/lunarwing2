@@ -1953,7 +1953,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_harness_job_skips_write_back_promotion() {        // CW-7: promotion is a success-only path; failed jobs keep their
+    async fn failed_harness_job_skips_write_back_promotion() {
+        // CW-7: promotion is a success-only path; failed jobs keep their
         // staging out of tenant memory and record the skip.
         let mgr = ContainerJobManager::new(ContainerJobConfig::default(), TokenStore::new());
         let job_id = Uuid::new_v4();
@@ -2058,8 +2059,7 @@ mod tests {
                 "sh".to_string(),
                 "-c".to_string(),
                 // Write as uid 1000, then prove ownership is uid 1000.
-                "touch /run/secrets/OK && test \"$(stat -c %u /run/secrets)\" = 1000"
-                    .to_string(),
+                "touch /run/secrets/OK && test \"$(stat -c %u /run/secrets)\" = 1000".to_string(),
             ]),
             user: Some("1000:1000".to_string()),
             host_config: Some(bollard::models::HostConfig {
