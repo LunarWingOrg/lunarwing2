@@ -783,20 +783,163 @@ fn sweep_harness_dirs_in(
     removed
 }
 
-/// Value-level redactor for worker-mounted secrets (CV-7).
+/// Value-level redactor for worker-mounted secrets (CV-7, DG-2).
 ///
-/// Built from the job's resolved secret values; scrubs the exact value, its
-/// base64 encoding, and its URL-encoded form from job events before they are
-/// persisted or broadcast, and reused by the promotion pipeline to reject
-/// staged files that embed a mounted secret (CW-10).
-#[derive(Debug, Clone, Default)]
+/// Built from the job's resolved secret values; scrubs every known encoding
+/// of a value from job events and completion output before they are persisted
+/// or broadcast, and reused by the promotion pipeline to reject staged files
+/// that embed a mounted secret (CW-10).
+///
+/// Variant coverage per value: the raw text; each line of a multi-line value
+/// (PEM / service-account JSON); the JSON-escaped form; the URL-encoded form;
+/// lowercase hex; base64 in the standard and URL-safe alphabets (padded and
+/// unpadded); the 76-column wrapped form the `base64` CLI emits by default;
+/// and the stream-stable base64 cores for a value encoded at byte offsets 1
+/// and 2 inside a larger blob (the `Authorization: Basic` shape).
+///
+/// Redaction is BEST-EFFORT, not a security boundary: a sub-agent that
+/// deliberately slices a value (e.g. `cut -c1-32` over several calls, or an
+/// encoding not covered above) can smuggle partials past any string matcher.
+/// The real control is the `Always` approval tier on harness secret mounts —
+/// redaction limits accidental exposure of whole values.
+///
+/// Variants are held as [`SecretString`] so they zeroize on drop (CV-10);
+/// `Debug` deliberately prints no variant material.
+#[derive(Clone, Default)]
 pub struct SecretValueRedactor {
-    variants: Vec<String>,
+    variants: Vec<SecretString>,
+    /// Longest variant length in bytes; bounds the truncation-cut scan.
+    max_variant_bytes: usize,
+}
+
+impl std::fmt::Debug for SecretValueRedactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretValueRedactor")
+            .field("armed_variants", &self.variants.len())
+            .finish()
+    }
+}
+
+/// Column width of the default (wrapped) output of the `base64` CLI.
+const BASE64_CLI_WRAP_COLS: usize = 76;
+
+/// Insert a variant when it is long enough and not already present. Dedup
+/// hashes only — plaintext copies live solely in `variants`.
+fn push_variant(
+    variants: &mut Vec<SecretString>,
+    seen: &mut std::collections::HashSet<u64>,
+    value: String,
+) {
+    use std::hash::{Hash, Hasher};
+    if value.len() < MIN_REDACTED_SECRET_BYTES {
+        return;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    if seen.insert(hasher.finish()) {
+        variants.push(SecretString::from(value));
+    }
+}
+
+/// Insert a base64 encoding in padded, unpadded, and (when long enough to
+/// wrap) 76-column wrapped form, plus the stream-stable core with the final
+/// quantum dropped (the last 4 chars can mix with suffix bytes when the value
+/// sits inside a larger encoded blob).
+fn push_base64_variants(
+    variants: &mut Vec<SecretString>,
+    seen: &mut std::collections::HashSet<u64>,
+    encoded: String,
+) {
+    if encoded.len() > BASE64_CLI_WRAP_COLS {
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(BASE64_CLI_WRAP_COLS)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        push_variant(variants, seen, wrapped);
+    }
+    if encoded.len() >= MIN_REDACTED_SECRET_BYTES + 4 {
+        let core = encoded[..encoded.len() - 4].to_string();
+        push_variant(variants, seen, core);
+    }
+    let unpadded = encoded.trim_end_matches('=').to_string();
+    if unpadded != encoded {
+        push_variant(variants, seen, unpadded);
+    }
+    push_variant(variants, seen, encoded);
+}
+
+/// Every known encoding of one secret value (DG-2).
+fn secret_variants(raw: &str) -> Vec<SecretString> {
+    use base64::Engine;
+    use secrecy::ExposeSecret;
+    let mut variants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    push_variant(&mut variants, &mut seen, raw.to_string());
+    // Multi-line values (PEM keys, service-account JSON) also leak one line
+    // at a time.
+    for line in raw.lines() {
+        push_variant(&mut variants, &mut seen, line.to_string());
+        let trimmed = line.trim();
+        if trimmed != line {
+            push_variant(&mut variants, &mut seen, trimmed.to_string());
+        }
+    }
+    // The form the value takes inside a JSON string literal.
+    if let Ok(json_quoted) = serde_json::to_string(raw) {
+        let escaped = json_quoted
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(json_quoted.as_str())
+            .to_string();
+        push_variant(&mut variants, &mut seen, escaped);
+    }
+    push_variant(
+        &mut variants,
+        &mut seen,
+        urlencoding::encode(raw).into_owned(),
+    );
+    // `xxd -p` / hex dumps.
+    let mut hex = String::with_capacity(raw.len() * 2);
+    for byte in raw.as_bytes() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    push_variant(&mut variants, &mut seen, hex);
+
+    // Base64: standard + URL-safe alphabets, and the stream-stable cores for
+    // a value encoded inside a larger blob at byte offset 0, 1, or 2. Offset
+    // o leaves b64(raw[a..]) stable from its second quantum on, with
+    // a = (3 - o) % 3 — so offsets 1 and 2 need the raw[2..] / raw[1..]
+    // encodings (their final quantum is dropped inside push_base64_variants).
+    let bytes = raw.as_bytes();
+    for start in [0usize, 1, 2] {
+        if start >= bytes.len() {
+            continue;
+        }
+        let slice = &bytes[start..];
+        push_base64_variants(
+            &mut variants,
+            &mut seen,
+            base64::engine::general_purpose::STANDARD.encode(slice),
+        );
+        if start == 0 {
+            push_base64_variants(
+                &mut variants,
+                &mut seen,
+                base64::engine::general_purpose::URL_SAFE.encode(slice),
+            );
+        }
+    }
+
+    // Longest first so overlapping values redact fully.
+    variants.sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
+    variants
 }
 
 impl SecretValueRedactor {
     pub fn new(values: &[SecretString]) -> Self {
-        use base64::Engine;
         use secrecy::ExposeSecret;
         let mut variants = Vec::new();
         for value in values {
@@ -804,36 +947,107 @@ impl SecretValueRedactor {
             if raw.len() < MIN_REDACTED_SECRET_BYTES {
                 continue;
             }
-            variants.push(raw.to_string());
-            variants.push(base64::engine::general_purpose::STANDARD.encode(raw));
-            variants.push(urlencoding::encode(raw).into_owned());
+            variants.extend(secret_variants(raw));
         }
-        variants.sort_by_key(String::len);
-        variants.reverse(); // longest first so overlapping values redact fully
-        Self { variants }
+        let max_variant_bytes = variants
+            .iter()
+            .map(|v| v.expose_secret().len())
+            .max()
+            .unwrap_or(0);
+        Self {
+            variants,
+            max_variant_bytes,
+        }
+    }
+
+    /// Add one more value to an existing redactor (e.g. the worker bearer
+    /// token, which is readable by job children via /proc/1/environ — DG-7).
+    pub fn add_value(&mut self, value: &str) {
+        use secrecy::ExposeSecret;
+        if value.len() < MIN_REDACTED_SECRET_BYTES {
+            return;
+        }
+        self.variants.extend(secret_variants(value));
+        self.variants
+            .sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
+        self.max_variant_bytes = self
+            .variants
+            .iter()
+            .map(|v| v.expose_secret().len())
+            .max()
+            .unwrap_or(0);
     }
 
     pub fn is_armed(&self) -> bool {
         !self.variants.is_empty()
     }
 
-    /// True when `text` contains any mounted secret value (exact, base64, or
-    /// URL-encoded).
+    /// True when `text` contains any mounted secret value in a known encoding.
     pub fn contains_secret(&self, text: &str) -> bool {
-        self.variants.iter().any(|v| text.contains(v))
+        use secrecy::ExposeSecret;
+        self.variants
+            .iter()
+            .any(|v| text.contains(v.expose_secret()))
     }
 
     pub fn scrub(&self, text: &str) -> String {
+        use secrecy::ExposeSecret;
         let mut out = text.to_string();
         for variant in &self.variants {
+            let variant = variant.expose_secret();
             if out.contains(variant) {
-                out = out.replace(variant.as_str(), "[redacted-secret]");
+                out = out.replace(variant, "[redacted-secret]");
             }
         }
         out
     }
 
-    /// Recursively scrub every string in a JSON value in place.
+    /// Scrub first, THEN truncate (DG-2): the daemon never sees text the
+    /// redactor has not scanned. When the cut lands on a value that was
+    /// already truncated upstream, the trailing partial prefix (≥
+    /// [`MIN_REDACTED_SECRET_BYTES`] bytes) is redacted as well.
+    pub fn scrub_and_truncate(&self, text: &str, max: usize) -> String {
+        let scrubbed = self.scrub(text);
+        if scrubbed.len() <= max {
+            return scrubbed;
+        }
+        let end = crate::util::floor_char_boundary(&scrubbed, max);
+        let mut cut = scrubbed[..end].to_string();
+        self.redact_partial_tail(&mut cut);
+        cut.push_str("...");
+        cut
+    }
+
+    /// Replace the longest suffix of `text` that is a proper prefix (≥
+    /// [`MIN_REDACTED_SECRET_BYTES`] bytes) of any variant.
+    fn redact_partial_tail(&self, text: &mut String) {
+        use secrecy::ExposeSecret;
+        if self.max_variant_bytes < MIN_REDACTED_SECRET_BYTES + 1 {
+            return;
+        }
+        let tail_bytes = text.as_bytes();
+        let mut best = 0usize;
+        for variant in &self.variants {
+            let variant = variant.expose_secret().as_bytes();
+            let upper = (variant.len() - 1).min(tail_bytes.len());
+            let mut k = upper;
+            while k >= MIN_REDACTED_SECRET_BYTES {
+                if tail_bytes.ends_with(&variant[..k]) {
+                    best = best.max(k);
+                    break;
+                }
+                k -= 1;
+            }
+        }
+        if best > 0 {
+            let keep = crate::util::floor_char_boundary(text, text.len() - best);
+            text.truncate(keep);
+            text.push_str("[redacted-secret]");
+        }
+    }
+
+    /// Recursively scrub every string in a JSON value in place, including
+    /// object keys (DG-2: a secret used as a JSON key must not survive).
     pub fn scrub_json(&self, value: &mut serde_json::Value) {
         if !self.is_armed() {
             return;
@@ -848,9 +1062,14 @@ impl SecretValueRedactor {
                 }
             }
             serde_json::Value::Object(map) => {
-                for v in map.values_mut() {
-                    self.scrub_json(v);
-                }
+                let entries: Vec<(String, serde_json::Value)> = std::mem::take(map)
+                    .into_iter()
+                    .map(|(key, mut v)| {
+                        self.scrub_json(&mut v);
+                        (self.scrub(&key), v)
+                    })
+                    .collect();
+                *map = entries.into_iter().collect();
             }
             _ => {}
         }
@@ -1775,6 +1994,113 @@ mod tests {
         let text = event.to_string();
         assert!(!text.contains("tok_1234567890abcdef"));
         assert_eq!(event["count"], 3);
+    }
+
+    #[test]
+    fn redactor_scrubs_json_object_keys() {
+        // DG-2: a secret used as a JSON KEY must not survive scrubbing.
+        let values = vec![SecretString::from("tok_1234567890abcdef".to_string())];
+        let redactor = SecretValueRedactor::new(&values);
+        let mut event = serde_json::json!({ "tok_1234567890abcdef": "value" });
+        redactor.scrub_json(&mut event);
+        let text = event.to_string();
+        assert!(!text.contains("tok_1234567890abcdef"));
+        assert!(text.contains("[redacted-secret]"));
+    }
+
+    #[test]
+    fn redactor_scrubs_wrapped_offset_urlsafe_hex_and_json_escaped() {
+        // DG-2: the encodings a job can produce from a mounted secret.
+        use base64::Engine;
+        // 60 bytes: long enough for the 76-column base64 wrap to kick in.
+        let value = "harness-fixture-value-with-enough-length-to-wrap-nicely-0";
+        let values = vec![SecretString::from(value.to_string())];
+        let redactor = SecretValueRedactor::new(&values);
+
+        // base64 CLI default output wraps at 76 columns.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(value);
+        let wrapped = b64
+            .as_bytes()
+            .chunks(76)
+            .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Offset base64: `curl -u user:$(cat T)` encodes "user:<value>".
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{value}"));
+        // URL-safe base64 and hex (`xxd -p`).
+        let urlsafe = base64::engine::general_purpose::URL_SAFE.encode(value);
+        let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
+        // JSON-escaped (value contains a quote as it appears in tool_use.input).
+        let quoted_value = "harness-fixture-\"quoted\"-value";
+        let quoted_redactor =
+            SecretValueRedactor::new(&[SecretString::from(quoted_value.to_string())]);
+        let json_escaped = serde_json::to_string(quoted_value).unwrap(); // safety: test
+        let json_escaped = json_escaped
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap() // safety: test
+            .to_string();
+
+        for variant in [wrapped, basic, urlsafe, hex] {
+            let scrubbed = redactor.scrub(&format!("prefix {variant} suffix"));
+            assert!(
+                !scrubbed.contains(&variant),
+                "variant must be scrubbed: {variant}"
+            );
+        }
+        let scrubbed = quoted_redactor.scrub(&format!("prefix {json_escaped} suffix"));
+        assert!(!scrubbed.contains(&json_escaped));
+    }
+
+    #[test]
+    fn redactor_scrubs_each_line_of_multiline_values() {
+        let value = "-----BEGIN FIXTURE-----\nline-one-fixture-material\nline-two-fixture-material\n-----END FIXTURE-----";
+        let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
+        for line in [
+            "line-one-fixture-material",
+            "line-two-fixture-material",
+        ] {
+            let scrubbed = redactor.scrub(&format!("leaked {line} here"));
+            assert!(!scrubbed.contains(line), "line must be scrubbed");
+        }
+    }
+
+    #[test]
+    fn scrub_and_truncate_redacts_before_and_at_the_cut() {
+        // DG-2: scrubbing runs BEFORE truncation, so a value that straddles
+        // the cut is already gone; a value truncated by an upstream step is
+        // caught by the trailing partial-prefix redaction.
+        let value = "harness-fixture-truncation-value";
+        let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
+
+        // Value straddling the cut: scrubbed out before truncation (the cut
+        // may slice the marker itself — what matters is the value is gone).
+        let text = format!("{}{}", "x".repeat(100), value);
+        let out = redactor.scrub_and_truncate(&text, 110);
+        assert!(!out.contains(value));
+        assert!(!out.contains(&value[..20]));
+        // Marker fully inside the limit survives whole.
+        let text = format!("{}{}{}", "x".repeat(50), value, "y".repeat(100));
+        let out = redactor.scrub_and_truncate(&text, 80);
+        assert!(out.contains("[redacted-secret]"));
+
+        // Value already truncated upstream (partial prefix at the cut). The
+        // text must exceed the limit so the cut slices the partial value.
+        let partial = &value[..20];
+        let text = format!("{}{}", "y".repeat(80), partial);
+        let out = redactor.scrub_and_truncate(&text, 95);
+        assert!(!out.contains(partial));
+        assert!(out.ends_with("[redacted-secret]..."));
+
+        // Short tails (< MIN_REDACTED_SECRET_BYTES) are left alone.
+        let tiny = &value[..6];
+        let text = format!("{}{}", "z".repeat(80), tiny);
+        let out = redactor.scrub_and_truncate(&text, 100);
+        assert!(out.contains(tiny));
+
+        // Under the limit: returned unchanged apart from scrubbing.
+        let out = redactor.scrub_and_truncate("clean", 100);
+        assert_eq!(out, "clean");
     }
 
     #[test]
