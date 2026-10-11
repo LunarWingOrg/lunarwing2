@@ -3,7 +3,6 @@
 ## Official LunarWing2 Roadmap:
 | Feature | Target |
 |---------|--------|
-| Alpha Release of Desktop/Mobile companion applications for LunarWing | v2.1.6.0 |
 | LunarVision Polish | v2.1.7.0 |
 | Further Podman Sandbox refinements, improvements, and proper tunnel networking support | v2.1.8.0 |
 | Part two of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.1.8.0 |
