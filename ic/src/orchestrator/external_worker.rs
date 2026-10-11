@@ -3362,6 +3362,9 @@ mod tests {
         // MR !1506 review (CQ-1): denylisted names can never pass the
         // execution gates, wildcards are not honored, and non-identifier
         // entries are useless — all are dropped at manager load.
+        // MR !1533 DP-2/DP-5: proxy-denylisted host tools ("shell",
+        // "read_file") and names outside the phase-1 capability set ("echo")
+        // are dropped too.
         let raw: Vec<String> = vec![
             "memory_read".to_string(),
             "*".to_string(),
@@ -3370,9 +3373,60 @@ mod tests {
             "secret_list".to_string(),
             "not a tool".to_string(),
             "line\nbreak".to_string(),
+            "shell".to_string(),
+            "read_file".to_string(),
+            "echo".to_string(),
         ];
         let sanitized = sanitize_tool_allowlist("w", &raw, false);
         assert_eq!(sanitized, vec!["memory_read".to_string()]);
+    }
+
+    #[test]
+    fn proxy_capability_set_is_positive_and_complete() {
+        // MR !1533 DP-2/DP-5: the proxy surface is the positive WI#324
+        // phase-1 set. Host execution/read tools, host stores, HTTP, the
+        // messaging/job planes, unlisted-but-harmless tools, and mission
+        // writes are all denied even if an operator lists them.
+        for name in [
+            "memory_read",
+            "memory_write",
+            "knowledge_search",
+            "knowledge_submit_note",
+            "knowledge_get_topic",
+            "gitlab_tool",
+            "mission_status",
+            "mission_history",
+            "mission_list",
+        ] {
+            assert!(is_proxy_callable(name), "{name} must be proxy-callable");
+        }
+        for name in [
+            "shell",
+            "read_file",
+            "write_file",
+            "list_dir",
+            "apply_patch",
+            "attachment_store",
+            "http",
+            "message",
+            "cancel_job",
+            "job_events",
+            "job_status",
+            "list_jobs",
+            // Unlisted-but-harmless names are still outside the phase-1 set.
+            "echo",
+            "time",
+            "memory_search",
+            // Mission writes stay out while #311/#317 are open.
+            "mission_create",
+            "mission_fire",
+            "mission_delete",
+        ] {
+            assert!(
+                !is_proxy_callable(name),
+                "{name} must not be proxy-callable"
+            );
+        }
     }
 
     #[test]
