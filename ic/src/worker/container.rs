@@ -761,7 +761,7 @@ impl LoopDelegate for ContainerDelegate {
                 serde_json::json!({
                     "tool_name": tc.name,
                     "output": match &result {
-                        Ok(output) => self.secret_redactor.scrub_and_truncate(output, 2000).into(),
+                        Ok(output) => self.secret_redactor.scrub_and_truncate(output, 2000),
                         Err(e) => format!("Error: {}", self.secret_redactor.scrub_and_truncate(e, 500)),
                     },
                     "success": result.is_ok(),
