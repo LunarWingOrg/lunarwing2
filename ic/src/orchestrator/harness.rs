@@ -1996,7 +1996,10 @@ mod tests {
         // to pattern-based leak detection.
         let tmp = staging_with(&[
             ("projects/clean.md", "no secrets here"),
-            ("projects/dirty.md", "copied: harness-promotion-fixture-value"),
+            (
+                "projects/dirty.md",
+                "copied: harness-promotion-fixture-value",
+            ),
         ]);
         let values = vec![SecretString::from(
             "harness-promotion-fixture-value".to_string(),
@@ -2157,10 +2160,7 @@ mod tests {
     fn redactor_scrubs_each_line_of_multiline_values() {
         let value = "-----BEGIN FIXTURE-----\nline-one-fixture-material\nline-two-fixture-material\n-----END FIXTURE-----";
         let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
-        for line in [
-            "line-one-fixture-material",
-            "line-two-fixture-material",
-        ] {
+        for line in ["line-one-fixture-material", "line-two-fixture-material"] {
             let scrubbed = redactor.scrub(&format!("leaked {line} here"));
             assert!(!scrubbed.contains(line), "line must be scrubbed");
         }

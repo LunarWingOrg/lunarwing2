@@ -4370,7 +4370,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn harness_mode_requires_sandbox() {        let manager = Arc::new(ContextManager::new(5));
+    async fn harness_mode_requires_sandbox() {
+        let manager = Arc::new(ContextManager::new(5));
         let tool = CreateJobTool::new(manager);
         let result = tool
             .execute(

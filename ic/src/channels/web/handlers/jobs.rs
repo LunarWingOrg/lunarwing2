@@ -505,7 +505,7 @@ pub async fn jobs_restart_handler(
                 started_at: None,
                 completed_at: None,
                 credential_grants_json: grants_json,
-            job_mode: "worker".to_string(),
+                job_mode: "worker".to_string(),
             };
             store
                 .save_sandbox_job(&record)

@@ -1264,7 +1264,8 @@ impl EffectBridgeAdapter {
             // execution will use (`prepare_tool_params`), so string-typed
             // args cannot slip past capability elevation. The lease check
             // below ("Always cannot run autonomously") depends on it.
-            let normalized_parameters = crate::tools::prepare_tool_params(tool.as_ref(), &parameters);
+            let normalized_parameters =
+                crate::tools::prepare_tool_params(tool.as_ref(), &parameters);
             let requirement = tool.requires_approval(&normalized_parameters);
             if context.shared_conversation && requirement.is_required() {
                 return Err(Self::gate_paused(

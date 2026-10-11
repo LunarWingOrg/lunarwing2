@@ -2360,10 +2360,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap(); // safety: test
         let staging = tmp.path().join("workspace_out");
         std::fs::create_dir_all(&staging).unwrap(); // safety: test
-        let userns_mode = match mgr
-            .prepare_staging_bind(Uuid::new_v4(), &staging)
-            .await
-        {
+        let userns_mode = match mgr.prepare_staging_bind(Uuid::new_v4(), &staging).await {
             Ok(mode) => mode,
             Err(e) => {
                 // Podman < 5 fails closed by design.
