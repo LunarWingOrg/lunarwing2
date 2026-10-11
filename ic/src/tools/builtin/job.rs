@@ -2427,18 +2427,14 @@ mod tests {
 
     #[test]
     fn external_worker_schema_guides_direct_opencode_dispatch() {
-        use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+        use crate::config::ExternalWorkerConfig;
 
         let manager = Arc::new(ContextManager::new(5));
         let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
             name: "opencode".to_string(),
             url: "ws://127.0.0.1:20007/ws/agent".to_string(),
-            auth_token: None,
             timeout_ms: 900_000,
-            endpoints: vec![],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: Default::default(),
-            tool_allowlist: vec![],
+            ..Default::default()
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
 
@@ -2481,18 +2477,14 @@ mod tests {
 
     #[tokio::test]
     async fn named_external_worker_rejects_local_iteration_budget() {
-        use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+        use crate::config::ExternalWorkerConfig;
 
         let manager = Arc::new(ContextManager::new(5));
         let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
             name: "opencode".to_string(),
             url: "ws://127.0.0.1:9/ws/agent".to_string(),
-            auth_token: None,
             timeout_ms: 900_000,
-            endpoints: vec![],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: Default::default(),
-            tool_allowlist: vec![],
+            ..Default::default()
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
         let error = tool

@@ -3465,20 +3465,13 @@ mod tests {
                 url: "ws://localhost:9090/ws/agent".to_string(),
                 auth_token: Some(secrecy::SecretString::from("tok")),
                 timeout_ms: 300_000,
-                endpoints: vec![],
-                load_balance: LoadBalanceStrategy::default(),
-                prompt_context: Default::default(),
-                tool_allowlist: vec![],
+                ..Default::default()
             },
             ExternalWorkerConfig {
                 name: "pebble".to_string(),
                 url: "ws://localhost:8443".to_string(),
-                auth_token: None,
                 timeout_ms: 600_000,
-                endpoints: vec![],
-                load_balance: LoadBalanceStrategy::default(),
-                prompt_context: Default::default(),
-                tool_allowlist: vec![],
+                ..Default::default()
             },
         ]);
         assert!(!mgr.is_empty());
@@ -3873,7 +3866,6 @@ mod tests {
         let mgr = ExternalWorkerManager::new(vec![ExternalWorkerConfig {
             name: "multi".to_string(),
             url: "ws://fallback:9090".to_string(),
-            auth_token: None,
             timeout_ms: 300_000,
             endpoints: vec![
                 WorkerEndpoint {
@@ -3887,9 +3879,7 @@ mod tests {
                     weight: None,
                 },
             ],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: Default::default(),
-            tool_allowlist: vec![],
+            ..Default::default()
         }]);
 
         let lb = mgr.load_balancers.get("multi").unwrap();

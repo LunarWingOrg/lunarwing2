@@ -44,7 +44,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use uuid::Uuid;
 
 use lunarwing::channels::web::types::SseEvent;
-use lunarwing::config::{ExternalWorkerConfig, LoadBalanceStrategy, WorkerEndpoint};
+use lunarwing::config::{ExternalWorkerConfig, WorkerEndpoint};
 use lunarwing::context::{ContextManager, JobContext, JobState};
 #[cfg(feature = "libsql")]
 use lunarwing::db::Database;
@@ -656,16 +656,13 @@ fn config_for(url: &str) -> ExternalWorkerConfig {
     ExternalWorkerConfig {
         name: "mock".to_string(),
         url: url.to_string(),
-        auth_token: None,
         timeout_ms: 30_000,
         endpoints: vec![WorkerEndpoint {
             url: url.to_string(),
             auth_token: None,
             weight: None,
         }],
-        load_balance: LoadBalanceStrategy::RoundRobin,
-        prompt_context: Default::default(),
-        tool_allowlist: vec![],
+        ..Default::default()
     }
 }
 
@@ -682,9 +679,7 @@ fn config_for_with_auth(url: &str, token: &str) -> ExternalWorkerConfig {
             auth_token: Some(SecretString::from(token)),
             weight: None,
         }],
-        load_balance: LoadBalanceStrategy::RoundRobin,
-        prompt_context: Default::default(),
-        tool_allowlist: vec![],
+        ..Default::default()
     }
 }
 

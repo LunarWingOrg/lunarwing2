@@ -237,6 +237,24 @@ pub struct ExternalWorkerConfig {
     pub tool_allowlist: Vec<String>,
 }
 
+impl Default for ExternalWorkerConfig {
+    /// Sensible standalone defaults (used by tests and by struct-update
+    /// literals so added fields do not break every construction site).
+    /// `timeout_ms` matches the settings-layer external-worker default.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            auth_token: None,
+            timeout_ms: 3_600_000,
+            endpoints: Vec::new(),
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: PromptContextLimits::default(),
+            tool_allowlist: Vec::new(),
+        }
+    }
+}
+
 impl ExternalWorkerConfig {
     pub fn resolve_from_settings(settings: &crate::settings::Settings) -> Vec<Self> {
         settings
