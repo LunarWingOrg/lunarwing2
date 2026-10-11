@@ -29,7 +29,7 @@
     - **Remaining CI-only step:** the branch-push pipeline for `rarity/kimi-1-20261010-0601` on origin must be confirmed green; every locally executable CI job surface above ran green on this exact tree
 2. [x] (S) (H) (COME BACK TO THIS LATER) Due to MULTIPLE various security concerns, including ethics of non-self-hosted relays being added into the project, opencode 2 external worker WILL NOT BE UPDATED - A WORK ITEM HAS BEEN CREATED PROVIDING FULL EXPLANATION AS TO WHY THIS IS BEING GATED - WE WILL REVISIT THIS CONCERN AFTER THE RELEASE OF 2.1.5.0 - CHECKING THIS BOX OFF SO AGENTS STOP ATTEMPTING THIS - Update external workers - opencode2 to 2.0.26 - NEW VERSION - update from current version - refer to previous commits related to opencode2 since the lunarwing 2.1.4.0 release for details - last MR was https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1490 - see work item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/357
 
-## Phase 2 — Features & Polish (for goals referencing work items, read comments on work items as well)
+## Phase 2 — Features & Polish (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
 3. [x] audit all crates and ensure there are no security vulnerabilities - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1505
     - DONE 2026-10-10 (Rarity, item-3, branch `sweetiebot/kimi-3-20261010-1807`) as **risk-acceptance audit, not a clean bill** — per the MR !1505 review (CP-1) this item must not read as "zero vulnerabilities": 6 vulnerability advisories + 1 unsound + 2 unmaintained ship accepted via `ic/deny.toml`, every one accounted for with clearing owner **WI#331** (open, goals item 11). No committed lockfile contains any *other* crate with an active applicable advisory
@@ -85,7 +85,7 @@
     - **!1529 follow-up verification (2026-10-11):** merged target `aragents/kimil00p/v2.1.6.0` at `4e96648f0` in `f06b5eb1c`; retained target goal updates. 6 targeted daemon tests and 8 guard regressions pass; standalone remote-feature `cargo check --tests` and default-feature `cargo clippy --lib --tests -- -D warnings` pass (12 CPUs/jobs, debug info disabled). Cargo-deny and all 26 satellite roots pass against advisory DB `7eebec69c`; bridge metadata still resolves 895 packages without either legacy pin. CI YAML validation, ShellCheck, Bash/Python syntax, formatting, diff and secret checks pass
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/332 - last attempt was rejected, see comments on MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1528
 
-## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (for goals referencing work items, read comments on work items as well)
+## Phase 4 — Carried Known-Issues from RELEASE-v2.1.3.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/334 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1536
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/337 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1515
@@ -103,8 +103,8 @@
 20. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/356
 21. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/357
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/359
-23. [x] (S) RESERVED
-24. [x] (S) RESERVED
+23. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/336
+24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/335
 25. [x] (S) RESERVED
 26. [x] (S) RESERVED
 27. [x] (S) RESERVED
@@ -120,7 +120,7 @@
 37. [x] (S) RESERVED
 38. [x] (S) RESERVED
 
-## Phase 5 - Documentation and Misc goal items (for goals referencing work items, read comments on work items as well)
+## Phase 5 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
 39. [ ] update all documentation under docs/architecture
 40. [ ] Create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for references)
