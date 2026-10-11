@@ -3282,6 +3282,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_prompt_concurrent_senders_preserve_seq_fifo_order() {
+        // MR !1525 DI-9 (CT-10 mutation coverage): seq assignment and
+        // try_send share one write-lock critical section, so N concurrent
+        // senders produce exactly seqs 1..=N and the queue's FIFO order
+        // matches seq order. If the lock stopped covering both, a sender
+        // could interleave seq N+1 ahead of seq N in the FIFO and this test
+        // would (eventually) catch the inversion.
+        let mgr = std::sync::Arc::new(control_test_manager());
+        let job_id = Uuid::new_v4();
+        reserve_capable(&mgr, job_id).await;
+
+        const SENDERS: u64 = 8;
+        let mut tasks = Vec::new();
+        for i in 0..SENDERS {
+            let mgr = std::sync::Arc::clone(&mgr);
+            tasks.push(tokio::spawn(async move {
+                mgr.send_prompt(job_id, "user", &format!("prompt {i}"), false)
+                    .await
+            }));
+        }
+        let mut seqs = Vec::new();
+        for task in tasks {
+            seqs.push(task.await.unwrap().unwrap()); // safety: test
+        }
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=SENDERS).collect::<Vec<_>>());
+
+        // FIFO order == seq order.
+        let mut delivered = Vec::new();
+        {
+            let mut handles = mgr.active_handles.write().await;
+            let rx = handles
+                .get_mut(&job_id)
+                .and_then(|h| h.prompt_rx.as_mut())
+                .unwrap(); // safety: test
+            while let Ok(prompt) = rx.try_recv() {
+                delivered.push(prompt);
+            }
+        }
+        assert_eq!(delivered.len(), SENDERS as usize);
+        for (index, prompt) in delivered.iter().enumerate() {
+            assert_eq!(
+                prompt.seq,
+                index as u64 + 1,
+                "FIFO slot {index} holds seq {} — seq/FIFO interleave",
+                prompt.seq
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn send_prompt_fails_after_handle_removed() {
         let mgr = control_test_manager();
         let job_id = Uuid::new_v4();

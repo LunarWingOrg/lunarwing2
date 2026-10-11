@@ -36,7 +36,6 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use lunarwing_common::PromptContextRole;
-use secrecy::SecretString;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -44,7 +43,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use uuid::Uuid;
 
 use lunarwing::channels::web::types::SseEvent;
-use lunarwing::config::{ExternalWorkerConfig, LoadBalanceStrategy, WorkerEndpoint};
+use lunarwing::config::ExternalWorkerConfig;
 use lunarwing::context::{ContextManager, JobContext, JobState};
 use lunarwing::error::OrchestratorError;
 use lunarwing::orchestrator::ExternalWorkerManager;
@@ -115,6 +114,15 @@ enum MockBehavior {
     ControlChannel {
         messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     },
+    /// WI#328 (MR !1525 DI-9): worker that advertises `task_prompt`, then
+    /// holds the task open forever — reading and forwarding envelopes (so the
+    /// daemon's cancel reaches a live read loop) but never sending a
+    /// `task_result`. When `forged_ack_seq` is set it immediately acks that
+    /// never-delivered seq, exercising the daemon's delivered-seqs filter.
+    ControlChannelHold {
+        messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        forged_ack_seq: Option<u64>,
+    },
     /// Complete the WebSocket upgrade but close without sending `ready`
     /// (drives a protocol error).
     CloseBeforeReady,
@@ -124,7 +132,9 @@ impl MockBehavior {
     /// Capabilities advertised in the mock's `ready` payload (WI#328).
     fn capabilities(&self) -> Vec<&'static str> {
         match self {
-            MockBehavior::ControlChannel { .. } => vec!["task_prompt"],
+            MockBehavior::ControlChannel { .. } | MockBehavior::ControlChannelHold { .. } => {
+                vec!["task_prompt"]
+            }
             _ => vec![],
         }
     }
@@ -574,44 +584,86 @@ async fn handle_connection(
                 }
                 // Loop: the connection may be pooled and reused.
             }
+            MockBehavior::ControlChannelHold {
+                ref messages,
+                forged_ack_seq,
+            } => {
+                // MR !1525 DI-9 shape: capture the task_request, optionally
+                // fire a FORGED ack (a seq the daemon never delivered), then
+                // hold the task open — forwarding every inbound envelope
+                // (task_prompt, cancel) but never answering with a
+                // task_result. Drives the forged-ack rejection test and the
+                // cancel-arm queue-close test (no ack → the daemon's bounded
+                // CANCEL_ACK_TIMEOUT fallback ends the task).
+                let _ = messages.send(req_envelope.clone());
+                let task_id = req_envelope["payload"]["task_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(seq) = forged_ack_seq {
+                    let forged = envelope(
+                        "task_prompt_ack",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "seq": seq,
+                            "accepted": true,
+                        }),
+                    );
+                    if ws.send(Message::Text(forged.into())).await.is_err() {
+                        return;
+                    }
+                }
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let Ok(msg_env) = serde_json::from_str::<serde_json::Value>(text) else {
+                        continue;
+                    };
+                    if msg_env.get("type").and_then(|value| value.as_str()) == Some("ping") {
+                        let pong = envelope("pong", serde_json::json!({}));
+                        if ws.send(Message::Text(pong.into())).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let _ = messages.send(msg_env);
+                }
+                return; // never pooled: the task never completed
+            }
         }
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+/// Build the mock worker config through the real settings resolver (TOML
+/// round-trip) rather than a struct literal: sibling branches that add
+/// `ExternalWorkerConfig` fields would otherwise textually auto-merge and
+/// break this target with E0063 (MR !1525 DI-2 — the same hazard the
+/// in-crate `ExternalWorkerConfig::test_config` covers; as a separate crate
+/// this target cannot use that cfg(test) helper).
 fn config_for(url: &str) -> ExternalWorkerConfig {
-    ExternalWorkerConfig {
-        name: "mock".to_string(),
-        url: url.to_string(),
-        auth_token: None,
-        timeout_ms: 30_000,
-        endpoints: vec![WorkerEndpoint {
-            url: url.to_string(),
-            auth_token: None,
-            weight: None,
-        }],
-        load_balance: LoadBalanceStrategy::RoundRobin,
-        prompt_context: Default::default(),
-    }
+    config_from_toml(&format!(
+        "[[sandbox.external_workers]]\nname = \"mock\"\nurl = {url:?}\ntimeout_ms = 30000\n"
+    ))
 }
 
-/// Like [`config_for`] but sets a Bearer auth token on both the worker config
-/// and its endpoint, exercising the `SecretString` -> `expose_secret()` path.
+/// Like [`config_for`] but sets a Bearer auth token on the worker config,
+/// exercising the `SecretString` -> `expose_secret()` path.
 fn config_for_with_auth(url: &str, token: &str) -> ExternalWorkerConfig {
-    ExternalWorkerConfig {
-        name: "mock".to_string(),
-        url: url.to_string(),
-        auth_token: Some(SecretString::from(token)),
-        timeout_ms: 30_000,
-        endpoints: vec![WorkerEndpoint {
-            url: url.to_string(),
-            auth_token: Some(SecretString::from(token)),
-            weight: None,
-        }],
-        load_balance: LoadBalanceStrategy::RoundRobin,
-        prompt_context: Default::default(),
-    }
+    config_from_toml(&format!(
+        "[[sandbox.external_workers]]\nname = \"mock\"\nurl = {url:?}\ntimeout_ms = 30000\nauth_token = {token:?}\n"
+    ))
+}
+
+fn config_from_toml(toml_src: &str) -> ExternalWorkerConfig {
+    let settings: lunarwing::settings::Settings =
+        toml::from_str(toml_src).expect("test worker config must parse");
+    ExternalWorkerConfig::resolve_from_settings(&settings)
+        .into_iter()
+        .next()
+        .expect("exactly one test worker")
 }
 
 /// Bind and immediately drop a listener to obtain a guaranteed-closed port.
@@ -2099,3 +2151,318 @@ async fn control_channel_rejects_prompt_when_worker_lacks_capability() {
         .expect("channel closed");
     assert_eq!(cancel["type"], "cancel");
 }
+
+// ── WI#328 control channel: audit rows, forged acks, cancel close (MR !1525 DI-9) ──
+
+/// Poll until the job's control capability reaches `expected` (the handshake
+/// completes asynchronously after dispatch).
+async fn wait_for_capability(
+    mgr: &ExternalWorkerManager,
+    job_id: Uuid,
+    expected: ControlCapability,
+) {
+    let mut attempts = 0;
+    loop {
+        if mgr.control_capability(job_id).await == Some(expected) {
+            return;
+        }
+        attempts += 1;
+        assert!(attempts < 1000, "capability handshake never completed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// `(event_type, content)` pairs persisted for a job, oldest first.
+#[cfg(feature = "libsql")]
+async fn persisted_event_contents(
+    store: &Arc<dyn lunarwing::db::Database>,
+    job_id: Uuid,
+) -> Vec<(String, String)> {
+    store
+        .list_job_events(job_id, Some(500))
+        .await
+        .expect("list job events")
+        .into_iter()
+        .map(|event| {
+            let content = event
+                .data
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            (event.event_type, content)
+        })
+        .collect()
+}
+
+/// libSQL-backed store for audit-row assertions — the same shape as the
+/// `create_test_db()` helpers in the other tests/ targets (the in-crate
+/// `testing` module is cfg(test)-gated and not visible here).
+#[cfg(feature = "libsql")]
+async fn test_store() -> (Arc<dyn lunarwing::db::Database>, tempfile::TempDir) {
+    use lunarwing::db::Database;
+    use lunarwing::db::libsql::LibSqlBackend;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backend = LibSqlBackend::new_local(&dir.path().join("test.db"))
+        .await
+        .expect("LibSqlBackend");
+    backend.run_migrations().await.expect("migrations");
+    (Arc::new(backend), dir)
+}
+
+/// job_events.job_id FK-references agent_jobs — seed the row the way
+/// create_job would before any event can persist.
+#[cfg(feature = "libsql")]
+async fn seed_agent_job(store: &Arc<dyn lunarwing::db::Database>, job_id: Uuid) {
+    let ctx = JobContext {
+        job_id,
+        user_id: "user".to_string(),
+        title: "control channel test".to_string(),
+        ..Default::default()
+    };
+    store.save_job(&ctx).await.expect("seed agent_jobs row");
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn control_channel_persists_delivery_and_ack_rows() {
+    // MR !1525 DI-8/DI-9: the enqueue/deliver/ack lifecycle lands in the job
+    // event log, and the ack row carries the worker's `accepted` flag.
+    let (store, _db_guard) = test_store().await;
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) =
+        spawn_mock_worker_async(MockBehavior::ControlChannel { messages: message_tx }).await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]).with_store(store.clone()));
+    let job_id = Uuid::new_v4();
+    seed_agent_job(&store, job_id).await;
+    mgr.reserve_task(job_id, "mock", "user")
+        .await
+        .expect("reserve task");
+
+    let mgr_c = Arc::clone(&mgr);
+    let task = tokio::spawn(async move {
+        mgr_c
+            .execute_task(
+                job_id,
+                "mock",
+                "do the thing",
+                Some(10_000),
+                true,
+                TaskContext::default(),
+            )
+            .await
+    });
+    wait_for_capability(&mgr, job_id, ControlCapability::Supported).await;
+
+    let seq = mgr
+        .send_prompt(job_id, "user", "status?", false)
+        .await
+        .expect("send_prompt");
+    assert_eq!(seq, 1);
+
+    let res = timeout(TEST_BOUND, task)
+        .await
+        .expect("test timed out")
+        .expect("task panicked")
+        .expect("execute_task errored")
+        .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    // The mock acks before its task_result, so once the task resolves both
+    // rows are persisted. (The worker saw task_request, then task_prompt.)
+    let _ = timeout(TEST_BOUND, message_rx.recv()).await;
+    let _ = timeout(TEST_BOUND, message_rx.recv()).await;
+
+    let events = persisted_event_contents(&store, job_id).await;
+    let prompt_rows: Vec<&str> = events
+        .iter()
+        .filter(|(kind, _)| kind == "control_prompt")
+        .map(|(_, content)| content.as_str())
+        .collect();
+    assert!(
+        prompt_rows.iter().any(|c| c.starts_with("enqueued seq=1")),
+        "missing enqueued row, got: {prompt_rows:?}"
+    );
+    assert!(
+        prompt_rows
+            .iter()
+            .any(|c| *c == "delivered seq=1 done=false"),
+        "missing delivered row, got: {prompt_rows:?}"
+    );
+    let ack_rows: Vec<&str> = events
+        .iter()
+        .filter(|(kind, _)| kind == "control_ack")
+        .map(|(_, content)| content.as_str())
+        .collect();
+    assert_eq!(
+        ack_rows,
+        vec!["seq=1 accepted=true"],
+        "the ack row must carry the accepted flag (DI-8)"
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn control_channel_ignores_forged_ack() {
+    // MR !1525 DI-9 (CT-8 mutation coverage): an ack for a seq the daemon
+    // never delivered must NOT produce a control_ack row — deleting the
+    // delivered_seqs filter turns this test red.
+    let (store, _db_guard) = test_store().await;
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ControlChannelHold {
+        messages: message_tx,
+        forged_ack_seq: Some(999),
+    })
+    .await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]).with_store(store.clone()));
+    let job_id = Uuid::new_v4();
+    seed_agent_job(&store, job_id).await;
+    mgr.reserve_task(job_id, "mock", "user")
+        .await
+        .expect("reserve task");
+
+    let mgr_c = Arc::clone(&mgr);
+    let task = tokio::spawn(async move {
+        mgr_c
+            .execute_task(
+                job_id,
+                "mock",
+                "do the thing",
+                Some(10_000),
+                true,
+                TaskContext::default(),
+            )
+            .await
+    });
+    wait_for_capability(&mgr, job_id, ControlCapability::Supported).await;
+
+    // Clean up the held-open task; the forged ack (sent right after the
+    // task_request) is processed by the read loop long before this.
+    assert!(mgr.cancel_task(job_id).await);
+    let res = timeout(TEST_BOUND, task)
+        .await
+        .expect("test timed out")
+        .expect("task panicked")
+        .expect("execute_task errored")
+        .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Cancelled);
+
+    // Every frame the worker sent has been processed by now: no control_ack
+    // row may exist for the forged seq 999.
+    let events = persisted_event_contents(&store, job_id).await;
+    assert!(
+        !events.iter().any(|(kind, _)| kind == "control_ack"),
+        "forged ack must produce no control_ack row, got: {events:?}"
+    );
+
+    // The worker observed task_request and the cancel envelope (its forged
+    // ack went out between them on the wire).
+    let first = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("task_request timed out")
+        .expect("channel closed");
+    assert_eq!(first["type"], "task_request");
+    let cancel = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("cancel envelope timed out")
+        .expect("channel closed");
+    assert_eq!(cancel["type"], "cancel");
+}
+
+#[tokio::test]
+async fn control_channel_cancel_closes_queue_immediately() {
+    // MR !1525 DI-7/DI-9: the cancel arm closes the control queue BEFORE the
+    // bounded ack handoff, so a prompt sent while the (never-acking) worker
+    // is being cancelled is rejected immediately rather than after
+    // CANCEL_ACK_TIMEOUT (3s) — or worse, accepted and silently dropped.
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ControlChannelHold {
+        messages: message_tx,
+        forged_ack_seq: None,
+    })
+    .await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
+    let job_id = Uuid::new_v4();
+    mgr.reserve_task(job_id, "mock", "user")
+        .await
+        .expect("reserve task");
+
+    let mgr_c = Arc::clone(&mgr);
+    let task = tokio::spawn(async move {
+        mgr_c
+            .execute_task(
+                job_id,
+                "mock",
+                "do the thing",
+                Some(10_000),
+                true,
+                TaskContext::default(),
+            )
+            .await
+    });
+    wait_for_capability(&mgr, job_id, ControlCapability::Supported).await;
+
+    // Sanity: a prompt is accepted while the task runs, and the worker
+    // receives it before we cancel (ordered wire: request, prompt, cancel).
+    let seq = mgr
+        .send_prompt(job_id, "user", "first", false)
+        .await
+        .expect("prompt while running");
+    assert_eq!(seq, 1);
+    let prompt_frame = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("task_prompt timed out")
+        .expect("channel closed");
+    assert_eq!(prompt_frame["type"], "task_request");
+    let prompt_frame = timeout(TEST_BOUND, message_rx.recv())
+        .await
+        .expect("task_prompt timed out")
+        .expect("channel closed");
+    assert_eq!(prompt_frame["type"], "task_prompt");
+
+    assert!(mgr.cancel_task(job_id).await);
+
+    // The queue must close well before the 3s cancel-ack handoff expires:
+    // poll briefly for the rejection.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+    let rejection = loop {
+        match mgr.send_prompt(job_id, "user", "during cancel", false).await {
+            Err(error) => break error,
+            Ok(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "control queue was still open 1.5s after cancel — cancel-arm close missing?"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    assert!(
+        matches!(
+            rejection,
+            OrchestratorError::ExternalWorkerTaskNotActive { .. }
+        ),
+        "expected TaskNotActive, got: {rejection}"
+    );
+
+    let res = timeout(TEST_BOUND, task)
+        .await
+        .expect("test timed out")
+        .expect("task panicked")
+        .expect("execute_task errored")
+        .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Cancelled);
+    // Drain until the cancel frame: a prompt from the rejection poll may have
+    // been delivered before the queue close landed.
+    loop {
+        let frame = timeout(TEST_BOUND, message_rx.recv())
+            .await
+            .expect("cancel envelope timed out")
+            .expect("channel closed");
+        if frame["type"] == "cancel" {
+            break;
+        }
+    }
+}
+

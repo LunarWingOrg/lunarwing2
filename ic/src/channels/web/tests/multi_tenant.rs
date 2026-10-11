@@ -412,7 +412,8 @@ mod workspace_pool {
 mod jobs_isolation {
     use super::*;
     use crate::channels::web::handlers::jobs::{
-        jobs_cancel_handler, jobs_prompt_handler, jobs_restart_handler, jobs_summary_handler,
+        jobs_cancel_handler, jobs_detail_handler, jobs_prompt_handler, jobs_restart_handler,
+        jobs_summary_handler,
     };
     // SandboxStore methods are accessed through the Database supertrait.
 
@@ -420,6 +421,7 @@ mod jobs_isolation {
     fn jobs_router(state: Arc<GatewayState>, auth: MultiAuthState) -> Router {
         Router::new()
             .route("/api/jobs/summary", get(jobs_summary_handler))
+            .route("/api/jobs/{id}", get(jobs_detail_handler))
             .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
             .route("/api/jobs/{id}/restart", post(jobs_restart_handler))
             .route("/api/jobs/{id}/prompt", post(jobs_prompt_handler))
@@ -773,6 +775,69 @@ mod jobs_isolation {
             StatusCode::BAD_REQUEST,
             "unsupported worker must produce an explicit 400, not a false queued"
         );
+    }
+
+    /// WI#328 (MR !1525 DI-9): the job detail payload reports `can_prompt`
+    /// for a running external job only when the worker's handshake actually
+    /// advertised the `task_prompt` capability.
+    async fn assert_can_prompt(capability: crate::orchestrator::external_worker::ControlCapability, expected: bool) {
+        use crate::config::ExternalWorkerConfig;
+        use crate::orchestrator::ExternalWorkerManager;
+
+        let (db, _dir) = test_db().await;
+
+        let mut alice_job = make_sandbox_job("alice", "external detail");
+        alice_job.status = "running".to_string();
+        alice_job.success = None;
+        alice_job.completed_at = None;
+        db.save_sandbox_job(&alice_job).await.unwrap();
+        db.update_sandbox_job_mode(alice_job.id, "external:harness")
+            .await
+            .unwrap();
+
+        let ewm = Arc::new(ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
+        ]));
+        ewm.reserve_task(alice_job.id, "harness", "alice")
+            .await
+            .unwrap();
+        ewm.force_control_capability(alice_job.id, capability).await;
+
+        let state = build_state_ex(Some(db), None, Some(ewm));
+        let auth = two_user_auth();
+        let app = jobs_router(state, auth);
+
+        let req = Request::builder()
+            .uri(format!("/api/jobs/{}", alice_job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["can_prompt"], expected,
+            "can_prompt mismatch for capability {capability:?}: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jobs_detail_can_prompt_true_when_capability_supported() {
+        assert_can_prompt(
+            crate::orchestrator::external_worker::ControlCapability::Supported,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_jobs_detail_can_prompt_false_when_capability_unsupported() {
+        assert_can_prompt(
+            crate::orchestrator::external_worker::ControlCapability::Unsupported,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
