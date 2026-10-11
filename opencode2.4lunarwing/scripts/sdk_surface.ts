@@ -13,7 +13,7 @@
  *  - scripts/sdk_surface_assert.ts — the image-build gate: constructs the
  *    real client against a dummy base URL (no server contact) and asserts
  *    typeof for every path below, plus asserts every BRIDGE_SDK_EVENTS name
- *    is present as a literal in the pinned client/schema source, so SDK
+ *    is present as a literal in the pinned client/schema/protocol source, so SDK
  *    drift fails the build, not the runtime.
  *  - scripts/opencode_task_executor_test.ts — asserts the injected mock
  *    implements EXACTLY this surface (both directions) AND that the
@@ -55,7 +55,7 @@ export const STALE_SDK_METHODS = [
  * depends on session.execution.{succeeded,failed,interrupted} / session.idle
  * and permission handling on permission.asked, so an upstream rename would
  * hang every task or stall permissions — the build gate asserts each name is
- * still a literal in the pinned client/schema source (WI#329, !1512 CY-2).
+ * still a literal in the pinned client/schema/protocol source (WI#329, !1512 CY-2).
  */
 export const BRIDGE_SDK_EVENTS = [
   "permission.asked",
