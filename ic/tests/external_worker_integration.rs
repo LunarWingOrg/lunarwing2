@@ -2604,10 +2604,13 @@ async fn cron_status_and_pause_answer_during_running_tick() {
     assert!(!status.paused);
 
     // Pause during the running tick applies immediately...
-    timeout(TEST_BOUND, mgr.pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool))
-        .await
-        .expect("pause starved by the running tick")
-        .expect("pause");
+    timeout(
+        TEST_BOUND,
+        mgr.pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool),
+    )
+    .await
+    .expect("pause starved by the running tick")
+    .expect("pause");
     let status = timeout(TEST_BOUND, mgr.cron_mission_status("mock", "owner-1"))
         .await
         .expect("status starved")
@@ -2615,10 +2618,13 @@ async fn cron_status_and_pause_answer_during_running_tick() {
     assert!(status.paused);
 
     // ...and resume restores it (also immediately).
-    timeout(TEST_BOUND, mgr.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool))
-        .await
-        .expect("resume starved")
-        .expect("resume");
+    timeout(
+        TEST_BOUND,
+        mgr.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool),
+    )
+    .await
+    .expect("resume starved")
+    .expect("resume");
     let status = timeout(TEST_BOUND, mgr.cron_mission_status("mock", "owner-1"))
         .await
         .expect("status starved")
@@ -2918,7 +2924,10 @@ async fn cron_pause_and_tick_counter_survive_restart() {
             .unwrap(),
     )
     .unwrap();
-    mgr_b.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool).await.unwrap();
+    mgr_b
+        .resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
+        .await
+        .unwrap();
     assert!(
         !mgr_b
             .cron_mission_status("mock", "owner-1")
@@ -3090,8 +3099,8 @@ async fn cron_gateway_recovers_persisted_pause_and_rejects_nonowners() {
             30,
             0,
         )])
-            .with_event_deps(events, Arc::new(ContextManager::new(16)))
-            .with_store(db.clone()),
+        .with_event_deps(events, Arc::new(ContextManager::new(16)))
+        .with_store(db.clone()),
     );
     let (shutdown, rx) = tokio::sync::broadcast::channel(1);
     mgr.spawn_cron_supervisors("owner-1", rx);
