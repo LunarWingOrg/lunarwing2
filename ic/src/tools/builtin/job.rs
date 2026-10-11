@@ -913,9 +913,11 @@ impl CreateJobTool {
 
         let grants_json = serde_json::to_string(&options.credential_grants).unwrap_or_default();
 
-        ewm.reserve_task(job_id, worker_name).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("failed to reserve external job: {e}"))
-        })?;
+        ewm.reserve_task(job_id, worker_name, &ctx.user_id)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("failed to reserve external job: {e}"))
+            })?;
         if let Err(error) = self
             .context_manager
             .register_sandbox_job(job_id, &ctx.user_id, task, task)

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -14,6 +14,7 @@ use futures::{SinkExt, StreamExt};
 pub use lunarwing_common::PromptContextMessage as ConversationMessage;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use uuid::Uuid;
 
@@ -55,6 +56,13 @@ struct ReadyPayload {
     version: String,
     #[allow(dead_code)]
     mode: String,
+    /// Optional worker-advertised capabilities (WI#328). Workers that
+    /// understand the runtime control channel advertise `"task_prompt"`;
+    /// the field is absent on older workers, which therefore read as
+    /// unsupported and get an explicit rejection instead of a silently
+    /// dropped prompt.
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,11 +186,59 @@ struct TaskResultPayload {
 /// enqueue so worker bridges never have to defend against unbounded frames.
 pub const MAX_CONTROL_PROMPT_LEN: usize = 16 * 1024;
 
+/// Capability string a worker advertises in its `ready` payload when it
+/// understands `task_prompt` / `task_prompt_ack` (WI#328).
+pub const CAPABILITY_TASK_PROMPT: &str = "task_prompt";
+
+/// Bound on a job's in-memory control queue (MR !1508 review CT-4). A full
+/// queue rejects new prompts with `ExternalWorkerControlQueueFull` instead of
+/// growing without bound.
+pub const CONTROL_QUEUE_BOUND: usize = 32;
+
+/// Total number of control prompts a single job will ever accept (CT-4).
+/// Bounds the job-event volume a prompt flood can produce; each accepted
+/// prompt already costs a persisted `control_prompt` row.
+pub const MAX_CONTROL_PROMPTS_PER_JOB: u64 = 64;
+
+/// Whether the worker running a job advertised the `task_prompt` capability
+/// in its `ready` handshake (WI#328, MR !1508 review CT-1). Until the
+/// handshake completes the state is [`ControlCapability::Unknown`]; prompts
+/// submitted in that window are rejected as "still connecting" rather than
+/// silently queued for a worker that may drop them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlCapability {
+    /// Connection/handshake has not completed yet (or the reservation was
+    /// released before dispatch).
+    Unknown,
+    /// The worker advertised `task_prompt` support.
+    Supported,
+    /// The worker completed its handshake without advertising `task_prompt`.
+    Unsupported,
+}
+
+impl ControlCapability {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Supported,
+            2 => Self::Unsupported,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Supported => 1,
+            Self::Unsupported => 2,
+        }
+    }
+}
+
 /// A queued runtime-control message for a RUNNING external worker task
 /// (WI#328). Mirrors `job_prompt` semantics: `prompt` is the follow-up
 /// instruction text, `done` signals "no more prompts coming, wrap up
 /// cleanly", and `seq` gives monotonic per-job ordering so workers can
-/// dedupe on at-least-once redelivery.
+/// dedupe repeats.
 #[derive(Debug, Clone)]
 pub struct ControlPrompt {
     pub seq: u64,
@@ -208,35 +264,52 @@ struct TaskPromptAckPayload {
 pub struct ExternalJobHandle {
     pub job_id: Uuid,
     pub worker_name: String,
+    /// User who owns the job (captured at reservation). `send_prompt`
+    /// re-checks the caller against this as defense in depth — the tool and
+    /// web routes already verify ownership, but the manager must not trust a
+    /// bare `job_id`/`user_id` pair (MR !1508 review CT-5).
+    owner_user_id: String,
     cancel_tx: watch::Sender<bool>,
-    /// Daemon → running-task control queue (WI#328). The receiver is taken
-    /// by `execute_task` and drained inside the task's WebSocket read loop,
-    /// so prompts enqueued while the worker is mid-turn are delivered on
-    /// the next loop cycle — never mid-frame.
-    prompt_tx: mpsc::UnboundedSender<ControlPrompt>,
-    prompt_rx: Option<mpsc::UnboundedReceiver<ControlPrompt>>,
+    /// Daemon → running-task control queue (WI#328). Bounded
+    /// (`CONTROL_QUEUE_BOUND`); a full queue rejects new prompts. The
+    /// receiver is taken by `execute_task` and drained inside the task's
+    /// WebSocket read loop, which closes it when the loop exits so late
+    /// senders get `ExternalWorkerTaskNotActive` instead of a false
+    /// "queued" (MR !1508 review CT-2).
+    prompt_tx: mpsc::Sender<ControlPrompt>,
+    prompt_rx: Option<mpsc::Receiver<ControlPrompt>>,
     /// Next control-message sequence number (1-based, monotonic per job).
     next_seq: AtomicU64,
+    /// Capability learned from the worker's `ready` handshake (or the pooled
+    /// connection's recorded handshake). Shared with the task loop, which
+    /// sets it once the handshake completes.
+    control_capability: Arc<AtomicU8>,
     started: bool,
 }
 
 impl ExternalJobHandle {
-    fn new(job_id: Uuid, worker_name: String) -> Self {
+    fn new(job_id: Uuid, worker_name: String, owner_user_id: String) -> Self {
         let (cancel_tx, _cancel_rx) = watch::channel(false);
-        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
+        let (prompt_tx, prompt_rx) = mpsc::channel(CONTROL_QUEUE_BOUND);
         Self {
             job_id,
             worker_name,
+            owner_user_id,
             cancel_tx,
             prompt_tx,
             prompt_rx: Some(prompt_rx),
             next_seq: AtomicU64::new(0),
+            control_capability: Arc::new(AtomicU8::new(ControlCapability::Unknown.to_u8())),
             started: false,
         }
     }
 
     pub fn cancel(&self) {
         self.cancel_tx.send_replace(true);
+    }
+
+    fn capability(&self) -> ControlCapability {
+        ControlCapability::from_u8(self.control_capability.load(Ordering::Relaxed))
     }
 }
 
@@ -334,6 +407,7 @@ impl ExternalWorkerManager {
         &self,
         job_id: Uuid,
         worker_name: &str,
+        owner_user_id: &str,
     ) -> Result<(), OrchestratorError> {
         if !self.workers.contains_key(worker_name) {
             return Err(OrchestratorError::ExternalWorkerNotFound {
@@ -350,7 +424,7 @@ impl ExternalWorkerManager {
         }
         handles.insert(
             job_id,
-            ExternalJobHandle::new(job_id, worker_name.to_string()),
+            ExternalJobHandle::new(job_id, worker_name.to_string(), owner_user_id.to_string()),
         );
         Ok(())
     }
@@ -363,14 +437,57 @@ impl ExternalWorkerManager {
         }
     }
 
+    /// Whether a job currently has a live external-task handle (reserved or
+    /// running). Used by the `job_prompt` tool to route on actual manager
+    /// state instead of a fallible store lookup (MR !1508 review CT-7).
+    pub async fn is_task_active(&self, job_id: Uuid) -> bool {
+        self.active_handles.read().await.contains_key(&job_id)
+    }
+
+    /// The job's control-channel capability, learned from the worker's
+    /// `ready` handshake. `None` when no task with this id exists.
+    pub async fn control_capability(&self, job_id: Uuid) -> Option<ControlCapability> {
+        self.active_handles
+            .read()
+            .await
+            .get(&job_id)
+            .map(ExternalJobHandle::capability)
+    }
+
+    /// Test-only: force a job's control-channel capability without running a
+    /// handshake, so tests can exercise the capability-gated paths.
+    #[cfg(test)]
+    pub(crate) async fn force_control_capability(
+        &self,
+        job_id: Uuid,
+        capability: ControlCapability,
+    ) {
+        if let Some(handle) = self.active_handles.write().await.get_mut(&job_id) {
+            handle
+                .control_capability
+                .store(capability.to_u8(), Ordering::Relaxed);
+        }
+    }
+
     /// Queue a runtime control prompt for a RUNNING external job (WI#328).
     ///
     /// The prompt is validated here (daemon side — text directives only, no
     /// shell/exec passthrough), assigned a monotonic per-job `seq`, and held
-    /// in the job's control queue until the task's WebSocket read loop
-    /// delivers it as a `task_prompt` envelope. Delivery is at-least-once:
-    /// the worker acks with `task_prompt_ack`, and enqueue/deliver/ack all
-    /// land in the job event log for an auditable control history.
+    /// in the job's bounded control queue until the task's WebSocket read
+    /// loop delivers it as a `task_prompt` envelope. Delivery is
+    /// **at-most-once**: a prompt whose send fails, or that is still queued
+    /// when the task ends, is dropped and recorded as such in the job event
+    /// log (`control_prompt` rows carry a SHA-256 digest and length so the
+    /// audit trail shows exactly what a credentialed worker was told without
+    /// logging prompt text). Workers that understand the channel ack with
+    /// `task_prompt_ack` (persisted as `control_ack`); acks for seqs the
+    /// daemon never delivered are ignored.
+    ///
+    /// Rejections are explicit: unknown owner (same "no active task" shape
+    /// as an unknown job, so job existence is not leaked), capability not
+    /// advertised by the worker (`ExternalWorkerControlUnsupported`), full
+    /// queue or per-job prompt cap (`ExternalWorkerControlQueueFull`), and
+    /// invalid content (`ExternalWorkerInvalidControlPrompt`).
     ///
     /// Follow-up prompts do NOT extend the job's timeout/fuel budget — the
     /// task's existing deadline still applies (budget extension must be an
@@ -388,45 +505,103 @@ impl ExternalWorkerManager {
             job_id,
             reason: reason.to_string(),
         };
+        let invalid = |reason: &str| OrchestratorError::ExternalWorkerInvalidControlPrompt {
+            job_id,
+            reason: reason.to_string(),
+        };
 
         let trimmed = content.trim();
         if trimmed.is_empty() {
-            return Err(not_active("prompt content is empty"));
+            return Err(invalid("prompt content is empty"));
         }
         if trimmed.len() > MAX_CONTROL_PROMPT_LEN {
-            return Err(not_active("prompt exceeds 16 KiB control-channel limit"));
+            return Err(invalid("prompt exceeds 16 KiB control-channel limit"));
         }
         if trimmed.contains('\0') {
-            return Err(not_active(
-                "prompt contains NUL bytes; text directives only",
-            ));
+            return Err(invalid("prompt contains NUL bytes; text directives only"));
         }
 
-        let handles = self.active_handles.read().await;
+        // The seq assignment and the queue send share one write-lock critical
+        // section, so concurrent senders (web UI + agent tool) cannot interleave
+        // seq N+1 into the FIFO ahead of seq N (MR !1508 review CT-10), and the
+        // persisted "enqueued" event always precedes any "delivered" row.
+        let mut handles = self.active_handles.write().await;
         let handle = handles
-            .get(&job_id)
+            .get_mut(&job_id)
             .ok_or_else(|| not_active("no active external task with this job id"))?;
 
+        if handle.owner_user_id != user_id {
+            return Err(not_active("no active external task with this job id"));
+        }
+
+        match handle.capability() {
+            ControlCapability::Supported => {}
+            ControlCapability::Unknown => {
+                return Err(not_active(
+                    "task is still connecting; the worker capability handshake has not completed",
+                ));
+            }
+            ControlCapability::Unsupported => {
+                return Err(OrchestratorError::ExternalWorkerControlUnsupported {
+                    job_id,
+                    worker_name: handle.worker_name.clone(),
+                });
+            }
+        }
+
+        let queue_full = |reason: &str| OrchestratorError::ExternalWorkerControlQueueFull {
+            job_id,
+            reason: reason.to_string(),
+        };
+        // A closed channel also reports zero capacity; check closed first so
+        // a finished task is not misreported as "queue full" (429).
+        if handle.prompt_tx.is_closed() {
+            return Err(not_active("task already finished; control queue closed"));
+        }
+        if handle.next_seq.load(Ordering::Relaxed) >= MAX_CONTROL_PROMPTS_PER_JOB {
+            return Err(queue_full("per-job control prompt limit reached"));
+        }
+        if handle.prompt_tx.capacity() == 0 {
+            return Err(queue_full("control queue is full; the worker is behind"));
+        }
+
         let seq = handle.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let digest = sha2::Sha256::digest(trimmed.as_bytes());
+        persist_event(
+            self.store.as_ref(),
+            job_id,
+            "control_prompt",
+            &format!(
+                "enqueued seq={seq} done={done} len={} sha256={digest:x}",
+                trimmed.len()
+            ),
+        )
+        .await;
         let prompt = ControlPrompt {
             seq,
             prompt: trimmed.to_string(),
             done,
         };
-        handle
-            .prompt_tx
-            .send(prompt)
-            .map_err(|_| not_active("task already finished; control queue closed"))?;
+        if let Err(error) = handle.prompt_tx.try_send(prompt) {
+            let reason = match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    queue_full("control queue filled between check and send")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    not_active("task already finished; control queue closed")
+                }
+            };
+            persist_event(
+                self.store.as_ref(),
+                job_id,
+                "control_prompt",
+                &format!("enqueue_failed seq={seq}: {reason}"),
+            )
+            .await;
+            return Err(reason);
+        }
         drop(handles);
 
-        // Observability (WI#328): every enqueue lands in the job event log.
-        persist_event(
-            self.store.as_ref(),
-            job_id,
-            "control_prompt",
-            &format!("enqueued seq={seq} done={done}"),
-        )
-        .await;
         emit_event(
             self.job_event_tx.as_ref(),
             job_id,
@@ -487,7 +662,7 @@ impl ExternalWorkerManager {
         let active_handles = Arc::clone(&self.active_handles);
         let pool = Arc::clone(&self.pool);
 
-        let (cancel_rx, prompt_rx) = {
+        let (cancel_rx, prompt_rx, control_capability) = {
             let mut handles = active_handles.write().await;
             if let Some(handle) = handles.get_mut(&job_id) {
                 if handle.started {
@@ -497,29 +672,38 @@ impl ExternalWorkerManager {
                     });
                 }
                 handle.started = true;
-                // Take the control-queue receiver for the read loop. It is
-                // always Some on a fresh reservation; if it was somehow
-                // consumed already, rebuild the channel so enqueued prompts
-                // can never silently black-hole.
-                let prompt_rx = match handle.prompt_rx.take() {
-                    Some(rx) => rx,
-                    None => {
-                        let (tx, rx) = mpsc::unbounded_channel();
-                        handle.prompt_tx = tx;
-                        rx
+                // Take the control-queue receiver for the read loop. A handle
+                // that lost its receiver without being started is a bug; fail
+                // the dispatch instead of panicking or rebuilding the channel
+                // (which would orphan prompts queued on the old one).
+                let prompt_rx = handle.prompt_rx.take().ok_or_else(|| {
+                    OrchestratorError::ExternalWorkerProtocolError {
+                        worker_name: worker_name_owned.clone(),
+                        reason: "control queue receiver already consumed".to_string(),
                     }
-                };
-                (handle.cancel_tx.subscribe(), prompt_rx)
+                })?;
+                (
+                    handle.cancel_tx.subscribe(),
+                    prompt_rx,
+                    Arc::clone(&handle.control_capability),
+                )
             } else {
-                let mut handle = ExternalJobHandle::new(job_id, worker_name_owned.clone());
+                let mut handle = ExternalJobHandle::new(
+                    job_id,
+                    worker_name_owned.clone(),
+                    context.user_id.clone(),
+                );
                 handle.started = true;
                 let cancel_rx = handle.cancel_tx.subscribe();
-                let prompt_rx = match handle.prompt_rx.take() {
-                    Some(rx) => rx,
-                    None => unreachable!("fresh handle always carries prompt_rx"),
-                };
+                let prompt_rx = handle.prompt_rx.take().ok_or_else(|| {
+                    OrchestratorError::ExternalWorkerProtocolError {
+                        worker_name: worker_name_owned.clone(),
+                        reason: "control queue receiver missing on fresh handle".to_string(),
+                    }
+                })?;
+                let control_capability = Arc::clone(&handle.control_capability);
                 handles.insert(job_id, handle);
-                (cancel_rx, prompt_rx)
+                (cancel_rx, prompt_rx, control_capability)
             }
         };
 
@@ -587,6 +771,7 @@ impl ExternalWorkerManager {
                     &pool,
                     &attempt_pool_key,
                     &mut prompt_rx,
+                    &control_capability,
                 )
                 .await;
 
@@ -620,6 +805,7 @@ impl ExternalWorkerManager {
                     .await;
                 }
 
+                close_control_queue(job_id, &mut prompt_rx, store.as_ref()).await;
                 active_handles.write().await.remove(&job_id);
                 return result.map(Some);
             }
@@ -648,9 +834,11 @@ impl ExternalWorkerManager {
                     &pool,
                     &pool_key,
                     &mut prompt_rx,
+                    &control_capability,
                 )
                 .await;
 
+                close_control_queue(job_id, &mut prompt_rx, store.as_ref()).await;
                 active_handles.write().await.remove(&job_id);
 
                 if let Err(error) = &result {
@@ -987,6 +1175,10 @@ const CANCEL_ACK_TASK_MARGIN: Duration = Duration::from_millis(50);
 pub struct PooledConnection {
     pub stream: WsStream,
     pub worker_id: String,
+    /// Capabilities advertised in the `ready` handshake that established this
+    /// connection (WI#328). Carried through pooling so a reused connection
+    /// doesn't have to re-handshake to know whether `task_prompt` is safe.
+    capabilities: Vec<String>,
     last_used: Instant,
 }
 
@@ -1123,7 +1315,7 @@ async fn connect_and_handshake(
     url: &str,
     auth_token: Option<&str>,
     worker_name: &str,
-) -> Result<(WsStream, String), OrchestratorError> {
+) -> Result<(WsStream, String, Vec<String>), OrchestratorError> {
     use tokio_tungstenite::tungstenite;
 
     let uri = url.parse::<http::Uri>().map_err(|e| {
@@ -1231,7 +1423,7 @@ async fn connect_and_handshake(
                 reason: "failed to reunite WebSocket stream halves".to_string(),
             })?;
 
-    Ok((stream, ready.worker_id))
+    Ok((stream, ready.worker_id, ready.capabilities))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1249,7 +1441,8 @@ async fn run_external_task(
     context: TaskContext,
     pool: &WorkerConnectionPool,
     pool_key: &str,
-    prompt_rx: &mut mpsc::UnboundedReceiver<ControlPrompt>,
+    prompt_rx: &mut mpsc::Receiver<ControlPrompt>,
+    control_capability: &AtomicU8,
 ) -> Result<ExternalTaskResult, OrchestratorError> {
     use tokio_tungstenite::tungstenite;
 
@@ -1262,16 +1455,36 @@ async fn run_external_task(
         None => None,
     };
 
-    let (mut write, mut read, worker_id, from_pool) = if let Some(pooled) = pooled {
+    let (mut write, mut read, worker_id, capabilities, from_pool) = if let Some(pooled) = pooled {
         tracing::debug!("Reusing pooled connection for '{worker_name}'");
-        let wid = pooled.worker_id.clone();
-        let (w, r) = pooled.stream.split();
-        (w, r, wid, true)
-    } else {
-        let (stream, wid) = connect_and_handshake(url, auth_token, worker_name).await?;
+        let PooledConnection {
+            stream,
+            worker_id,
+            capabilities,
+            ..
+        } = pooled;
         let (w, r) = stream.split();
-        (w, r, wid, false)
+        (w, r, worker_id, capabilities, true)
+    } else {
+        let (stream, wid, capabilities) = connect_and_handshake(url, auth_token, worker_name).await?;
+        let (w, r) = stream.split();
+        (w, r, wid, capabilities, false)
     };
+
+    // Publish the worker's control-channel capability (WI#328): only now can
+    // `send_prompt` tell a supporting worker from one that would silently
+    // drop the frame. Capabilities are stable for a worker binary, so the
+    // value a pooled connection carries from its original handshake stays
+    // authoritative for the reuse.
+    control_capability.store(
+        if capabilities.iter().any(|c| c == CAPABILITY_TASK_PROMPT) {
+            ControlCapability::Supported
+        } else {
+            ControlCapability::Unsupported
+        }
+        .to_u8(),
+        Ordering::Relaxed,
+    );
 
     let source = if from_pool { "pooled" } else { "new" };
     tracing::info!(
@@ -1328,6 +1541,11 @@ async fn run_external_task(
     let mut accumulated_output = String::new();
     let mut cancel_rx = cancel_rx;
     let task_start = tokio::time::Instant::now();
+    // WI#328: seqs this loop actually put on the wire. A `task_prompt_ack` is
+    // only recorded when it references one of these — a worker cannot forge
+    // ack rows for prompts it never saw (MR !1508 review CT-8). Bounded by
+    // MAX_CONTROL_PROMPTS_PER_JOB.
+    let mut delivered_seqs = std::collections::HashSet::new();
 
     let result = tokio::time::timeout(task_timeout, async {
         loop {
@@ -1479,20 +1697,29 @@ async fn run_external_task(
                         "pong" => {}
                         "task_prompt_ack" => {
                             // WI#328: worker receipt for a delivered control
-                            // prompt — the ack half of at-least-once delivery.
-                            // Acks for other task ids or malformed payloads
-                            // are ignored (older workers never send these).
+                            // prompt. Only seqs this loop actually delivered
+                            // are recorded; anything else (forged, duplicated,
+                            // or for another task) is ignored — older workers
+                            // never send acks at all.
                             if let Ok(ack) =
                                 serde_json::from_value::<TaskPromptAckPayload>(env.payload)
                                 && ack.task_id == job_id.to_string()
                             {
-                                persist_event(
-                                    store,
-                                    job_id,
-                                    "control_ack",
-                                    &format!("seq={}", ack.seq),
-                                )
-                                .await;
+                                if delivered_seqs.remove(&ack.seq) {
+                                    persist_event(
+                                        store,
+                                        job_id,
+                                        "control_ack",
+                                        &format!("seq={}", ack.seq),
+                                    )
+                                    .await;
+                                } else {
+                                    tracing::debug!(
+                                        %job_id,
+                                        seq = ack.seq,
+                                        "Ignoring task_prompt_ack for an undelivered or already-acked seq"
+                                    );
+                                }
                             }
                         }
                         other => {
@@ -1501,16 +1728,19 @@ async fn run_external_task(
                     }
                 }
                 Some(control) = prompt_rx.recv() => {
-                    // WI#328 runtime control channel: deliver the next queued
+                    // WI#328 runtime control channel: push the next queued
                     // follow-up prompt/directive as a `task_prompt` envelope.
-                    // Prompts enqueued while the worker is mid-turn wait here
-                    // until this loop cycles — no mid-frame injection.
-                    deliver_control_prompt(&mut write, job_id, worker_name, &control).await?;
-                    persist_event(
-                        store,
+                    // The frame goes out as soon as this loop selects the arm;
+                    // holding it until the worker's current turn ends (no
+                    // mid-LLM-call injection) is the worker's obligation —
+                    // capability-advertising workers implement that.
+                    dispatch_control_prompt(
+                        &mut write,
                         job_id,
-                        "control_prompt",
-                        &format!("delivered seq={} done={}", control.seq, control.done),
+                        worker_name,
+                        &control,
+                        store,
+                        &mut delivered_seqs,
                     )
                     .await;
                 }
@@ -1718,6 +1948,7 @@ async fn run_external_task(
                     PooledConnection {
                         stream,
                         worker_id,
+                        capabilities,
                         last_used: std::time::Instant::now(),
                     },
                 )
@@ -1733,6 +1964,32 @@ async fn run_external_task(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Close a finished task's control queue and record anything still queued as
+/// dropped (WI#328). Closing the receiver makes every subsequent `try_send`
+/// fail, so prompts submitted after the read loop exits get an explicit
+/// `ExternalWorkerTaskNotActive` instead of a false "queued" — and prompts
+/// that raced the exit are visible in the job event log instead of vanishing
+/// (MR !1508 review CT-2; delivery is at-most-once).
+async fn close_control_queue(
+    job_id: Uuid,
+    prompt_rx: &mut mpsc::Receiver<ControlPrompt>,
+    store: Option<&Arc<dyn Database>>,
+) {
+    prompt_rx.close();
+    while let Ok(prompt) = prompt_rx.try_recv() {
+        persist_event(
+            store,
+            job_id,
+            "control_prompt",
+            &format!(
+                "dropped seq={} done={}: task ended before delivery",
+                prompt.seq, prompt.done
+            ),
+        )
+        .await;
+    }
+}
 
 async fn wait_for_cancellation(cancel_rx: &mut watch::Receiver<bool>) {
     loop {
@@ -1764,11 +2021,51 @@ async fn send_cancel_envelope(write: &mut WsWrite, job_id: Uuid) {
     }
 }
 
+/// Deliver one queued control prompt and record the outcome in the job event
+/// log (WI#328). Delivery is at-most-once: a failed send loses the prompt but
+/// never aborts the task — a genuinely dead socket fails the read side on its
+/// own (MR !1508 review CT-2). Successful deliveries are tracked in
+/// `delivered_seqs` so only their `task_prompt_ack`s are accepted.
+async fn dispatch_control_prompt(
+    write: &mut WsWrite,
+    job_id: Uuid,
+    worker_name: &str,
+    control: &ControlPrompt,
+    store: Option<&Arc<dyn Database>>,
+    delivered_seqs: &mut std::collections::HashSet<u64>,
+) {
+    match deliver_control_prompt(write, job_id, worker_name, control).await {
+        Ok(()) => {
+            delivered_seqs.insert(control.seq);
+            persist_event(
+                store,
+                job_id,
+                "control_prompt",
+                &format!("delivered seq={} done={}", control.seq, control.done),
+            )
+            .await;
+        }
+        Err(error) => {
+            tracing::warn!(
+                %job_id,
+                seq = control.seq,
+                "task_prompt delivery failed (prompt dropped): {error}"
+            );
+            persist_event(
+                store,
+                job_id,
+                "control_prompt",
+                &format!("delivery_failed seq={}: {error}", control.seq),
+            )
+            .await;
+        }
+    }
+}
+
 /// Deliver one queued control prompt to the worker as a `task_prompt`
 /// envelope (WI#328). The channel carries TEXT directives only; content was
-/// validated at enqueue. A send failure means the connection is dead — the
-/// read side would fail on the next frame anyway — so it aborts the task
-/// with a protocol error rather than silently dropping the directive.
+/// validated at enqueue. Callers decide what a send failure means —
+/// [`dispatch_control_prompt`] treats it as a lost prompt, not a dead task.
 async fn deliver_control_prompt(
     write: &mut WsWrite,
     job_id: Uuid,
@@ -2641,15 +2938,19 @@ mod tests {
     use crate::config::ExternalWorkerConfig;
 
     fn control_test_manager() -> ExternalWorkerManager {
-        ExternalWorkerManager::new(vec![ExternalWorkerConfig {
-            name: "harness".to_string(),
-            url: "ws://127.0.0.1:9/ws/agent".to_string(),
-            auth_token: None,
-            timeout_ms: 900_000,
-            endpoints: vec![],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: Default::default(),
-        }])
+        ExternalWorkerManager::new(vec![ExternalWorkerConfig::test_config(
+            "harness",
+            "ws://127.0.0.1:9/ws/agent",
+        )])
+    }
+
+    /// Reserve a job owned by "user" with the control channel marked as
+    /// supported — the state a job reaches once a capable worker's `ready`
+    /// handshake has completed.
+    async fn reserve_capable(mgr: &ExternalWorkerManager, job_id: Uuid) {
+        mgr.reserve_task(job_id, "harness", "user").await.unwrap();
+        mgr.force_control_capability(job_id, ControlCapability::Supported)
+            .await;
     }
 
     #[test]
@@ -2674,6 +2975,27 @@ mod tests {
         assert!(json.contains("\"seq\":3"));
         assert!(json.contains("\"done\":true"));
         assert!(json.contains(&format!("\"task_id\":\"{job_id}\"")));
+    }
+
+    #[test]
+    fn ready_payload_defaults_to_no_capabilities() {
+        // Older workers send no capabilities field: they must parse and read
+        // as unsupported, not fail the handshake.
+        let ready: ReadyPayload =
+            serde_json::from_str(r#"{"worker_id":"w1","version":"1.0","mode":"websocket"}"#)
+                .unwrap();
+        assert!(ready.capabilities.is_empty());
+
+        let capable: ReadyPayload = serde_json::from_str(
+            r#"{"worker_id":"w1","version":"1.0","mode":"websocket","capabilities":["task_prompt"]}"#,
+        )
+        .unwrap();
+        assert!(
+            capable
+                .capabilities
+                .iter()
+                .any(|c| c == CAPABILITY_TASK_PROMPT)
+        );
     }
 
     #[test]
@@ -2708,17 +3030,26 @@ mod tests {
     async fn send_prompt_validates_content() {
         let mgr = control_test_manager();
         let job_id = Uuid::new_v4();
-        mgr.reserve_task(job_id, "harness").await.unwrap();
+        reserve_capable(&mgr, job_id).await;
 
         let empty = mgr.send_prompt(job_id, "user", "   ", false).await;
-        assert!(empty.is_err());
+        assert!(matches!(
+            empty.unwrap_err(),
+            OrchestratorError::ExternalWorkerInvalidControlPrompt { .. }
+        ));
 
         let nul = mgr.send_prompt(job_id, "user", "bad\0prompt", false).await;
-        assert!(nul.is_err());
+        assert!(matches!(
+            nul.unwrap_err(),
+            OrchestratorError::ExternalWorkerInvalidControlPrompt { .. }
+        ));
 
         let too_long = "x".repeat(MAX_CONTROL_PROMPT_LEN + 1);
         let long = mgr.send_prompt(job_id, "user", &too_long, false).await;
-        assert!(long.is_err());
+        assert!(matches!(
+            long.unwrap_err(),
+            OrchestratorError::ExternalWorkerInvalidControlPrompt { .. }
+        ));
 
         // Validation failures must not consume sequence numbers: the next
         // valid prompt is still seq=1.
@@ -2730,10 +3061,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_prompt_rejects_until_capability_handshake_completes() {
+        // CT-1: a reserved-but-not-yet-connected job reports "still
+        // connecting" instead of accepting a prompt the worker may drop.
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        mgr.reserve_task(job_id, "harness", "user").await.unwrap();
+
+        let error = mgr
+            .send_prompt(job_id, "user", "too early", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OrchestratorError::ExternalWorkerTaskNotActive { .. }),
+            "pre-handshake prompt must be rejected, got: {error}"
+        );
+
+        // A worker that completed its handshake without the capability gets
+        // the explicit unsupported rejection, not a silent queue.
+        mgr.force_control_capability(job_id, ControlCapability::Unsupported)
+            .await;
+        let error = mgr
+            .send_prompt(job_id, "user", "hello", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OrchestratorError::ExternalWorkerControlUnsupported { .. }
+            ),
+            "unsupported worker must be rejected explicitly, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_rejects_non_owner_like_an_unknown_job() {
+        // CT-5: a cross-user prompt fails with the same shape as an unknown
+        // job, so the handle's existence is not leaked.
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        reserve_capable(&mgr, job_id).await;
+
+        let result = mgr.send_prompt(job_id, "mallory", "sneaky", false).await;
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                OrchestratorError::ExternalWorkerTaskNotActive { .. }
+            ),
+            "non-owner must get the unknown-job rejection"
+        );
+
+        // The rejection consumed no sequence number.
+        let seq = mgr
+            .send_prompt(job_id, "user", "legitimate", false)
+            .await
+            .unwrap();
+        assert_eq!(seq, 1);
+    }
+
+    #[tokio::test]
     async fn send_prompt_enqueues_ordered_by_seq() {
         let mgr = control_test_manager();
         let job_id = Uuid::new_v4();
-        mgr.reserve_task(job_id, "harness").await.unwrap();
+        reserve_capable(&mgr, job_id).await;
 
         let seq1 = mgr
             .send_prompt(job_id, "user", "first", false)
@@ -2764,10 +3154,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_prompt_rejects_when_bounded_queue_is_full() {
+        // CT-4: the queue is bounded; a worker that never drains it produces
+        // ControlQueueFull, not unbounded memory growth.
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        reserve_capable(&mgr, job_id).await;
+
+        for index in 0..CONTROL_QUEUE_BOUND {
+            mgr.send_prompt(job_id, "user", &format!("prompt {index}"), false)
+                .await
+                .unwrap();
+        }
+        let error = mgr
+            .send_prompt(job_id, "user", "one too many", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OrchestratorError::ExternalWorkerControlQueueFull { .. }
+            ),
+            "full queue must reject, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_enforces_per_job_prompt_cap() {
+        // CT-4: even a worker that drains steadily cannot absorb more than
+        // MAX_CONTROL_PROMPTS_PER_JOB prompts for one job — each accepted
+        // prompt costs job-event rows.
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        reserve_capable(&mgr, job_id).await;
+        let mut rx = {
+            let mut handles = mgr.active_handles.write().await;
+            handles
+                .get_mut(&job_id)
+                .and_then(|h| h.prompt_rx.take())
+                .unwrap()
+        };
+
+        for index in 0..MAX_CONTROL_PROMPTS_PER_JOB {
+            mgr.send_prompt(job_id, "user", &format!("prompt {index}"), false)
+                .await
+                .unwrap();
+            rx.try_recv().unwrap(); // keep the queue drained
+        }
+        let error = mgr
+            .send_prompt(job_id, "user", "past the cap", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OrchestratorError::ExternalWorkerControlQueueFull { .. }
+            ),
+            "per-job cap must reject, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_control_queue_rejects_late_senders_and_drains() {
+        // CT-2: once the read loop exits and closes the queue, late senders
+        // get TaskNotActive instead of a false "queued".
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        reserve_capable(&mgr, job_id).await;
+        mgr.send_prompt(job_id, "user", "in flight", false)
+            .await
+            .unwrap();
+
+        let mut rx = {
+            let mut handles = mgr.active_handles.write().await;
+            handles
+                .get_mut(&job_id)
+                .and_then(|h| h.prompt_rx.take())
+                .unwrap()
+        };
+        close_control_queue(job_id, &mut rx, None).await;
+
+        let error = mgr
+            .send_prompt(job_id, "user", "too late", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OrchestratorError::ExternalWorkerTaskNotActive { .. }),
+            "closed queue must reject, got: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn send_prompt_fails_after_handle_removed() {
         let mgr = control_test_manager();
         let job_id = Uuid::new_v4();
-        mgr.reserve_task(job_id, "harness").await.unwrap();
+        mgr.reserve_task(job_id, "harness", "user").await.unwrap();
         mgr.release_task_reservation(job_id).await;
 
         let result = mgr.send_prompt(job_id, "user", "too late", false).await;
@@ -2791,22 +3272,12 @@ mod tests {
     fn manager_new_with_workers() {
         let mgr = ExternalWorkerManager::new(vec![
             ExternalWorkerConfig {
-                name: "nanocode".to_string(),
-                url: "ws://localhost:9090/ws/agent".to_string(),
                 auth_token: Some(secrecy::SecretString::from("tok")),
-                timeout_ms: 300_000,
-                endpoints: vec![],
-                load_balance: LoadBalanceStrategy::default(),
-                prompt_context: Default::default(),
+                ..ExternalWorkerConfig::test_config("nanocode", "ws://localhost:9090/ws/agent")
             },
             ExternalWorkerConfig {
-                name: "pebble".to_string(),
-                url: "ws://localhost:8443".to_string(),
-                auth_token: None,
                 timeout_ms: 600_000,
-                endpoints: vec![],
-                load_balance: LoadBalanceStrategy::default(),
-                prompt_context: Default::default(),
+                ..ExternalWorkerConfig::test_config("pebble", "ws://localhost:8443")
             },
         ]);
         assert!(!mgr.is_empty());
@@ -3199,10 +3670,6 @@ mod tests {
         use crate::config::WorkerEndpoint;
 
         let mgr = ExternalWorkerManager::new(vec![ExternalWorkerConfig {
-            name: "multi".to_string(),
-            url: "ws://fallback:9090".to_string(),
-            auth_token: None,
-            timeout_ms: 300_000,
             endpoints: vec![
                 WorkerEndpoint {
                     url: "ws://a:9090".to_string(),
@@ -3215,8 +3682,7 @@ mod tests {
                     weight: None,
                 },
             ],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: Default::default(),
+            ..ExternalWorkerConfig::test_config("multi", "ws://fallback:9090")
         }]);
 
         let lb = mgr.load_balancers.get("multi").unwrap();
