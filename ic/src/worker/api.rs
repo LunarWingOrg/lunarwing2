@@ -134,6 +134,20 @@ pub struct McpCredentialResponse {
     pub value: String,
 }
 
+/// A single harness-mode secret file (WI#326): the worker writes the value
+/// to `/run/secrets/<file_name>` on tmpfs. Values never enter the env.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HarnessSecretFileResponse {
+    pub file_name: String,
+    pub value: String,
+}
+
+/// Envelope for the harness-secrets endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HarnessSecretsResponse {
+    pub secrets: Vec<HarnessSecretFileResponse>,
+}
+
 impl WorkerHttpClient {
     /// Create a new client from environment.
     ///
@@ -460,6 +474,48 @@ impl WorkerHttpClient {
                 secret_name: "(mcp)".to_string(),
                 reason: format!("failed to parse MCP credentials response: {e}"),
             })
+    }
+
+    /// Fetch harness-mode secret files granted to this job (WI#326 CV-2).
+    ///
+    /// Returns an empty vec when the job mounts no secrets (204/404). The
+    /// caller verifies the delivered set against LUNARWING_SECRET_FILES and
+    /// fails closed on any mismatch.
+    pub async fn fetch_harness_secrets(
+        &self,
+    ) -> Result<Vec<HarnessSecretFileResponse>, WorkerError> {
+        let resp = self
+            .client
+            .get(self.url("harness-secrets"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| WorkerError::ConnectionFailed {
+                url: self.orchestrator_url.clone(),
+                reason: e.to_string(),
+            })?;
+
+        if resp.status() == reqwest::StatusCode::NO_CONTENT
+            || resp.status() == reqwest::StatusCode::NOT_FOUND
+        {
+            return Ok(vec![]);
+        }
+
+        if !resp.status().is_success() {
+            return Err(WorkerError::SecretResolveFailed {
+                secret_name: "(harness)".to_string(),
+                reason: format!("harness-secrets endpoint returned {}", resp.status()),
+            });
+        }
+
+        let envelope: HarnessSecretsResponse =
+            resp.json()
+                .await
+                .map_err(|e| WorkerError::SecretResolveFailed {
+                    secret_name: "(harness)".to_string(),
+                    reason: format!("failed to parse harness-secrets response: {e}"),
+                })?;
+        Ok(envelope.secrets)
     }
 
     /// Signal job completion to the orchestrator.

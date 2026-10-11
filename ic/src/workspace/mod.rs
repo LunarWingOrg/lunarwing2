@@ -132,7 +132,7 @@ const LOREBOOK_DIR_PREFIX: &str = "lorebooks/";
 const MAX_DAILY_LOG_BACKUP_GENERATIONS: u32 = 8;
 
 /// Returns true if `path` (already normalized) is a system-prompt-injected file.
-fn is_system_prompt_file(path: &str) -> bool {
+pub(crate) fn is_system_prompt_file(path: &str) -> bool {
     SYSTEM_PROMPT_FILES
         .iter()
         .any(|p| path.eq_ignore_ascii_case(p))

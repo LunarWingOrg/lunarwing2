@@ -43,15 +43,21 @@
 pub mod api;
 pub mod auth;
 pub mod external_worker;
+pub mod harness;
 pub mod job_manager;
 pub mod reaper;
 
 pub use api::OrchestratorApi;
 pub use auth::{CredentialGrant, McpCredentialGrant, TokenStore};
 pub use external_worker::{ExternalTaskResult, ExternalWorkerManager};
+pub use harness::{
+    HarnessError, HarnessJobOptions, InjectedFileProvenance, InjectionManifest, InjectionSpec,
+    PromotionRecord, PromotionRejection, PromotionSummary, ResolvedSecretFile, SecretFileMount,
+    SecretValueRedactor, WriteBackPolicy,
+};
 pub use job_manager::{
     CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager,
-    ContainerJobRequest, JobMode, snapshot_worker_mcp,
+    ContainerJobRequest, HarnessJobRequest, HarnessJobState, JobMode, snapshot_worker_mcp,
 };
 pub use reaper::{ReaperConfig, SandboxReaper, sweep_cli_sandboxes_once};
 
@@ -92,6 +98,7 @@ pub async fn setup_orchestrator(
     db: Option<&Arc<dyn Database>>,
     secrets_store: Option<&Arc<dyn SecretsStore + Send + Sync>>,
     context_manager: Option<Arc<crate::context::ContextManager>>,
+    workspace_resolver: Option<Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>>,
 ) -> OrchestratorSetup {
     let prompt_queue = Arc::new(Mutex::new(
         HashMap::<Uuid, VecDeque<api::PendingPrompt>>::new(),
@@ -145,7 +152,25 @@ pub async fn setup_orchestrator(
         if let (Some(etx), Some(cm)) = (&job_event_tx, &context_manager) {
             jm_inner = jm_inner.with_completion_deps(etx.clone(), Arc::clone(cm));
         }
+        // WI#326: harness write-back promotion needs the tenant workspace;
+        // the audit event persists to the sandbox job event log when a DB
+        // is available.
+        if let Some(resolver) = workspace_resolver {
+            jm_inner = jm_inner.with_write_back_deps(resolver, db.cloned());
+        }
         let jm = Arc::new(jm_inner);
+
+        // WI#326 CW-8: harness dirs hold injection snapshots (memory and
+        // opted-in identity documents) and staged writes. Sweep any left
+        // behind by a crash/restart; the sweep only removes dirs with no
+        // live labeled container and a grace period, so in-flight dispatch
+        // is never disturbed.
+        {
+            let jm = Arc::clone(&jm);
+            tokio::spawn(async move {
+                jm.sweep_orphaned_harness_dirs().await;
+            });
+        }
 
         let orchestrator_state = api::OrchestratorState {
             llm: Arc::clone(llm),

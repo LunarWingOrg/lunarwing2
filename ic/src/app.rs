@@ -41,6 +41,9 @@ pub struct AppComponents {
     pub tools: Arc<ToolRegistry>,
     pub embeddings: Option<Arc<dyn EmbeddingProvider>>,
     pub workspace: Option<Arc<Workspace>>,
+    /// Resolves the tenant workspace for a user; shared by memory/knowledge
+    /// tools and harness-mode job injection/write-back (WI#326).
+    pub workspace_resolver: Option<Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>>,
     pub extension_manager: Option<Arc<ExtensionManager>>,
     pub mcp_session_manager: Arc<McpSessionManager>,
     pub mcp_process_manager: Arc<McpProcessManager>,
@@ -340,6 +343,7 @@ impl AppBuilder {
             Arc<ToolRegistry>,
             Option<Arc<dyn EmbeddingProvider>>,
             Option<Arc<Workspace>>,
+            Option<Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>>,
             Option<Arc<dyn crate::tools::SoftwareBuilder>>,
         ),
         anyhow::Error,
@@ -372,6 +376,9 @@ impl AppBuilder {
 
         // Register memory tools if database is available
         let workspace_user_id = self.config.owner_id.as_str();
+        let mut workspace_resolver: Option<
+            Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>,
+        > = None;
         let workspace = if let Some(ref db) = self.db {
             let emb_cache_config = EmbeddingCacheConfig {
                 max_entries: self.config.embeddings.cache_size,
@@ -416,15 +423,18 @@ impl AppBuilder {
                     self.config.workspace.clone(),
                 ));
                 tools.register_memory_tools_with_resolver(pool.clone());
-                tools.register_knowledge_tools_with_resolver(pool);
+                tools.register_knowledge_tools_with_resolver(pool.clone());
+                workspace_resolver = Some(pool);
                 tracing::info!(
                     "Memory tools configured with per-user workspace resolver (multi-tenant mode)"
                 );
             } else {
                 tools.register_memory_tools(Arc::clone(&ws));
-                tools.register_knowledge_tools_with_resolver(Arc::new(
+                let resolver: Arc<dyn crate::tools::builtin::memory::WorkspaceResolver> = Arc::new(
                     crate::tools::builtin::memory::FixedWorkspaceResolver::new(Arc::clone(&ws)),
-                ));
+                );
+                tools.register_knowledge_tools_with_resolver(Arc::clone(&resolver));
+                workspace_resolver = Some(resolver);
             }
 
             Some(ws)
@@ -488,7 +498,14 @@ impl AppBuilder {
             None
         };
 
-        Ok((safety, tools, embeddings, workspace, builder))
+        Ok((
+            safety,
+            tools,
+            embeddings,
+            workspace,
+            workspace_resolver,
+            builder,
+        ))
     }
 
     /// Phase 5: Load WASM tools, MCP servers, and create extension manager.
@@ -1129,7 +1146,8 @@ impl AppBuilder {
         } else {
             self.init_llm().await?
         };
-        let (safety, tools, embeddings, workspace, builder) = self.init_tools(&llm).await?;
+        let (safety, tools, embeddings, workspace, workspace_resolver, builder) =
+            self.init_tools(&llm).await?;
 
         // Create hook registry early so runtime extension activation can register hooks.
         let hooks = Arc::new(HookRegistry::new());
@@ -1477,6 +1495,7 @@ impl AppBuilder {
             tools,
             embeddings,
             workspace,
+            workspace_resolver,
             extension_manager,
             mcp_session_manager,
             mcp_process_manager,
