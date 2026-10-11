@@ -63,7 +63,12 @@
 
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/334 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1514
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/337 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1515
-15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/338
+15. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/338
+    - DONE 2026-10-11 (Rarity, item-15, branch `sweetiebot/kimi-15-20261011-1205`): AE-2 residual fixed in `ic/crates/lunarwing_engine/src/runtime/mission.rs`.
+    - `resolve_stamped_interruption` now mirrors `record_restart_interrupted_thread`'s parity checks — `thread_type == Mission`, `project_id` match, owner match for non-shared missions — plus `mission.thread_history.contains(&thread_id)`; on mismatch the stamp is cleared with a `warn!` and no retry marker or notification is produced.
+    - Same scan-time parity check applied in `recover_pending_mission_retries` and `resume_recoverable_threads`, which trusted `thread_history` blindly (both already checked thread type; project/owner checks added, warn+skip on mismatch).
+    - Tests: stamps naming a foreign user's thread, a non-Mission thread, and an own thread absent from `thread_history` each assert the stamp is cleared with no marker write and no notification; retry recovery over a planted foreign history thread asserts no retry arms and the foreign marker is untouched. `cargo test -p lunarwing_engine --lib -- boot_resolution retry_recovery_skips`: 10/10 pass (includes the 6 pre-existing boot-resolution tests); `cargo clippy -p lunarwing_engine --all-targets -- -D warnings` clean; `cargo fmt --check` clean.
+    - WI#322's `engine/projects/**` write-path reservation deliberately not landed here: it is labeled `2.1.7.0` (next release), appears in no item of this goals file, and the WI#338 cross-link comment frames these parity checks as the residual defense until #322 ships.
 16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/339
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/341
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351
