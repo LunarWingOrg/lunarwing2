@@ -232,8 +232,10 @@ pub struct ExternalWorkerConfig {
     /// (WI#324). Deny-by-default: empty means every `tool_call` frame from
     /// this worker is rejected. Exact tool names only — there is no
     /// wildcard; `ExternalWorkerManager` drops `"*"`, autonomous-denylisted,
-    /// and non-identifier entries at load, and strips the whole list when
-    /// the worker is reached over cleartext `ws://` on a non-loopback host.
+    /// proxy-denylisted, non-identifier, and non-phase-1 entries at load
+    /// (the proxy surface is the positive WI#324 phase-1 capability set,
+    /// MR !1533 DP-2), and strips the whole list when the worker is reached
+    /// over cleartext `ws://` on a non-loopback host.
     pub tool_allowlist: Vec<String>,
 }
 
