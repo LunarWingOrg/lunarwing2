@@ -556,6 +556,15 @@ impl ExternalWorkerConfig {
                 if config.is_cron() && !config.cron_block_valid(&mut seen_mission_ids) {
                     return None;
                 }
+                // A [cron] block on a task-mode worker is ignored — say so
+                // instead of letting the operator believe a mission is armed.
+                if !config.is_cron() && config.cron.is_some() {
+                    tracing::warn!(
+                        worker = %config.name,
+                        "External worker has a [cron] block but mode is not \"cron\"; \
+                         the cron block is ignored (set mode = \"cron\" to arm the mission)"
+                    );
+                }
                 Some(config)
             })
             .collect()

@@ -297,6 +297,12 @@ pub struct ExternalWorkerManager {
     /// touch it) so a command issued right after spawn never races
     /// registration.
     pub(crate) cron_controls: Arc<std::sync::RwLock<HashMap<String, CronMissionControl>>>,
+    /// The daemon owner id cron missions belong to (WI#325), recorded by
+    /// `spawn_cron_supervisors`. Lets the command gate reject non-owners
+    /// with one uniform error before any worker-mode lookup, so the error
+    /// surface cannot be used to probe which workers are cron-mode (MR
+    /// !1522 DE-9).
+    pub(crate) cron_owner_id: std::sync::RwLock<Option<String>>,
 }
 
 impl ExternalWorkerManager {
@@ -342,6 +348,7 @@ impl ExternalWorkerManager {
             store: None,
             active_handles: Arc::new(RwLock::new(HashMap::new())),
             cron_controls: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            cron_owner_id: std::sync::RwLock::new(None),
         }
     }
 

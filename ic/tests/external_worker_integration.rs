@@ -2558,3 +2558,318 @@ async fn cron_tick_events_persist_to_job_events() {
         .expect("cron_tick_end row");
     assert_eq!(end_row.data["outcome"], "completed");
 }
+
+/// MR !1522 DE-3: owner commands are serviced while a tick chain is running
+/// — status and pause must answer immediately, not after the chain ends.
+/// (On the pre-fix loop this test timed out: `run_tick` was awaited inside
+/// the sleep arm, so the command channel was not polled during a tick.)
+#[tokio::test]
+async fn cron_status_and_pause_answer_during_running_tick() {
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CaptureHang {
+        requests: request_tx,
+    })
+    .await;
+    // Long heartbeat: the link stays "alive" for the whole test, so the tick
+    // chain is in its watch phase when the commands arrive.
+    let (mgr, _cm, _shutdown) = spawn_cron_manager(cron_config_for(&url, 300, 3));
+
+    timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+        .await
+        .expect("tick timed out")
+        .expect("tick errored");
+    request_rx.recv().await.expect("dispatch captured");
+
+    // Status during the running tick answers promptly.
+    let status = timeout(TEST_BOUND, mgr.cron_mission_status("mock", "owner-1"))
+        .await
+        .expect("status starved by the running tick")
+        .expect("status");
+    assert_eq!(status.mission_id, "test-mission");
+    assert!(!status.paused);
+
+    // Pause during the running tick applies immediately...
+    timeout(TEST_BOUND, mgr.pause_cron_mission("mock", "owner-1"))
+        .await
+        .expect("pause starved by the running tick")
+        .expect("pause");
+    let status = timeout(TEST_BOUND, mgr.cron_mission_status("mock", "owner-1"))
+        .await
+        .expect("status starved")
+        .expect("status");
+    assert!(status.paused);
+
+    // ...and resume restores it (also immediately).
+    timeout(TEST_BOUND, mgr.resume_cron_mission("mock", "owner-1"))
+        .await
+        .expect("resume starved")
+        .expect("resume");
+    let status = timeout(TEST_BOUND, mgr.cron_mission_status("mock", "owner-1"))
+        .await
+        .expect("status starved")
+        .expect("status");
+    assert!(!status.paused);
+}
+
+/// MR !1522 DE-3: an owner pause stops the re-entry chain at the next link
+/// boundary — a wedged link that lapses while paused is NOT re-dispatched.
+#[tokio::test]
+async fn cron_pause_stops_pending_reentries() {
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CaptureHang {
+        requests: request_tx,
+    })
+    .await;
+    // Short heartbeat so the link lapses quickly; re-entries would follow.
+    let (mgr, _cm, _shutdown) = spawn_cron_manager(cron_config_for(&url, 2, 3));
+
+    timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+        .await
+        .expect("tick timed out")
+        .expect("tick errored");
+    request_rx.recv().await.expect("link 1 captured");
+
+    mgr.pause_cron_mission("mock", "owner-1")
+        .await
+        .expect("pause");
+
+    // Without the boundary check the chain would re-dispatch after the lapse
+    // (~2s) + terminal wait + backoff (~4s). Allow generous slack.
+    assert!(
+        timeout(TEST_BOUND * 2, request_rx.recv()).await.is_err(),
+        "a paused mission must not re-dispatch its tick chain"
+    );
+    let status = mgr
+        .cron_mission_status("mock", "owner-1")
+        .await
+        .expect("status");
+    assert!(status.paused);
+}
+
+/// MR !1522 DE-6: a non-retryable worker rejection abandons the tick with NO
+/// re-dispatch, and three consecutive abandons trip the circuit breaker into
+/// a persisted owner-visible pause.
+#[tokio::test]
+async fn cron_non_retryable_abandons_and_breaker_trips() {
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CaptureFail {
+        requests: request_tx,
+        error: "timeout_ms must be an integer between 1 and 14400000".to_string(),
+    })
+    .await;
+    // High re-entry budget: if non-retryable classification regressed, the
+    // tick would re-dispatch several times instead of abandoning at once.
+    let (mgr, _cm, _shutdown) = spawn_cron_manager(cron_config_for(&url, 30, 5));
+
+    for tick in 1..=3u32 {
+        timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+            .await
+            .expect("tick timed out")
+            .expect("tick errored");
+        let request = timeout(TEST_BOUND, request_rx.recv())
+            .await
+            .expect("dispatch timed out")
+            .expect("dispatch captured");
+        assert_eq!(
+            request["payload"]["context"]["cron_tick"]["chain_index"],
+            0,
+            "tick {tick}: a non-retryable rejection must not re-dispatch"
+        );
+        // No second link for this tick (a wrong re-dispatch would land after
+        // the ~4s chain backoff).
+        assert!(
+            timeout(Duration::from_secs(8), request_rx.recv())
+                .await
+                .is_err(),
+            "tick {tick}: non-retryable rejection must abandon immediately"
+        );
+        let status = mgr
+            .cron_mission_status("mock", "owner-1")
+            .await
+            .expect("status");
+        assert_eq!(status.consecutive_abandoned, tick, "tick {tick}");
+    }
+
+    let status = mgr
+        .cron_mission_status("mock", "owner-1")
+        .await
+        .expect("status");
+    assert!(
+        status.paused,
+        "circuit breaker must pause the mission after 3 consecutive abandons"
+    );
+
+    // Owner resume clears the breaker (and is how the mission recovers).
+    mgr.resume_cron_mission("mock", "owner-1")
+        .await
+        .expect("resume");
+    let status = mgr
+        .cron_mission_status("mock", "owner-1")
+        .await
+        .expect("status");
+    assert!(!status.paused);
+    assert_eq!(status.consecutive_abandoned, 0);
+}
+
+/// MR !1522 DE-6: a terminal tick job's in-memory context is evicted so a
+/// long-lived mission cannot grow the ContextManager without bound (the DB
+/// record remains the durable log).
+#[tokio::test]
+async fn cron_tick_context_is_evicted_after_resolution() {
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+    let (mgr, cm, _shutdown) = spawn_cron_manager(cron_config_for(&url, 30, 0));
+
+    timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+        .await
+        .expect("tick timed out")
+        .expect("tick errored");
+    let request = request_rx.recv().await.expect("dispatch captured");
+    let job_id = Uuid::parse_str(
+        request["payload"]["task_id"]
+            .as_str()
+            .expect("task_id string"),
+    )
+    .expect("task_id uuid");
+
+    // The Capture mock completes the job; the supervisor then persists the
+    // tick end and evicts the context.
+    timeout(TEST_BOUND, async {
+        loop {
+            if cm.get_context(job_id).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("terminal tick context was never evicted");
+}
+
+/// MR !1522 DE-9: for a non-owner caller the gate returns one uniform
+/// `CronMissionNotOwned` error whether the named worker is cron-mode with a
+/// live supervisor, cron-mode with a dead supervisor, or plain task-mode —
+/// the error surface must not reveal worker modes. The owner still gets the
+/// precise distinctions.
+#[tokio::test]
+async fn cron_owner_gate_is_uniform_for_non_owners() {
+    let (request_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+    let mut plain = config_for(&url);
+    plain.name = "plain".to_string();
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_for(&url, 30, 0), plain])
+            .with_event_deps(event_tx, Arc::clone(&context_manager)),
+    );
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+
+    for worker in ["mock", "plain", "nonexistent"] {
+        let err = mgr
+            .fire_cron_tick_now(worker, "someone-else")
+            .await
+            .expect_err("non-owner must be rejected");
+        assert!(
+            matches!(err, OrchestratorError::CronMissionNotOwned { .. }),
+            "non-owner probing {worker} must get the uniform not-owned error, got: {err}"
+        );
+    }
+    // The owner retains the precise distinctions.
+    let err = mgr
+        .fire_cron_tick_now("plain", "owner-1")
+        .await
+        .expect_err("task-mode worker must reject cron fire");
+    assert!(matches!(
+        err,
+        OrchestratorError::ExternalWorkerNotCron { .. }
+    ));
+    mgr.fire_cron_tick_now("mock", "owner-1")
+        .await
+        .expect("owner fire on cron worker succeeds");
+}
+
+/// MR !1522 DE-6: the persisted pause flag and tick counter survive a
+/// supervisor restart — the mission resumes paused with its tick index
+/// intact instead of silently resuming from zero.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_pause_and_tick_counter_survive_restart() {
+    use lunarwing::db::Database;
+    use lunarwing::db::libsql::LibSqlBackend;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join("cron-restart.db"))
+        .await
+        .expect("test db");
+    backend.run_migrations().await.expect("migrations");
+    let db: Arc<dyn Database> = Arc::new(backend);
+
+    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+
+    // First incarnation: per-second schedule; let two ticks fire, then pause.
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr_a = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_with_schedule(&url, "* * * * * *", 30, 0)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown_a, shutdown_rx_a) = tokio::sync::broadcast::channel(1);
+    mgr_a.spawn_cron_supervisors("owner-1", shutdown_rx_a);
+
+    timeout(TEST_BOUND * 2, async {
+        loop {
+            let status = mgr_a
+                .cron_mission_status("mock", "owner-1")
+                .await
+                .expect("status");
+            if status.tick_index >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("two scheduled ticks never fired");
+    mgr_a
+        .pause_cron_mission("mock", "owner-1")
+        .await
+        .expect("pause");
+    let _ = shutdown_a.send(());
+    drop(mgr_a);
+    drop(request_rx);
+
+    // Second incarnation over the same store: paused and tick_index persist.
+    let context_manager_b = Arc::new(ContextManager::new(16));
+    let (event_tx_b, _event_rx_b) = tokio::sync::broadcast::channel(16);
+    let mgr_b = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_with_schedule(&url, "* * * * * *", 30, 0)])
+            .with_event_deps(event_tx_b, Arc::clone(&context_manager_b))
+            .with_store(db.clone()),
+    );
+    let (_shutdown_b, shutdown_rx_b) = tokio::sync::broadcast::channel(1);
+    mgr_b.spawn_cron_supervisors("owner-1", shutdown_rx_b);
+
+    let status = mgr_b
+        .cron_mission_status("mock", "owner-1")
+        .await
+        .expect("status after restart");
+    assert!(status.paused, "persisted pause must survive the restart");
+    assert!(
+        status.tick_index >= 2,
+        "persisted tick counter must survive the restart, got {}",
+        status.tick_index
+    );
+}

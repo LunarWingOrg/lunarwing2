@@ -166,9 +166,11 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   `job_events` (`cron_paused`) and SSE.
 - **Runtime stop (CU-2)** — the owner-gated `cron_mission` tool
   (`pause`/`resume`/`status`, gated exactly like `cancel_job`; AskEachTime
-  permission; v1-only in the engine bridge). `cancel_job` still ends only the
-  current link; `cron_mission pause` stops future fires and pending
-  re-entries, and survives restart.
+  permission). `cancel_job` still ends only the current link;
+  `cron_mission pause` stops future fires and pending re-entries, and
+  survives restart. Known limitation: the tool is v1-only in the engine
+  bridge (`is_v1_only_tool`), so Engine V2 gateway chats get the v1-only
+  redirect error — an Engine V2 cron-mission verb is follow-up work.
 - **Memory growth (CU-2)** — terminal tick contexts are evicted from the
   `ContextManager` once their events are persisted; the durable record lives
   in `agent_jobs` + `job_events` (`job_status` falls back to the DB).
@@ -292,6 +294,9 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   proxied tool path that lets workers call `memory_*`/`knowledge_*`).
 - Hub-mediated cross-thread coordination (KV + advisory locks) — WI#324 phase 2.
 - Audio session capture (no audio path exists in external workers today).
+- Per-tick credential grants: `create_job` can inject named tenant secrets
+  per job; tick jobs currently dispatch with an empty environment and
+  `credential_grants_json = "[]"`. Follow-up if missions need tenant secrets.
 - Worker-side consumption of `cron_tick` beyond the prompt (optional by
   design).
 - A non-test manual-fire surface: `fire_cron_tick_now` is exercised by the

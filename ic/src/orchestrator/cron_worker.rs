@@ -195,6 +195,12 @@ impl ExternalWorkerManager {
         owner_id: &str,
         shutdown_rx: broadcast::Receiver<()>,
     ) {
+        // Record the mission owner up front: the command gate rejects
+        // non-owners uniformly before any worker-mode lookup (MR !1522 DE-9).
+        self.cron_owner_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(owner_id.to_string());
         for worker in self.cron_worker_configs() {
             let Some(cron) = worker.cron.clone() else {
                 tracing::error!(
@@ -333,13 +339,29 @@ impl ExternalWorkerManager {
     }
 
     /// Owner-gated command dispatch to a running mission supervisor. The
-    /// gate mirrors `cancel_job`: only the mission's owning user may drive it.
+    /// gate mirrors `cancel_job`: only the mission's owning user may drive
+    /// it. Non-owners get one uniform `CronMissionNotOwned` error regardless
+    /// of the worker's mode or supervisor state, so the error surface cannot
+    /// be used to probe which workers run cron missions (MR !1522 DE-9).
     async fn send_cron_command(
         &self,
         worker_name: &str,
         owner_id: &str,
         command: CronCommand,
     ) -> Result<(), OrchestratorError> {
+        {
+            let mission_owner = self
+                .cron_owner_id
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mission_owner) = mission_owner.as_deref()
+                && mission_owner != owner_id
+            {
+                return Err(OrchestratorError::CronMissionNotOwned {
+                    worker_name: worker_name.to_string(),
+                });
+            }
+        }
         let tx = {
             let controls = self
                 .cron_controls
@@ -793,7 +815,10 @@ async fn run_tick(
     let mut busy_retries: u32 = 0;
     let mut last_link: Option<Uuid> = None;
     loop {
-        if pause_flag.load(Ordering::SeqCst) {
+        // Owner pause is honored at chain-link boundaries only: a manual fire
+        // always dispatches its first link (the escape hatch works on a
+        // paused mission), but no re-entry fires once paused.
+        if last_link.is_some() && pause_flag.load(Ordering::SeqCst) {
             // Owner paused mid-tick: stop the chain at this boundary. The
             // resolved link's events are already persisted; record the
             // pause-induced end against it so the tick does not look lost.
@@ -1733,6 +1758,117 @@ mod tests {
             "Workspace path escapes WORKSPACE_ROOT: ../etc"
         ));
         assert!(!is_non_retryable("worker exploded"));
+    }
+
+    /// Test TickCtx over an empty manager (no store/context manager: all
+    /// persistence and SSE calls become no-ops).
+    fn test_ctx<'a>(
+        manager: &'a Arc<ExternalWorkerManager>,
+        worker: &'a ExternalWorkerConfig,
+        cron: &'a CronWorkerConfig,
+        last_tick_job_id: &'a Arc<std::sync::Mutex<Option<Uuid>>>,
+    ) -> TickCtx<'a> {
+        TickCtx {
+            manager,
+            worker,
+            cron,
+            mission_id: "pr-digest",
+            owner_id: "owner",
+            last_tick_job_id,
+        }
+    }
+
+    /// MR !1522 DE-6: the circuit breaker must actually trip at the
+    /// threshold, stay latched below it, reset on a resolved tick — and
+    /// busy/capacity skips must NEVER count (DE-2).
+    #[tokio::test]
+    async fn circuit_breaker_counts_abandons_but_not_busy_skips() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let pause = Arc::new(AtomicBool::new(false));
+        let mut state = MissionState::default();
+
+        for _ in 0..10 {
+            after_tick(&ctx, &mut state, &pause, TickEnd::SkippedBusy).await;
+        }
+        assert!(!state.paused, "busy skips must never trip the breaker");
+        assert_eq!(state.consecutive_abandoned, 0);
+
+        for attempt in 1..CIRCUIT_BREAKER_THRESHOLD {
+            after_tick(
+                &ctx,
+                &mut state,
+                &pause,
+                TickEnd::Abandoned {
+                    job_id: Uuid::new_v4(),
+                    reason: format!("abandon {attempt}"),
+                },
+            )
+            .await;
+            assert!(!state.paused, "breaker tripped early at {attempt}");
+            assert_eq!(state.consecutive_abandoned, attempt);
+        }
+        after_tick(
+            &ctx,
+            &mut state,
+            &pause,
+            TickEnd::Abandoned {
+                job_id: Uuid::new_v4(),
+                reason: "final".to_string(),
+            },
+        )
+        .await;
+        assert!(state.paused, "breaker must trip at the threshold");
+        assert!(pause.load(Ordering::SeqCst), "live pause flag must follow");
+
+        // A resolved tick resets the counter.
+        after_tick(&ctx, &mut state, &pause, TickEnd::Resolved).await;
+        assert_eq!(state.consecutive_abandoned, 0);
+    }
+
+    /// MR !1522 DE-6: the busy-retry budget retries exactly MAX_BUSY_RETRIES
+    /// times and then skips the tick (SkippedBusy), never abandoning it.
+    #[tokio::test]
+    async fn busy_retry_budget_exhaustion_skips_without_abandoning() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let mut retries = 0;
+        for expected in 1..=MAX_BUSY_RETRIES {
+            let action = busy_retry_step(
+                &ctx,
+                1,
+                0,
+                None,
+                "Workspace /workspace is already being modified by task x",
+                &mut retries,
+                "busy_retry",
+            )
+            .await;
+            assert!(
+                matches!(action, BusyAction::Retry),
+                "busy retry {expected} must retry"
+            );
+        }
+        let action = busy_retry_step(
+            &ctx,
+            1,
+            0,
+            None,
+            "Workspace /workspace is already being modified by task x",
+            &mut retries,
+            "busy_retry",
+        )
+        .await;
+        assert!(
+            matches!(action, BusyAction::Skip(TickEnd::SkippedBusy)),
+            "exhaustion must skip, not abandon"
+        );
     }
 
     #[test]
