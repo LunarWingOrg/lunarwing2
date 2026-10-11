@@ -124,7 +124,7 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("default-graph advisory guard: ok", result.stdout)
 
-    def test_each_root_uses_locked_offline_default_graph_and_own_cargo_config(self):
+    def test_each_root_uses_locked_default_graph_and_own_cargo_config(self):
         self.real_ic_lock_pins()
         result = self.run_guard()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -133,7 +133,8 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
         for call, root in zip(calls, ("ic", "ic/bridges/xmpp-bridge")):
             cwd, args = call.split("|", 1)
             self.assertEqual(cwd, str(self.root / root))
-            self.assertIn("--locked --offline", args)
+            self.assertIn("--locked", args)
+            self.assertNotIn("--offline", args)  # Pinned git sources need fetching on cold CI caches.
             self.assertIn("-e normal --target all", args)
             self.assertIn(f"--manifest-path {cwd}/Cargo.toml", args)
             self.assertNotIn("--all-features", args)

@@ -20,7 +20,7 @@
 #     If the pin ever leaves the lock (the chain is really cleared), the
 #     guard fails loudly as stale instead of passing vacuously — the entry
 #     and the matching ic/deny.toml ignores must then be removed together.
-#   * A successful `cargo tree --locked --offline -e normal --target all`
+#   * A successful `cargo tree --locked -e normal --target all`
 #     over the DEFAULT-feature graph must not contain the pin at either root:
 #     the ic workspace and the xmpp-bridge satellite (the bridge builds
 #     lunarwing with default features, so its graph is exactly what ships in
@@ -61,9 +61,10 @@ done
 for root in "${lock_roots[@]}"; do
     # Cargo discovers .cargo/config.toml from the working directory, not
     # --manifest-path. Enter each root to honor ic/vendor source replacement.
+    # Git sources are not replaced; allow fetching pinned revisions on cold CI caches.
     # Inspect a successful forward graph: resolver errors must never count
     # as evidence that a vulnerable package is absent.
-    if ! out=$(cd "$root" && taskset -c 0-11 cargo tree --locked --offline \
+    if ! out=$(cd "$root" && taskset -c 0-11 cargo tree --locked \
         -e normal --target all --prefix none --format '{p}' \
         --manifest-path "$root/Cargo.toml" 2>&1); then
         echo "ERROR: failed to inspect $root's DEFAULT-feature production graph." >&2
