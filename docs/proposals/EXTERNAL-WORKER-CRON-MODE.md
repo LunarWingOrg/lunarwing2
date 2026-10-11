@@ -120,8 +120,10 @@ OpenCode/OpenCode2/Pebble have no equivalent wire-protocol maximum. Set
 `cron.tick_timeout_ms` at or below any lower configured Kimi cap: the daemon
 cannot discover that environment value, so a default 4h tick is otherwise
 rejected. A worker-side protocol-validation rejection
-(`timeout_ms must be…`, unresolvable/escaping `project_dir` — both kimi's
-`realpathSync` ENOENT and pebble's wrapped wording are classified) is treated
+(`timeout_ms must be…`, unresolvable/escaping `project_dir` — kimi's raw
+realpathSync failure (Node reports the failing syscall as `lstat`:
+`ENOENT: no such file or directory, lstat …`) and pebble's wrapped wording
+are both classified) is treated
 as **non-retryable**: the tick is abandoned immediately rather than burning
 the re-entry budget on a config error. Missions longer than one link's bound
 are expressed by chaining (the goal text should work in per-tick increments).
@@ -246,7 +248,9 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   every test literal uses `..Default::default()`, so sibling MRs adding
   config fields no longer break this tree in auto-merged code.
 - **DE-5 (per-bridge wording)** — `NON_RETRYABLE_MARKERS` and the busy
-  markers cover both shipped bridges (kimi `realpathSync` ENOENT,
+  markers cover both shipped bridges (kimi/opencode's raw Node
+  realpathSync failure, which names the `lstat` syscall —
+  `ENOENT: no such file or directory, lstat …` —
   "Workspace path escapes WORKSPACE_ROOT", "Worker concurrency limit
   reached"; pebble's wrapped "could not be resolved under WORKSPACE_ROOT").
 - **DE-6 (test realism)** — the sub-minute override test uses a genuinely
@@ -334,7 +338,10 @@ curl --fail -H "Authorization: Bearer $GATEWAY_AUTH_TOKEN" \
   capacity retry exits without creating a phantom job/event; failed job-row
   persistence prevents dispatch. A store-backed regression checks no orphan row.
 - **DN-8:** only the exact Node missing-path shape (`ENOENT: no such file or
-  directory, realpath`) is non-retryable; arbitrary user-task mentions retry.
+  directory, lstat` — Node's JS `realpathSync` reports the failing syscall as
+  `lstat`, not `realpath`; corrected in MR !1531 DQ-2 after the original
+  `realpath` wording matched no shipped bridge) is non-retryable; arbitrary
+  user-task mentions retry.
 - **DO-2 / DO-3:** cap-boundary unit test and positive abandonment assertions;
   live-supervisor tool pause/status/resume success and JSON-shape coverage.
 - **DO-7:** queued-command precedence over shutdown is unit-tested; the

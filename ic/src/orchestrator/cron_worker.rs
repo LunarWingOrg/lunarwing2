@@ -97,16 +97,18 @@ const BUSY_MARKERS: &[&str] = &["already being modified", "Worker concurrency li
 /// Worker-reported markers for protocol/config rejections that retrying can
 /// never fix (bad timeout, unresolvable/escaping project_dir, empty prompt).
 /// Covers both shipped bridges (MR !1522 DE-5): pebble wraps a missing dir as
-/// "could not be resolved under WORKSPACE_ROOT", kimi's realpathSync surfaces
-/// a raw "ENOENT: … realpath …" error, and both use the same
-/// "Workspace path escapes WORKSPACE_ROOT" wording for traversal.
+/// "could not be resolved under WORKSPACE_ROOT", both use the same
+/// "Workspace path escapes WORKSPACE_ROOT" wording for traversal, and on
+/// pre-DN-2 images the kimi/opencode bridges surface Node's raw realpathSync
+/// failure — which names the failing syscall `lstat`, not `realpath`
+/// (MR !1531 DQ-2).
 const NON_RETRYABLE_MARKERS: &[&str] = &[
     "timeout_ms must be",
     "could not be resolved under WORKSPACE_ROOT",
     "Workspace path escapes WORKSPACE_ROOT",
     "Invalid workspace path",
     "Missing or invalid prompt",
-    "ENOENT: no such file or directory, realpath",
+    "ENOENT: no such file or directory, lstat",
 ];
 
 /// Outcome of watching one tick job to resolution (or to a heartbeat lapse).
@@ -1869,8 +1871,9 @@ mod tests {
     }
 
     /// MR !1522 DE-5: busy and non-retryable classification must cover BOTH
-    /// shipped worker bridges' wordings (kimi realpath/ENOENT + concurrency
-    /// cap, pebble's wrapped resolution error, the shared escape wording).
+    /// shipped worker bridges' wordings (kimi/opencode lstat/ENOENT +
+    /// concurrency cap, pebble's wrapped resolution error, the shared escape
+    /// wording).
     #[test]
     fn busy_and_non_retryable_markers_classify() {
         assert!(is_busy(
@@ -1886,9 +1889,11 @@ mod tests {
         assert!(is_non_retryable(
             "project_dir 'missions/x' could not be resolved under WORKSPACE_ROOT: ENOENT"
         ));
-        // kimi: missing mission dir (raw realpathSync failure).
+        // kimi/opencode on pre-DN-2 images: missing mission dir surfaces as
+        // Node's raw realpathSync failure, whose syscall name is `lstat`
+        // (real bridge output shape, MR !1531 DQ-2).
         assert!(is_non_retryable(
-            "ENOENT: no such file or directory, realpath '/workspace/missions/x'"
+            "ENOENT: no such file or directory, lstat '/workspace/missions/x'"
         ));
         // both bridges: traversal out of WORKSPACE_ROOT.
         assert!(is_non_retryable(
