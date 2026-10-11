@@ -16,8 +16,12 @@ docker compose up -d lunarwing-worker
 `AGENT_AUTH_TOKEN` is required in server mode, including loopback deployments;
 Compose rejects a missing value before launching the container. The baked
 default model is the TensorZero gateway function
-`tensorzero::function_name::FrontierCODEK` (OpenAI-compatible endpoint, reached
-over NetBird at `http://cotterhomelab3.netbird.selfhosted:3000/openai/v1`);
+`tensorzero::function_name::FrontierCODEK` (OpenAI-compatible endpoint). Since
+WI#330 the baked `base_url` is a placeholder (`set-kimi-base-url.invalid`)
+that `entrypoint.sh` refuses to run, so a standalone compose deployment must
+also set `KIMI_BASE_URL` in `.env` or the shell to a container-reachable
+endpoint (mt-admin renders it per tenant by default — host loopback and
+overlay MagicDNS names do not work from inside the container). Separately,
 since kimi-code 0.37.2
 the managed `api.kimi.com` provider no longer works for worker prompts. Set
 `KIMI_API_KEY` (or the shared `TENSORZERO_API_KEY`) when the gateway requires

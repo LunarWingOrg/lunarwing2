@@ -57,7 +57,7 @@ The default setup connects directly to the configured upstream TensorZero URL:
 
 ```bash
 LLM_BACKEND=openai_compatible
-LLM_BASE_URL=http://192.168.1.157:3000/openai/v1
+LLM_BASE_URL=http://tensorzero.example.com:3000/openai/v1
 LLM_MODEL=tensorzero::function_name::lunarwing
 ```
 
@@ -113,7 +113,7 @@ daemon to that loopback endpoint:
 ```bash
 PROXY_PORT=<allocated_port>
 PROXY_BIND=127.0.0.1
-TENSORZERO_URL=http://192.168.1.157:3000/openai/v1
+TENSORZERO_URL=http://tensorzero.example.com:3000/openai/v1
 ```
 
 `TENSORZERO_URL` is the upstream instance that the per-tenant proxy forwards to.
@@ -553,7 +553,7 @@ The `state/config.toml` file is auto-seeded on first daemon start. It provides d
 ```toml
 llm_backend = "openai_compatible"
 selected_model = "tensorzero::function_name::lunarwing"
-openai_compatible_base_url = "http://192.168.1.157:3000/openai/v1"
+openai_compatible_base_url = "http://tensorzero.example.com:3000/openai/v1"
 
 [agent]
 name = "tenant"
@@ -667,7 +667,7 @@ These environment variables change the defaults used by `lunarwing-mt-admin.sh` 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUNARWING_MT_TENSORZERO_URL` | `http://192.168.1.157:3000/openai/v1` | Upstream TensorZero URL |
+| `LUNARWING_MT_TENSORZERO_URL` | (empty — required at `add-tenant` since WI#330) | Upstream TensorZero URL |
 | `LUNARWING_MT_GOTIFY_URL` | (empty) | Default Gotify server URL |
 | `LUNARWING_MT_GOTIFY_TITLE` | (empty) | Default Gotify notification title |
 | `LUNARWING_MT_SOURCE_REPO` | (auto-detected) | Source repo to clone from |

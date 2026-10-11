@@ -208,8 +208,8 @@
     }
 
     function stepLLM(b) {
-      b.appendChild(textField(data, 'llm_base_url', 'Daemon LLM base URL override (optional)', {
-        hint: 'Leave blank to use the normal daemon default.',
+      b.appendChild(textField(data, 'llm_base_url', 'LLM base URL (daemon; workers inherit it when container-reachable)', {
+        hint: 'Leave blank only when the host fleet default (LUNARWING_MT_TENSORZERO_URL) is set — add-tenant fails loudly with no endpoint at all (WI#330). Host loopback and overlay MagicDNS names are not inherited by workers.',
       }));
       b.appendChild(selectField(data, 'model_choice', 'LLM model', [
         { value: 'FrontierCODE', label: 'FrontierCODE' },
