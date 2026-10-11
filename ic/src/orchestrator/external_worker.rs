@@ -1466,7 +1466,8 @@ async fn run_external_task(
         let (w, r) = stream.split();
         (w, r, worker_id, capabilities, true)
     } else {
-        let (stream, wid, capabilities) = connect_and_handshake(url, auth_token, worker_name).await?;
+        let (stream, wid, capabilities) =
+            connect_and_handshake(url, auth_token, worker_name).await?;
         let (w, r) = stream.split();
         (w, r, wid, capabilities, false)
     };

@@ -3529,7 +3529,9 @@ mod tests {
         let ewm = Arc::new(ExternalWorkerManager::new(vec![
             ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
         ]));
-        ewm.reserve_task(job_id, "harness", "default").await.unwrap(); // safety: test
+        ewm.reserve_task(job_id, "harness", "default")
+            .await
+            .unwrap(); // safety: test
         ewm.force_control_capability(job_id, ControlCapability::Supported)
             .await;
 
@@ -3566,7 +3568,9 @@ mod tests {
         let ewm = Arc::new(ExternalWorkerManager::new(vec![
             ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
         ]));
-        ewm.reserve_task(job_id, "harness", "default").await.unwrap(); // safety: test
+        ewm.reserve_task(job_id, "harness", "default")
+            .await
+            .unwrap(); // safety: test
         ewm.force_control_capability(job_id, ControlCapability::Unsupported)
             .await;
 

@@ -49,7 +49,7 @@ use lunarwing::context::{ContextManager, JobContext, JobState};
 use lunarwing::error::OrchestratorError;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
-    ConversationMessage, ControlCapability, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
+    ControlCapability, ConversationMessage, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
 };
 use lunarwing::tools::Tool;
 use lunarwing::tools::builtin::CreateJobTool;
@@ -2041,7 +2041,14 @@ async fn control_channel_rejects_prompt_when_worker_lacks_capability() {
     let mgr_c = Arc::clone(&mgr);
     let task = tokio::spawn(async move {
         mgr_c
-            .execute_task(job_id, "mock", "task", Some(10_000), true, TaskContext::default())
+            .execute_task(
+                job_id,
+                "mock",
+                "task",
+                Some(10_000),
+                true,
+                TaskContext::default(),
+            )
             .await
     });
 
