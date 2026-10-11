@@ -863,7 +863,9 @@ validate_llm_url() {  # <url> <label>
   # Tenant envs feed systemd unit renders, where '%' introduces a specifier.
   [[ "$url" != *%* ]] \
     || die "$label must not contain '%' (systemd specifier expansion)"
-  [[ -n "${${url#*://}%%[:/]*}" ]] \
+  # A host is required.
+  local rest="${url#*://}"
+  [[ -n "${rest%%[:/]*}" ]] \
     || die "$label has no host: $url"
 }
 
