@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { test } from "node:test"
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -85,6 +86,23 @@ test("cron bootstrap: a non-directory component is permanent and names the compo
     const context = { project_dir: "missions/pr-digest", cron_tick: { event: "cron.tick" } }
     // ENOTDIR is in the permanent set (DS-2), so the host abandons the tick
     // instead of retrying; the wrap names the failing component (DS-7).
+    assert.throws(
+      () => resolveTaskWorkspace(context, root),
+      /Invalid workspace path for cron tick:.*component 'missions'.*ENOTDIR/,
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("cron bootstrap: a FIFO component fails fast as permanent (pins O_DIRECTORY)", () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-fifo-"))
+  try {
+    execFileSync("mkfifo", [join(root, "missions")])
+    const context = { project_dir: "missions/x", cron_tick: { event: "cron.tick" } }
+    // DS-3: with O_DIRECTORY the FIFO open fails fast with ENOTDIR; without it
+    // the blocking FIFO open would hang the bridge event loop (surfacing only
+    // via the outer test timeout — that hang is the mutation this pins).
     assert.throws(
       () => resolveTaskWorkspace(context, root),
       /Invalid workspace path for cron tick:.*component 'missions'.*ENOTDIR/,

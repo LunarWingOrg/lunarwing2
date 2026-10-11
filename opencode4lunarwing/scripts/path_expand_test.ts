@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -35,6 +36,13 @@ try {
     assert.throws(
       () => resolveTaskWorkspace({ project_dir: "missions/x", cron_tick: { event: "cron.tick" } }, fileRoot),
       /Invalid workspace path for cron tick:.*component 'missions'.*ENOTDIR/,
+    )
+    // DS-3: a FIFO component fails fast with ENOTDIR via O_DIRECTORY; without
+    // it the blocking FIFO open would hang (outer timeout is the only tell).
+    execFileSync("mkfifo", [join(fileRoot, "fifo")])
+    assert.throws(
+      () => resolveTaskWorkspace({ project_dir: "fifo/x", cron_tick: { event: "cron.tick" } }, fileRoot),
+      /Invalid workspace path for cron tick:.*component 'fifo'.*ENOTDIR/,
     )
   } finally {
     rmSync(fileRoot, { recursive: true, force: true })

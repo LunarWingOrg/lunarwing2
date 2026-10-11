@@ -298,6 +298,30 @@ mod tests {
         }
     }
 
+    /// DS-3: a FIFO component must fail fast with ENOTDIR (permanent) —
+    /// without `O_DIRECTORY` the blocking FIFO open would hang the bridge.
+    #[test]
+    fn cron_bootstrap_rejects_fifo_component_fast() {
+        let root = temp_root("cron-fifo");
+        let fifo = root.join("missions");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed: {status}");
+        let context = crate::protocol::TaskContext {
+            project_dir: Some("missions/x".to_string()),
+            cron_tick: Some(serde_json::json!({"event":"cron.tick"})),
+            ..Default::default()
+        };
+        let error = resolve_task_workspace(&context, &root).expect_err("FIFO must be refused");
+        assert!(
+            error.to_string().contains("Invalid workspace path"),
+            "FIFO component must be a permanent failure, got: {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn cron_bootstrap_creates_default_directory_without_following_symlinks() {
         let root = temp_root("cron");
