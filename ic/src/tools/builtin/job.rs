@@ -2178,6 +2178,14 @@ impl Tool for CronMissionTool {
         ApprovalRequirement::UnlessAutoApproved
     }
 
+    /// Never autonomous (WI#325 review): an owner routine processing injected
+    /// content must not be able to silently pause a mission, and `resume`
+    /// resets the runaway circuit breaker — that escape hatch is for the
+    /// interactive owner only. The name is also on `AUTONOMOUS_TOOL_DENYLIST`.
+    fn allows_autonomous_execution(&self) -> bool {
+        false
+    }
+
     fn requires_sanitization(&self) -> bool {
         false
     }
@@ -2552,6 +2560,27 @@ mod tests {
             .await
             .expect_err("unknown action must error"); // safety: test
         assert!(err.to_string().contains("unknown cron_mission action")); // safety: test
+    }
+
+    /// WI#325 (MR !1522 DE-1): cron_mission is lifecycle control — it can
+    /// pause a mission and its `resume` resets the runaway circuit breaker —
+    /// so it must never be reachable from autonomous runs, even when the
+    /// caller's user_id is the owner. Both gates are asserted: the per-tool
+    /// opt-out and the static denylist through `autonomous_allowed_tool_names`.
+    #[tokio::test]
+    async fn cron_mission_tool_is_excluded_from_autonomous_runs() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let tool = CronMissionTool::new(Arc::clone(&manager));
+        assert!(!tool.allows_autonomous_execution());
+        assert!(crate::tools::is_autonomous_tool_denylisted("cron_mission"));
+
+        let registry = Arc::new(crate::tools::ToolRegistry::new());
+        registry.register_sync(Arc::new(CronMissionTool::new(manager)));
+        let allowed = crate::tools::autonomous_allowed_tool_names(&registry, None, "default").await;
+        assert!(
+            !allowed.contains("cron_mission"),
+            "cron_mission must not be available to autonomous runs"
+        );
     }
 
     #[test]

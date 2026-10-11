@@ -66,6 +66,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "list_jobs",
     "job_status",
     "cancel_job",
+    "cron_mission",
     "build_software",
     "tool_search",
     "tool_install",
