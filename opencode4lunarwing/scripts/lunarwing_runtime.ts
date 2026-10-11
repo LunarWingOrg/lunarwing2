@@ -144,6 +144,20 @@ export interface TaskPromptAck {
   accepted: boolean
 }
 
+/**
+ * Shared follow-up queue between the bridge (producer) and the executor
+ * (consumer). The executor sets `closed` when the task is finishing — after
+ * the final turn-boundary drain, no more prompts will be consumed — and when
+ * a `done` prompt is consumed (no further prompts may extend the run). The
+ * bridge rejects frames for a closed/missing queue with `accepted: false` so
+ * the daemon audit reflects the drop instead of a silent loss (MR !1525
+ * DI-4).
+ */
+export interface FollowupQueue {
+  prompts: TaskPrompt[]
+  closed: boolean
+}
+
 export interface ReadyPayload {
   worker_id: string
   version: string

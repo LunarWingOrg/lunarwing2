@@ -18,7 +18,9 @@ import {
   WORKER_VERSION,
   CAPABILITY_TASK_PROMPT,
   type Envelope,
+  type FollowupQueue,
   type TaskPrompt,
+  type TaskPromptAck,
   type TaskRequest,
   type WsState,
 } from "./lunarwing_runtime"
@@ -54,7 +56,9 @@ const activeWorkspaces = new Map<string, string>()
 // WI#328 runtime control channel: queued `task_prompt` follow-ups per running
 // task. The executor drains a task's queue at turn boundaries (session idle),
 // never mid-call — mirroring the daemon's "no mid-prompt injection" contract.
-const activePromptQueues = new Map<string, TaskPrompt[]>()
+// The queue object is shared with the executor, which closes it when the task
+// finishes (or a done prompt is consumed) so late frames are refused.
+const activePromptQueues = new Map<string, FollowupQueue>()
 
 function taskWorkspace(request: TaskRequest): string {
   return resolve(expandWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT))
@@ -170,7 +174,7 @@ async function handleTaskRequest(
   const controller = new AbortController()
   activeTasks.set(request.task_id, { controller, socket: ws, workspace })
   activeWorkspaces.set(workspace, request.task_id)
-  const promptQueue: TaskPrompt[] = []
+  const promptQueue: FollowupQueue = { prompts: [], closed: false }
   activePromptQueues.set(request.task_id, promptQueue)
 
   try {
@@ -210,8 +214,10 @@ function handleCancel(payload: { task_id: string }): void {
  * WI#328: queue a daemon follow-up prompt for a running task and ack it.
  * The ack means "the worker received and queued it" — the executor injects
  * queued prompts at the next turn boundary (session idle), never mid-call.
- * Prompts for unknown/finished tasks are acked with accepted=false so the
- * daemon's audit log reflects the drop instead of a false delivery.
+ * Prompts for unknown/finished tasks — including ones that land after the
+ * executor closed the queue (final drain done, or a done prompt consumed) —
+ * are acked with accepted=false so the daemon's audit log reflects the drop
+ * instead of a false delivery (MR !1525 DI-4).
  */
 function handleTaskPrompt(payload: TaskPrompt, ws: BridgeSocket): void {
   const taskId = typeof payload?.task_id === "string" ? payload.task_id : ""
@@ -219,20 +225,22 @@ function handleTaskPrompt(payload: TaskPrompt, ws: BridgeSocket): void {
   const queue = taskId ? activePromptQueues.get(taskId) : undefined
   const accepted =
     queue !== undefined &&
+    !queue.closed &&
     typeof payload.prompt === "string" &&
     payload.prompt.trim().length > 0 &&
     typeof payload.done === "boolean"
   if (accepted) {
-    queue!.push({ task_id: taskId, seq, prompt: payload.prompt, done: payload.done })
+    queue!.prompts.push({ task_id: taskId, seq, prompt: payload.prompt, done: payload.done })
     console.log(`[bridge] task ${taskId}: follow-up prompt seq=${seq} queued`)
   } else {
-    console.warn(`[bridge] task_prompt rejected (unknown/finished task or invalid payload)`)
+    console.warn(
+      `[bridge] task_prompt rejected (unknown/finished task, closed queue, or invalid payload)`,
+    )
   }
-  ws.send(
-    JSON.stringify(
-      createEnvelope("task_prompt_ack", { task_id: taskId, seq, accepted } as TaskPromptAck),
-    ),
-  )
+  const ack: TaskPromptAck = { task_id: taskId, seq, accepted }
+  // Spread reifies the interface into an object-literal type so it stays
+  // assignable to createEnvelope's Record<string, unknown> under tsc.
+  ws.send(JSON.stringify(createEnvelope("task_prompt_ack", { ...ack })))
 }
 
 // ── Server Role ───────────────────────────────────────────────────────────────
