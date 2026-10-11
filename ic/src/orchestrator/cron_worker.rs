@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -157,6 +158,10 @@ struct TickCtx<'a> {
     cron: &'a CronWorkerConfig,
     mission_id: &'a str,
     owner_id: &'a str,
+    /// Most recent tick job id — used to key owner-command audit events to a
+    /// real job row (`job_events.job_id` references `agent_jobs`). Shared
+    /// with the in-flight tick via a std mutex (never held across `.await`).
+    last_tick_job_id: &'a Arc<std::sync::Mutex<Option<Uuid>>>,
 }
 
 impl ExternalWorkerManager {
@@ -360,9 +365,9 @@ fn validate_cron_schedule(schedule: &str) -> Result<(), String> {
 }
 
 /// The per-mission loop: wait for each scheduled fire, then run the tick's
-/// job chain to resolution before computing the next fire. Commands from
-/// `fire_cron_tick_now`/`pause_cron_mission`/`resume_cron_mission` are
-/// serviced in the same select so everything stays serialized.
+/// job chain to resolution before computing the next fire. Owner commands are
+/// serviced while the loop waits AND while a tick chain runs (MR !1522 DE-3),
+/// so pause/resume/status are never starved by a long-running chain.
 async fn run_cron_mission(
     manager: Arc<ExternalWorkerManager>,
     worker: ExternalWorkerConfig,
@@ -372,14 +377,19 @@ async fn run_cron_mission(
     mut shutdown_rx: broadcast::Receiver<()>,
     mut cmd_rx: mpsc::Receiver<CronCommand>,
 ) -> MissionExit {
+    let last_tick_job_id = Arc::new(std::sync::Mutex::new(None));
     let ctx = TickCtx {
         manager: &manager,
         worker: &worker,
         cron: &cron,
         mission_id: &mission_id,
         owner_id: &owner_id,
+        last_tick_job_id: &last_tick_job_id,
     };
     let mut state = load_mission_state(manager.store_handle(), &owner_id, &mission_id).await;
+    // Shared with the in-flight tick chain: an owner pause stops further
+    // re-entries at the next link boundary, not only after the chain ends.
+    let pause_flag = Arc::new(AtomicBool::new(state.paused));
     if state.paused {
         tracing::info!(
             worker = %worker.name,
@@ -389,18 +399,19 @@ async fn run_cron_mission(
     }
     loop {
         if state.paused {
-            tokio::select! {
-                command = cmd_rx.recv() => {
-                    let Some(command) = command else {
-                        return MissionExit::Shutdown;
-                    };
-                    if handle_command(&ctx, &mut state, command, &mut shutdown_rx).await
-                        == CommandOutcome::Shutdown
-                    {
-                        return MissionExit::Shutdown;
-                    }
-                }
+            let command = tokio::select! {
+                command = cmd_rx.recv() => command,
                 _ = shutdown_rx.recv() => return MissionExit::Shutdown,
+            };
+            let Some(command) = command else {
+                return MissionExit::Shutdown;
+            };
+            if handle_idle_command(&ctx, &mut state, &pause_flag, command).await
+                == IdleAction::FireNow
+                && !drive_tick(&ctx, &mut state, &pause_flag, 0, &mut cmd_rx, &mut shutdown_rx)
+                    .await
+            {
+                return MissionExit::Shutdown;
             }
             continue;
         }
@@ -414,26 +425,16 @@ async fn run_cron_mission(
             next_fire_at = %fire_at.to_rfc3339(),
             "Cron mission awaiting next tick"
         );
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {
-                state.tick_index += 1;
-                persist_tick_counter(ctx.manager, &owner_id, &mission_id, state.tick_index).await;
-                let tick_index = state.tick_index;
-                match run_tick(&ctx, tick_index, &mut shutdown_rx).await {
-                    Some(end) => after_tick(&ctx, &mut state, end).await,
-                    None => return MissionExit::Shutdown,
-                }
-            }
-            command = cmd_rx.recv() => {
-                let Some(command) = command else {
-                    return MissionExit::Shutdown;
-                };
-                if handle_command(&ctx, &mut state, command, &mut shutdown_rx).await
-                    == CommandOutcome::Shutdown
-                {
-                    return MissionExit::Shutdown;
-                }
-            }
+        enum Wake {
+            Tick,
+            Command(CronCommand),
+        }
+        let wake = tokio::select! {
+            _ = tokio::time::sleep(wait) => Wake::Tick,
+            command = cmd_rx.recv() => match command {
+                Some(command) => Wake::Command(command),
+                None => return MissionExit::Shutdown,
+            },
             _ = shutdown_rx.recv() => {
                 tracing::info!(
                     worker = %worker.name,
@@ -442,71 +443,248 @@ async fn run_cron_mission(
                 );
                 return MissionExit::Shutdown;
             }
+        };
+        let tick_index = match wake {
+            Wake::Tick => {
+                state.tick_index += 1;
+                persist_tick_counter(ctx.manager, &owner_id, &mission_id, state.tick_index).await;
+                state.tick_index
+            }
+            Wake::Command(command) => {
+                match handle_idle_command(&ctx, &mut state, &pause_flag, command).await {
+                    IdleAction::Continue => continue,
+                    // Manual fires use tick_index 0 as a manual/test trigger
+                    // marker; the durable counter is not advanced.
+                    IdleAction::FireNow => 0,
+                }
+            }
+        };
+        if !drive_tick(
+            &ctx,
+            &mut state,
+            &pause_flag,
+            tick_index,
+            &mut cmd_rx,
+            &mut shutdown_rx,
+        )
+        .await
+        {
+            return MissionExit::Shutdown;
         }
     }
 }
 
-/// Whether the mission loop should keep running after a command.
-#[derive(Debug, PartialEq, Eq)]
-enum CommandOutcome {
-    Continue,
-    Shutdown,
-}
-
-/// Handle one supervisor command. `FireNow` runs a manual tick (tick_index 0)
-/// even while paused — an operator trigger is the point of the escape hatch.
-async fn handle_command(
+/// Run one tick to resolution while still servicing owner commands, so a
+/// multi-hour chain does not starve pause/resume/status (MR !1522 DE-3).
+/// Returns false when daemon shutdown interrupted the tick.
+async fn drive_tick(
     ctx: &TickCtx<'_>,
     state: &mut MissionState,
-    command: CronCommand,
+    pause_flag: &Arc<AtomicBool>,
+    tick_index: u64,
+    cmd_rx: &mut mpsc::Receiver<CronCommand>,
     shutdown_rx: &mut broadcast::Receiver<()>,
-) -> CommandOutcome {
+) -> bool {
+    let mut tick_shutdown = shutdown_rx.resubscribe();
+    let tick = run_tick(ctx, tick_index, &mut tick_shutdown, pause_flag);
+    tokio::pin!(tick);
+    let end = loop {
+        tokio::select! {
+            end = &mut tick => break end,
+            command = cmd_rx.recv() => {
+                let Some(command) = command else {
+                    return false;
+                };
+                handle_active_command(ctx, state, pause_flag, command).await;
+            }
+            _ = shutdown_rx.recv() => {
+                // The tick's own resubscription observes the same signal and
+                // cancels the in-flight link with the shutdown reason; awaiting
+                // it lets that cleanup finish before the supervisor exits.
+                let _ = tick.await;
+                return false;
+            }
+        }
+    };
+    let Some(end) = end else {
+        return false;
+    };
+    after_tick(ctx, state, pause_flag, end).await;
+    true
+}
+
+/// What the mission loop should do after an idle-time command.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleAction {
+    Continue,
+    /// A manual/test trigger (`tick_index` 0) — allowed even while paused;
+    /// being able to fire a paused mission by hand is the point of the
+    /// escape hatch. The mission stays paused afterwards.
+    FireNow,
+}
+
+/// Handle one owner command while no tick is running.
+async fn handle_idle_command(
+    ctx: &TickCtx<'_>,
+    state: &mut MissionState,
+    pause_flag: &Arc<AtomicBool>,
+    command: CronCommand,
+) -> IdleAction {
     match command {
         CronCommand::FireNow => {
             tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, "Manual cron tick fired");
-            match run_tick(ctx, 0, shutdown_rx).await {
-                Some(end) => {
-                    after_tick(ctx, state, end).await;
-                    CommandOutcome::Continue
-                }
-                None => CommandOutcome::Shutdown,
-            }
+            IdleAction::FireNow
         }
         CronCommand::Pause => {
-            state.paused = true;
-            persist_paused(ctx.manager, ctx.owner_id, ctx.mission_id, true).await;
-            tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, "Cron mission paused by owner");
-            CommandOutcome::Continue
+            apply_owner_pause(ctx, state, pause_flag).await;
+            IdleAction::Continue
         }
         CronCommand::Resume => {
-            state.paused = false;
-            state.consecutive_abandoned = 0;
-            persist_paused(ctx.manager, ctx.owner_id, ctx.mission_id, false).await;
-            tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, "Cron mission resumed by owner");
-            CommandOutcome::Continue
+            apply_owner_resume(ctx, state, pause_flag).await;
+            IdleAction::Continue
         }
         CronCommand::Status(reply) => {
-            let _ = reply.send(CronMissionStatus {
-                mission_id: ctx.mission_id.to_string(),
-                worker_name: ctx.worker.name.clone(),
-                paused: state.paused,
-                tick_index: state.tick_index,
-                consecutive_abandoned: state.consecutive_abandoned,
-            });
-            CommandOutcome::Continue
+            reply_status(ctx, state, reply);
+            IdleAction::Continue
         }
     }
+}
+
+/// Handle one owner command while a tick chain is running. Pause applies at
+/// the next chain-link boundary (it never cancels the running link — that is
+/// `cancel_job`'s job); a manual fire is skipped because a mission never
+/// overlaps itself.
+async fn handle_active_command(
+    ctx: &TickCtx<'_>,
+    state: &mut MissionState,
+    pause_flag: &Arc<AtomicBool>,
+    command: CronCommand,
+) {
+    match command {
+        CronCommand::FireNow => {
+            tracing::warn!(
+                worker = %ctx.worker.name,
+                mission_id = %ctx.mission_id,
+                "Manual cron tick requested while a tick is running; skipped \
+                 (a mission never overlaps itself)"
+            );
+        }
+        CronCommand::Pause => apply_owner_pause(ctx, state, pause_flag).await,
+        CronCommand::Resume => apply_owner_resume(ctx, state, pause_flag).await,
+        CronCommand::Status(reply) => reply_status(ctx, state, reply),
+    }
+}
+
+fn reply_status(
+    ctx: &TickCtx<'_>,
+    state: &MissionState,
+    reply: tokio::sync::oneshot::Sender<CronMissionStatus>,
+) {
+    let _ = reply.send(CronMissionStatus {
+        mission_id: ctx.mission_id.to_string(),
+        worker_name: ctx.worker.name.clone(),
+        paused: state.paused,
+        tick_index: state.tick_index,
+        consecutive_abandoned: state.consecutive_abandoned,
+    });
+}
+
+/// Pause the mission on the owner's command: flip the live flag the
+/// in-flight tick chain observes, persist the pause (restart-safe), and
+/// record an auditable `cron_paused` event + SSE frame (MR !1522 DE-1 —
+/// owner lifecycle commands must not leave only an `info!` line).
+async fn apply_owner_pause(
+    ctx: &TickCtx<'_>,
+    state: &mut MissionState,
+    pause_flag: &Arc<AtomicBool>,
+) {
+    state.paused = true;
+    pause_flag.store(true, Ordering::SeqCst);
+    persist_paused(ctx.manager, ctx.owner_id, ctx.mission_id, true).await;
+    tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, "Cron mission paused by owner");
+    record_lifecycle_event(
+        ctx,
+        "cron_paused",
+        serde_json::json!({
+            "mission_id": ctx.mission_id,
+            "origin": "owner_command",
+        }),
+        format!("cron mission {} paused by owner", ctx.mission_id),
+    )
+    .await;
+}
+
+/// Resume the mission on the owner's command and reset the circuit breaker.
+async fn apply_owner_resume(
+    ctx: &TickCtx<'_>,
+    state: &mut MissionState,
+    pause_flag: &Arc<AtomicBool>,
+) {
+    state.paused = false;
+    state.consecutive_abandoned = 0;
+    pause_flag.store(false, Ordering::SeqCst);
+    persist_paused(ctx.manager, ctx.owner_id, ctx.mission_id, false).await;
+    tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, "Cron mission resumed by owner");
+    record_lifecycle_event(
+        ctx,
+        "cron_resumed",
+        serde_json::json!({
+            "mission_id": ctx.mission_id,
+            "origin": "owner_command",
+        }),
+        format!("cron mission {} resumed by owner", ctx.mission_id),
+    )
+    .await;
+}
+
+/// Persist a mission lifecycle event (`cron_paused` / `cron_resumed`) keyed
+/// to the mission's most recent tick job, plus the matching SSE frame. A
+/// mission that has never ticked has no job row to key the event to (the
+/// `job_events.job_id` foreign key requires one), so the tracing line above
+/// is the record in that case.
+async fn record_lifecycle_event(
+    ctx: &TickCtx<'_>,
+    event_type: &str,
+    value: serde_json::Value,
+    sse_message: String,
+) {
+    let job_id = last_tick_job(ctx);
+    let Some(job_id) = job_id else {
+        tracing::info!(
+            worker = %ctx.worker.name,
+            mission_id = %ctx.mission_id,
+            %event_type,
+            "Mission lifecycle event before the first tick; no job row to key it to"
+        );
+        return;
+    };
+    persist_cron_event(ctx.manager.store_handle(), job_id, event_type, value).await;
+    emit_cron_status(ctx.manager, job_id, ctx.owner_id, sse_message);
+}
+
+/// The mission's most recent tick job, if any.
+fn last_tick_job(ctx: &TickCtx<'_>) -> Option<Uuid> {
+    *ctx
+        .last_tick_job_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Update circuit-breaker state after a scheduled tick resolves; trips into
 /// a persisted pause after `CIRCUIT_BREAKER_THRESHOLD` consecutive abandons.
-async fn after_tick(ctx: &TickCtx<'_>, state: &mut MissionState, end: TickEnd) {
+async fn after_tick(
+    ctx: &TickCtx<'_>,
+    state: &mut MissionState,
+    pause_flag: &Arc<AtomicBool>,
+    end: TickEnd,
+) {
     match end {
         TickEnd::Resolved => state.consecutive_abandoned = 0,
         TickEnd::Abandoned { job_id, reason } => {
             state.consecutive_abandoned += 1;
             if state.consecutive_abandoned >= CIRCUIT_BREAKER_THRESHOLD {
                 state.paused = true;
+                pause_flag.store(true, Ordering::SeqCst);
                 persist_paused(ctx.manager, ctx.owner_id, ctx.mission_id, true).await;
                 tracing::error!(
                     worker = %ctx.worker.name,
@@ -520,7 +698,7 @@ async fn after_tick(ctx: &TickCtx<'_>, state: &mut MissionState, end: TickEnd) {
                     "cron_paused",
                     serde_json::json!({
                         "mission_id": ctx.mission_id,
-                        "reason": "circuit_breaker",
+                        "origin": "circuit_breaker",
                         "consecutive_abandoned": state.consecutive_abandoned,
                         "last_abandon_reason": reason,
                         "schedule": ctx.cron.schedule,
@@ -570,20 +748,51 @@ fn next_fire_or_log(worker_name: &str, schedule: &str) -> Option<chrono::DateTim
 /// Run one tick as a chain of bounded jobs: dispatch, watch, and re-dispatch
 /// on wedge/failure up to `max_reentries` times, with exponential backoff
 /// between links. Every chain link is a fresh job id so `job_events` shows
-/// each attempt; the mission id links the chain. Returns `None` when daemon
-/// shutdown interrupted the tick.
+/// each attempt; the mission id links the chain. An owner pause observed at a
+/// link boundary stops the chain (the running link is never cancelled — that
+/// is `cancel_job`'s job). Returns `None` when daemon shutdown interrupted
+/// the tick.
 async fn run_tick(
     ctx: &TickCtx<'_>,
     tick_index: u64,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    pause_flag: &Arc<AtomicBool>,
 ) -> Option<TickEnd> {
     let manager = ctx.manager;
     let cron = ctx.cron;
     let max_reentries = cron.max_reentries();
     let mut chain_index: u32 = 0;
     let mut busy_retries: u32 = 0;
+    let mut last_link: Option<Uuid> = None;
     loop {
+        if pause_flag.load(Ordering::SeqCst) {
+            // Owner paused mid-tick: stop the chain at this boundary. The
+            // resolved link's events are already persisted; record the
+            // pause-induced end against it so the tick does not look lost.
+            if let Some(job_id) = last_link {
+                persist_cron_event(
+                    manager.store_handle(),
+                    job_id,
+                    "cron_tick_end",
+                    serde_json::json!({
+                        "mission_id": ctx.mission_id,
+                        "tick_index": tick_index,
+                        "chain_index": chain_index,
+                        "outcome": "paused",
+                    }),
+                )
+                .await;
+            }
+            tracing::info!(
+                worker = %ctx.worker.name,
+                mission_id = %ctx.mission_id,
+                tick_index,
+                "Cron tick chain stopped at link boundary: mission paused"
+            );
+            return Some(TickEnd::Resolved);
+        }
         let job_id = Uuid::new_v4();
+        last_link = Some(job_id);
         dispatch_tick_job(ctx, tick_index, chain_index, job_id).await;
 
         let Some(outcome) = watch_tick_job(ctx, job_id, shutdown_rx).await else {
@@ -625,6 +834,7 @@ async fn run_tick(
             job_id,
             &outcome,
             max_reentries,
+            shutdown_rx,
         )
         .await
         {
@@ -744,12 +954,13 @@ async fn prepare_reentry(
     job_id: Uuid,
     outcome: &TickOutcome,
     max_reentries: u32,
+    shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> Reentry {
     if matches!(outcome, TickOutcome::HeartbeatLapse) {
         ctx.manager
             .cancel_task_with_reason(job_id, CancelReason::CronSupervisor)
             .await;
-        await_terminal(ctx.manager, job_id).await;
+        await_terminal(ctx.manager, job_id, shutdown_rx).await;
     }
     if let TickOutcome::Failed(reason) = outcome
         && is_non_retryable(reason)
@@ -872,8 +1083,13 @@ async fn backoff_sleep(attempt: u32, shutdown_rx: &mut broadcast::Receiver<()>) 
 
 /// Wait (bounded) for a cancelled tick job to reach a terminal state so the
 /// next link does not dispatch while the old runner still owns the worker
-/// workspace (CU-1).
-async fn await_terminal(manager: &ExternalWorkerManager, job_id: Uuid) {
+/// workspace (CU-1). Returns early on daemon shutdown — the bounded wait must
+/// not hold the supervisor loop hostage (MR !1522 CU-6 residue).
+async fn await_terminal(
+    manager: &ExternalWorkerManager,
+    job_id: Uuid,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) {
     let Some(cm) = manager.context_manager_handle() else {
         return;
     };
@@ -901,7 +1117,10 @@ async fn await_terminal(manager: &ExternalWorkerManager, job_id: Uuid) {
             );
             return;
         }
-        tokio::time::sleep(TERMINAL_POLL).await;
+        tokio::select! {
+            _ = tokio::time::sleep(TERMINAL_POLL) => {}
+            _ = shutdown_rx.recv() => return,
+        }
     }
 }
 
@@ -914,6 +1133,7 @@ async fn dispatch_tick_job(ctx: &TickCtx<'_>, tick_index: u64, chain_index: u32,
         cron,
         mission_id,
         owner_id,
+        last_tick_job_id: _,
     } = *ctx;
     if let Err(error) = manager.reserve_task(job_id, &worker.name).await {
         tracing::warn!(%job_id, worker = %worker.name, "Cron tick reservation failed: {error}");
@@ -948,6 +1168,12 @@ async fn dispatch_tick_job(ctx: &TickCtx<'_>, tick_index: u64, chain_index: u32,
     }
 
     persist_tick_record(manager, worker, cron, job_id, owner_id, &description).await;
+    // Record the link as the mission's most recent job so owner-command
+    // audit events (cron_paused/cron_resumed) have a job row to key to.
+    ctx.last_tick_job_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(job_id);
 
     let fired_at = Utc::now().to_rfc3339();
     let mut context = build_task_context(
