@@ -84,6 +84,17 @@ pub struct OrchestratorSetup {
     pub docker_status: crate::sandbox::DockerStatus,
 }
 
+/// Dependencies for the WI#324 proxied tool path: when present, external
+/// workers may invoke their allowlisted in-process tools over the task
+/// WebSocket control channel. Hooks are required so proxied calls pass the
+/// same `BeforeToolCall` operator policy as every other autonomous path
+/// (MR !1506 review CQ-1).
+pub struct ToolProxyDeps {
+    pub tools: Arc<crate::tools::ToolRegistry>,
+    pub safety: Arc<crate::safety::SafetyLayer>,
+    pub hooks: Arc<crate::hooks::HookRegistry>,
+}
+
 /// Detect Docker availability, create the container job manager, and start
 /// the orchestrator internal API in the background.
 pub async fn setup_orchestrator(
@@ -92,6 +103,7 @@ pub async fn setup_orchestrator(
     db: Option<&Arc<dyn Database>>,
     secrets_store: Option<&Arc<dyn SecretsStore + Send + Sync>>,
     context_manager: Option<Arc<crate::context::ContextManager>>,
+    tool_proxy_deps: Option<ToolProxyDeps>,
 ) -> OrchestratorSetup {
     let prompt_queue = Arc::new(Mutex::new(
         HashMap::<Uuid, VecDeque<api::PendingPrompt>>::new(),
@@ -179,6 +191,13 @@ pub async fn setup_orchestrator(
         }
         if let Some(store) = db {
             mgr = mgr.with_store(Arc::clone(store));
+        }
+        if let Some(deps) = tool_proxy_deps {
+            mgr = mgr.with_tool_proxy(external_worker::ToolProxy::new(
+                deps.tools,
+                deps.safety,
+                deps.hooks,
+            ));
         }
         Some(Arc::new(mgr))
     } else {

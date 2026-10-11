@@ -228,6 +228,31 @@ pub struct ExternalWorkerConfig {
     pub load_balance: LoadBalanceStrategy,
     /// Bounds applied when recent conversation context is requested.
     pub prompt_context: PromptContextLimits,
+    /// Per-worker tool capability allowlist for the proxied tool path
+    /// (WI#324). Deny-by-default: empty means every `tool_call` frame from
+    /// this worker is rejected. Exact tool names only — there is no
+    /// wildcard; `ExternalWorkerManager` drops `"*"`, autonomous-denylisted,
+    /// and non-identifier entries at load, and strips the whole list when
+    /// the worker is reached over cleartext `ws://` on a non-loopback host.
+    pub tool_allowlist: Vec<String>,
+}
+
+impl Default for ExternalWorkerConfig {
+    /// Sensible standalone defaults (used by tests and by struct-update
+    /// literals so added fields do not break every construction site).
+    /// `timeout_ms` matches the settings-layer external-worker default.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            auth_token: None,
+            timeout_ms: 3_600_000,
+            endpoints: Vec::new(),
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: PromptContextLimits::default(),
+            tool_allowlist: Vec::new(),
+        }
+    }
 }
 
 impl ExternalWorkerConfig {
@@ -255,6 +280,7 @@ impl ExternalWorkerConfig {
                     endpoints: ew.endpoints.clone(),
                     load_balance: ew.load_balance.clone(),
                     prompt_context,
+                    tool_allowlist: ew.tool_allowlist.clone(),
                 }
             })
             .collect()
