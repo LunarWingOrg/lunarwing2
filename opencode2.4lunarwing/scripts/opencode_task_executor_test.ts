@@ -1,12 +1,16 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 
 import type { OpenCodeClient } from "@opencode/client/promise"
 
 import { executeTask } from "./opencode_task_executor.ts"
 import type { TaskRequest } from "./lunarwing_runtime.ts"
 import {
+  BRIDGE_SDK_EVENTS,
   BRIDGE_SDK_METHODS,
   STALE_SDK_METHODS,
+  extractEventTypes,
+  extractSdkCallPaths,
   mockMethodPaths,
   resolveMethod,
 } from "./sdk_surface.ts"
@@ -149,17 +153,33 @@ function makeSdk(options: MockOptions = {}) {
   }
 }
 
-// The mock must implement EXACTLY the shared sdk_surface.ts list — the same
-// list the image-build gate (sdk_surface_assert.ts) asserts against the real
-// pinned client (WI#329). A bridge call added without updating the list, a
-// mock path that drifted from it, or a stale path sneaking onto the mock all
-// fail here, so the two gates cannot diverge.
+// Three-way binding (WI#329, !1512 CY-1/CY-2): the shared sdk_surface.ts
+// lists must match BOTH the injected mock AND the executor source's real
+// call sites / event literals — and the image-build gate
+// (sdk_surface_assert.ts) asserts the same lists against the real pinned
+// client, so list, mock, bridge, and pinned SDK cannot drift apart. A
+// bridge call added without updating the list fails here (this is the
+// WI#320 F7 class: a non-existent method whose TypeError a fallback
+// swallows); a mock path that drifted from the list or a stale path
+// sneaking onto the mock fails here too.
 {
   const surface = mockMethodPaths(makeSdk().sdk)
   assert.deepEqual(surface, [...BRIDGE_SDK_METHODS].sort())
   for (const path of STALE_SDK_METHODS) {
     assert.equal(resolveMethod(makeSdk().sdk, path), undefined, `mock exposes stale path ${path}`)
   }
+
+  const executorSource = readFileSync(new URL("./opencode_task_executor.ts", import.meta.url), "utf8")
+  assert.deepEqual(
+    extractSdkCallPaths(executorSource),
+    [...BRIDGE_SDK_METHODS].sort(),
+    "executor sdk.*(...) call sites differ from BRIDGE_SDK_METHODS — update sdk_surface.ts",
+  )
+  assert.deepEqual(
+    extractEventTypes(executorSource),
+    [...BRIDGE_SDK_EVENTS].sort(),
+    "executor event.type literals differ from BRIDGE_SDK_EVENTS — update sdk_surface.ts",
+  )
 }
 
 async function runTask(sdk: OpenCodeClient, request?: TaskRequest) {
