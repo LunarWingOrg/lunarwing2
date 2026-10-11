@@ -1032,6 +1032,90 @@ async fn reconcile_pending_gate_state(
     Ok(())
 }
 
+/// A pending gate stays actionable only while its owning thread is parked on
+/// it: the thread must exist, still be `Waiting`, and belong to the gate's
+/// user — the same validity rule boot-time [`reconcile_pending_gate_state`]
+/// enforces (WI#332). A store read error treats the gate as live so a
+/// transient failure neither hides it from the UI nor drops it prematurely.
+async fn gate_thread_is_live(store: &Arc<dyn Store>, gate: &PendingGate) -> bool {
+    match store.load_thread(gate.thread_id).await {
+        Ok(Some(thread)) => {
+            thread.state == lunarwing_engine::ThreadState::Waiting
+                && thread.is_owned_by(&gate.user_id)
+        }
+        Ok(None) => false,
+        Err(error) => {
+            debug!(
+                thread_id = %gate.thread_id,
+                %error,
+                "pending-gate liveness check failed; treating gate as live"
+            );
+            true
+        }
+    }
+}
+
+/// Drop gates whose owning thread is gone or no longer `Waiting` (WI#332).
+async fn filter_live_pending_gates(
+    store: &Arc<dyn Store>,
+    gates: Vec<PendingGate>,
+) -> Vec<PendingGate> {
+    let mut live = Vec::with_capacity(gates.len());
+    for gate in gates {
+        if gate_thread_is_live(store, &gate).await {
+            live.push(gate);
+        }
+    }
+    live
+}
+
+/// Discard pending gates whose owning thread vanished or left `Waiting`
+/// without the gate being resolved (WI#332). Returns the discarded gates so
+/// the caller can clear them from connected gateway clients. A gate already
+/// consumed by an in-flight resolution is gone from the store, so `NotFound`
+/// is the common no-op and not an error.
+async fn discard_gates_with_dead_threads(state: &EngineState) -> Vec<PendingGate> {
+    let mut discarded = Vec::new();
+    for gate in state.pending_gates.list_all().await {
+        if gate_thread_is_live(&state.store, &gate).await {
+            continue;
+        }
+        match state.pending_gates.discard(&gate.key()).await {
+            Ok(()) => discarded.push(gate),
+            Err(crate::gate::store::GateStoreError::NotFound) => {}
+            Err(error) => {
+                debug!(
+                    thread_id = %gate.thread_id,
+                    %error,
+                    "engine v2: failed to discard dead-thread gate"
+                );
+            }
+        }
+    }
+    discarded
+}
+
+/// Tell connected gateway clients that a discarded gate is gone so any open
+/// approval prompt clears (same shape as the expiry path's `GateResolved`).
+fn broadcast_dead_gate_resolutions(state: &EngineState, discarded: &[PendingGate]) {
+    let Some(ref sse) = state.sse else {
+        return;
+    };
+    for gate in discarded {
+        sse.broadcast_for_user(
+            &gate.user_id,
+            AppEvent::GateResolved {
+                request_id: gate.request_id.to_string(),
+                gate_name: gate.gate_name.clone(),
+                tool_name: gate.action_name.clone(),
+                resolution: "thread_terminated".into(),
+                message: "The gated thread ended before this request was resolved.".into(),
+                thread_id: Some(gate.thread_id.to_string()),
+            },
+        );
+    }
+}
+
 /// How an expired gate was disposed of inside its key reservation.
 enum ExpiredGateDisposition {
     /// The paused thread was resumed with an injected expiry result; a
@@ -2002,14 +2086,23 @@ pub async fn get_engine_pending_gate(
     };
 
     match resolve_pending_gate_for_user(&state.pending_gates, user_id, thread_id).await {
-        PendingGateResolution::Resolved(gate) => Ok(Some(
-            crate::gate::pending::PendingGateView::from(gate.as_ref()),
-        )),
-        PendingGateResolution::None | PendingGateResolution::Ambiguous => Ok(None),
+        // WI#332: never surface a gate whose owning thread is already gone
+        // or terminal — the reconnect path would re-arm a dead prompt.
+        PendingGateResolution::Resolved(gate) if gate_thread_is_live(&state.store, &gate).await => {
+            Ok(Some(crate::gate::pending::PendingGateView::from(
+                gate.as_ref(),
+            )))
+        }
+        PendingGateResolution::Resolved(_)
+        | PendingGateResolution::None
+        | PendingGateResolution::Ambiguous => Ok(None),
     }
 }
 
 /// Recover live approval/auth prompts lost during a gateway disconnect.
+///
+/// Gates whose owning thread is gone or no longer `Waiting` are filtered out
+/// (WI#332) so the endpoint never re-arms a prompt for a terminated thread.
 pub async fn list_engine_pending_gates(
     user_id: &str,
 ) -> Result<Vec<crate::gate::pending::PendingGateView>, Error> {
@@ -2026,7 +2119,11 @@ pub async fn list_engine_pending_gates(
         }
         return Ok(Vec::new());
     };
-    let mut gates = state.pending_gates.list_for_user(user_id).await;
+    let mut gates = filter_live_pending_gates(
+        &state.store,
+        state.pending_gates.list_for_user(user_id).await,
+    )
+    .await;
     gates.sort_by_key(|gate| std::cmp::Reverse((gate.created_at, gate.request_id)));
     Ok(gates
         .iter()
@@ -5692,6 +5789,8 @@ fn start_skill_update_sweep(user_id: String) {
 ///
 /// Without this, a thread waiting on an expired gate blocks until
 /// the next ingress triggers cleanup via `drain_expired()`.
+/// The same tick also discards gates whose owning thread terminated outside
+/// the gate path (WI#332) — those otherwise lingered until expiry or restart.
 fn start_pending_gate_sweep(
     pending_gates: Arc<crate::gate::store::PendingGateStore>,
     channels: std::sync::Arc<crate::channels::ChannelManager>,
@@ -5703,20 +5802,32 @@ fn start_pending_gate_sweep(
         loop {
             interval.tick().await;
             let expired = pending_gates.drain_expired().await;
+            let Some(lock) = ENGINE_STATE.get() else {
+                continue;
+            };
+            let guard = lock.read().await;
+            let Some(state) = guard.as_ref() else {
+                continue;
+            };
             if !expired.is_empty() {
                 debug!(
                     removed = expired.len(),
                     "background sweep removed expired pending gates"
                 );
-                let Some(lock) = ENGINE_STATE.get() else {
-                    continue;
-                };
-                let guard = lock.read().await;
-                let Some(state) = guard.as_ref() else {
-                    continue;
-                };
                 handle_expired_gates(state, &channels, &hooks, &expired).await;
             }
+            let discarded = discard_gates_with_dead_threads(state).await;
+            for gate in &discarded {
+                tracing::warn!(
+                    user_id = %gate.user_id,
+                    thread_id = %gate.thread_id,
+                    request_id = %gate.request_id,
+                    gate = %gate.gate_name,
+                    action = %gate.action_name,
+                    "engine v2: discarded pending gate; owning thread is no longer waiting"
+                );
+            }
+            broadcast_dead_gate_resolutions(state, &discarded);
         }
     });
 }
@@ -6534,6 +6645,107 @@ pub(crate) mod tests {
             .unwrap();
         store.save_thread(&thread).await.unwrap();
         thread
+    }
+
+    /// WI#332: the pending-gates endpoint must not list a gate whose owning
+    /// thread terminated, vanished, or belongs to someone else.
+    #[tokio::test]
+    async fn pending_gate_list_filter_drops_gates_without_a_waiting_thread() {
+        let store = Arc::new(TestStore::new());
+        let project_id = lunarwing_engine::ProjectId::new();
+
+        let waiting = save_waiting_thread(&store, project_id, "alice").await;
+        let live_gate = sample_pending_gate(
+            "alice",
+            waiting.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+
+        // Thread terminated while the gate was still pending.
+        let mut terminal = save_waiting_thread(&store, project_id, "alice").await;
+        terminal
+            .transition_to(lunarwing_engine::ThreadState::Failed, None)
+            .unwrap();
+        store.save_thread(&terminal).await.unwrap();
+        let terminal_gate = sample_pending_gate(
+            "alice",
+            terminal.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+
+        // Thread vanished entirely.
+        let orphan_gate = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+
+        // Waiting thread owned by a different user than the gate claims.
+        let bobs = save_waiting_thread(&store, project_id, "bob").await;
+        let wrong_owner_gate = sample_pending_gate(
+            "alice",
+            bobs.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+
+        let store_dyn: Arc<dyn Store> = store;
+        let live = filter_live_pending_gates(
+            &store_dyn,
+            vec![
+                live_gate.clone(),
+                terminal_gate,
+                orphan_gate,
+                wrong_owner_gate,
+            ],
+        )
+        .await;
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].request_id, live_gate.request_id);
+    }
+
+    /// WI#332: the runtime sweep discards gates whose thread left `Waiting`
+    /// and keeps gates whose thread is still parked.
+    #[tokio::test]
+    async fn dead_thread_sweep_discards_terminal_gates_and_keeps_live_ones() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let waiting = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let live_gate = sample_pending_gate(
+            "alice",
+            waiting.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+
+        let mut terminal = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        terminal
+            .transition_to(lunarwing_engine::ThreadState::Failed, None)
+            .unwrap();
+        store.save_thread(&terminal).await.unwrap();
+        let dead_gate = sample_pending_gate(
+            "alice",
+            terminal.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+
+        state.pending_gates.insert(live_gate.clone()).await.unwrap();
+        state.pending_gates.insert(dead_gate.clone()).await.unwrap();
+
+        let discarded = discard_gates_with_dead_threads(&state).await;
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].request_id, dead_gate.request_id);
+        assert!(
+            state.pending_gates.peek(&live_gate.key()).await.is_some(),
+            "the live gate must survive the sweep"
+        );
+        assert!(
+            state.pending_gates.peek(&dead_gate.key()).await.is_none(),
+            "the dead-thread gate must be discarded"
+        );
+
+        // Idempotent: a second sweep finds nothing left to discard.
+        assert!(discard_gates_with_dead_threads(&state).await.is_empty());
     }
 
     /// Work item #108 regression: an expired gate must resume the paused
@@ -7468,23 +7680,23 @@ pub(crate) mod tests {
         use tower::ServiceExt;
 
         let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
-        let state = make_expected_test_state(Arc::new(TestStore::new()));
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
         let kind = lunarwing_engine::ResumeKind::Approval {
             allow_always: false,
         };
-        let mut alice =
-            sample_pending_gate("alice", lunarwing_engine::ThreadId::new(), kind.clone());
+        // WI#332: only gates whose owning thread is still Waiting are listed,
+        // so the listed gates need real waiting threads behind them.
+        let alice_thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let mut alice = sample_pending_gate("alice", alice_thread.id, kind.clone());
         alice.parameters = serde_json::json!({"token":"must-not-leak"});
         alice.display_parameters = Some(serde_json::json!({"token":"[REDACTED]"}));
         let request_id = alice.request_id;
         state.pending_gates.insert(alice).await.unwrap();
+        let bob_thread = save_waiting_thread(&store, state.default_project_id, "bob").await;
         state
             .pending_gates
-            .insert(sample_pending_gate(
-                "bob",
-                lunarwing_engine::ThreadId::new(),
-                kind.clone(),
-            ))
+            .insert(sample_pending_gate("bob", bob_thread.id, kind.clone()))
             .await
             .unwrap();
         let mut expired = sample_pending_gate("alice", lunarwing_engine::ThreadId::new(), kind);
