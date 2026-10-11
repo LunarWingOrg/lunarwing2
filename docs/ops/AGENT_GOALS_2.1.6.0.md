@@ -108,7 +108,7 @@
 25. [x] (S) RESERVED
 26. [x] (S) RESERVED
 27. [x] (S) RESERVED
-28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5481 for latest master pipeline run and see if anything is not GREEN
+28. [ ] fix issues in CI/CD (if any) - See Pipeline Number 5481 for latest master pipeline run and see if anything is not GREEN
 29. [x] (S) (H) MASCOT ANIMS
 30. [x] (S) RESERVED
 31. [ ] review all currently open work items - create audit document for 2.1.6.0 in docs/ops - there are similar docs in docs/ops for 2.1.5.0 and 2.1.4.0 and earlier releases so you can use those as references - you can sort doc by label of release ( i.e. 2.1.5.0, 2.1.6.0 )
@@ -124,5 +124,7 @@
 
 39. [ ] update all documentation under docs/architecture
 40. [ ] Create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for references)
+41. [x] (S) RESERVED
+42. [ ] update all docs in docs/guides
 
 ---
