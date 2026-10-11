@@ -1693,9 +1693,11 @@ async fn finalize_harness_job(
     harness::cleanup_harness_job_dir(job_id);
 }
 
-/// Run the write-back promotion pipeline: screen staged files, then write
-/// accepted ones into the tenant workspace, recording the previous content
-/// hash for rollback (CW-9).
+/// Run the write-back promotion pipeline: screen staged files, snapshot the
+/// prior content of each replaced file under `backups/harness/<job_id>/`
+/// (DH-5 rollback), then write accepted ones into the tenant workspace. Every
+/// run — accepted, rejection-only, or skipped — is audited by the caller
+/// (CW-9).
 async fn run_promotion(
     deps: &PromotionDeps,
     job_id: Uuid,
@@ -1707,11 +1709,24 @@ async fn run_promotion(
     // CW-10: scan staged content for the job's own mounted secret values in
     // addition to the pattern-based leak scan.
     let redactor = deps.token_store.harness_secret_redactor(job_id).await;
-    let plan = match harness::plan_promotion(staging, policy, redactor.as_ref()) {
-        Ok(plan) => plan,
-        Err(e) => {
+    // DH-10: the staging walk is blocking filesystem IO — keep it off the
+    // async executor.
+    let staging_buf = staging.to_path_buf();
+    let policy_owned = policy.clone();
+    let planned = tokio::task::spawn_blocking(move || {
+        harness::plan_promotion(&staging_buf, &policy_owned, redactor.as_ref())
+    })
+    .await;
+    let plan = match planned {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(e)) => {
             summary.skipped = true;
             summary.skip_reason = Some(format!("staging scan failed: {e}"));
+            return summary;
+        }
+        Err(e) => {
+            summary.skipped = true;
+            summary.skip_reason = Some(format!("staging scan task failed: {e}"));
             return summary;
         }
     };
@@ -1728,16 +1743,35 @@ async fn run_promotion(
     };
     let workspace = resolver.resolve(owner_id).await;
     for write in plan.accepted {
-        let previous_sha256 = workspace
-            .read(&write.relative_path)
-            .await
-            .ok()
+        let prior = workspace.read(&write.relative_path).await.ok();
+        let previous_sha256 = prior
+            .as_ref()
             .map(|doc| harness::sha256_hex(doc.content.as_bytes()));
+        // DH-5: real rollback, not just a hash — snapshot the prior content
+        // under the job-scoped backup root BEFORE the promoted write, and
+        // fail the file closed when the snapshot cannot be persisted.
+        let backup_path = match prior.as_ref() {
+            Some(doc) if !doc.content.is_empty() && doc.content != write.content => {
+                let path = format!("backups/harness/{job_id}/{}", write.relative_path);
+                match workspace.write(&path, &doc.content).await {
+                    Ok(_) => Some(path),
+                    Err(e) => {
+                        summary.rejections.push(harness::PromotionRejection {
+                            relative_path: write.relative_path,
+                            reason: format!("rollback snapshot failed: {e}"),
+                        });
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
         match workspace.write(&write.relative_path, &write.content).await {
             Ok(_) => summary.records.push(harness::PromotionRecord {
                 relative_path: write.relative_path,
                 sha256: write.sha256,
                 previous_sha256,
+                backup_path,
                 size_bytes: write.size_bytes,
                 job_id,
                 owner_id: owner_id.to_string(),

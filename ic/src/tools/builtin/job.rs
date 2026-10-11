@@ -853,11 +853,19 @@ impl CreateJobTool {
                 });
             }
             let dir = harness::injection_dir(job_id);
-            harness::write_injection_dir(&dir, job_id, &entries)
-                .map_err(|e| ToolError::ExecutionFailed(format!("injection failed: {e}")))?;
+            let entry_count = entries.len();
+            // DH-10: file writes are blocking IO — keep them off the async
+            // executor.
+            let write_dir = dir.clone();
+            tokio::task::spawn_blocking(move || {
+                harness::write_injection_dir(&write_dir, job_id, &entries)
+            })
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("injection task failed: {e}")))?
+            .map_err(|e| ToolError::ExecutionFailed(format!("injection failed: {e}")))?;
             tracing::info!(
                 job_id = %job_id,
-                files = entries.len(),
+                files = entry_count,
                 "Prepared harness injection mount"
             );
             Some(dir)
@@ -922,9 +930,15 @@ impl CreateJobTool {
         // CW-3: an explicit project_dir must belong to a job owned by THIS
         // user — otherwise a prompt-injected call could mount another user's
         // job workspace (cross-user read/write in multi-user daemons).
-        if let Some(ref dir) = explicit_dir
-            && let Some(store) = &self.store
-        {
+        // DH-7: without a job store the ownership check cannot run — fail
+        // closed instead of skipping it.
+        if let Some(ref dir) = explicit_dir {
+            let Some(store) = &self.store else {
+                return Err(ToolError::NotAuthorized(
+                    "explicit project_dir requires the job store for ownership verification"
+                        .to_string(),
+                ));
+            };
             let dir_job_id = dir
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -979,10 +993,13 @@ impl CreateJobTool {
         // Register in ContextManager so query tools (list_jobs, job_status,
         // job_events, cancel_job) can find sandbox jobs. Without this, sandbox
         // jobs exist only in the DB and are invisible to the agent.
+        // DH-2: on failure the harness dirs prepared above would be orphaned
+        // until the next boot sweep — clean them up on every early return.
         self.context_manager
             .register_sandbox_job(job_id, &ctx.user_id, task, task)
             .await
             .map_err(|e| {
+                harness::cleanup_harness_job_dir(job_id);
                 ToolError::ExecutionFailed(format!("failed to register sandbox job: {}", e))
             })?;
         self.context_manager
@@ -990,9 +1007,15 @@ impl CreateJobTool {
                 job.metadata = serde_json::json!({ "max_iterations": max_iterations });
             })
             .await
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            .map_err(|error| {
+                harness::cleanup_harness_job_dir(job_id);
+                ToolError::ExecutionFailed(error.to_string())
+            })?;
 
-        // Persist the job to DB before creating the container.
+        // Persist the job to DB before creating the container. CV-9: the
+        // record carries its mode in the INITIAL insert — a harness job whose
+        // mode landed only after container start could restart as a plain
+        // worker carrying the harness task text.
         let record = SandboxJobRecord {
             id: job_id,
             task: task.to_string(),
@@ -1005,13 +1028,23 @@ impl CreateJobTool {
             started_at: None,
             completed_at: None,
             credential_grants_json,
+            job_mode: job_mode.db_value(),
         };
         if harness_request.is_some() {
-            // Await the insert so the harness mode update below cannot race it.
+            // Await the insert and FAIL CLOSED on error: a harness job without
+            // its persisted mode would restart as a plain worker (CV-9).
             if let Some(store) = &self.store
                 && let Err(e) = store.save_sandbox_job(&record).await
             {
-                tracing::warn!(job_id = %job_id, "Failed to persist harness job: {}", e);
+                harness::cleanup_harness_job_dir(job_id);
+                self.update_context_state(
+                    job_id,
+                    JobState::Failed,
+                    Some(format!("failed to persist harness job: {e}")),
+                );
+                return Err(ToolError::ExecutionFailed(format!(
+                    "failed to persist harness job: {e}"
+                )));
             }
         } else {
             self.persist_job(record);
@@ -1054,16 +1087,9 @@ impl CreateJobTool {
                 ToolError::ExecutionFailed(format!("failed to create container: {}", e))
             })?;
 
-        // Harness jobs persist their mode so job_prompt and restarts can tell
-        // them apart from plain worker jobs.
-        if job_mode == JobMode::Harness
-            && let Some(store) = &self.store
-            && let Err(error) = store
-                .update_sandbox_job_mode(job_id, &job_mode.db_value())
-                .await
-        {
-            tracing::warn!(job_id = %job_id, "Failed to persist harness job mode: {error}");
-        }
+        // The mode was persisted in the initial insert above (CV-9), so
+        // job_prompt and restarts can already tell harness jobs apart from
+        // plain worker jobs — no post-start mode update is needed.
 
         // Container started successfully.
         let now = Utc::now();
@@ -1353,6 +1379,7 @@ impl CreateJobTool {
             started_at: None,
             completed_at: None,
             credential_grants_json: grants_json,
+            job_mode: crate::orchestrator::job_manager::JobMode::Worker.db_value(),
         };
 
         if let Some(store) = &self.store {
@@ -2624,6 +2651,16 @@ impl Tool for CancelJobTool {
             match jm.stop_job(job_id).await {
                 Ok(()) => stopped = true,
                 Err(crate::error::OrchestratorError::ContainerNotFound { .. }) => {}
+                // DG-4: write-back promotion is running; cancellation must
+                // not clear the secrets its secret-scan needs or remove the
+                // staging dir mid-walk.
+                Err(crate::error::OrchestratorError::InvalidContainerState { state, .. })
+                    if state.starts_with("finalizing") =>
+                {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "job {job_id} is finalizing write-back promotion; cancellation is refused — retry once it completes"
+                    )));
+                }
                 Err(error) => {
                     tracing::warn!(%job_id, "Failed to stop container during cancellation: {error}");
                 }
@@ -3288,6 +3325,7 @@ mod tests {
                 started_at: Some(Utc::now()),
                 completed_at: Some(Utc::now()),
                 credential_grants_json: "[]".to_string(),
+                job_mode: "worker".to_string(),
             })
             .await
             .expect("save persisted job");
@@ -3376,6 +3414,7 @@ mod tests {
                 started_at: Some(Utc::now()),
                 completed_at: Some(Utc::now()),
                 credential_grants_json: "[]".to_string(),
+                job_mode: "worker".to_string(),
             })
             .await
             .expect("save persisted job");
@@ -4307,8 +4346,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn harness_mode_requires_sandbox() {
-        let manager = Arc::new(ContextManager::new(5));
+    async fn explicit_project_dir_without_store_fails_closed() {
+        // DH-7: the CW-3 ownership check must not be silently skipped when
+        // the tool has no job store.
+        let tool = sandbox_tool();
+        let ctx = JobContext::default();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "title": "t",
+                    "description": "d",
+                    "mode": "worker",
+                    "project_dir": format!("/tmp/{}", Uuid::new_v4()),
+                }),
+                &ctx,
+            )
+            .await;
+        let err = result.unwrap_err(); // safety: test
+        assert!(
+            err.to_string().contains("ownership verification"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_mode_requires_sandbox() {        let manager = Arc::new(ContextManager::new(5));
         let tool = CreateJobTool::new(manager);
         let result = tool
             .execute(

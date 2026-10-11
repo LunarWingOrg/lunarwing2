@@ -498,6 +498,11 @@ pub struct SandboxJobRecord {
     /// may contain a bare `Vec<CredentialGrant>`.
     /// Stored in the `description` column of `agent_jobs` (unused for sandbox jobs).
     pub credential_grants_json: String,
+    /// Job mode (`worker`, `harness`, `external:<name>`). Persisted in the
+    /// INITIAL insert (CV-9): a harness job whose mode only lands after
+    /// container start could otherwise restart as a plain worker carrying
+    /// the harness task text.
+    pub job_mode: String,
 }
 
 /// Summary of sandbox job counts grouped by status.
@@ -560,8 +565,9 @@ impl Store {
             r#"
             INSERT INTO agent_jobs (
                 id, title, description, status, source, user_id, project_dir,
-                success, failure_reason, created_at, started_at, completed_at
-            ) VALUES ($1, $2, $3, $4, 'sandbox', $5, $6, $7, $8, $9, $10, $11)
+                success, failure_reason, created_at, started_at, completed_at,
+                job_mode
+            ) VALUES ($1, $2, $3, $4, 'sandbox', $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 success = EXCLUDED.success,
@@ -581,6 +587,7 @@ impl Store {
                 &job.created_at,
                 &job.started_at,
                 &job.completed_at,
+                &job.job_mode,
             ],
         )
         .await?;
@@ -597,7 +604,8 @@ impl Store {
             .query_opt(
                 r#"
                 SELECT id, title, description, status, user_id, project_dir,
-                       success, failure_reason, created_at, started_at, completed_at
+                       success, failure_reason, created_at, started_at, completed_at,
+                       job_mode
                 FROM agent_jobs WHERE id = $1 AND source = 'sandbox'
                 "#,
                 &[&id],
@@ -618,6 +626,7 @@ impl Store {
             started_at: r.get("started_at"),
             completed_at: r.get("completed_at"),
             credential_grants_json: r.get::<_, String>("description"),
+            job_mode: r.get("job_mode"),
         }))
     }
 
@@ -628,7 +637,8 @@ impl Store {
             .query(
                 r#"
                 SELECT id, title, description, status, user_id, project_dir,
-                       success, failure_reason, created_at, started_at, completed_at
+                       success, failure_reason, created_at, started_at, completed_at,
+                       job_mode
                 FROM agent_jobs WHERE source = 'sandbox'
                 ORDER BY created_at DESC
                 "#,
@@ -652,6 +662,7 @@ impl Store {
                 started_at: r.get("started_at"),
                 completed_at: r.get("completed_at"),
                 credential_grants_json: r.get::<_, String>("description"),
+                job_mode: r.get("job_mode"),
             })
             .collect())
     }
@@ -666,7 +677,8 @@ impl Store {
             .query(
                 r#"
                 SELECT id, title, description, status, user_id, project_dir,
-                       success, failure_reason, created_at, started_at, completed_at
+                       success, failure_reason, created_at, started_at, completed_at,
+                       job_mode
                 FROM agent_jobs WHERE source = 'sandbox' AND user_id = $1
                 ORDER BY created_at DESC
                 "#,
@@ -690,6 +702,7 @@ impl Store {
                 started_at: r.get("started_at"),
                 completed_at: r.get("completed_at"),
                 credential_grants_json: r.get::<_, String>("description"),
+                job_mode: r.get("job_mode"),
             })
             .collect())
     }

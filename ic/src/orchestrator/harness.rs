@@ -1122,9 +1122,13 @@ impl PromotionPlan {
 pub struct PromotionRecord {
     pub relative_path: String,
     pub sha256: String,
-    /// SHA-256 of the document this write replaced, when one existed (CW-9
-    /// rollback support).
+    /// SHA-256 of the document this write replaced, when one existed.
     pub previous_sha256: Option<String>,
+    /// Workspace path holding a full snapshot of the replaced content
+    /// (`backups/harness/<job_id>/<path>`) — the actual rollback target
+    /// (DH-5: a bare hash is not a rollback). None for new files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
     pub size_bytes: u64,
     pub job_id: Uuid,
     pub owner_id: String,
