@@ -589,7 +589,6 @@ mod tests {
             .expect("local database must accept connections");
     }
 
-
     #[test]
     fn test_parse_timestamp_accepts_rfc3339_and_legacy_naive_formats() {
         let expected = Utc.with_ymd_and_hms(2026, 3, 7, 12, 34, 56).unwrap();
