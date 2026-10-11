@@ -288,10 +288,9 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   `cron_tick_reaches_worker_with_structured_tick_context` asserts the on-wire
   payload. Missing-directory startup is additionally covered through the real
   Kimi bridge with a mock CLI, Pebble bridge dispatch, and all four workspace
-  helpers — those bridge suites are author-run (no MR CI lane runs them;
-  the Kimi image build runs `npm test`, OpenCode2's build runs
-  `path_expand_test.ts`, the OpenCode v1 and Pebble builds run neither — the
-  CI gap is tracked as follow-up). Production model execution and older images are not covered by
+  helpers. The bridge suites gate the image builds (Kimi `npm test`, both
+  OpenCode `path_expand_test.ts`, Pebble `cargo test --locked`); no MR CI lane
+  runs them host-side, so between image builds they remain author-run. Production model execution and older images are not covered by
   those tests; older images need the documented pre-creation step.
 - [x] The run outlives the standard bounded deadline without being killed —
   per-link `tick_timeout_ms` defaults to the host's 4h limit (longer than any
