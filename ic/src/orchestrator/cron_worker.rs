@@ -13,7 +13,7 @@
 //! - **Infinite deadline participation** — the supervisor (host) always holds
 //!   the mission lease. Tick jobs are *not* subject to the standard bounded
 //!   `timeout_ms` worker deadline; they run under the cron block's own
-//!   `tick_timeout_ms` (validated against the worker bridge cap at load) plus
+//!   `tick_timeout_ms` (bounded by the host's 4h cap at load) plus
 //!   the heartbeat watchdog. The mission itself has no deadline: it fires
 //!   again at the next scheduled tick regardless of how any one tick resolved.
 //! - **Not the mission lifecycle machine** — a cron-mode mission is never an
@@ -106,7 +106,7 @@ const NON_RETRYABLE_MARKERS: &[&str] = &[
     "Workspace path escapes WORKSPACE_ROOT",
     "Invalid workspace path",
     "Missing or invalid prompt",
-    "realpath",
+    "ENOENT: no such file or directory, realpath",
 ];
 
 /// Outcome of watching one tick job to resolution (or to a heartbeat lapse).
@@ -290,7 +290,7 @@ impl ExternalWorkerManager {
     /// The fire is routed through the mission supervisor's command channel,
     /// so a manual tick is serialized with scheduled ticks and can never
     /// overlap one on the same worker workspace. `tick_index` 0 marks the
-    /// run as an operator/test trigger. The mission's durable state handoff
+    /// run as a test trigger (no public manual-fire surface). The durable state handoff
     /// still goes through the worker's `/workspace` mount.
     pub async fn fire_cron_tick_now(
         &self,
@@ -426,7 +426,8 @@ async fn run_cron_mission(
     mut shutdown_rx: broadcast::Receiver<()>,
     mut cmd_rx: mpsc::Receiver<CronCommand>,
 ) -> MissionExit {
-    let last_tick_job_id = Arc::new(std::sync::Mutex::new(None));
+    let last_job = load_last_tick_job(manager.store_handle(), &owner_id, &mission_id).await;
+    let last_tick_job_id = Arc::new(std::sync::Mutex::new(last_job));
     let ctx = TickCtx {
         manager: &manager,
         worker: &worker,
@@ -560,6 +561,9 @@ async fn drive_tick(
             end = &mut tick => break end,
             command = cmd_rx.recv() => {
                 let Some(command) = command else {
+                    if let Some(job_id) = last_tick_job(ctx) {
+                        ctx.manager.cancel_task_with_reason(job_id, CancelReason::Shutdown).await;
+                    }
                     return false;
                 };
                 handle_active_command(ctx, state, pause_flag, command).await;
@@ -835,11 +839,10 @@ async fn run_tick(
         // Owner pause is honored at chain-link boundaries only: a manual fire
         // always dispatches its first link (the escape hatch works on a
         // paused mission), but no re-entry fires once paused.
-        if last_link.is_some() && pause_flag.load(Ordering::SeqCst) {
+        if (last_link.is_some() || busy_retries > 0) && pause_flag.load(Ordering::SeqCst) {
             return Some(pause_chain(ctx, tick_index, chain_index, last_link).await);
         }
         let job_id = Uuid::new_v4();
-        last_link = Some(job_id);
         if let Some(action) =
             dispatch_or_busy(ctx, tick_index, chain_index, job_id, &mut busy_retries).await
         {
@@ -854,6 +857,8 @@ async fn run_tick(
             }
         }
 
+        // Capacity failures have no agent_jobs row (DN-6).
+        last_link = Some(job_id);
         let Some(outcome) = watch_tick_job(ctx, job_id, shutdown_rx).await else {
             // Shutdown mid-tick: cancel the in-flight link with the shutdown
             // reason so it is not mistaken for an owner cancel.
@@ -895,7 +900,7 @@ async fn run_tick(
             max_reentries,
             shutdown_rx,
         )
-        .await
+        .await?
         {
             Reentry::Redispatch => {
                 chain_index += 1;
@@ -1131,12 +1136,14 @@ async fn prepare_reentry(
     outcome: &TickOutcome,
     max_reentries: u32,
     shutdown_rx: &mut broadcast::Receiver<()>,
-) -> Reentry {
+) -> Option<Reentry> {
     if matches!(outcome, TickOutcome::HeartbeatLapse) {
         ctx.manager
             .cancel_task_with_reason(job_id, CancelReason::CronSupervisor)
             .await;
-        await_terminal(ctx.manager, job_id, shutdown_rx).await;
+        if !await_terminal(ctx.manager, job_id, shutdown_rx).await {
+            return None;
+        }
     }
     if let TickOutcome::Failed(reason) = outcome
         && is_non_retryable(reason)
@@ -1145,10 +1152,12 @@ async fn prepare_reentry(
             "non-retryable dispatch rejection: {}",
             describe_outcome(outcome)
         );
-        return Reentry::Abandon(abandon_tick(ctx, tick_index, chain_index, job_id, reason).await);
+        return Some(Reentry::Abandon(
+            abandon_tick(ctx, tick_index, chain_index, job_id, reason).await,
+        ));
     }
     if !outcome.is_retryable() || chain_index >= max_reentries {
-        return Reentry::Abandon(
+        return Some(Reentry::Abandon(
             abandon_tick(
                 ctx,
                 tick_index,
@@ -1157,7 +1166,7 @@ async fn prepare_reentry(
                 describe_outcome(outcome),
             )
             .await,
-        );
+        ));
     }
     let reason = describe_outcome(outcome);
     tracing::warn!(
@@ -1183,7 +1192,7 @@ async fn prepare_reentry(
     )
     .await;
     evict_tick_context(ctx.manager, job_id).await;
-    Reentry::Redispatch
+    Some(Reentry::Redispatch)
 }
 
 enum Reentry {
@@ -1265,15 +1274,15 @@ async fn backoff_sleep(attempt: u32, shutdown_rx: &mut broadcast::Receiver<()>) 
 
 /// Wait (bounded) for a cancelled tick job to reach a terminal state so the
 /// next link does not dispatch while the old runner still owns the worker
-/// workspace (CU-1). Returns early on daemon shutdown — the bounded wait must
-/// not hold the supervisor loop hostage (MR !1522 CU-6 residue).
+/// workspace (CU-1). Returns false on shutdown: the caller must end the
+/// entire chain, because this receiver has consumed the shutdown message.
 async fn await_terminal(
     manager: &ExternalWorkerManager,
     job_id: Uuid,
     shutdown_rx: &mut broadcast::Receiver<()>,
-) {
+) -> bool {
     let Some(cm) = manager.context_manager_handle() else {
-        return;
+        return true;
     };
     let deadline = tokio::time::Instant::now() + TERMINAL_WAIT;
     loop {
@@ -1287,21 +1296,21 @@ async fn await_terminal(
                         | JobState::Cancelled
                 ) =>
             {
-                return;
+                return true;
             }
             Ok(_) => {}
-            Err(_) => return,
+            Err(_) => return true,
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
                 %job_id,
                 "Cancelled tick job did not reach a terminal state within the bounded wait"
             );
-            return;
+            return true;
         }
         tokio::select! {
             _ = tokio::time::sleep(TERMINAL_POLL) => {}
-            _ = shutdown_rx.recv() => return,
+            _ = shutdown_rx.recv() => return false,
         }
     }
 }
@@ -1310,8 +1319,8 @@ async fn await_terminal(
 enum DispatchOutcome {
     /// The job was registered, persisted, and fired at the worker.
     Fired,
-    /// The job could not be reserved/registered (context manager at
-    /// capacity, duplicate reservation). No DB row exists for it, so any
+    /// The job could not be reserved/registered/persisted (context manager at
+    /// capacity, duplicate reservation, DB error). No confirmed DB row exists, so any
     /// events are log-only (`job_events.job_id` references `agent_jobs`).
     Capacity(String),
 }
@@ -1324,14 +1333,11 @@ async fn dispatch_tick_job(
     chain_index: u32,
     job_id: Uuid,
 ) -> DispatchOutcome {
-    let TickCtx {
-        manager,
-        worker,
-        cron,
-        mission_id,
-        owner_id,
-        ..
-    } = *ctx;
+    let manager = ctx.manager;
+    let worker = ctx.worker;
+    let cron = ctx.cron;
+    let mission_id = ctx.mission_id;
+    let owner_id = ctx.owner_id;
     let project_dir = cron.resolved_project_dir(&worker.name);
     let title = format!("{mission_id} tick #{tick_index}");
     let description = build_tick_prompt(cron, mission_id, tick_index, chain_index, &project_dir);
@@ -1341,7 +1347,7 @@ async fn dispatch_tick_job(
         return DispatchOutcome::Capacity(reason);
     }
 
-    persist_tick_record(
+    if !persist_tick_record(
         manager,
         worker,
         job_id,
@@ -1349,13 +1355,15 @@ async fn dispatch_tick_job(
         &description,
         &project_dir,
     )
-    .await;
+    .await
+    {
+        manager.release_task_reservation(job_id).await;
+        evict_tick_context(manager, job_id).await;
+        return DispatchOutcome::Capacity("tick job persistence failed".to_string());
+    }
     // Record the link as the mission's most recent job so owner-command
     // audit events (cron_paused/cron_resumed) have a job row to key to.
-    ctx.last_tick_job_id
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .replace(job_id);
+    remember_tick_job(ctx, job_id).await;
 
     let tick_timeout_ms = cron.tick_timeout_ms();
     persist_cron_event(
@@ -1504,9 +1512,9 @@ async fn persist_tick_record(
     owner_id: &str,
     description: &str,
     project_dir: &str,
-) {
+) -> bool {
     let Some(store) = manager.store_handle() else {
-        return;
+        return true;
     };
     let now = Utc::now();
     let record = SandboxJobRecord {
@@ -1524,11 +1532,13 @@ async fn persist_tick_record(
     };
     if let Err(error) = store.save_sandbox_job(&record).await {
         tracing::warn!(%job_id, "Failed to persist cron tick job record: {error}");
+        return false;
     }
     let mode = crate::orchestrator::job_manager::JobMode::External(worker.name.clone()).db_value();
     if let Err(error) = store.update_sandbox_job_mode(job_id, &mode).await {
         tracing::warn!(%job_id, "Failed to persist cron tick job mode: {error}");
     }
+    true
 }
 
 /// Watch one tick job: poll the context until the job resolves or the
@@ -1649,6 +1659,45 @@ fn tick_counter_key(mission_id: &str) -> String {
 /// Settings-store key for the persisted per-mission pause flag.
 fn paused_key(mission_id: &str) -> String {
     format!("cron-mission:{mission_id}:paused")
+}
+
+async fn remember_tick_job(ctx: &TickCtx<'_>, job_id: Uuid) {
+    ctx.last_tick_job_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(job_id);
+    if let Some(db) = ctx.manager.store_handle()
+        && let Err(error) = db
+            .set_setting(
+                ctx.owner_id,
+                &format!("cron-mission:{}:last-job", ctx.mission_id),
+                &serde_json::json!(job_id),
+            )
+            .await
+    {
+        tracing::warn!(%job_id, "Failed to persist last cron tick job: {error}");
+    }
+}
+
+async fn load_last_tick_job(
+    store: Option<&Arc<dyn Database>>,
+    owner: &str,
+    mission: &str,
+) -> Option<Uuid> {
+    let db = store?;
+    let value = db
+        .get_setting(owner, &format!("cron-mission:{mission}:last-job"))
+        .await
+        .ok()??;
+    let id = value.as_str().and_then(|s| Uuid::parse_str(s).ok())?;
+    // A deleted job cannot anchor lifecycle events (nor may another owner's
+    // job). This also keeps Postgres' job_events FK valid after retention.
+    db.get_sandbox_job(id)
+        .await
+        .ok()??
+        .user_id
+        .eq(owner)
+        .then_some(id)
 }
 
 /// Load durable mission state (tick counter + pause flag) from the
@@ -1846,6 +1895,166 @@ mod tests {
             "Workspace path escapes WORKSPACE_ROOT: ../etc"
         ));
         assert!(!is_non_retryable("worker exploded"));
+        assert!(!is_non_retryable(
+            "realpath failed during the user's build; retry after checkout"
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_terminal_wait_ends_reentry() {
+        let cm = Arc::new(crate::context::ContextManager::new(1));
+        let (events, _) = broadcast::channel(8);
+        let manager =
+            Arc::new(ExternalWorkerManager::new(vec![]).with_event_deps(events, cm.clone()));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "owner", "tick", "pending cancel")
+            .await
+            .unwrap();
+        let (shutdown, mut receiver) = broadcast::channel(1);
+        let reentry = prepare_reentry(
+            &ctx,
+            1,
+            0,
+            job_id,
+            &TickOutcome::HeartbeatLapse,
+            3,
+            &mut receiver,
+        );
+        tokio::pin!(reentry);
+        // Poll until the non-terminal context makes await_terminal suspend,
+        // then deliver the one shutdown message it used to swallow (DN-1).
+        tokio::select! {
+            biased;
+            _ = &mut reentry => panic!("must wait for the active link"),
+            _ = std::future::ready(()) => {}
+        }
+        shutdown.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), reentry)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn reentry_cap_abandons_at_boundary() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let (_shutdown, mut receiver) = broadcast::channel(1);
+        for (index, allowed) in [(1, true), (2, false), (3, false)] {
+            let result = prepare_reentry(
+                &ctx,
+                1,
+                index,
+                Uuid::new_v4(),
+                &TickOutcome::Failed("retryable".into()),
+                2,
+                &mut receiver,
+            )
+            .await;
+            assert_eq!(matches!(result, Some(Reentry::Redispatch)), allowed);
+            if !allowed {
+                assert!(matches!(result, Some(Reentry::Abandon(_))));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_owner_command_precedes_shutdown() {
+        // Every iteration has both arms ready. Repetition catches a removed
+        // bias instead of giving randomized select order a 50% false pass.
+        for _ in 0..64 {
+            let (commands, mut rx) = mpsc::channel(2);
+            let (shutdown, mut shutdown_rx) = broadcast::channel(1);
+            commands.send(CronCommand::Pause).await.unwrap();
+            shutdown.send(()).unwrap();
+            assert!(matches!(
+                next_wake(Duration::ZERO, &mut rx, &mut shutdown_rx).await,
+                Some(Wake::Command(CronCommand::Pause))
+            ));
+            assert!(
+                next_wake(Duration::from_secs(60), &mut rx, &mut shutdown_rx)
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_mission_applies_queued_command_before_shutdown() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        for _ in 0..64 {
+            let (commands, mut rx) = mpsc::channel(2);
+            let (shutdown, mut shutdown_rx) = broadcast::channel(1);
+            let pause = Arc::new(AtomicBool::new(true));
+            let mut state = MissionState {
+                paused: true,
+                ..Default::default()
+            };
+            commands.send(CronCommand::Resume).await.unwrap();
+            shutdown.send(()).unwrap();
+            assert!(paused_turn(&ctx, &mut state, &pause, &mut rx, &mut shutdown_rx).await);
+            assert!(!state.paused);
+            assert!(!paused_turn(&ctx, &mut state, &pause, &mut rx, &mut shutdown_rx).await);
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn capacity_retry_then_pause_never_writes_an_orphan_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("capacity.db"))
+            .await
+            .unwrap();
+        backend.run_migrations().await.unwrap();
+        let conn = backend.shared_db().connect().unwrap();
+        let worker = ExternalWorkerConfig::default();
+        let (events, _) = broadcast::channel(8);
+        let manager = Arc::new(
+            ExternalWorkerManager::new(vec![worker.clone()])
+                .with_event_deps(events, Arc::new(crate::context::ContextManager::new(0)))
+                .with_store(Arc::new(backend)),
+        );
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let pause = Arc::new(AtomicBool::new(false));
+        let (_shutdown, mut receiver) = broadcast::channel(1);
+        let tick = run_tick(&ctx, 1, &mut receiver, &pause);
+        tokio::pin!(tick);
+        tokio::select! {
+            biased;
+            _ = &mut tick => panic!("capacity rejection must back off"),
+            _ = std::future::ready(()) => {}
+        }
+        pause.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(6), tick)
+                .await
+                .unwrap(),
+            Some(TickEnd::Resolved)
+        ));
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM job_events", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            0
+        );
+        assert!(last_tick_job(&ctx).is_none());
     }
 
     /// Test TickCtx over an empty manager (no store/context manager: all

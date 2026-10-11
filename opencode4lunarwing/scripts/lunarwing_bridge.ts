@@ -7,8 +7,6 @@
  *   client — connects outbound to a hub
  */
 
-import { resolve } from "node:path"
-
 import {
   createEnvelope,
   parseEnvelope,
@@ -27,7 +25,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
-import { expandWorkspacePath } from "./workspace_path"
+import { resolveTaskWorkspace } from "./workspace_path"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -50,7 +48,7 @@ const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
 function taskWorkspace(request: TaskRequest): string {
-  return resolve(expandWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT))
+  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
 }
 
 function abortSocketTasks(socket: BridgeSocket): void {
@@ -133,7 +131,16 @@ async function handleTaskRequest(
     return
   }
 
-  const workspace = taskWorkspace(request)
+  let workspace: string
+  try {
+    workspace = taskWorkspace(request)
+  } catch (error) {
+    ws.send(JSON.stringify(createEnvelope("task_result", {
+      task_id: request.task_id, status: "error", output: "",
+      error: String(error), duration_ms: 0,
+    })))
+    return
+  }
   const workspaceTask = activeWorkspaces.get(workspace)
   if (workspaceTask) {
     const result = createEnvelope("task_result", {

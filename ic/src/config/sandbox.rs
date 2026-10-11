@@ -257,7 +257,7 @@ pub struct CronWorkerConfig {
     /// Per-tick job deadline in milliseconds. Replaces the standard bounded
     /// `timeout_ms` for this mode — the mission itself is unbounded because
     /// the supervisor always holds the lease and chains fresh jobs.
-    /// Default: [`Self::MAX_TICK_TIMEOUT_MS`] (the worker bridge cap, 4h), so
+    /// Default: [`Self::MAX_TICK_TIMEOUT_MS`] (the host cap, 4h), so
     /// a tick link genuinely outlives the worker's ordinary bounded deadline;
     /// the heartbeat watchdog bounds *silence*, not work.
     #[serde(default)]
@@ -275,9 +275,9 @@ pub struct CronWorkerConfig {
     pub allow_subminute_schedule: Option<bool>,
     /// Per-mission workspace directory sent as the tick job's
     /// `context.project_dir` (WI#325). Relative paths resolve under the
-    /// worker's `WORKSPACE_ROOT`; the directory must already exist — both
-    /// shipped workers (kimi bridge, pebble) canonicalize the path and
-    /// reject a missing one before the task starts. Default:
+    /// worker's `WORKSPACE_ROOT`; updated bridges create missing cron-only
+    /// directories without following symlinks. Older worker images require
+    /// the directory to be pre-created before enabling the schedule. Default:
     /// `missions/<mission_id>`, so a mission never shares the worker root
     /// with ordinary dispatches unless the operator opts into that.
     /// Host-side validated at load: must be a relative path with no `..`
@@ -307,9 +307,9 @@ impl CronWorkerConfig {
     /// Minimum per-tick job deadline (ms).
     pub const MIN_TICK_TIMEOUT_MS: u64 = 1_000;
     /// Maximum per-tick job deadline (ms). Matches the default
-    /// `KIMI_MAX_TIMEOUT_MS` cap of the kimi worker bridge (4h): a larger
-    /// value is rejected by the worker on every tick, so it is refused at
-    /// load instead.
+    /// `KIMI_MAX_TIMEOUT_MS` cap of the kimi worker bridge (4h), applied by
+    /// the host to all workers. Operators lowering Kimi's configurable cap
+    /// must also lower `tick_timeout_ms`; the host cannot discover that cap.
     pub const MAX_TICK_TIMEOUT_MS: u64 = 14_400_000;
     /// Minimum gap between scheduled fires (seconds) unless
     /// `allow_subminute_schedule` is set.
@@ -326,10 +326,10 @@ impl CronWorkerConfig {
         self.max_reentries.unwrap_or(Self::DEFAULT_MAX_REENTRIES)
     }
 
-    /// Per-link tick deadline. Defaults to the worker bridge cap so a tick
+    /// Per-link tick deadline. Defaults to the host's 4h cap so a tick
     /// genuinely outlives the worker's ordinary bounded `timeout_ms`
     /// (WI#325 "infinite deadline participation": the lease is the chain,
-    /// and each link is as long as the wire protocol allows).
+    /// and each link is bounded by the host and any lower worker cap).
     pub fn tick_timeout_ms(&self) -> u64 {
         self.tick_timeout_ms.unwrap_or(Self::MAX_TICK_TIMEOUT_MS)
     }
@@ -424,7 +424,7 @@ impl CronWorkerConfig {
         if !(Self::MIN_TICK_TIMEOUT_MS..=Self::MAX_TICK_TIMEOUT_MS).contains(&tick_timeout_ms) {
             return Err(format!(
                 "cron.tick_timeout_ms {tick_timeout_ms} outside {}..={} (ms); the upper bound \
-                 matches the kimi worker bridge cap so ticks are not rejected on the wire",
+                 matches the kimi worker bridge's default cap",
                 Self::MIN_TICK_TIMEOUT_MS,
                 Self::MAX_TICK_TIMEOUT_MS
             ));
@@ -435,7 +435,7 @@ impl CronWorkerConfig {
     /// Host-side `project_dir` validation (MR !1522 DE-5): the worker bridges
     /// reject bad paths with *wording that differs per bridge*, so the host
     /// refuses obviously-invalid values at load and the supervisor only has
-    /// to classify the "directory does not exist on the worker" case.
+    /// to classify filesystem/preflight failures at dispatch time.
     /// Validates the *effective* directory (explicit or `missions/<id>`
     /// default), which also confines a hostile `mission_id`.
     fn validate_project_dir(&self, worker_name: &str) -> Result<(), String> {
@@ -468,6 +468,11 @@ impl CronWorkerConfig {
                     return Err(bad("a `.` segment"));
                 }
             }
+        }
+        // Path::components normalizes interior `.` and empty components;
+        // the bridge's descriptor-relative creation rejects them literally.
+        if dir.split('/').any(|part| part.is_empty() || part == ".") {
+            return Err(bad("not a sequence of nonempty normal components"));
         }
         Ok(())
     }
@@ -1386,6 +1391,9 @@ goal = "g"
             "missions/../../escape",
             "~/rooted",
             "./dot",
+            "missions/./digest",
+            "missions//digest",
+            "missions/digest/",
             "white space/..",
         ] {
             assert!(

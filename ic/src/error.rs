@@ -413,7 +413,7 @@ pub enum OrchestratorError {
     ExternalWorkerNotCron { worker_name: String },
 
     #[error(
-        "Cron mission supervisor for worker '{worker_name}' is not running (invalid cron config or startup failure)"
+        "Cron mission supervisor for worker '{worker_name}' is not running (startup failure or supervisor stopped)"
     )]
     CronSupervisorNotRunning { worker_name: String },
 

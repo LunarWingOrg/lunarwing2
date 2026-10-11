@@ -3,6 +3,7 @@
 //! Each module groups related endpoint handlers by domain.
 
 pub mod coord;
+pub mod cron_workers;
 pub mod jobs;
 pub mod memory;
 pub mod missions;

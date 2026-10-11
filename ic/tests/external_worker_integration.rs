@@ -2376,6 +2376,14 @@ async fn cron_tick_abandoned_after_max_reentries() {
         timeout(TEST_BOUND, request_rx.recv()).await.is_err(),
         "a tick past its re-entry budget must not dispatch again"
     );
+    assert_eq!(
+        mgr.cron_mission_status("mock", "owner-1")
+            .await
+            .unwrap()
+            .consecutive_abandoned,
+        1,
+        "the tick must be abandoned, not waiting to dispatch an illegal fourth link"
+    );
 }
 
 /// CU-1 with a lock-enforcing mock: the supervisor cancels the wedged link,
@@ -2426,6 +2434,13 @@ async fn cron_busy_rejection_retries_without_spending_reentry_budget() {
     assert!(
         timeout(TEST_BOUND, request_rx.recv()).await.is_err(),
         "a tick at its re-entry cap must not dispatch again"
+    );
+    assert_eq!(
+        mgr.cron_mission_status("mock", "owner-1")
+            .await
+            .unwrap()
+            .consecutive_abandoned,
+        1
     );
 }
 
@@ -2674,8 +2689,8 @@ async fn cron_non_retryable_abandons_and_breaker_trips() {
             request["payload"]["context"]["cron_tick"]["chain_index"], 0,
             "tick {tick}: a non-retryable rejection must not re-dispatch"
         );
-        // No second link for this tick (a wrong re-dispatch would land after
-        // the ~4s chain backoff).
+        // The status assertion below pins abandonment. This short negative
+        // window alone cannot exclude a 5s poll + 4s backoff re-dispatch.
         assert!(
             timeout(Duration::from_secs(8), request_rx.recv())
                 .await
@@ -2750,7 +2765,7 @@ async fn cron_tick_context_is_evicted_after_resolution() {
 
 /// MR !1522 DE-9: for a non-owner caller the gate returns one uniform
 /// `CronMissionNotOwned` error whether the named worker is cron-mode with a
-/// live supervisor, cron-mode with a dead supervisor, or plain task-mode —
+/// live supervisor, a nonexistent worker, or plain task-mode —
 /// the error surface must not reveal worker modes. The owner still gets the
 /// precise distinctions.
 #[tokio::test]
@@ -2811,7 +2826,7 @@ async fn cron_pause_and_tick_counter_survive_restart() {
     backend.run_migrations().await.expect("migrations");
     let db: Arc<dyn Database> = Arc::new(backend);
 
-    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
         requests: request_tx,
     })
@@ -2842,6 +2857,12 @@ async fn cron_pause_and_tick_counter_survive_restart() {
     })
     .await
     .expect("two scheduled ticks never fired");
+    for _ in 0..2 {
+        timeout(TEST_BOUND, request_rx.recv())
+            .await
+            .unwrap()
+            .expect("persisted tick reached worker");
+    }
     mgr_a
         .pause_cron_mission("mock", "owner-1")
         .await
@@ -2866,7 +2887,6 @@ async fn cron_pause_and_tick_counter_survive_restart() {
     .expect("pause was never applied");
     let _ = shutdown_a.send(());
     drop(mgr_a);
-    drop(request_rx);
 
     // Second incarnation over the same store: paused and tick_index persist.
     let context_manager_b = Arc::new(ContextManager::new(16));
@@ -2876,7 +2896,7 @@ async fn cron_pause_and_tick_counter_survive_restart() {
             .with_event_deps(event_tx_b, Arc::clone(&context_manager_b))
             .with_store(db.clone()),
     );
-    let (_shutdown_b, shutdown_rx_b) = tokio::sync::broadcast::channel(1);
+    let (shutdown_b, shutdown_rx_b) = tokio::sync::broadcast::channel(1);
     mgr_b.spawn_cron_supervisors("owner-1", shutdown_rx_b);
 
     let status = mgr_b
@@ -2889,4 +2909,213 @@ async fn cron_pause_and_tick_counter_survive_restart() {
         "persisted tick counter must survive the restart, got {}",
         status.tick_index
     );
+    // DN-4 / DO-4: after restart, resume still uses the last real job row as
+    // its audit anchor. Status drains the command before reading the store.
+    let job_id: Uuid = serde_json::from_value(
+        db.get_setting("owner-1", "cron-mission:test-mission:last-job")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    mgr_b.resume_cron_mission("mock", "owner-1").await.unwrap();
+    assert!(
+        !mgr_b
+            .cron_mission_status("mock", "owner-1")
+            .await
+            .unwrap()
+            .paused
+    );
+    let events = db.list_job_events(job_id, None).await.unwrap();
+    for kind in ["cron_paused", "cron_resumed"] {
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == kind && event.data["origin"] == "owner_command"),
+            "missing persisted {kind} lifecycle event"
+        );
+    }
+    let _ = shutdown_b.send(());
+}
+
+#[cfg(feature = "libsql")]
+async fn assert_cron_gateway_auth(client: &reqwest::Client, addr: std::net::SocketAddr) {
+    let url = format!("http://{addr}/api/workers/mock/cron");
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+    assert_eq!(
+        client
+            .post(format!("{url}?token=owner-test-token"))
+            .json(&serde_json::json!({"action":"resume"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    for worker in ["mock", "nonexistent"] {
+        let endpoint = format!("http://{addr}/api/workers/{worker}/cron");
+        assert_eq!(
+            client
+                .get(&endpoint)
+                .bearer_auth("other-test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert_eq!(
+            client
+                .post(&endpoint)
+                .bearer_auth("other-test-token")
+                .json(&serde_json::json!({"action":"resume"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("owner-test-token")
+            .json(&serde_json::json!({"action":"resume", "user_id":"other"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
+}
+
+/// DN-3: recovery uses the authenticated gateway independently of either LLM
+/// engine. No chat turn or model/tool invocation participates in this route.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_gateway_recovers_persisted_pause_and_rejects_nonowners() {
+    use std::collections::HashMap;
+
+    use lunarwing::channels::web::{
+        auth::{MultiAuthState, UserIdentity},
+        test_helpers::TestGatewayBuilder,
+    };
+    use lunarwing::db::{Database, libsql::LibSqlBackend};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = LibSqlBackend::new_local(&dir.path().join("recovery.db"))
+        .await
+        .unwrap();
+    backend.run_migrations().await.unwrap();
+    let db: Arc<dyn Database> = Arc::new(backend);
+    db.set_setting(
+        "owner-1",
+        "cron-mission:test-mission:paused",
+        &serde_json::json!(true),
+    )
+    .await
+    .unwrap();
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_for("ws://127.0.0.1:9", 30, 0)])
+            .with_event_deps(events, Arc::new(ContextManager::new(16)))
+            .with_store(db.clone()),
+    );
+    let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", rx);
+    let auth = MultiAuthState::multi(HashMap::from([
+        (
+            "owner-test-token".into(),
+            UserIdentity {
+                user_id: "owner-1".into(),
+                workspace_read_scopes: vec![],
+            },
+        ),
+        (
+            "other-test-token".into(),
+            UserIdentity {
+                user_id: "other".into(),
+                workspace_read_scopes: vec![],
+            },
+        ),
+    ]));
+    let (addr, _state) = TestGatewayBuilder::new()
+        .user_id("owner-1")
+        .external_worker_manager(mgr.clone())
+        .start_multi(auth)
+        .await
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(TEST_BOUND)
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/api/workers/mock/cron");
+    assert_cron_gateway_auth(&client, addr).await;
+    assert!(
+        mgr.cron_mission_status("mock", "owner-1")
+            .await
+            .unwrap()
+            .paused
+    );
+    for (action, paused) in [("status", true), ("resume", false), ("pause", true)] {
+        let response = if action == "status" {
+            client
+                .get(&url)
+                .bearer_auth("owner-test-token")
+                .send()
+                .await
+                .unwrap()
+        } else {
+            client
+                .post(&url)
+                .bearer_auth("owner-test-token")
+                .json(&serde_json::json!({"action":action}))
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["action"], action);
+        assert_eq!(body["mission"]["paused"], paused);
+        assert_eq!(body["mission"]["worker_name"], "mock");
+        assert_eq!(
+            db.get_setting("owner-1", "cron-mission:test-mission:paused")
+                .await
+                .unwrap(),
+            Some(serde_json::json!(paused))
+        );
+    }
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn cron_mission_tool_success_routes_pause_status_resume() {
+    use lunarwing::context::JobContext;
+    use lunarwing::tools::{Tool, builtin::CronMissionTool};
+    let (mgr, _cm, shutdown) = spawn_cron_manager(cron_config_for("ws://127.0.0.1:9", 30, 0));
+    let tool = CronMissionTool::new(mgr);
+    let owner = JobContext {
+        user_id: "owner-1".to_string(),
+        ..Default::default()
+    };
+    for (action, paused) in [
+        ("pause", true),
+        ("status", true),
+        ("resume", false),
+        ("status", false),
+    ] {
+        let output = tool
+            .execute(
+                serde_json::json!({"worker":"mock", "action":action}),
+                &owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.result["action"], action);
+        assert_eq!(output.result["mission"]["paused"], paused);
+        assert_eq!(output.result["mission"]["mission_id"], "test-mission");
+        assert_eq!(output.result["mission"]["consecutive_abandoned"], 0);
+    }
+    let _ = shutdown.send(());
 }

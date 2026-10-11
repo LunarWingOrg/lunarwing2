@@ -1,8 +1,8 @@
 # External Worker Cron Mode (WI#325)
 
-Status: implemented (host-side) in v2.1.6.0; revised after the MR !1509
-adversarial review (CU-1..CU-9) and the MR !1522 adversarial review
-(DE-1..DE-10; see "Review-driven hardening").
+Status: implemented in v2.1.6.0; revised after the MR !1509 (CU-1..CU-10),
+!1522 (DE-1..DE-10), and !1531 (DN/DO) reviews. WI#325 remains open:
+audio capture and its proposed scope-out still require the WI owner's decision.
 Work item: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
 
 ## Problem
@@ -36,21 +36,43 @@ mission_id = "pr-digest"          # optional; default "cron-worker-<name>";
                                   # must be unique across cron workers
 timezone = "America/New_York"     # optional IANA zone; default UTC
 heartbeat_timeout_secs = 900      # optional; default 900 (15 min); floor 5
-tick_timeout_ms = 14400000        # optional; default = 14_400_000 (the 4h
-                                  # worker bridge cap); bounded 1_000..=14_400_000
+tick_timeout_ms = 14400000        # optional; host limit matching Kimi's default
+                                  # 4h cap; bounded 1_000..=14_400_000
 max_reentries = 3                 # optional; default 3; hard cap 16
 # allow_subminute_schedule = true # explicit override for fire gaps < 60s
 # project_dir = "missions/pr-digest" # optional; default "missions/<mission_id>"
+# Updated bridges create this directory for cron ticks. On older images,
+# pre-create it under the worker's WORKSPACE_ROOT before enabling the schedule.
 ```
 
-**Validation fails loudly at load**: an invalid cron block (unparseable or
+**Workspace prerequisite:** `WORKSPACE_ROOT` must already exist and be writable.
+Updated Kimi, OpenCode, OpenCode2 and Pebble bridges create missing mission
+directories before executing a `cron.tick`. Creation is component-by-component,
+relative to held directory descriptors, rejecting symlinks, absolute paths,
+`..`, `.` and `~`. Existing mission files are preserved across ticks. Ordinary
+tasks do not gain directory creation. These bridges run in Linux containers
+with `/proc/self/fd` available. **Older images require the directory to pre-exist**
+(for example, create `missions/pr-digest` inside their workspace mount before
+enabling this example). Upgrade/recreate workers with the daemon changes;
+rolling back to an older worker image requires pre-creating each mission dir.
+
+**Semantic validation fails loudly at load**: an invalid cron block (unparseable or
 sub-60s schedule without the override, empty goal, heartbeat below the floor,
 re-entry count above the cap, tick timeout outside the bounded range, a
 `project_dir` that is absolute/`..`-traversal/`~`-rooted, an unparseable
-`timezone`, a duplicate `mission_id`, an unknown key — or a missing `[cron]`
+`timezone`, a duplicate `mission_id` — or a missing `[cron]`
 block on a `mode = "cron"` worker) rejects the worker from the resolved config
 with an `error!` naming the reason. A schedule typo can never boot a silently
-mission-less worker (WI#321 class).
+mission-less worker (WI#321 class). This removes the entire worker, including
+ordinary task-mode availability, rather than disabling only its schedule.
+
+**Unknown keys fail earlier:** `deny_unknown_fields` rejects deserialization
+of the complete `Settings` value in strict TOML/JSON parsing; it is not a
+per-worker resolution error. The DB-backed loader applies settings rows via
+`Settings::set`: an invalid `sandbox.external_workers` row logs a warning and
+is skipped wholesale, retaining the default empty worker list. Validate the
+whole worker array before storing/reloading it; one misspelled cron key can
+therefore remove every worker supplied by that row (DO-6).
 
 ### 1. Cron-tick JSON events
 
@@ -83,8 +105,8 @@ manual/test trigger marker and do not advance the durable counter.
 
 The **host supervisor always holds the mission lease**. Tick jobs are not
 subject to the standard bounded `timeout_ms` semantics: they run under the
-cron block's own `tick_timeout_ms` — **defaulting to the 4h worker-bridge
-cap**, i.e. a tick link outlives the worker's ordinary bounded deadline by
+cron block's own `tick_timeout_ms` — **defaulting to a host-imposed 4h limit
+matching Kimi's default cap**, i.e. a tick link outlives the ordinary deadline by
 default — plus the heartbeat watchdog, which bounds *silence*, not work. The
 mission itself has no deadline: it fires again at the next scheduled tick
 regardless of how any one tick resolved. Because a cron-mode mission is never
@@ -92,10 +114,12 @@ an engine `Mission` record, the WI#311 `Completed`-parking lifecycle machine
 and the WI#317 boot writer never touch it (structural, not behavioral,
 exclusion).
 
-The honest bound: a single link cannot exceed the worker bridge's hard timeout
-cap (kimi's `KIMI_MAX_TIMEOUT_MS`, 4h by default) — the wire protocol rejects
-it. Config validation refuses out-of-range values at load instead of letting
-every tick fail on the wire, and a worker-side protocol-validation rejection
+The host validates every worker's tick links to 1s..4h. Kimi additionally
+enforces `KIMI_MAX_TIMEOUT_MS` (default 4h; configurable from 1s to 24h);
+OpenCode/OpenCode2/Pebble have no equivalent wire-protocol maximum. Set
+`cron.tick_timeout_ms` at or below any lower configured Kimi cap: the daemon
+cannot discover that environment value, so a default 4h tick is otherwise
+rejected. A worker-side protocol-validation rejection
 (`timeout_ms must be…`, unresolvable/escaping `project_dir` — both kimi's
 `realpathSync` ENOENT and pebble's wrapped wording are classified) is treated
 as **non-retryable**: the tick is abandoned immediately rather than burning
@@ -142,9 +166,11 @@ spawns, so rows are ordered and survive shutdown):
   reservation/registration failure; log-only, since no job row exists yet).
 - `cron_tick_end` — `completed` / `cancelled` / `abandoned` (+reason) /
   `skipped_busy` / `paused`.
-- `cron_paused` / `cron_resumed` — on circuit-breaker trips AND on owner
-  commands (keyed to the mission's most recent tick job; a mission that has
-  never ticked has no job row, so the tracing line is the record then).
+- `cron_paused` — on circuit-breaker trips and owner pause; `cron_resumed`
+  — on owner resume (the breaker never resumes itself). Both are keyed to
+  the mission's most recent tick job, persisted across restart; a mission that has
+  never ticked (or whose last job was deleted before restart) has no job row,
+  so the tracing line is the record then.
 
 plus SSE `JobStatus` frames for live subscribers, and `info!`/`warn!`/`error!`
 tracing at supervisor start, each tick fire, each re-entry, each tick end, and
@@ -165,15 +191,19 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   pauses itself, persists the pause (restart-safe), and surfaces it via
   `job_events` (`cron_paused`) and SSE.
 - **Runtime stop (CU-2)** — the owner-gated `cron_mission` tool
-  (`pause`/`resume`/`status`, gated exactly like `cancel_job`; AskEachTime
-  permission). `cancel_job` still ends only the current link;
+  (`pause`/`resume`/`status`, owner-gated with AskEachTime and an explicit
+  autonomous denylist, stricter than `cancel_job`). `cancel_job` ends only the current link;
   `cron_mission pause` stops future fires and pending re-entries, and
-  survives restart. Known limitation: the tool is v1-only in the engine
-  bridge (`is_v1_only_tool`), so Engine V2 gateway chats get the v1-only
-  redirect error — an Engine V2 cron-mission verb is follow-up work.
+  survives restart. The tool is v1-only in the engine bridge
+  (`is_v1_only_tool`); all deployments can use the owner-authenticated HTTP
+  control route below, including Engine V2 tenants.
 - **Memory growth (CU-2)** — terminal tick contexts are evicted from the
   `ContextManager` once their events are persisted; the durable record lives
   in `agent_jobs` + `job_events` (`job_status` falls back to the DB).
+  Durable rows currently have no automatic retention. A per-minute mission
+  adds up to 1,440 jobs/day plus events and reentries; `list_jobs`' newest-100
+  limit can hide ordinary jobs. Retention/discovery is tracked by
+  [WI#370](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/370).
 - **Self-repair interference (CU-5)** — jobs whose metadata carries
   `cron_mode: true` are exempt from the self-repair idle detector; the cron
   supervisor owns their watchdog, so no double-cancel and no spurious
@@ -191,14 +221,17 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   `cron_paused`/`cron_resumed` `job_events` rows and emit SSE frames.
 - **DE-2 (breaker vs. contention)** — busy rejections (workspace lock held,
   worker concurrency cap) and dispatch-time capacity failures retry the same
-  chain link (bounded, 5×) and, on exhaustion, record `skipped_busy` and wait
+  chain link (bounded, 5×) and, on exhaustion, log `skipped_busy` and wait
   for the next scheduled fire **without counting toward the circuit
-  breaker**. Ordinary tasks contending with a mission no longer pause it.
+  breaker**. Busy worker rejections have a job row and persist a
+  `cron_tick_end`; pre-dispatch capacity failures are log-only. Ordinary
+  tasks contending with a mission no longer pause it.
 - **CU-1 residue / project_dir** — `cron.project_dir` now **defaults to
   `missions/<mission_id>`**, so a mission never shares the worker root with
   ordinary dispatches unless the operator opts into that, and the value is
-  host-validated at load (relative, no `..`, no `~`, no `.` segments, no NUL)
-  so classification no longer depends on per-bridge error wording. Honest
+  host-validated at load (relative, no `..`, no `~`, no `.` segments, no NUL).
+  Updated bridges bootstrap missing dirs; older images require the directory
+  to pre-exist. Worker preflight errors still use textual classification. Honest
   caveat: the kimi/pebble workspace lock treats nested paths as overlapping,
   so an ordinary dispatch that uses the worker root still contends with a
   running tick — give ordinary tasks on a cron-mode worker their own
@@ -236,12 +269,15 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   a mission-like run — `cron_scheduled_loop_fires_on_schedule` drives the real
   scheduled loop (per-second schedule) and asserts monotonic tick indices;
   `cron_tick_reaches_worker_with_structured_tick_context` asserts the on-wire
-  payload.
+  payload. Missing-directory startup is additionally covered through the real
+  Kimi bridge with a mock CLI, Pebble bridge dispatch, and all four workspace
+  helpers. Production model execution and older images are not covered by
+  those tests; older images need the documented pre-creation step.
 - [x] The run outlives the standard bounded deadline without being killed —
-  per-link `tick_timeout_ms` defaults to the 4h bridge cap (longer than any
+  per-link `tick_timeout_ms` defaults to the host's 4h limit (longer than any
   shipped worker's ordinary default), and the mission itself has no deadline:
   the supervisor holds the lease and chains fresh links. No `Completed`
-  parking. (A single link cannot exceed the wire-protocol cap, documented
+  parking. (A single link cannot exceed the host limit or Kimi's configured cap, documented
   above.)
 - [x] If the job dies mid-run, the supervisor re-dispatches a fresh job and
   the mission resumes from workspace state — `cron_supervisor_redispatches_wedged_tick_job`
@@ -250,17 +286,68 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   mock). Cross-job workspace durability is a property of the worker bind mount
   recorded in the WI's evidence section; the chain itself is
   integration-tested.
-- [x] Every tick and job transition is visible in `job_events` —
+- [~] Tick/job transitions are persisted where a job row exists —
   `cron_tick_events_persist_to_job_events` asserts persisted `cron_tick` and
   `cron_tick_end` rows against a real store; owner pause/resume persist
   `cron_paused`/`cron_resumed` rows keyed to the mission's most recent tick
-  job.
+  job, including resume after restart. Pre-dispatch capacity failures and
+  lifecycle controls before any job exists are log-only; full store-backed
+  outcome/FK coverage is tracked by WI#370.
 - [x] A `cron`-mode mission is NOT parked `Completed` by the in-process
   lifecycle machine — it is never an engine `Mission` at all.
 - [~] Session audio/log capture — text session logs are covered by
   `job_events` + workspace state files; **audio capture is not implemented**
-  (no audio path exists in external workers today) and remains out of scope
-  for this item.
+   (no audio path exists in external workers today). Deferring it needs the
+   WI owner's acceptance; this branch does not claim that acceptance.
+
+## Owner recovery API (MR !1531 DN-3)
+
+`GET /api/workers/{worker}/cron` returns live mission status.
+`POST /api/workers/{worker}/cron` accepts `{"action":"pause"}` or
+`{"action":"resume"}` (also `status`). Responses contain `action` and
+`mission` (`mission_id`, `worker_name`, `paused`, `tick_index`,
+`consecutive_abandoned`). Mutations read status after the command is applied.
+
+Both routes use the existing gateway bearer authentication and require the
+authenticated user to match the configured daemon owner before any lookup.
+No body-supplied identity or query-string bearer is accepted. Existing gateway
+CORS and body limits apply; the handler bounds supervisor waits to 10 seconds.
+This route is independent of Engine V1/V2 and needs no LLM, UI, or database edit:
+
+```sh
+curl --fail -H "Authorization: Bearer $GATEWAY_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"action":"resume"}' \
+  "$GATEWAY_URL/api/workers/kimi/cron"
+```
+
+## MR !1531 disposition (review #7569)
+
+- **DN-2 / DO-1:** confined cron-directory bootstrap in all four bridges;
+  missing-default-dir and traversal/symlink regressions, plus upgrade prerequisites above.
+- **DN-3:** owner-authenticated recovery API, tested with a persisted pause,
+  real auth middleware, non-owner/missing/query-token rejection, and ordered status.
+- **DN-1:** terminal wait returns shutdown to the reentry chain; deterministic
+  test delivers shutdown while awaiting a non-terminal job and requires chain exit.
+- **DN-4:** persist/reload the last real job id for post-restart audit events;
+  store test reads owner pause and post-restart resume back from `job_events`.
+- **DN-6:** only dispatched/persisted links can anchor pause events. A paused
+  capacity retry exits without creating a phantom job/event; failed job-row
+  persistence prevents dispatch. A store-backed regression checks no orphan row.
+- **DN-8:** only the exact Node missing-path shape (`ENOENT: no such file or
+  directory, realpath`) is non-retryable; arbitrary user-task mentions retry.
+- **DO-2 / DO-3:** cap-boundary unit test and positive abandonment assertions;
+  live-supervisor tool pause/status/resume success and JSON-shape coverage.
+- **DO-7:** queued-command precedence over shutdown is unit-tested; the
+  original restart test alone did not pin the select ordering.
+- **DN-9 / DN-10 / DO-5 / DO-6 / DO-8..DO-11:** timeout/config/claim corrections;
+  closed command channels cancel the active tick; durable tick-index docs and
+  test-only manual-fire wording corrected. A mission can still consume one
+  parallel slot per active link for up to 4h × (1 + max_reentries) per tick.
+- **Deferred as permitted by the review:** [WI#371](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/371)
+  owns DN-5 (fail-open state reads, pause-write retries/acknowledgements, and
+  durable breaker counters); WI#370 owns DN-7 and remaining DO-4 (retention,
+  complete persisted outcome matrix and PostgreSQL FK CI coverage). Pause writes
+  are currently best-effort, and the abandon counter currently resets on restart.
 
 ## Files
 
@@ -283,6 +370,14 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
 - `ic/crates/lunarwing_engine/src/gate/tool_tier.rs` —
   `AUTONOMOUS_TOOL_DENYLIST` entry.
 - `ic/src/tools/registry.rs` — `PROTECTED_TOOL_NAMES` entry.
+- `ic/src/tools/permissions.rs`, `ic/src/tools/builtin/mod.rs` — permission seed/export.
+- `ic/src/bridge/effect_adapter.rs` — V1-only tool fence.
+- `ic/src/agent/routine_engine.rs` — autonomous denylist regression.
+- `ic/src/error.rs`, `ic/src/config/mod.rs`, `ic/src/orchestrator/mod.rs` — errors/exports.
+- `ic/src/channels/web/handlers/cron_workers.rs`, `handlers/mod.rs`, `server.rs`
+  — owner HTTP control and authenticated route registration.
+- All four worker bridges and their `workspace_path` helpers — cron-only
+  directory creation; Pebble protocol and TS runtime context carry `cron_tick`.
 - `ic/src/main.rs` — supervisor spawn next to the pool eviction task.
 - `ic/tests/external_worker_integration.rs` — wire-shape, scheduled-loop,
   shutdown, re-entry, busy-lock, abandonment, breaker, owner-gate, command

@@ -83,7 +83,7 @@ pub struct CronTick {
     pub schedule: String,
     /// The mission's durable goal text.
     pub goal: String,
-    /// Monotonic tick counter since daemon start (0-based).
+    /// Persisted, 1-based scheduled tick counter; 0 denotes a manual test fire.
     pub tick_index: u64,
     /// Which attempt of this tick this job is (0 = first dispatch,
     /// >0 = supervisor re-entry after wedge/failure).
@@ -235,7 +235,7 @@ impl CancelReason {
 /// stay serialized with the scheduled loop — a manual tick can never overlap
 /// a scheduled tick on the same worker workspace.
 pub enum CronCommand {
-    /// Fire one tick immediately (operator/test trigger; tick_index 0).
+    /// Fire one tick immediately (test-only surface; tick_index 0).
     FireNow,
     /// Pause the mission: scheduled fires are skipped until resumed. The
     /// pause is persisted and survives daemon restarts.
@@ -2628,7 +2628,7 @@ mod tests {
             metadata: [("priority".to_string(), "high".to_string())]
                 .into_iter()
                 .collect(),
-            cron_tick: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&ctx).unwrap();
