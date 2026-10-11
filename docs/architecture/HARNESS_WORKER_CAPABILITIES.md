@@ -17,8 +17,9 @@ params execution will use (in both the agent dispatcher and the Engine V2
 effect adapter), and is presence-based on raw params, so string-typed values
 (`"allow_identity_injection": "true"`) cannot slip past it (DH-1).
 
-All harness host state lives under `~/.lunarwing/harness/<job_id>/` (mode
-0700) — deliberately **outside** the projects base, which any job can mount
+All harness host state lives under `~/.lunarwing/harness/<job_id>/`. The
+`harness/` base is mode 0700; job subdirectories are ordinarily 0755. This is
+deliberately **outside** the projects base, which any job can mount
 via an explicit `project_dir` (CW-3). Explicit `project_dir` values are
 restricted to `projects/<uuid>` dirs owned by the calling user, and are
 rejected outright when the job store needed for the ownership check is
@@ -44,35 +45,47 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   `LUNARWING_SECRET_FILES` (names only). The worker exits before any job work
   unless the delivered set matches exactly — a job never runs with a partial
   secret set.
-- **One-shot delivery (DG-7):** the first successful pull is the only pull —
-  a replay with a leaked job token gets `410 Gone`.
+- **One-shot delivery (DG-7):** the first accepted pull marks the values served
+  before its response is written; subsequent pulls get `410 Gone`, including
+  retries after an interrupted response.
 - Values are **never exported to the child-process env** (CV-3): the job
   reads the files (`$(cat /run/secrets/NAME)`) when a command needs them.
   File names must match `[A-Z_][A-Z0-9_]*`, must not be on the env-var
   denylist (`LD_PRELOAD`, `PATH`, …), and must not use the reserved
   `LUNARWING_`/`IRONCLAW_` prefixes (CV-4) — enforced daemon-side and
   re-checked worker-side. Bytes are written exactly (no newline trimming).
-- **Redaction (CV-7, DG-1/DG-2):** the worker scrubs every known encoding of
-  each mounted value — raw, per-line for multi-line values, JSON-escaped,
-  URL-encoded, hex, and base64 (standard and URL-safe alphabets, padded and
-  unpadded, the 76-column wrapped form the `base64` CLI emits, and the
-  stream-stable cores for a value encoded at byte offsets 1–2 inside a larger
-  blob) — at the **tool-result boundary, before any truncation**, so events,
-  the final `last_output`, the completion report, the LLM context, and
-  provider logs only ever see scrubbed text; JSON object keys are scrubbed
-  too, and a partial value prefix (≥ 8 bytes) sliced by a truncation cut is
-  redacted at the cut. The daemon re-scrubs at event ingest and on
-  `/complete` as a backstop, so values do not reach persisted events, the
-  `agent_jobs` table, SSE, the web UI, or the parent agent's context. The
-  per-job worker bearer token (readable by job children via
-  `/proc/1/environ`) is armed in the same redactor (DG-7).
+- **Redaction (CV-7, DG-1/DG-2, DZ-1/DZ-4):** the conventional worker scrubs
+  selected value representations at the **serialized tool-result boundary,
+  before worker event truncation**, and reuses that text for `last_output`
+  and the LLM context. Examples include raw text, lines of multi-line values,
+  JSON-escaped and URL-encoded text, lowercase/uppercase hex (including
+  60-column `xxd -p` output), and base64 (standard/URL-safe, padded/unpadded,
+  76-column CLI wrapping, and standard-alphabet offset-1/2 stream cores).
+  Wrapped encodings include literal and JSON-escaped newlines and individual
+  wrap lines. Variants are sorted longest-first across all mounted values.
+  JSON object keys are also scrubbed. The daemon re-scrubs event ingest and
+  `/complete` before persistence and broadcast.
+  - Tools can truncate **before** this boundary: shell capture is capped at
+    64 KiB and then reduced to a 32 KiB head/tail result. Fragments at those
+    internal cuts may survive. The partial-prefix check only protects the
+    trailing cut made by `scrub_and_truncate`, not arbitrary upstream cuts.
+  - The conventional worker also arms its bearer token as defense in depth;
+    the ACP bridge does not. The worker's `PR_SET_DUMPABLE=0` is intended to
+    prevent child access to `/proc/1/environ`; token redaction is not proof
+    that such access is possible or that every output path is covered.
+  - Retained variants use `SecretString` and zeroize on drop. Temporary
+    encoding strings, pulled strings, and serialized copies do not all
+    zeroize (DZ-8).
   - Redaction is **best-effort, not a boundary**: a job that deliberately
     slices a value (e.g. `cut -c1-32` over several calls) or encodes it in a
-    form not covered above can smuggle partials out. The real control is the
-    `Always` approval tier on secret mounts.
+    form not covered above can smuggle partials out. Extracted/decoded fields
+    of structured secrets (e.g. a JSON private-key field) are not guaranteed
+    coverage. Unmatched text can reach events, completion reports, parent
+    context and provider logs. The real control is the `Always` approval tier
+    on secret mounts.
   - Values shorter than 8 bytes are not value-redacted (scrubbing would
-    mangle legitimate output); they still never enter env/logs by
-    construction.
+    mangle legitimate output). They are not exported to child env, but a
+    tool can still print them.
 
 ## 2. Read-only file/memory injection (`inject_files`)
 
@@ -101,15 +114,21 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   the roots and **lower** the limits). Default off.
 - A separate staging dir is mounted RW at `/harness/workspace_out`. Jobs
   never write into tenant memory directly. The bind is made writable for the
-  container's worker uid per runtime (DG-6): podman ≥ 5 gets
+  container's worker uid per runtime (DG-6/EA-1): rootless podman ≥ 5 gets
   `userns_mode: keep-id:uid=1000,gid=1000` (the in-container uid lands on the
-  daemon's host uid); Docker gets a 0777 staging **leaf** (the 0700 harness
-  parents keep it private) plus a daemon-side write probe when the daemon is
-  not uid 1000. Podman < 5 cannot express the pin — dispatch fails closed.
+  daemon's non-root host uid). Rootful Docker without userns remapping is
+  supported only when the daemon is uid 1000, matching the worker. Runtime
+  security options are checked through the connected API; rootless/remapped
+  Docker, rootful/old podman, unreported security options, and incompatible
+  daemon UIDs fail closed. Staging is not chmodded 0777, and a daemon-side
+  probe is not treated as evidence of worker access. The runtime test checks
+  both worker writes and daemon removal of worker-created subdirectories.
 - On job completion (`/complete`), after the container teardown is
   confirmed, the daemon runs the promotion pipeline detached (the job sits
   in a `Finalizing` state until it lands, so waiters cannot race it — CW-7;
-  stop/cancel/cleanup are refused or deferred while `Finalizing` — DH-4):
+  stop/cancel/cleanup are refused or deferred while `Finalizing` — DH-4).
+  Stop and the exit watcher claim a terminal result under the same write
+  lock used by completion; cleanup checks and removes atomically (EA-3):
   - **Allowlist is operator-fixed to `projects/**`** (CW-1). Callers may
     narrow (e.g. `projects/demo/`) but never widen or replace it.
   - Hard-denied regardless of roots: identity documents, system-prompt files
@@ -140,20 +159,27 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   skipped — writes a `harness_write_back` audit event with the full write
   set, every rejection with its reason, and the skip reason (CW-9). Each
   promoted record carries the owner id, the previous content hash, and —
-  when the write replaced existing content — a full snapshot of the replaced
-  content at `backups/harness/<job_id>/<path>` (DH-5: a real rollback
-  target, not just a hash; a file whose snapshot cannot be persisted is
-  rejected rather than promoted unsnapshotted). The synchronous
-  (`wait=true`) result also carries the outcome under `write_back`.
+  when the write replaced differing, non-empty content — a full snapshot at
+  `backups/harness/<job_id>/<path>` (DH-5: a real rollback
+  target, not just a hash). The source is read from the primary write scope;
+  only `DocumentNotFound` means absent. Other read errors and snapshot-write
+  errors reject the file. Snapshots use an empty search-chunk projection,
+  like prompt-file shadows: no embeddings or search results (EA-4). If the
+  promoted write fails and the original is confirmed intact, its unused
+  snapshot is deleted; an uncertain commit/read or cleanup failure retains
+  recovery evidence. The synchronous (`wait=true`) result also carries the
+  outcome under `write_back`.
 
 ## Cleanup (CW-8, DH-2)
 
 Harness dirs (injection snapshot + staging) and the held secret values are
-released on every terminal path: normal completion — both the promotion
+released on the handled terminal paths: normal completion — both the promotion
 (`finalize_harness_job`) and non-promotion branches of `complete_job` —
 stop/cancel, the container-exit watcher (crash/OOM), `create_job` failure,
-and the early-return paths between harness preparation and container
-creation. While a job is `Finalizing`, stop/cancel are refused and
+and several early-return paths between harness preparation and container
+creation. Failures during partial harness preparation or before the manager's
+MCP validation completes can still leave directories, and filesystem cleanup
+can fail (EA-2). While a job is `Finalizing`, stop/cancel are refused and
 `cleanup_job` defers, so promotion is never torn down mid-walk (DH-4). At
 daemon startup a sweep removes harness dirs with no live labeled container
 (1-hour grace for in-flight dispatch; skipped entirely when the runtime
@@ -167,7 +193,7 @@ cannot be listed).
 - `ic/src/orchestrator/job_manager.rs` — `JobMode::Harness`, runtime-aware
   tmpfs/mounts, `Finalizing` state, detached promotion, cleanup paths.
 - `ic/src/orchestrator/auth.rs` — per-job harness secret storage in the
-  token store (cleared on every terminal path, not on `revoke`) and the
+  token store (explicit terminal cleanup, not cleared by `revoke`) and the
   one-shot delivery marker.
 - `ic/src/orchestrator/api.rs` — `GET /worker/{id}/harness-secrets` worker
   pull endpoint (one-shot; replay gets 410); ingest-side event redaction;
@@ -175,11 +201,18 @@ cannot be listed).
 - `ic/src/tools/builtin/job.rs` — `create_job` params, approval elevation,
   harness dispatch, `project_dir` ownership/shape checks.
 - `ic/src/worker/container.rs` — worker-side pull, tmpfs staging, and the
-  tool-result-boundary scrub that runs before any truncation.
+  tool-result-boundary scrub that precedes worker event truncation.
   `ic/src/worker/api.rs` — the client call.
 
 ## Explicitly out of scope (follow-ups)
 
+- !1542 residual Low/Info findings: structured-field/other-encoding redaction
+  gaps and low-entropy line over-redaction; staged paths bypassing value scans
+  and direct audit/result scrubbing; duplicate `/complete` handler side
+  effects beyond the manager's idempotence; temporary plaintext copies and
+  per-request redactor rebuilding; remaining preparation/cleanup orphans;
+  no promotion deadline; remaining synchronous filesystem cleanup on async
+  tasks; and stronger delivery, sparse-file and persisted-insert tests.
 - External-worker (opencode/pebble) secrets mounting — this WI covers the
   conventional harness only.
 - Concurrent-edit conflict policy: promotion snapshots the replaced content

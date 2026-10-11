@@ -748,9 +748,10 @@ impl LoopDelegate for ContainerDelegate {
             )
             .await;
 
-            // DG-1/DG-2: scrub at the tool-result boundary, BEFORE any
-            // truncation — one scrub covers the job event, `last_output`,
-            // the completion report, the LLM context, and provider logs.
+            // DG-1/DG-2: scrub at the tool-result boundary before worker event
+            // truncation and reuse that text for last_output and LLM context.
+            // Tools may already have truncated output internally; fragments at
+            // those earlier cuts are not guaranteed to match whole variants.
             let result = match result {
                 Ok(output) => Ok(self.secret_redactor.scrub(&output)),
                 Err(error) => Err(self.secret_redactor.scrub(&error)),

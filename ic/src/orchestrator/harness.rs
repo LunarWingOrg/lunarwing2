@@ -787,15 +787,15 @@ fn sweep_harness_dirs_in(
 
 /// Value-level redactor for worker-mounted secrets (CV-7, DG-2).
 ///
-/// Built from the job's resolved secret values; scrubs every known encoding
+/// Built from the job's resolved secret values; scrubs selected encodings
 /// of a value from job events and completion output before they are persisted
 /// or broadcast, and reused by the promotion pipeline to reject staged files
 /// that embed a mounted secret (CW-10).
 ///
-/// Variant coverage per value: the raw text; each line of a multi-line value
-/// (PEM / service-account JSON); the JSON-escaped form; the URL-encoded form;
-/// lowercase hex; base64 in the standard and URL-safe alphabets (padded and
-/// unpadded); the 76-column wrapped form the `base64` CLI emits by default;
+/// Examples of covered variants: raw text; lines of a multi-line value;
+/// JSON-escaped and URL-encoded forms; lowercase/uppercase hex (including
+/// 60-column `xxd -p` output); base64 in the standard and URL-safe alphabets
+/// (padded and unpadded); the 76-column wrapped output of the `base64` CLI;
 /// and the stream-stable base64 cores for a value encoded at byte offsets 1
 /// and 2 inside a larger blob (the `Authorization: Basic` shape).
 ///
@@ -805,8 +805,9 @@ fn sweep_harness_dirs_in(
 /// The real control is the `Always` approval tier on harness secret mounts —
 /// redaction limits accidental exposure of whole values.
 ///
-/// Variants are held as [`SecretString`] so they zeroize on drop (CV-10);
-/// `Debug` deliberately prints no variant material.
+/// Retained variants are held as [`SecretString`] and zeroize on drop (CV-10);
+/// temporary strings and serialized copies do not all zeroize. `Debug`
+/// deliberately prints no variant material.
 #[derive(Clone, Default)]
 pub struct SecretValueRedactor {
     variants: Vec<SecretString>,
@@ -824,6 +825,9 @@ impl std::fmt::Debug for SecretValueRedactor {
 
 /// Column width of the default (wrapped) output of the `base64` CLI.
 const BASE64_CLI_WRAP_COLS: usize = 76;
+
+/// Column width of plain hex output from `xxd -p` (30 input bytes).
+const HEX_CLI_WRAP_COLS: usize = 60;
 
 /// Insert a variant when it is long enough and not already present. Dedup
 /// hashes only — plaintext copies live solely in `variants`.
@@ -843,6 +847,30 @@ fn push_variant(
     }
 }
 
+/// Cover CLI wrapping both as raw output and inside serialized tool results.
+/// Lines are armed separately too, since a tool may return one line at a time.
+fn push_wrapped_variants(
+    variants: &mut Vec<SecretString>,
+    seen: &mut std::collections::HashSet<u64>,
+    encoded: &str,
+    width: usize,
+) {
+    if encoded.len() <= width {
+        return;
+    }
+    // All callers pass ASCII encodings, so the column boundaries are UTF-8 safe.
+    let lines: Vec<&str> = encoded
+        .as_bytes()
+        .chunks(width)
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .collect();
+    push_variant(variants, seen, lines.join("\n"));
+    push_variant(variants, seen, lines.join("\\n"));
+    for line in lines {
+        push_variant(variants, seen, line.to_string());
+    }
+}
+
 /// Insert a base64 encoding in padded, unpadded, and (when long enough to
 /// wrap) 76-column wrapped form, plus the stream-stable core with the final
 /// quantum dropped (the last 4 chars can mix with suffix bytes when the value
@@ -852,15 +880,7 @@ fn push_base64_variants(
     seen: &mut std::collections::HashSet<u64>,
     encoded: String,
 ) {
-    if encoded.len() > BASE64_CLI_WRAP_COLS {
-        let wrapped = encoded
-            .as_bytes()
-            .chunks(BASE64_CLI_WRAP_COLS)
-            .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        push_variant(variants, seen, wrapped);
-    }
+    push_wrapped_variants(variants, seen, &encoded, BASE64_CLI_WRAP_COLS);
     if encoded.len() >= MIN_REDACTED_SECRET_BYTES + 4 {
         let core = encoded[..encoded.len() - 4].to_string();
         push_variant(variants, seen, core);
@@ -872,7 +892,7 @@ fn push_base64_variants(
     push_variant(variants, seen, encoded);
 }
 
-/// Every known encoding of one secret value (DG-2).
+/// Selected encodings of one secret value (DG-2).
 fn secret_variants(raw: &str) -> Vec<SecretString> {
     use base64::Engine;
     use secrecy::ExposeSecret;
@@ -903,12 +923,15 @@ fn secret_variants(raw: &str) -> Vec<SecretString> {
         &mut seen,
         urlencoding::encode(raw).into_owned(),
     );
-    // `xxd -p` / hex dumps.
+    // Plain hex and `xxd -p` / `xxd -p -u`, including serialized line breaks.
     let mut hex = String::with_capacity(raw.len() * 2);
     for byte in raw.as_bytes() {
         hex.push_str(&format!("{byte:02x}"));
     }
-    push_variant(&mut variants, &mut seen, hex);
+    for encoded in [hex.to_ascii_uppercase(), hex] {
+        push_wrapped_variants(&mut variants, &mut seen, &encoded, HEX_CLI_WRAP_COLS);
+        push_variant(&mut variants, &mut seen, encoded);
+    }
 
     // Base64: standard + URL-safe alphabets, and the stream-stable cores for
     // a value encoded inside a larger blob at byte offset 0, 1, or 2. Offset
@@ -951,6 +974,8 @@ impl SecretValueRedactor {
             }
             variants.extend(secret_variants(raw));
         }
+        // Values can overlap across separate secrets (e.g. password + URL).
+        variants.sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
         let max_variant_bytes = variants
             .iter()
             .map(|v| v.expose_secret().len())
@@ -963,7 +988,7 @@ impl SecretValueRedactor {
     }
 
     /// Add one more value to an existing redactor (e.g. the worker bearer
-    /// token, which is readable by job children via /proc/1/environ — DG-7).
+    /// token, as defense in depth against accidental output — DG-7).
     pub fn add_value(&mut self, value: &str) {
         use secrecy::ExposeSecret;
         if value.len() < MIN_REDACTED_SECRET_BYTES {
@@ -1004,10 +1029,9 @@ impl SecretValueRedactor {
         out
     }
 
-    /// Scrub first, THEN truncate (DG-2): the daemon never sees text the
-    /// redactor has not scanned. When the cut lands on a value that was
-    /// already truncated upstream, the trailing partial prefix (≥
-    /// [`MIN_REDACTED_SECRET_BYTES`] bytes) is redacted as well.
+    /// Scrub before this helper's truncation (DG-2). A variant prefix (≥
+    /// [`MIN_REDACTED_SECRET_BYTES`] bytes) at this cut is redacted as well.
+    /// This does not recover fragments at earlier, internal tool-output cuts.
     pub fn scrub_and_truncate(&self, text: &str, max: usize) -> String {
         let scrubbed = self.scrub(text);
         if scrubbed.len() <= max {
@@ -2116,8 +2140,8 @@ mod tests {
     fn redactor_scrubs_wrapped_offset_urlsafe_hex_and_json_escaped() {
         // DG-2: the encodings a job can produce from a mounted secret.
         use base64::Engine;
-        // 60 bytes: long enough for the 76-column base64 wrap to kick in.
-        let value = "harness-fixture-value-with-enough-length-to-wrap-nicely-0";
+        let value = "harness-fixture-value-with-enough-length-to-wrap-nicely-at-least-61-bytes";
+        assert!(value.len() >= 61);
         let values = vec![SecretString::from(value.to_string())];
         let redactor = SecretValueRedactor::new(&values);
 
@@ -2129,6 +2153,7 @@ mod tests {
             .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(wrapped.contains('\n'));
         // Offset base64: `curl -u user:$(cat T)` encodes "user:<value>".
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{value}"));
         // URL-safe base64 and hex (`xxd -p`).
@@ -2154,6 +2179,66 @@ mod tests {
         }
         let scrubbed = quoted_redactor.scrub(&format!("prefix {json_escaped} suffix"));
         assert!(!scrubbed.contains(&json_escaped));
+    }
+
+    #[test]
+    fn redactor_scrubs_wrapped_cli_output_in_serialized_shell_results() {
+        use base64::Engine;
+
+        let value = "harness-fixture-with-at-least-61-bytes-for-real-shell-output-wrapping";
+        assert!(value.len() >= 61);
+        let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
+        let hex: String = value.bytes().map(|byte| format!("{byte:02x}")).collect();
+        for (encoded, width) in [
+            (base64::engine::general_purpose::STANDARD.encode(value), 76),
+            (hex.to_ascii_uppercase(), 60),
+            (hex, 60),
+        ] {
+            let lines = encoded
+                .as_bytes()
+                .chunks(width)
+                .map(|line| std::str::from_utf8(line).unwrap())
+                .collect::<Vec<_>>();
+            assert!(lines.len() > 1);
+            let output = format!("{}\n", lines.join("\n"));
+            // ShellTool result -> execute_tool_simple -> worker boundary.
+            let result = serde_json::json!({
+                "output": output, "exit_code": 0, "sandboxed": false, "truncated": false,
+                "success": true, "warning": null,
+            });
+            let serialized = serde_json::to_string_pretty(&result).unwrap();
+            assert!(serialized.contains("\\n"));
+            let scrubbed = redactor.scrub(&serialized);
+            let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap();
+            assert_eq!(cleaned["output"], "[redacted-secret]\n");
+            assert_eq!(cleaned["exit_code"], 0);
+            assert_eq!(redactor.scrub(&output), "[redacted-secret]\n");
+            for line in lines {
+                if line.len() >= MIN_REDACTED_SECRET_BYTES {
+                    assert_eq!(redactor.scrub(line), "[redacted-secret]");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn redactor_new_scrubs_overlapping_values_longest_first() {
+        let password = "harness-fixture-password";
+        let url = format!("postgres://fixture:{password}@fixture.invalid/fixture");
+        for values in [
+            vec![
+                SecretString::from(password.to_string()),
+                SecretString::from(url.clone()),
+            ],
+            vec![
+                SecretString::from(url.clone()),
+                SecretString::from(password.to_string()),
+            ],
+        ] {
+            let redactor = SecretValueRedactor::new(&values);
+            assert_eq!(redactor.scrub(&url), "[redacted-secret]");
+            assert_eq!(redactor.scrub(password), "[redacted-secret]");
+        }
     }
 
     #[test]
