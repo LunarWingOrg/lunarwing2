@@ -278,6 +278,27 @@ impl ExternalWorkerConfig {
     }
 }
 
+#[cfg(test)]
+impl ExternalWorkerConfig {
+    /// Shared constructor for test fixtures. Tests that need a config should
+    /// start from `ExternalWorkerConfig::test_config(name, url)` and override
+    /// fields with struct-update syntax, so adding a new field to the struct
+    /// only requires a default here instead of an edit at every literal
+    /// (MR !1508 review CT-3: bare literals auto-merge into E0063 breakage
+    /// when sibling branches add fields).
+    pub fn test_config(name: &str, url: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            url: url.to_string(),
+            auth_token: None,
+            timeout_ms: 300_000,
+            endpoints: vec![],
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: PromptContextLimits::default(),
+        }
+    }
+}
+
 /// ACP (Agent Client Protocol) mode configuration.
 #[derive(Debug, Clone)]
 pub struct AcpModeConfig {
