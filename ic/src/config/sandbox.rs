@@ -282,20 +282,31 @@ impl ExternalWorkerConfig {
 impl ExternalWorkerConfig {
     /// Shared constructor for test fixtures. Tests that need a config should
     /// start from `ExternalWorkerConfig::test_config(name, url)` and override
-    /// fields with struct-update syntax, so adding a new field to the struct
-    /// only requires a default here instead of an edit at every literal
-    /// (MR !1508 review CT-3: bare literals auto-merge into E0063 breakage
-    /// when sibling branches add fields).
+    /// fields with struct-update syntax.
+    ///
+    /// Built by round-tripping a minimal `[[sandbox.external_workers]]` TOML
+    /// block through the real settings resolver rather than a struct literal
+    /// (MR !1525 DI-2: a full literal textually auto-merges against sibling
+    /// branches that add `ExternalWorkerConfig` fields and then fails E0063
+    /// in test lanes only). New fields with the project-mandated
+    /// `#[serde(default)]` on the Settings side flow through with no edit
+    /// here; a missing serde default fails loudly in this one constructor
+    /// instead of breaking every test lane's compile.
+    ///
+    /// This only covers field ADDITIONS. Sibling branches that change
+    /// signatures (`reserve_task`) or handle fields (`ExternalJobHandle`)
+    /// still require whoever lands second to fix the call sites.
     pub fn test_config(name: &str, url: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            url: url.to_string(),
-            auth_token: None,
-            timeout_ms: 300_000,
-            endpoints: vec![],
-            load_balance: LoadBalanceStrategy::default(),
-            prompt_context: PromptContextLimits::default(),
-        }
+        // `{name:?}`/`{url:?}` render valid TOML basic strings for the plain
+        // identifier/URL values tests pass here.
+        let toml_src =
+            format!("[[sandbox.external_workers]]\nname = {name:?}\nurl = {url:?}\ntimeout_ms = 300000\n");
+        let settings: crate::settings::Settings =
+            toml::from_str(&toml_src).expect("test worker config must parse"); // safety: test
+        Self::resolve_from_settings(&settings)
+            .into_iter()
+            .next()
+            .expect("exactly one test worker") // safety: test
     }
 }
 
