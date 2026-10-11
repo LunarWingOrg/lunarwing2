@@ -1,9 +1,9 @@
 import assert from "node:assert/strict"
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { expandWorkspacePath, resolveWorkspacePath, workspacePathsOverlap } from "./workspace_path"
+import { expandWorkspacePath, resolveWorkspacePath, resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
 
 const workspaceRoot = "/workspace"
 
@@ -28,6 +28,14 @@ try {
   const escape = join(root, "escape")
   symlinkSync(tmpdir(), escape)
   assert.throws(() => resolveWorkspacePath("escape", root), /escapes WORKSPACE_ROOT/)
+  const cron = { project_dir: "missions/default", cron_tick: { event: "cron.tick" } }
+  assert.throws(() => resolveTaskWorkspace({ project_dir: cron.project_dir }, root), /ENOENT/)
+  assert.equal(resolveTaskWorkspace(cron, root), join(root, cron.project_dir))
+  assert.equal(resolveTaskWorkspace(cron, root), join(root, cron.project_dir))
+  for (const project_dir of ["../bad", "/tmp/bad", "~", "missions/../bad", "escape/cron-escape", "alias/new"]) {
+    assert.throws(() => resolveTaskWorkspace({ ...cron, project_dir }, root), /Invalid workspace path/)
+  }
+  assert.equal(existsSync(join(project, "new")), false)
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

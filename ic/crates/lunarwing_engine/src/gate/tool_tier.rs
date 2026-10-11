@@ -17,6 +17,7 @@ pub const AUTONOMOUS_TOOL_DENYLIST: &[&str] = &[
     "routine_update",
     "routine_delete",
     "routine_fire",
+    "cron_mission",
     "event_emit",
     "create_job",
     "job_prompt",

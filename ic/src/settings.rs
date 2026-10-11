@@ -908,6 +908,13 @@ pub struct ExternalWorkerSettings {
     /// Bounds applied when `create_job` requests recent conversation context.
     #[serde(default)]
     pub prompt_context: lunarwing_common::PromptContextLimits,
+    /// Operating mode: "task" (default, bounded dispatches) or "cron"
+    /// (mission-like, long-running supervised jobs — WI#325).
+    #[serde(default)]
+    pub mode: crate::config::ExternalWorkerMode,
+    /// Cron-mission configuration; used when `mode = "cron"`.
+    #[serde(default)]
+    pub cron: Option<crate::config::CronWorkerConfig>,
 }
 
 fn default_external_worker_timeout() -> u64 {

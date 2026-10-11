@@ -42,6 +42,7 @@ export function parseEnvelope(data: string): Envelope | null {
 
 export interface TaskContext {
   project_dir?: string
+  cron_tick?: unknown
   conversation_history?: Array<{ role: string; content: string }>
   environment?: Record<string, string>
   user_id?: string

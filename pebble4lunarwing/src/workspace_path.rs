@@ -54,6 +54,70 @@ pub(crate) fn workspace_paths_overlap(left: &Path, right: &Path) -> bool {
     left.strip_prefix(right).is_ok() || right.strip_prefix(left).is_ok()
 }
 
+/// Bootstrap a cron mission directory using held directory descriptors.
+/// Linux workers provide /proc/self/fd; `O_NOFOLLOW` rejects symlink components
+/// before the next mkdir, including swaps by another task in the workspace.
+fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
+    use std::fs::{create_dir, OpenOptions};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if path.is_empty()
+        || path.starts_with('~')
+        || path.contains('\0')
+        || Path::new(path).is_absolute()
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected relative directory components",
+        ));
+    }
+    let root = workspace_root.canonicalize()?;
+    let open_dir = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let mut parent = open_dir(&root)?;
+    for part in path.split('/') {
+        let child = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(part);
+        match create_dir(&child) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        parent = open_dir(&child)?;
+    }
+    resolve_workspace_path(path, &root)
+}
+
+pub(crate) fn resolve_task_workspace(
+    context: &crate::protocol::TaskContext,
+    workspace_root: &Path,
+) -> io::Result<PathBuf> {
+    let path = context.project_dir.as_deref().unwrap_or("~");
+    if context
+        .cron_tick
+        .as_ref()
+        .and_then(|tick| tick.get("event"))
+        .and_then(serde_json::Value::as_str)
+        == Some("cron.tick")
+    {
+        create_cron_workspace(path, workspace_root).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Invalid workspace path for cron tick: {error}"),
+            )
+        })
+    } else {
+        resolve_workspace_path(path, workspace_root)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -177,5 +241,49 @@ mod tests {
             Path::new("/workspace/project"),
             Path::new("/workspace/project-a")
         ));
+    }
+
+    #[test]
+    fn cron_bootstrap_creates_default_directory_without_following_symlinks() {
+        let root = temp_root("cron");
+        let outside = temp_root("cron-outside");
+        let mut context = crate::protocol::TaskContext {
+            project_dir: Some("missions/pr-digest".to_string()),
+            ..Default::default()
+        };
+        assert!(resolve_task_workspace(&context, &root).is_err());
+        assert!(!root.join("missions").exists());
+        context.cron_tick = Some(serde_json::json!({"event":"cron.tick"}));
+        let mission = resolve_task_workspace(&context, &root).unwrap();
+        assert_eq!(
+            mission,
+            root.join("missions/pr-digest").canonicalize().unwrap()
+        );
+        std::fs::write(mission.join("state"), "tick one").unwrap();
+        assert_eq!(resolve_task_workspace(&context, &root).unwrap(), mission);
+        assert_eq!(
+            std::fs::read_to_string(mission.join("state")).unwrap(),
+            "tick one"
+        );
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), root.join("dangling")).unwrap();
+        for path in [
+            "../bad",
+            "/tmp/bad",
+            "~",
+            "missions/../bad",
+            "escape/new",
+            "dangling/new",
+        ] {
+            context.project_dir = Some(path.to_string());
+            assert!(resolve_task_workspace(&context, &root)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid workspace path"));
+        }
+        assert!(!outside.join("new").exists());
+        assert!(!root.join("missing").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 }

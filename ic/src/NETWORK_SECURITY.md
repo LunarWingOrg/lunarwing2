@@ -61,6 +61,18 @@ Both paths use **constant-time comparison** via `subtle::ConstantTimeEq` (`ct_eq
 
 If `GATEWAY_AUTH_TOKEN` is not set, a random hex token is generated at startup.
 
+### Owner-only cron worker recovery (WI#325 / MR !1531)
+
+`GET/POST /api/workers/{worker}/cron` lives on the authenticated gateway
+router. The handler compares `AuthenticatedUser.user_id` with
+`GatewayState.owner_id` before any worker/manager lookup, then invokes the
+manager's independent mission-owner gate. POST accepts only a typed
+`pause|resume|status` action and rejects unknown JSON fields; callers cannot
+choose their identity. Query-string bearer tokens are not accepted on this
+route. Existing CORS/body limits apply, and waits are bounded to 10 seconds.
+The route works independently of Engine V1/V2 and creates no tool/worker
+credential bypass. See `handlers/cron_workers.rs` and the cron-mode design doc.
+
 ### Unauthenticated Routes
 
 | Route | Purpose | Response |
