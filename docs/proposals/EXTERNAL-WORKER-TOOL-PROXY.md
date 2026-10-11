@@ -1,9 +1,9 @@
 # External Worker Tool Proxy (WI#324)
 
-Status: phase 1 (hub-side) implemented, hardened per the MR !1506
-(CQ-1..CQ-9), MR !1521 (DD-1..DD-10), and MR !1533 (DP-1..DP-6)
-adversarial reviews. Worker-side bridge support is the remaining piece and
-lives in the worker images (kimi / pebble / opencode).
+Status: **partial (hub side)**, hardened per the MR !1506 (CQ-1..CQ-9),
+MR !1521 (DD-1..DD-10), MR !1533 (DP-1..DP-6), and MR !1540 (DX-1..DX-6)
+reviews. Worker-side bridge support remains unimplemented in the worker
+images (kimi / pebble / opencode); real-worker acceptance is still open.
 
 ## What this is
 
@@ -46,15 +46,17 @@ All frames are the standard envelope `{id, type, timestamp, payload}`.
   before execution.
 - Frames larger than 256 KiB are rejected with `error` before dispatch: the
   read loop first probes an oversized frame's `type` with a `Cow` field (so a
-  type spelled with a JSON escape — `"tool_call"` — still classifies;
+  type spelled with a JSON escape — `"\u0074ool_call"` — still classifies;
   serde_json cannot borrow an escaped string, MR !1533 DP-1), and re-checks
   the bound inside the `tool_call` arm so an oversized frame never reaches
-  audit/persist/dispatch even after the envelope parse ran. Below the frame
-  layer, the socket itself is configured with `max_message_size = 1 MiB`, so
-  a frame past that is never materialized at all — it fails the job as a
-  protocol error (fail-loud, never silently truncated). Other frame types
-  under 1 MiB are unaffected — a legitimate `task_result`/`task_progress`
-  payload may be larger than a tool call.
+  audit/persist/dispatch even after the envelope parse ran. The socket sets
+  **both `max_message_size` and `max_frame_size` to 16 MiB** (DX-1/DX-3),
+  bounding individual frame payloads and aggregate fragmented messages
+  before JSON parsing. Exceeding either bound fails the job as a protocol
+  error, without silent truncation. Other message types, including
+  `task_result`/`task_progress`, may exceed 256 KiB within that 16 MiB
+  transport ceiling, matching Kimi's configurable `WS_MAX_PAYLOAD_BYTES`
+  maximum. See [worker limits](../ops/WORKER-CONTAINERS.md#websocket-message-limits).
 
 ### `tool_result` (daemon → worker)
 
@@ -72,8 +74,9 @@ All frames are the standard envelope `{id, type, timestamp, payload}`.
 
 - `denied` is a **hard reject** on policy grounds: not in the worker's
   `tool_allowlist`, on the proxy denylist, blocked by the autonomous gates,
-  `Disabled` in tool permissions, hook-rejected, or refused by the WI#322
-  engine-tree guard. It is never a silent empty result.
+  `Disabled` in tool permissions, hook-rejected, or refused by the memory-write
+  destination policy (engine state, prompt files, explicit layers). It is
+  never a silent empty result.
 - `error` covers malformed frames, missing/mismatched `task_id`, invalid
   identifiers, an unconfigured proxy, an unknown (unregistered) tool name,
   rate limiting, terminal job state, cancellation, and tool execution failure.
@@ -88,7 +91,7 @@ All frames are the standard envelope `{id, type, timestamp, payload}`.
 
 ### `tool_list` (worker → daemon) → `tool_catalog` (daemon → worker)
 
-`tool_list` takes an empty payload (a `task_id` field is accepted; when
+`tool_list` takes an empty object payload `{}` (a `task_id` field is accepted; when
 present it must equal the connection's job id, same binding rule as
 `tool_call` — a mismatch returns an error catalog; MR !1521 DD-10).
 `tool_list` frames count toward the same per-job control-frame budget as
@@ -103,9 +106,10 @@ registered, visible to the job's user, inside the phase-1 capability set and
 not hard-denied (the catalog applies the same `is_proxy_callable` predicate
 as dispatch, MR !1533 DP-6a), and not excluded by the autonomous gates
 (MR !1506 CQ-6) — so a worker-side MCP bridge exposes a truthful
-`tools/list`. A malformed `tool_list` payload (e.g. a numeric `task_id`)
+`tools/list`. A malformed `tool_list` payload (including `null` or a numeric `task_id`)
 fails closed with an error catalog (MR !1533 DP-6b). An error reply keeps
 the `tool_catalog` type with an empty `tools` array plus an `error` string.
+Omitting `payload` fails the outer envelope parse; it is not a legacy catalog request.
 
 ## Capability allowlist (deny-by-default)
 
@@ -121,7 +125,7 @@ name = "kimi"
 # for remote workers.
 url = "ws://127.0.0.1:19000/kimi"
 # phase-1 capability set from the WI: memory read+write, knowledge read+write,
-# gitlab. mission_* stays gated until the mission lifecycle fixes land.
+# gitlab. mission_* actions are not part of this ToolRegistry surface.
 tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
                   "knowledge_submit_note", "knowledge_get_topic", "gitlab_tool"]
 ```
@@ -149,9 +153,9 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   - **names outside the phase-1 capability set are removed** (MR !1533 DP-2):
     the proxied surface is a *positive* list — `memory_read`, `memory_write`,
     `knowledge_search`, `knowledge_submit_note`, `knowledge_get_topic`,
-    `gitlab_tool`, and read-only `mission_status`/`mission_history`/
-    `mission_list` (mission writes stay gated behind the mission lifecycle
-    fixes #311/#317). A denylist alone cannot deliver the phase-1 scoping:
+    `gitlab_tool` / legacy `gitlab-tool`. `mission_status` is not a tool;
+    `mission_history`/`mission_list` are Engine V2 bridge actions, not
+    ToolRegistry tools, and are excluded (DX-6a). A denylist alone cannot deliver the phase-1 scoping:
     unlisted and future host tools would be exposed by default. The dispatch
     gate and the `tool_catalog` apply the same positive predicate on the
     resolved name, so a registry alias or a later-registered tool under an
@@ -165,10 +169,14 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
     unparseable URLs (MR !1521 DD-9): `ws://localhost:9000@host.example/x`
     connects to `host.example` and is correctly classified non-loopback. Use
     `wss://` or loopback.
-- Entries are matched by literal (canonical) tool name at load and by
-  resolved name at dispatch; an alias spelling in the config (e.g.
-  `gitlab-tool` for `gitlab_tool`) fails closed — use the canonical name
-  (MR !1533 DP-6e).
+- Worker requests must match an allowlist entry literally. The user-scoped
+  registry then resolves it, and the resolved name must independently pass
+  the phase-1 predicate. Prefer `gitlab_tool`: it also resolves a tool stored
+  as legacy `gitlab-tool`. An exact `gitlab-tool` grant works when that name
+  is registered; reverse alias resolution is not provided by the registry.
+  Catalog entries retain the granted spelling so the bridge can call them
+  (DX-6b). Persisted permission and autonomous gates apply to the resolved
+  tool. Arbitrary hyphenated names such as `memory-write` remain excluded.
 - The allowlist is the approval boundary for the proxy: in-process approval
   prompts cannot reach a worker, so listing a write tool (e.g.
   `memory_write`) is the operator's explicit grant. The seeded `AskEachTime`
@@ -195,16 +203,20 @@ autonomous paths (jobs, routines) enforce, in this order:
 5. **Persisted `Disabled` permission** — a user who disabled a tool in tool
    permissions must not have it executed by a worker. Fails closed on store
    read errors.
-6. **WI#322 engine-tree guard** — while that WI is open, proxied
-   `memory_write` refuses targets under ALL of `engine/**` (MR !1521 DD-3,
-   widened from missions-only): the engine reloads `engine/projects/**` and
-   `engine/knowledge/**` from the owner workspace at boot, so a compromised
-   worker could otherwise plant project or knowledge documents into the
-   trusted in-process engine's store and prompts.
+6. **Memory-write destination policy** (WI#322, DX-2) — resolve `memory`,
+   `heartbeat`, `daily_log` (also the omitted-target default), and `bootstrap`
+   with the same mapping as `MemoryWriteTool`, then normalize the path.
+   Refuse ALL of `engine/**` and anything classified by the workspace's
+   `is_system_prompt_file`: identity/config files, `MEMORY.md`, `HEARTBEAT.md`,
+   `BOOTSTRAP.md`, profile/directives, `lorebooks/**`, and `daily/*.md`.
+   Workers cannot plant trusted engine state or persistent main-agent prompts.
+   Any explicit `layer` parameter is refused, including empty/null values;
+   ordinary notes such as `notes/proxied.md` use the owner's default scope.
 7. **Per-tool rate limit** — the registry's limiter, keyed on the job's
    `user_id`.
 8. **`BeforeToolCall` hooks** — operator hook policy, with sensitive params
-   redacted; hook modifications are re-normalized.
+   redacted; hook modifications are re-normalized. The memory-write policy
+   is checked again on the final arguments before execution.
 
 Approved calls execute the exact `Arc<dyn Tool>` instance the gates vetted —
 validate → per-tool timeout → execute via `execute_timed_tool`, mirroring
@@ -224,6 +236,16 @@ tool, and its `scope` parameter accepts `"shared"`, which writes the
 herd-shared knowledge scope rather than the agent's own. Operators granting
 it to a worker should treat that worker as able to plant notes other tenants
 of the herd may read; withhold the entry if that is not intended.
+
+A `memory_read` grant discloses the owner's workspace, including `USER.md`
+and `MEMORY.md`, to a container with internet egress, subject to the tool's
+reserved-path restrictions and output sanitization. The write policy above
+does not restrict those reads (DX-2).
+
+Compatibility: workers that previously wrote prompt files or selected a
+memory layer now receive `denied`; use ordinary note paths for worker
+reports. Reverting this policy restores persistent prompt-write authority
+to the untrusted worker.
 
 Per-job bounds (MR !1506 CQ-3, MR !1521 DD-5, MR !1533 DP-3): at most 100
 proxied control frames per job — every `tool_call`-typed frame counts,
@@ -282,14 +304,16 @@ for multi-threaded missions.
   (wildcard/denylisted/proxy-denylisted/non-phase-1/invalid dropped,
   cleartext strips all), the phase-1 capability predicate (positive set
   callable; host tools, stores, job planes, unlisted names, and mission
-  writes denied), frame identifier validation, wire shapes.
+  actions denied), frame identifier validation, wire shapes, and a direct
+  escaped `TypeProbe` parse that pins the `Cow` fallback independently of
+  the in-arm bound (DX-5).
 - `ic/tests/external_worker_integration.rs`: mock-worker round trips over a
   real loopback WS —
   - allowlisted call succeeds with tenant scoping asserted; non-allowlisted
     call is `denied`; empty allowlist denies even registered tools;
     unknown-but-allowlisted tool is an `error` (not a hang); unwired proxy
     replies `error` rather than dropping the frame;
-  - AC1: real `memory_write` → `memory_read` round-trip through the proxy
+  - AC1 hub-side evidence: real `memory_write` → `memory_read` round-trip through the proxy
     (LibSqlBackend workspace), plus the WI#322 engine-tree guard for both
     `engine/projects/**/missions/**` and `engine/projects/**` documents
     (MR !1521 DD-3, pinned per MR !1533 DP-5);
@@ -302,27 +326,48 @@ for multi-threaded missions.
   - `tool_catalog` advertises only callable tools (CQ-6);
   - missing/mismatched `task_id` rejected (CQ-7);
   - MR !1533 DP pins: oversized `tool_call` frames rejected with `error`
-    both plain and with a JSON-escaped `type` (DP-1), a frame past the 1 MiB
+    both plain and with a JSON-escaped `type` (DP-1), a frame past the 16 MiB
     socket cap fails the job as a protocol error (DP-1), and a 103-frame
     flood executes exactly 100 calls, denies the rest, persists exactly one
     cap marker row, and never persists/echoes unvalidated identifiers from
     the cap path (DD-5/DP-3).
 
-Open acceptance items: AC2 (`knowledge_search` real hits through the proxy)
-and the worker-side bridge itself (design item 2) — the wire contract above
-is the bridge's specification.
+- `ic/tests/external_worker_integration/proxy_review.rs` (DX regressions):
+  - Results/progress over 1.5 MiB succeed with and without proxy grants and
+    retain connection reuse; large worker error text is preserved;
+  - fragmented messages below 16 MiB succeed; aggregate messages above it
+    fail even though each fragment fits;
+  - prompt destinations and aliases/defaults are denied without changing
+    stored owner content; ordinary notes still round-trip; explicit layers
+    and hook rewrites cannot bypass the policy;
+  - canonical/legacy GitLab resolution, callable catalog spelling, ungranted
+    calls, and persisted permission denials.
 
-## Land-order note (MR !1533 run-67 review)
+Open acceptance items: the worker-side bridge (design item 2), AC1 with a
+real worker (current evidence uses mock sockets with real memory tools),
+and AC2 (`knowledge_search` real hits through the proxy). WI#324 stays open;
+the wire contract above is the bridge's specification.
 
-This branch and MR !1531 (WI#325) both touch the task read loop's cancel
-watch: this MR's `handle_tool_call`/`execute_proxied_call` take
-`&watch::Receiver<bool>`, while !1531 widens the read loop's watch to
-`watch::Receiver<Option<CancelReason>>`. Whichever lands second must thread
-`Option<CancelReason>` through the two proxy call sites (the select arm
-ignores the reason) and resolve the three-file conflict
-(`config/sandbox.rs`, `settings.rs`,
-`ic/tests/external_worker_integration.rs` — keep both sides, one
-`impl Default for ExternalWorkerConfig` carrying `mode`, `cron` and
-`tool_allowlist`). MR !1532's wiring conflict (`main.rs`,
-`orchestrator/mod.rs`) is trivial: keep both trailing `setup_orchestrator`
-parameters in matching order.
+## Land-order note (MR !1540 review #7716)
+
+**!1541 (item 6 / WI#325) first, then !1540.** !1541 remains open as of this
+DX fix; its target integration is pending, not claimed complete. Once it
+lands, back-merge the new target into this branch and:
+
+- Keep both sides of the goals, `config/sandbox.rs`, `settings.rs`, and
+  integration-test conflicts. Produce one `impl Default for ExternalWorkerConfig`
+  and one `resolve_from_settings` literal carrying `mode`, `cron`, and
+  `tool_allowlist`, retaining cron validation and both test sets.
+- Change **both** `handle_tool_call` and `execute_proxied_call` cancellation
+  parameters from `&watch::Receiver<bool>` to
+  `&watch::Receiver<Option<CancelReason>>`. These breaks are outside conflict
+  markers: the read loop and `wait_for_cancellation` have already changed
+  in !1541 (previously !1531). The proxy select arm ignores the reason.
+- Require green `rust-check-*` and `rust-test-*` on that combined head.
+
+Item 7's closed !1532 wiring conflict (`main.rs`, `orchestrator/mod.rs`)
+needs both trailing `setup_orchestrator` dependencies (`workspace_resolver`
+and `tool_proxy_deps`) in matching order. Item 8's closed !1537 overlaps the
+goals, `external_worker.rs`, `tools/builtin/job.rs`, and integration tests;
+retain both implementations and regression suites. Its old boolean cancel
+watch must not undo the `Option<CancelReason>` integration after item 6.

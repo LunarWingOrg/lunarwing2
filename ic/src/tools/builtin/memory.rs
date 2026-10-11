@@ -93,6 +93,21 @@ fn validate_memory_search_query(query: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
+/// Resolve the named write targets before path policy or normalization. The
+/// worker proxy uses this same mapping to protect prompt-visible destinations.
+pub(crate) fn resolve_memory_write_target(target: &str, tz: chrono_tz::Tz) -> String {
+    match target {
+        "memory" => paths::MEMORY.to_string(),
+        "daily_log" => {
+            let now = chrono::Utc::now().with_timezone(&tz);
+            format!("daily/{}.md", now.format("%Y-%m-%d"))
+        }
+        "heartbeat" => paths::HEARTBEAT.to_string(),
+        "bootstrap" => paths::BOOTSTRAP.to_string(),
+        path => path.to_string(),
+    }
+}
+
 pub(crate) fn normalize_memory_tool_path(path: &str) -> Result<String, ToolError> {
     let normalized = normalize_path(path);
     if is_engine_runtime_path(&normalized) {
@@ -697,15 +712,7 @@ impl Tool for MemoryWriteTool {
         let tz = crate::timezone::parse_timezone(&ctx.user_timezone).unwrap_or(chrono_tz::Tz::UTC);
 
         // Resolve the target to a workspace path
-        let resolved_path = match target {
-            "memory" => paths::MEMORY.to_string(),
-            "daily_log" => {
-                let now = chrono::Utc::now().with_timezone(&tz);
-                format!("daily/{}.md", now.format("%Y-%m-%d"))
-            }
-            "heartbeat" => paths::HEARTBEAT.to_string(),
-            path => path.to_string(),
-        };
+        let resolved_path = resolve_memory_write_target(target, tz);
         let normalized_path = normalize_memory_tool_path(&resolved_path)?;
         let workspace = self.resolver.resolve(&ctx.user_id).await;
 

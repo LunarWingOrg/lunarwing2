@@ -25,6 +25,7 @@ use crate::db::Database;
 use crate::error::OrchestratorError;
 use crate::hooks::{HookError, HookEvent, HookOutcome, HookRegistry};
 use crate::safety::SafetyLayer;
+use crate::tools::builtin::memory::resolve_memory_write_target;
 use crate::tools::permissions::{
     PermissionState, gitlab_permission_alias_conflict, permission_setting_keys,
 };
@@ -33,7 +34,7 @@ use crate::tools::{
     ApprovalContext, Tool, ToolRegistry, is_autonomous_tool_denylisted, prepare_tool_params,
     redact_params,
 };
-use crate::workspace::{is_engine_internal_path, normalize_path};
+use crate::workspace::{is_engine_internal_path, is_system_prompt_file, normalize_path};
 
 // ── Protocol types ──────────────────────────────────────────────────
 
@@ -221,8 +222,8 @@ struct TypeProbe<'a> {
 
 /// Optional `tool_list` payload (MR !1521 DD-10): when the worker sends a
 /// `task_id` it must match the connection's job, same binding rule as
-/// `tool_call`. Absent payload/absent field stays accepted for older
-/// workers; a mismatch is an error.
+/// `tool_call`. An empty object is accepted; a missing/null payload or a
+/// malformed task_id is rejected. A mismatched id is an error.
 #[derive(Debug, Deserialize)]
 struct ToolListPayload {
     #[serde(default)]
@@ -972,14 +973,12 @@ type WsRead = futures::stream::SplitStream<WsStream>;
 
 const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Socket-level bound on any single inbound WS message from a worker
-/// (MR !1533 DP-1): the read loop's 256 KiB `tool_call` probe runs on text
-/// tungstenite has already fully assembled, so without this cap a frame up
-/// to the tungstenite default (64 MiB) is materialized before any check
-/// runs. 1 MiB leaves ample room for legitimate `task_result` outputs while
-/// bounding per-frame allocation; an oversized frame surfaces as a protocol
-/// error that fails the job (fail-loud, never silently truncated).
-const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Bound both inbound messages and individual frames before JSON parsing.
+/// 16 MiB matches Kimi's configurable WS_MAX_PAYLOAD_BYTES ceiling and leaves
+/// room for large progress/results from other workers (MR !1540 DX-1/DX-3).
+/// The independent 256 KiB tool_call limit still applies before dispatch.
+/// Exceeding either transport bound fails the job without silent truncation.
+const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long the daemon waits for a worker's terminal frame (`task_result` for
 /// the cancelled job) or socket close after sending a `cancel` envelope before
@@ -1172,7 +1171,8 @@ async fn connect_and_handshake(
 
     let connect_timeout = Duration::from_secs(15);
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(MAX_WS_MESSAGE_BYTES));
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WS_MESSAGE_BYTES));
     let (ws_stream, _response) = tokio::time::timeout(
         connect_timeout,
         tokio_tungstenite::connect_async_with_config(ws_request, Some(ws_config), false),
@@ -1389,13 +1389,10 @@ async fn run_external_task(
                     // accepted or rejected — counts toward the per-job cap
                     // so rejected-frame floods are bounded too. Rejection
                     // rows stop at the cap so a flood cannot spam
-                    // job_events. Oversized frames of other types (a
-                    // legitimate large task_result/progress payload) are
-                    // unaffected. Two further layers bound what the probe
-                    // cannot see: the socket-level `max_message_size`
-                    // (frame never materializes) and the in-arm size
-                    // re-check below (a classified-elsewhere oversized
-                    // frame never dispatches).
+                    // job_events. Other message types may exceed 256 KiB,
+                    // within the transport's 16 MiB message AND frame limits.
+                    // The in-arm check below independently prevents oversized
+                    // tool calls from dispatching if the probe misses them.
                     if text.len() > MAX_TOOL_CALL_FRAME_BYTES
                         && matches!(
                             serde_json::from_str::<TypeProbe<'_>>(text),
@@ -2128,9 +2125,8 @@ const MAX_CALL_ID_BYTES: usize = 128;
 const MAX_HANDOFF_TOOL_RESULT_ROWS: u32 = 5;
 
 /// Proxy-level positive capability set (MR !1533 DP-2): the WI#324 phase-1
-/// tools — memory read+write, knowledge search/submit/get-topic, gitlab, and
-/// read-only mission status/history/list — are the ONLY tools that may ever
-/// be reachable from an untrusted worker container. Enforced at allowlist
+/// tools — memory read+write, knowledge search/submit/get-topic and gitlab —
+/// are the ONLY tools reachable from an untrusted worker container. Enforced at allowlist
 /// load and again at dispatch on the resolved name. A denylist cannot
 /// deliver this scoping: the dev file tools (`read_file`/`list_dir` with no
 /// `base_dir` accept any absolute host path, handing the container daemon-
@@ -2145,11 +2141,9 @@ const PROXY_TOOL_ALLOWLIST: &[&str] = &[
     "knowledge_submit_note",
     "knowledge_get_topic",
     "gitlab_tool",
-    // mission_* read-only in phase 1; mission writes stay gated behind the
-    // mission lifecycle fixes (#311/#317).
-    "mission_status",
-    "mission_history",
-    "mission_list",
+    // This legacy registry spelling is still supported. Do not normalize
+    // arbitrary names: e.g. memory-write must not bypass memory_write policy.
+    "gitlab-tool",
 ];
 
 /// Whether a tool name is in the WI#324 phase-1 proxy capability set
@@ -2228,8 +2222,8 @@ fn tool_name_allowed(allowlist: &[String], name: &str) -> bool {
 ///   allowlist: tool authority must never ride a channel an on-path attacker
 ///   can inject frames into.
 ///
-/// Entries are matched by literal (canonical) name; an alias spelling fails
-/// closed here and at dispatch (MR !1533 DP-6e) — use the canonical name.
+/// Grants match requested names literally; registry alias resolution is then
+/// checked against the same phase-1 set. Both GitLab spellings are supported.
 fn sanitize_tool_allowlist(
     worker_name: &str,
     allowlist: &[String],
@@ -2634,8 +2628,8 @@ struct PreparedCall {
 
 /// Run every preflight gate the repo's other autonomous paths enforce
 /// (MR !1506 review CQ-1): real job context, user-scoped tool resolution,
-/// autonomous hard gates, persisted `Disabled` permission, the WI#322
-/// mission-path guard, per-tool rate limit, and `BeforeToolCall` hooks.
+/// autonomous hard gates, persisted `Disabled` permission, the memory-write
+/// destination policy, per-tool rate limit, and `BeforeToolCall` hooks.
 /// Returns the prepared call or the reply to send back.
 async fn preflight_gates(
     ctx: &ToolCallCtx<'_>,
@@ -2697,11 +2691,13 @@ async fn preflight_gates(
     // secret_delete, ssh, ssh_git). Note: the seeded `AskEachTime`
     // permission default is NOT an approval prompt on this path (a worker
     // cannot answer prompts) — the operator's allowlist entry IS the grant;
-    // only a persisted `Disabled` still blocks (checked below).
+    // only a persisted `Disabled` still blocks (checked below). The requested
+    // name already passed the exact worker grant in handle_tool_call; bind
+    // that grant to this user-visible resolution, including legacy GitLab.
     let requirement = tool.requires_approval(&params);
-    let approval = Some(ApprovalContext::autonomous_with_tools(
-        ctx.allowlist.iter().cloned(),
-    ));
+    let approval = Some(ApprovalContext::autonomous_with_tools([
+        resolved_name.clone()
+    ]));
     if !tool.allows_autonomous_execution()
         || ApprovalContext::is_blocked_or_default(&approval, &resolved_name, requirement)
     {
@@ -2721,11 +2717,9 @@ async fn preflight_gates(
         return Err(deny_tool_call(ctx, call, reason).await);
     }
 
-    // WI#322 (open): memory_write can plant engine-internal state (mission
-    // records, project/knowledge docs the engine reloads into its trusted
-    // store at boot). Until that WI lands, the proxied path refuses writes
-    // into the whole `engine/**` tree.
-    if let Some(reason) = engine_path_guard_reason(&resolved_name, &params) {
+    // Untrusted workers cannot plant engine state, persistent system prompts,
+    // or write into an explicitly selected memory layer (MR !1540 DX-2).
+    if let Some(reason) = proxy_memory_write_guard_reason(&resolved_name, &params, &job_ctx) {
         return Err(deny_tool_call(ctx, call, reason).await);
     }
 
@@ -2815,24 +2809,34 @@ async fn persisted_disabled_reason(
     None
 }
 
-/// WI#322 guard (open WI; MR !1506 review CQ-1 scenario C, widened per
-/// !1521 DD-3): until the memory tools reserve the engine tree themselves,
-/// the proxied path refuses `memory_write` into **any** engine-internal path
-/// (`engine/**` — not just the missions family). The engine reloads
-/// `engine/projects/**` and `engine/knowledge/**` from the owner workspace at
-/// boot, so a worker writable there could plant project/knowledge documents
-/// into the trusted in-process engine's store and prompts, not only forge
-/// mission records. `memory_write` carries the destination in its `target`
-/// parameter (named targets like "memory" resolve outside the engine tree
-/// and pass).
-fn engine_path_guard_reason(name: &str, params: &serde_json::Value) -> Option<String> {
+/// Confine proxied memory writes to non-prompt, non-engine documents in the
+/// default owner scope. Resolve aliases/defaults exactly as MemoryWriteTool
+/// does, then use the workspace's prompt classification on normalized paths.
+fn proxy_memory_write_guard_reason(
+    name: &str,
+    params: &serde_json::Value,
+    job_ctx: &JobContext,
+) -> Option<String> {
     if name != "memory_write" {
         return None;
     }
-    let target = params.get("target").and_then(|v| v.as_str())?;
-    is_engine_internal_path(&normalize_path(target)).then(|| {
-        "proxied memory_write may not write engine-internal paths (engine/**) (WI#322)".to_string()
-    })
+    if params.get("layer").is_some() {
+        return Some("proxied memory_write may not select a memory layer".to_string());
+    }
+    let target = params
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("daily_log");
+    let tz = crate::timezone::parse_timezone(&job_ctx.user_timezone).unwrap_or(chrono_tz::Tz::UTC);
+    let path = normalize_path(&resolve_memory_write_target(target, tz));
+    if is_engine_internal_path(&path) {
+        return Some(
+            "proxied memory_write may not write engine-internal paths (engine/**) (WI#322)"
+                .to_string(),
+        );
+    }
+    is_system_prompt_file(&path)
+        .then(|| "proxied memory_write may not write system-prompt files".to_string())
 }
 
 /// Per-tool rate limit, keyed on the job's user (MR !1506 review CQ-3): the
@@ -2914,6 +2918,15 @@ async fn execute_proxied_call(
     prepared: PreparedCall,
     cancel_rx: &watch::Receiver<bool>,
 ) -> Envelope {
+    // Hooks may rewrite params after preflight; enforce the same destination
+    // policy on the final arguments before executing the vetted instance.
+    if let Some(reason) = proxy_memory_write_guard_reason(
+        &prepared.resolved_name,
+        &prepared.params,
+        &prepared.job_ctx,
+    ) {
+        return deny_tool_call(ctx, call, reason).await;
+    }
     // Same validator the shared pipeline runs, against the hook-final
     // parameters.
     let validation = proxy
@@ -3019,11 +3032,11 @@ async fn build_tool_catalog(
 ) -> Envelope {
     let mut tools: Vec<ToolCatalogEntry> = Vec::new();
     if let Some(p) = proxy {
-        let approval = Some(ApprovalContext::autonomous_with_tools(
-            allowlist.iter().cloned(),
-        ));
         let mut seen = std::collections::HashSet::new();
         for name in allowlist {
+            if !is_proxy_callable(name) {
+                continue;
+            }
             let Some((resolved, tool)) = p.tools.get_resolved_for_user(name, user_id).await else {
                 continue;
             };
@@ -3033,12 +3046,15 @@ async fn build_tool_catalog(
             if !is_proxy_callable(&resolved) {
                 continue;
             }
+            let approval = Some(ApprovalContext::autonomous_with_tools([resolved.clone()]));
             let requirement = tool.requires_approval(&serde_json::Value::Null);
             if tool.allows_autonomous_execution()
                 && !ApprovalContext::is_blocked_or_default(&approval, &resolved, requirement)
             {
                 tools.push(ToolCatalogEntry {
-                    name: resolved,
+                    // Advertise the granted spelling so a bridge can call
+                    // the catalog entry even when the registry uses an alias.
+                    name: name.clone(),
                     description: tool.description().to_string(),
                     parameters: tool.parameters_schema(),
                 });
@@ -3394,9 +3410,7 @@ mod tests {
             "knowledge_submit_note",
             "knowledge_get_topic",
             "gitlab_tool",
-            "mission_status",
-            "mission_history",
-            "mission_list",
+            "gitlab-tool",
         ] {
             assert!(is_proxy_callable(name), "{name} must be proxy-callable");
         }
@@ -3417,6 +3431,10 @@ mod tests {
             "echo",
             "time",
             "memory_search",
+            "memory-write",
+            "mission_status",
+            "mission_history",
+            "mission_list",
             // Mission writes stay out while #311/#317 are open.
             "mission_create",
             "mission_fire",
@@ -3427,6 +3445,14 @@ mod tests {
                 "{name} must not be proxy-callable"
             );
         }
+    }
+
+    #[test]
+    fn type_probe_classifies_unicode_escaped_type_without_borrowing() {
+        let raw = r#"{"type":"\u0074ool_call","payload":{"arguments":{}}}"#;
+        let probe: TypeProbe<'_> = serde_json::from_str(raw).expect("escaped type");
+        assert_eq!(probe.msg_type, "tool_call");
+        assert!(matches!(probe.msg_type, std::borrow::Cow::Owned(_)));
     }
 
     #[test]

@@ -133,6 +133,8 @@ enum MockBehavior {
         frames: Vec<String>,
         replies: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     },
+    /// Send one text message in individually bounded continuation frames.
+    FragmentedText(String),
     /// WI#267: a kimi-executor-shaped worker whose CLI wedged. Streams the
     /// given progress frames (typically synthetic `[worker] ` heartbeats,
     /// optionally interleaved with genuine deltas), then reports `timed_out`
@@ -358,6 +360,27 @@ async fn handle_connection(
         }
 
         match behavior {
+            MockBehavior::FragmentedText(ref text) => {
+                use tokio_tungstenite::tungstenite::protocol::frame::{
+                    Frame,
+                    coding::{Data, OpCode},
+                };
+                let chunks = text.as_bytes().chunks(512 * 1024);
+                let count = chunks.len();
+                for (index, chunk) in chunks.enumerate() {
+                    let opcode = if index == 0 {
+                        Data::Text
+                    } else {
+                        Data::Continue
+                    };
+                    let frame =
+                        Frame::message(chunk.to_vec(), OpCode::Data(opcode), index + 1 == count);
+                    if ws.send(Message::Frame(frame)).await.is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
             MockBehavior::Success {
                 ref progress,
                 ref output,
@@ -2961,7 +2984,7 @@ async fn tool_call_oversized_frame_plain_and_escaped_type_is_rejected() {
             r#"{{"id":"m","type":"{ty}","timestamp":"2026-01-01T00:00:00Z","payload":{{"task_id":"@task_id@","call_id":"{call_id}","name":"knowledge_search","arguments":{{"pad":"{pad}"}}}}}}"#
         )
     };
-    let small_escaped = r#"{"id":"m","type":"tool_call","timestamp":"2026-01-01T00:00:00Z","payload":{"task_id":"@task_id@","call_id":"c-esc-small","name":"knowledge_search","arguments":{}}}"#
+    let small_escaped = r#"{"id":"m","type":"\u0074ool_call","timestamp":"2026-01-01T00:00:00Z","payload":{"task_id":"@task_id@","call_id":"c-esc-small","name":"knowledge_search","arguments":{}}}"#
         .to_string();
     let small_plain = r#"{"id":"m","type":"tool_call","timestamp":"2026-01-01T00:00:00Z","payload":{"task_id":"@task_id@","call_id":"c-plain-small","name":"knowledge_search","arguments":{}}}"#
         .to_string();
@@ -3012,12 +3035,11 @@ async fn tool_call_oversized_frame_plain_and_escaped_type_is_rejected() {
 
 #[tokio::test]
 async fn tool_call_giant_frame_is_capped_at_the_socket() {
-    // MR !1533 DP-1: the socket's max_message_size (1 MiB) bounds what
-    // tungstenite materializes at all — a frame beyond it surfaces as a
-    // protocol error that fails the job rather than a 64 MiB heap frame.
+    // MR !1540 DX-1/DX-3: both message and individual-frame limits are 16 MiB;
+    // a larger frame fails the job at the transport boundary.
     let giant = format!(
         r#"{{"id":"m","type":"tool_call","timestamp":"2026-01-01T00:00:00Z","payload":{{"task_id":"@task_id@","call_id":"c-huge","name":"knowledge_search","arguments":{{"pad":"{}"}}}}}}"#,
-        "A".repeat(2 * 1024 * 1024)
+        "A".repeat(17 * 1024 * 1024)
     );
 
     let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3050,6 +3072,7 @@ async fn tool_call_giant_frame_is_capped_at_the_socket() {
         matches!(err, OrchestratorError::ExternalWorkerProtocolError { .. }),
         "got {err:?}"
     );
+    assert!(err.to_string().contains("Message too long"), "{err}");
 }
 
 #[tokio::test]
@@ -3217,3 +3240,6 @@ async fn tool_call_cap_bounds_frames_and_marker_rows() {
     );
     assert_eq!(cap_rows[0].data["success"], false);
 }
+
+#[path = "external_worker_integration/proxy_review.rs"]
+mod proxy_review;

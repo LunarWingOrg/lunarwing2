@@ -265,6 +265,14 @@ Four tools for LLM use:
 - **`memory_read`** - Read bounded pages from a file by path
 - **`memory_tree`** - View a bounded workspace tree (depth parameter, default 1)
 
+External-worker proxy grants have a narrower write policy: after resolving
+named targets and normalizing paths, `memory_write` refuses prompt-visible
+files (including daily logs/lorebooks), all `engine/**` paths, and any explicit
+`layer` parameter. The policy also applies after hook rewrites. Ordinary
+notes such as `notes/proxied.md` remain writable in the owner's default scope.
+`memory_read` can disclose the owner's workspace, including prompt files, to
+the egress-enabled worker. See [the proxy contract](../../../docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md).
+
 `memory_search` excludes internal `engine/.runtime/**` documents, the
 mission-directory subtree (`engine/projects/*/missions/*/**`, WI#135
 hardening), and the project-level `missions.json` manifest, so mission goal

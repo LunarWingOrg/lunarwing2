@@ -917,8 +917,7 @@ pub struct ExternalWorkerSettings {
     /// list is stripped for cleartext `ws://` endpoints on non-loopback
     /// hosts. Only names inside the WI#324 phase-1 capability set
     /// (`memory_read`/`memory_write`, `knowledge_search`/
-    /// `knowledge_submit_note`/`knowledge_get_topic`, `gitlab_tool`,
-    /// read-only `mission_status`/`mission_history`/`mission_list`) are
+    /// `knowledge_submit_note`/`knowledge_get_topic`, `gitlab_tool`/`gitlab-tool`) are
     /// kept; host-execution, host-read, store, HTTP, and cross-plane tools
     /// are never worker-callable (MR !1533 DP-2). Tools must additionally
     /// pass the daemon's autonomous-execution gates, and secrets never cross
