@@ -248,6 +248,16 @@ async fn report_complete(
         .await
         .map(|handle| handle.owner_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    // DG-1: the completion message reaches the parent agent's context, the
+    // `agent_jobs` table, and the web UI. The worker scrubs before sending;
+    // scrub AGAIN here as the daemon-side backstop so a value a worker-side
+    // gap let through never lands in the DB or the parent's tool result.
+    let mut report = report;
+    if let Some(redactor) = state.token_store.harness_secret_redactor(job_id).await
+        && let Some(message) = report.message.take()
+    {
+        report.message = Some(redactor.scrub(&message));
+    }
     if report.success {
         tracing::info!(
             job_id = %job_id,
@@ -632,6 +642,15 @@ async fn get_harness_secrets_handler(
         Some(secrets) if !secrets.is_empty() => secrets,
         _ => return Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null))),
     };
+    // DG-7: one-shot delivery. The worker pulls exactly once at startup; a
+    // second pull means the bearer token leaked mid-job — refuse the replay.
+    if !state.token_store.mark_harness_secrets_served(job_id).await {
+        tracing::warn!(
+            job_id = %job_id,
+            "Refused replay of harness secret pull (already served once)"
+        );
+        return Err(StatusCode::GONE);
+    }
     let files: Vec<serde_json::Value> = secrets
         .iter()
         .map(|(file_name, value)| {
@@ -951,6 +970,96 @@ mod tests {
             "secret value must be redacted from the broadcast event: {content}"
         );
         assert!(content.contains("[redacted-secret]"));
+    }
+
+    #[tokio::test]
+    async fn complete_report_redacts_mounted_secret_values() {
+        // DG-1: a worker that `cat`s its own mounted secret into the
+        // completion report must not land the value in the job handle (the
+        // parent agent's tool result) — the daemon scrubs /complete.
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        insert_test_handle(&state, job_id, "owner").await;
+        let secret_value = "harness-complete-fixture-value";
+        state
+            .token_store
+            .store_harness_secrets(
+                job_id,
+                vec![(
+                    "API_KEY".to_string(),
+                    secrecy::SecretString::from(secret_value.to_string()),
+                )],
+            )
+            .await;
+
+        let router = OrchestratorApi::router(state.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{job_id}/complete"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "success": true,
+                    "message": format!("done; the token was {secret_value}"),
+                    "iterations": 1
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let handle = state
+            .job_manager
+            .get_handle(job_id)
+            .await
+            .expect("handle kept after completion");
+        let message = handle
+            .completion_result
+            .and_then(|r| r.message)
+            .unwrap_or_default();
+        assert!(
+            !message.contains(secret_value),
+            "completion message must be redacted: {message}"
+        );
+        assert!(message.contains("[redacted-secret]"));
+    }
+
+    #[tokio::test]
+    async fn harness_secrets_pull_is_one_shot() {
+        // DG-7: the worker pulls once at startup; a replay (leaked token)
+        // gets 410 Gone and never re-serves values.
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        insert_test_handle(&state, job_id, "owner").await;
+        state
+            .token_store
+            .store_harness_secrets(
+                job_id,
+                vec![(
+                    "API_KEY".to_string(),
+                    secrecy::SecretString::from("super-secret-value".to_string()),
+                )],
+            )
+            .await;
+
+        let router = OrchestratorApi::router(state);
+        let pull = || {
+            Request::builder()
+                .uri(format!("/worker/{job_id}/harness-secrets"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router.clone().oneshot(pull()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router.oneshot(pull()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]

@@ -262,6 +262,11 @@ impl WorkerRuntime {
         // A delivery mismatch fails the worker before any job work. The
         // redactor keeps values out of job events (CV-7).
         self.secret_redactor = setup_harness_secrets(&self.client).await?;
+        // DG-7: the per-job worker token is readable by every job child via
+        // /proc/1/environ; arm the redactor with it so a `cat` of the environ
+        // block cannot persist a live token into events. Applies to plain
+        // worker jobs too — the token is exposed regardless of harness mode.
+        self.secret_redactor.add_value(self.client.bearer_token());
 
         let owner_id = if job.owner_id.is_empty() {
             "default".to_string()
@@ -292,7 +297,7 @@ impl WorkerRuntime {
                 self.client
                     .report_complete(&CompletionReport {
                         success: false,
-                        message: Some(message),
+                        message: Some(self.secret_redactor.scrub(&message)),
                         iterations: 0,
                     })
                     .await?;
@@ -469,12 +474,16 @@ Work independently to complete this job. Report when done."#,
         } else {
             "error"
         };
+        // DG-1: the completion report reaches the parent agent, the DB and
+        // the web UI — scrub it worker-side before it leaves (the daemon
+        // re-scrubs at /complete as a backstop).
+        report.message = report.message.map(|m| self.secret_redactor.scrub(&m));
         self.post_event(
             "result",
             serde_json::json!({
                 "status": status,
                 "success": report.success,
-                "message": report.message.as_deref().map(|message| truncate_for_preview(message, 2000)),
+                "message": report.message.as_deref().map(|message| self.secret_redactor.scrub_and_truncate(message, 2000)),
             }),
         )
         .await;
@@ -575,7 +584,7 @@ impl ContainerDelegate {
                     "message",
                     serde_json::json!({
                         "role": "user",
-                        "content": truncate_for_preview(&prompt.content, 2000),
+                        "content": self.secret_redactor.scrub_and_truncate(&prompt.content, 2000),
                     }),
                 )
                 .await;
@@ -647,7 +656,7 @@ impl LoopDelegate for ContainerDelegate {
             "message",
             serde_json::json!({
                 "role": "assistant",
-                "content": truncate_for_preview(text, 2000),
+                "content": self.secret_redactor.scrub_and_truncate(text, 2000),
             }),
         )
         .await;
@@ -663,7 +672,9 @@ impl LoopDelegate for ContainerDelegate {
         if is_done {
             let last = self.last_output.lock().await;
             let output = if last.is_empty() {
-                text.to_string()
+                // DG-1: the completion report leaves the worker — scrub the
+                // LLM's own closing text too (partials can reassemble here).
+                self.secret_redactor.scrub(text)
             } else {
                 last.clone()
             };
@@ -695,7 +706,7 @@ impl LoopDelegate for ContainerDelegate {
                 "message",
                 serde_json::json!({
                     "role": "assistant",
-                    "content": truncate_for_preview(text, 2000),
+                    "content": self.secret_redactor.scrub_and_truncate(text, 2000),
                 }),
             )
             .await;
@@ -717,7 +728,7 @@ impl LoopDelegate for ContainerDelegate {
                 "tool_use",
                 serde_json::json!({
                     "tool_name": tc.name,
-                    "input": truncate_for_preview(&tc.arguments.to_string(), 500),
+                    "input": self.secret_redactor.scrub_and_truncate(&tc.arguments.to_string(), 500),
                 }),
             )
             .await;
@@ -737,13 +748,21 @@ impl LoopDelegate for ContainerDelegate {
             )
             .await;
 
+            // DG-1/DG-2: scrub at the tool-result boundary, BEFORE any
+            // truncation — one scrub covers the job event, `last_output`,
+            // the completion report, the LLM context, and provider logs.
+            let result = match result {
+                Ok(output) => Ok(self.secret_redactor.scrub(&output)),
+                Err(error) => Err(self.secret_redactor.scrub(&error)),
+            };
+
             self.post_event(
                 "tool_result",
                 serde_json::json!({
                     "tool_name": tc.name,
                     "output": match &result {
-                        Ok(output) => truncate_for_preview(output, 2000),
-                        Err(e) => format!("Error: {}", truncate_for_preview(e, 500)).into(),
+                        Ok(output) => self.secret_redactor.scrub_and_truncate(output, 2000).into(),
+                        Err(e) => format!("Error: {}", self.secret_redactor.scrub_and_truncate(e, 500)),
                     },
                     "success": result.is_ok(),
                 }),
@@ -795,7 +814,7 @@ impl LoopDelegate for ContainerDelegate {
             "message",
             serde_json::json!({
                 "role": "assistant",
-                "content": truncate_for_preview(text, 2000),
+                "content": self.secret_redactor.scrub_and_truncate(text, 2000),
                 "nudge": true,
             }),
         )

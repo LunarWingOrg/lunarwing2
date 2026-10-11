@@ -102,6 +102,15 @@ enum WorkerRuntimeKind {
     Podman,
 }
 
+/// Detected runtime plus, for podman, the engine version (DG-6): the
+/// write-back staging bind needs `keep-id:uid=1000,gid=1000`, which only
+/// podman >= 5.0 can express.
+#[derive(Debug, Clone, Copy)]
+struct RuntimeFlavor {
+    kind: WorkerRuntimeKind,
+    podman_version: Option<(u32, u32)>,
+}
+
 impl WorkerRuntimeKind {
     /// tmpfs options for the harness secrets mount. Both shapes end with the
     /// tmpfs owned by the container's worker uid (1000) with mode 0700, so
@@ -116,6 +125,38 @@ impl WorkerRuntimeKind {
             Self::Podman => "size=4M,mode=0700,noexec,nosuid,U",
         }
     }
+}
+
+/// Parse a `"5.2.3"`-shaped version into `(major, minor)` (DG-6). Anything
+/// else returns None — the caller fails closed.
+fn parse_semver_pair(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Docker path of DG-6: container uid 1000 maps to host uid 1000. When the
+/// daemon runs as uid 1000 the staging dir is already writable as 0755;
+/// otherwise chmod the staging LEAF to 0777 (the 0700 harness parents keep
+/// the path unreachable for other host users) so the container worker uid
+/// can write. Finally probe that the daemon itself can still write — the
+/// promotion walk and cleanup run as the daemon. Fails closed on any error.
+fn make_staging_writable_by_worker_uid(staging_dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let daemon_euid = unsafe { libc::geteuid() };
+        if daemon_euid != 1000 {
+            std::fs::set_permissions(staging_dir, std::fs::Permissions::from_mode(0o777))?;
+        }
+    }
+    // Probe: the daemon must be able to write (promotion reads, cleanup
+    // removes) regardless of the uid mapping.
+    let probe = staging_dir.join(".write-probe");
+    std::fs::write(&probe, b"probe")?;
+    std::fs::remove_file(&probe)?;
+    Ok(())
 }
 
 /// Configuration for the container job manager.
@@ -631,7 +672,7 @@ pub struct ContainerJobManager {
     /// Cached Docker connection (created on first use).
     docker: Arc<RwLock<Option<bollard::Docker>>>,
     /// Cached container-runtime detection (created on first use, CV-2).
-    runtime_kind: Arc<RwLock<Option<WorkerRuntimeKind>>>,
+    runtime_flavor: Arc<RwLock<Option<RuntimeFlavor>>>,
     /// Broadcast channel for emitting job events when a container exits
     /// without calling /complete.
     job_event_tx: Option<
@@ -652,7 +693,7 @@ impl ContainerJobManager {
             token_store,
             containers: Arc::new(RwLock::new(HashMap::new())),
             docker: Arc::new(RwLock::new(None)),
-            runtime_kind: Arc::new(RwLock::new(None)),
+            runtime_flavor: Arc::new(RwLock::new(None)),
             job_event_tx: None,
             context_manager: None,
             write_back_workspace: None,
@@ -707,11 +748,11 @@ impl ContainerJobManager {
     /// per manager (CV-2). Harness secret mounts fail closed when detection
     /// fails: silently guessing tmpfs options could leave secrets unreadable
     /// or delivered into the wrong ownership mode.
-    async fn runtime_kind(&self) -> Result<WorkerRuntimeKind, OrchestratorError> {
+    async fn runtime_flavor(&self) -> Result<RuntimeFlavor, OrchestratorError> {
         {
-            let guard = self.runtime_kind.read().await;
-            if let Some(kind) = *guard {
-                return Ok(kind);
+            let guard = self.runtime_flavor.read().await;
+            if let Some(flavor) = *guard {
+                return Ok(flavor);
             }
         }
         let docker = self.docker().await?;
@@ -726,14 +767,85 @@ impl ContainerJobManager {
                 .iter()
                 .any(|c| c.name.to_ascii_lowercase().contains("podman"))
         });
-        let kind = if is_podman {
-            WorkerRuntimeKind::Podman
+        let podman_version = if is_podman {
+            version.components.as_ref().and_then(|components| {
+                components
+                    .iter()
+                    .find(|c| c.name.to_ascii_lowercase().contains("podman"))
+                    .and_then(|c| parse_semver_pair(&c.version))
+            })
         } else {
-            WorkerRuntimeKind::Docker
+            None
         };
-        *self.runtime_kind.write().await = Some(kind);
-        tracing::debug!(runtime = ?kind, "Detected container runtime for harness mounts");
-        Ok(kind)
+        let flavor = RuntimeFlavor {
+            kind: if is_podman {
+                WorkerRuntimeKind::Podman
+            } else {
+                WorkerRuntimeKind::Docker
+            },
+            podman_version,
+        };
+        *self.runtime_flavor.write().await = Some(flavor);
+        tracing::debug!(flavor = ?flavor, "Detected container runtime for harness mounts");
+        Ok(flavor)
+    }
+
+    async fn runtime_kind(&self) -> Result<WorkerRuntimeKind, OrchestratorError> {
+        Ok(self.runtime_flavor().await?.kind)
+    }
+
+    /// DG-6: make the RW write-back staging bind writable by the container's
+    /// worker uid (1000) and return the userns mode to set on the container.
+    ///
+    /// - Podman >= 5.0: pin `keep-id:uid=1000,gid=1000` (mirrors
+    ///   `sandbox/cli_runner.rs`), so in-container uid 1000 lands on the
+    ///   daemon's host uid and the daemon-owned 0755 staging dir is writable.
+    ///   Older podman cannot express the pin — fail closed rather than run a
+    ///   write-back job whose staging is silently unwritable.
+    /// - Docker: container uid 1000 maps to host uid 1000. When the daemon
+    ///   itself is uid 1000 the default 0755 dir is already writable;
+    ///   otherwise chmod the staging LEAF to 0777 (the 0700 parents keep the
+    ///   path private to the daemon user) and verify the daemon can still
+    ///   write it (promotion/cleanup run as the daemon).
+    async fn prepare_staging_bind(
+        &self,
+        job_id: Uuid,
+        staging_dir: &std::path::Path,
+    ) -> Result<Option<String>, OrchestratorError> {
+        match self.runtime_flavor().await? {
+            RuntimeFlavor {
+                kind: WorkerRuntimeKind::Podman,
+                podman_version: Some((major, _)),
+            } if major >= 5 => Ok(Some("keep-id:uid=1000,gid=1000".to_string())),
+            RuntimeFlavor {
+                kind: WorkerRuntimeKind::Podman,
+                podman_version,
+            } => Err(OrchestratorError::ContainerCreationFailed {
+                job_id,
+                reason: format!(
+                    "harness write-back requires podman >= 5.0 for the keep-id uid pin \
+                     (detected {}); upgrade podman or disable write_back",
+                    podman_version
+                        .map(|(maj, min)| format!("{maj}.{min}"))
+                        .unwrap_or_else(|| "an unversioned podman".to_string())
+                ),
+            }),
+            RuntimeFlavor {
+                kind: WorkerRuntimeKind::Docker,
+                ..
+            } => {
+                make_staging_writable_by_worker_uid(staging_dir).map_err(|e| {
+                    OrchestratorError::ContainerCreationFailed {
+                        job_id,
+                        reason: format!(
+                            "write-back staging dir {} is not writable by the container worker uid: {e}",
+                            staging_dir.display()
+                        ),
+                    }
+                })?;
+                Ok(None)
+            }
+        }
     }
 
     /// Create and start a new container for a job.
@@ -846,6 +958,9 @@ impl ContainerJobManager {
             Ok(()) => Ok(token),
             Err(e) => {
                 self.token_store.revoke(job_id).await;
+                // DG-3: dispatch failed — release the held harness secret
+                // values too, or they sit in memory for the daemon lifetime.
+                self.token_store.clear_harness_secrets(job_id).await;
                 self.containers.write().await.remove(&job_id);
                 harness::cleanup_harness_job_dir(job_id);
                 Err(e)
@@ -906,6 +1021,7 @@ impl ContainerJobManager {
         // Both live under ~/.lunarwing/harness/<job_id>/ — deliberately
         // outside the bind-mountable projects base (CW-3) — and validate
         // against the harness base.
+        let mut staging_userns_mode: Option<String> = None;
         if let Some(ref harness_req) = harness {
             env_vec.push("LUNARWING_HARNESS_MODE=1".to_string());
             if let Some(ref injection_dir) = harness_req.injection_dir {
@@ -924,6 +1040,11 @@ impl ContainerJobManager {
                 && let Some(ref staging_dir) = harness_req.staging_dir
             {
                 let canonical = validate_harness_mount_path(staging_dir, job_id)?;
+                // DG-6: the plain `:rw` bind is NOT writable by the container
+                // worker uid on rootless podman (no keep-id) or on Docker
+                // unless the daemon is uid 1000 — prepare the bind per runtime
+                // and fail closed when write-back cannot work.
+                staging_userns_mode = self.prepare_staging_bind(job_id, &canonical).await?;
                 binds.push(format!(
                     "{}:{}:rw",
                     canonical.display(),
@@ -991,6 +1112,9 @@ impl ContainerJobManager {
             cap_add: Some(vec!["CHOWN".to_string()]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             tmpfs: Some(tmpfs_mounts),
+            // DG-6: keep-id pin so the write-back staging bind is writable on
+            // rootless podman (None on Docker and for non-write-back jobs).
+            userns_mode: staging_userns_mode,
             ..Default::default()
         };
 
@@ -1056,10 +1180,14 @@ impl ContainerJobManager {
         // Clone container_id before moving it into the handle.
         let watcher_container_id = container_id.clone();
 
-        // Update handle with container ID
+        // Update handle with container ID. State advances only from Creating
+        // (DG-5): a concurrent stop/complete must never be overwritten back
+        // to Running.
         if let Some(handle) = self.containers.write().await.get_mut(&job_id) {
             handle.container_id = container_id;
-            handle.state = ContainerState::Running;
+            if handle.state == ContainerState::Creating {
+                handle.state = ContainerState::Running;
+            }
         }
 
         tracing::info!(
@@ -1199,10 +1327,19 @@ impl ContainerJobManager {
     pub async fn stop_job(&self, job_id: Uuid) -> Result<(), OrchestratorError> {
         let container_id = {
             let containers = self.containers.read().await;
-            containers
+            let handle = containers
                 .get(&job_id)
-                .map(|h| h.container_id.clone())
-                .ok_or(OrchestratorError::ContainerNotFound { job_id })?
+                .ok_or(OrchestratorError::ContainerNotFound { job_id })?;
+            // DH-4: promotion is running detached against the staging dir and
+            // the held secret values (CW-10 scan). A stop now would clear
+            // both mid-walk — refuse; finalize flips to Stopped when done.
+            if handle.state == ContainerState::Finalizing {
+                return Err(OrchestratorError::InvalidContainerState {
+                    job_id,
+                    state: "finalizing (write-back promotion in progress)".to_string(),
+                });
+            }
+            handle.container_id.clone()
         };
 
         if container_id.is_empty() {
@@ -1278,6 +1415,12 @@ impl ContainerJobManager {
             let mut containers = self.containers.write().await;
             match containers.get_mut(&job_id) {
                 Some(handle) => {
+                    // DH-3: /complete is idempotent — a duplicate or racing
+                    // report must not spawn a second finalize task or flip
+                    // state mid-promotion.
+                    if handle.completion_result.is_some() {
+                        return Ok(());
+                    }
                     handle.completion_result = Some(result);
                     let promote = handle
                         .harness
@@ -1296,15 +1439,17 @@ impl ContainerJobManager {
 
         // Stop container and revoke token (but keep handle in map).
         // Teardown must be confirmed before promotion reads the staging dir:
-        // a live container could keep mutating it (CW-3/CW-7).
+        // a live container could keep mutating it (CW-3/CW-7). An unknown
+        // (empty) container id means teardown is NOT confirmed (DG-5).
         let container_id = {
             let containers = self.containers.read().await;
             containers.get(&job_id).map(|h| h.container_id.clone())
         };
-        let mut teardown_confirmed = true;
+        let mut teardown_confirmed = false;
         if let Some(cid) = container_id
             && !cid.is_empty()
         {
+            teardown_confirmed = true;
             match self.docker().await {
                 Ok(docker) => {
                     if let Err(e) = docker
@@ -1349,6 +1494,13 @@ impl ContainerJobManager {
             tokio::spawn(async move {
                 finalize_harness_job(deps, job_id, job_succeeded, teardown_confirmed).await;
             });
+        } else {
+            // DH-2/DG-3: a terminal completion WITHOUT promotion still carries
+            // harness state (injection snapshot, mounted secret values). The
+            // wait=true read paths call cleanup_job, but the default
+            // wait=false dispatch never does — release both here.
+            self.token_store.clear_harness_secrets(job_id).await;
+            harness::cleanup_harness_job_dir(job_id);
         }
 
         tracing::info!(job_id = %job_id, "Completed worker container");
@@ -1357,6 +1509,19 @@ impl ContainerJobManager {
 
     /// Remove a completed job handle from memory (called after result is read).
     pub async fn cleanup_job(&self, job_id: Uuid) {
+        {
+            let containers = self.containers.read().await;
+            // DH-4: promotion is still running — removing the handle, the
+            // held secrets, or the staging dir now would corrupt the audit
+            // trail and the CW-10 scan. The finalize task flips the state to
+            // Stopped; a later cleanup_job call then completes normally.
+            if containers
+                .get(&job_id)
+                .is_some_and(|h| h.state == ContainerState::Finalizing)
+            {
+                return;
+            }
+        }
         self.containers.write().await.remove(&job_id);
         self.token_store.clear_harness_secrets(job_id).await;
         harness::cleanup_harness_job_dir(job_id);
@@ -1463,6 +1628,10 @@ async fn finalize_harness_job(
         if let Some(handle) = containers.get_mut(&job_id) {
             handle.state = ContainerState::Stopped;
         }
+        drop(containers);
+        // DH-2: even the degenerate path releases harness state.
+        deps.token_store.clear_harness_secrets(job_id).await;
+        harness::cleanup_harness_job_dir(job_id);
         return;
     };
 
@@ -1518,8 +1687,10 @@ async fn finalize_harness_job(
         }
     }
     // The job is fully terminal: release the mounted secret values held for
-    // delivery/redaction/scanning.
+    // delivery/redaction/scanning, and remove the harness dir (injection
+    // snapshot + staging) — DH-2: nothing is left for the boot-time sweep.
     deps.token_store.clear_harness_secrets(job_id).await;
+    harness::cleanup_harness_job_dir(job_id);
 }
 
 /// Run the write-back promotion pipeline: screen staged files, then write
@@ -1888,7 +2059,9 @@ mod tests {
                 job_id,
                 ContainerHandle {
                     job_id,
-                    // Empty container id: teardown is skipped, no Docker needed.
+                    // Empty container id: teardown is never attempted (no
+                    // Docker needed) — and per DG-5 it counts as UNCONFIRMED,
+                    // so write-back promotion is refused.
                     container_id: String::new(),
                     state: ContainerState::Running,
                     mode: JobMode::Harness,
@@ -1940,7 +2113,8 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         };
 
-        // No workspace resolver is configured in this manager, so the run is
+        // DG-5: an empty container id means teardown is UNCONFIRMED, so
+        // promotion is refused before any workspace access — the run is
         // skipped with a recorded reason rather than silently dropped (CW-9).
         assert!(summary.skipped);
         assert!(
@@ -1948,7 +2122,7 @@ mod tests {
                 .skip_reason
                 .as_deref()
                 .unwrap_or("")
-                .contains("no workspace")
+                .contains("teardown")
         );
     }
 
@@ -2104,5 +2278,118 @@ mod tests {
             exit, 0,
             "tmpfs secrets mount must be writable by uid 1000 on {kind:?}"
         );
+    }
+
+    #[test]
+    fn parse_semver_pair_shapes() {
+        assert_eq!(parse_semver_pair("5.2.3"), Some((5, 2)));
+        assert_eq!(parse_semver_pair("4.9.4"), Some((4, 9)));
+        assert_eq!(parse_semver_pair("5"), Some((5, 0)));
+        assert_eq!(parse_semver_pair(""), None);
+        assert_eq!(parse_semver_pair("garbage"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_bind_made_writable_and_daemon_can_write() {
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let staging = tmp.path().join("workspace_out");
+        std::fs::create_dir_all(&staging).unwrap(); // safety: test
+        make_staging_writable_by_worker_uid(&staging).unwrap(); // safety: test
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777; // safety: test
+        let daemon_euid = unsafe { libc::geteuid() };
+        if daemon_euid == 1000 {
+            assert_ne!(mode & 0o200, 0, "daemon-owned dir stays owner-writable");
+        } else {
+            assert_eq!(mode, 0o777, "non-1000 daemon must chmod the leaf");
+        }
+        // Probe guarantee: the daemon can write (promotion/cleanup).
+        std::fs::write(staging.join("probe.md"), "ok").unwrap(); // safety: test
+    }
+
+    /// DG-6: the write-back staging bind must be writable by the container's
+    /// worker uid (1000) through `prepare_staging_bind` — keep-id on podman
+    /// >= 5, chmod+probe on Docker. Self-skips when no runtime/image exists.
+    #[tokio::test]
+    async fn harness_staging_bind_is_writable_by_worker_uid() {
+        let mgr = ContainerJobManager::new(ContainerJobConfig::default(), TokenStore::new());
+        let Ok(docker) = mgr.docker().await else {
+            eprintln!("skipping: no container runtime available");
+            return;
+        };
+        let image = mgr.config.image.clone();
+        if docker.inspect_image(&image).await.is_err() {
+            eprintln!("skipping: worker image '{image}' not present");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let staging = tmp.path().join("workspace_out");
+        std::fs::create_dir_all(&staging).unwrap(); // safety: test
+        let userns_mode = match mgr
+            .prepare_staging_bind(Uuid::new_v4(), &staging)
+            .await
+        {
+            Ok(mode) => mode,
+            Err(e) => {
+                // Podman < 5 fails closed by design.
+                eprintln!("skipping: staging bind not supported here: {e}");
+                return;
+            }
+        };
+
+        let config = bollard::container::Config {
+            image: Some(image.clone()),
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "touch /harness/workspace_out/OK".to_string(),
+            ]),
+            user: Some("1000:1000".to_string()),
+            host_config: Some(bollard::models::HostConfig {
+                binds: Some(vec![format!(
+                    "{}:{}:rw",
+                    staging.display(),
+                    harness::HARNESS_WRITE_BACK_CONTAINER_DIR
+                )]),
+                userns_mode,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let name = format!("lunarwing-harness-staging-test-{}", Uuid::new_v4());
+        let created = docker
+            .create_container(
+                Some(bollard::container::CreateContainerOptions {
+                    name: name.clone(),
+                    ..Default::default()
+                }),
+                config,
+            )
+            .await
+            .unwrap(); // safety: test — a create failure here is exactly DG-6
+        docker
+            .start_container::<String>(&created.id, None)
+            .await
+            .unwrap(); // safety: test
+        let wait = docker
+            .wait_container::<String>(&created.id, None)
+            .next()
+            .await;
+        let _ = docker
+            .remove_container(
+                &created.id,
+                Some(bollard::container::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let exit = wait
+            .and_then(|r| r.ok())
+            .map(|r| r.status_code)
+            .unwrap_or(-1);
+        assert_eq!(exit, 0, "staging bind must be writable by uid 1000");
+        assert!(staging.join("OK").exists());
     }
 }

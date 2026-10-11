@@ -136,14 +136,15 @@ pub struct McpCredentialResponse {
 
 /// A single harness-mode secret file (WI#326): the worker writes the value
 /// to `/run/secrets/<file_name>` on tmpfs. Values never enter the env.
-#[derive(Debug, Serialize, Deserialize)]
+/// No `Debug` derive: a debug print must never carry the value (CV-10).
+#[derive(Serialize, Deserialize)]
 pub struct HarnessSecretFileResponse {
     pub file_name: String,
     pub value: String,
 }
 
 /// Envelope for the harness-secrets endpoint.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct HarnessSecretsResponse {
     pub secrets: Vec<HarnessSecretFileResponse>,
 }
@@ -188,6 +189,13 @@ impl WorkerHttpClient {
     /// Get the base orchestrator URL.
     pub fn orchestrator_url(&self) -> &str {
         &self.orchestrator_url
+    }
+
+    /// The per-job bearer token. Exposed only so the worker-side event
+    /// redactor can scrub it from job output (DG-7: job children can read
+    /// it via /proc/1/environ) — never log or return it.
+    pub(crate) fn bearer_token(&self) -> &str {
+        &self.token
     }
 
     fn url(&self, path: &str) -> String {

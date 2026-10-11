@@ -475,10 +475,12 @@ impl WriteBackPolicy {
 
     /// True when a normalized staging-relative path falls under an allowed
     /// root. The hard-deny set ([`write_back_deny_reason`]) always wins.
+    /// DH-9: a staged file named exactly like a root ("projects") is NOT
+    /// under it — promotion targets are files below a root directory.
     pub fn root_allows(&self, normalized_path: &str) -> bool {
         self.allowed_roots
             .iter()
-            .any(|root| normalized_path == root || normalized_path.starts_with(&format!("{root}/")))
+            .any(|root| normalized_path.starts_with(&format!("{root}/")))
     }
 }
 
@@ -1162,35 +1164,38 @@ pub fn plan_promotion(
 ) -> Result<PromotionPlan, HarnessError> {
     policy.validate()?;
     let mut files = Vec::new();
-    if staging.is_dir() {
-        let canonical_staging = staging
+    // DH-6: the walk runs over the CANONICAL staging dir, so every relative
+    // path below must strip the canonical prefix — stripping the raw prefix
+    // rejects everything when the harness base path contains a symlink.
+    let canonical_staging = if staging.is_dir() {
+        let canonical = staging
             .canonicalize()
             .map_err(|e| HarnessError::io(format!("canonicalize {}", staging.display()), e))?;
         let mut visited = 0usize;
-        collect_staged_files(&canonical_staging, 0, &mut visited, &mut files)?;
-    }
+        collect_staged_files(&canonical, 0, &mut visited, &mut files)?;
+        canonical
+    } else {
+        staging.to_path_buf()
+    };
     files.sort();
 
     let mut plan = PromotionPlan::default();
     let mut total_bytes = 0u64;
     let detector = crate::safety::LeakDetector::new();
-    let canonical_staging = staging
-        .canonicalize()
-        .unwrap_or_else(|_| staging.to_path_buf());
 
     for (path, lstat_size) in files {
         if plan.accepted.len() >= policy.max_files {
             plan.reject(
-                relative_lossy(staging, &path),
+                relative_lossy(&canonical_staging, &path),
                 format!("write-back file count limit ({}) reached", policy.max_files),
             );
             continue;
         }
-        let relative = match strict_relative(staging, &path) {
+        let relative = match strict_relative(&canonical_staging, &path) {
             Some(rel) => rel,
             None => {
                 plan.reject(
-                    relative_lossy(staging, &path),
+                    relative_lossy(&canonical_staging, &path),
                     "non-UTF-8 path cannot be promoted".to_string(),
                 );
                 continue;
@@ -1730,6 +1735,98 @@ mod tests {
             std::fs::write(path, content).unwrap(); // safety: test
         }
         tmp
+    }
+
+    #[test]
+    fn root_allows_only_files_below_a_root() {
+        // DH-9: a staged file named exactly like the root is not "under" it.
+        let policy = WriteBackPolicy::default();
+        assert!(!policy.root_allows("projects"));
+        assert!(policy.root_allows("projects/out.md"));
+        assert!(policy.root_allows("projects/demo/out.md"));
+        assert!(!policy.root_allows("projectsx/out.md"));
+
+        let tmp = staging_with(&[("projects", "a file literally named projects")]);
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
+        assert!(plan.accepted.is_empty());
+        assert!(
+            plan.rejections
+                .iter()
+                .any(|r| r.relative_path == "projects")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_works_through_a_symlinked_base_path() {
+        // DH-6: when the harness base path contains a symlink, canonical and
+        // raw prefixes differ — promotion must still work (strip canonical).
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let real = tmp.path().join("real");
+        let staging = real.join("workspace_out");
+        std::fs::create_dir_all(staging.join("projects")).unwrap(); // safety: test
+        std::fs::write(staging.join("projects/out.md"), "result").unwrap(); // safety: test
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap(); // safety: test
+        let via_link = link.join("workspace_out");
+        let plan = plan_promotion(&via_link, &WriteBackPolicy::default(), None).unwrap(); // safety: test
+        assert_eq!(plan.accepted.len(), 1);
+        assert_eq!(plan.accepted[0].relative_path, "projects/out.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_staged_file_rejects_symlinks_and_fifos_fast() {
+        // DH-8: exercise the read-path defense DIRECTLY (the lstat walk
+        // filters these before reads, so walking tests cannot regress it).
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let target = tmp.path().join("target.md");
+        std::fs::write(&target, "secret-ish").unwrap(); // safety: test
+        let link = tmp.path().join("link.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap(); // safety: test
+        // Without O_NOFOLLOW this read would SUCCEED.
+        assert!(read_staged_file(&link, 1024).is_err());
+
+        let fifo = tmp.path().join("pipe.md");
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap(); // safety: test
+        let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }; // safety: test fifo creation
+        assert_eq!(created, 0);
+        // Without O_NONBLOCK the open would block forever — bound the wait so
+        // a regression FAILS instead of hanging the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo_clone = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_staged_file(&fifo_clone, 1024));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fifo read must fail fast, not block"); // safety: test
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn promotion_caps_rejection_list_and_walk_entries() {
+        // DH-8: the 128-rejection cap and the 4096-entry walk cap.
+        let tmp = tempfile::tempdir().unwrap(); // safety: test
+        let dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        for i in 0..(MAX_PROMOTION_REJECTIONS + 2) {
+            // Non-UTF-8 content: every file is rejected.
+            std::fs::write(dir.join(format!("f{i}.md")), [0xff, 0xfe]).unwrap(); // safety: test
+        }
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), None).unwrap(); // safety: test
+        assert_eq!(plan.rejections.len(), MAX_PROMOTION_REJECTIONS);
+        assert_eq!(plan.dropped_rejections, 2);
+
+        let wide = tempfile::tempdir().unwrap(); // safety: test
+        let dir = wide.path().join("projects");
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        for i in 0..(MAX_STAGING_WALK_ENTRIES + 1) {
+            std::fs::write(dir.join(format!("f{i:05}.md")), "x").unwrap(); // safety: test
+        }
+        let result = plan_promotion(wide.path(), &WriteBackPolicy::default(), None);
+        assert!(result.is_err(), "walk entry cap must fail the plan");
     }
 
     #[test]

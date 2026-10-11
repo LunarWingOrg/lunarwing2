@@ -106,6 +106,10 @@ pub struct TokenStore {
     /// `revoke` — promotion runs after the token dies; every terminal path
     /// calls [`TokenStore::clear_harness_secrets`] explicitly.
     harness_secrets: Arc<RwLock<HashMap<Uuid, HarnessSecrets>>>,
+    /// Jobs whose harness secrets were already served once (DG-7). The
+    /// worker pulls exactly once at startup; any later pull is a replay and
+    /// gets 410 Gone, so a token leaked mid-job cannot re-fetch values.
+    harness_secrets_served: Arc<RwLock<std::collections::HashSet<Uuid>>>,
 }
 
 impl TokenStore {
@@ -115,6 +119,7 @@ impl TokenStore {
             credential_grants: Arc::new(RwLock::new(HashMap::new())),
             mcp_credential_grants: Arc::new(RwLock::new(HashMap::new())),
             harness_secrets: Arc::new(RwLock::new(HashMap::new())),
+            harness_secrets_served: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -214,6 +219,14 @@ impl TokenStore {
     /// (finalize after promotion, stop/cancel, crash watcher, cleanup).
     pub async fn clear_harness_secrets(&self, job_id: Uuid) {
         self.harness_secrets.write().await.remove(&job_id);
+        self.harness_secrets_served.write().await.remove(&job_id);
+    }
+
+    /// Mark the job's harness secrets as served (DG-7 one-shot delivery).
+    /// Returns false when they were already served — the caller must refuse
+    /// the replay with 410 Gone.
+    pub async fn mark_harness_secrets_served(&self, job_id: Uuid) -> bool {
+        self.harness_secrets_served.write().await.insert(job_id)
     }
 }
 
