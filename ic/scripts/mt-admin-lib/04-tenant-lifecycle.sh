@@ -543,6 +543,9 @@ add_tenant() {
       die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/opencode2-/weechat-/weechat-adapter-); choose another name" ;;
   esac
 
+  # WI#330: never render an unreachable built-in endpoint; require a real one.
+  require_tenant_llm_endpoint "$tensorzero_url" "$llm_base_url" "$enable_proxy"
+
   # Resolve after sanitize_name so a preserved/default JID keys off the real name.
   local xmpp_jid_prev
   xmpp_jid_prev="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)"
@@ -1522,6 +1525,10 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" opencode2; then
     with_opencode2="true"
   fi
+  # WI#330: the rebuilt worker images refuse their placeholder endpoints, so an
+  # enabled worker without a resolvable base URL must fail the upgrade BEFORE
+  # the images rebuild. Idempotent; patch_tenant_env re-runs it post-build.
+  backfill_tenant_worker_base_urls "$name"
   build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" "$with_opencode2" \
     || die "build failed for $name; aborting upgrade (tenant left stopped at $target_commit; fix the build and re-run upgrade-tenant)"
 
