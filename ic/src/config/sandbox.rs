@@ -1218,7 +1218,7 @@ goal = "Watch the herd"
             cron.heartbeat_timeout(),
             std::time::Duration::from_secs(CronWorkerConfig::DEFAULT_HEARTBEAT_TIMEOUT_SECS)
         );
-        // Default per-link deadline is the worker bridge cap (4h), not the
+        // Default per-link deadline is the host's 4h tick cap, not the
         // worker's ordinary timeout: a tick link must outlive the standard
         // bounded deadline by default (WI#325, MR !1522 CU-3).
         assert_eq!(
@@ -1338,7 +1338,9 @@ mode = "cron"
             resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\ntick_timeout_ms = 0")
                 .is_none()
         );
-        // Above the kimi bridge cap: every tick would be rejected on the wire.
+        // Above the host's 4h tick cap: rejected at load (the host enforces
+        // the same bound per link; only Kimi's bridge separately caps
+        // timeout_ms, configurable via KIMI_MAX_TIMEOUT_MS).
         assert!(
             resolve_cron_worker(
                 "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\ntick_timeout_ms = 604800000"
@@ -1353,7 +1355,7 @@ mode = "cron"
             .is_some()
         );
         // The worker's ordinary timeout no longer feeds the tick deadline:
-        // the default tick deadline is the bridge cap regardless.
+        // the default tick deadline is the host cap regardless.
         let settings: crate::settings::Settings = toml::from_str(
             r#"
 [[sandbox.external_workers]]

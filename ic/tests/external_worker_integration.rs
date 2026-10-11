@@ -2931,11 +2931,76 @@ async fn cron_pause_and_tick_counter_survive_restart() {
         assert!(
             events
                 .iter()
-                .any(|event| event.event_type == kind && event.data["origin"] == "owner_command"),
+                .any(|event| event.event_type == kind && event.data["origin"] == "owner_tool"),
             "missing persisted {kind} lifecycle event"
         );
     }
     let _ = shutdown_b.send(());
+}
+
+/// MR !1531 DR-2 / DN-6: when the job-row write fails, the tick must end
+/// without the worker ever being asked to run — a failed persist prevents
+/// dispatch. Sabotages only the `agent_jobs` table; the settings store
+/// (pause flag / tick counter) keeps working so the supervisor stays alive.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_tick_with_failing_job_persistence_never_dispatches() {
+    use lunarwing::db::Database;
+    use lunarwing::db::libsql::LibSqlBackend;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join("cron-persist-fail.db"))
+        .await
+        .expect("test db");
+    backend.run_migrations().await.expect("migrations");
+    backend
+        .shared_db()
+        .connect()
+        .expect("raw connection")
+        .execute("ALTER TABLE agent_jobs RENAME TO agent_jobs_sabotaged", ())
+        .await
+        .expect("sabotage agent_jobs");
+    let db: Arc<dyn Database> = Arc::new(backend);
+
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_with_schedule(&url, "* * * * * *", 30, 0)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db),
+    );
+    let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+
+    // A tick fires (the counter advances) but no request may reach the worker.
+    timeout(TEST_BOUND * 2, async {
+        loop {
+            let status = mgr
+                .cron_mission_status("mock", "owner-1")
+                .await
+                .expect("status");
+            if status.tick_index >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("no tick fired");
+    // Give the capacity-retry loop room to misbehave: three more seconds with
+    // no request proves dispatch is gated on the persisted job row.
+    let leak = timeout(Duration::from_secs(3), request_rx.recv()).await;
+    assert!(
+        leak.is_err(),
+        "worker received a dispatch despite the failed job-row persist: {leak:?}"
+    );
+    let _ = shutdown.send(());
 }
 
 #[cfg(feature = "libsql")]
@@ -3017,7 +3082,14 @@ async fn cron_gateway_recovers_persisted_pause_and_rejects_nonowners() {
     .unwrap();
     let (events, _) = tokio::sync::broadcast::channel(16);
     let mgr = Arc::new(
-        ExternalWorkerManager::new(vec![cron_config_for("ws://127.0.0.1:9", 30, 0)])
+        // Unreachable worker; a Feb-29 schedule can never fire mid-test
+        // (DR-7 — the daily 10:15 UTC schedule could, in principle).
+        ExternalWorkerManager::new(vec![cron_config_with_schedule(
+            "ws://127.0.0.1:9",
+            "0 0 0 29 2 *",
+            30,
+            0,
+        )])
             .with_event_deps(events, Arc::new(ContextManager::new(16)))
             .with_store(db.clone()),
     );
@@ -3089,11 +3161,67 @@ async fn cron_gateway_recovers_persisted_pause_and_rejects_nonowners() {
     let _ = shutdown.send(());
 }
 
+/// MR !1531 DR-4: the handler-level owner gate fires before any manager
+/// lookup — a non-owner gets 403 even when the gateway has no external worker
+/// manager at all (never a 503 that would leak the gateway's shape).
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_gateway_owner_gate_precedes_manager_lookup() {
+    use std::collections::HashMap;
+
+    use lunarwing::channels::web::{
+        auth::{MultiAuthState, UserIdentity},
+        test_helpers::TestGatewayBuilder,
+    };
+
+    let auth = MultiAuthState::multi(HashMap::from([(
+        "other-test-token".to_string(),
+        UserIdentity {
+            user_id: "other".to_string(),
+            workspace_read_scopes: vec![],
+        },
+    )]));
+    let (addr, _state) = TestGatewayBuilder::new()
+        .user_id("owner-1")
+        .start_multi(auth)
+        .await
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(TEST_BOUND)
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/api/workers/mock/cron");
+    let get_status = client
+        .get(&url)
+        .bearer_auth("other-test-token")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    let post_status = client
+        .post(&url)
+        .bearer_auth("other-test-token")
+        .json(&serde_json::json!({"action":"pause"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(get_status, 403);
+    assert_eq!(post_status, 403);
+}
+
 #[tokio::test]
 async fn cron_mission_tool_success_routes_pause_status_resume() {
     use lunarwing::context::JobContext;
     use lunarwing::tools::{Tool, builtin::CronMissionTool};
-    let (mgr, _cm, shutdown) = spawn_cron_manager(cron_config_for("ws://127.0.0.1:9", 30, 0));
+    // Unreachable worker on a Feb-29 schedule: no tick can fire mid-test
+    // (DR-7).
+    let (mgr, _cm, shutdown) = spawn_cron_manager(cron_config_with_schedule(
+        "ws://127.0.0.1:9",
+        "0 0 0 29 2 *",
+        30,
+        0,
+    ));
     let tool = CronMissionTool::new(mgr);
     let owner = JobContext {
         user_id: "owner-1".to_string(),

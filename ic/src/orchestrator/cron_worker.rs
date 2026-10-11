@@ -1254,8 +1254,8 @@ fn is_busy(reason: &str) -> bool {
 }
 
 /// Whether a worker rejection can never be fixed by re-dispatching (CU-4):
-/// protocol validation (timeout above the bridge cap, bad project_dir) is a
-/// config error, not a transient failure.
+/// protocol validation (timeout outside the wire bounds, bad project_dir) is
+/// a config error, not a transient failure.
 ///
 /// MR !1531 DS-2: the bridges wrap genuinely transient bootstrap errnos
 /// (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on first mkdir, ENOENT/EINVAL
