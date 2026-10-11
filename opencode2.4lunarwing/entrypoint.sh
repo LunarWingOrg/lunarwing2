@@ -141,6 +141,15 @@ PY
   : "${OPENCODE_CONFIG:=$WORKSPACE_ROOT/.opencode/opencode2.json}"
   export OPENCODE_CONFIG
   log "OPENCODE_CONFIG=$OPENCODE_CONFIG"
+  # WI#330: the baked config ships a placeholder baseURL on the .invalid TLD
+  # (guaranteed NXDOMAIN). mt-admin always renders OPENCODE2_BASE_URL —
+  # defaulting to the tenant's own LLM endpoint — so a placeholder that
+  # survives to the EFFECTIVE runtime config (an operator-set OPENCODE_CONFIG
+  # wins, so that file is what gets checked) means a hand-rolled deployment
+  # forgot the override. Fail loudly at startup, not at the first LLM request.
+  if grep -q 'set-opencode2-base-url\.invalid' "$OPENCODE_CONFIG" 2>/dev/null; then
+    die "OPENCODE2_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-opencode2 <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
+  fi
 fi
 
 # ── optional Paseo MCP integration ────────────────────────────────────────────

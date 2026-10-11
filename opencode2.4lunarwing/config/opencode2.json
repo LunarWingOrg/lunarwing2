@@ -7,7 +7,7 @@
       "package": "@ai-sdk/openai-compatible",
       "settings": {
         "apiKey": "unneeded",
-        "baseURL": "http://100.88.232.146:3000/openai/v1/"
+        "baseURL": "http://set-opencode2-base-url.invalid/openai/v1/"
       },
       "models": {
         "tensorzero::function_name::lunarwing": {

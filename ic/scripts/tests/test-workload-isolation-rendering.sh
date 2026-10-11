@@ -171,6 +171,10 @@ assert_contains "OpenRC conf.d preserves rc_ulimit" "$daemon_confd" 'rc_ulimit="
 assert_contains "OpenRC conf.d preserves unrelated settings" "$daemon_confd" 'operator_setting="preserve-me"'
 
 tenant_proxy_enabled() { return 0; }
+# WI#330: the proxy unit renders the tenant's own TENSORZERO_URL from
+# proxy.env (never a fleet literal), so the fixture provides one.
+mkdir -p "$(tenant_env_dir t1)"
+printf 'TENSORZERO_URL=http://tz-fixture:3030/openai/v1\n' >"$(tenant_env_dir t1)/proxy.env"
 render_tenant_openrc_units t1
 assert_contains "OpenRC managed dependency updates" "$daemon_confd" 'lunarwing_rc_need="xmpp-bridge-t1 lunarwing-proxy-t1"'
 tenant_proxy_enabled() { return 1; }

@@ -14,7 +14,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "apiKey": "unneeded",
-        "baseURL": "http://192.168.1.157:3000/openai/v1/"
+        "baseURL": "http://set-opencode-base-url.invalid/openai/v1/"
       },
       "models": {
         "tensorzero::function_name::lunarwing": {

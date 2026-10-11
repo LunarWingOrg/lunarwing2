@@ -69,7 +69,11 @@ INSTALL_WATCHDOG=false             # Single-tenant watchdog; MT health pipeline 
 WATCHDOG_SCHEDULER="auto"
 
 # LLM
-TENSORZERO_URL="http://192.168.1.157:3000/openai/v1"
+# REQUIRED — no built-in default since WI#330 (the old default was a
+# developer-LAN address unreachable from any other host). Used as each
+# tenant's --llm-base-url and exported as LUNARWING_MT_TENSORZERO_URL; must be
+# reachable from worker containers (no host loopback, no overlay MagicDNS).
+TENSORZERO_URL=""
 
 # Gotify (notifications)
 GOTIFY_URL="https://gotify.darkc.sobe.world"
@@ -126,6 +130,8 @@ in_phase_range() {
 validate_config() {
   [[ -n "$TENANTS" ]] || die "TENANTS must be set"
   [[ -n "$GOTIFY_URL" ]] || die "GOTIFY_URL must be set"
+  # WI#330: mt-admin add-tenant now refuses to render an endpoint-less tenant.
+  [[ -n "$TENSORZERO_URL" ]] || die "TENSORZERO_URL must be set (no built-in default since WI#330)"
   [[ -f "$MT_ADMIN" ]] || die "mt-admin script not found at $MT_ADMIN"
 
   # Force OpenRC for this variant
