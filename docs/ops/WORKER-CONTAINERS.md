@@ -254,6 +254,12 @@ above applies unchanged; client/schema/protocol SDK changes in
 `7673ed6bd6547ee0dcb81aab55f1392fb751d652` are additive against the bridge's
 `@opencode/client/promise` usage. Whole-image reproducibility remains
 CI-verified per revision.
+(2026-10-11 correction, WI#329: this entry's "additive against the bridge's
+`@opencode/client/promise` usage" claim was checked against protocol
+identifier strings, not the generated promise client — the bridge then called
+`session.message.list` / `session.permission.reply`, which never existed on
+the promise client at v2.0.8 (WI#320 F7 observed the runtime TypeError at
+v2.0.21). Both call paths were corrected in the v2.0.23 entry below.)
 Bridge executor, result, workspace-path, build-profile, and study-notes tests
 passed; workspace cleanup was also checked with an injected assertion failure.
 Full image digest verification remains with CI: local Podman could not unpack
@@ -302,6 +308,13 @@ now preserves base-URL path prefixes and throws declared HTTP errors as
 calls. The new session metadata event and update field are additive to the
 bridge's session execution, message, and permission calls. Whole-image
 reproducibility must still pass the CI candidate-versus-clean-rebuild gate.
+(2026-10-11 correction, WI#329: this entry's "additive to the bridge's
+session execution, message, and permission calls" claim vouched for the
+bridge surface as checked against protocol identifier strings, not the
+generated promise client — the bridge then called `session.message.list` /
+`session.permission.reply`, which never existed on the promise client at
+v2.0.15 (WI#320 F7). Both call paths were corrected in the v2.0.23 entry
+below.)
 
 v2.0.17 bump (2026-09-26): tag SHA `04f4b0610c79e3692f3b91bd7e4489c2c7010e4b`
 verified against the anomalyco/opencode remote (this release's checklist item #2
@@ -357,7 +370,16 @@ asserted paths now come from the single committed list
 `opencode2.4lunarwing/scripts/sdk_surface.ts`, which the build gate runs as
 `scripts/sdk_surface_assert.ts` and which also drives the executor
 self-test's mock-parity check, so the two gates cannot diverge; the stale
-v2.0.11/v2.0.14/v2.0.20 bump entries carry dated WI#329 corrections.)
+v2.0.8/v2.0.11/v2.0.14/v2.0.15/v2.0.20 bump entries carry dated WI#329
+corrections. 2026-10-11, !1512 review CY-1/CY-2/CY-3/CY-5: the self-test now
+also binds the list to the executor itself — it extracts the real
+`sdk.*(...)` call sites and `event.type === "..."` literals from
+`opencode_task_executor.ts` and asserts set equality with
+`BRIDGE_SDK_METHODS`/`BRIDGE_SDK_EVENTS`, closing the F7-class gap where an
+unlisted swallowed call passed both gates; `mockMethodPaths` flattens at any
+nesting depth; and the build gate additionally asserts every bridge event
+name is still a literal in the pinned `@opencode` client/schema/protocol
+source shipped in the image.)
 
 Verified host-side with bun: the executor self-test passes against the real
 client shape and fails with the pre-fix executor; the build-time assertion
