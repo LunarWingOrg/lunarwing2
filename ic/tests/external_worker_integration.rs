@@ -46,7 +46,9 @@ use uuid::Uuid;
 use lunarwing::channels::web::types::SseEvent;
 use lunarwing::config::{ExternalWorkerConfig, LoadBalanceStrategy, WorkerEndpoint};
 use lunarwing::context::{ContextManager, JobContext, JobState};
+#[cfg(feature = "libsql")]
 use lunarwing::db::Database;
+#[cfg(feature = "libsql")]
 use lunarwing::db::libsql::LibSqlBackend;
 use lunarwing::error::OrchestratorError;
 use lunarwing::hooks::HookRegistry;
@@ -55,7 +57,10 @@ use lunarwing::orchestrator::external_worker::{
     ConversationMessage, ExternalTaskStatus, SUBPROTOCOL, TaskContext, ToolProxy,
 };
 use lunarwing::tools::Tool;
-use lunarwing::tools::builtin::{CreateJobTool, MemoryReadTool, MemoryWriteTool};
+use lunarwing::tools::builtin::CreateJobTool;
+#[cfg(feature = "libsql")]
+use lunarwing::tools::builtin::{MemoryReadTool, MemoryWriteTool};
+#[cfg(feature = "libsql")]
 use lunarwing::workspace::Workspace;
 
 /// How long we wait for any single test assertion before declaring the test
@@ -2300,7 +2305,9 @@ impl Tool for GateProbeTool {
 }
 
 /// A migrated libSQL store in a tempdir, for store-backed event/permission
-/// assertions.
+/// assertions. libSQL-only: the proxy gate tests persist through the shared
+/// `Database` trait, and this is the in-process backend available to tests.
+#[cfg(feature = "libsql")]
 async fn test_db() -> (Arc<dyn Database>, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let backend = LibSqlBackend::new_local(&temp_dir.path().join("proxy_gate_test.db"))
@@ -2523,6 +2530,7 @@ async fn tool_call_denylisted_allowlist_entry_never_executes() {
     assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(feature = "libsql")]
 #[tokio::test]
 async fn tool_call_disabled_permission_is_denied() {
     // MR !1506 review (CQ-1): a user who set a tool to Disabled must not have
@@ -2568,6 +2576,7 @@ async fn tool_call_disabled_permission_is_denied() {
     assert!(probe.seen.lock().expect("probe lock").is_empty());
 }
 
+#[cfg(feature = "libsql")]
 #[tokio::test]
 async fn proxied_calls_persist_canonical_tool_events() {
     // MR !1506 review (CQ-4, WI#324 AC4): every proxied call appears in
@@ -2741,6 +2750,7 @@ async fn tool_call_rejected_for_terminal_job() {
     assert!(probe.seen.lock().expect("probe lock").is_empty());
 }
 
+#[cfg(feature = "libsql")]
 #[tokio::test]
 async fn memory_write_read_roundtrip_and_mission_path_guard() {
     // WI#324 AC1: a worker job can call memory_write + memory_read and
