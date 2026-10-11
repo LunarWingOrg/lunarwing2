@@ -18,14 +18,14 @@ use crate::tools::builder::{
     BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder, SoftwareBuilder,
 };
 use crate::tools::builtin::{
-    ApplyPatchTool, AttachmentStoreTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool,
-    HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, KnowledgeGetTopicTool,
-    KnowledgeListStaleTool, KnowledgeListTopicsTool, KnowledgeSearchTool, KnowledgeStatsTool,
-    KnowledgeSubmitNoteTool, KnowledgeUpdateStatusTool, ListDirTool, ListJobsTool, MemoryReadTool,
-    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool,
-    SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool,
-    ToolAuthTool, ToolDeactivateTool, ToolInstallTool, ToolListTool, ToolRemoveTool,
-    ToolSearchTool, ToolUpdateTool, ToolUpgradeTool, WriteFileTool,
+    ApplyPatchTool, AttachmentStoreTool, CancelJobTool, CreateJobTool, CronMissionTool, EchoTool,
+    ExtensionInfoTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
+    KnowledgeGetTopicTool, KnowledgeListStaleTool, KnowledgeListTopicsTool, KnowledgeSearchTool,
+    KnowledgeStatsTool, KnowledgeSubmitNoteTool, KnowledgeUpdateStatusTool, ListDirTool,
+    ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue,
+    ReadFileTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool,
+    TimeTool, ToolActivateTool, ToolAuthTool, ToolDeactivateTool, ToolInstallTool, ToolListTool,
+    ToolRemoveTool, ToolSearchTool, ToolUpdateTool, ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
@@ -685,7 +685,9 @@ impl ToolRegistry {
             cancel_tool = cancel_tool.with_sandbox(jm, store_for_cancel);
         }
         if let Some(ewm) = ewm_for_cancel {
-            cancel_tool = cancel_tool.with_external_workers(ewm);
+            cancel_tool = cancel_tool.with_external_workers(Arc::clone(&ewm));
+            // WI#325: owner-gated runtime control for cron-mode missions.
+            self.register_sync(Arc::new(CronMissionTool::new(ewm)));
         }
         if let Some(cancel_store) = store.clone() {
             cancel_tool = cancel_tool.with_store(cancel_store);
