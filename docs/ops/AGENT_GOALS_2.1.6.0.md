@@ -39,13 +39,22 @@
     - Empty-ignore control run: `ic` flags exactly the 9 accepted IDs, `xmpp-bridge` the 6 webpki/h2/rsa ones — nothing unaccounted. Exposure re-verified with `cargo tree --locked` across feature sets (postgres-only lacks webpki 0.102.8/h2 0.3.27, still has rsa+failure; rental only in all-features).
     - Pointers updated: `.gitlab/README.md:281`, `docs/ops/README.md`. No files moved; v2.1.5.0 audit stays in place.
     - Note: `.gitlab/tests` unittest discovery shows 17 pre-existing failures (test_cargo_deny_gate / test_lockfile_only_advisory_guard / test_rust_bootstrap shell harnesses) on this dev VM — reproduced identically on untouched base `a05bd7ac8`; unrelated to this item (docs + deny.toml text only).
-    - Clearing the accepted advisories themselves is **not** part of this item: owned by WI#331 (goals item 11, still `[ ]`).
+    - Clearing the accepted advisories themselves is **not** part of this item: owned by WI#331 (goals item 11, still `[ ]`)
 4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/298 - Brightdawn confirmed close now
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1506
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1509
-7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1510
-8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1508
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1512
+5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/324 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1521
+6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1522
+7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/326 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1524
+8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/328 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1525
+9. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/329 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1512
+    - DONE 2026-10-11 (item-9, branch `sweetiebot/kimi-9-20261011-0005`), re-attempt of the closed MR !1512 (review run-58 verdict "APPROVE WITH NITS"; all findings CY-1..CY-6 addressed in-tree).
+    - The six !1512 implementation commits are re-applied (now authored under the lane identity — CY-6): WI#329 fix item (2) single committed list `opencode2.4lunarwing/scripts/sdk_surface.ts` driving both gates, fix item (3) dated WORKER-CONTAINERS corrections (v2.0.11/v2.0.14/v2.0.20) plus AGENTS.md key-file entry, the Dockerfile RUN of `sdk_surface_assert.ts` in place of the inline `bun -e` check, and the self-test mock-parity block. WI#329 fix item (1) was already on the target branch (f3fdc0437/28b75debe): the executor calls top-level `sdk.message.list` with `.data` unwrap and server-contract paging.
+    - **CY-1 (Medium, required before WI#329 close):** the self-test now extracts the executor's real `sdk.*(...)` call sites from source (any depth, multi-line aware) and asserts set equality with `BRIDGE_SDK_METHODS`; the reviewer's mutation (a swallowed `sdk.session.summarize` call) now fails the suite, and the overclaiming parity comment was rewritten to describe the actual three-way binding (list ⇔ mock ⇔ executor source ⇔ pinned client via the build gate).
+    - **CY-2 (Low):** `BRIDGE_SDK_EVENTS` added (8 `event.type` literals the bridge matches); the self-test binds it to the executor source, and `sdk_surface_assert.ts` additionally asserts each name is still a literal in the pinned `@opencode` client/schema/protocol source shipped in the image (dirs derived from the resolved promise entry; `SDK_SURFACE_SOURCE_DIRS` override for host runs), so an upstream event rename fails the image build instead of hanging tasks at runtime.
+    - **CY-3 (Low):** `mockMethodPaths` flattens recursively at any nesting depth.
+    - **CY-4 (Info):** goals/provenance wording corrected to "recorded" — `promote-worker-image.py` only checks the manifest has hash lines and a matching `source_sha`; the opencode2 `input_files` manifest now also records the build-executed `opencode_task_executor.ts` and `opencode_task_executor_test.ts` alongside the previously listed inputs (hashed into `worker-inputs.sha256`, recorded at promotion).
+    - **CY-5 (Info):** dated WI#329 corrections added to the v2.0.8 and v2.0.15 WORKER-CONTAINERS bump entries (the remaining two that vouched for the broken surface); the v2.0.23 entry's WI#329 follow-up records these !1512 fixes.
+    - Verification (host-side, bun 1.3.1): all 4 TS self-tests pass (`opencode_task_executor_test.ts` incl. the new call-site/event bindings, path_expand, opencode_result, task_prompt); `sdk_surface_assert.ts` passes against the REAL pinned v2.0.24 client source (sparse clone at OPENCODE_REF `e7a34f09bfd9134dfade5a8ddb843f7030bc9a69`: 6 methods present, 2 stale absent, 8 event literals present) and fails closed on a missing method path, an event literal renamed in all shipped source copies, and an unreadable source dir; CY-1/CY-2 extraction mutations both caught; `prepare_reproducible_build_test.py` and `study_notes_config_test.py` OK; `bash -n` clean; `.gitlab/tests/test_goal1_ci.py` 15/15 OK. The whole-image candidate build remains the protected-pipeline gate (no MR-pipeline job runs bun or the worker image build), unchanged from !1512.
+    - Note: opencode2 stays pinned at v2.0.24 in this lane — the v2.0.26 bump is gated off per checklist item #2 (WI#357) and was not pulled in.
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/330 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1511
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331 - last attempt rejected (see comments in closed MR and address if necessary) https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1513
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/332
@@ -67,8 +76,8 @@
 25. [x] (S) (H MR) release alpha of droid and desk repo projs
 26. [x] (S) RESERVED
 27. [x] (S) RESERVED
-28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5426 for latest master pipeline run and see if anything is not GREEN
-29. [x] (S) RESERVED
+28. [ ] fix issues in CI/CD (if any) - See Pipeline number 5437 for latest master pipeline run and see if anything is not GREEN
+29. [x] (S) (H) MASCOT ANIMS
 30. [x] (S) RESERVED
 31. [x] (S) RESERVED
 32. [x] (S) RESERVED
