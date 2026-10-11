@@ -726,7 +726,13 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
             // Check if tool requires approval
             if let Some(tool) = tool_opt {
-                let requirement = tool.requires_approval(&tc.arguments);
+                // DH-1: evaluate approval on the SAME schema-coerced params
+                // execution will use — otherwise `"true"` / stringified-object
+                // args slip past capability elevation (`scheduler.rs` already
+                // does this).
+                let normalized_arguments =
+                    crate::tools::prepare_tool_params(tool.as_ref(), &tc.arguments);
+                let requirement = tool.requires_approval(&normalized_arguments);
                 if requirement.is_required() && self.message.is_shared_conversation() {
                     tracing::info!(
                         tool = %tc.name,
@@ -741,7 +747,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     preflight.push((tc, PreflightOutcome::Rejected(reject_msg)));
                     continue;
                 }
-                let allow_always = tool.allows_always_approval(&tc.arguments)
+                let allow_always = tool.allows_always_approval(&normalized_arguments)
                     && !(matches!(tc.name.as_str(), "gitlab_tool" | "gitlab-tool")
                         && crate::tools::permissions::gitlab_permission_alias_conflict(
                             &self.agent.deps.tools,

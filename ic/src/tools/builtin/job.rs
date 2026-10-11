@@ -380,6 +380,22 @@ fn has_harness_params(params: &serde_json::Value) -> bool {
         || params.get("write_back").is_some()
 }
 
+/// DH-1: presence-based capability check for approval elevation. Approval
+/// may run on RAW params while execution uses schema-coerced params
+/// (`"true"` → `true`, a JSON string → object), so any non-inert shape must
+/// elevate. `inert_empty_object` marks `{}` as inert for map-typed params
+/// (`worker_secrets: {}` mounts nothing); `write_back: {}` is NOT inert — it
+/// enables the default policy at execution.
+fn harness_capability_active(value: &serde_json::Value, inert_empty_object: bool) -> bool {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(false) => false,
+        serde_json::Value::Object(obj) => !(inert_empty_object && obj.is_empty()),
+        // Strings, numbers, arrays, `true`, non-empty objects: coercion may
+        // activate the capability at execution — elevate.
+        _ => true,
+    }
+}
+
 /// Append harness mount instructions to the worker task prompt so the
 /// sub-agent knows about the injected files, secrets, and write-back staging.
 fn harness_task_prompt(task: &str, request: &HarnessJobRequest) -> String {
@@ -2140,19 +2156,24 @@ impl Tool for CreateJobTool {
         // and identity injection / secret mounts must be explicitly approved.
         // The approval prompt renders the params, which carry the resolved
         // (narrowed) write-back roots and the mounted secret names.
+        //
+        // DH-1: approval can be evaluated on RAW params while execution uses
+        // schema-coerced params (`"true"` → true, a JSON string → object).
+        // Elevate whenever a capability key is present in ANY shape coercion
+        // could activate; only the literal inert forms stay at the default
+        // tier. (The dispatchers also normalize before calling this — both
+        // layers agree by construction.)
         if params.get("mode").and_then(|v| v.as_str()) == Some("harness") {
             let has_secrets = params
                 .get("worker_secrets")
-                .and_then(|v| v.as_object())
-                .is_some_and(|obj| !obj.is_empty());
+                .is_some_and(|v| harness_capability_active(v, true));
             let has_identity_injection = params
                 .get("allow_identity_injection")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .is_some_and(|v| harness_capability_active(v, false));
             // write_back: true or an options object both enable promotion.
             let has_write_back = params
                 .get("write_back")
-                .is_some_and(|v| v.as_bool().unwrap_or(true));
+                .is_some_and(|v| harness_capability_active(v, false));
             if has_secrets || has_identity_injection || has_write_back {
                 return ApprovalRequirement::Always;
             }
@@ -4221,6 +4242,12 @@ mod tests {
             serde_json::json!({"write_back": true}),
             serde_json::json!({"write_back": {"max_files": 1}}),
             serde_json::json!({"allow_identity_injection": true}),
+            // DH-1: string-typed shapes that schema coercion ACTIVATES at
+            // execution must elevate on raw params too.
+            serde_json::json!({"allow_identity_injection": "true"}),
+            serde_json::json!({"worker_secrets": "{\"tok\":\"TOKEN\"}"}),
+            // write_back: {} enables the default policy at execution.
+            serde_json::json!({"write_back": {}}),
         ] {
             let mut params = base.clone();
             params
@@ -4233,15 +4260,26 @@ mod tests {
                 "{params}"
             );
         }
-        // write_back: false keeps the default tier.
-        let mut off = base.clone();
-        off.as_object_mut()
-            .unwrap() // safety: test
-            .insert("write_back".to_string(), serde_json::json!(false));
-        assert_eq!(
-            tool.requires_approval(&off),
-            ApprovalRequirement::UnlessAutoApproved
-        );
+        // Inert forms keep the default tier: write_back: false,
+        // allow_identity_injection: false, worker_secrets: {} (mounts
+        // nothing even after coercion).
+        for extra in [
+            serde_json::json!({"write_back": false}),
+            serde_json::json!({"allow_identity_injection": false}),
+            serde_json::json!({"worker_secrets": {}}),
+            serde_json::json!({"worker_secrets": null}),
+        ] {
+            let mut params = base.clone();
+            params
+                .as_object_mut()
+                .unwrap() // safety: test
+                .extend(extra.as_object().unwrap().clone()); // safety: test
+            assert_eq!(
+                tool.requires_approval(&params),
+                ApprovalRequirement::UnlessAutoApproved,
+                "{params}"
+            );
+        }
         // Non-harness modes never elevate through these params here.
         let worker = serde_json::json!({"title": "t", "description": "d", "mode": "worker"});
         assert_eq!(
