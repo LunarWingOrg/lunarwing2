@@ -12,14 +12,18 @@
  * Imported by:
  *  - scripts/sdk_surface_assert.ts — the image-build gate: constructs the
  *    real client against a dummy base URL (no server contact) and asserts
- *    typeof for every path below, so SDK drift fails the build, not the
- *    runtime.
+ *    typeof for every path below, plus asserts every BRIDGE_SDK_EVENTS name
+ *    is present as a literal in the pinned client/schema source, so SDK
+ *    drift fails the build, not the runtime.
  *  - scripts/opencode_task_executor_test.ts — asserts the injected mock
- *    implements EXACTLY this surface (both directions), so the mock cannot
- *    drift from the surface the build gate verified.
+ *    implements EXACTLY this surface (both directions) AND that the
+ *    executor source's real `sdk.*(...)` call sites and
+ *    `event.type === "..."` literals match these lists, so a bridge call
+ *    added without updating this file fails the suite instead of drifting
+ *    past the gates the way WI#320 F7 did.
  *
- * When the bridge starts calling a new client method, add its path here once
- * and both gates cover it.
+ * When the bridge starts calling a new client method or matching a new
+ * event name, add its path here once and every gate covers it.
  */
 
 /** Dotted method paths the bridge calls on the promise client. */
@@ -46,6 +50,26 @@ export const STALE_SDK_METHODS = [
   "session.permission.reply",
 ] as const
 
+/**
+ * SSE event `type` literals the bridge matches on. Completion detection
+ * depends on session.execution.{succeeded,failed,interrupted} / session.idle
+ * and permission handling on permission.asked, so an upstream rename would
+ * hang every task or stall permissions — the build gate asserts each name is
+ * still a literal in the pinned client/schema source (WI#329, !1512 CY-2).
+ */
+export const BRIDGE_SDK_EVENTS = [
+  "permission.asked",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.execution.succeeded",
+  "session.idle",
+  "session.text.delta",
+  "session.tool.failed",
+  "session.tool.success",
+] as const
+
+export type BridgeSdkEvent = (typeof BRIDGE_SDK_EVENTS)[number]
+
 /** Resolve a dotted path ("message.list") on a nested object. */
 export function resolveMethod(root: unknown, path: string): unknown {
   let current = root
@@ -56,14 +80,56 @@ export function resolveMethod(root: unknown, path: string): unknown {
   return current
 }
 
-/** Flatten a nested method mock into sorted dotted paths ("session.create", ...). */
+/** Flatten a nested method mock into sorted dotted paths, any depth ("session.message.get", ...). */
 export function mockMethodPaths(mock: object): string[] {
   const paths: string[] = []
-  for (const [group, methods] of Object.entries(mock)) {
-    if (methods === null || typeof methods !== "object") continue
-    for (const [name, fn] of Object.entries(methods as Record<string, unknown>)) {
-      if (typeof fn === "function") paths.push(`${group}.${name}`)
+  const walk = (node: unknown, prefix: string) => {
+    if (node === null || typeof node !== "object") return
+    for (const [name, value] of Object.entries(node as Record<string, unknown>)) {
+      const path = prefix ? `${prefix}.${name}` : name
+      if (typeof value === "function") paths.push(path)
+      else walk(value, path)
     }
   }
+  walk(mock, "")
   return paths.sort()
+}
+
+/**
+ * Extract every `sdk.<seg>.<seg>...(…)` call path from bridge source, any
+ * depth, multi-line aware ("sdk.session\n  .interrupt(" binds). This is what
+ * ties BRIDGE_SDK_METHODS to the executor's real call sites: the self-test
+ * asserts set equality, so an unlisted bridge call fails the suite (WI#329,
+ * !1512 CY-1).
+ */
+export function extractSdkCallPaths(source: string): string[] {
+  const paths = new Set<string>()
+  const pattern = /\bsdk((?:\s*\.\s*[A-Za-z_$][\w$]*)+)\s*\(/g
+  for (const match of source.matchAll(pattern)) {
+    const captured = match[1]
+    if (!captured) continue
+    paths.add(
+      captured
+        .split(".")
+        .map((segment) => segment.trim())
+        .filter((segment) => segment.length > 0)
+        .join("."),
+    )
+  }
+  return [...paths].sort()
+}
+
+/**
+ * Extract every `event.type === "<name>"` literal from bridge source. Ties
+ * BRIDGE_SDK_EVENTS to the executor's real event matches the same way
+ * extractSdkCallPaths ties the method list (!1512 CY-2).
+ */
+export function extractEventTypes(source: string): string[] {
+  const names = new Set<string>()
+  const pattern = /\bevent\s*\.\s*type\s*===\s*"([^"]+)"/g
+  for (const match of source.matchAll(pattern)) {
+    const captured = match[1]
+    if (captured) names.add(captured)
+  }
+  return [...names].sort()
 }
