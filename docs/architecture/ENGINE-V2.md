@@ -580,6 +580,17 @@ resolved request IDs cannot be resurrected by stale responses. Engine startup
 unavailability and transient recovery failures are retried. Authentication is by
 bearer header (query-token fallback is reserved for streaming routes).
 
+Listed gates are filtered by live thread state (WI#332): a gate is only
+returned while its owning thread exists, is still `Waiting`, and belongs to the
+gate's user — the same validity rule boot-time reconciliation enforces. The
+60-second pending-gate sweep additionally discards gates whose thread
+terminated outside the gate path (previously they lingered until expiry or
+restart), logs each discard at warn level with user/thread/request ids, and
+broadcasts `gate_resolved` with resolution `thread_terminated` so open approval
+prompts clear. Approvals on engine-routed channels that match no engine gate
+fall through to the legacy path with a warn-level log naming the request id and
+thread scope, so an unmatched approval is diagnosable from logs.
+
 Recovered authentication controls send both `request_id` and `thread_id` to
 `POST /api/chat/auth-token` and `POST /api/chat/auth-cancel`. The pair is optional
 for legacy clients, but an explicitly supplied pair must match a live auth gate
