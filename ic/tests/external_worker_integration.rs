@@ -2288,9 +2288,7 @@ async fn control_channel_persists_delivery_and_ack_rows() {
         "missing enqueued row, got: {prompt_rows:?}"
     );
     assert!(
-        prompt_rows
-            .iter()
-            .any(|c| *c == "delivered seq=1 done=false"),
+        prompt_rows.contains(&"delivered seq=1 done=false"),
         "missing delivered row, got: {prompt_rows:?}"
     );
     let ack_rows: Vec<&str> = events
