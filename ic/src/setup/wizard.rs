@@ -1003,8 +1003,11 @@ impl SetupWizard {
             {
                 let _ = (url, token);
                 return Err(SetupError::Database(
-                    "libSQL remote replicas (Turso sync) are disabled in this build; rebuild \
-                     with the cargo feature `libsql-remote-replica` or unset LIBSQL_URL (WI#331)"
+                    "libSQL remote replicas (Turso sync) are disabled in this build (WI#331). \
+                     Rebuild with the cargo feature `libsql-remote-replica` to keep Turso sync. \
+                     Unsetting LIBSQL_URL instead is NOT a safe fallback: the existing replica \
+                     file becomes a diverging standalone database whose writes never reach the \
+                     Turso primary."
                         .to_string(),
                 ));
             }
@@ -3534,6 +3537,70 @@ mod tests {
 
     use super::*;
     use crate::config::helpers::lock_env;
+
+    /// WI#331 / MR !1513 review CZ-3: build a wizard without touching
+    /// bootstrap settings or instance assets.
+    #[cfg(all(feature = "libsql", not(feature = "libsql-remote-replica")))]
+    fn bare_wizard_for_fail_closed_tests() -> SetupWizard {
+        SetupWizard {
+            config: SetupConfig::default(),
+            settings: Settings::default(),
+            owner_id: "test".to_string(),
+            session_manager: None,
+            #[cfg(feature = "postgres")]
+            db_pool: None,
+            db_backend: None,
+            secrets_crypto: None,
+            llm_api_key: None,
+        }
+    }
+
+    /// WI#331 / MR !1513 review CZ-3: without the `libsql-remote-replica`
+    /// feature, a configured Turso remote replica must fail closed and name
+    /// the cargo feature — never silently fall back to a local-only database
+    /// (that fallback is the data-divergence failure this gate exists to
+    /// prevent).
+    #[tokio::test]
+    #[cfg(all(feature = "libsql", not(feature = "libsql-remote-replica")))]
+    async fn libsql_remote_replica_configured_fails_closed_without_feature() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("replica.db").to_string_lossy().to_string();
+        let mut wizard = bare_wizard_for_fail_closed_tests();
+
+        let result = wizard
+            .test_database_connection_libsql(
+                &db_path,
+                Some("libsql://example.turso.io"),
+                Some("test-token"),
+            )
+            .await;
+
+        let err = result.expect_err("remote replica config must fail without the feature");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("libsql-remote-replica"),
+            "error must name the cargo feature, got: {msg}"
+        );
+        assert!(wizard.db_backend.is_none());
+    }
+
+    /// WI#331 / MR !1513 review CZ-3: a local-only configuration (no
+    /// LIBSQL_URL) must still open a local database in builds without the
+    /// feature.
+    #[tokio::test]
+    #[cfg(all(feature = "libsql", not(feature = "libsql-remote-replica")))]
+    async fn libsql_local_only_opens_local_database_without_feature() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("local.db").to_string_lossy().to_string();
+        let mut wizard = bare_wizard_for_fail_closed_tests();
+
+        wizard
+            .test_database_connection_libsql(&db_path, None, Some("ignored-token"))
+            .await
+            .expect("local-only config must still open a local database");
+
+        assert!(wizard.db_backend.is_some());
+    }
 
     #[test]
     #[cfg(feature = "libsql")]

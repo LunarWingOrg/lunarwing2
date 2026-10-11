@@ -293,7 +293,10 @@ Both features compiled?
 
 **libSQL path:**
 1. Offer local path (default: `~/.lunarwing/lunarwing.db`)
-2. Optional Turso cloud sync (URL + auth token)
+2. Optional Turso cloud sync (URL + auth token) — only offered in builds with
+   the non-default `libsql-remote-replica` cargo feature (WI#331); without
+   the feature the prompt is skipped, and a Turso URL arriving via
+   `LIBSQL_URL` fails the connection test closed (no silent local fallback)
 3. Test connection via `connect_without_migrations()`
 4. Always run migrations (idempotent CREATE IF NOT EXISTS)
 
