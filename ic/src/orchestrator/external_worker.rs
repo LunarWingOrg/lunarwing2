@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -14,7 +14,7 @@ use futures::{SinkExt, StreamExt};
 pub use lunarwing_common::PromptContextMessage as ConversationMessage;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use uuid::Uuid;
 
 use crate::channels::web::types::SseEvent;
@@ -171,6 +171,37 @@ struct TaskResultPayload {
     duration_ms: u64,
 }
 
+// ── Runtime control channel (WI#328) ────────────────────────────────
+
+/// Maximum length of a single control-channel prompt (16 KiB). The channel
+/// carries TEXT directives only — validation happens daemon-side before
+/// enqueue so worker bridges never have to defend against unbounded frames.
+pub const MAX_CONTROL_PROMPT_LEN: usize = 16 * 1024;
+
+/// A queued runtime-control message for a RUNNING external worker task
+/// (WI#328). Mirrors `job_prompt` semantics: `prompt` is the follow-up
+/// instruction text, `done` signals "no more prompts coming, wrap up
+/// cleanly", and `seq` gives monotonic per-job ordering so workers can
+/// dedupe on at-least-once redelivery.
+#[derive(Debug, Clone)]
+pub struct ControlPrompt {
+    pub seq: u64,
+    pub prompt: String,
+    pub done: bool,
+}
+
+/// Worker's receipt for a delivered control prompt (`task_prompt_ack`).
+#[derive(Debug, Deserialize)]
+struct TaskPromptAckPayload {
+    task_id: String,
+    seq: u64,
+    /// Whether the worker accepted the prompt (vs. dropping it, e.g. because
+    /// the task was already wrapping up). Informational only — the ack
+    /// itself is the delivery receipt.
+    #[allow(dead_code)]
+    accepted: Option<bool>,
+}
+
 // ── External job handle ─────────────────────────────────────────────
 
 /// Handle to a running external worker task.
@@ -178,10 +209,32 @@ pub struct ExternalJobHandle {
     pub job_id: Uuid,
     pub worker_name: String,
     cancel_tx: watch::Sender<bool>,
+    /// Daemon → running-task control queue (WI#328). The receiver is taken
+    /// by `execute_task` and drained inside the task's WebSocket read loop,
+    /// so prompts enqueued while the worker is mid-turn are delivered on
+    /// the next loop cycle — never mid-frame.
+    prompt_tx: mpsc::UnboundedSender<ControlPrompt>,
+    prompt_rx: Option<mpsc::UnboundedReceiver<ControlPrompt>>,
+    /// Next control-message sequence number (1-based, monotonic per job).
+    next_seq: AtomicU64,
     started: bool,
 }
 
 impl ExternalJobHandle {
+    fn new(job_id: Uuid, worker_name: String) -> Self {
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
+        Self {
+            job_id,
+            worker_name,
+            cancel_tx,
+            prompt_tx,
+            prompt_rx: Some(prompt_rx),
+            next_seq: AtomicU64::new(0),
+            started: false,
+        }
+    }
+
     pub fn cancel(&self) {
         self.cancel_tx.send_replace(true);
     }
@@ -295,15 +348,9 @@ impl ExternalWorkerManager {
                 job_id,
             });
         }
-        let (cancel_tx, _cancel_rx) = watch::channel(false);
         handles.insert(
             job_id,
-            ExternalJobHandle {
-                job_id,
-                worker_name: worker_name.to_string(),
-                cancel_tx,
-                started: false,
-            },
+            ExternalJobHandle::new(job_id, worker_name.to_string()),
         );
         Ok(())
     }
@@ -314,6 +361,83 @@ impl ExternalWorkerManager {
         if handles.get(&job_id).is_some_and(|handle| !handle.started) {
             handles.remove(&job_id);
         }
+    }
+
+    /// Queue a runtime control prompt for a RUNNING external job (WI#328).
+    ///
+    /// The prompt is validated here (daemon side — text directives only, no
+    /// shell/exec passthrough), assigned a monotonic per-job `seq`, and held
+    /// in the job's control queue until the task's WebSocket read loop
+    /// delivers it as a `task_prompt` envelope. Delivery is at-least-once:
+    /// the worker acks with `task_prompt_ack`, and enqueue/deliver/ack all
+    /// land in the job event log for an auditable control history.
+    ///
+    /// Follow-up prompts do NOT extend the job's timeout/fuel budget — the
+    /// task's existing deadline still applies (budget extension must be an
+    /// explicit future directive, not implicit in prompting).
+    ///
+    /// Returns the assigned sequence number.
+    pub async fn send_prompt(
+        &self,
+        job_id: Uuid,
+        user_id: &str,
+        content: &str,
+        done: bool,
+    ) -> Result<u64, OrchestratorError> {
+        let not_active = |reason: &str| OrchestratorError::ExternalWorkerTaskNotActive {
+            job_id,
+            reason: reason.to_string(),
+        };
+
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err(not_active("prompt content is empty"));
+        }
+        if trimmed.len() > MAX_CONTROL_PROMPT_LEN {
+            return Err(not_active("prompt exceeds 16 KiB control-channel limit"));
+        }
+        if trimmed.contains('\0') {
+            return Err(not_active(
+                "prompt contains NUL bytes; text directives only",
+            ));
+        }
+
+        let handles = self.active_handles.read().await;
+        let handle = handles
+            .get(&job_id)
+            .ok_or_else(|| not_active("no active external task with this job id"))?;
+
+        let seq = handle.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let prompt = ControlPrompt {
+            seq,
+            prompt: trimmed.to_string(),
+            done,
+        };
+        handle
+            .prompt_tx
+            .send(prompt)
+            .map_err(|_| not_active("task already finished; control queue closed"))?;
+        drop(handles);
+
+        // Observability (WI#328): every enqueue lands in the job event log.
+        persist_event(
+            self.store.as_ref(),
+            job_id,
+            "control_prompt",
+            &format!("enqueued seq={seq} done={done}"),
+        )
+        .await;
+        emit_event(
+            self.job_event_tx.as_ref(),
+            job_id,
+            user_id,
+            SseEvent::JobStatus {
+                job_id: job_id.to_string(),
+                message: format!("Control prompt seq={seq} queued for external worker"),
+            },
+        );
+
+        Ok(seq)
     }
 
     /// Execute a task on a named external worker.
@@ -363,7 +487,7 @@ impl ExternalWorkerManager {
         let active_handles = Arc::clone(&self.active_handles);
         let pool = Arc::clone(&self.pool);
 
-        let cancel_rx = {
+        let (cancel_rx, prompt_rx) = {
             let mut handles = active_handles.write().await;
             if let Some(handle) = handles.get_mut(&job_id) {
                 if handle.started {
@@ -373,19 +497,29 @@ impl ExternalWorkerManager {
                     });
                 }
                 handle.started = true;
-                handle.cancel_tx.subscribe()
+                // Take the control-queue receiver for the read loop. It is
+                // always Some on a fresh reservation; if it was somehow
+                // consumed already, rebuild the channel so enqueued prompts
+                // can never silently black-hole.
+                let prompt_rx = match handle.prompt_rx.take() {
+                    Some(rx) => rx,
+                    None => {
+                        let (tx, rx) = mpsc::unbounded_channel();
+                        handle.prompt_tx = tx;
+                        rx
+                    }
+                };
+                (handle.cancel_tx.subscribe(), prompt_rx)
             } else {
-                let (cancel_tx, cancel_rx) = watch::channel(false);
-                handles.insert(
-                    job_id,
-                    ExternalJobHandle {
-                        job_id,
-                        worker_name: worker_name_owned.clone(),
-                        cancel_tx,
-                        started: true,
-                    },
-                );
-                cancel_rx
+                let mut handle = ExternalJobHandle::new(job_id, worker_name_owned.clone());
+                handle.started = true;
+                let cancel_rx = handle.cancel_tx.subscribe();
+                let prompt_rx = match handle.prompt_rx.take() {
+                    Some(rx) => rx,
+                    None => unreachable!("fresh handle always carries prompt_rx"),
+                };
+                handles.insert(job_id, handle);
+                (cancel_rx, prompt_rx)
             }
         };
 
@@ -418,6 +552,7 @@ impl ExternalWorkerManager {
             };
 
             let mut failed_urls: Vec<String> = Vec::new();
+            let mut prompt_rx = prompt_rx;
 
             for attempt in 0..max_attempts {
                 let attempt_lease = lb.map(|lb| {
@@ -451,6 +586,7 @@ impl ExternalWorkerManager {
                     context.clone(),
                     &pool,
                     &attempt_pool_key,
+                    &mut prompt_rx,
                 )
                 .await;
 
@@ -496,6 +632,7 @@ impl ExternalWorkerManager {
                 // count (LeastConnections accounting) stays accurate until the
                 // task finishes; it decrements when _lease drops at block end.
                 let _lease = lease;
+                let mut prompt_rx = prompt_rx;
                 let result = run_external_task(
                     job_id,
                     &url,
@@ -510,6 +647,7 @@ impl ExternalWorkerManager {
                     context,
                     &pool,
                     &pool_key,
+                    &mut prompt_rx,
                 )
                 .await;
 
@@ -829,6 +967,11 @@ type WsRead = futures::stream::SplitStream<WsStream>;
 
 const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bound on a single `task_prompt` control-channel write (WI#328). Same
+/// rationale as `CANCEL_SEND_TIMEOUT`: a wedged socket must not stall the
+/// task read loop.
+const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long the daemon waits for a worker's terminal frame (`task_result` for
 /// the cancelled job) or socket close after sending a `cancel` envelope before
 /// tearing the connection down (WI#149). Workers that received the WI#101
@@ -1106,6 +1249,7 @@ async fn run_external_task(
     context: TaskContext,
     pool: &WorkerConnectionPool,
     pool_key: &str,
+    prompt_rx: &mut mpsc::UnboundedReceiver<ControlPrompt>,
 ) -> Result<ExternalTaskResult, OrchestratorError> {
     use tokio_tungstenite::tungstenite;
 
@@ -1333,10 +1477,42 @@ async fn run_external_task(
                             });
                         }
                         "pong" => {}
+                        "task_prompt_ack" => {
+                            // WI#328: worker receipt for a delivered control
+                            // prompt — the ack half of at-least-once delivery.
+                            // Acks for other task ids or malformed payloads
+                            // are ignored (older workers never send these).
+                            if let Ok(ack) =
+                                serde_json::from_value::<TaskPromptAckPayload>(env.payload)
+                                && ack.task_id == job_id.to_string()
+                            {
+                                persist_event(
+                                    store,
+                                    job_id,
+                                    "control_ack",
+                                    &format!("seq={}", ack.seq),
+                                )
+                                .await;
+                            }
+                        }
                         other => {
                             tracing::debug!("Unknown message type '{}' from '{}'", other, worker_name);
                         }
                     }
+                }
+                Some(control) = prompt_rx.recv() => {
+                    // WI#328 runtime control channel: deliver the next queued
+                    // follow-up prompt/directive as a `task_prompt` envelope.
+                    // Prompts enqueued while the worker is mid-turn wait here
+                    // until this loop cycles — no mid-frame injection.
+                    deliver_control_prompt(&mut write, job_id, worker_name, &control).await?;
+                    persist_event(
+                        store,
+                        job_id,
+                        "control_prompt",
+                        &format!("delivered seq={} done={}", control.seq, control.done),
+                    )
+                    .await;
                 }
                 _ = wait_for_cancellation(&mut cancel_rx) => {
                     send_cancel_envelope(&mut write, job_id).await;
@@ -1586,6 +1762,47 @@ async fn send_cancel_envelope(write: &mut WsWrite, job_id: Uuid) {
     {
         tracing::warn!(%job_id, "Timed out sending external worker cancellation");
     }
+}
+
+/// Deliver one queued control prompt to the worker as a `task_prompt`
+/// envelope (WI#328). The channel carries TEXT directives only; content was
+/// validated at enqueue. A send failure means the connection is dead — the
+/// read side would fail on the next frame anyway — so it aborts the task
+/// with a protocol error rather than silently dropping the directive.
+async fn deliver_control_prompt(
+    write: &mut WsWrite,
+    job_id: Uuid,
+    worker_name: &str,
+    control: &ControlPrompt,
+) -> Result<(), OrchestratorError> {
+    let env = Envelope::new(
+        "task_prompt",
+        serde_json::json!({
+            "task_id": job_id.to_string(),
+            "seq": control.seq,
+            "prompt": control.prompt,
+            "done": control.done,
+        }),
+    );
+    let json = serde_json::to_string(&env).map_err(|e| {
+        OrchestratorError::ExternalWorkerProtocolError {
+            worker_name: worker_name.to_string(),
+            reason: format!("failed to serialize task_prompt: {e}"),
+        }
+    })?;
+    tokio::time::timeout(
+        CONTROL_SEND_TIMEOUT,
+        write.send(tokio_tungstenite::tungstenite::Message::Text(json.into())),
+    )
+    .await
+    .map_err(|_| OrchestratorError::ExternalWorkerProtocolError {
+        worker_name: worker_name.to_string(),
+        reason: "timed out sending task_prompt".to_string(),
+    })?
+    .map_err(|e| OrchestratorError::ExternalWorkerProtocolError {
+        worker_name: worker_name.to_string(),
+        reason: format!("failed to send task_prompt: {e}"),
+    })
 }
 
 /// Wait bounded for the worker's terminal frame after a cancel envelope
@@ -2417,6 +2634,150 @@ mod tests {
         assert_eq!(result.output, "done");
         assert!(result.error.is_none());
         assert_eq!(result.duration_ms, 1234);
+    }
+
+    // ── WI#328 runtime control channel ──────────────────────────────
+
+    use crate::config::ExternalWorkerConfig;
+
+    fn control_test_manager() -> ExternalWorkerManager {
+        ExternalWorkerManager::new(vec![ExternalWorkerConfig {
+            name: "harness".to_string(),
+            url: "ws://127.0.0.1:9/ws/agent".to_string(),
+            auth_token: None,
+            timeout_ms: 900_000,
+            endpoints: vec![],
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
+        }])
+    }
+
+    #[test]
+    fn task_prompt_envelope_shape() {
+        let job_id = Uuid::new_v4();
+        let control = ControlPrompt {
+            seq: 3,
+            prompt: "wrap up".to_string(),
+            done: true,
+        };
+        let env = Envelope::new(
+            "task_prompt",
+            serde_json::json!({
+                "task_id": job_id.to_string(),
+                "seq": control.seq,
+                "prompt": control.prompt,
+                "done": control.done,
+            }),
+        );
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"task_prompt\""));
+        assert!(json.contains("\"seq\":3"));
+        assert!(json.contains("\"done\":true"));
+        assert!(json.contains(&format!("\"task_id\":\"{job_id}\"")));
+    }
+
+    #[test]
+    fn task_prompt_ack_deserialization() {
+        let json = r#"{"task_id":"abc","seq":7,"accepted":true}"#;
+        let ack: TaskPromptAckPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(ack.task_id, "abc");
+        assert_eq!(ack.seq, 7);
+        assert_eq!(ack.accepted, Some(true));
+
+        // `accepted` is optional — minimal acks still parse.
+        let minimal: TaskPromptAckPayload =
+            serde_json::from_str(r#"{"task_id":"abc","seq":1}"#).unwrap();
+        assert_eq!(minimal.seq, 1);
+        assert!(minimal.accepted.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_prompt_rejects_unknown_job() {
+        let mgr = control_test_manager();
+        let result = mgr
+            .send_prompt(Uuid::new_v4(), "user", "hello", false)
+            .await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, OrchestratorError::ExternalWorkerTaskNotActive { .. }),
+            "expected TaskNotActive, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_validates_content() {
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        mgr.reserve_task(job_id, "harness").await.unwrap();
+
+        let empty = mgr.send_prompt(job_id, "user", "   ", false).await;
+        assert!(empty.is_err());
+
+        let nul = mgr.send_prompt(job_id, "user", "bad\0prompt", false).await;
+        assert!(nul.is_err());
+
+        let too_long = "x".repeat(MAX_CONTROL_PROMPT_LEN + 1);
+        let long = mgr.send_prompt(job_id, "user", &too_long, false).await;
+        assert!(long.is_err());
+
+        // Validation failures must not consume sequence numbers: the next
+        // valid prompt is still seq=1.
+        let seq = mgr
+            .send_prompt(job_id, "user", "first valid", false)
+            .await
+            .unwrap();
+        assert_eq!(seq, 1);
+    }
+
+    #[tokio::test]
+    async fn send_prompt_enqueues_ordered_by_seq() {
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        mgr.reserve_task(job_id, "harness").await.unwrap();
+
+        let seq1 = mgr
+            .send_prompt(job_id, "user", "first", false)
+            .await
+            .unwrap();
+        let seq2 = mgr
+            .send_prompt(job_id, "user", "second, wrap up", true)
+            .await
+            .unwrap();
+        assert_eq!((seq1, seq2), (1, 2));
+
+        // Drain the control queue the way execute_task's read loop would.
+        let mut rx = {
+            let mut handles = mgr.active_handles.write().await;
+            handles
+                .get_mut(&job_id)
+                .and_then(|h| h.prompt_rx.take())
+                .unwrap()
+        };
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.prompt, "first");
+        assert!(!first.done);
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.prompt, "second, wrap up");
+        assert!(second.done);
+    }
+
+    #[tokio::test]
+    async fn send_prompt_fails_after_handle_removed() {
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        mgr.reserve_task(job_id, "harness").await.unwrap();
+        mgr.release_task_reservation(job_id).await;
+
+        let result = mgr.send_prompt(job_id, "user", "too late", false).await;
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                OrchestratorError::ExternalWorkerTaskNotActive { .. }
+            ),
+            "released reservation must reject prompts"
+        );
     }
 
     #[test]

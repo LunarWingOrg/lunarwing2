@@ -56,6 +56,15 @@ fn build_state(
     store: Option<Arc<dyn crate::db::Database>>,
     prompt_queue: Option<PromptQueue>,
 ) -> Arc<GatewayState> {
+    build_state_ex(store, prompt_queue, None)
+}
+
+/// Build a `GatewayState` additionally wiring an external worker manager.
+fn build_state_ex(
+    store: Option<Arc<dyn crate::db::Database>>,
+    prompt_queue: Option<PromptQueue>,
+    external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
+) -> Arc<GatewayState> {
     Arc::new(GatewayState {
         msg_tx: tokio::sync::RwLock::new(None),
         sse: Arc::new(SseManager::new()),
@@ -68,7 +77,7 @@ fn build_state(
         tool_registry: None,
         store,
         job_manager: None,
-        external_worker_manager: None,
+        external_worker_manager,
         prompt_queue,
         owner_id: "test".to_string(),
         default_sender_id: "test".to_string(),
@@ -603,6 +612,62 @@ mod jobs_isolation {
             StatusCode::NOT_FOUND,
             "bob should not be able to prompt alice's job"
         );
+    }
+
+    #[tokio::test]
+    async fn test_jobs_prompt_routes_external_job_to_control_channel() {
+        use crate::config::{ExternalWorkerConfig, LoadBalanceStrategy};
+        use crate::orchestrator::ExternalWorkerManager;
+
+        let (db, _dir) = test_db().await;
+
+        // Running external worker job owned by alice.
+        let mut alice_job = make_sandbox_job("alice", "external prompt test");
+        alice_job.status = "running".to_string();
+        alice_job.success = None;
+        alice_job.completed_at = None;
+        db.save_sandbox_job(&alice_job).await.unwrap();
+        db.update_sandbox_job_mode(alice_job.id, "external:harness")
+            .await
+            .unwrap();
+
+        // Manager with the job reserved (as create_job would before dispatch).
+        let ewm = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
+            name: "harness".to_string(),
+            url: "ws://127.0.0.1:9/ws/agent".to_string(),
+            auth_token: None,
+            timeout_ms: 900_000,
+            endpoints: vec![],
+            load_balance: LoadBalanceStrategy::default(),
+            prompt_context: Default::default(),
+        }]));
+        ewm.reserve_task(alice_job.id, "harness").await.unwrap();
+
+        let state = build_state_ex(Some(db), None, Some(ewm));
+        let auth = two_user_auth();
+        let app = jobs_router(state, auth);
+
+        // WI#328: the prompt is accepted onto the runtime control channel.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/jobs/{}/prompt", alice_job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({"content": "status?", "done": true}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "external job prompts should queue on the control channel"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "queued");
+        assert_eq!(body["seq"], 1);
     }
 
     #[tokio::test]

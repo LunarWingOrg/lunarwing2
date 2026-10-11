@@ -191,6 +191,12 @@ pub async fn jobs_detail_handler(
             }
 
             let mode = store.get_sandbox_job_mode(job.id).await.ok().flatten();
+            // WI#328: running external worker jobs are promptable via the
+            // runtime control channel; other sandbox modes remain
+            // non-promptable from the web UI.
+            let can_prompt = job.status == "running"
+                && mode.as_deref().is_some_and(|m| m.starts_with("external:"))
+                && state.external_worker_manager.is_some();
 
             return Ok(Json(JobDetailResponse {
                 id: job.id,
@@ -207,7 +213,7 @@ pub async fn jobs_detail_handler(
                 job_mode: mode.filter(|m| m != "worker"),
                 transitions,
                 can_restart: state.job_manager.is_some(),
-                can_prompt: false,
+                can_prompt,
                 job_kind: Some("sandbox".to_string()),
             }));
         }
@@ -595,6 +601,7 @@ pub async fn jobs_restart_handler(
 ///
 /// Routes to the appropriate backend:
 /// - Claude Code sandbox jobs → prompt queue (polled by the bridge)
+/// - External worker jobs → runtime control channel `task_prompt` (WI#328)
 /// - Agent (non-sandbox) jobs → WorkerMessage injection via scheduler
 /// - Worker-mode sandbox jobs → not supported (no mechanism to inject)
 pub async fn jobs_prompt_handler(
@@ -616,15 +623,38 @@ pub async fn jobs_prompt_handler(
         ))?
         .to_string();
 
-    let _done = body.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+    let done = body.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // Try sandbox job path first: verify ownership, then reject (prompts not supported).
+    // Try sandbox job path first: verify ownership, then route by job mode.
     if let Some(ref s) = state.store
         && let Ok(Some(sandbox_job)) = s.get_sandbox_job(job_id).await
     {
         // Verify ownership.
         if sandbox_job.user_id != user.user_id {
             return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
+        }
+
+        // External worker jobs accept follow-up prompts over the runtime
+        // control channel (WI#328) — delivered as `task_prompt` between
+        // worker turns, no mid-call injection.
+        let mode = s
+            .get_sandbox_job_mode(job_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if mode.as_deref().is_some_and(|m| m.starts_with("external:")) {
+            let manager = state.external_worker_manager.as_ref().ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "External worker manager not available".to_string(),
+            ))?;
+            let seq = manager
+                .send_prompt(job_id, &user.user_id, &content, done)
+                .await
+                .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+            return Ok(Json(serde_json::json!({
+                "status": "queued",
+                "job_id": job_id.to_string(),
+                "seq": seq,
+            })));
         }
 
         return Err((

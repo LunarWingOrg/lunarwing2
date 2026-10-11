@@ -2222,6 +2222,7 @@ pub struct JobPromptTool {
     prompt_queue: PromptQueue,
     context_manager: Arc<ContextManager>,
     store: Option<Arc<dyn Database>>,
+    external_worker_manager: Option<Arc<ExternalWorkerManager>>,
 }
 
 /// Type alias matching `crate::channels::web::server::PromptQueue`.
@@ -2240,11 +2241,19 @@ impl JobPromptTool {
             prompt_queue,
             context_manager,
             store: None,
+            external_worker_manager: None,
         }
     }
 
     pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Inject the external worker manager so follow-up prompts can reach
+    /// RUNNING external jobs over the runtime control channel (WI#328).
+    pub fn with_external_workers(mut self, mgr: Arc<ExternalWorkerManager>) -> Self {
+        self.external_worker_manager = Some(mgr);
         self
     }
 }
@@ -2256,11 +2265,12 @@ impl Tool for JobPromptTool {
     }
 
     fn description(&self) -> &str {
-        "Send a follow-up prompt to a running Claude Code sandbox job. The prompt is \
-         queued and delivered on the next poll cycle. Use this to give the sub-agent \
-         additional instructions, answer its questions, or tell it to wrap up. This does \
-         not cancel work; use cancel_job for cancellation. External workers do not support \
-         follow-up prompts."
+        "Send a follow-up prompt to a running job. For Claude Code sandbox jobs the prompt is \
+         queued and delivered on the next poll cycle. For external workers (opencode, pebble, \
+         harness, etc.) the prompt travels over the runtime control channel and is delivered \
+         between worker turns; workers on older protocol versions ignore it. Use this to give \
+         the sub-agent additional instructions, answer its questions, or tell it to wrap up. \
+         This does not cancel work; use cancel_job for cancellation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2326,16 +2336,6 @@ impl Tool for JobPromptTool {
             )));
         }
 
-        if let Some(ref store) = self.store
-            && let Ok(Some(mode)) = store.get_sandbox_job_mode(job_id).await
-            && mode.starts_with("external:")
-        {
-            return Err(ToolError::ExecutionFailed(format!(
-                "job {job_id} uses external worker '{}'; external jobs cannot receive job_prompt. Use cancel_job to stop it",
-                mode.trim_start_matches("external:")
-            )));
-        }
-
         let content = params
             .get("content")
             .and_then(|v| v.as_str())
@@ -2345,6 +2345,40 @@ impl Tool for JobPromptTool {
             .get("done")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // External worker jobs receive follow-up prompts over the runtime
+        // control channel (WI#328): validated daemon-side, assigned a
+        // monotonic seq, and delivered as a `task_prompt` envelope between
+        // worker turns.
+        if let Some(ref store) = self.store
+            && let Ok(Some(mode)) = store.get_sandbox_job_mode(job_id).await
+            && let Some(worker_name) = mode.strip_prefix("external:")
+        {
+            let Some(ref ewm) = self.external_worker_manager else {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "job {job_id} uses external worker '{worker_name}' but no external worker \
+                     manager is available; use cancel_job to stop it"
+                )));
+            };
+            let seq = ewm
+                .send_prompt(job_id, &ctx.user_id, content, done)
+                .await
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "failed to queue control prompt for external job {job_id}: {e}"
+                    ))
+                })?;
+            let result = serde_json::json!({
+                "job_id": job_id.to_string(),
+                "status": "queued",
+                "message": format!(
+                    "Prompt queued for external worker '{worker_name}' (control channel seq={seq})"
+                ),
+                "seq": seq,
+                "done": done,
+            });
+            return Ok(ToolOutput::success(result, start.elapsed()));
+        }
 
         let prompt = crate::orchestrator::api::PendingPrompt {
             content: content.to_string(),

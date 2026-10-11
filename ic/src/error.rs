@@ -408,6 +408,9 @@ pub enum OrchestratorError {
 
     #[error("External worker '{worker_name}' task is already active (job {job_id})")]
     ExternalWorkerTaskAlreadyActive { worker_name: String, job_id: Uuid },
+
+    #[error("External job {job_id} cannot receive control messages: {reason}")]
+    ExternalWorkerTaskNotActive { job_id: Uuid, reason: String },
 }
 
 /// Worker errors (container-side execution).
