@@ -1676,9 +1676,11 @@ mod tests {
         // to pattern-based leak detection.
         let tmp = staging_with(&[
             ("projects/clean.md", "no secrets here"),
-            ("projects/dirty.md", "token: ghp_abcdefghijklmnop12345"),
+            ("projects/dirty.md", "copied: harness-promotion-fixture-value"),
         ]);
-        let values = vec![SecretString::from("ghp_abcdefghijklmnop12345".to_string())];
+        let values = vec![SecretString::from(
+            "harness-promotion-fixture-value".to_string(),
+        )];
         let redactor = SecretValueRedactor::new(&values);
         let plan =
             plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
@@ -1736,7 +1738,7 @@ mod tests {
     #[test]
     fn redactor_scrubs_exact_base64_and_url_encoded_values() {
         use base64::Engine;
-        let value = "sk-live-abcdef1234567890";
+        let value = "harness-redactor-fixture-value";
         let values = vec![SecretString::from(value.to_string())];
         let redactor = SecretValueRedactor::new(&values);
         assert!(redactor.is_armed());

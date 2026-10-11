@@ -917,7 +917,7 @@ mod tests {
         let job_id = Uuid::new_v4();
         let token = state.token_store.create_token(job_id).await;
         insert_test_handle(&state, job_id, "owner").await;
-        let secret_value = "sk-live-abcdef1234567890";
+        let secret_value = "harness-redaction-fixture-value";
         state
             .token_store
             .store_harness_secrets(
