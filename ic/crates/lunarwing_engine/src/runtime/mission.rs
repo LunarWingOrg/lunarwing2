@@ -1422,10 +1422,12 @@ impl MissionManager {
                 {
                     continue;
                 }
-                // WI#338: thread_history rides the agent-writable mission
-                // record (WI#322); only resume threads this mission actually
-                // fired — a planted foreign id must not resume under this
-                // mission's outcome watcher.
+                // WI#338 (defense in depth, not the fix): thread_history rides
+                // the agent-writable mission record (WI#322). Skip a planted id
+                // whose thread belongs to another project or user (a partial
+                // forgery). A forger who also rewrites the mission's
+                // user_id/project_id still passes, because both sides of the
+                // comparison then come from the forged record; WI#322 is the fix.
                 if thread.project_id != mission.project_id
                     || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
                 {
@@ -2682,9 +2684,11 @@ impl MissionManager {
                 if thread.thread_type != ThreadType::Mission {
                     continue;
                 }
-                // WI#338: thread_history rides the agent-writable mission
-                // record (WI#322); a planted foreign id must not re-arm a
-                // retry as this mission with the marker's payload.
+                // WI#338 (defense in depth, not the fix): thread_history rides
+                // the agent-writable mission record (WI#322). Skip a planted id
+                // whose thread belongs to another project or user (a partial
+                // forgery). A forger who also rewrites the mission's
+                // user_id/project_id still passes; WI#322 is the fix.
                 if thread.project_id != mission.project_id
                     || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
                 {
@@ -2901,11 +2905,16 @@ impl MissionManager {
             self.store.save_mission(mission).await?;
             return Ok(true);
         };
-        // WI#338: the stamp rides mission metadata, which stays agent-writable
-        // until WI#322 lands — never act on a thread this mission did not
-        // fire. Mirrors `record_restart_interrupted_thread`'s type/project/
-        // owner parity checks plus history membership; a mismatch clears the
-        // stamp without writing a marker or emitting a notice.
+        // WI#338 (defense in depth, not the fix): the stamp rides mission
+        // metadata, which stays agent-writable until WI#322 lands. Mirrors
+        // `record_restart_interrupted_thread`'s type/project/owner parity
+        // checks plus history membership; a mismatch clears the stamp without
+        // writing a marker or emitting a notice. This stops partial forgeries
+        // (only the stamp or `thread_history` edited) and store corruption. It
+        // does NOT stop a forger who rewrites the whole record (`user_id`,
+        // `project_id`, `thread_history`): every mission-side value compared
+        // here comes from that record. WI#322 removes the input; a mission id
+        // stamped on the thread row would be the unforgeable side.
         if thread.thread_type != ThreadType::Mission
             || thread.project_id != mission.project_id
             || (!mission.owner_id().is_shared() && thread.user_id != mission.user_id)
