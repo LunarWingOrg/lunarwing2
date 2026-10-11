@@ -6,6 +6,8 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -25,6 +27,13 @@ def load_module(name: str, path: pathlib.Path):
 
 config = load_module("validate_config", ROOT / ".gitlab/scripts/validate_config.py")
 guard = load_module("verify_upstream_lock", ROOT / "pebble4lunarwing/scripts/verify_upstream_lock.py")
+
+# WI#334: one probe text is shared by the Dockerfile build-time proof and the
+# standalone smoke script, so both always exercise the same commands.
+TOOLCHAIN_PROBE = (
+    "set -e; command -v cargo; command -v rustc; command -v go; command -v rustup; "
+    "cargo --version; rustc --version; go version; rustup --version"
+)
 
 
 class LockDeltaTests(unittest.TestCase):
@@ -155,8 +164,8 @@ class LockDeltaTests(unittest.TestCase):
 
 
 class TaskShellToolchainPathTests(unittest.TestCase):
-    """WI#334: the pebble task shell must keep cargo/go on PATH even when
-    upstream's shell tool resets the environment (login/sanitised shell)."""
+    """WI#334: the pebble task shell must keep cargo/go on PATH across the
+    /etc/profile login reset in upstream's `/bin/sh -lc` spawn."""
 
     def setUp(self):
         self.dockerfile = (ROOT / "pebble4lunarwing/Dockerfile").read_text(encoding="utf-8")
@@ -177,26 +186,144 @@ class TaskShellToolchainPathTests(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertIn(line, self.dockerfile)
-        # Build-time proof: a scrubbed login shell still runs the toolchains.
-        self.assertIn("env -i bash -lc 'cargo --version && rustc --version && go version && rustup --version'", self.dockerfile)
+        # Build-time proof: pebble's real spawn mode (/bin/sh -lc with the
+        # image env) plus a fully sanitised leg — never the old bash probe.
+        self.assertNotIn("env -i bash -lc", self.dockerfile)
+        self.assertIn(f"/bin/sh -lc '{TOOLCHAIN_PROBE}'", self.dockerfile)
+        self.assertIn(f"env -i /bin/sh -c '{TOOLCHAIN_PROBE}'", self.dockerfile)
 
     def test_anchor_scripts_exist_with_expected_content(self):
         profile = (ROOT / "pebble4lunarwing/scripts/toolchain-profile.sh").read_text(encoding="utf-8")
-        for needle in ("/usr/local/cargo/bin", "/usr/local/go/bin", "RUSTUP_HOME", "CARGO_HOME", "GOROOT", "GOPATH"):
+        # Needles are the functional lines, not the header comment, so
+        # deleting every export/PATH edit fails the test.
+        for needle in (
+            'export RUSTUP_HOME="${RUSTUP_HOME:-/usr/local/rustup}"',
+            'export CARGO_HOME="${CARGO_HOME:-/usr/local/cargo}"',
+            'export GOROOT="${GOROOT:-/usr/local/go}"',
+            'export GOPATH="${GOPATH:-/root/go}"',
+            'if [ -d "${CARGO_HOME}/bin" ]; then',
+            'PATH="${CARGO_HOME}/bin:${PATH}"',  # prepend: rustup proxies stay ahead of the /usr/local/bin symlinks
+            'PATH="${PATH}:${GOROOT}/bin"',
+            'PATH="${PATH}:${GOPATH}/bin"',  # `go install`ed tools survive the login reset
+        ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, profile)
         wrapper = (ROOT / "pebble4lunarwing/scripts/rustup-wrapper.sh").read_text(encoding="utf-8")
-        self.assertIn('exec /usr/local/cargo/bin/rustup "$@"', wrapper)
+        for needle in (
+            'export RUSTUP_HOME="${RUSTUP_HOME:-/usr/local/rustup}"',
+            'export CARGO_HOME="${CARGO_HOME:-/usr/local/cargo}"',
+            'exec /usr/local/cargo/bin/rustup "$@"',
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, wrapper)
         smoke = (ROOT / "pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh").read_text(encoding="utf-8")
-        for needle in ("env -i bash -lc", "cargo --version", "go version"):
+        # Both legs probe the shared command set: pebble's real spawn mode
+        # (/bin/sh -lc, image env) and a fully sanitised shell.
+        for needle in (
+            f"probe='{TOOLCHAIN_PROBE}'",
+            'run --rm --network=none --entrypoint /bin/sh "${ref}" -lc "${probe}"',
+            'run --rm --network=none --entrypoint env "${ref}" -i /bin/sh -c "${probe}"',
+            'exec "${name}" /bin/sh -lc "${probe}"',
+            'exec "${name}" env -i /bin/sh -c "${probe}"',
+        ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, smoke)
+
+    def test_fat_pebble_builds_run_the_smoke_probe(self):
+        # mt-admin wires the smoke script into WITH_TOOLCHAINS=true builds.
+        build_lib = (ROOT / "ic/scripts/mt-admin-lib/05-tenant-build.sh").read_text(encoding="utf-8")
+        self.assertIn('"$smoke_script" image lunarwing-worker-pebble:latest', build_lib)
+        self.assertIn('LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$pebble_dir/scripts/smoke-task-shell-toolchain.sh', build_lib)
 
     def test_ci_image_build_tracks_the_new_inputs(self):
         build_script = (ROOT / ".gitlab/scripts/build-worker-image.sh").read_text(encoding="utf-8")
         for path in ("pebble4lunarwing/scripts/toolchain-profile.sh", "pebble4lunarwing/scripts/rustup-wrapper.sh"):
             with self.subTest(path=path):
                 self.assertIn(path, build_script)
+
+
+class ToolchainProfileBehaviourTests(unittest.TestCase):
+    """WI#334: source toolchain-profile.sh in a real POSIX shell and assert
+    the resulting PATH, instead of only string-matching the script."""
+
+    PROFILE = ROOT / "pebble4lunarwing/scripts/toolchain-profile.sh"
+    SCRIPTS = (
+        ROOT / "pebble4lunarwing/scripts/toolchain-profile.sh",
+        ROOT / "pebble4lunarwing/scripts/rustup-wrapper.sh",
+        ROOT / "pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh",
+    )
+
+    def source_profile(self, env, sources=1, shell="sh"):
+        snippet = "".join(f'. "{self.PROFILE}"; ' for _ in range(sources))
+        cmd = snippet + 'printf "%s\\n" "$PATH"; printf "%s %s %s %s\\n" "$RUSTUP_HOME" "$CARGO_HOME" "$GOROOT" "$GOPATH"'
+        result = subprocess.run([shell, "-c", cmd], env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, f"{shell}: {result.stderr}")
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 2, result.stdout)
+        return lines[0].split(":"), lines[1]
+
+    def fat_env(self, base):
+        for name in ("cargo", "go", "gopath"):
+            (base / name / "bin").mkdir(parents=True)
+        return {
+            # The post-/etc/profile PATH shape: toolchain entries already gone.
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin",
+            "HOME": str(base),
+            "CARGO_HOME": str(base / "cargo"),
+            "GOROOT": str(base / "go"),
+            "GOPATH": str(base / "gopath"),
+        }
+
+    def assert_fat_behaviour(self, shell):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            path, _homes = self.source_profile(self.fat_env(base), shell=shell)
+        cargo_bin = str(base / "cargo" / "bin")
+        # The rustup proxies sort ahead of /usr/local/bin, where the
+        # real-binary symlinks live, so rust-toolchain.toml keeps working.
+        self.assertEqual(path[0], cargo_bin)
+        self.assertLess(path.index(cargo_bin), path.index("/usr/local/bin"))
+        # The reset PATH is preserved in the middle; Go and GOPATH (for
+        # `go install`ed tools) are appended in order.
+        self.assertEqual(path[1:5], ["/usr/local/sbin", "/usr/local/bin", "/usr/bin", "/bin"])
+        self.assertEqual(path[-2:], [str(base / "go" / "bin"), str(base / "gopath" / "bin")])
+
+    def test_fat_image_path_ordering(self):
+        self.assert_fat_behaviour("sh")
+
+    @unittest.skipUnless(shutil.which("dash"), "dash not installed on this host")
+    def test_fat_image_path_ordering_under_dash(self):
+        # dash is the image's /bin/sh and the strictest POSIX reader.
+        self.assert_fat_behaviour("dash")
+
+    def test_sourcing_twice_adds_no_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            path, _homes = self.source_profile(self.fat_env(base), sources=2)
+        self.assertEqual(len(path), len(set(path)), path)
+
+    def test_slim_image_is_inert(self):
+        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/root"}
+        path, homes = self.source_profile(env)
+        self.assertEqual(":".join(path), "/usr/local/bin:/usr/bin:/bin")
+        # Toolchain homes are still defaulted for downstream readers, but no
+        # PATH entry appears for the missing directories.
+        self.assertEqual(homes, "/usr/local/rustup /usr/local/cargo /usr/local/go /root/go")
+
+    def test_scripts_pass_sh_syntax_check(self):
+        for script in self.SCRIPTS:
+            with self.subTest(script=script.name):
+                result = subprocess.run(["sh", "-n", str(script)], capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("dash"), "dash not installed on this host")
+    def test_scripts_pass_dash_syntax_check(self):
+        # dash aborts the whole task command on a profile.d syntax error, so
+        # the snippet must parse under dash, not only under bash-as-sh.
+        for script in self.SCRIPTS:
+            with self.subTest(script=script.name):
+                result = subprocess.run(["dash", "-n", str(script)], capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class BuildInputInventoryTests(unittest.TestCase):
