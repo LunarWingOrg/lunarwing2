@@ -108,8 +108,8 @@ _register_worker_unit() {
   ensure_init_system
   [[ "$INIT_SYSTEM" == "openrc" ]] || return 0
   render_worker_openrc_unit "$name" "$worker"
-  rc-update add "lunarwing-${worker}-${name}" default >/dev/null 2>&1 || true
-  rc-service "lunarwing-${worker}-${name}" start >/dev/null 2>&1 || true
+  _openrc_update add "lunarwing-${worker}-${name}" default >/dev/null 2>&1 || true
+  _openrc_service "lunarwing-${worker}-${name}" start >/dev/null 2>&1 || true
   say "registered OpenRC unit lunarwing-${worker}-${name} (health-monitored, boot-persistent)"
   local container="lunarwing-${worker}-${name}"
   local uid home
@@ -125,8 +125,8 @@ _deregister_worker_unit() {
   [[ "$INIT_SYSTEM" == "openrc" ]] || return 0
   [[ -f "/etc/init.d/lunarwing-${worker}-${name}" ]] || return 0
   _deregister_babysitter "lunarwing-${worker}-${name}"
-  rc-service "lunarwing-${worker}-${name}" stop >/dev/null 2>&1 || true
-  rc-update del "lunarwing-${worker}-${name}" default >/dev/null 2>&1 || true
+  _openrc_service "lunarwing-${worker}-${name}" stop >/dev/null 2>&1 || true
+  _openrc_update del "lunarwing-${worker}-${name}" default >/dev/null 2>&1 || true
   rm -f "/etc/init.d/lunarwing-${worker}-${name}" "/etc/conf.d/lunarwing-${worker}-${name}"
 }
 
@@ -625,7 +625,7 @@ _stop_nanocode_supervision() {
   local svc
   for svc in "${container}-sup" "$container"; do
     _nanocode_openrc_service_known "$svc" || continue
-    rc-service "$svc" stop >/dev/null 2>&1 \
+    _openrc_service "$svc" stop >/dev/null 2>&1 \
       || { say "failed to stop legacy OpenRC service $svc" >&2; return 1; }
   done
 }
@@ -681,7 +681,7 @@ _remove_nanocode_supervision() {
       [[ -e "$link" || -L "$link" ]] || continue
       runlevel="$(basename "$(dirname "$link")")"
       if command -v rc-update >/dev/null 2>&1; then
-        rc-update del "$svc" "$runlevel" >/dev/null 2>&1 \
+        _openrc_update del "$svc" "$runlevel" >/dev/null 2>&1 \
           || { say "failed to remove $svc from OpenRC runlevel $runlevel" >&2; return 1; }
       else
         rm -f -- "$link"
@@ -1335,7 +1335,7 @@ stop_tenant_opencode() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
     _deregister_babysitter "$container_name"
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
+    _openrc_service "$container_name" stop >/dev/null 2>&1 || true
     say "opencode worker stopped ($container_name)"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
@@ -1519,7 +1519,7 @@ stop_tenant_opencode2() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
     _deregister_babysitter "$container_name"
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
+    _openrc_service "$container_name" stop >/dev/null 2>&1 || true
     say "opencode2 worker stopped ($container_name)"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
@@ -1796,7 +1796,7 @@ stop_tenant_kimi() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
     _deregister_babysitter "$container_name"
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
+    _openrc_service "$container_name" stop >/dev/null 2>&1 || true
     say "kimi worker stopped ($container_name)"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
@@ -1958,7 +1958,7 @@ stop_tenant_pebble() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
     _deregister_babysitter "$container_name"
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
+    _openrc_service "$container_name" stop >/dev/null 2>&1 || true
     say "pebble worker stopped ($container_name)"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
@@ -1996,7 +1996,7 @@ openrc_worker_stop_disable() {
   container="lunarwing-${worker}-${name}"
   for svc in "${container}-sup" "$container"; do
     if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
-      rc-service "$svc" stop >/dev/null 2>&1 \
+      _openrc_service "$svc" stop >/dev/null 2>&1 \
         || { say "failed to stop OpenRC service $svc" >&2; return 1; }
     fi
     openrc_service_remove_runlevels "$svc" || return 1
@@ -2062,7 +2062,7 @@ kill_worker() {
     _systemctl_user "$name" stop --no-block "$service" >/dev/null 2>&1 || true
   elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
     ports_set_worker_desired_running "$name" "$worker" false
-    rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+    _openrc_service "${container}-sup" stop >/dev/null 2>&1 || true
     openrc_service_remove_runlevels "${container}-sup" \
       || die "failed to disable OpenRC supervisor ${container}-sup"
     openrc_service_remove_runlevels "$container" \
@@ -2078,7 +2078,7 @@ kill_worker() {
       && podman_supports_quadlet; then
     _systemctl_user "$name" stop "$service" >/dev/null 2>&1 || true
   elif [[ "$INIT_SYSTEM" == "openrc" && -x "$OPENRC_INITD_DIR/${container}" ]]; then
-    rc-service "$container" stop >/dev/null 2>&1 || true
+    _openrc_service "$container" stop >/dev/null 2>&1 || true
   fi
   say "$worker worker killed and left stopped for $name"
 }

@@ -670,8 +670,14 @@ missing env var, instead of dying at the first LLM request after N retries.
 Multi-tenant provisioning has **no built-in LLM endpoint default**: `add-tenant`
 fails loudly unless it is given `--tensorzero-url` (or fleet
 `LUNARWING_MT_TENSORZERO_URL`), or `--llm-base-url` for a non-proxy tenant.
-The tenant's TensorZero proxy units render the tenant's own `TENSORZERO_URL`
-from `proxy.env`, not a fleet literal.
+The tenant's TensorZero proxy uses its own `TENSORZERO_URL` from `proxy.env`,
+not a fleet literal. systemd passes the validated URL as an argument; OpenRC
+passes `--tensorzero-env` and loads the URL only after dropping to the tenant
+(WI#376), so tenant data never becomes root-parsed init-script text. Existing
+OpenRC deployments must first neutralize installed proxy units fleet-wide with
+`render-units --all-proxies`, then update tenant proxy code before restarting.
+The patched `upgrade-tenant` performs this mandatory neutralization before
+service operations; see [the proxy URL boundary](MULTITENANCY-PRODUCTION.md#proxy-url-boundary-wi376).
 
 mt-admin renders `OPENCODE_BASE_URL` / `KIMI_BASE_URL` / `OPENCODE2_BASE_URL`
 into the tenant's `lunarwing.env`. Resolution order per worker:

@@ -520,13 +520,144 @@ files. It fails closed unless the env directory is tenant-owned mode `0700` and
 the env file is a non-symlink, single-link, tenant-owned regular file mode
 `0600`.
 
-Existing OpenRC tenants adopt this boundary after `render-units <name>` followed
+Existing OpenRC fleets must first complete the [proxy migration below](#proxy-url-boundary-wi376).
+After that, tenants adopt other unit changes with `render-units <name>` followed
 by `restart-tenant <name>`. Check ownership and modes before restarting.
 
 ```bash
 rc-service lunarwing-<name> start
 rc-service lunarwing-<name> status
 ```
+
+#### Proxy URL boundary (WI#376)
+
+The proxy's `TENSORZERO_URL` is tenant-controlled data. OpenRC units now pass
+the fixed `--tensorzero-env` option, and the Python proxy reads the literal
+value exported by `lunarwing-openrc-env-exec` **after** `command_user` drops
+privileges. Both renderers read `proxy.env` through `read_tenant_env_value`
+as the tenant, rejecting unsafe ownership, permissions, symlinks and shared
+hard links. Normal rendering shape-checks the URL against RFC 3986 ASCII
+characters (with the existing userinfo and percent-sign prohibitions), but
+OpenRC never copies it into the init script or `command_args`. Reserved URI
+characters such as `$`, `;` and `&` remain valid data, not shell-safe text.
+A changed `proxy.env` takes effect at the next start without re-rendering
+**on OpenRC only**. systemd still embeds the URL in the tenant user unit's
+`ExecStart`, so its URL changes require `render-units <tenant>` and a restart.
+Environment mode rejects an unset, empty,
+or whitespace-only value before opening a listener; it has no built-in URL
+fallback. Explicit `--tensorzero` and standalone defaults retain their prior
+behavior outside this mode; the two options are mutually exclusive.
+
+The regression test distinguishes generation from execution: expanding a
+variable in the generator's heredoc copies embedded `$()`/backtick text
+without recursively executing it. The previous script executed that copied
+text when OpenRC later parsed the init file as root, including during service
+operations other than startup. Shell-looking URL text now stays literal data.
+
+**Existing installations — fleet-wide neutralize first (!1547 EG–E):** an
+OpenRC dependency-cache rebuild can source **every** installed init script
+as root. Repairing tenant A and restarting it while tenant B's old proxy
+unit remains is unsafe. Arrange a maintenance window with no concurrent
+OpenRC operations: pause the host health/self-heal cron
+(`lunarwing-mt-health` fcron/cron block running
+`/usr/local/lib/lunarwing-health/cron-wrapper.sh`, which drives
+`lunarwing-self-heal.sh`), the OpenRC watchdog
+(`/etc/cron.hourly/lunarwing-watchdog` or the managed fcron block), and do
+not run `ic/scripts/enable-health-fleet.sh` in the window. The mt-admin
+guard covers its own commands, not other programs invoking OpenRC.
+
+Before overwriting any units, inspect them as data, without service commands.
+A naive grep for `$(`/backticks misses quote-closing redirection payloads;
+ask instead for any legacy `--tensorzero` value containing characters
+outside the URL set:
+
+```bash
+sudo grep -lE -- '--tensorzero ' /etc/init.d/lunarwing-proxy-* \
+  | sudo xargs -r grep -LE -- '--tensorzero []A-Za-z0-9._~:/?#@!*+,=[-]+}"$'
+```
+
+A listed file means the unit carries a value outside plain URL characters —
+possibly an exploited payload such as `}">/etc/…` or `${` parameter
+expansion, and possibly a legitimate `&`/`;` query string, so this is a
+detection signal, not proof of execution. Preserve such units' bytes for
+investigation; mt-admin does this automatically on replacement (below).
+
+From the **patched admin checkout**, run the file-only migration first:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies
+```
+
+This replaces each proxy-enabled tenant's proxy unit and every installed
+registered proxy unit — including disabled tenants' leftover units —
+atomically **per file** (the fleet sweep itself is not a transaction). For
+each unit it replaces, it first copies the installed bytes verbatim to a
+private archive (`$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`, default
+`/var/lib/lunarwing/openrc-proxy-backups`, directory mode 0700, files mode
+0600, never executable, never sourced). The render aborts rather than
+replace a unit it cannot archive safely. It neither reads tenant env data
+nor invokes OpenRC, the full tenant renderer, retirement hooks or sidecar
+lifecycle helpers. It works even when `proxy.env` is malformed or the
+tenant proxy code is still old. An unregistered or symlinked installed
+proxy unit blocks the migration: inspect and move that file outside
+`init.d` using file operations, then retry before invoking OpenRC.
+The command does not change enablement flags or runlevels.
+
+Next, in the **same maintenance window**, update
+`tensorzero-proxy-configurations/lunarwing-proxy.py` in every proxy
+tenant's checkout before anything restarts that tenant: an older proxy
+rejects `--tensorzero-env`, and the daemon's conf.d hard-`need`s the proxy,
+so a reboot, self-heal run, watchdog run or `start-tenant` takes the whole
+tenant down until its checkout is updated. Then restart through mt-admin.
+
+From deploying the patched mt-admin until `render-units --all-proxies`
+succeeds, every mt-admin command on OpenRC **except** `help`, the fleet
+migration and `upgrade-tenant` refuses up front with the migration command.
+The service/update wrappers return exit code **125** for a refusal — never
+an OpenRC service state — so `remove-tenant`, `restore-tenant`,
+`migrate-owner-scope` and the writer-quiescence probes cannot misread a
+refused or refused-looking status as "stopped".
+
+The patched `upgrade-tenant` performs the same fleet neutralization before
+backup/service probes even with `--skip-render` (`--skip-render` skips
+ordinary rendering, **not** the migration), validates the target tenant's
+proxy env before stopping (a full pre-stop re-render was deliberately
+rejected: stop must operate against the *installed* unit contract), and
+aborts if the tenant cannot be stopped rather than upgrading a still-running
+tenant. For manually updated checkouts, use `render-units <tenant>` followed
+by `restart-tenant <tenant>` only after the fleet migration succeeds.
+
+Updating a source checkout alone does not repair installed units. Keep the
+repaired units on rollback; restore/update compatible proxy code instead of
+restoring the URL-interpolating renderer. Root-owned conf.d overrides remain
+trusted operator shell configuration.
+
+**Sibling render-site audit:**
+
+| Sites | Values entering privileged shell code |
+|---|---|
+| Main daemon, XMPP bridge, WeeChat, WeeChat/DarkIRC adapters | Computed tenant paths, executable paths and operator defaults; env-file contents are loaded by the post-drop launcher, not copied into heredocs. |
+| PostgreSQL, vision, voice, DarkIRC daemon | Constructed container/config paths, registry ports, account IDs and admin-selected runtime/policy values; no tenant env values are interpolated. |
+| conf.d generation | Dependency names constructed from the sanitized tenant name and registry feature flags; the main daemon's existing operator conf.d content is preserved as configuration, not sourced by the renderer. |
+| Proxy (`08-units-openrc.sh`) | The `read_tenant_env_value` result is used for normal render-time validation only. The endpoint never enters generated shell text, and fleet neutralization does not read it at all. |
+| Worker units (`09-worker-config.sh`, `render_worker_openrc_unit`) | Sanitized tenant/worker names, computed home and container name, account ID, runtime path and registry health port; no tenant env values. |
+| Container babysitter (`02-containers.sh`, `render_container_babysitter_unit`) | Constructed container/log paths, tenant name, home and account ID supplied by the admin lifecycle; no tenant env values. |
+
+This audit covers the tenant-env-to-shell interpolation class. It relies on
+the existing admin trust boundary for registry/configuration and executable
+paths, and the public `render-units` path's tenant-name sanitization.
+
+`ic/scripts/tests/test-proxy-openrc-env-boundary.sh` renders and parses the
+actual init scripts with command-substitution, backtick and quote-breakout
+fixtures. It simulates OpenRC sourcing/argument handling using `/bin/sh`,
+checks `command_user`, then executes the real launcher and proxy configuration
+parser as a non-root tenant. It also covers env edits after rendering, missing
+startup data and unsafe env-file rejection on both init systems. The harness
+explicitly invokes all six tests in `test_lunarwing_proxy.py`, including the
+local HTTP forwarding smoke test, in the shell-harness CI lane. The rollout
+harness simulates fleet-wide dependency scanning and checks that legacy units
+block stop/status/update, while the upgrade harness pins neutralize/render/stop
+ordering and the `--skip-render` exception.
 
 ## PostgreSQL
 

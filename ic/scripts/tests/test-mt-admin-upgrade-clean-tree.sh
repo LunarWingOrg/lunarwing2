@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
+export INIT_SYSTEM=systemd
 
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
@@ -249,6 +250,80 @@ if output="$(upgrade_tenant fixture moving '' false false 2>&1)" \
   pass 'upgrade refreshes an installed health pipeline once despite auto-install opt-out'
 else
   fail "upgrade did not refresh an installed health pipeline: $output"
+fi
+
+# !1547 EG-1/EP-4: migration precedes backup probes; a proxy-enabled OpenRC
+# tenant is env-validated (not fully re-rendered) before stop, so stop keeps the
+# installed unit contract. --skip-render cannot bypass fleet neutralization.
+events="$fixture/rollout-events"
+render_all_openrc_proxy_units() { printf 'neutralize\n' >>"$events"; }
+render_tenant_units() { printf 'render\n' >>"$events"; }
+backup_tenant_postgres() { printf 'backup\n' >>"$events"; }
+stop_tenant() { printf 'stop\n' >>"$events"; }
+start_tenant() { printf 'start\n' >>"$events"; }
+for init in openrc systemd; do
+  INIT_SYSTEM="$init"
+  for do_render in true false; do
+    : >"$events"
+    expected=""
+    [[ "$init" != openrc ]] || expected+=$'neutralize\n'
+    expected+=$'backup\n'
+    expected+=$'stop\n'
+    [[ "$do_render" != true ]] || expected+=$'render\n'
+    expected+='start'
+    if output="$(upgrade_tenant fixture "$target" '' true "$do_render" 2>&1)" \
+      && [[ "$(cat "$events")" == "$expected" ]]; then
+      pass "$init upgrade rollout order (render=$do_render)"
+    else
+      fail "$init upgrade rollout order (render=$do_render): $output"
+    fi
+  done
+done
+
+# A proxy-enabled OpenRC tenant validates its env before stopping, without a
+# pre-stop full render, and validation failure leaves the tenant running.
+INIT_SYSTEM=openrc
+PROXY_FIXTURE_ENABLED=true
+tenant_proxy_enabled() { [[ "$PROXY_FIXTURE_ENABLED" == "true" ]]; }
+validate_openrc_proxy_env() { printf 'validate\n' >>"$events"; }
+: >"$events"
+if output="$(upgrade_tenant fixture "$target" '' true true 2>&1)" \
+  && [[ "$(cat "$events")" == $'neutralize\nbackup\nvalidate\nstop\nrender\nstart' ]]; then
+  pass 'proxy-enabled OpenRC upgrade validates env before stop without pre-stop render'
+else
+  fail "proxy-enabled upgrade order wrong: $output"
+fi
+validate_openrc_proxy_env() { printf 'validate\n' >>"$events"; return 1; }
+: >"$events"
+if output="$(upgrade_tenant fixture "$target" '' true true 2>&1)"; then
+  fail 'proxy validation failure did not block upgrade'
+elif [[ "$(cat "$events")" != *stop* && "$output" == *'validation failed'* ]]; then
+  pass 'proxy validation failure blocks upgrade before stop'
+else
+  fail "proxy validation failure still stopped the tenant: $output"
+fi
+tenant_proxy_enabled() { return 1; }
+
+# Fleet neutralization failure blocks everything, and a stop failure aborts
+# before checkout/build/start instead of upgrading a running tenant (EP-4).
+render_all_openrc_proxy_units() { return 1; }
+: >"$events"
+if output="$(upgrade_tenant fixture "$target" '' true true 2>&1)"; then
+  fail 'failed fleet neutralization did not block upgrade'
+elif [[ -s "$events" ]]; then
+  fail 'failed neutralization still invoked backup/stop/start'
+else
+  pass 'failed neutralization blocks upgrade before service operations'
+fi
+render_all_openrc_proxy_units() { printf 'neutralize\n' >>"$events"; }
+stop_tenant() { printf 'stop\n' >>"$events"; return 1; }
+: >"$events"
+if output="$(upgrade_tenant fixture "$target" '' true true 2>&1)"; then
+  fail 'stop failure did not block upgrade'
+elif [[ "$(cat "$events")" == $'neutralize\nbackup\nstop' && "$output" == *'not upgrading'* ]]; then
+  pass 'stop failure aborts upgrade before checkout and start'
+else
+  fail "stop failure was ignored: $output"
 fi
 
 if [[ "$failures" -ne 0 ]]; then

@@ -371,7 +371,14 @@ restore_tenant_postgres() {
   if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v systemctl >/dev/null 2>&1; then
     if _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service" 2>/dev/null; then daemon_state="active"; else daemon_state="stopped"; fi
   elif [[ "$INIT_SYSTEM" == "openrc" ]] && command -v rc-service >/dev/null 2>&1; then
-    if rc-service "lunarwing-${name}" status >/dev/null 2>&1; then daemon_state="active"; else daemon_state="stopped"; fi
+    local status_rc=0
+    _openrc_service "lunarwing-${name}" status >/dev/null 2>&1 || status_rc=$?
+    case "$status_rc" in
+      0) daemon_state="active" ;;
+      3) daemon_state="stopped" ;;
+      125) die "OpenRC proxy migration required; run: $0 render-units --all-proxies (restore refused)" ;;
+      *) daemon_state="unknown" ;;
+    esac
   fi
   case "$daemon_state" in
     stopped) : ;;

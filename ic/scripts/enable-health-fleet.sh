@@ -103,7 +103,10 @@ for t in "${TENANTS[@]}"; do
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     _systemctl_user "$t" is-active --quiet "lunarwing-${t}.service" 2>/dev/null && active=true
   else
-    rc-service "lunarwing-${t}" status >/dev/null 2>&1 && active=true
+    # Guarded like every mt-admin OpenRC call: a legacy proxy unit (WI#376)
+    # refuses instead of probing, and the tenant then counts as down (safer
+    # than re-arming self-heal during the migration window).
+    _openrc_service "lunarwing-${t}" status >/dev/null 2>&1 && active=true
   fi
   $active || DOWN+=("$t")
 done
