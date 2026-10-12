@@ -3,6 +3,11 @@
   "model": "tensorzero/tensorzero::function_name::lunarwing",
   "share": "disabled",
   "update": "disable",
+  "permissions": [
+    { "action": "shell", "resource": "*opencode service *", "effect": "deny" },
+    { "action": "shell", "resource": "*opencode pair *", "effect": "deny" },
+    { "action": "shell", "resource": "*opencode serve *", "effect": "deny" }
+  ],
   "providers": {
     "tensorzero": {
       "name": "TensorZero",
