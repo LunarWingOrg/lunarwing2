@@ -949,7 +949,11 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
             .to_string();
         push_variant(&mut direct, &mut seen, escaped);
     }
-    push_variant(&mut direct, &mut seen, urlencoding::encode(raw).into_owned());
+    push_variant(
+        &mut direct,
+        &mut seen,
+        urlencoding::encode(raw).into_owned(),
+    );
     // Plain hex, lowercase and `xxd -p -u` uppercase.
     let mut hex = String::with_capacity(raw.len() * 2);
     for byte in raw.as_bytes() {
@@ -1177,7 +1181,11 @@ impl SecretValueRedactor {
         }
         let tail_bytes = text.as_bytes();
         let mut best = 0usize;
-        for variant in self.direct_variants.iter().chain(self.folded_variants.iter()) {
+        for variant in self
+            .direct_variants
+            .iter()
+            .chain(self.folded_variants.iter())
+        {
             let variant = variant.expose_secret().as_bytes();
             let upper = (variant.len() - 1).min(tail_bytes.len());
             let mut k = upper;
@@ -2410,7 +2418,9 @@ mod tests {
         }
         // A value of all-same bytes compresses to identical wrap lines; use a
         // varying value to prove per-line pieces are NOT armed above the cap.
-        let varying: String = (0..5000u32).map(|i| char::from_digit(i % 10, 10).unwrap()).collect(); // safety: test
+        let varying: String = (0..5000u32)
+            .map(|i| char::from_digit(i % 10, 10).unwrap())
+            .collect(); // safety: test
         let redactor = SecretValueRedactor::new([SecretString::from(varying.clone())].as_slice());
         let b64 = base64::engine::general_purpose::STANDARD.encode(&varying);
         assert!(b64.len() > WRAP_LINE_VARIANT_CHAR_CAP);
