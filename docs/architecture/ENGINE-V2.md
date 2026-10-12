@@ -767,16 +767,28 @@ with a recorded key; the sweep releases that stale key before re-arming.
 The shutdown-time "retry scheduled" broadcast has no live consumer, so the
 marker records the notice as undelivered and the boot sweep emits it once
 when re-arming, acknowledging the delivery on the marker itself (the same
-pattern as the WI#301 acknowledgement). A run that finished during the
-shutdown window has its real outcome recorded too. A run that does not
-settle within the grace cannot have its thread row written (its own final
-save lands during teardown), so the watcher records the mission row only —
+pattern as the WI#301 acknowledgement). A non-retry outcome settling in the
+same window — a completion, MaxIterations, budget exhaustion, or an
+exhausted retry chain — has no marker to carry that flag, so the owed
+notice is stamped on the mission row as `pending_outcome_notification`
+(keyed by thread id) and the boot-time
+`deliver_pending_outcome_notifications` sweep emits it once the bridge
+consumer is wired, with the stamp removal as the acknowledgement (WI#339).
+A run that finished during the shutdown window has its real outcome
+recorded too. A run that does not settle within the grace cannot have its
+thread row written (its own final save lands during teardown), so the
+watcher records the mission row only —
 `INTERRUPTED: shutdown while the thread was still stopping (<thread_id>)`,
 the dedup release, and a `pending_shutdown_interruption` stamp in mission
-metadata. At boot, `resolve_pending_shutdown_interruptions` resolves the
-stamp against the thread's final persisted state: a stop that settled
-during teardown (host-stop terminal reason) earns the retry the watcher
-would have planned, with the boot-time notice; a thread the restart sweep
+metadata, keyed by thread id so two runs of one mission both unsettled at
+shutdown each keep their stamp (WI#339; the pre-WI#339 single-slot shape is
+still read and is folded into the map on the next write). At boot,
+`resolve_pending_shutdown_interruptions` resolves each stamp against the
+thread's final persisted state — one unreadable row or unresolvable stamp
+warns and skips rather than aborting the sweep (WI#339): a stop that
+settled during teardown (host-stop terminal reason) earns the retry the
+watcher would have planned, with the boot-time notice; a thread the
+restart sweep
 stamped stays WI#301's record case; a run that completed needs no retry; a
 run that failed on its own during teardown is record-only, because the
 persisted row does not carry the failure kind and WI#302 forbids retrying
