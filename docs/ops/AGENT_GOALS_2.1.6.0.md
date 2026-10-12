@@ -154,13 +154,13 @@
 25. [x] (S) RESERVED
 26. [x] (S) RESERVED
 27. [x] (S) RESERVED
-28. [ ] fix issues in CI/CD (if any) - See Pipeline Number 5481 for latest master pipeline run and see if anything is not GREEN
+28. [ ] fix issues in CI/CD (if any) - See Pipeline Number 5503 for latest master pipeline run and see if anything is not GREEN
 29. [x] (S) (H) MASCOT ANIMS
 30. [x] (S) RESERVED
 31. [ ] review all currently open work items - create audit document for 2.1.6.0 in docs/ops - there are similar docs in docs/ops for 2.1.5.0 and 2.1.4.0 and earlier releases so you can use those as references - you can sort doc by label of release ( i.e. 2.1.5.0, 2.1.6.0 )
 32. [x] (S) (H MR) release alpha of droid and desk repo projs LATER near end of dev cycle
 33. [x] (S) (H MR) come back to item 2 at some point after manual review is completed (NOTE FOR LATER)
-34. [x] (S) RESERVED
+34. [x] (S) (H MR) prob rm opencode v1 in .1.7.0 and add lunardepth in .1.8.0
 35. [x] (S) RESERVED
 36. [x] (S) RESERVED
 37. [x] (S) RESERVED
