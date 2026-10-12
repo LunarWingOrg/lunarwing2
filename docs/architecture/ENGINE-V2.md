@@ -786,21 +786,40 @@ with a recorded key; the sweep releases that stale key before re-arming.
 The shutdown-time "retry scheduled" broadcast has no live consumer, so the
 marker records the notice as undelivered and the boot sweep emits it once
 when re-arming, acknowledging the delivery on the marker itself (the same
-pattern as the WI#301 acknowledgement). A run that finished during the
-shutdown window has its real outcome recorded too. A run that does not
-settle within the grace cannot have its thread row written (its own final
-save lands during teardown), so the watcher records the mission row only —
+pattern as the WI#301 acknowledgement). A non-retry outcome settling in the
+same window — a completion, MaxIterations, budget exhaustion, or an
+exhausted retry chain — has no marker to carry that flag, so the owed
+notice is stamped on the mission row as `pending_outcome_notification`
+(keyed by thread id) and the boot-time
+`deliver_pending_outcome_notifications` sweep emits it once the bridge
+consumer is wired, with the stamp removal as the acknowledgement (WI#339).
+A run that finished during the shutdown window has its real outcome
+recorded too. A run that does not settle within the grace cannot have its
+thread row written (its own final save lands during teardown), so the
+watcher records the mission row only —
 `INTERRUPTED: shutdown while the thread was still stopping (<thread_id>)`,
 the dedup release, and a `pending_shutdown_interruption` stamp in mission
-metadata. At boot, `resolve_pending_shutdown_interruptions` resolves the
-stamp against the thread's final persisted state: a stop that settled
-during teardown (host-stop terminal reason) earns the retry the watcher
-would have planned, with the boot-time notice; a thread the restart sweep
+metadata, keyed by thread id so two runs of one mission both unsettled at
+shutdown each keep their stamp (WI#339; the pre-WI#339 single-slot shape is
+still read and is folded into the map on the next write). At boot,
+`resolve_pending_shutdown_interruptions` resolves each stamp against the
+thread's final persisted state — one unreadable row or unresolvable stamp
+warns and skips rather than aborting the sweep (WI#339): a stop that
+settled during teardown (host-stop terminal reason) earns the retry the
+watcher would have planned, with the boot-time notice; a thread the
+restart sweep
 stamped stays WI#301's record case; a run that completed needs no retry; a
 run that failed on its own during teardown is record-only, because the
 persisted row does not carry the failure kind and WI#302 forbids retrying
 budget exhaustion; a suspended or waiting thread stays with checkpoint or
-gate recovery.
+gate recovery. When two overlapping fires are both stamped, only the
+newest earns the retry: the older one is a superseded fire (below) and is
+resolved record-only, matching the retry sweep's one-pending-retry rule
+(the retry payload is the mission's last trigger payload, so re-arming the
+older fire would re-run the newer fire's work). A stamp whose resolution
+fails (for example, its mission save errors) is restored in memory before
+the mission's next stamp resolves, so a sibling's successful save never
+persists its clear; it stays for the next boot.
 
 The stamp is also cleared WITHOUT a retry whenever the fire's future
 already has an owner (WI#337): the stamped thread carries a persisted
@@ -814,8 +833,10 @@ cron/manual fires would then run twice, contradicting the "suppresses the
 armed retry instead of doubling" invariant — so the resolution only
 clears the stamp and records a `SHUTDOWN RESOLUTION: ... already owned
 ...; not auto-refired` approach entry naming the owner. A stamp is also
-resolved record-only when it is older than 24 hours
-(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`): the resolution is a next-boot
+resolved record-only when its entry is older than 24 hours
+(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`; the age is read per thread from the
+map entry, and a legacy single-slot stamp supplies its top-level
+`recorded_at` for the thread it names): the resolution is a next-boot
 affair, and a stamp that old was left behind by an older build or by a
 downtime long enough that cadence or operator re-fires already superseded
 the interrupted fire. A missing or unparseable `recorded_at` counts as
