@@ -1840,7 +1840,27 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                 resolved.len()
             );
         }
-        Err(e) => debug!("engine v2: resolve_pending_shutdown_interruptions failed: {e}"),
+        // WI#339 (AE-4): a sweep failure suppresses recovery for every
+        // stamped mission at every boot — it must be loud, not debug-only.
+        Err(e) => tracing::warn!("engine v2: resolve_pending_shutdown_interruptions failed: {e}"),
+        _ => {}
+    }
+    // WI#339 (AE-5): deliver outcome notices owed at the last shutdown — a
+    // completion, MaxIterations, budget exhaustion, or an exhausted retry
+    // chain settling inside the grace was recorded but never reached the
+    // mission's channels (the broadcast consumer was already gone, and only
+    // retry markers carry the owed flag). The consumer is wired above.
+    match mission_manager
+        .deliver_pending_outcome_notifications()
+        .await
+    {
+        Ok(delivered) if !delivered.is_empty() => {
+            debug!(
+                "engine v2: delivered {} owed mission outcome notice(s)",
+                delivered.len()
+            );
+        }
+        Err(e) => tracing::warn!("engine v2: deliver_pending_outcome_notifications failed: {e}"),
         _ => {}
     }
     if let Some(budget) = crate::channels::budget::budget_for_channel("darkirc") {
