@@ -1599,11 +1599,15 @@ mod tests {
         let messages = thread.messages();
         let tool_result_content = &messages[2].content;
         assert!(
-            tool_result_content.len() <= 1010,
+            tool_result_content.len() <= 1000,
             "Tool result should be truncated, got {} chars",
             tool_result_content.len()
         );
-        assert!(tool_result_content.ends_with("..."));
+        // Head+tail middle elision (WI#351): the tail is preserved instead of
+        // a trailing "...".
+        assert!(tool_result_content.contains("middle elided"));
+        assert!(tool_result_content.starts_with("xxx"));
+        assert!(tool_result_content.ends_with("xxx"));
     }
 
     #[test]
