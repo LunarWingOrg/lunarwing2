@@ -1109,14 +1109,21 @@ build_pebble_worker() {
   local -a toolchain_args=()
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
+  # Fat builds target a candidate tag first: the toolchain smoke gate below
+  # must pass before the image is re-tagged :latest, so a failed probe can
+  # never replace the previous good image (WI#334).
+  local target_tag="lunarwing-worker-pebble:latest"
+  local candidate_tag="lunarwing-worker-pebble:candidate"
+  [[ "$with_toolchains" == "true" ]] && target_tag="$candidate_tag"
+
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
-    podman build $cache_flag "${toolchain_args[@]}" --network=host --format docker -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    podman build $cache_flag "${toolchain_args[@]}" --network=host --format docker -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   else
-    docker build $cache_flag "${toolchain_args[@]}" -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    docker build $cache_flag "${toolchain_args[@]}" -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   fi
 
@@ -1124,10 +1131,20 @@ build_pebble_worker() {
     # WI#334: prove the task-shell toolchain anchors on the freshly built fat
     # image (pebble's real /bin/sh -lc spawn mode plus a sanitised shell).
     # The slim image has no toolchains, so the probe is fat-only.
+    # CONTAINER_RT is passed explicitly: the smoke must probe the same store
+    # this build just wrote to (its own autodetect prefers podman, which may
+    # not be the build runtime).
+    # LUNARWING_PEBBLE_TOOLCHAIN_SMOKE is a test hook for harnesses to stub
+    # the probe; it is undocumented on purpose and only settable from the
+    # build operator's own environment. Production runs use the committed
+    # script.
     local smoke_script="${LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$pebble_dir/scripts/smoke-task-shell-toolchain.sh}"
     say "smoke-checking task-shell toolchain anchors (WI#334) ..."
-    "$smoke_script" image lunarwing-worker-pebble:latest \
+    CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$candidate_tag" \
       || die "pebble worker task-shell toolchain smoke check failed (WI#334)"
+    "$CONTAINER_RT" tag "$candidate_tag" lunarwing-worker-pebble:latest \
+      || die "pebble worker image tag failed"
+    "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
   fi
 
   say "pebble worker image built: lunarwing-worker-pebble:latest [$toolchain_desc]"
