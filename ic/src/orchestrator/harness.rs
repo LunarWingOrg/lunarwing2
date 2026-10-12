@@ -793,11 +793,23 @@ fn sweep_harness_dirs_in(
 /// that embed a mounted secret (CW-10).
 ///
 /// Examples of covered variants: raw text; lines of a multi-line value;
-/// JSON-escaped and URL-encoded forms; lowercase/uppercase hex (including
-/// 60-column `xxd -p` output); base64 in the standard and URL-safe alphabets
-/// (padded and unpadded); the 76-column wrapped output of the `base64` CLI;
-/// and the stream-stable base64 cores for a value encoded at byte offsets 1
-/// and 2 inside a larger blob (the `Authorization: Basic` shape).
+/// JSON-escaped and URL-encoded forms; lowercase/uppercase hex and base64 in
+/// the standard and URL-safe alphabets (padded and unpadded); and the
+/// stream-stable base64 cores for a value encoded at byte offsets 1 and 2
+/// inside a larger blob (the `Authorization: Basic` shape). Encoded forms are
+/// matched against the text with line breaks folded out (both real newlines
+/// and the JSON-escaped `\n`/`\r` two-character forms), so ANY CLI wrap width
+/// is covered — the `base64` 76-column default, `openssl base64` /
+/// `base64 -w 64`, `xxd -p` at 60 columns, etc. (EB-3). For secrets whose
+/// encoded form is at most [`WRAP_LINE_VARIANT_CHAR_CAP`] chars, individual
+/// wrap lines at the canonical widths are armed as well (a tool returning one
+/// line at a time); larger secrets rely on whole-blob fold matching to keep
+/// the variant count bounded (EB-4).
+///
+/// NOT covered (documented gaps): offset/grouped dump formats such as plain
+/// `xxd`, `od`, or `hexdump -C`, which interleave offsets and ASCII columns
+/// and never contain a contiguous encoded span; base32 and other alphabets;
+/// `rev` and similar reorderings.
 ///
 /// Redaction is BEST-EFFORT, not a security boundary: a sub-agent that
 /// deliberately slices a value (e.g. `cut -c1-32` over several calls, or an
@@ -810,7 +822,14 @@ fn sweep_harness_dirs_in(
 /// deliberately prints no variant material.
 #[derive(Clone, Default)]
 pub struct SecretValueRedactor {
-    variants: Vec<SecretString>,
+    /// Variants matched directly against the text: the raw value, per-line
+    /// splits of multi-line values, JSON-escaped and URL-encoded forms, and
+    /// capped per-width wrap lines.
+    direct_variants: Vec<SecretString>,
+    /// Contiguous ASCII encodings (hex lower/upper, base64 standard and
+    /// URL-safe plus offset cores) matched against the text with line breaks
+    /// folded out, covering every wrap width with O(1) variants (EB-3/EB-4).
+    folded_variants: Vec<SecretString>,
     /// Longest variant length in bytes; bounds the truncation-cut scan.
     max_variant_bytes: usize,
 }
@@ -818,7 +837,10 @@ pub struct SecretValueRedactor {
 impl std::fmt::Debug for SecretValueRedactor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretValueRedactor")
-            .field("armed_variants", &self.variants.len())
+            .field(
+                "armed_variants",
+                &(self.direct_variants.len() + self.folded_variants.len()),
+            )
             .finish()
     }
 }
@@ -828,6 +850,13 @@ const BASE64_CLI_WRAP_COLS: usize = 76;
 
 /// Column width of plain hex output from `xxd -p` (30 input bytes).
 const HEX_CLI_WRAP_COLS: usize = 60;
+
+/// Cap on the encoded length for which individual wrap lines are armed as
+/// direct variants (EB-4). Whole-blob coverage for larger encodings comes
+/// from fold matching, which is wrap-width independent. 4096 chars covers
+/// single-line tokens and PEM-sized secrets (~3 KiB raw) while capping the
+/// per-secret variant count at a few hundred instead of thousands.
+const WRAP_LINE_VARIANT_CHAR_CAP: usize = 4096;
 
 /// Insert a variant when it is long enough and not already present. Dedup
 /// hashes only — plaintext copies live solely in `variants`.
@@ -847,66 +876,68 @@ fn push_variant(
     }
 }
 
-/// Cover CLI wrapping both as raw output and inside serialized tool results.
-/// Lines are armed separately too, since a tool may return one line at a time.
-fn push_wrapped_variants(
+/// Arm individual wrap lines at one canonical width as direct variants, so a
+/// tool returning a single wrapped line at a time is still caught. Bounded by
+/// [`WRAP_LINE_VARIANT_CHAR_CAP`] — larger encodings are covered whole by the
+/// width-independent fold pass (EB-4).
+fn push_wrap_line_variants(
     variants: &mut Vec<SecretString>,
     seen: &mut std::collections::HashSet<u64>,
     encoded: &str,
     width: usize,
 ) {
-    if encoded.len() <= width {
+    if encoded.len() <= width || encoded.len() > WRAP_LINE_VARIANT_CHAR_CAP {
         return;
     }
     // All callers pass ASCII encodings, so the column boundaries are UTF-8 safe.
-    let lines: Vec<&str> = encoded
-        .as_bytes()
-        .chunks(width)
-        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
-        .collect();
-    push_variant(variants, seen, lines.join("\n"));
-    push_variant(variants, seen, lines.join("\\n"));
-    for line in lines {
-        push_variant(variants, seen, line.to_string());
+    for chunk in encoded.as_bytes().chunks(width) {
+        if let Ok(line) = std::str::from_utf8(chunk) {
+            push_variant(variants, seen, line.to_string());
+        }
     }
 }
 
-/// Insert a base64 encoding in padded, unpadded, and (when long enough to
-/// wrap) 76-column wrapped form, plus the stream-stable core with the final
-/// quantum dropped (the last 4 chars can mix with suffix bytes when the value
-/// sits inside a larger encoded blob).
+/// Insert a base64 encoding in padded and unpadded form, plus the
+/// stream-stable core with the final quantum dropped (the last 4 chars can
+/// mix with suffix bytes when the value sits inside a larger encoded blob).
+/// The full contiguous form is matched by the fold pass, so any CLI wrap
+/// width is covered; per-line pieces are armed via `push_wrap_line_variants`.
 fn push_base64_variants(
-    variants: &mut Vec<SecretString>,
+    direct: &mut Vec<SecretString>,
+    folded: &mut Vec<SecretString>,
     seen: &mut std::collections::HashSet<u64>,
     encoded: String,
 ) {
-    push_wrapped_variants(variants, seen, &encoded, BASE64_CLI_WRAP_COLS);
+    push_wrap_line_variants(direct, seen, &encoded, BASE64_CLI_WRAP_COLS);
     if encoded.len() >= MIN_REDACTED_SECRET_BYTES + 4 {
         let core = encoded[..encoded.len() - 4].to_string();
-        push_variant(variants, seen, core);
+        push_variant(folded, seen, core);
     }
     let unpadded = encoded.trim_end_matches('=').to_string();
     if unpadded != encoded {
-        push_variant(variants, seen, unpadded);
+        push_variant(folded, seen, unpadded);
     }
-    push_variant(variants, seen, encoded);
+    push_variant(folded, seen, encoded);
 }
 
-/// Selected encodings of one secret value (DG-2).
-fn secret_variants(raw: &str) -> Vec<SecretString> {
+/// Selected encodings of one secret value (DG-2), split into variants matched
+/// directly against the text and contiguous encodings matched with line
+/// breaks folded out (EB-3/EB-4).
+fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     use base64::Engine;
     use secrecy::ExposeSecret;
-    let mut variants = Vec::new();
+    let mut direct = Vec::new();
+    let mut folded = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    push_variant(&mut variants, &mut seen, raw.to_string());
+    push_variant(&mut direct, &mut seen, raw.to_string());
     // Multi-line values (PEM keys, service-account JSON) also leak one line
     // at a time.
     for line in raw.lines() {
-        push_variant(&mut variants, &mut seen, line.to_string());
+        push_variant(&mut direct, &mut seen, line.to_string());
         let trimmed = line.trim();
         if trimmed != line {
-            push_variant(&mut variants, &mut seen, trimmed.to_string());
+            push_variant(&mut direct, &mut seen, trimmed.to_string());
         }
     }
     // The form the value takes inside a JSON string literal.
@@ -916,21 +947,17 @@ fn secret_variants(raw: &str) -> Vec<SecretString> {
             .and_then(|s| s.strip_suffix('"'))
             .unwrap_or(json_quoted.as_str())
             .to_string();
-        push_variant(&mut variants, &mut seen, escaped);
+        push_variant(&mut direct, &mut seen, escaped);
     }
-    push_variant(
-        &mut variants,
-        &mut seen,
-        urlencoding::encode(raw).into_owned(),
-    );
-    // Plain hex and `xxd -p` / `xxd -p -u`, including serialized line breaks.
+    push_variant(&mut direct, &mut seen, urlencoding::encode(raw).into_owned());
+    // Plain hex, lowercase and `xxd -p -u` uppercase.
     let mut hex = String::with_capacity(raw.len() * 2);
     for byte in raw.as_bytes() {
         hex.push_str(&format!("{byte:02x}"));
     }
     for encoded in [hex.to_ascii_uppercase(), hex] {
-        push_wrapped_variants(&mut variants, &mut seen, &encoded, HEX_CLI_WRAP_COLS);
-        push_variant(&mut variants, &mut seen, encoded);
+        push_wrap_line_variants(&mut direct, &mut seen, &encoded, HEX_CLI_WRAP_COLS);
+        push_variant(&mut folded, &mut seen, encoded);
     }
 
     // Base64: standard + URL-safe alphabets, and the stream-stable cores for
@@ -945,13 +972,15 @@ fn secret_variants(raw: &str) -> Vec<SecretString> {
         }
         let slice = &bytes[start..];
         push_base64_variants(
-            &mut variants,
+            &mut direct,
+            &mut folded,
             &mut seen,
             base64::engine::general_purpose::STANDARD.encode(slice),
         );
         if start == 0 {
             push_base64_variants(
-                &mut variants,
+                &mut direct,
+                &mut folded,
                 &mut seen,
                 base64::engine::general_purpose::URL_SAFE.encode(slice),
             );
@@ -959,73 +988,168 @@ fn secret_variants(raw: &str) -> Vec<SecretString> {
     }
 
     // Longest first so overlapping values redact fully.
-    variants.sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
-    variants
+    direct.sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
+    folded.sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
+    (direct, folded)
+}
+
+/// Text with every line break removed so wrapped encodings match however the
+/// CLI wrapped them (EB-3). Both real newlines and the JSON-escaped `\n`/`\r`
+/// two-character forms are folded; `map` translates folded byte offsets back
+/// to the original byte offset of each folded char.
+struct FoldedText {
+    text: String,
+    map: Vec<usize>,
+}
+
+fn fold_line_breaks(text: &str) -> FoldedText {
+    let mut folded = String::with_capacity(text.len());
+    let mut map = Vec::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\n' | '\r' => {}
+            '\\' => {
+                if matches!(chars.peek(), Some(&(_, 'n' | 'r'))) {
+                    chars.next();
+                } else {
+                    push_mapped(&mut folded, &mut map, idx, ch);
+                }
+            }
+            _ => push_mapped(&mut folded, &mut map, idx, ch),
+        }
+    }
+    FoldedText { text: folded, map }
+}
+
+fn push_mapped(folded: &mut String, map: &mut Vec<usize>, orig_idx: usize, ch: char) {
+    // One map entry per folded BYTE; variants are pure ASCII and UTF-8
+    // continuation bytes are >= 0x80, so match boundaries never land on a
+    // continuation entry.
+    for _ in 0..ch.len_utf8() {
+        map.push(orig_idx);
+    }
+    folded.push(ch);
 }
 
 impl SecretValueRedactor {
     pub fn new(values: &[SecretString]) -> Self {
         use secrecy::ExposeSecret;
-        let mut variants = Vec::new();
+        let mut redactor = Self::default();
         for value in values {
-            let raw = value.expose_secret();
-            if raw.len() < MIN_REDACTED_SECRET_BYTES {
-                continue;
-            }
-            variants.extend(secret_variants(raw));
+            redactor.add_raw(value.expose_secret());
         }
-        // Values can overlap across separate secrets (e.g. password + URL).
-        variants.sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
-        let max_variant_bytes = variants
-            .iter()
-            .map(|v| v.expose_secret().len())
-            .max()
-            .unwrap_or(0);
-        Self {
-            variants,
-            max_variant_bytes,
-        }
+        redactor
     }
 
     /// Add one more value to an existing redactor (e.g. the worker bearer
     /// token, as defense in depth against accidental output — DG-7).
     pub fn add_value(&mut self, value: &str) {
+        self.add_raw(value);
+    }
+
+    fn add_raw(&mut self, raw: &str) {
         use secrecy::ExposeSecret;
-        if value.len() < MIN_REDACTED_SECRET_BYTES {
+        if raw.len() < MIN_REDACTED_SECRET_BYTES {
             return;
         }
-        self.variants.extend(secret_variants(value));
-        self.variants
+        let (direct, folded) = secret_variants(raw);
+        self.direct_variants.extend(direct);
+        self.folded_variants.extend(folded);
+        // Values can overlap across separate secrets (e.g. password + URL).
+        self.direct_variants
+            .sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
+        self.folded_variants
             .sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
         self.max_variant_bytes = self
-            .variants
+            .direct_variants
             .iter()
+            .chain(self.folded_variants.iter())
             .map(|v| v.expose_secret().len())
             .max()
             .unwrap_or(0);
     }
 
     pub fn is_armed(&self) -> bool {
-        !self.variants.is_empty()
+        !self.direct_variants.is_empty() || !self.folded_variants.is_empty()
     }
 
     /// True when `text` contains any mounted secret value in a known encoding.
     pub fn contains_secret(&self, text: &str) -> bool {
         use secrecy::ExposeSecret;
-        self.variants
+        if self
+            .direct_variants
             .iter()
             .any(|v| text.contains(v.expose_secret()))
+        {
+            return true;
+        }
+        if self.folded_variants.is_empty() {
+            return false;
+        }
+        let folded = fold_line_breaks(text);
+        self.folded_variants
+            .iter()
+            .any(|v| folded.text.contains(v.expose_secret()))
     }
 
     pub fn scrub(&self, text: &str) -> String {
         use secrecy::ExposeSecret;
-        let mut out = text.to_string();
-        for variant in &self.variants {
+        // Folded pass first: whole wrapped encodings are the longest matches;
+        // once they are replaced, the direct per-line pieces find nothing.
+        let mut out = self.scrub_folded(text);
+        for variant in &self.direct_variants {
             let variant = variant.expose_secret();
             if out.contains(variant) {
                 out = out.replace(variant, "[redacted-secret]");
             }
         }
+        out
+    }
+
+    /// Replace every folded-variant match in `text`, with line breaks folded
+    /// out for matching and mapped back for replacement (EB-3/EB-4).
+    fn scrub_folded(&self, text: &str) -> String {
+        use secrecy::ExposeSecret;
+        if self.folded_variants.is_empty() {
+            return text.to_string();
+        }
+        let folded = fold_line_breaks(text);
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for variant in &self.folded_variants {
+            let needle = variant.expose_secret();
+            let mut from = 0usize;
+            while let Some(pos) = folded.text[from..].find(needle) {
+                let start = from + pos;
+                let end = start + needle.len();
+                ranges.push((start, end));
+                from = end;
+            }
+        }
+        if ranges.is_empty() {
+            return text.to_string();
+        }
+        // Variants are longest-first; folded and original offsets are both
+        // monotonic, so an ascending sweep can skip overlaps by comparing
+        // original coordinates.
+        ranges.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for (fs, fe) in ranges {
+            let os = folded.map[fs];
+            // The replaced span ends right after the last matched char
+            // (variants are pure ASCII, so it is one byte): interior line
+            // breaks between matched chars are swallowed, but break
+            // characters BEFORE or AFTER the blob survive the redaction.
+            let oe = folded.map[fe - 1] + 1;
+            if os < cursor {
+                continue;
+            }
+            out.push_str(&text[cursor..os]);
+            out.push_str("[redacted-secret]");
+            cursor = oe;
+        }
+        out.push_str(&text[cursor..]);
         out
     }
 
@@ -1053,7 +1177,7 @@ impl SecretValueRedactor {
         }
         let tail_bytes = text.as_bytes();
         let mut best = 0usize;
-        for variant in &self.variants {
+        for variant in self.direct_variants.iter().chain(self.folded_variants.iter()) {
             let variant = variant.expose_secret().as_bytes();
             let upper = (variant.len() - 1).min(tail_bytes.len());
             let mut k = upper;
@@ -2219,6 +2343,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn redactor_fold_matching_covers_any_wrap_width() {
+        // EB-3: `openssl base64` (== `base64 -w 64`) and other non-76-column
+        // widths must scrub whole via fold matching, both as raw CLI output
+        // and inside a JSON-serialized tool result (escaped newlines).
+        use base64::Engine;
+        let value = "harness-fixture-with-at-least-61-bytes-for-real-shell-output-wrapping";
+        let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(value);
+        let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
+        for (encoded, width) in [(b64.clone(), 64usize), (b64, 30), (hex, 48)] {
+            let wrapped = encoded
+                .as_bytes()
+                .chunks(width)
+                .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
+                .collect::<Vec<_>>()
+                .join("\n");
+            let scrubbed = redactor.scrub(&format!("prefix\n{wrapped}\nsuffix"));
+            assert!(
+                !scrubbed.contains(&encoded),
+                "{width}-col wrap must fold-scrub"
+            );
+            for line in wrapped.lines() {
+                assert!(
+                    !scrubbed.contains(line),
+                    "no {width}-col line may survive: {line}"
+                );
+            }
+            let result = serde_json::json!({ "output": wrapped });
+            let serialized = serde_json::to_string_pretty(&result).unwrap(); // safety: test
+            let scrubbed = redactor.scrub(&serialized);
+            let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
+            assert_eq!(cleaned["output"], "[redacted-secret]");
+        }
+    }
+
+    #[test]
+    fn redactor_fold_matching_scrubs_large_secrets_without_line_variants() {
+        // EB-3/EB-4: a secret whose encodings exceed the per-line cap is still
+        // scrubbed whole at any wrap width, and the variant count stays
+        // bounded (no per-line explosion for MAX_SECRET_BYTES-sized values).
+        use base64::Engine;
+        let value = "V".repeat(MAX_SECRET_BYTES as usize);
+        let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
+        let total = redactor.direct_variants.len() + redactor.folded_variants.len();
+        assert!(
+            total < 256,
+            "variant count must stay bounded for large secrets, got {total}"
+        );
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
+        for width in [64usize, 76] {
+            let wrapped = b64
+                .as_bytes()
+                .chunks(width)
+                .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
+                .collect::<Vec<_>>()
+                .join("\n");
+            let scrubbed = redactor.scrub(&wrapped);
+            assert!(
+                !scrubbed.contains(&b64[..64]),
+                "{width}-col wrap of a large secret must fold-scrub"
+            );
+        }
+        // A value of all-same bytes compresses to identical wrap lines; use a
+        // varying value to prove per-line pieces are NOT armed above the cap.
+        let varying: String = (0..5000u32).map(|i| char::from_digit(i % 10, 10).unwrap()).collect(); // safety: test
+        let redactor = SecretValueRedactor::new([SecretString::from(varying.clone())].as_slice());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&varying);
+        assert!(b64.len() > WRAP_LINE_VARIANT_CHAR_CAP);
+        let first_line = std::str::from_utf8(&b64.as_bytes()[..76]).unwrap(); // safety: test
+        assert!(
+            !redactor.contains_secret(first_line),
+            "single wrap lines above the cap are intentionally not armed"
+        );
+    }
+
+    #[test]
+    fn redactor_fold_matching_handles_multibyte_text_and_crlf() {
+        // Folded-offset bookkeeping must stay correct when the text contains
+        // multi-byte UTF-8 and CRLF/JSON-escaped-\r line breaks.
+        use base64::Engine;
+        let value = "harness-fixture-value-with-enough-length-to-wrap-nicely-at-least-61-bytes";
+        let redactor = SecretValueRedactor::new([SecretString::from(value.to_string())].as_slice());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(value);
+        let wrapped = b64
+            .as_bytes()
+            .chunks(40)
+            .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let text = format!("émoji 🎠 prefix\r\n{wrapped}\r\n后缀");
+        let scrubbed = redactor.scrub(&text);
+        assert!(!scrubbed.contains(&b64));
+        assert!(scrubbed.contains("émoji 🎠 prefix"));
+        assert!(scrubbed.contains("后缀"));
+        assert!(redactor.contains_secret(&text));
+        assert!(!redactor.contains_secret("émoji 🎠 only"));
     }
 
     #[test]

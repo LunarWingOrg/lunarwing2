@@ -54,17 +54,29 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   denylist (`LD_PRELOAD`, `PATH`, …), and must not use the reserved
   `LUNARWING_`/`IRONCLAW_` prefixes (CV-4) — enforced daemon-side and
   re-checked worker-side. Bytes are written exactly (no newline trimming).
-- **Redaction (CV-7, DG-1/DG-2, DZ-1/DZ-4):** the conventional worker scrubs
-  selected value representations at the **serialized tool-result boundary,
-  before worker event truncation**, and reuses that text for `last_output`
-  and the LLM context. Examples include raw text, lines of multi-line values,
-  JSON-escaped and URL-encoded text, lowercase/uppercase hex (including
-  60-column `xxd -p` output), and base64 (standard/URL-safe, padded/unpadded,
-  76-column CLI wrapping, and standard-alphabet offset-1/2 stream cores).
-  Wrapped encodings include literal and JSON-escaped newlines and individual
-  wrap lines. Variants are sorted longest-first across all mounted values.
-  JSON object keys are also scrubbed. The daemon re-scrubs event ingest and
-  `/complete` before persistence and broadcast.
+- **Redaction (CV-7, DG-1/DG-2, DZ-1/DZ-4, EB-3/EB-4):** the conventional
+  worker scrubs selected value representations at the **serialized
+  tool-result boundary, before worker event truncation**, and reuses that
+  text for `last_output` and the LLM context. Examples include raw text,
+  lines of multi-line values, JSON-escaped and URL-encoded text,
+  lowercase/uppercase hex, and base64 (standard/URL-safe, padded/unpadded,
+  and standard-alphabet offset-1/2 stream cores). Encoded forms are matched
+  with line breaks folded out (real newlines and JSON-escaped `\n`/`\r`), so
+  **any** CLI wrap width is covered from one contiguous variant — the
+  `base64` 76-column default, `openssl base64` / `base64 -w 64`, `xxd -p` at
+  60 columns, etc. For secrets whose encoded form is at most 4096 chars,
+  individual wrap lines at the canonical widths are armed as well (a tool
+  returning one line at a time); larger secrets rely on whole-blob fold
+  matching so the variant count stays bounded. Variants are sorted
+  longest-first across all mounted values. JSON object keys are also
+  scrubbed. The daemon re-scrubs event ingest and `/complete` before
+  persistence and broadcast, using a redactor built **once per job and
+  cached** next to the held secrets (cleared on the same terminal paths).
+  - NOT covered (documented gaps): offset/grouped dump formats — plain
+    `xxd`, `od`, `hexdump -C` — which interleave offsets and ASCII columns
+    and never contain a contiguous encoded span; base32 and other alphabets;
+    `rev`-style reorderings. Fold matching can over-redact when unrelated
+    base64/hex-looking text spans a folded line break (safe direction).
   - Tools can truncate **before** this boundary: shell capture is capped at
     64 KiB and then reduced to a 32 KiB head/tail result. Fragments at those
     internal cuts may survive. The partial-prefix check only protects the
@@ -206,11 +218,12 @@ cannot be listed).
 
 ## Explicitly out of scope (follow-ups)
 
-- !1542 residual Low/Info findings: structured-field/other-encoding redaction
-  gaps and low-entropy line over-redaction; staged paths bypassing value scans
+- !1542 residual Low/Info findings: structured-field extraction redaction
+  gaps (`jq -r .field` output is decoded text, not an armed encoding) and
+  low-entropy line over-redaction; staged paths bypassing value scans
   and direct audit/result scrubbing; duplicate `/complete` handler side
-  effects beyond the manager's idempotence; temporary plaintext copies and
-  per-request redactor rebuilding; remaining preparation/cleanup orphans;
+  effects beyond the manager's idempotence; temporary plaintext copies;
+  remaining preparation/cleanup orphans;
   no promotion deadline; remaining synchronous filesystem cleanup on async
   tasks; and stronger delivery, sparse-file and persisted-insert tests.
 - External-worker (opencode/pebble) secrets mounting — this WI covers the

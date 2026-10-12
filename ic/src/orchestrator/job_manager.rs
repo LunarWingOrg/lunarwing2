@@ -1695,7 +1695,7 @@ async fn run_promotion(
     let staging_buf = staging.to_path_buf();
     let policy_owned = policy.clone();
     let planned = tokio::task::spawn_blocking(move || {
-        harness::plan_promotion(&staging_buf, &policy_owned, redactor.as_ref())
+        harness::plan_promotion(&staging_buf, &policy_owned, redactor.as_deref())
     })
     .await;
     let plan = match planned {

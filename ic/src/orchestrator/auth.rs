@@ -110,6 +110,11 @@ pub struct TokenStore {
     /// worker pulls exactly once at startup; any later pull is a replay and
     /// gets 410 Gone, so a token leaked mid-job cannot re-fetch values.
     harness_secrets_served: Arc<RwLock<std::collections::HashSet<Uuid>>>,
+    /// Per-job redactor cache (EB-4): building a redactor costs one variant
+    /// set per secret, so it is built once per job and reused by every
+    /// event/complete scrub. Cleared alongside the secrets on terminal paths.
+    harness_redactors:
+        Arc<RwLock<HashMap<Uuid, Arc<crate::orchestrator::harness::SecretValueRedactor>>>>,
 }
 
 impl TokenStore {
@@ -120,6 +125,7 @@ impl TokenStore {
             mcp_credential_grants: Arc::new(RwLock::new(HashMap::new())),
             harness_secrets: Arc::new(RwLock::new(HashMap::new())),
             harness_secrets_served: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            harness_redactors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -190,6 +196,8 @@ impl TokenStore {
         } else {
             stored.insert(job_id, secrets);
         }
+        // A re-store invalidates any redactor built from the older values.
+        self.harness_redactors.write().await.remove(&job_id);
     }
 
     /// Retrieve the mounted file names and values for a job (worker pull).
@@ -197,12 +205,17 @@ impl TokenStore {
         self.harness_secrets.read().await.get(&job_id).cloned()
     }
 
-    /// Build a redactor over the job's mounted secret values (CV-7/CW-10).
-    /// Returns `None` when the job has no harness secrets.
+    /// The job's redactor over its mounted secret values (CV-7/CW-10), built
+    /// once and cached per job (EB-4) — rebuilding on every event would
+    /// re-allocate the full variant set per request. Returns `None` when the
+    /// job has no harness secrets.
     pub async fn harness_secret_redactor(
         &self,
         job_id: Uuid,
-    ) -> Option<crate::orchestrator::harness::SecretValueRedactor> {
+    ) -> Option<Arc<crate::orchestrator::harness::SecretValueRedactor>> {
+        if let Some(redactor) = self.harness_redactors.read().await.get(&job_id) {
+            return Some(Arc::clone(redactor));
+        }
         let values: Vec<SecretString> = self
             .harness_secrets
             .read()
@@ -212,7 +225,15 @@ impl TokenStore {
             .map(|(_, value)| value.clone())
             .collect();
         let redactor = crate::orchestrator::harness::SecretValueRedactor::new(&values);
-        redactor.is_armed().then_some(redactor)
+        if !redactor.is_armed() {
+            return None;
+        }
+        let redactor = Arc::new(redactor);
+        self.harness_redactors
+            .write()
+            .await
+            .insert(job_id, Arc::clone(&redactor));
+        Some(redactor)
     }
 
     /// Release a job's mounted secret values. Called on every terminal path
@@ -220,6 +241,7 @@ impl TokenStore {
     pub async fn clear_harness_secrets(&self, job_id: Uuid) {
         self.harness_secrets.write().await.remove(&job_id);
         self.harness_secrets_served.write().await.remove(&job_id);
+        self.harness_redactors.write().await.remove(&job_id);
     }
 
     /// Mark the job's harness secrets as served (DG-7 one-shot delivery).
@@ -510,6 +532,45 @@ mod tests {
 
         store.clear_harness_secrets(job_id).await;
         assert!(store.harness_secrets(job_id).await.is_none());
+        assert!(store.harness_secret_redactor(job_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn harness_redactor_is_cached_per_job_and_cleared_with_secrets() {
+        // EB-4: the redactor is built once per job, not per request.
+        let store = TokenStore::new();
+        let job_id = Uuid::new_v4();
+        store
+            .store_harness_secrets(
+                job_id,
+                vec![(
+                    "API_KEY".to_string(),
+                    SecretString::from("value-that-is-long-enough".to_string()),
+                )],
+            )
+            .await;
+
+        let first = store.harness_secret_redactor(job_id).await.unwrap();
+        let second = store.harness_secret_redactor(job_id).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeat calls must reuse the cached redactor"
+        );
+
+        // A re-store invalidates the cache (new values, new redactor).
+        store
+            .store_harness_secrets(
+                job_id,
+                vec![(
+                    "API_KEY".to_string(),
+                    SecretString::from("another-value-that-is-long".to_string()),
+                )],
+            )
+            .await;
+        let third = store.harness_secret_redactor(job_id).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &third));
+
+        store.clear_harness_secrets(job_id).await;
         assert!(store.harness_secret_redactor(job_id).await.is_none());
     }
 }
