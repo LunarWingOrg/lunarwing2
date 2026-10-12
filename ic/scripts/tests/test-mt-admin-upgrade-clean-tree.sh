@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
+export INIT_SYSTEM=systemd
 
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
@@ -249,6 +250,44 @@ if output="$(upgrade_tenant fixture moving '' false false 2>&1)" \
   pass 'upgrade refreshes an installed health pipeline once despite auto-install opt-out'
 else
   fail "upgrade did not refresh an installed health pipeline: $output"
+fi
+
+# !1547 EG-1: migration precedes backup probes; ordinary OpenRC rendering also
+# precedes stop. --skip-render cannot bypass fleet proxy neutralization.
+events="$fixture/rollout-events"
+render_all_openrc_proxy_units() { printf 'neutralize\n' >>"$events"; }
+render_tenant_units() { printf 'render\n' >>"$events"; }
+backup_tenant_postgres() { printf 'backup\n' >>"$events"; }
+stop_tenant() { printf 'stop\n' >>"$events"; }
+start_tenant() { printf 'start\n' >>"$events"; }
+for init in openrc systemd; do
+  INIT_SYSTEM="$init"
+  for do_render in true false; do
+    : >"$events"
+    expected=""
+    [[ "$init" != openrc ]] || expected+=$'neutralize\n'
+    expected+=$'backup\n'
+    [[ "$init" != openrc || "$do_render" != true ]] || expected+=$'render\n'
+    expected+=$'stop\n'
+    [[ "$do_render" != true ]] || expected+=$'render\n'
+    expected+='start'
+    if output="$(upgrade_tenant fixture "$target" '' true "$do_render" 2>&1)" \
+      && [[ "$(cat "$events")" == "$expected" ]]; then
+      pass "$init upgrade rollout order (render=$do_render)"
+    else
+      fail "$init upgrade rollout order (render=$do_render): $output"
+    fi
+  done
+done
+INIT_SYSTEM=openrc
+render_all_openrc_proxy_units() { return 1; }
+: >"$events"
+if output="$(upgrade_tenant fixture "$target" '' true true 2>&1)"; then
+  fail 'failed fleet neutralization did not block upgrade'
+elif [[ -s "$events" ]]; then
+  fail 'failed neutralization still invoked backup/stop/start'
+else
+  pass 'failed neutralization blocks upgrade before service operations'
 fi
 
 if [[ "$failures" -ne 0 ]]; then

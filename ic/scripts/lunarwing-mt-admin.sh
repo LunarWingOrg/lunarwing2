@@ -425,15 +425,19 @@ Commands:
                                    Workers: pebble, opencode, kimi, opencode2
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
+  render-units --all-proxies      OpenRC only: replace proxy units fleet-wide without
+                                  invoking OpenRC (WI#376 neutralize-first migration)
   upgrade-tenant <name> --target <ref>
                                   In-place upgrade: backup, fetch, clean-tree gate,
                                   stop, checkout <ref> (as tenant user), rebuild
                                    with WASM and selected OpenCode/Kimi workers, re-render
                                   units, patch env, start.
+                                  OpenRC neutralizes fleet proxy units before probes/stop.
                                   Long-running — run inside tmux.
     --source-repo <path>           Point the tenant's git origin at this repo first
     --no-backup                    Skip the pre-upgrade Postgres backup
-    --skip-render                  Keep existing unit files (run render-units later;
+    --skip-render                  Keep other unit files; OpenRC proxy neutralization
+                                   is mandatory (run render-units later;
                                    must happen before v2.0.0 for pre-1.1.9 tenants)
   rotate-pg-password <name>       Generate a new random PG password (ALTER ROLE + env update)
   psql <name> [psql args...]      Run psql inside the tenant's own PostgreSQL
@@ -1158,9 +1162,13 @@ main() {
 
     render-units)
       require_root
-      [[ -n "${1:-}" ]] || die "usage: render-units <name>"
-      ports_registry_init
-      render_tenant_units "$1"
+      [[ $# -eq 1 ]] || die "usage: render-units <name>|--all-proxies"
+      if [[ "$1" == --all-proxies ]]; then
+        render_all_openrc_proxy_units
+      else
+        ports_registry_init
+        render_tenant_units "$1"
+      fi
       ;;
 
     upgrade-tenant)

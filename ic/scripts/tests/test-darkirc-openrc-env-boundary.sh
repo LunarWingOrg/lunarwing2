@@ -154,6 +154,7 @@ fi
 # shellcheck disable=SC1091
 source "$ADMIN_SCRIPT"
 render_body="$(declare -f render_tenant_openrc_units)"
+render_body+="$(declare -f render_proxy_openrc_unit)"
 weechat_render_body="$(declare -f _render_weechat_openrc_unit)"
 writer_body="$(declare -f write_tenant_darkirc_adapter_env)"
 grep -Fq 'write_tenant_file_atomic "$name" "$path" 600' <<<"$writer_body" || {

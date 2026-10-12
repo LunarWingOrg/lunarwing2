@@ -40,7 +40,7 @@ restart_weechat_adapter() {
       _systemctl_user "$name" restart "lunarwing-weechat-adapter-${name}.service"
       ;;
     openrc)
-      rc-service "lunarwing-weechat-adapter-${name}" restart
+      _openrc_service "lunarwing-weechat-adapter-${name}" restart
       ;;
     *) die "unsupported init system: $INIT_SYSTEM" ;;
   esac
@@ -116,12 +116,12 @@ weechat_lifecycle_stop_disable() {
       local svc link runlevel
       for svc in "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"; do
         if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
-          rc-service "$svc" stop || return 1
+          _openrc_service "$svc" stop || return 1
         fi
         for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
           [[ -e "$link" || -L "$link" ]] || continue
           runlevel="$(basename "$(dirname "$link")")"
-          rc-update del "$svc" "$runlevel" || return 1
+          _openrc_update del "$svc" "$runlevel" || return 1
         done
       done
       say "stopped + removed from runlevels: lunarwing-weechat{,-adapter}-${name} (OpenRC)"
@@ -160,10 +160,10 @@ weechat_lifecycle_enable_start() {
         say "weechat units not rendered for '$name'" >&2
         return 1
       fi
-      rc-update add "lunarwing-weechat-${name}" default || return 1
-      rc-update add "lunarwing-weechat-adapter-${name}" default || return 1
-      rc-service "lunarwing-weechat-${name}" start || return 1
-      rc-service "lunarwing-weechat-adapter-${name}" start || return 1
+      _openrc_update add "lunarwing-weechat-${name}" default || return 1
+      _openrc_update add "lunarwing-weechat-adapter-${name}" default || return 1
+      _openrc_service "lunarwing-weechat-${name}" start || return 1
+      _openrc_service "lunarwing-weechat-adapter-${name}" start || return 1
       say "enabled + started lunarwing-weechat{,-adapter}-${name} (OpenRC)"
       ;;
     *)
@@ -302,8 +302,8 @@ stop_tenant_writers() {
         "lunarwing-opencode2-${name}"|"lunarwing-opencode2-${name}-sup") continue ;;
       esac
       [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
-      rc-service "$service" stop >/dev/null 2>&1 \
-        || rc-service "$service" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
+      _openrc_service "$service" stop >/dev/null 2>&1 \
+        || _openrc_service "$service" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
         || die "failed to stop writer $service"
     done < <(tenant_writer_services "$name")
   fi
@@ -365,7 +365,7 @@ tenant_writers_active() {
     while IFS= read -r service; do
       [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
       rc=0
-      state="$(rc-service "$service" status 2>&1)" || rc=$?
+      state="$(_openrc_service "$service" status 2>&1)" || rc=$?
       case "$state" in
         # WI#137: the WeeChat unit reports "session is up" / "session is not
         # running" instead of the standard started/stopped wording. "not
@@ -468,8 +468,8 @@ darkirc_health_strict() {
     _systemctl_user "$name" is-active --quiet "lunarwing-darkirc-adapter-${name}.service" \
       || return 1
   else
-    rc-service "lunarwing-darkirc-${name}" status >/dev/null 2>&1 || return 1
-    rc-service "lunarwing-darkirc-adapter-${name}" status >/dev/null 2>&1 || return 1
+    _openrc_service "lunarwing-darkirc-${name}" status >/dev/null 2>&1 || return 1
+    _openrc_service "lunarwing-darkirc-adapter-${name}" status >/dev/null 2>&1 || return 1
   fi
 
   adapter_port="$(ports_get "$name" darkirc_adapter 2>/dev/null || true)"
@@ -901,7 +901,7 @@ _restart_tenant_daemon() {
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     _systemctl_user "$name" restart "lunarwing-${name}.service"
   else
-    rc-service "lunarwing-${name}" restart
+    _openrc_service "lunarwing-${name}" restart
   fi
 }
 
@@ -1423,6 +1423,8 @@ upgrade_tenant_darkirc_locked() {
 # re-render units -> patch env -> start). The verbs it calls dispatch
 # OpenRC/systemd themselves, so this works on any supported init system. See
 # docs/ops/TENANT-RENAME-MIGRATION-1.1.9.md for the 1.1.9 rename specifics.
+# OpenRC additionally neutralizes fleet proxy units before backup/probes, then
+# renders this tenant before stopping it (WI#376 / !1547).
 upgrade_tenant() {
   local name="$1"
   shift
@@ -1452,6 +1454,14 @@ upgrade_tenant_locked() {
   repo="$(tenant_repo "$name")"
 
   [[ -d "$lw_root/.git" ]] || die "no git checkout at $lw_root; run add-tenant first"
+
+  # WI#376: even a status/stop of another tenant may rebuild OpenRC's entire
+  # dependency cache. Neutralize ALL installed proxies before any such call,
+  # including backup preflights. Mandatory even with --skip-render.
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == openrc ]]; then
+    render_all_openrc_proxy_units || die "failed to neutralize OpenRC proxy units; tenant was not stopped"
+  fi
 
   local tgit=(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root")
 
@@ -1501,6 +1511,9 @@ upgrade_tenant_locked() {
 
   previous_commit="$("${tgit[@]}" rev-parse --verify HEAD)" \
     || die "failed to record current tenant commit"
+  if [[ "$INIT_SYSTEM" == openrc && "$do_render" == true ]]; then
+    render_tenant_units "$name" || die "pre-stop OpenRC rendering failed; tenant was not stopped"
+  fi
   stop_tenant "$name"
 
   say "checking out $target at $target_commit (as $name) ..."
@@ -1536,7 +1549,7 @@ upgrade_tenant_locked() {
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
   else
-    say "skipping render-units (--skip-render); unit files keep their embedded paths"
+    say "skipping ordinary render-units (--skip-render)"
   fi
 
   patch_tenant_env "$name"
@@ -1561,8 +1574,9 @@ upgrade_tenant_locked() {
 
 openrc_service_state() {
   local svc="$1" output state
+  require_safe_openrc_proxy_units || return 1
 
-  if output="$(rc-service "$svc" status 2>/dev/null)"; then
+  if output="$(_openrc_service "$svc" status 2>/dev/null)"; then
     state="$(grep -oE 'started|stopped|crashed' <<<"$output" | head -n 1 || true)"
     printf '%s\n' "${state:-started}"
     return 0
@@ -1667,6 +1681,10 @@ _daemon_pid_belongs_to_tenant() {
 status_tenant() {
   local name="$1"
   name="$(sanitize_name "$name")"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == openrc ]]; then
+    require_safe_openrc_proxy_units || return 1
+  fi
 
   if ! tenant_exists_in_registry "$name"; then
     say "tenant '$name' not found in registry"

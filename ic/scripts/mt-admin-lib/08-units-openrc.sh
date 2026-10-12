@@ -22,14 +22,14 @@
 _register_vision_openrc() {
   local name="$1" container="lunarwing-vision-${1}" uid home
   render_vision_openrc_unit "$name" || return 1
-  rc-update add "$container" default >/dev/null 2>&1 || return 1
-  rc-service "$container" start >/dev/null 2>&1 || return 1
+  _openrc_update add "$container" default >/dev/null 2>&1 || return 1
+  _openrc_service "$container" start >/dev/null 2>&1 || return 1
   [[ "$MT_ROOTLESS" == "true" ]] || return 0
   uid="$(id -u "$name")" || return 1
   home="$(tenant_home "$name")"
   render_container_babysitter_unit "$name" vision "$container" "$uid" "$home" || return 1
-  rc-update add "${container}-sup" default >/dev/null 2>&1 || return 1
-  rc-service "${container}-sup" start >/dev/null 2>&1 || return 1
+  _openrc_update add "${container}-sup" default >/dev/null 2>&1 || return 1
+  _openrc_service "${container}-sup" start >/dev/null 2>&1 || return 1
 }
 
 render_vision_openrc_unit() {
@@ -117,8 +117,8 @@ remove_vision_openrc_assets() {
     [[ ! -e "$path" && ! -L "$path" ]] && continue
     [[ -f "$path" && ! -L "$path" ]] \
       || { say "ERROR: refusing to remove unsafe LunarVision OpenRC unit $path" >&2; return 1; }
-    rc-service "${path##*/}" stop >/dev/null 2>&1 || true
-    rc-update del "${path##*/}" default >/dev/null 2>&1 || true
+    _openrc_service "${path##*/}" stop >/dev/null 2>&1 || true
+    _openrc_update del "${path##*/}" default >/dev/null 2>&1 || true
     rm -f -- "$path"
   done
   rm -f -- "$(_hash_dir "$name")/${container}.hash"
@@ -146,14 +146,14 @@ render_vision_openrc_assets() {
 _register_voice_openrc() {
   local name="$1" container="lunarwing-voice-${1}" uid home
   render_voice_openrc_unit "$name" || return 1
-  rc-update add "$container" default >/dev/null 2>&1 || return 1
-  rc-service "$container" start >/dev/null 2>&1 || return 1
+  _openrc_update add "$container" default >/dev/null 2>&1 || return 1
+  _openrc_service "$container" start >/dev/null 2>&1 || return 1
   [[ "$MT_ROOTLESS" == "true" ]] || return 0
   uid="$(id -u "$name")" || return 1
   home="$(tenant_home "$name")"
   render_container_babysitter_unit "$name" voice "$container" "$uid" "$home" || return 1
-  rc-update add "${container}-sup" default >/dev/null 2>&1 || return 1
-  rc-service "${container}-sup" start >/dev/null 2>&1 || return 1
+  _openrc_update add "${container}-sup" default >/dev/null 2>&1 || return 1
+  _openrc_service "${container}-sup" start >/dev/null 2>&1 || return 1
 }
 
 render_voice_openrc_unit() {
@@ -238,8 +238,8 @@ render_voice_openrc_assets() {
   direct="$OPENRC_INITD_DIR/$container"
   supervisor="$OPENRC_INITD_DIR/${container}-sup"
   if ! tenant_voice_enabled "$name"; then
-    rc-update del "${container}-sup" default >/dev/null 2>&1 || true
-    rc-update del "$container" default >/dev/null 2>&1 || true
+    _openrc_update del "${container}-sup" default >/dev/null 2>&1 || true
+    _openrc_update del "$container" default >/dev/null 2>&1 || true
     rm -f -- "$direct" "$supervisor"
     return 0
   fi
@@ -385,6 +385,139 @@ INITEOF
 }
 
 # ── OpenRC service units ─────────────────────────────────────────────────────
+
+# A dependency-cache rebuild can source every init script, even for a command
+# addressing a different tenant. Inspect files as data before invoking OpenRC.
+require_safe_openrc_proxy_units() {
+  local path
+  for path in "$OPENRC_INITD_DIR"/lunarwing-proxy-*; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    if [[ ! -f "$path" || -L "$path" ]] || ! grep -Eq \
+      '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"; then
+      say "refusing OpenRC operation: unsafe legacy proxy unit $path; run: $0 render-units --all-proxies" >&2
+      return 1
+    fi
+  done
+}
+
+_openrc_service() {
+  # All mt-admin rc-service/rc-update calls go through these guards, including
+  # worker, sidecar and cron operations which can also trigger a deptree rebuild.
+  require_safe_openrc_proxy_units || return 1
+  rc-service "$@"
+}
+
+_openrc_update() {
+  require_safe_openrc_proxy_units || return 1
+  rc-update "$@"
+}
+
+# File-only fleet migration. Do not call the full tenant renderer here: its
+# retirement/sidecar helpers can invoke OpenRC before other tenants are repaired.
+# Include installed-but-disabled proxies; refuse orphaned or unsafe paths so
+# they cannot be overlooked by a registry-only sweep. No tenant env is read.
+render_all_openrc_proxy_units() {
+  ensure_init_system
+  [[ "$INIT_SYSTEM" == openrc ]] || die "render-units --all-proxies requires OpenRC"
+  ports_registry_require_readonly
+  local names name path
+  names="$(all_tenant_names)" || return 1
+  local -A selected=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$name" == "$(sanitize_name "$name")" ]] || die "invalid tenant name in registry"
+    if tenant_proxy_enabled "$name"; then selected["$name"]=1; fi
+  done <<<"$names"
+  for path in "$OPENRC_INITD_DIR"/lunarwing-proxy-*; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    [[ -f "$path" && ! -L "$path" ]] || die "unsafe installed proxy unit: $path"
+    name="${path##*/lunarwing-proxy-}"
+    [[ -n "$name" && "$name" == "$(sanitize_name "$name")" ]] \
+      && tenant_exists_in_registry "$name" \
+      || die "unregistered proxy unit $path; inspect and move it outside init.d before retrying (do not invoke OpenRC)"
+    selected["$name"]=1
+  done
+  install_openrc_env_exec || return 1
+  for name in "${!selected[@]}"; do
+    render_proxy_openrc_unit "$name" || return 1
+  done
+  require_safe_openrc_proxy_units || return 1
+  say "OpenRC proxy units neutralized fleet-wide (file writes only; services not restarted)."
+}
+
+# Pure proxy renderer shared by normal rendering and the fleet migration. The
+# atomic replacement prevents dependency scanning from seeing a partial script.
+render_proxy_openrc_unit() {
+  local name="$1" proxy_port proxy_bin env_dir run_dir log_dir path tmp
+  proxy_port="$(ports_get "$name" proxy)" || return 1
+  [[ "$proxy_port" =~ ^[0-9]+$ ]] || die "invalid proxy port for $name"
+  proxy_bin="$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py"
+  env_dir="$(tenant_env_dir "$name")"
+  run_dir="$(tenant_run_dir "$name")"
+  log_dir="$(tenant_log_dir "$name")"
+  mkdir -p "$OPENRC_INITD_DIR" || return 1
+  path="$OPENRC_INITD_DIR/lunarwing-proxy-${name}"
+  [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || die "unsafe installed proxy unit: $path"
+  tmp="$(mktemp "$OPENRC_INITD_DIR/.lunarwing-proxy-${name}.XXXXXX")" || return 1
+  if ! cat >"$tmp" <<INITEOF
+#!/sbin/openrc-run
+
+description="LunarWing TensorZero proxy ($name)"
+
+: "\${proxy_command:=$(command -v python3)}"
+: "\${proxy_args:=$proxy_bin --port $proxy_port --bind 127.0.0.1 --tensorzero-env}"
+: "\${proxy_user:=$name}"
+: "\${proxy_group:=$name}"
+: "\${proxy_pidfile:=$run_dir/proxy.pid}"
+: "\${proxy_runtime_dir:=$run_dir}"
+: "\${proxy_log_dir:=$log_dir}"
+: "\${proxy_output_log:=\${proxy_log_dir}/proxy.log}"
+: "\${proxy_error_log:=\${proxy_log_dir}/proxy.err}"
+: "\${proxy_env_file:=$env_dir/proxy.env}"
+: "\${proxy_openrc_env_exec:=$OPENRC_ENV_EXEC}"
+: "\${proxy_umask:=0077}"
+: "\${proxy_respawn_delay:=5}"
+: "\${proxy_respawn_max:=5}"
+: "\${proxy_respawn_period:=60}"
+: "\${proxy_retry:=SIGTERM/30/KILL/5}"
+
+command="\${proxy_openrc_env_exec}"
+command_args="--env-file \${proxy_env_file} -- \${proxy_command} \${proxy_args}"
+command_user="\${proxy_user}:\${proxy_group}"
+pidfile="\${proxy_pidfile}"
+supervisor="supervise-daemon"
+retry="\${proxy_retry}"
+respawn_delay="\${proxy_respawn_delay}"
+respawn_max="\${proxy_respawn_max}"
+respawn_period="\${proxy_respawn_period}"
+output_log="\${proxy_output_log}"
+error_log="\${proxy_error_log}"
+required_files="\${proxy_openrc_env_exec} \${proxy_command} \${proxy_env_file}"
+
+depend() {
+    need net
+    use dns
+    after firewall
+    before lunarwing-${name}
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_runtime_dir}"
+    checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_log_dir}"
+    checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${output_log}"
+    checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${error_log}"
+    umask "\${proxy_umask}"
+}
+INITEOF
+  then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! chmod 0755 "$tmp" || ! mv -T -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
 
 install_openrc_env_exec() {
   local install_dir owner group mode links
@@ -550,15 +683,9 @@ render_tenant_openrc_units() {
   install_openrc_env_exec
   mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR"
 
-  local proxy_port bridge_port weechat_port
-  proxy_port="$(ports_get "$name" proxy)"
+  local bridge_port weechat_port
   bridge_port="$(ports_get "$name" bridge)"
   weechat_port="$(ports_get "$name" weechat)"
-
-  local proxy_bin
-  # Run from the tenant's own clone (in their home), not the admin's source repo,
-  # so a tenant's services aren't coupled to another user's home directory.
-  proxy_bin="$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py"
 
   local ws_adapter_path
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
@@ -1034,61 +1161,12 @@ INITEOF
   # drops privileges; the proxy reads TENSORZERO_URL without shell evaluation.
   if tenant_proxy_enabled "$name"; then
   local proxy_upstream
-  proxy_upstream="$(_read_env_value "$env_dir/proxy.env" TENSORZERO_URL)"
+  proxy_upstream="$(read_tenant_env_value "$name" "$env_dir/proxy.env" TENSORZERO_URL)" \
+    || die "cannot safely read proxy.env for tenant '$name'"
   [[ -n "$proxy_upstream" ]] \
     || die "proxy enabled for tenant '$name' but $env_dir/proxy.env has no TENSORZERO_URL; re-render with: $0 add-tenant $name --tensorzero-url <url>"
   validate_llm_url "$proxy_upstream" "proxy.env TENSORZERO_URL ($name)"
-  cat >"$OPENRC_INITD_DIR/lunarwing-proxy-${name}" <<INITEOF
-#!/sbin/openrc-run
-
-description="LunarWing TensorZero proxy ($name)"
-
-: "\${proxy_command:=$(command -v python3)}"
-: "\${proxy_args:=$proxy_bin --port $proxy_port --bind 127.0.0.1 --tensorzero-env}"
-: "\${proxy_user:=$name}"
-: "\${proxy_group:=$name}"
-: "\${proxy_pidfile:=$run_dir/proxy.pid}"
-: "\${proxy_runtime_dir:=$run_dir}"
-: "\${proxy_log_dir:=$log_dir}"
-: "\${proxy_output_log:=\${proxy_log_dir}/proxy.log}"
-: "\${proxy_error_log:=\${proxy_log_dir}/proxy.err}"
-: "\${proxy_env_file:=$env_dir/proxy.env}"
-: "\${proxy_openrc_env_exec:=$OPENRC_ENV_EXEC}"
-: "\${proxy_umask:=0077}"
-: "\${proxy_respawn_delay:=5}"
-: "\${proxy_respawn_max:=5}"
-: "\${proxy_respawn_period:=60}"
-: "\${proxy_retry:=SIGTERM/30/KILL/5}"
-
-command="\${proxy_openrc_env_exec}"
-command_args="--env-file \${proxy_env_file} -- \${proxy_command} \${proxy_args}"
-command_user="\${proxy_user}:\${proxy_group}"
-pidfile="\${proxy_pidfile}"
-supervisor="supervise-daemon"
-retry="\${proxy_retry}"
-respawn_delay="\${proxy_respawn_delay}"
-respawn_max="\${proxy_respawn_max}"
-respawn_period="\${proxy_respawn_period}"
-output_log="\${proxy_output_log}"
-error_log="\${proxy_error_log}"
-required_files="\${proxy_openrc_env_exec} \${proxy_command} \${proxy_env_file}"
-
-depend() {
-    need net
-    use dns
-    after firewall
-    before lunarwing-${name}
-}
-
-start_pre() {
-    checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_runtime_dir}"
-    checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_log_dir}"
-    checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${output_log}"
-    checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${error_log}"
-    umask "\${proxy_umask}"
-}
-INITEOF
-  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-proxy-${name}"
+  render_proxy_openrc_unit "$name" || return 1
   fi
 
   if [[ "$weechat_enabled" == "true" ]]; then
@@ -1267,6 +1345,7 @@ CONFD
 
 start_tenant_openrc() {
   local name="$1"
+  require_safe_openrc_proxy_units || return 1
   # Record operator intent UP FRONT: enabling the primary daemon in the default
   # runlevel marks this tenant as "started" (boot-persistent) regardless of whether
   # any unit's FIRST start succeeds. health-openrc.sh's started-gate
@@ -1274,33 +1353,33 @@ start_tenant_openrc() {
   # start is still reported `critical` (a real outage) and remediated — not masked
   # as `skipped`. The selective rc-update-add loop below additionally boot-enables
   # the optional units that actually came up. Idempotent.
-  rc-update add "lunarwing-${name}" default >/dev/null 2>&1 || true
+  _openrc_update add "lunarwing-${name}" default >/dev/null 2>&1 || true
 
   # Postgres first: the daemon `need`s it (and it's idempotent if already up).
-  rc-service "lunarwing-pg-${name}" start
+  _openrc_service "lunarwing-pg-${name}" start
   # Start PG babysitter (supervises the container via podman wait)
-  rc-service "lunarwing-pg-${name}-sup" start 2>/dev/null || true
+  _openrc_service "lunarwing-pg-${name}-sup" start 2>/dev/null || true
   # Optional channels next, non-fatal: a missing weechat/aiohttp must not abort
   # the core stack (the main daemon does not depend on them). WeeChat units are
   # skipped entirely when the tenant's registry flag disables them (ISSUE-006):
   # start-tenant must not reactivate a service the operator turned off.
   if tenant_weechat_enabled "$name"; then
-    rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} skipped — optional)"
-    rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} skipped — optional)"
+    _openrc_service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} skipped — optional)"
+    _openrc_service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} skipped — optional)"
   else
     say "  (weechat disabled for $name — not starting lunarwing-weechat{,-adapter}-${name})"
   fi
   if tenant_darkirc_enabled "$name"; then
-    rc-service "lunarwing-darkirc-${name}" start \
+    _openrc_service "lunarwing-darkirc-${name}" start \
       || die "failed to start OpenRC service lunarwing-darkirc-${name}"
-    rc-service "lunarwing-darkirc-adapter-${name}" start \
+    _openrc_service "lunarwing-darkirc-adapter-${name}" start \
       || die "failed to start OpenRC service lunarwing-darkirc-adapter-${name}"
   fi
   if tenant_proxy_enabled "$name"; then
-    rc-service "lunarwing-proxy-${name}" start
+    _openrc_service "lunarwing-proxy-${name}" start
   fi
-  rc-service "xmpp-bridge-${name}" start
-  rc-service "lunarwing-${name}" start
+  _openrc_service "xmpp-bridge-${name}" start
+  _openrc_service "lunarwing-${name}" start
   # Remove stale worker supervision for unselected or intentionally stopped
   # workers. Selected running workers register/start their own units after the
   # daemon is ready, preserving the SSH-agent socket ordering.
@@ -1328,8 +1407,8 @@ start_tenant_openrc() {
     boot_svcs+=("lunarwing-darkirc-${name}" "lunarwing-darkirc-adapter-${name}")
   fi
   for svc in "${boot_svcs[@]}"; do
-    if rc-service "$svc" status >/dev/null 2>&1; then
-      rc-update add "$svc" default >/dev/null 2>&1 || true
+    if _openrc_service "$svc" status >/dev/null 2>&1; then
+      _openrc_update add "$svc" default >/dev/null 2>&1 || true
     fi
   done
   say "enabled boot persistence (default runlevel) for $name's running services"
@@ -1337,7 +1416,7 @@ start_tenant_openrc() {
 
 _openrc_stop_service() {
   local service="$1"
-  if rc-service "$service" stop; then
+  if _openrc_service "$service" stop; then
     return 0
   fi
   say "failed to stop OpenRC service $service"
@@ -1352,6 +1431,7 @@ _openrc_stop_service_if_installed() {
 
 stop_tenant_openrc() {
   local name="$1"
+  require_safe_openrc_proxy_units || return 1
   local stop_failed=false worker
   _openrc_stop_service "lunarwing-${name}" || stop_failed=true
   _openrc_stop_service "xmpp-bridge-${name}" || stop_failed=true
@@ -1388,14 +1468,14 @@ cleanup_legacy_weechat_openrc() {
   if [[ -e "$init_path" || -L "$init_path" ]]; then
     [[ -f "$init_path" && ! -L "$init_path" ]] \
       || die "refusing to operate on non-regular legacy OpenRC service: $init_path"
-    rc-service "$service" stop || return 1
+    _openrc_service "$service" stop || return 1
   fi
 
   for link in "$OPENRC_RUNLEVELS_DIR"/*/"$service"; do
     [[ -e "$link" || -L "$link" ]] || continue
     [[ -L "$link" ]] || die "refusing to remove non-symlink legacy runlevel entry: $link"
     runlevel="$(basename "$(dirname "$link")")"
-    rc-update del "$service" "$runlevel" || return 1
+    _openrc_update del "$service" "$runlevel" || return 1
     if [[ -e "$link" || -L "$link" ]]; then
       rm -- "$link" || return 1
     fi
@@ -1420,7 +1500,7 @@ cleanup_legacy_weechat_openrc() {
 uninstall_tenant_openrc() {
   local name="$1"
   for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-opencode2-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-voice-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-opencode2-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}-sup"; do
-    rc-update del "$svc" default 2>/dev/null || true
+    _openrc_update del "$svc" default 2>/dev/null || true
     rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
   done
   say "uninstalled OpenRC services for $name"
@@ -1431,7 +1511,7 @@ openrc_service_remove_runlevels() {
   for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
     [[ -e "$link" || -L "$link" ]] || continue
     runlevel="$(basename "$(dirname "$link")")"
-    rc-update del "$svc" "$runlevel" >/dev/null 2>&1 \
+    _openrc_update del "$svc" "$runlevel" >/dev/null 2>&1 \
       || { say "failed to remove $svc from OpenRC runlevel $runlevel" >&2; return 1; }
   done
 }

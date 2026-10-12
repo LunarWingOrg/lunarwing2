@@ -88,6 +88,9 @@ tenant_proxy_enabled()   { return 1; }
 tenant_darkirc_enabled() { return 1; }
 ensure_container_runtime() { :; }
 install_openrc_env_exec() { :; }
+# This rendering fixture uses synthetic accounts; the proxy boundary harness
+# separately exercises read_tenant_env_value with a real unprivileged identity.
+read_tenant_env_value() { _read_env_value "$2" "$3"; }
 chown() { :; }
 chmod() { :; }
 

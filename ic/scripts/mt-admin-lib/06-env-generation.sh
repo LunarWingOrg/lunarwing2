@@ -647,7 +647,7 @@ _relay_service_active() {  # <tenant> <service basename>
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     _systemctl_user "$1" is-active --quiet "$2.service"
   else
-    rc-service "$2" status >/dev/null 2>&1
+    _openrc_service "$2" status >/dev/null 2>&1
   fi
 }
 
@@ -659,7 +659,7 @@ _relay_service_action() {  # <tenant> <stop|start|restart> <service basename>
     fi
     _systemctl_user "$1" "$2" "$3.service"
   else
-    rc-service "$3" "$2"
+    _openrc_service "$3" "$2"
   fi
 }
 
@@ -850,7 +850,7 @@ tensorzero_openai_base() {
 # Shape-check an operator-supplied LLM endpoint. Dies on any violation.
 # Call directly (never inside $(...)) so die aborts the caller.
 validate_llm_url() {  # <url> <label>
-  local url="$1" label="$2"
+  local url="$1" label="$2" LC_ALL=C
   [[ "$url" =~ ^https?:// ]] \
     || die "$label must be an http(s) URL: $url"
   # Whitespace/control characters would inject extra lines into env files.
@@ -863,6 +863,12 @@ validate_llm_url() {  # <url> <label>
   # Tenant envs feed systemd unit renders, where '%' introduces a specifier.
   [[ "$url" != *%* ]] \
     || die "$label must not contain '%' (systemd specifier expansion)"
+  # RFC 3986 reserved + unreserved ASCII characters. '%' and userinfo remain
+  # disallowed above. URI delimiters such as $, &, and ; are DATA, not shell
+  # escaping: no allowlist replaces the post-drop environment boundary.
+  local uri_chars="^[][a-zA-Z0-9._~:/?#@!\$&'()*+,;=-]+$"
+  [[ "$url" =~ $uri_chars ]] \
+    || die "$label must contain only RFC 3986 URI characters"
   # A host is required.
   local rest="${url#*://}"
   [[ -n "${rest%%[:/]*}" ]] \

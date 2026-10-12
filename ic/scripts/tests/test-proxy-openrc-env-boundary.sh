@@ -14,6 +14,9 @@ TENANT="$(id -un)"
 if [[ "$EUID" -eq 0 ]]; then
   TENANT=nobody
   chown "$TENANT:$(id -gn "$TENANT")" "$FIXTURE"
+  # Minimal CI images may have runuser but no sudo. Still perform a real drop
+  # when the production env reader invokes sudo -u.
+  sudo() { local user="$2"; shift 2; runuser -u "$user" -- "$@"; }
 fi
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
@@ -78,7 +81,10 @@ run_as_tenant() {
 
 unit="$OPENRC_INITD_DIR/lunarwing-proxy-$TENANT"
 marker="$FIXTURE/evaluated"
+printf '#!/bin/sh\ntouch "%s"\n' "$marker" >"$FIXTURE/payload"
+chmod 0755 "$FIXTURE/payload"
 payloads=(
+  "http://upstream.invalid/\$($FIXTURE/payload)"
   "http://upstream.invalid/\$(touch\${IFS}$marker)"
   "http://upstream.invalid/\`touch\${IFS}$marker\`"
   "http://upstream.invalid/\";touch\${IFS}$marker;#"
@@ -90,7 +96,18 @@ for upstream in "${payloads[@]}"; do
   if [[ "$EUID" -eq 0 ]]; then
     chown "$TENANT:$(id -gn "$TENANT")" "$env_dir" "$env_dir/proxy.env"
   fi
-  render_tenant_openrc_units "$TENANT" >/dev/null
+  if (validate_llm_url "$upstream" fixture) >/dev/null 2>&1; then
+    render_tenant_openrc_units "$TENANT" >/dev/null
+  else
+    # Non-URI bytes are now rejected at render time. Still exercise them after
+    # a tenant edits its env: the actual security boundary must remain literal.
+    if (render_tenant_openrc_units "$TENANT") >"$FIXTURE/rejected.log" 2>&1; then
+      fail 'render accepted non-URI characters'
+    fi
+    printf 'TENSORZERO_URL=https://upstream.invalid\n' >"$env_dir/proxy.env"
+    render_tenant_openrc_units "$TENANT" >/dev/null
+    printf 'TENSORZERO_URL=%s\n' "$upstream" >"$env_dir/proxy.env"
+  fi
   render_vision_openrc_unit "$TENANT"
   render_voice_openrc_unit "$TENANT"
   [[ ! -e "$marker" ]] || fail 'render evaluated tenant URL'
@@ -146,6 +163,32 @@ if run_as_tenant env -u TENSORZERO_URL /bin/sh -c \
   fail 'proxy started without an upstream'
 fi
 grep -Fq 'TENSORZERO_URL' "$FIXTURE/missing.log" || fail 'missing-upstream diagnostic absent'
+
+# Both renderers must use the tenant-side reader, not open a symlink/hardlink
+# as root. Use a valid outside value so the URL validator cannot mask a bad read.
+printf 'TENSORZERO_URL=https://outside.invalid\n' >"$env_dir/outside.env"
+chmod 0600 "$env_dir/outside.env"
+if [[ "$EUID" -eq 0 ]]; then
+  chown "$TENANT:$(id -gn "$TENANT")" "$env_dir/outside.env"
+fi
+for link_kind in symlink hardlink; do
+  rm "$env_dir/proxy.env"
+  if [[ "$link_kind" == symlink ]]; then
+    ln -s "$env_dir/outside.env" "$env_dir/proxy.env"
+  else
+    ln "$env_dir/outside.env" "$env_dir/proxy.env"
+  fi
+  for renderer in render_tenant_openrc_units render_tenant_systemd_units; do
+    if (chown() { :; }; "$renderer" "$TENANT") >"$FIXTURE/unsafe.log" 2>&1; then
+      fail "$renderer accepted a $link_kind env file"
+    fi
+    grep -Eq 'unsafe tenant env path|cannot safely read proxy.env' "$FIXTURE/unsafe.log" \
+      || fail 'renderer failed for a reason other than the unsafe env file'
+    if grep -Fq 'outside.invalid' "$FIXTURE/unsafe.log"; then
+      fail 'renderer exposed contents of unsafe env file'
+    fi
+  done
+done
 
 # Include the parser/HTTP smoke regressions in the existing shell-harness CI lane.
 python3 -B -m unittest discover -s "$TEST_REPO_ROOT/tensorzero-proxy-configurations/tests"
