@@ -212,7 +212,11 @@ RUN groupadd --gid 10003 opencode2 \
 # ── app layout ─────────────────────────
 WORKDIR /app
 
-COPY --from=builder /out/bin/opencode /usr/local/bin/opencode
+# WI#357: the pinned binary moves aside so the exposure-guard wrapper can own
+# /usr/local/bin/opencode. The wrapper refuses the self-exposure command
+# surface (service/pair, non-loopback serve) even when invoked through layers
+# the session permission ruleset cannot see (bash -c, absolute paths).
+COPY --from=builder /out/bin/opencode /usr/local/lib/opencode2/opencode
 COPY --from=builder /out/client /app/node_modules/@opencode/client
 # @opencode/client's generated types import from @opencode/schema and
 # @opencode/protocol; both resolve as source via their exports maps.
@@ -226,6 +230,18 @@ COPY --chown=opencode2:opencode2 scripts/ ./scripts/
 COPY --chown=opencode2:opencode2 config/ ./config/
 
 RUN chmod +x /app/entrypoint.sh /app/health_server.py
+
+# WI#357: install the exposure-guard wrapper as the only PATH-visible
+# opencode entrypoint, then fail the BUILD when the policy regresses:
+# lane config must pin share/update off, the entrypoint must not invoke
+# service mode, the wrapper must refuse service/pair, and the built binary
+# must contain no OpenTunnel client markers (the compile-out guard in
+# scripts/compile_out_remote_tunnel.py keeps that true on version bumps).
+RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode \
+    && python3 /app/scripts/exposure_policy_assert.py \
+        --lane /app \
+        --profile opencode2 \
+        --binary /usr/local/lib/opencode2/opencode
 
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
 # resolve — the client build above is best-effort, so verify the exact import
@@ -281,6 +297,7 @@ RUN set -eu; \
     && bun scripts/opencode_task_executor_test.ts \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
+    && python3 scripts/exposure_policy_assert_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
            [ ! -e "$leaked" ] \
            || { echo "FATAL: build-time self-tests leaked per-build state at $leaked — refusing to bake a non-reproducible layer" >&2; exit 1; }; \
