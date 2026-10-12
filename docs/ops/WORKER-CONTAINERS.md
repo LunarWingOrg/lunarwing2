@@ -20,6 +20,24 @@ accommodates that maximum. OpenCode and Pebble bridges do not currently cap
 their outgoing envelopes, so outputs above 16 MiB still exceed the transport
 contract. Results/progress between 1 and 16 MiB are accepted (MR !1540 DX-1/DX-3).
 
+## Worker-side tool proxy bridge (WI#324)
+
+The kimi worker image ships the WI#324 worker-side bridge: a per-task unix
+socket relay in `lunarwing_bridge.ts` plus a thin stdio MCP server
+(`scripts/lunarwing_mcp_server.ts`) registered in `$KIMI_CODE_HOME/mcp.json`
+by the entrypoint (write-if-absent; set `"enabled": false` there to opt out).
+The kimi CLI spawns the shim per task session; the bridge injects
+`LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET` per task, and the shim
+translates MCP `tools/list` / `tools/call` into `tool_list` / `tool_call`
+frames on the existing hub WebSocket. Tools appear to the agent as
+`mcp__lunarwing__<name>`; the hub stays deny-by-default until the worker's
+`tool_allowlist` (or `cron.tool_allowlist` for tick jobs — MR !1506 CQ-10)
+grants phase-1 names. `LUNARWING_TOOL_PROXY_TIMEOUT_MS` bounds one proxied
+call (default 300000, capped 900000). The opencode/opencode2/pebble lanes do
+not have the bridge yet; see
+[`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md)
+for the wire contract.
+
 ## Generic shell sandbox network policy (WI#154/155)
 
 The generic shell sandbox (`ic/src/sandbox/`) defaults to
