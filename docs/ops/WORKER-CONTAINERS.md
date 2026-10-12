@@ -19,6 +19,11 @@ Kimi's `WS_MAX_PAYLOAD_BYTES` defaults to 1,048,576 bytes and can be raised to
 accommodates that maximum. OpenCode and Pebble bridges do not currently cap
 their outgoing envelopes, so outputs above 16 MiB still exceed the transport
 contract. Results/progress between 1 and 16 MiB are accepted (MR !1540 DX-1/DX-3).
+Note the interplay with the WI#324 tool proxy (MR !1549 EF-9): raising the
+hub's tool-output safety cap (`SAFETY_MAX_OUTPUT_LENGTH`, default 100,000
+bytes) past the worker bridge's inbound `maxPayload` (Kimi default 1 MiB)
+means a large `tool_result` is dropped by the worker's own WS layer — keep
+the worker's `WS_MAX_PAYLOAD_BYTES` at or above the hub cap when tuning it.
 
 ## Worker-side tool proxy bridge (WI#324)
 
