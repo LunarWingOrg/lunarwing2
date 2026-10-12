@@ -51,9 +51,16 @@ RUN bun run build || echo "WARNING: @opencode/client build reported errors (impo
 
 WORKDIR /build/opencode/packages/cli
 COPY scripts/prepare_reproducible_build.py /build/prepare_reproducible_build.py
+COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py
 # Single-bundle source compilation avoids per-build chunk IDs/bytecode in the
 # executable. Fail closed if the pinned upstream build options have drifted.
 RUN python3 /build/prepare_reproducible_build.py script/build.ts
+# WI#357 control 8: compile the OpenTunnel remote-access client out, fail
+# closed. v2.0.24 has no tunnel (guard passes with nothing to stub); when a
+# future bump lands v2.0.26+'s remote-tunnel.ts the guard replaces it with a
+# refusing stub, and if upstream moves/renames the module or extends its
+# export surface the build fails instead of silently shipping the tunnel.
+RUN python3 /build/compile_out_remote_tunnel.py /build/opencode
 # Build only the native platform target (mirrors the v1 worker's --single
 # rationale; the image is distributed same-host via podman save|load).
 # Inject the pinned release version (sans leading v) into the build env:
@@ -298,6 +305,7 @@ RUN set -eu; \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
+    && python3 scripts/compile_out_remote_tunnel_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
            [ ! -e "$leaked" ] \
            || { echo "FATAL: build-time self-tests leaked per-build state at $leaked — refusing to bake a non-reproducible layer" >&2; exit 1; }; \
