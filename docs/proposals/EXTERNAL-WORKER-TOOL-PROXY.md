@@ -402,7 +402,12 @@ cross-thread coordination (KV + advisory locks) is also still open.
   mapping, zero-tools fallback), and a full-path bridge test: a mock `kimi`
   binary drives the injected proxy env, the bridge emits `tool_call` on the
   hub WS, the mock hub's `tool_result` routes back, and the task result
-  carries the tool output.
+  carries the tool output. Additionally verified against the **real kimi
+  2.1.1 CLI** on a dev host (dead provider, no LLM spend): in print mode the
+  CLI reads `$KIMI_CODE_HOME/mcp.json`, spawns the shim, passes the proxy env
+  through to the MCP child, completes `initialize` →
+  `notifications/initialized` → `tools/list` over newline-delimited JSON-RPC,
+  and the shim's `list` op reached the relay socket.
 
 Open acceptance items: AC1 with a **real** worker (hub-side evidence uses
 mock sockets with real memory tools; worker-side evidence uses a mock CLI
