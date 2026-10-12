@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 
 import { executeTask } from "./opencode_task_executor.ts"
-import type { TaskRequest } from "./lunarwing_runtime.ts"
+import type { FollowupQueue, TaskRequest } from "./lunarwing_runtime.ts"
 
 interface MockOptions {
   events?: unknown[]
@@ -15,6 +15,7 @@ interface MockOptions {
   pendingPermissionReply?: boolean
   pendingAbort?: boolean
   parts?: Array<{ type: string; text?: string }>
+  partsPerCall?: Array<Array<{ type: string; text?: string }>>
   promptError?: Error
   assistantErrors?: Array<unknown | undefined>
 }
@@ -52,11 +53,14 @@ function makeSdk(options: MockOptions = {}) {
         captureSignal(args)
         if (options.pendingPrompt) await new Promise(() => {})
         if (options.promptError) throw options.promptError
-        const assistantError = options.assistantErrors?.[promptArgs.length - 1]
+        const callIndex = promptArgs.length - 1
+        const assistantError = options.assistantErrors?.[callIndex]
         return {
           data: {
             info: assistantError ? { error: assistantError } : {},
-            parts: options.parts ?? [{ type: "text", text: "done" }],
+            parts:
+              options.partsPerCall?.[callIndex] ??
+              options.parts ?? [{ type: "text", text: "done" }],
           },
         }
       },
@@ -394,5 +398,136 @@ fix it`,
 })
 assert.equal(contextPromptArgs[1].throwOnError, true)
 assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
+
+// WI#328: a queued follow-up prompt continues the SAME opencode session at
+// the turn boundary (session idle) instead of resolving the task — never
+// mid-call. The second prompt must carry the follow-up text verbatim; with
+// done=true it also carries the wrap-up instruction and closes the queue
+// (MR !1525 DI-4).
+const followupSdk = makeSdk({
+  events: [
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+})
+const followupQueue: FollowupQueue = {
+  prompts: [{ task_id: "task-followup", seq: 1, prompt: "also fix the tests", done: true }],
+  closed: false,
+}
+const followupProgress: string[] = []
+const followupResults: Array<{ status: string; output: string; error: string | null }> = []
+await executeTask(
+  { task_id: "task-followup", prompt: "do the main thing" },
+  (progress) => followupProgress.push(progress.delta),
+  (result) => followupResults.push(result),
+  undefined,
+  followupSdk.sdk,
+  followupQueue,
+)
+assert.equal(followupResults.length, 1)
+assert.equal(followupResults[0]!.status, "success")
+assert.equal(followupSdk.promptArgs.length, 2)
+const followupArgs = followupSdk.promptArgs[1] as [
+  { sessionID: string; parts: Array<{ type: string; text: string }> },
+  { throwOnError: boolean; signal: AbortSignal },
+]
+assert.equal(followupArgs[0].sessionID, "session-1")
+assert.equal(followupArgs[0].parts.length, 1)
+assert.equal(followupArgs[0].parts[0]!.type, "text")
+assert.ok(
+  followupArgs[0].parts[0]!.text.startsWith("also fix the tests"),
+  "follow-up text must lead the injected prompt",
+)
+assert.match(
+  followupArgs[0].parts[0]!.text,
+  /final instruction for this task/,
+  "done=true appends the wrap-up instruction",
+)
+assert.equal(followupArgs[1].throwOnError, true)
+assert.ok(followupArgs[1].signal instanceof AbortSignal)
+assert.ok(
+  followupProgress.some((d) => d.includes("seq=1") && d.includes("wrap-up requested")),
+  "follow-up progress note must carry the seq and wrap-up marker",
+)
+assert.equal(followupQueue.prompts.length, 0, "consumed follow-up leaves the queue empty")
+assert.equal(followupQueue.closed, true, "done=true closes the queue against later prompts")
+
+// WI#328 (MR !1525 DI-3): a follow-up turn must not replace the task's final
+// output — the result accumulates the canonical text of EVERY turn.
+const multiTurnSdk = makeSdk({
+  events: [
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+  partsPerCall: [
+    [{ type: "text", text: "MAIN DELIVERABLE" }],
+    [{ type: "text", text: "status: on track" }],
+  ],
+})
+const multiTurnQueue: FollowupQueue = {
+  prompts: [{ task_id: "task-multiturn", seq: 1, prompt: "status?", done: false }],
+  closed: false,
+}
+const multiTurnResults: Array<{ status: string; output: string }> = []
+await executeTask(
+  { task_id: "task-multiturn", prompt: "build the feature" },
+  () => {},
+  (result) => multiTurnResults.push(result),
+  undefined,
+  multiTurnSdk.sdk,
+  multiTurnQueue,
+)
+assert.equal(multiTurnResults.length, 1)
+assert.equal(multiTurnResults[0]!.status, "success")
+assert.equal(multiTurnSdk.promptArgs.length, 2)
+assert.ok(
+  multiTurnResults[0]!.output.includes("MAIN DELIVERABLE"),
+  `follow-up turn must not drop the main deliverable, got: ${multiTurnResults[0]!.output}`,
+)
+assert.ok(
+  multiTurnResults[0]!.output.includes("status: on track"),
+  `follow-up turn's own answer must be present, got: ${multiTurnResults[0]!.output}`,
+)
+assert.equal(multiTurnQueue.closed, true, "finishing closes the queue")
+
+// WI#328 (MR !1525 DI-4): a queue closed before the first turn boundary (a
+// prompt that raced the final drain) is not consumed — the bridge acks such
+// frames accepted=false, and the executor must never inject them.
+const stragglerSdk = makeSdk()
+const stragglerQueue: FollowupQueue = {
+  prompts: [{ task_id: "task-straggler", seq: 9, prompt: "too late", done: false }],
+  closed: true,
+}
+const stragglerResults: Array<{ status: string }> = []
+await executeTask(
+  { task_id: "task-straggler", prompt: "test" },
+  () => {},
+  (result) => stragglerResults.push(result),
+  undefined,
+  stragglerSdk.sdk,
+  stragglerQueue,
+)
+assert.equal(stragglerResults.length, 1)
+assert.equal(stragglerResults[0]!.status, "success")
+assert.equal(stragglerSdk.promptArgs.length, 1, "closed-queue prompt must never be injected")
+assert.equal(stragglerQueue.prompts.length, 1, "refused prompt is left for the bridge to audit")
+
+// WI#328: with no queued follow-ups the first idle resolves the task exactly
+// as before (regression guard for the turn-boundary check).
+const noFollowupSdk = makeSdk()
+const noFollowupQueue: FollowupQueue = { prompts: [], closed: false }
+const noFollowupResults: Array<{ status: string }> = []
+await executeTask(
+  { task_id: "task-no-followup", prompt: "test" },
+  () => {},
+  (result) => noFollowupResults.push(result),
+  undefined,
+  noFollowupSdk.sdk,
+  noFollowupQueue,
+)
+assert.equal(noFollowupResults.length, 1)
+assert.equal(noFollowupResults[0]!.status, "success")
+assert.equal(noFollowupSdk.promptArgs.length, 1)
+assert.equal(noFollowupQueue.closed, true, "finishing closes an empty queue too")
 
 console.log("opencode task executor self-check passed")

@@ -122,10 +122,49 @@ export interface TaskResult {
   duration_ms: number
 }
 
+// ── Runtime control channel (WI#328) ─────────────────────────────────────────
+
+/** Capability string advertised in `ready` by workers that consume `task_prompt`. */
+export const CAPABILITY_TASK_PROMPT = "task_prompt"
+
+/** Agent → Worker: follow-up prompt/directive for a RUNNING task. */
+export interface TaskPrompt {
+  task_id: string
+  /** Monotonic per-job sequence number assigned by the daemon. */
+  seq: number
+  prompt: string
+  /** True signals "no more prompts coming; wrap up cleanly". */
+  done: boolean
+}
+
+/** Worker → Agent: receipt for a `task_prompt` frame. */
+export interface TaskPromptAck {
+  task_id: string
+  seq: number
+  /** False when the task was already finished/wrapping up. */
+  accepted: boolean
+}
+
+/**
+ * Shared follow-up queue between the bridge (producer) and the executor
+ * (consumer). The executor sets `closed` when the task is finishing — after
+ * the final turn-boundary drain, no more prompts will be consumed — and when
+ * a `done` prompt is consumed (no further prompts may extend the run). The
+ * bridge rejects frames for a closed/missing queue with `accepted: false` so
+ * the daemon audit reflects the drop instead of a silent loss (MR !1525
+ * DI-4).
+ */
+export interface FollowupQueue {
+  prompts: TaskPrompt[]
+  closed: boolean
+}
+
 export interface ReadyPayload {
   worker_id: string
   version: string
   mode: string
+  /** Optional capability advertisement (WI#328); absent means none. */
+  capabilities?: string[]
 }
 
 // ── State File (IPC with health_server.py) ────────────────────────────────────

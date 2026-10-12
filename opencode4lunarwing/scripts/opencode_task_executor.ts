@@ -8,6 +8,7 @@
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import {
   buildTaskPrompt,
+  type FollowupQueue,
   type TaskRequest,
   type TaskProgress,
   type TaskResult,
@@ -24,6 +25,13 @@ const RETRY_PROMPT =
   "The previous model request failed transiently. Continue this task from the current session and " +
   "workspace state. Do not repeat completed work. Inspect existing changes and proceed from " +
   "the next incomplete step."
+// Appended to a follow-up prompt carrying done=true (WI#328): the injected
+// turn is the wrap-up turn — the worker must not start new lines of work
+// after it, and the queue is closed so nothing can extend the run further.
+const WRAP_UP_SUFFIX =
+  "[control] This is the final instruction for this task: no further follow-up prompts will be " +
+  "accepted. Answer it against the current session state, then consider the task complete — do " +
+  "not start new lines of work."
 
 type StopReason = "timeout" | "cancelled"
 
@@ -92,6 +100,7 @@ export async function executeTask(
   onResult: ResultCallback,
   abortSignal?: AbortSignal,
   sdkOverride?: OpencodeClient,
+  followups?: FollowupQueue,
 ): Promise<void> {
   const startTime = Date.now()
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
@@ -221,11 +230,15 @@ export async function executeTask(
     )
     const eventIterator = events.stream[Symbol.asyncIterator]()
     closeEvents = () => void eventIterator.return?.()
-    let finalPromptData: Awaited<ReturnType<typeof sdk.session.prompt>>["data"] | undefined
+    // Per-turn canonical assistant text (MR !1525 DI-3): every turn's prompt
+    // response contributes to the final result, so a short follow-up turn
+    // (e.g. "status?") can never replace the main deliverable.
+    const canonicalTurns: string[] = []
 
+    let nextPrompt = buildTaskPrompt(request)
     for (let attempt = 0; ; attempt++) {
       let sessionErrorMsg = ""
-      const promptText = attempt === 0 ? buildTaskPrompt(request) : RETRY_PROMPT
+      const promptText = nextPrompt
       // Attach rejection handling immediately so a provider/API error cannot
       // become an unhandled rejection while the SSE loop is still draining.
       const promptPromise = sdk.session
@@ -342,7 +355,34 @@ export async function executeTask(
         sessionErrorMsg
 
       if (!promptError) {
-        finalPromptData = promptData
+        // Turn finished cleanly; bank its canonical text (DI-3).
+        const turnText = extractAssistantText(promptData?.parts)
+        if (turnText) canonicalTurns.push(turnText)
+        // A queued follow-up prompt (WI#328 runtime control channel)
+        // continues the SAME session instead of resolving the task: the
+        // daemon pushed it while the worker was busy and it is injected only
+        // here, at a turn boundary — never mid-call.
+        const followup = followups && !followups.closed ? followups.prompts.shift() : undefined
+        if (followup) {
+          emitProgress(
+            `[control] Follow-up prompt received (seq=${followup.seq}${followup.done ? ", wrap-up requested" : ""})`,
+          )
+          if (followup.done) {
+            // done=true: this injected turn is the wrap-up turn. Close the
+            // queue so later prompts are acked accepted=false instead of
+            // silently extending the run (DI-4).
+            if (followups) followups.closed = true
+            nextPrompt = `${followup.prompt}\n\n${WRAP_UP_SUFFIX}`
+          } else {
+            nextPrompt = followup.prompt
+          }
+          attempt = -1 // each follow-up turn gets its own transient-retry budget
+          continue
+        }
+        // Finishing: close the queue BEFORE resolving so a prompt landing
+        // after this drain is refused (accepted=false) rather than queued
+        // into a buffer nothing will ever read (DI-4).
+        if (followups) followups.closed = true
         break
       }
 
@@ -358,6 +398,8 @@ export async function executeTask(
       emitProgress(delta)
       console.warn(`[opencode_task_executor] task ${request.task_id}: ${delta} ${promptError}`)
 
+      nextPrompt = RETRY_PROMPT
+
       const delayResult = await Promise.race([
         new Promise<undefined>((resolve) => setTimeout(resolve, retryDelayMs)),
         stopPromise,
@@ -367,7 +409,7 @@ export async function executeTask(
       }
     }
 
-    const canonicalOutput = extractAssistantText(finalPromptData?.parts)
+    const canonicalOutput = canonicalTurns.join("\n\n")
     const resultOutput = canonicalOutput || output.trim()
     const durationMs = Date.now() - startTime
 
