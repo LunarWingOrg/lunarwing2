@@ -1,9 +1,12 @@
 # External Worker Tool Proxy (WI#324)
 
-Status: **partial (hub side)**, hardened per the MR !1506 (CQ-1..CQ-9),
+Status: **partial**, hardened per the MR !1506 (CQ-1..CQ-9),
 MR !1521 (DD-1..DD-10), MR !1533 (DP-1..DP-6), and MR !1540 (DX-1..DX-6)
-reviews. Worker-side bridge support remains unimplemented in the worker
-images (kimi / pebble / opencode); real-worker acceptance is still open.
+reviews. The hub side is merged; the worker-side bridge (design item 2) is
+implemented for the **kimi** worker lane. Real-worker acceptance (AC1/AC2
+against a live tenant with a rebuilt worker image) and the
+opencode/opencode2/pebble lanes remain open. Cron-mode tick authority is
+split out per MR !1506 CQ-10 (`cron.tool_allowlist`).
 
 ## What this is
 
@@ -182,6 +185,29 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   `memory_write`) is the operator's explicit grant. The seeded `AskEachTime`
   permission default is NOT enforced on this path (a worker cannot answer
   prompts); only a persisted `Disabled` permission still blocks.
+- **Cron tick jobs never use the worker-level list** (MR !1506 CQ-10): a
+  `mode = "cron"` mission fires unattended on a schedule, so tick jobs draw
+  proxy authority from the mission's own `cron.tool_allowlist` (default
+  empty — every proxied call from a tick is denied). Ordinary dispatches to
+  the same worker keep using the worker-level list. The cron list goes
+  through the same load-time sanitization (phase-1 positive set, denylist
+  drops, cleartext strip), and a load-time warning fires when a cron-mode
+  worker sets only the worker-level list:
+
+  ```toml
+  [[sandbox.external_workers]]
+  name = "kimi"
+  url = "ws://127.0.0.1:19000/kimi"
+  mode = "cron"
+  # interactive dispatches only:
+  tool_allowlist = ["memory_read", "gitlab_tool"]
+
+  [sandbox.external_workers.cron]
+  schedule = "0 15 10 * * *"
+  goal = "Produce the daily PR digest"
+  # standing, unattended tick authority — grant the mission its own set:
+  tool_allowlist = ["knowledge_search"]
+  ```
 
 ## Execution gates (MR !1506 CQ-1)
 
@@ -286,16 +312,42 @@ Plus a structured tracing line per completed call.
   safety validation as in-process calls, and every worker-controlled field is
   bounded before persistence or logging.
 
-## Worker-side contract (remaining work)
+## Worker-side contract (kimi lane implemented)
 
 A worker opts in by sending `tool_list` after `ready`, then issuing
 `tool_call` frames (with `task_id` set to the job id from `task_request`)
-and correlating replies by `call_id`. The reference plan (WI#324 design
-item 2) is a thin stdio MCP server in the worker image that translates MCP
-`tools/list`/`tools/call` into these frames, giving the worker agent a
-native `mcp__lunarwing__*` surface with no changes to worker agent logic.
-Phase 2 adds hub-mediated cross-thread coordination (KV + advisory locks)
-for multi-threaded missions.
+and correlating replies by `call_id`. The kimi worker image implements this
+as the WI's thin stdio MCP server, giving the worker agent a native
+`mcp__lunarwing__*` surface with no changes to worker agent logic:
+
+- `kimicode4lunarwing/scripts/lunarwing_tool_proxy.ts` — bridge-side relay.
+  For each accepted task the bridge starts a per-task unix socket
+  (`/tmp/lunarwing-tool-proxy/<task>.sock`, override with
+  `LUNARWING_TOOL_PROXY_DIR`), injects `LUNARWING_TASK_ID` +
+  `LUNARWING_TOOL_PROXY_SOCKET` into the CLI's environment (applied after
+  task-supplied env so it cannot be shadowed), and routes inbound
+  `tool_result`/`tool_catalog` hub frames back to the shim by `call_id`,
+  scoped to the owning hub socket. The relay mirrors the hub's bounds —
+  `[A-Za-z0-9_-]{1,128}` identifiers and a locally pre-checked 256 KiB
+  `tool_call` frame cap — so an oversized call gets a clean local error
+  instead of a hub-side job failure. Per-call timeout:
+  `LUNARWING_TOOL_PROXY_TIMEOUT_MS` (default 300 s, capped 900 s). Task
+  teardown fails in-flight calls; IPC is one-response-per-connection
+  (end-after-flush) so teardown never drops a final reply.
+- `kimicode4lunarwing/scripts/lunarwing_mcp_server.ts` — the stdio MCP
+  server the kimi CLI spawns per task session. Implements `initialize`,
+  `ping`, `tools/list`, `tools/call` over newline-delimited JSON-RPC; hub
+  `parameters` maps to MCP `inputSchema`; `denied`/`error` tool results
+  surface as MCP tool errors carrying the hub's sanitized reason. With no
+  proxy env (cli mode, non-task runs) it advertises zero tools.
+- `entrypoint.sh` registers the shim in `$KIMI_CODE_HOME/mcp.json`
+  (user-level, so no workspace trust prompt), write-if-absent so operators
+  can disable or replace the entry.
+
+The opencode/opencode2/pebble lanes have no bridge yet; the same pattern
+applies (their `lunarwing_bridge.ts` equivalents need the relay + frame
+routing, plus an MCP/registration mechanism per lane). Phase 2 hub-mediated
+cross-thread coordination (KV + advisory locks) is also still open.
 
 ## Tests
 
@@ -343,10 +395,22 @@ for multi-threaded missions.
   - canonical/legacy GitLab resolution, callable catalog spelling, ungranted
     calls, and persisted permission denials.
 
-Open acceptance items: the worker-side bridge (design item 2), AC1 with a
-real worker (current evidence uses mock sockets with real memory tools),
-and AC2 (`knowledge_search` real hits through the proxy). WI#324 stays open;
-the wire contract above is the bridge's specification.
+- `kimicode4lunarwing` (worker side, node): relay unit tests (frame shape,
+  call-id routing scoped to the owning socket, identifier/frame bounds,
+  task-close failure of in-flight calls, socket-path safety), shim MCP tests
+  (initialize echo, catalog→MCP mapping, success/denied/transport-failure
+  mapping, zero-tools fallback), and a full-path bridge test: a mock `kimi`
+  binary drives the injected proxy env, the bridge emits `tool_call` on the
+  hub WS, the mock hub's `tool_result` routes back, and the task result
+  carries the tool output.
+
+Open acceptance items: AC1 with a **real** worker (hub-side evidence uses
+mock sockets with real memory tools; worker-side evidence uses a mock CLI
+against the real bridge/relay) and AC2 (`knowledge_search` real hits
+through the proxy). Both need a rebuilt kimi worker image and a live
+tenant, which is the protected-pipeline/deploy gate, not an MR-pipeline
+lane. The opencode/opencode2/pebble worker-side bridges are also open.
+WI#324 stays open until those land.
 
 ## Land-order note (MR !1540 review #7716)
 
