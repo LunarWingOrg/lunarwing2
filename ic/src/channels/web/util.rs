@@ -58,6 +58,42 @@ pub fn truncate_preview(s: &str, max_bytes: usize) -> String {
     result
 }
 
+/// Truncate a string to at most `max_bytes` bytes, keeping both the head and
+/// the tail and eliding the middle.
+///
+/// List-tool envelopes serialize pagination/completion metadata
+/// (`next_cursor`, `truncated`, `complete`, `resume_page`) at the very end, so
+/// a head-only cut (see `truncate_preview`) amputates the cursor and a later
+/// "next page" request then has to improvise one (WI#349, WI#351). The marker
+/// always separates the halves. Byte-budgeted and char-boundary safe; the
+/// result never exceeds `max_bytes`. Input already within budget passes
+/// through unchanged.
+///
+/// Unlike `truncate_preview` this never needs to re-close `<tool_output>`:
+/// the preserved tail retains the closing tag whenever the input carried one.
+pub fn truncate_preview_middle(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let marker = format!("\n... [output truncated to {max_bytes} bytes, middle elided] ...\n");
+    let Some(keep) = max_bytes
+        .checked_sub(marker.len())
+        .filter(|keep| *keep >= 2)
+    else {
+        // The marker is pure ASCII, so char-count == byte-count here.
+        return marker.chars().take(max_bytes).collect();
+    };
+    let head_bytes = keep / 2;
+    let tail_bytes = keep - head_bytes;
+    let head_end = s.floor_char_boundary(head_bytes);
+    let tail_start = s.ceil_char_boundary(s.len() - tail_bytes);
+    let mut result = String::with_capacity(max_bytes);
+    result.push_str(&s[..head_end]);
+    result.push_str(&marker);
+    result.push_str(&s[tail_start..]);
+    result
+}
+
 /// Build TurnInfo pairs from flat DB messages (user/tool_calls/assistant triples).
 ///
 /// Handles four message patterns:
@@ -259,6 +295,54 @@ mod tests {
         let result = truncate_preview(s, 10);
         assert_eq!(result, "Just a pla...");
         assert!(!result.contains("</tool_output>"));
+    }
+
+    // ---- truncate_preview_middle tests ----
+
+    #[test]
+    fn test_truncate_preview_middle_within_budget_passes_through() {
+        assert_eq!(truncate_preview_middle("short", 100), "short");
+        assert_eq!(truncate_preview_middle("", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_preview_middle_preserves_pagination_tail() {
+        let tail = r#""truncated": true, "complete": false, "next_cursor": "cursor-abc123"}"#;
+        let s = format!("{{\"items\": [{}] , {}", "\"x\", ".repeat(500), tail);
+        let out = truncate_preview_middle(&s, 1000);
+        assert!(out.len() <= 1000);
+        assert!(out.contains("middle elided"));
+        assert!(out.contains("cursor-abc123"));
+        assert!(out.contains("\"truncated\": true"));
+        assert!(out.starts_with("{\"items\": ["));
+    }
+
+    #[test]
+    fn test_truncate_preview_middle_char_boundary_safe() {
+        // 'é' is 2 bytes; a mid-char head cut must floor, a mid-char tail cut
+        // must ceil, and the result stays within budget.
+        let s = "é".repeat(9000);
+        let out = truncate_preview_middle(&s, 8191);
+        assert!(out.len() <= 8191);
+        assert!(out.contains("middle elided"));
+        assert!(out.ends_with('é'));
+    }
+
+    #[test]
+    fn test_truncate_preview_middle_tiny_budget_falls_back_to_marker() {
+        let out = truncate_preview_middle(&"z".repeat(500), 10);
+        assert!(out.len() <= 10);
+    }
+
+    #[test]
+    fn test_truncate_preview_middle_keeps_tool_output_closing_tag() {
+        let s = format!(
+            "<tool_output name=\"list\">\n{}\n</tool_output>",
+            "row\n".repeat(500)
+        );
+        let out = truncate_preview_middle(&s, 1000);
+        assert!(out.len() <= 1000);
+        assert!(out.ends_with("</tool_output>"));
     }
 
     // ---- build_turns_from_db_messages tests ----
