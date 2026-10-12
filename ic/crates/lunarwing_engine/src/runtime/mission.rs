@@ -12081,6 +12081,353 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         mgr.shutdown().await;
     }
 
+    /// WI#337 scenario (i): an older build's crash window could leave the
+    /// retry marker on the thread AND the interruption stamp on the mission.
+    /// The boot sweep re-arms from the marker; the resolution must then clear
+    /// the stamp WITHOUT arming the same retry a second time (a second
+    /// interruption notice is the observable side effect of the double-arm).
+    #[tokio::test]
+    async fn boot_resolution_defers_to_the_already_armed_retry_marker() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        // The pre-crash marker, with the retry notice already delivered, so
+        // neither the sweep nor the resolution owes a notice.
+        let pending = PendingMissionRetry::new(
+            mission.id,
+            "test-user",
+            1,
+            None,
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        let mut state = pending.to_retry_state();
+        state.notified = true;
+        let mut marked = thread.clone();
+        marked.metadata = serde_json::json!({ RetryState::METADATA_KEY: state.to_value() });
+        store.save_thread(&marked).await.unwrap();
+
+        // Boot order: the sweep first (re-arms from the marker), then the
+        // resolution.
+        assert_eq!(
+            mgr.recover_pending_mission_retries().await.unwrap(),
+            vec![mission.id]
+        );
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved_thread.metadata).is_some(),
+            "the armed retry's marker survives the resolution"
+        );
+        assert!(
+            saved_mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains("already owned")),
+            "the clear-only guard records its decision: {:?}",
+            saved_mission.approach_history
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no second interruption notice — the retry was armed exactly once"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#337 scenario (ii): a stamped thread hard-killed with a runtime
+    /// checkpoint is suspended by the boot sweep and resumed by checkpoint
+    /// recovery BEFORE the resolution runs, so the resolution sees it
+    /// `Running`. The resumed run's live watcher owns its outcome — the stamp
+    /// must clear without planning a retry. A surviving stamp would double-arm
+    /// a later in-grace shutdown stop, or record a false "completed during
+    /// teardown" when the resumed run finishes.
+    #[tokio::test]
+    async fn boot_resolution_clears_the_stamp_of_a_resumed_running_thread() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) =
+            shutdown_stamped_fixture(&store, vec!["darkirc".into()], ThreadState::Running, None)
+                .await;
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            stamped_interrupted_thread(&saved_mission).is_none(),
+            "the stamp clears — the resumed run's watcher owns the outcome"
+        );
+        assert!(
+            saved_mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains("already owned")),
+            "the clear-only guard records its decision: {:?}",
+            saved_mission.approach_history
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "no interruption notice for a fire whose run resumed"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#337: a stamp older than the resolution window was left behind by an
+    /// older build or a downtime long enough to supersede the fire — resolve
+    /// it record-only, never into a fresh retry planned from stale state.
+    #[tokio::test]
+    async fn boot_resolution_records_a_stale_interruption_stamp_without_retry() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        let mut stale = mission.clone();
+        let stamp = serde_json::json!({
+            "thread_id": thread.id,
+            "recorded_at": (Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+        });
+        stale.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: stamp });
+        store.save_mission(&stale).await.unwrap();
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved_thread.metadata).is_none(),
+            "a stale stamp never plans a retry"
+        );
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(
+            saved_mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains("exceeded the resolution window")),
+            "{:?}",
+            saved_mission.approach_history
+        );
+        assert!(rx.try_recv().is_err(), "a stale stamp earns no notice");
+        mgr.shutdown().await;
+    }
+
+    /// WI#337: a stamp whose `recorded_at` is missing or unparseable counts
+    /// as stale — every writer stamps it, so its absence means the stamp is
+    /// malformed — and resolves record-only, never into a retry.
+    #[tokio::test]
+    async fn boot_resolution_records_a_malformed_interruption_stamp_without_retry() {
+        for recorded_at in [None, Some("not-a-timestamp")] {
+            let store = Arc::new(TestStore::new());
+            let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+            mgr.arm_retry_wake().await;
+            let (mission, thread) = shutdown_stamped_fixture(
+                &store,
+                vec!["darkirc".into()],
+                ThreadState::Failed,
+                Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+            )
+            .await;
+            let stamp = serde_json::json!({
+                "thread_id": thread.id,
+                "recorded_at": recorded_at,
+            });
+            let mut malformed = mission.clone();
+            malformed.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: stamp });
+            store.save_mission(&malformed).await.unwrap();
+
+            assert_eq!(
+                mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+                vec![mission.id]
+            );
+            let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+            assert!(
+                RetryState::from_metadata(&saved_thread.metadata).is_none(),
+                "a malformed stamp never plans a retry"
+            );
+            let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+            assert!(stamped_interrupted_thread(&saved_mission).is_none());
+            assert!(
+                saved_mission
+                    .approach_history
+                    .iter()
+                    .any(|entry| entry.contains("exceeded the resolution window")),
+                "{:?}",
+                saved_mission.approach_history
+            );
+            mgr.shutdown().await;
+        }
+    }
+
+    /// WI#337: a stamp whose thread is no longer the mission's newest fire was
+    /// superseded — clear it without planning a retry against stale mission
+    /// state, and record the supersession (overlapping fires of one cron
+    /// mission must not silently lose the older one's record).
+    #[tokio::test]
+    async fn boot_resolution_clears_a_stamp_superseded_by_a_newer_fire() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            Vec::new(),
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        // A newer fire landed after the stamp was written.
+        let newer = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            mission.project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        store.save_thread(&newer).await.unwrap();
+        let mut superseded = mission.clone();
+        superseded.thread_history.push(newer.id);
+        store.save_mission(&superseded).await.unwrap();
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
+        let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(
+            saved_mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains("already owned") && entry.contains("superseded")),
+            "the supersession is recorded: {:?}",
+            saved_mission.approach_history
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#337 review (DB-1a): a retry armed by the resolution is admitted
+    /// into `recovered_retries`, so a later sweep pass in the same process
+    /// cannot arm the same retry a second time.
+    #[tokio::test]
+    async fn boot_resolution_admission_blocks_a_later_sweep_rearm() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved_thread.metadata).is_some(),
+            "the resolution armed the retry"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the boot notice for the armed retry went out"
+        );
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a later sweep pass must not re-arm the resolution's retry"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#337 review (DB-1b): the mission row (stamp cleared) saves BEFORE
+    /// the retry marker, so a store failure on that save leaves no marker —
+    /// and no notice, which is only sent after the marker persists. The next
+    /// boot still finds the stamp and resolves it then.
+    #[tokio::test]
+    async fn boot_resolution_writes_no_marker_when_the_stamp_save_fails() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, thread) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        store.failing_mission_saves.write().await.push(mission.id);
+
+        assert!(
+            mgr.resolve_pending_shutdown_interruptions().await.is_err(),
+            "the save failure propagates"
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved_thread.metadata).is_none(),
+            "no marker may be written before the stamp-clearing save lands"
+        );
+        assert!(
+            stamped_interrupted_thread(
+                &store.load_mission(mission.id).await.unwrap().unwrap()
+            )
+            .is_some(),
+            "the stamp survives the failed save for the next boot"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no notice may be delivered without the persisted retry behind it"
+        );
+
+        // The store recovers: the next boot's resolution arms the retry.
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&saved_thread.metadata).is_some(),
+            "the retry is armed once the save lands"
+        );
+        assert!(rx.try_recv().is_ok(), "the notice follows the marker");
+        mgr.shutdown().await;
+    }
+
     /// WI#338: retry recovery scans `thread_history` from the same
     /// agent-writable record — a planted foreign thread carrying a retry
     /// marker must not arm a retry as this mission, and its marker is left
