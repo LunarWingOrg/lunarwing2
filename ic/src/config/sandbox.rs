@@ -612,13 +612,17 @@ impl ExternalWorkerConfig {
                 if config.is_cron() && !config.cron_block_valid(&mut seen_mission_ids) {
                     return None;
                 }
-                // MR !1506 CQ-10: tick jobs use `cron.tool_allowlist`, never the
-                // worker-level list. Say so when the split could surprise.
+                // MR !1506 CQ-10 / MR !1549 EF-1: tick jobs use
+                // `cron.tool_allowlist`, never the worker-level list, and the
+                // manager strips a cron worker's worker-level list at load
+                // (one container = one authority domain). Say so when a
+                // configured list would otherwise silently vanish.
                 if config.is_cron() && !config.tool_allowlist.is_empty() {
                     tracing::warn!(
                         worker = %config.name,
                         "External worker is mode=cron with a worker-level tool_allowlist; \
-                         cron tick jobs ignore it — grant tick authority via cron.tool_allowlist"
+                         the manager strips it at load — grant tick authority via \
+                         cron.tool_allowlist (ordinary dispatches get no proxied tools)"
                     );
                 }
                 // A [cron] block on a task-mode worker is ignored — say so

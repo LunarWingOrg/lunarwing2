@@ -2504,9 +2504,13 @@ async fn cron_tick_tool_calls_use_cron_allowlist_not_worker_allowlist() {
 }
 
 #[tokio::test]
-async fn ordinary_dispatch_on_cron_worker_still_uses_worker_allowlist() {
-    // CQ-10 companion: a non-tick dispatch to a cron-mode worker is an
-    // interactive grant and keeps using the worker-level tool_allowlist.
+async fn cron_worker_worker_level_allowlist_is_stripped_at_load() {
+    // MR !1549 EF-1: a worker container is one authority domain shared by
+    // every concurrent and successive job in it — any same-uid process can
+    // connect to a concurrent task's relay socket and borrow that job's
+    // grant. A cron worker's worker-level list would therefore be standing
+    // authority for every tick, so the manager strips it at load: even an
+    // ordinary (non-tick) dispatch to a cron-mode worker is denied.
     let probe = ProbeEchoTool::phase1();
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools.register(probe.clone()).await;
@@ -2547,12 +2551,13 @@ async fn ordinary_dispatch_on_cron_worker_still_uses_worker_allowlist() {
 
     let reply = reply_rx.recv().await.expect("tool_result");
     assert_eq!(
-        reply["payload"]["status"], "success",
-        "ordinary dispatches keep the worker-level grant: {reply}"
+        reply["payload"]["status"], "denied",
+        "a cron worker's stripped worker-level list must deny ordinary dispatches too: {reply}"
     );
-    let seen = probe.seen.lock().expect("probe lock");
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0], ("tenant-user".to_string(), job_id));
+    assert!(
+        probe.seen.lock().expect("probe lock").is_empty(),
+        "a denied call must never reach the tool"
+    );
 }
 
 #[tokio::test]

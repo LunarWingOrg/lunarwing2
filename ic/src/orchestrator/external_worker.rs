@@ -484,6 +484,23 @@ impl ExternalWorkerManager {
                     cleartext_remote,
                 );
             }
+            // MR !1549 EF-1: a worker container is one authority domain
+            // shared by every concurrent and successive job running in it —
+            // any same-uid process can connect to another task's tool-proxy
+            // relay socket and borrow that job's grant. A worker-level list
+            // on a cron-mode worker would therefore be standing authority
+            // available to every tick, defeating the CQ-10 split. Strip it:
+            // a cron worker container never holds more than
+            // `cron.tool_allowlist`.
+            if config.is_cron() && !config.tool_allowlist.is_empty() {
+                tracing::error!(
+                    "External worker '{}' is mode=cron but sets a worker-level tool_allowlist; \
+                     stripping it — a cron worker container holds only cron.tool_allowlist \
+                     authority (ordinary dispatches to it get no proxied tools)",
+                    config.name
+                );
+                config.tool_allowlist = Vec::new();
+            }
             let endpoints = config.endpoints();
             load_balancers.insert(
                 config.name.clone(),

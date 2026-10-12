@@ -38,6 +38,16 @@ not have the bridge yet; see
 [`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md)
 for the wire contract.
 
+**One worker container is one authority domain** (MR !1549 EF-1): every
+concurrent and successive job in a container runs as the same uid, and any
+process in it can connect to another task's relay socket and act with that
+job's grant — including a detached leftover process waiting for later tasks.
+Per-user isolation therefore requires per-user workers. Because a tick job
+could borrow a concurrent interactive job's grant this way, a `mode = "cron"`
+worker's worker-level `tool_allowlist` is stripped at manager load (logged
+as an error): a cron worker container never holds more than its
+`cron.tool_allowlist`, and ordinary dispatches to it get no proxied tools.
+
 ## Generic shell sandbox network policy (WI#154/155)
 
 The generic shell sandbox (`ic/src/sandbox/`) defaults to

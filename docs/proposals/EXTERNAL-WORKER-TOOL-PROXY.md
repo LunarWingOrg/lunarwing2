@@ -188,19 +188,29 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
 - **Cron tick jobs never use the worker-level list** (MR !1506 CQ-10): a
   `mode = "cron"` mission fires unattended on a schedule, so tick jobs draw
   proxy authority from the mission's own `cron.tool_allowlist` (default
-  empty — every proxied call from a tick is denied). Ordinary dispatches to
-  the same worker keep using the worker-level list. The cron list goes
+  empty — every proxied call from a tick is denied). The cron list goes
   through the same load-time sanitization (phase-1 positive set, denylist
-  drops, cleartext strip), and a load-time warning fires when a cron-mode
-  worker sets only the worker-level list:
+  drops, cleartext strip).
+- **A cron worker's worker-level list is stripped at load** (MR !1549
+  EF-1): one worker container is **one authority domain** shared by every
+  concurrent and successive job running in it — any same-uid process in the
+  container can connect to another task's tool-proxy relay socket and act
+  with that job's grant, and a detached leftover process can wait for later
+  tasks' sockets. A worker-level `tool_allowlist` on a cron-mode worker
+  would therefore be standing authority borrowable by every tick, so the
+  manager drops it with an `error!` at load: the container never holds more
+  than `cron.tool_allowlist`, and ordinary dispatches to a cron-mode worker
+  get no proxied tools. Per-user isolation likewise requires per-user
+  workers — jobs of two daemon users sharing one worker container share one
+  authority domain:
 
   ```toml
   [[sandbox.external_workers]]
   name = "kimi"
   url = "ws://127.0.0.1:19000/kimi"
   mode = "cron"
-  # interactive dispatches only:
-  tool_allowlist = ["memory_read", "gitlab_tool"]
+  # Do NOT set a worker-level tool_allowlist here: it is stripped at load
+  # (a cron worker container must hold no standing interactive authority).
 
   [sandbox.external_workers.cron]
   schedule = "0 15 10 * * *"
