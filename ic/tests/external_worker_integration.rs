@@ -238,7 +238,20 @@ async fn spawn_mock_worker_full(
     expected_token: Option<String>,
     subprotocols: SubprotocolPolicy,
 ) -> (String, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    spawn_mock_worker_on_host("127.0.0.1", behavior, expected_token, subprotocols).await
+}
+
+/// Like [`spawn_mock_worker_full`] but binds a specific host. `127.0.0.2` is
+/// loopback-routed by the OS while the manager's strict host check classifies
+/// it non-loopback (MR !1549 EF-3), letting tests exercise the cleartext
+/// non-loopback strip against a real connection.
+async fn spawn_mock_worker_on_host(
+    host: &str,
+    behavior: MockBehavior,
+    expected_token: Option<String>,
+    subprotocols: SubprotocolPolicy,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind((host, 0))
         .await
         .expect("bind mock listener");
     let addr = listener.local_addr().expect("local_addr");
@@ -2558,6 +2571,126 @@ async fn cron_worker_worker_level_allowlist_is_stripped_at_load() {
         probe.seen.lock().expect("probe lock").is_empty(),
         "a denied call must never reach the tool"
     );
+}
+
+#[tokio::test]
+async fn cron_allowlist_is_sanitized_at_manager_load() {
+    // MR !1549 EF-3: pins that `ExternalWorkerManager::new` actually applies
+    // `sanitize_tool_allowlist` to `cron.tool_allowlist` — deleting that call
+    // must fail this test, because the cleartext non-loopback strip is
+    // load-only (the dispatch gate never sees the URL).
+    //
+    // Phase 1: a cron worker reached over cleartext ws:// on a
+    // non-loopback-classified host loses its whole cron list at load, so a
+    // tick's knowledge_search call is denied even though it is listed.
+    // (127.0.0.2 is loopback-routed by the OS but classified non-loopback by
+    // the strict host check, which only special-cases 127.0.0.1/localhost.)
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_on_host(
+        "127.0.0.2",
+        MockBehavior::ToolProxy {
+            calls: vec![(
+                "knowledge_search".to_string(),
+                serde_json::json!({ "k": "v" }),
+            )],
+            replies: reply_tx,
+        },
+        None,
+        SubprotocolPolicy::NewOnly,
+    )
+    .await;
+    let mut cleartext_config = cron_config_with_schedule(&url, "0 15 10 * * *", 300, 2);
+    cleartext_config
+        .cron
+        .as_mut()
+        .expect("cron block")
+        .tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![cleartext_config])
+        .with_tool_proxy(test_proxy(tools.clone()));
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            cron_tick_context(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+    let reply = reply_rx.recv().await.expect("tool_result");
+    assert_eq!(
+        reply["payload"]["status"], "denied",
+        "cleartext non-loopback must strip the cron list at load: {reply}"
+    );
+    assert!(probe.seen.lock().expect("probe lock").is_empty());
+
+    // Phase 2 (loopback): "*" is not honored and "shell" is dropped, while a
+    // real phase-1 grant still round-trips — all through the manager path.
+    let (reply_tx2, mut reply_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let (url2, _count2) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![
+            ("shell".to_string(), serde_json::json!({ "c": "id" })),
+            ("memory_read".to_string(), serde_json::json!({ "p": "x" })),
+            (
+                "knowledge_search".to_string(),
+                serde_json::json!({ "k": "v" }),
+            ),
+        ],
+        replies: reply_tx2,
+    })
+    .await;
+    let mut config2 = cron_config_with_schedule(&url2, "0 15 10 * * *", 300, 2);
+    config2
+        .cron
+        .as_mut()
+        .expect("cron block")
+        .tool_allowlist = vec![
+        "*".to_string(),
+        "shell".to_string(),
+        "knowledge_search".to_string(),
+    ];
+    let mgr2 =
+        ExternalWorkerManager::new(vec![config2]).with_tool_proxy(test_proxy(tools.clone()));
+    let res2 = timeout(
+        TEST_BOUND,
+        mgr2.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            cron_tick_context(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res2.status, ExternalTaskStatus::Success);
+    let shell_reply = reply_rx2.recv().await.expect("shell tool_result");
+    assert_eq!(
+        shell_reply["payload"]["status"], "denied",
+        "the proxy-denylisted shell entry must be dropped at load: {shell_reply}"
+    );
+    let wildcard_reply = reply_rx2.recv().await.expect("memory_read tool_result");
+    assert_eq!(
+        wildcard_reply["payload"]["status"], "denied",
+        "the dropped \"*\" must not grant memory_read: {wildcard_reply}"
+    );
+    let ok_reply = reply_rx2.recv().await.expect("knowledge_search tool_result");
+    assert_eq!(ok_reply["payload"]["status"], "success");
+    let seen = probe.seen.lock().expect("probe lock");
+    assert_eq!(seen.len(), 1, "only the genuine grant may reach the tool");
 }
 
 #[tokio::test]
