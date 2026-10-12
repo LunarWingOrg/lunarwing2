@@ -58,8 +58,8 @@
       "tool_catalog": {
         "description": "Agent → Worker: WI#324 reply to tool_list. Contains exactly the tools this worker may call (allowlist + phase-1 gates applied).",
         "payload": {
-          "tools": "array of { name, description, parameters (JSON schema) }",
-          "error": "string — present instead of tools on failure (fail-closed)"
+          "tools": "array of { name, description, parameters (JSON schema) } — empty array on failure",
+          "error": "string — present alongside tools: [] on failure (fail-closed)"
         }
       }
     },

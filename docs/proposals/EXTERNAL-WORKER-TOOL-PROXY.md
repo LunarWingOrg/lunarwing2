@@ -219,6 +219,13 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   tool_allowlist = ["knowledge_search"]
   ```
 
+  Rollback note (MR !1549 EF-6): `CronWorkerConfig` is
+  `deny_unknown_fields`, so a binary older than this change rejects any
+  config carrying `cron.tool_allowlist` — even `[]` from a settings
+  write-back. The field is therefore serialized only when non-empty; a
+  rollback only fails to boot if an operator set a non-empty cron list
+  (which the old binary could not honor anyway).
+
 ## Execution gates (MR !1506 CQ-1)
 
 An allowlisted call must additionally pass every gate the repo's other
@@ -332,8 +339,10 @@ as the WI's thin stdio MCP server, giving the worker agent a native
 
 - `kimicode4lunarwing/scripts/lunarwing_tool_proxy.ts` — bridge-side relay.
   For each accepted task the bridge starts a per-task unix socket
-  (`/tmp/lunarwing-tool-proxy/<task>.sock`, override with
-  `LUNARWING_TOOL_PROXY_DIR`), injects `LUNARWING_TASK_ID` +
+  (`/tmp/lunarwing-tool-proxy/<id≤64>-<sha16>.sock` — the task id sanitized
+  to `[A-Za-z0-9_-]` and capped at 64 chars, plus a 16-hex-char sha256
+  suffix; directory overridable with `LUNARWING_TOOL_PROXY_DIR`, kept short:
+  unix socket paths cap at ~108 bytes), injects `LUNARWING_TASK_ID` +
   `LUNARWING_TOOL_PROXY_SOCKET` into the CLI's environment (applied after
   task-supplied env so it cannot be shadowed), and routes inbound
   `tool_result`/`tool_catalog` hub frames back to the shim by `call_id`,
@@ -343,13 +352,30 @@ as the WI's thin stdio MCP server, giving the worker agent a native
   instead of a hub-side job failure. Per-call timeout:
   `LUNARWING_TOOL_PROXY_TIMEOUT_MS` (default 300 s, capped 900 s). Task
   teardown fails in-flight calls; IPC is one-response-per-connection
-  (end-after-flush) so teardown never drops a final reply.
+  (end-after-flush) so teardown never drops a final reply. Proxy socket
+  setup/teardown is best-effort (MR !1549 EF-2): the directory is a
+  same-uid shared /tmp tree a task process can sabotage, so a setup failure
+  degrades the task to tool-less instead of failing it, and teardown never
+  throws out of slot cleanup. Closing the hub socket fails that socket's
+  pending waiters immediately and drops its routing state (EF-9). Note the
+  hub runs proxied calls inline and serially (60 s default tool timeout), so
+  several concurrent MCP calls from one task can outlast the 300 s relay
+  timeout: the agent then sees a timeout for a call that later executes, and
+  a retry duplicates the side effect. Workers should issue proxied calls
+  sequentially.
 - `kimicode4lunarwing/scripts/lunarwing_mcp_server.ts` — the stdio MCP
   server the kimi CLI spawns per task session. Implements `initialize`,
   `ping`, `tools/list`, `tools/call` over newline-delimited JSON-RPC; hub
   `parameters` maps to MCP `inputSchema`; `denied`/`error` tool results
   surface as MCP tool errors carrying the hub's sanitized reason. With no
   proxy env (cli mode, non-task runs) it advertises zero tools.
+  The grant is **ambient for every process in the task**, not just the MCP
+  agent (MR !1549 EF-10): the socket path is in the CLI's environment, so an
+  untrusted `npm install` or test script in the workspace can call the
+  relay directly — and the kimi config loader merges
+  `<gitroot>/.mcp.json` / `<cwd>/.kimi-code/mcp.json`, so workspace content
+  can shadow or disable the `lunarwing` entry. Neither changes the security
+  posture: the hub's allowlist and gates stay authoritative for every call.
 - `entrypoint.sh` registers the shim in `$KIMI_CODE_HOME/mcp.json`
   (user-level, so no workspace trust prompt), write-if-absent so operators
   can disable or replace the entry.

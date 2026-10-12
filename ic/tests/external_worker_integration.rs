@@ -3031,6 +3031,49 @@ async fn tool_catalog_lists_only_callable_allowlisted_tools() {
 }
 
 #[tokio::test]
+async fn tool_catalog_advertises_the_proxied_memory_write_schema() {
+    // MR !1549 EF-4: memory_write's own schema accepts `layer` and defaults
+    // `target` to daily_log — both always denied by the DX-2 guard. The
+    // catalog entry must advertise the proxied schema instead: no `layer`,
+    // `target` required.
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools
+        .register(Arc::new(GateProbeTool {
+            tool_name: "memory_write".to_string(),
+            output: "ok".to_string(),
+            autonomous: true,
+            calls: AtomicUsize::new(0),
+        }))
+        .await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxyRaw {
+        frames: vec![("tool_list".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["memory_write".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
+    let entries = replies[0]["payload"]["tools"].as_array().expect("tools array");
+    assert_eq!(entries.len(), 1);
+    let params = &entries[0]["parameters"];
+    let props = params["properties"].as_object().expect("properties");
+    assert!(
+        !props.contains_key("layer") && !props.contains_key("force"),
+        "the proxied schema must not advertise layer/force: {params}"
+    );
+    let required = params["required"].as_array().expect("required");
+    assert!(
+        required.contains(&serde_json::json!("target")),
+        "the proxied schema must require target: {params}"
+    );
+}
+
+#[tokio::test]
 async fn tool_call_autonomous_opt_out_is_denied() {
     // MR !1506 review (CQ-1): a tool that opts out of autonomous execution
     // must be refused even when it is named in the worker allowlist. The

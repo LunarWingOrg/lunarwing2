@@ -3261,13 +3261,45 @@ async fn build_tool_catalog(
                     // the catalog entry even when the registry uses an alias.
                     name: name.clone(),
                     description: tool.description().to_string(),
-                    parameters: tool.parameters_schema(),
+                    parameters: proxied_catalog_schema(&resolved, tool.parameters_schema()),
                 });
             }
         }
         tools.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     }
     Envelope::new("tool_catalog", serde_json::json!({ "tools": tools }))
+}
+
+/// MR !1549 EF-4: the catalog must advertise the schema the proxy boundary
+/// actually accepts. The DX-2 guard denies any explicit `layer`, and an
+/// omitted `target` resolves to `daily_log`, which the prompt-file
+/// classification rejects — so the tool's own schema (layer accepted, target
+/// defaulting to daily_log) would advertise calls that are always denied.
+/// The proxied memory_write schema drops `layer` (and the layer-only
+/// `force`), makes `target` required, and describes the allowed paths.
+fn proxied_catalog_schema(resolved_name: &str, original: serde_json::Value) -> serde_json::Value {
+    if resolved_name != "memory_write" {
+        return original;
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The content to write to memory. Be concise but include relevant context."
+            },
+            "target": {
+                "type": "string",
+                "description": "Workspace-memory path to write, e.g. 'notes/today.md' or 'projects/alpha/notes.md'. REQUIRED on this surface: there is no default — the named shortcuts ('memory', 'daily_log', 'heartbeat', 'bootstrap'), identity/config files, lorebooks, daily logs and 'engine/**' paths are all denied by the proxy boundary."
+            },
+            "append": {
+                "type": "boolean",
+                "description": "If true, append to existing content; if false, replace it (the previous version is kept at backups/<path>.bak).",
+                "default": true
+            }
+        },
+        "required": ["content", "target"]
+    })
 }
 
 /// Marker prefix workers use for synthetic keep-alive progress (WI#263).
@@ -3658,6 +3690,27 @@ mod tests {
         let probe: TypeProbe<'_> = serde_json::from_str(raw).expect("escaped type");
         assert_eq!(probe.msg_type, "tool_call");
         assert!(matches!(probe.msg_type, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn proxied_memory_write_schema_drops_layer_and_requires_target() {
+        // MR !1549 EF-4: the DX-2 guard denies any explicit `layer` and an
+        // omitted target resolves to the always-denied daily_log — the
+        // catalog must not advertise a shape that can never succeed.
+        let original = serde_json::json!({
+            "type": "object",
+            "properties": { "content": {"type": "string"}, "layer": {"type": "string"} },
+            "required": ["content"]
+        });
+        let schema = proxied_catalog_schema("memory_write", original.clone());
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(!props.contains_key("layer"), "layer must not be advertised");
+        assert!(!props.contains_key("force"), "layer-only force must not be advertised");
+        assert!(props.contains_key("content") && props.contains_key("target"));
+        let required = schema["required"].as_array().expect("required");
+        assert!(required.contains(&serde_json::json!("target")));
+        // Other tools keep their own schema untouched.
+        assert_eq!(proxied_catalog_schema("memory_read", original.clone()), original);
     }
 
     #[test]

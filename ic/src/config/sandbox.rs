@@ -298,11 +298,17 @@ pub struct CronWorkerConfig {
     /// mission fires unattended on a schedule, so tick jobs never inherit the
     /// interactive list — grant the schedule its own (usually narrower) set
     /// here. Default: empty — every `tool_call` from a tick job is denied.
-    /// Ordinary (non-tick) dispatches to the same worker still use the
-    /// worker-level list. Sanitized with the same rules as the worker-level
-    /// list at manager load (phase-1 positive set, denylist drops, cleartext
-    /// strip).
-    #[serde(default)]
+    /// Sanitized with the same rules as the worker-level list at manager load
+    /// (phase-1 positive set, denylist drops, cleartext strip).
+    /// MR !1549 EF-1: a cron worker's worker-level list is stripped at
+    /// manager load (one container = one authority domain), so this is the
+    /// ONLY proxy authority a cron worker container holds — ordinary
+    /// dispatches to it get no proxied tools either.
+    /// Serialized only when non-empty (MR !1549 EF-6): `CronWorkerConfig` is
+    /// `deny_unknown_fields`, so an older binary rejects any config carrying
+    /// this field at all — write-backs must not introduce
+    /// `tool_allowlist = []` or a rollback could no longer boot the config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_allowlist: Vec<String>,
 }
 
@@ -534,7 +540,11 @@ pub struct ExternalWorkerConfig {
     /// This list governs **ordinary (task-mode) dispatches only**. Cron tick
     /// jobs on a `mode = "cron"` worker use `cron.tool_allowlist` instead
     /// (MR !1506 CQ-10): a schedule is standing unattended authority, so the
-    /// mission's grant is an explicit separate decision.
+    /// mission's grant is an explicit separate decision. On a cron-mode worker
+    /// this worker-level list is stripped at manager load (MR !1549 EF-1): one
+    /// worker container is one authority domain shared by every concurrent and
+    /// successive job in it, so a tick could otherwise borrow the interactive
+    /// grant through another task's relay socket.
     pub tool_allowlist: Vec<String>,
     /// Operating mode (default task). `Cron` arms the host-side mission
     /// supervisor. The worker still accepts ordinary bounded dispatches, but
