@@ -6937,6 +6937,106 @@ pub(crate) mod tests {
         );
     }
 
+    /// WI#332 / MR !1528 DJ-1: the HTTP-facing lookups still return an
+    /// authentication-fallback gate whose thread already terminated — the
+    /// user must be able to fetch the token prompt and answer it.
+    #[tokio::test]
+    async fn engine_pending_gate_lookups_return_fallback_gates_for_dead_threads() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let mut terminal = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        terminal
+            .transition_to(lunarwing_engine::ThreadState::Failed, None)
+            .unwrap();
+        store.save_thread(&terminal).await.unwrap();
+
+        let mut fallback = sample_pending_gate(
+            "alice",
+            terminal.id,
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "gitlab".into(),
+                instructions: "token".into(),
+                auth_url: None,
+            },
+        );
+        fallback.gate_name = "authentication".into();
+        fallback.action_name = "authentication_fallback".into();
+        fallback.original_message = Some("deploy the branch".into());
+        let request_id = fallback.request_id;
+        state.pending_gates.insert(fallback).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let listed = list_engine_pending_gates("alice").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].request_id, request_id.to_string());
+
+        let fetched = get_engine_pending_gate("alice", Some(&terminal.id.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched.map(|view| view.request_id),
+            Some(request_id.to_string())
+        );
+
+        *lock.write().await = None;
+    }
+
+    /// WI#332 / MR !1528 DJ-6b: liveness filtering happens before selection,
+    /// so a dead newest gate cannot hide an older live one under the same
+    /// conversation hint.
+    #[tokio::test]
+    async fn engine_pending_gate_lookup_skips_a_dead_newest_gate() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let conversation_id = lunarwing_engine::ConversationId::new();
+
+        let live_thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let mut older_live = sample_pending_gate(
+            "alice",
+            live_thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        older_live.conversation_id = conversation_id;
+        older_live.created_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let older_live_id = older_live.request_id;
+
+        let mut dead_thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        dead_thread
+            .transition_to(lunarwing_engine::ThreadState::Failed, None)
+            .unwrap();
+        store.save_thread(&dead_thread).await.unwrap();
+        let mut newer_dead = sample_pending_gate(
+            "alice",
+            dead_thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        newer_dead.conversation_id = conversation_id;
+        newer_dead.created_at = chrono::Utc::now();
+
+        state.pending_gates.insert(older_live).await.unwrap();
+        state.pending_gates.insert(newer_dead).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let fetched = get_engine_pending_gate("alice", Some(&conversation_id.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched.map(|view| view.request_id),
+            Some(older_live_id.to_string()),
+            "the older live gate must win over the dead newest one"
+        );
+
+        *lock.write().await = None;
+    }
+
     /// Work item #108 regression: an expired gate must resume the paused
     /// thread with an injected expiry result and deliver the wrap-up reply to
     /// the gate's source channel — not silently fail the thread.
