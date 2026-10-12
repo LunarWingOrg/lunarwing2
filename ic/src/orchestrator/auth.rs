@@ -228,11 +228,31 @@ impl TokenStore {
         if !redactor.is_armed() {
             return None;
         }
-        let redactor = Arc::new(redactor);
-        self.harness_redactors
-            .write()
+        self.cache_redactor_if_held(job_id, Arc::new(redactor))
             .await
-            .insert(job_id, Arc::clone(&redactor));
+    }
+
+    /// Insert a freshly built redactor only when the job's secrets are still
+    /// held (EE-4): a `clear_harness_secrets` that raced the build must not
+    /// be followed by a re-insert — nothing would ever remove that entry.
+    /// Lock order secrets → redactors matches the clear path, so the
+    /// re-check and the insert are atomic against a concurrent clear.
+    async fn cache_redactor_if_held(
+        &self,
+        job_id: Uuid,
+        redactor: Arc<crate::orchestrator::harness::SecretValueRedactor>,
+    ) -> Option<Arc<crate::orchestrator::harness::SecretValueRedactor>> {
+        let secrets = self.harness_secrets.read().await;
+        if !secrets.contains_key(&job_id) {
+            return None;
+        }
+        let mut redactors = self.harness_redactors.write().await;
+        if let Some(existing) = redactors.get(&job_id) {
+            // A concurrent build won the insert; both describe the same
+            // held values, so either Arc is correct.
+            return Some(Arc::clone(existing));
+        }
+        redactors.insert(job_id, Arc::clone(&redactor));
         Some(redactor)
     }
 
@@ -572,5 +592,69 @@ mod tests {
 
         store.clear_harness_secrets(job_id).await;
         assert!(store.harness_secret_redactor(job_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn harness_redactor_insert_is_skipped_when_secrets_were_cleared() {
+        // EE-4: a redactor built while `clear_harness_secrets` ran must NOT
+        // be inserted — nothing would ever remove that entry, leaving a full
+        // secret-derived variant set alive for an ended job.
+        let store = TokenStore::new();
+        let job_id = Uuid::new_v4();
+        let redactor = Arc::new(crate::orchestrator::harness::SecretValueRedactor::new(
+            [SecretString::from("value-that-is-long-enough".to_string())].as_slice(),
+        ));
+        // No secrets held for the job (as after a racing clear): refused.
+        assert!(
+            store
+                .cache_redactor_if_held(job_id, Arc::clone(&redactor))
+                .await
+                .is_none()
+        );
+        assert!(store.harness_redactors.read().await.get(&job_id).is_none());
+
+        // Secrets held: the insert lands and is reused.
+        store
+            .store_harness_secrets(
+                job_id,
+                vec![(
+                    "API_KEY".to_string(),
+                    SecretString::from("value-that-is-long-enough".to_string()),
+                )],
+            )
+            .await;
+        assert!(
+            store
+                .cache_redactor_if_held(job_id, Arc::clone(&redactor))
+                .await
+                .is_some()
+        );
+        assert!(store.harness_redactors.read().await.get(&job_id).is_some());
+
+        // Quiescent-state invariant under racing builds and clears: once
+        // everything settles, the cache never outlives the held secrets.
+        for _ in 0..64 {
+            let store = Arc::new(TokenStore::new());
+            let job_id = Uuid::new_v4();
+            store
+                .store_harness_secrets(
+                    job_id,
+                    vec![(
+                        "API_KEY".to_string(),
+                        SecretString::from("value-that-is-long-enough".to_string()),
+                    )],
+                )
+                .await;
+            let builder = tokio::spawn({
+                let store = Arc::clone(&store);
+                async move { store.harness_secret_redactor(job_id).await }
+            });
+            store.clear_harness_secrets(job_id).await;
+            let _ = builder.await;
+            assert!(
+                store.harness_redactors.read().await.get(&job_id).is_none(),
+                "a cleared job must never retain a cached redactor"
+            );
+        }
     }
 }
