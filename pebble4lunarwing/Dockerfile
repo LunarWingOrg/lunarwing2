@@ -157,6 +157,46 @@ ENV GOROOT=/usr/local/go \
     GOPATH=/root/go \
     PATH=/usr/local/cargo/bin:/usr/local/go/bin:/root/go/bin:$PATH
 
+# ── Task-shell toolchain anchors (WI#334) ────────────────────────────
+# Upstream pebble's Bash tool spawns every task command as
+# `/bin/sh -lc <cmd>` with the process environment inherited (no env_clear;
+# pebble/crates/runtime/src/bash.rs at the pinned PEBBLE_REF). On this
+# Debian base /bin/sh is dash: as a login shell it reads /etc/profile, which
+# resets PATH to the system default — dropping the ENV PATH above (the
+# WI#320 gauntlet F6 failure) — and then sources /etc/profile.d/*.sh.
+# An entrypoint.sh export cannot survive that reset, so the toolchains are
+# anchored where a reset shell still finds them:
+#   * /etc/profile.d/lunarwing-toolchain.sh restores the toolchain env for
+#     login shells, sourcing AFTER the /etc/profile PATH reset. It must stay
+#     dash-clean: dash aborts the task command on a syntax error in a
+#     sourced profile.d file. Existence-guarded, so inert in the slim image.
+#   * Real-binary symlinks in /usr/local/bin (cargo, rustc, go, gofmt) cover
+#     sanitised shells whose fallback PATH still includes /usr/local/bin.
+#   * /usr/local/bin/rustup is a wrapper that re-exports RUSTUP_HOME/
+#     CARGO_HOME before delegating, keeping rustup usable from any shell.
+COPY pebble4lunarwing/scripts/toolchain-profile.sh /etc/profile.d/lunarwing-toolchain.sh
+COPY pebble4lunarwing/scripts/rustup-wrapper.sh /usr/local/share/lunarwing/rustup-wrapper.sh
+
+# Build-time proof, two legs mirroring smoke-task-shell-toolchain.sh:
+#   1. the real spawn mode — /bin/sh -lc with the image env (login PATH
+#      reset + profile.d restore; the rustup proxies answer);
+#   2. a fully sanitised shell — env -i /bin/sh -c, where only the
+#      /usr/local/bin symlinks and the rustup wrapper can resolve the
+#      toolchains. The command -v lines are the resolution evidence.
+RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
+      set -eu; \
+      toolchain_bins="$(ls -d /usr/local/rustup/toolchains/*/bin)"; \
+      [ "$(printf '%s\n' "${toolchain_bins}" | wc -l)" = "1" ] || { \
+        echo "expected exactly one rustup toolchain dir" >&2; exit 1; }; \
+      ln -s "${toolchain_bins}/cargo" /usr/local/bin/cargo; \
+      ln -s "${toolchain_bins}/rustc" /usr/local/bin/rustc; \
+      ln -s /usr/local/go/bin/go /usr/local/bin/go; \
+      ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt; \
+      install -m 0755 /usr/local/share/lunarwing/rustup-wrapper.sh /usr/local/bin/rustup; \
+      /bin/sh -lc 'set -e; command -v cargo; command -v rustc; command -v go; command -v rustup; cargo --version; rustc --version; go version; rustup --version'; \
+      env -i /bin/sh -c 'set -e; command -v cargo; command -v rustc; command -v go; command -v rustup; cargo --version; rustc --version; go version; rustup --version'; \
+    fi
+
 COPY --from=builder /build/bridge/target/release/pebble4lunarwing /usr/local/bin/pebble4lunarwing
 COPY --from=builder /build/pebble/target/release/pebble /usr/local/bin/pebble
 COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh

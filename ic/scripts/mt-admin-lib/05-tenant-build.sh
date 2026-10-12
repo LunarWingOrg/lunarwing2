@@ -1120,6 +1120,16 @@ build_pebble_worker() {
       || die "pebble worker image build failed"
   fi
 
+  if [[ "$with_toolchains" == "true" ]]; then
+    # WI#334: prove the task-shell toolchain anchors on the freshly built fat
+    # image (pebble's real /bin/sh -lc spawn mode plus a sanitised shell).
+    # The slim image has no toolchains, so the probe is fat-only.
+    local smoke_script="${LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$pebble_dir/scripts/smoke-task-shell-toolchain.sh}"
+    say "smoke-checking task-shell toolchain anchors (WI#334) ..."
+    "$smoke_script" image lunarwing-worker-pebble:latest \
+      || die "pebble worker task-shell toolchain smoke check failed (WI#334)"
+  fi
+
   say "pebble worker image built: lunarwing-worker-pebble:latest [$toolchain_desc]"
 }
 

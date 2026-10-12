@@ -38,12 +38,30 @@ capture_build() {
 docker() { capture_build "$@"; }
 podman() { capture_build "$@"; }
 
+# WI#334: the fat build must smoke-check the task-shell toolchain anchors on
+# the freshly built image; the slim build must not (it has no toolchains).
+smoke_calls=0
+mt_admin_smoke_stub() {
+  smoke_calls=$((smoke_calls + 1))
+  [[ "${1:-}" == image && "${2:-}" == lunarwing-worker-pebble:latest ]] \
+    || fail 'wrong smoke invocation'
+}
+export LUNARWING_PEBBLE_TOOLCHAIN_SMOKE=mt_admin_smoke_stub
+
 for CONTAINER_RT in docker podman; do
   for profile in false true; do
     for no_cache in false true; do
+      smoke_before=$smoke_calls
       build_pebble_worker "$no_cache" "$profile"
       [[ "$effective_digest" == "$actual_digest" ]] || fail "$CONTAINER_RT missing effective digest"
       [[ "$effective_toolchains" == "$profile" ]] || fail "$CONTAINER_RT wrong toolchain profile"
+      if [[ "$profile" == true ]]; then
+        [[ $smoke_calls -eq $((smoke_before + 1)) ]] \
+          || fail "$CONTAINER_RT fat build skipped the toolchain smoke check"
+      else
+        [[ $smoke_calls -eq $smoke_before ]] \
+          || fail "$CONTAINER_RT slim build ran the toolchain smoke check"
+      fi
     done
   done
 done

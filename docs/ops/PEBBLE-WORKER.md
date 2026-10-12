@@ -51,6 +51,52 @@ Before v2.1.2.0 the read loop was parked inside the running task, so
 mid-task cancels queued unread and every task ran to its full timeout
 (work item #101).
 
+## Task-Shell Toolchain PATH (WI#334)
+
+Upstream pebble's Bash tool spawns every task command as `/bin/sh -lc <cmd>`
+with the process environment inherited — there is no env_clear
+(`pebble/crates/runtime/src/bash.rs` at the pinned `PEBBLE_REF`). On the
+Debian base `/bin/sh` is dash; as a login shell it reads `/etc/profile`,
+which resets `PATH` to the system default — dropping the Dockerfile `ENV
+PATH` entries for the toolchains (the WI#320 gauntlet F6 failure) — and
+then sources `/etc/profile.d/*.sh`. The rest of the image `ENV` survives.
+Exporting PATH from `entrypoint.sh` cannot help — the reset happens after
+the entrypoint. The fat image (`WITH_TOOLCHAINS=true`) therefore anchors
+the toolchains in three places:
+
+- `/etc/profile.d/lunarwing-toolchain.sh`
+  (`pebble4lunarwing/scripts/toolchain-profile.sh`) re-adds the toolchain
+  variables and PATH entries — including `$GOPATH/bin`, so `go install`ed
+  tools survive — for login shells, sourcing after the `/etc/profile`
+  reset. The snippet must stay dash-clean: dash aborts the whole task
+  command on a syntax error in a sourced profile.d file. It is
+  existence-guarded, so it is inert in the slim image, and it prepends the
+  rustup proxies ahead of `/usr/local/bin` so `rust-toolchain.toml` keeps
+  working.
+- `/usr/local/bin/{cargo,rustc,go,gofmt}` are symlinks to the real
+  toolchain binaries (not the rustup shims), so they run without
+  `RUSTUP_HOME`/`CARGO_HOME` from any shell whose fallback PATH includes
+  `/usr/local/bin`; a fully sanitised non-login shell is the only mode that
+  actually resolves through them.
+- `/usr/local/bin/rustup`
+  (`pebble4lunarwing/scripts/rustup-wrapper.sh`) is a wrapper that
+  re-exports `RUSTUP_HOME`/`CARGO_HOME` before delegating to the real
+  rustup, keeping it discoverable and functional from sanitised shells.
+
+The image build proves the anchors in both spawn shapes — `/bin/sh -lc`
+with the image environment, and `env -i /bin/sh -c` where only the symlinks
+and wrapper can resolve the toolchains — printing `command -v` evidence for
+each binary. `mt-admin build-pebble-worker --with-toolchains` re-runs the
+same probe against the freshly built image via
+`pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh`, and a failed
+probe fails the build; that script is the gauntlet smoke check for this
+finding. To re-check any built image or a live worker container:
+
+```bash
+pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh image lunarwing-worker-pebble:latest
+pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh container <pebble-container>
+```
+
 ## Single-Instance Setup
 
 ### Native (no Docker)
