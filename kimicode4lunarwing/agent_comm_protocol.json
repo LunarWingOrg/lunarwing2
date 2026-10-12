@@ -45,10 +45,39 @@
       "ping": {
         "description": "Agent → Worker: keep-alive probe",
         "payload": {}
+      },
+      "tool_result": {
+        "description": "Agent → Worker: WI#324 reply to a tool_call. Routed by the bridge relay to the in-task MCP shim by call_id.",
+        "payload": {
+          "call_id": "string — echoed from tool_call",
+          "status":  "string — success | error | denied",
+          "output":  "string — sanitized tool result (pretty JSON)",
+          "error":   "string | null — sanitized reason for error/denied"
+        }
+      },
+      "tool_catalog": {
+        "description": "Agent → Worker: WI#324 reply to tool_list. Contains exactly the tools this worker may call (allowlist + phase-1 gates applied).",
+        "payload": {
+          "tools": "array of { name, description, parameters (JSON schema) }",
+          "error": "string — present instead of tools on failure (fail-closed)"
+        }
       }
     },
 
     "outbound": {
+      "tool_call": {
+        "description": "Worker → Agent: WI#324 proxied tool invocation. task_id must equal the job this connection serves; frames over 256 KiB are rejected with error.",
+        "payload": {
+          "task_id":   "string — the active job id (required, binding)",
+          "call_id":   "string — worker-chosen correlation id [A-Za-z0-9_-]{1,128}",
+          "name":      "string — allowlisted tool name",
+          "arguments": "object | null — tool arguments"
+        }
+      },
+      "tool_list": {
+        "description": "Worker → Agent: WI#324 request for the callable tool catalog. Payload {} (task_id optional, must equal the job id when present). Shares the per-job 100 control-frame budget with tool_call.",
+        "payload": {}
+      },
       "task_progress": {
         "description": "Worker → Agent: streaming progress update",
         "payload": {

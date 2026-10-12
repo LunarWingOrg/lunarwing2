@@ -1839,6 +1839,7 @@ mod tests {
             allow_subminute_schedule: None,
             project_dir: None,
             timezone: None,
+            tool_allowlist: Vec::new(),
         }
     }
 
