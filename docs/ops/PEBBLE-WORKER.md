@@ -69,28 +69,40 @@ the toolchains in three places:
   variables and PATH entries — including `$GOPATH/bin`, so `go install`ed
   tools survive — for login shells, sourcing after the `/etc/profile`
   reset. The snippet must stay dash-clean: dash aborts the whole task
-  command on a syntax error in a sourced profile.d file. It is
-  existence-guarded, so it is inert in the slim image, and it prepends the
-  rustup proxies ahead of `/usr/local/bin` so `rust-toolchain.toml` keeps
-  working.
+  command on a syntax error in a sourced profile.d file. It restores the
+  image `ENV PATH` order (rustup proxies first, ahead of `/usr/local/bin`
+  so `rust-toolchain.toml` keeps working, then `GOROOT/bin`, then
+  `GOPATH/bin`), so login shells resolve `go` through the snippet's GOROOT
+  restore rather than the symlinks. It is existence-guarded, so it is inert
+  in the slim image, and it skips non-absolute homes and never adds an
+  empty PATH entry. The fat image pre-creates `/root/go/bin`, so
+  `go install`ed tools resolve from the very first task command.
 - `/usr/local/bin/{cargo,rustc,go,gofmt}` are symlinks to the real
-  toolchain binaries (not the rustup shims), so they run without
+  toolchain binaries (not the rustup shims), so they resolve without
   `RUSTUP_HOME`/`CARGO_HOME` from any shell whose fallback PATH includes
   `/usr/local/bin`; a fully sanitised non-login shell is the only mode that
   actually resolves through them.
 - `/usr/local/bin/rustup`
   (`pebble4lunarwing/scripts/rustup-wrapper.sh`) is a wrapper that
   re-exports `RUSTUP_HOME`/`CARGO_HOME` before delegating to the real
-  rustup, keeping it discoverable and functional from sanitised shells.
+  rustup, keeping it resolvable from sanitised shells.
 
 The image build proves the anchors in both spawn shapes — `/bin/sh -lc`
 with the image environment, and `env -i /bin/sh -c` where only the symlinks
 and wrapper can resolve the toolchains — printing `command -v` evidence for
-each binary. `mt-admin build-pebble-worker --with-toolchains` re-runs the
-same probe against the freshly built image via
-`pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh`, and a failed
-probe fails the build; that script is the gauntlet smoke check for this
-finding. To re-check any built image or a live worker container:
+each binary. The sanitised leg proves *resolution*, not full toolchain
+function (with no PATH exported, a stripped-env `cargo` cannot re-locate
+`rustc` for its own subprocesses); pebble never spawns that mode — it is an
+anchor against future spawn changes, not a supported shell shape. `mt-admin
+build-pebble-worker --with-toolchains` re-runs the same probe against the
+freshly built image via
+`pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh` as a build gate:
+the fat build tags the image `lunarwing-worker-pebble:candidate` first, the
+smoke probes the candidate with the build's own container runtime
+(`CONTAINER_RT` is passed through) and `--pull=never` so it can never hit a
+registry, and only a passing probe re-tags `:latest` — a failed probe fails
+the build and leaves the previous `:latest` untouched. No gauntlet lane
+invokes the script. To re-check any built image or a live worker container:
 
 ```bash
 pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh image lunarwing-worker-pebble:latest
