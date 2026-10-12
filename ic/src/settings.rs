@@ -908,6 +908,22 @@ pub struct ExternalWorkerSettings {
     /// Bounds applied when `create_job` requests recent conversation context.
     #[serde(default)]
     pub prompt_context: lunarwing_common::PromptContextLimits,
+    /// Per-worker tool capability allowlist for the proxied tool path
+    /// (WI#324). Names of in-process tools this worker may invoke over the
+    /// WebSocket control channel (e.g. "memory_read", "memory_write",
+    /// "knowledge_search"). Deny-by-default: an empty list means the worker
+    /// gets a hard reject for every `tool_call`. Exact names only — `"*"`
+    /// and autonomous-denylisted names are dropped at load, and the whole
+    /// list is stripped for cleartext `ws://` endpoints on non-loopback
+    /// hosts. Only names inside the WI#324 phase-1 capability set
+    /// (`memory_read`/`memory_write`, `knowledge_search`/
+    /// `knowledge_submit_note`/`knowledge_get_topic`, `gitlab_tool`/`gitlab-tool`) are
+    /// kept; host-execution, host-read, store, HTTP, and cross-plane tools
+    /// are never worker-callable (MR !1533 DP-2). Tools must additionally
+    /// pass the daemon's autonomous-execution gates, and secrets never cross
+    /// the proxy — only sanitized results.
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
     /// Operating mode: "task" (default, bounded dispatches) or "cron"
     /// (mission-like, long-running supervised jobs — WI#325).
     #[serde(default)]

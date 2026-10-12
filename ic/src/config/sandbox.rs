@@ -511,6 +511,15 @@ pub struct ExternalWorkerConfig {
     pub load_balance: LoadBalanceStrategy,
     /// Bounds applied when recent conversation context is requested.
     pub prompt_context: PromptContextLimits,
+    /// Per-worker tool capability allowlist for the proxied tool path
+    /// (WI#324). Deny-by-default: empty means every `tool_call` frame from
+    /// this worker is rejected. Exact tool names only — there is no
+    /// wildcard; `ExternalWorkerManager` drops `"*"`, autonomous-denylisted,
+    /// proxy-denylisted, non-identifier, and non-phase-1 entries at load
+    /// (the proxy surface is the positive WI#324 phase-1 capability set,
+    /// MR !1533 DP-2), and strips the whole list when the worker is reached
+    /// over cleartext `ws://` on a non-loopback host.
+    pub tool_allowlist: Vec<String>,
     /// Operating mode (default task). `Cron` arms the host-side mission
     /// supervisor. The worker still accepts ordinary bounded dispatches, but
     /// the kimi/pebble workspace lock treats nested paths as overlapping, so
@@ -529,6 +538,9 @@ pub struct ExternalWorkerConfig {
 /// every literal should use `..Default::default()` so a sibling MR adding a
 /// field does not break compilation outside Git's conflict markers.
 impl Default for ExternalWorkerConfig {
+    /// Sensible standalone defaults (used by tests and by struct-update
+    /// literals so added fields do not break every construction site).
+    /// `timeout_ms` matches the settings-layer external-worker default.
     fn default() -> Self {
         Self {
             name: String::new(),
@@ -539,6 +551,7 @@ impl Default for ExternalWorkerConfig {
             endpoints: Vec::new(),
             load_balance: LoadBalanceStrategy::default(),
             prompt_context: PromptContextLimits::default(),
+            tool_allowlist: Vec::new(),
             mode: ExternalWorkerMode::default(),
             cron: None,
         }
@@ -574,6 +587,7 @@ impl ExternalWorkerConfig {
                     endpoints: ew.endpoints.clone(),
                     load_balance: ew.load_balance.clone(),
                     prompt_context,
+                    tool_allowlist: ew.tool_allowlist.clone(),
                     mode: ew.mode,
                     cron: ew.cron.clone(),
                 };

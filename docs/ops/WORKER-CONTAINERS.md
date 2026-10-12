@@ -5,6 +5,21 @@ Several container images provide sandboxed and persistent job execution for Luna
 Nanocode is retired and has no active source, build, or runtime image definition.
 See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 
+## WebSocket message limits
+
+The daemon accepts external-worker messages and individual WebSocket frames
+up to **16 MiB**, including envelope overhead. Fragmentation does not bypass
+the total-message limit. This applies to every worker, even with an empty
+`tool_allowlist`; exceeding the bound fails the job with a WebSocket size
+error and drops the connection. Proxied `tool_call` messages additionally
+have an independent **256 KiB** limit before dispatch.
+
+Kimi's `WS_MAX_PAYLOAD_BYTES` defaults to 1,048,576 bytes and can be raised to
+16,777,216 bytes; its serializer caps the whole envelope. The daemon limit
+accommodates that maximum. OpenCode and Pebble bridges do not currently cap
+their outgoing envelopes, so outputs above 16 MiB still exceed the transport
+contract. Results/progress between 1 and 16 MiB are accepted (MR !1540 DX-1/DX-3).
+
 ## Generic shell sandbox network policy (WI#154/155)
 
 The generic shell sandbox (`ic/src/sandbox/`) defaults to

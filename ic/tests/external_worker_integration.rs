@@ -48,13 +48,22 @@ use lunarwing::config::{
     CronWorkerConfig, ExternalWorkerConfig, ExternalWorkerMode, WorkerEndpoint,
 };
 use lunarwing::context::{ContextManager, JobContext, JobState};
+#[cfg(feature = "libsql")]
+use lunarwing::db::Database;
+#[cfg(feature = "libsql")]
+use lunarwing::db::libsql::LibSqlBackend;
 use lunarwing::error::OrchestratorError;
+use lunarwing::hooks::HookRegistry;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
-    ConversationMessage, CronCommandOrigin, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
+    ConversationMessage, CronCommandOrigin, ExternalTaskStatus, SUBPROTOCOL, TaskContext, ToolProxy,
 };
 use lunarwing::tools::Tool;
 use lunarwing::tools::builtin::CreateJobTool;
+#[cfg(feature = "libsql")]
+use lunarwing::tools::builtin::{MemoryReadTool, MemoryWriteTool};
+#[cfg(feature = "libsql")]
+use lunarwing::workspace::Workspace;
 
 /// How long we wait for any single test assertion before declaring the test
 /// hung. The protocol path under test should resolve in well under this.
@@ -127,6 +136,33 @@ enum MockBehavior {
     /// never closes the socket (read loop parked inside the task). Drives the
     /// daemon's bounded-deadline fallback (WI#149).
     CancelNoAck,
+    /// WI#324 proxied tool path: on `task_request`, send the scripted
+    /// `tool_call` frames in order, forwarding every `tool_result` reply to
+    /// `replies`, then finish with a success `task_result`. Loops so the
+    /// connection stays poolable.
+    ToolProxy {
+        calls: Vec<(String, serde_json::Value)>,
+        replies: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    },
+    /// Like `ToolProxy`, but the caller scripts raw frame payloads as
+    /// `(type, payload)` pairs — for frames the typed builder cannot express
+    /// (missing/mismatched `task_id`, `tool_list`). The literal string
+    /// `@task_id@` inside a payload is replaced with the real task id.
+    /// Every `tool_result`/`tool_catalog` reply is forwarded to `replies`.
+    ToolProxyRaw {
+        frames: Vec<(String, serde_json::Value)>,
+        replies: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    },
+    /// Like `ToolProxyRaw`, but each frame is a verbatim pre-serialized JSON
+    /// text — for frames no builder can express: escaped `"type"` spellings,
+    /// oversized payloads (MR !1533 DP-1/DP-5). `@task_id@` inside the text
+    /// is replaced with the real task id.
+    ToolProxyVerbatim {
+        frames: Vec<String>,
+        replies: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    },
+    /// Send one text message in individually bounded continuation frames.
+    FragmentedText(String),
     /// WI#267: a kimi-executor-shaped worker whose CLI wedged. Streams the
     /// given progress frames (typically synthetic `[worker] ` heartbeats,
     /// optionally interleaved with genuine deltas), then reports `timed_out`
@@ -352,6 +388,27 @@ async fn handle_connection(
         }
 
         match behavior {
+            MockBehavior::FragmentedText(ref text) => {
+                use tokio_tungstenite::tungstenite::protocol::frame::{
+                    Frame,
+                    coding::{Data, OpCode},
+                };
+                let chunks = text.as_bytes().chunks(512 * 1024);
+                let count = chunks.len();
+                for (index, chunk) in chunks.enumerate() {
+                    let opcode = if index == 0 {
+                        Data::Text
+                    } else {
+                        Data::Continue
+                    };
+                    let frame =
+                        Frame::message(chunk.to_vec(), OpCode::Data(opcode), index + 1 == count);
+                    if ws.send(Message::Frame(frame)).await.is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
             MockBehavior::Success {
                 ref progress,
                 ref output,
@@ -616,6 +673,190 @@ async fn handle_connection(
                 // Pre-WI#101 shape: the cancel envelope queues unread (read
                 // loop parked inside the task); never ack, never close.
                 tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            MockBehavior::ToolProxy {
+                ref calls,
+                ref replies,
+            } => {
+                // WI#324 shape: mid-task the worker issues proxied tool calls
+                // over the control channel and blocks on each reply.
+                let task_id = req_envelope["payload"]["task_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let mut failed = false;
+                for (index, (name, args)) in calls.iter().enumerate() {
+                    let call = envelope(
+                        "tool_call",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "call_id": format!("call-{index}"),
+                            "name": name,
+                            "arguments": args,
+                        }),
+                    );
+                    if ws.send(Message::Text(call.into())).await.is_err() {
+                        return;
+                    }
+                    // Read until the daemon's tool_result for this call arrives.
+                    loop {
+                        match ws.next().await {
+                            Some(Ok(m)) if !m.is_close() => {
+                                let Ok(text) = m.to_text() else { continue };
+                                let Ok(env) = serde_json::from_str::<serde_json::Value>(text)
+                                else {
+                                    continue;
+                                };
+                                if env.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                                    let _ = replies.send(env);
+                                    break;
+                                }
+                            }
+                            _ => {
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if failed {
+                        return;
+                    }
+                }
+                let r = envelope(
+                    "task_result",
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "status": "success",
+                        "output": "tool calls done",
+                        "error": null,
+                        "duration_ms": 1,
+                    }),
+                );
+                if ws.send(Message::Text(r.into())).await.is_err() {
+                    return;
+                }
+                // Loop: success leaves the connection poolable.
+            }
+            MockBehavior::ToolProxyRaw {
+                ref frames,
+                ref replies,
+            } => {
+                // Raw scripted frames (WI#324 negative paths): each frame is
+                // sent verbatim after @task_id@ substitution; the worker
+                // blocks on each reply like the typed ToolProxy behavior.
+                let task_id = req_envelope["payload"]["task_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let mut failed = false;
+                for (msg_type, payload) in frames {
+                    let substituted = payload.to_string().replace("@task_id@", &task_id);
+                    let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(&substituted)
+                    else {
+                        return;
+                    };
+                    let frame = envelope(msg_type, payload_json);
+                    if ws.send(Message::Text(frame.into())).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        match ws.next().await {
+                            Some(Ok(m)) if !m.is_close() => {
+                                let Ok(text) = m.to_text() else { continue };
+                                let Ok(env) = serde_json::from_str::<serde_json::Value>(text)
+                                else {
+                                    continue;
+                                };
+                                let reply_type = env.get("type").and_then(|v| v.as_str());
+                                if matches!(reply_type, Some("tool_result") | Some("tool_catalog"))
+                                {
+                                    let _ = replies.send(env);
+                                    break;
+                                }
+                            }
+                            _ => {
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if failed {
+                        return;
+                    }
+                }
+                let r = envelope(
+                    "task_result",
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "status": "success",
+                        "output": "raw frames done",
+                        "error": null,
+                        "duration_ms": 1,
+                    }),
+                );
+                if ws.send(Message::Text(r.into())).await.is_err() {
+                    return;
+                }
+                // Loop: success leaves the connection poolable.
+            }
+            MockBehavior::ToolProxyVerbatim {
+                ref frames,
+                ref replies,
+            } => {
+                // Verbatim pre-serialized frames (MR !1533 DP-1/DP-5): each
+                // text is sent exactly as given after @task_id@ substitution,
+                // so escaped `"type"` spellings and oversized payloads reach
+                // the daemon byte-for-byte. The worker blocks on each reply
+                // like the typed ToolProxy behavior.
+                let task_id = req_envelope["payload"]["task_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let mut failed = false;
+                for frame_text in frames {
+                    let substituted = frame_text.replace("@task_id@", &task_id);
+                    if ws.send(Message::Text(substituted.into())).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        match ws.next().await {
+                            Some(Ok(m)) if !m.is_close() => {
+                                let Ok(text) = m.to_text() else { continue };
+                                let Ok(env) = serde_json::from_str::<serde_json::Value>(text)
+                                else {
+                                    continue;
+                                };
+                                let reply_type = env.get("type").and_then(|v| v.as_str());
+                                if matches!(reply_type, Some("tool_result") | Some("tool_catalog"))
+                                {
+                                    let _ = replies.send(env);
+                                    break;
+                                }
+                            }
+                            _ => {
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if failed {
+                        return;
+                    }
+                }
+                let r = envelope(
+                    "task_result",
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "status": "success",
+                        "output": "verbatim frames done",
+                        "error": null,
+                        "duration_ms": 1,
+                    }),
+                );
+                if ws.send(Message::Text(r.into())).await.is_err() {
+                    return;
+                }
+                // Loop: success leaves the connection poolable.
             }
             MockBehavior::HeartbeatTimeout {
                 ref progress,
@@ -2008,6 +2249,1157 @@ async fn auth_wrong_token_rejected() {
         "auth rejection must not carry the worker-upgrade hint (see !893 follow-up): {reason}"
     );
 }
+
+// ── WI#324: proxied tool path ────────────────────────────────────────
+
+/// Test tool standing in for an in-process tenant tool. Records the
+/// JobContext it was invoked with so the test can assert tenant scoping
+/// (user_id + job_id come from the connection's job, never from the frame).
+/// The name is configurable (MR !1533 DP-2): the proxy only dispatches the
+/// WI#324 phase-1 capability set, so probes meant to execute register under
+/// a phase-1 name (e.g. "knowledge_search") — the test registry is empty
+/// apart from the probe, so the name resolves to the probe itself.
+struct ProbeEchoTool {
+    tool_name: String,
+    seen: std::sync::Mutex<Vec<(String, Uuid)>>,
+}
+
+impl ProbeEchoTool {
+    /// A probe registered under the phase-1 name `knowledge_search`.
+    fn phase1() -> Arc<Self> {
+        Arc::new(Self {
+            tool_name: "knowledge_search".to_string(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ProbeEchoTool {
+    fn name(&self) -> &str {
+        &self.tool_name
+    }
+    fn description(&self) -> &str {
+        "Echoes params back; records the job context"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<lunarwing::tools::ToolOutput, lunarwing::tools::ToolError> {
+        self.seen
+            .lock()
+            .expect("probe lock")
+            .push((ctx.user_id.clone(), ctx.job_id));
+        Ok(lunarwing::tools::ToolOutput::success(
+            serde_json::json!({ "echo": params, "user_id": ctx.user_id }),
+            Duration::default(),
+        ))
+    }
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+}
+
+fn test_safety() -> Arc<lunarwing::safety::SafetyLayer> {
+    Arc::new(lunarwing::safety::SafetyLayer::new(
+        &lunarwing::config::SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        },
+    ))
+}
+
+fn test_proxy(tools: Arc<lunarwing::tools::ToolRegistry>) -> ToolProxy {
+    ToolProxy::new(tools, test_safety(), Arc::new(HookRegistry::new()))
+}
+
+#[tokio::test]
+async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
+    // WI#324 acceptance: an allowlisted tool round-trips through the tenant's
+    // in-process registry; a non-allowlisted tool is a hard "denied" reject,
+    // never a silent empty result.
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![
+            (
+                "knowledge_search".to_string(),
+                serde_json::json!({ "k": "v" }),
+            ),
+            // Registered nowhere AND not allowlisted -> denied.
+            (
+                "memory_write".to_string(),
+                serde_json::json!({ "path": "x" }),
+            ),
+        ],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+    let job_id = Uuid::new_v4();
+
+    let context = TaskContext {
+        user_id: "tenant-user".to_string(),
+        ..Default::default()
+    };
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(job_id, "mock", "task", Some(10_000), true, context),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let first = reply_rx.recv().await.expect("first tool_result");
+    assert_eq!(first["payload"]["call_id"], "call-0");
+    assert_eq!(first["payload"]["status"], "success");
+    let output = first["payload"]["output"].as_str().expect("output string");
+    assert!(
+        output.contains("\"k\": \"v\"") || output.contains("\"k\":\"v\""),
+        "echo output should carry the params, got: {output}"
+    );
+    assert!(
+        output.contains("tenant-user"),
+        "tool must run in the job's user scope, got: {output}"
+    );
+
+    let second = reply_rx.recv().await.expect("second tool_result");
+    assert_eq!(second["payload"]["call_id"], "call-1");
+    assert_eq!(second["payload"]["status"], "denied");
+    assert!(
+        second["payload"]["error"]
+            .as_str()
+            .expect("denial reason")
+            .contains("tool_allowlist"),
+        "denial must name the allowlist: {second}"
+    );
+
+    // The allowlisted call ran exactly once, scoped to this job + user.
+    let seen = probe.seen.lock().expect("probe lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], ("tenant-user".to_string(), job_id));
+}
+
+#[tokio::test]
+async fn tool_call_denied_when_allowlist_empty() {
+    // Deny-by-default: no tool_allowlist configured at all -> every tool_call
+    // is rejected, even one naming a registered tool.
+    let probe = Arc::new(ProbeEchoTool {
+        tool_name: "probe_echo".to_string(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![("probe_echo".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)]).with_tool_proxy(test_proxy(tools));
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let reply = reply_rx.recv().await.expect("tool_result");
+    assert_eq!(reply["payload"]["status"], "denied");
+    assert!(
+        probe.seen.lock().expect("probe lock").is_empty(),
+        "a denied call must never reach the tool"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_unknown_allowlisted_tool_is_an_error_not_a_hang() {
+    // Allowlisted but not registered: the registry miss must come back as a
+    // tool_result error frame, not a dropped reply (the worker blocks on it).
+    // The name must be inside the phase-1 set (else the load-time sanitizer
+    // drops it and the call never reaches resolution), so use a phase-1 tool
+    // this test registry deliberately does not register.
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![("knowledge_search".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let reply = reply_rx.recv().await.expect("tool_result");
+    assert_eq!(reply["payload"]["status"], "error");
+}
+
+#[tokio::test]
+async fn tool_call_without_wired_proxy_replies_error() {
+    // A daemon built without with_tool_proxy must still answer tool_call
+    // frames with an explicit error (never silently drop them), and the
+    // allowlist gate runs first: a non-allowlisted name is "denied" even with
+    // no proxy wired.
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![
+            ("memory_read".to_string(), serde_json::json!({})),
+            ("memory_write".to_string(), serde_json::json!({})),
+        ],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["memory_read".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]); // no with_tool_proxy
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let first = reply_rx.recv().await.expect("first tool_result");
+    assert_eq!(first["payload"]["status"], "error");
+    assert!(
+        first["payload"]["error"]
+            .as_str()
+            .expect("error text")
+            .contains("not configured"),
+        "expected a proxy-not-configured error: {first}"
+    );
+    let second = reply_rx.recv().await.expect("second tool_result");
+    assert_eq!(second["payload"]["status"], "denied");
+}
+
+// ── WI#324 / MR !1506 review: gate, audit, and sanitization coverage ──
+
+/// Configurable probe tool: records invocations and lets the test decide the
+/// name, the emitted output, and the autonomous-execution opt-out.
+struct GateProbeTool {
+    tool_name: String,
+    output: String,
+    autonomous: bool,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Tool for GateProbeTool {
+    fn name(&self) -> &str {
+        &self.tool_name
+    }
+    fn description(&self) -> &str {
+        "gate probe"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<lunarwing::tools::ToolOutput, lunarwing::tools::ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(lunarwing::tools::ToolOutput::success(
+            serde_json::json!({ "result": self.output, "echo": params }),
+            Duration::default(),
+        ))
+    }
+    fn allows_autonomous_execution(&self) -> bool {
+        self.autonomous
+    }
+}
+
+/// A migrated libSQL store in a tempdir, for store-backed event/permission
+/// assertions. libSQL-only: the proxy gate tests persist through the shared
+/// `Database` trait, and this is the in-process backend available to tests.
+#[cfg(feature = "libsql")]
+async fn test_db() -> (Arc<dyn Database>, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join("proxy_gate_test.db"))
+        .await
+        .expect("LibSqlBackend");
+    backend.run_migrations().await.expect("migrations");
+    (Arc::new(backend), temp_dir)
+}
+
+/// Drive one task against a mock worker and collect every scripted reply.
+async fn run_proxy_task(
+    mgr: &ExternalWorkerManager,
+    job_id: Uuid,
+    reply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    expected_replies: usize,
+) -> Vec<serde_json::Value> {
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext {
+                user_id: "tenant-user".to_string(),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+    let mut replies = Vec::with_capacity(expected_replies);
+    for _ in 0..expected_replies {
+        replies.push(reply_rx.recv().await.expect("scripted reply"));
+    }
+    replies
+}
+
+#[tokio::test]
+async fn tool_call_missing_or_mismatched_task_id_is_rejected() {
+    // MR !1506 review (CQ-7): `task_id` is required and must equal the
+    // connection's job id — a leftover worker process on a pooled socket must
+    // not run calls in the next job's scope.
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxyRaw {
+        frames: vec![
+            // Missing task_id entirely.
+            (
+                "tool_call".to_string(),
+                serde_json::json!({"call_id": "c-missing", "name": "knowledge_search"}),
+            ),
+            // Mismatched task_id.
+            (
+                "tool_call".to_string(),
+                serde_json::json!({
+                    "call_id": "c-wrong",
+                    "name": "knowledge_search",
+                    "task_id": "00000000-0000-0000-0000-000000000000",
+                }),
+            ),
+            // Correct task_id (template substituted by the mock).
+            (
+                "tool_call".to_string(),
+                serde_json::json!({
+                    "call_id": "c-right",
+                    "name": "knowledge_search",
+                    "task_id": "@task_id@",
+                }),
+            ),
+        ],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 3).await;
+    assert_eq!(replies[0]["payload"]["status"], "error");
+    assert!(
+        replies[0]["payload"]["error"]
+            .as_str()
+            .expect("error text")
+            .contains("task_id"),
+        "missing task_id must be explained: {}",
+        replies[0]
+    );
+    assert_eq!(replies[1]["payload"]["status"], "error");
+    assert_eq!(replies[2]["payload"]["status"], "success");
+    assert_eq!(
+        probe.seen.lock().expect("probe lock").len(),
+        1,
+        "only the correctly bound call may execute"
+    );
+}
+
+#[tokio::test]
+async fn tool_catalog_lists_only_callable_allowlisted_tools() {
+    // MR !1506 review (CQ-6): the catalog is built from the allowlist through
+    // user-scoped resolution and the autonomous gates — unknown names and
+    // autonomous opt-outs are not advertised. Names must be inside the
+    // phase-1 set (MR !1533 DP-2) to survive the load-time sanitizer.
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools
+        .register(Arc::new(GateProbeTool {
+            tool_name: "knowledge_search".to_string(),
+            output: "ok".to_string(),
+            autonomous: true,
+            calls: AtomicUsize::new(0),
+        }))
+        .await;
+    tools
+        .register(Arc::new(GateProbeTool {
+            tool_name: "knowledge_get_topic".to_string(),
+            output: "ok".to_string(),
+            autonomous: false,
+            calls: AtomicUsize::new(0),
+        }))
+        .await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxyRaw {
+        frames: vec![("tool_list".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec![
+        "knowledge_search".to_string(),
+        "knowledge_get_topic".to_string(),
+        // Phase-1 name this registry never registered: a resolution ghost.
+        "gitlab_tool".to_string(),
+    ];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
+    let names: Vec<&str> = replies[0]["payload"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["knowledge_search"],
+        "catalog must contain only allowlisted, registered, autonomous-capable tools"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_autonomous_opt_out_is_denied() {
+    // MR !1506 review (CQ-1): a tool that opts out of autonomous execution
+    // must be refused even when it is named in the worker allowlist. The
+    // probe uses a phase-1 name so it reaches the autonomous gate rather than
+    // being dropped by the load-time sanitizer (MR !1533 DP-2).
+    let probe = Arc::new(GateProbeTool {
+        tool_name: "knowledge_get_topic".to_string(),
+        output: "ok".to_string(),
+        autonomous: false,
+        calls: AtomicUsize::new(0),
+    });
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![("knowledge_get_topic".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_get_topic".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
+    assert_eq!(replies[0]["payload"]["status"], "denied");
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        0,
+        "an autonomous opt-out tool must never execute via the proxy"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_denylisted_allowlist_entry_never_executes() {
+    // MR !1506 review (CQ-1): autonomous-denylisted names (create_job,
+    // restart, secret_*, tool_install, ssh, ...) are stripped from the
+    // allowlist at manager load, so a configured grant is dead on arrival.
+    let probe = Arc::new(GateProbeTool {
+        tool_name: "create_job".to_string(),
+        output: "pwned".to_string(),
+        autonomous: true,
+        calls: AtomicUsize::new(0),
+    });
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![("create_job".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["create_job".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
+    assert_eq!(replies[0]["payload"]["status"], "denied");
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn tool_call_disabled_permission_is_denied() {
+    // MR !1506 review (CQ-1): a user who set a tool to Disabled must not have
+    // it executed by a worker, even when the worker allowlist names it.
+    let (db, _tmp) = test_db().await;
+    db.set_setting(
+        "tenant-user",
+        "tool_permissions.knowledge_search",
+        &serde_json::json!("disabled"),
+    )
+    .await
+    .expect("seed permission");
+
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![("knowledge_search".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config])
+        .with_tool_proxy(test_proxy(tools))
+        .with_store(db);
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
+    assert_eq!(replies[0]["payload"]["status"], "denied");
+    assert!(
+        replies[0]["payload"]["error"]
+            .as_str()
+            .expect("error text")
+            .contains("disabled"),
+        "denial must name the permission state: {}",
+        replies[0]
+    );
+    assert!(probe.seen.lock().expect("probe lock").is_empty());
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn proxied_calls_persist_canonical_tool_events() {
+    // MR !1506 review (CQ-4, WI#324 AC4): every proxied call appears in
+    // job_events in the canonical tool_use {tool_name,input} /
+    // tool_result {tool_name,success,output} shape — denied calls included,
+    // with success:false so they cannot render as green checkmarks.
+    let (db, _tmp) = test_db().await;
+
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![
+            (
+                "knowledge_search".to_string(),
+                serde_json::json!({ "k": "v" }),
+            ),
+            ("memory_write".to_string(), serde_json::json!({})),
+        ],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config])
+        .with_tool_proxy(test_proxy(tools))
+        .with_store(db.clone());
+    let job_id = Uuid::new_v4();
+
+    // job_events.job_id references agent_jobs(id): seed the parent row so
+    // the persisted events satisfy the FK (mirrors the create_job path).
+    db.save_sandbox_job(&lunarwing::history::SandboxJobRecord {
+        id: job_id,
+        task: "task".to_string(),
+        status: "running".to_string(),
+        user_id: "tenant-user".to_string(),
+        project_dir: String::new(),
+        success: None,
+        failure_reason: None,
+        created_at: chrono::Utc::now(),
+        started_at: Some(chrono::Utc::now()),
+        completed_at: None,
+        credential_grants_json: String::new(),
+    })
+    .await
+    .expect("seed parent job row");
+
+    let _replies = run_proxy_task(&mgr, job_id, &mut reply_rx, 2).await;
+
+    let events = db
+        .list_job_events(job_id, None)
+        .await
+        .expect("list job events");
+    let tool_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.event_type.as_str(), "tool_use" | "tool_result"))
+        .collect();
+    assert_eq!(
+        tool_events.len(),
+        4,
+        "allowed + denied calls each produce tool_use + tool_result: {tool_events:?}"
+    );
+
+    assert_eq!(tool_events[0].event_type, "tool_use");
+    assert_eq!(tool_events[0].data["tool_name"], "knowledge_search");
+    assert!(
+        tool_events[0].data["input"]
+            .as_str()
+            .expect("input preview")
+            .contains("\"k\""),
+        "input preview carries the call arguments: {}",
+        tool_events[0].data["input"]
+    );
+
+    assert_eq!(tool_events[1].event_type, "tool_result");
+    assert_eq!(tool_events[1].data["tool_name"], "knowledge_search");
+    assert_eq!(tool_events[1].data["success"], true);
+
+    assert_eq!(tool_events[2].event_type, "tool_use");
+    assert_eq!(tool_events[2].data["tool_name"], "memory_write");
+    assert_eq!(tool_events[3].event_type, "tool_result");
+    assert_eq!(tool_events[3].data["tool_name"], "memory_write");
+    assert_eq!(
+        tool_events[3].data["success"], false,
+        "a denied call must persist success:false"
+    );
+}
+
+#[tokio::test]
+async fn tool_output_is_sanitized_before_reaching_worker() {
+    // MR !1506 review (CQ-2) / WI#324 AC5 regression guard: tool output and
+    // error text pass through the SafetyLayer's LeakDetector before the reply
+    // is sent — a secret-shaped string must never reach the worker verbatim.
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools
+        .register(Arc::new(GateProbeTool {
+            tool_name: "knowledge_search".to_string(),
+            output: "aws key: AKIAIOSFODNN7EXAMPLE".to_string(),
+            autonomous: true,
+            calls: AtomicUsize::new(0),
+        }))
+        .await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![("knowledge_search".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
+    let output = replies[0]["payload"]["output"]
+        .as_str()
+        .expect("output string");
+    assert!(
+        !output.contains("AKIAIOSFODNN7EXAMPLE"),
+        "secret-shaped output must be redacted or blocked before reply: {output}"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_rejected_for_terminal_job() {
+    // MR !1506 review (CQ-1/CQ-6): with a context manager wired, the real job
+    // context is authoritative — a Cancelled (terminal) job gets no new tool
+    // calls even if its worker socket is still streaming frames.
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![("knowledge_search".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let cm = Arc::new(ContextManager::new(5));
+    let job_id = Uuid::new_v4();
+    cm.register_sandbox_job(job_id, "tenant-user", "t", "d")
+        .await
+        .expect("register job");
+    cm.update_context(job_id, |ctx| ctx.state = JobState::Cancelled)
+        .await
+        .expect("mark cancelled");
+    let (tx, _rx) = tokio::sync::broadcast::channel(8);
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config])
+        .with_event_deps(tx, cm)
+        .with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, job_id, &mut reply_rx, 1).await;
+    assert_eq!(replies[0]["payload"]["status"], "error");
+    assert!(
+        replies[0]["payload"]["error"]
+            .as_str()
+            .expect("error text")
+            .contains("Cancelled"),
+        "terminal-state refusal must name the state: {}",
+        replies[0]
+    );
+    assert!(probe.seen.lock().expect("probe lock").is_empty());
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn memory_write_read_roundtrip_and_mission_path_guard() {
+    // WI#324 AC1: a worker job can call memory_write + memory_read and
+    // observe round-trip persistence in the tenant scope. MR !1506 review
+    // (CQ-1 scenario C / WI#322): the same worker may NOT write into
+    // engine/projects/** mission records while that WI is open.
+    let (db, _tmp) = test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("tenant-user", db));
+
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools
+        .register(Arc::new(MemoryWriteTool::from_workspace(workspace.clone())))
+        .await;
+    tools
+        .register(Arc::new(MemoryReadTool::from_workspace(workspace)))
+        .await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![
+            (
+                "memory_write".to_string(),
+                serde_json::json!({
+                    "target": "notes/proxied.md",
+                    "content": "lunar-proxied-roundtrip",
+                    "append": false,
+                }),
+            ),
+            (
+                "memory_read".to_string(),
+                serde_json::json!({ "path": "notes/proxied.md" }),
+            ),
+            (
+                "memory_write".to_string(),
+                serde_json::json!({
+                    "target": "engine/projects/proj/missions/m1/mission.json",
+                    "content": "forged mission",
+                    "append": false,
+                }),
+            ),
+            // MR !1521 DD-3 / MR !1533 DP-5: the engine-tree guard is NOT
+            // missions-only — engine/projects/** project documents are
+            // engine-internal too and must be refused the same way.
+            (
+                "memory_write".to_string(),
+                serde_json::json!({
+                    "target": "engine/projects/x/project.json",
+                    "content": "forged project",
+                    "append": false,
+                }),
+            ),
+        ],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["memory_write".to_string(), "memory_read".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 4).await;
+
+    assert_eq!(
+        replies[0]["payload"]["status"], "success",
+        "memory_write must succeed: {}",
+        replies[0]
+    );
+    assert_eq!(replies[1]["payload"]["status"], "success");
+    let read_output = replies[1]["payload"]["output"]
+        .as_str()
+        .expect("read output");
+    assert!(
+        read_output.contains("lunar-proxied-roundtrip"),
+        "memory_read must observe the proxied write (tenant scope): {read_output}"
+    );
+
+    assert_eq!(
+        replies[2]["payload"]["status"], "denied",
+        "mission-tree writes are refused while WI#322 is open: {}",
+        replies[2]
+    );
+    assert!(
+        replies[2]["payload"]["error"]
+            .as_str()
+            .expect("error text")
+            .contains("WI#322"),
+        "the refusal must name the guard: {}",
+        replies[2]
+    );
+
+    assert_eq!(
+        replies[3]["payload"]["status"], "denied",
+        "engine/projects/** document writes are refused while WI#322 is open: {}",
+        replies[3]
+    );
+    assert!(
+        replies[3]["payload"]["error"]
+            .as_str()
+            .expect("error text")
+            .contains("WI#322"),
+        "the refusal must name the guard: {}",
+        replies[3]
+    );
+}
+
+// ── MR !1533 review (DP-1/DP-2/DP-3/DP-5): hardening pins ────────────
+
+#[tokio::test]
+async fn tool_call_oversized_frame_plain_and_escaped_type_is_rejected() {
+    // MR !1533 DP-1/DP-5: a `tool_call` frame over the 256 KiB bound is
+    // rejected with `error` whether its `type` is spelled plain or with a
+    // JSON escape — serde_json cannot borrow an escaped string, which is why
+    // the probe field is a `Cow`. A small escaped-type frame still classifies
+    // and dispatches normally, and the read loop keeps serving later frames.
+    let probe = Arc::new(GateProbeTool {
+        tool_name: "knowledge_search".to_string(),
+        output: "ok".to_string(),
+        autonomous: true,
+        calls: AtomicUsize::new(0),
+    });
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let pad = "A".repeat(300 * 1024);
+    let oversized = |ty: &str, call_id: &str| {
+        format!(
+            r#"{{"id":"m","type":"{ty}","timestamp":"2026-01-01T00:00:00Z","payload":{{"task_id":"@task_id@","call_id":"{call_id}","name":"knowledge_search","arguments":{{"pad":"{pad}"}}}}}}"#
+        )
+    };
+    let small_escaped = r#"{"id":"m","type":"\u0074ool_call","timestamp":"2026-01-01T00:00:00Z","payload":{"task_id":"@task_id@","call_id":"c-esc-small","name":"knowledge_search","arguments":{}}}"#
+        .to_string();
+    let small_plain = r#"{"id":"m","type":"tool_call","timestamp":"2026-01-01T00:00:00Z","payload":{"task_id":"@task_id@","call_id":"c-plain-small","name":"knowledge_search","arguments":{}}}"#
+        .to_string();
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxyVerbatim {
+        frames: vec![
+            small_escaped,
+            oversized("tool_call", "c-big-plain"),
+            oversized("\\u0074ool_call", "c-big-esc"),
+            small_plain,
+        ],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 4).await;
+    assert_eq!(
+        replies[0]["payload"]["status"], "success",
+        "a small escaped-type frame classifies and dispatches: {}",
+        replies[0]
+    );
+    for (i, reply) in replies[1..3].iter().enumerate() {
+        assert_eq!(reply["payload"]["status"], "error", "frame {i}: {reply}");
+        assert!(
+            reply["payload"]["error"]
+                .as_str()
+                .expect("error text")
+                .contains("exceeds"),
+            "oversized rejection must name the bound: {reply}"
+        );
+    }
+    assert_eq!(
+        replies[3]["payload"]["status"], "success",
+        "the read loop keeps serving frames after oversized rejects: {}",
+        replies[3]
+    );
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        2,
+        "only the two small frames may execute"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_giant_frame_is_capped_at_the_socket() {
+    // MR !1540 DX-1/DX-3: both message and individual-frame limits are 16 MiB;
+    // a larger frame fails the job at the transport boundary.
+    let giant = format!(
+        r#"{{"id":"m","type":"tool_call","timestamp":"2026-01-01T00:00:00Z","payload":{{"task_id":"@task_id@","call_id":"c-huge","name":"knowledge_search","arguments":{{"pad":"{}"}}}}}}"#,
+        "A".repeat(17 * 1024 * 1024)
+    );
+
+    let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxyVerbatim {
+        frames: vec![giant],
+        replies: reply_tx,
+    })
+    .await;
+
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let err = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect_err("a frame past the socket cap must fail the job");
+    assert!(
+        matches!(err, OrchestratorError::ExternalWorkerProtocolError { .. }),
+        "got {err:?}"
+    );
+    assert!(err.to_string().contains("Message too long"), "{err}");
+}
+
+#[tokio::test]
+async fn tool_call_proxy_denylisted_allowlist_entry_never_executes() {
+    // MR !1521 DD-4 / MR !1533 DP-2/DP-5: host-read dev tools are on the proxy
+    // denylist AND outside the phase-1 capability set — an operator entry like
+    // `tool_allowlist = ["read_file"]` is stripped at load, so the grant is
+    // dead on arrival even though `read_file` passes the autonomous gates.
+    let probe = Arc::new(GateProbeTool {
+        tool_name: "read_file".to_string(),
+        output: "pwned".to_string(),
+        autonomous: true,
+        calls: AtomicUsize::new(0),
+    });
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![("read_file".to_string(), serde_json::json!({}))],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["read_file".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
+    assert_eq!(replies[0]["payload"]["status"], "denied");
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        0,
+        "a proxy-denylisted tool must never execute via the proxy"
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn tool_call_cap_bounds_frames_and_marker_rows() {
+    // MR !1521 DD-5 / MR !1533 DP-3/DP-5: every tool_call-typed frame counts
+    // toward the 100-per-job cap; frame 101 is denied with exactly one marker
+    // row persisted, and later frames are denied with no further rows. The cap
+    // path validates worker-controlled name/call_id before persisting or
+    // echoing (an invalid pair falls back to "unknown"/"" and is never stored).
+    let (db, _tmp) = test_db().await;
+
+    let probe = Arc::new(GateProbeTool {
+        tool_name: "knowledge_search".to_string(),
+        output: "ok".to_string(),
+        autonomous: true,
+        calls: AtomicUsize::new(0),
+    });
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let mut frames: Vec<(String, serde_json::Value)> = (0..102)
+        .map(|i| {
+            (
+                "tool_call".to_string(),
+                serde_json::json!({
+                    "task_id": "@task_id@",
+                    "call_id": format!("call-{i}"),
+                    "name": "knowledge_search",
+                    "arguments": {},
+                }),
+            )
+        })
+        .collect();
+    // Past the cap with invalid identifiers: the reply must echo "" and no
+    // row may carry the unvalidated values (MR !1533 DP-3).
+    frames.push((
+        "tool_call".to_string(),
+        serde_json::json!({
+            "task_id": "@task_id@",
+            "call_id": "evil\nid",
+            "name": "evil\nname",
+            "arguments": {},
+        }),
+    ));
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxyRaw {
+        frames,
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config])
+        .with_tool_proxy(test_proxy(tools))
+        .with_store(db.clone());
+    let job_id = Uuid::new_v4();
+
+    // job_events.job_id references agent_jobs(id): seed the parent row.
+    db.save_sandbox_job(&lunarwing::history::SandboxJobRecord {
+        id: job_id,
+        task: "task".to_string(),
+        status: "running".to_string(),
+        user_id: "tenant-user".to_string(),
+        project_dir: String::new(),
+        success: None,
+        failure_reason: None,
+        created_at: chrono::Utc::now(),
+        started_at: Some(chrono::Utc::now()),
+        completed_at: None,
+        credential_grants_json: String::new(),
+    })
+    .await
+    .expect("seed parent job row");
+
+    let replies = run_proxy_task(&mgr, job_id, &mut reply_rx, 103).await;
+
+    for reply in &replies[..100] {
+        assert_eq!(reply["payload"]["status"], "success", "{reply}");
+    }
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        100,
+        "exactly the in-cap frames may execute"
+    );
+    for reply in &replies[100..102] {
+        assert_eq!(reply["payload"]["status"], "denied", "{reply}");
+        assert!(
+            reply["payload"]["error"]
+                .as_str()
+                .expect("error text")
+                .contains("per-job proxied tool call cap"),
+            "cap denial must name the cap: {reply}"
+        );
+    }
+    assert_eq!(
+        replies[102]["payload"]["status"], "denied",
+        "{}",
+        replies[102]
+    );
+    assert_eq!(
+        replies[102]["payload"]["call_id"], "",
+        "an invalid call_id is never echoed from the cap path: {}",
+        replies[102]
+    );
+
+    let events = db
+        .list_job_events(job_id, None)
+        .await
+        .expect("list job events");
+    let cap_rows: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == "tool_result"
+                && e.data["output"]
+                    .as_str()
+                    .is_some_and(|o| o.contains("call cap"))
+        })
+        .collect();
+    assert_eq!(
+        cap_rows.len(),
+        1,
+        "exactly one cap marker row, however many frames flood past the cap: {cap_rows:?}"
+    );
+    assert_eq!(
+        cap_rows[0].data["tool_name"], "knowledge_search",
+        "the marker row carries the validated name of the first capped frame"
+    );
+    assert_eq!(cap_rows[0].data["success"], false);
+}
+
+#[path = "external_worker_integration/proxy_review.rs"]
+mod proxy_review;
 
 // ── WI#325: cron worker mode ────────────────────────────────────────
 
