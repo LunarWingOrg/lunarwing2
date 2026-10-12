@@ -6831,8 +6831,7 @@ pub(crate) mod tests {
         let store = Arc::new(TestStore::new());
         let state = make_expected_test_state(store.clone());
 
-        let mut terminal =
-            save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let mut terminal = save_waiting_thread(&store, state.default_project_id, "alice").await;
         terminal
             .transition_to(lunarwing_engine::ThreadState::Failed, None)
             .unwrap();
@@ -6882,8 +6881,7 @@ pub(crate) mod tests {
         let store = Arc::new(TestStore::new());
         let state = make_expected_test_state(store.clone());
 
-        let mut terminal =
-            save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let mut terminal = save_waiting_thread(&store, state.default_project_id, "alice").await;
         terminal
             .transition_to(lunarwing_engine::ThreadState::Failed, None)
             .unwrap();
@@ -6904,12 +6902,15 @@ pub(crate) mod tests {
         // gate is consumed by a resolution and a replacement is parked.
         store.block_next_thread_load.store(true, Ordering::SeqCst);
         let sweep_state = state.clone();
-        let sweep = tokio::spawn(async move {
-            discard_gates_with_dead_threads(&sweep_state).await
-        });
+        let sweep =
+            tokio::spawn(async move { discard_gates_with_dead_threads(&sweep_state).await });
         store.thread_load_started.notified().await;
 
-        state.pending_gates.discard(&stale_gate.key()).await.unwrap();
+        state
+            .pending_gates
+            .discard(&stale_gate.key())
+            .await
+            .unwrap();
         let replacement = sample_pending_gate(
             "alice",
             terminal.id,
