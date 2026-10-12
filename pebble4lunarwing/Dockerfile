@@ -173,7 +173,10 @@ ENV GOROOT=/usr/local/go \
 #   * Real-binary symlinks in /usr/local/bin (cargo, rustc, go, gofmt) cover
 #     sanitised shells whose fallback PATH still includes /usr/local/bin.
 #   * /usr/local/bin/rustup is a wrapper that re-exports RUSTUP_HOME/
-#     CARGO_HOME before delegating, keeping rustup usable from any shell.
+#     CARGO_HOME before delegating, keeping rustup resolvable from any shell.
+#     The snippet restores the image ENV PATH order (rustup proxies, then
+#     GOROOT/bin, then GOPATH/bin); the fat image pre-creates /root/go/bin so
+#     `go install`ed tools resolve from the very first task command.
 COPY pebble4lunarwing/scripts/toolchain-profile.sh /etc/profile.d/lunarwing-toolchain.sh
 COPY pebble4lunarwing/scripts/rustup-wrapper.sh /usr/local/share/lunarwing/rustup-wrapper.sh
 
@@ -193,6 +196,7 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       ln -s /usr/local/go/bin/go /usr/local/bin/go; \
       ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt; \
       install -m 0755 /usr/local/share/lunarwing/rustup-wrapper.sh /usr/local/bin/rustup; \
+      mkdir -p /root/go/bin; \
       /bin/sh -lc 'set -e; command -v cargo; command -v rustc; command -v go; command -v rustup; cargo --version; rustc --version; go version; rustup --version'; \
       env -i /bin/sh -c 'set -e; command -v cargo; command -v rustc; command -v go; command -v rustup; cargo --version; rustc --version; go version; rustup --version'; \
     fi
