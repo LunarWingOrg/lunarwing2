@@ -2911,7 +2911,10 @@ impl MissionManager {
             };
             let mut resolved_any = false;
             for thread_id in stamped_interrupted_threads(&current) {
-                match self.resolve_stamped_interruption(&mut current, thread_id).await {
+                match self
+                    .resolve_stamped_interruption(&mut current, thread_id)
+                    .await
+                {
                     Ok(true) => resolved_any = true,
                     Ok(false) => {}
                     Err(error) => {
@@ -4661,6 +4664,7 @@ mod tests {
         mission_load_delay: Duration,
         failing_mission_loads: tokio::sync::RwLock<Vec<MissionId>>,
         failing_mission_saves: tokio::sync::RwLock<Vec<MissionId>>,
+        failing_thread_loads: tokio::sync::RwLock<Vec<ThreadId>>,
         failing_thread_saves: tokio::sync::RwLock<Vec<ThreadId>>,
     }
 
@@ -4673,6 +4677,7 @@ mod tests {
                 mission_load_delay: Duration::ZERO,
                 failing_mission_loads: tokio::sync::RwLock::new(Vec::new()),
                 failing_mission_saves: tokio::sync::RwLock::new(Vec::new()),
+                failing_thread_loads: tokio::sync::RwLock::new(Vec::new()),
                 failing_thread_saves: tokio::sync::RwLock::new(Vec::new()),
             }
         }
@@ -4701,6 +4706,11 @@ mod tests {
             Ok(())
         }
         async fn load_thread(&self, id: ThreadId) -> Result<Option<Thread>, EngineError> {
+            if self.failing_thread_loads.read().await.contains(&id) {
+                return Err(EngineError::Store {
+                    reason: format!("injected thread load failure for {id}"),
+                });
+            }
             Ok(self.threads.read().await.get(&id).cloned())
         }
         async fn list_threads(&self, _: ProjectId, _: &str) -> Result<Vec<Thread>, EngineError> {
@@ -12209,6 +12219,541 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
         assert!(stamped_interrupted_threads(&saved_mission).is_empty());
         assert!(rx.try_recv().is_err());
+        mgr.shutdown().await;
+    }
+
+    // ── WI#339: AE-3/AE-4/AE-5 residuals ────────────────────
+
+    /// A Mission-typed history thread for `mission` in `thread_state` with
+    /// the given terminal reason, saved and recorded in the mission's
+    /// history (the mission row is re-loaded and re-saved).
+    async fn push_history_thread(
+        store: &Arc<TestStore>,
+        mission: &Mission,
+        thread_state: ThreadState,
+        terminal_reason: &str,
+    ) -> Thread {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            mission.project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread
+            .transition_to(ThreadState::Running, None)
+            .expect("created -> running");
+        thread
+            .transition_to(thread_state, Some(terminal_reason.to_string()))
+            .expect("running -> terminal");
+        store.save_thread(&thread).await.unwrap();
+        let mut current = store.load_mission(mission.id).await.unwrap().unwrap();
+        current.thread_history.push(thread.id);
+        store.save_mission(&current).await.unwrap();
+        thread
+    }
+
+    /// WI#339 (AE-3): two runs of one mission both unsettled at shutdown
+    /// (the cron-tick + armed-retry overlap ENGINE-V2.md accepts) each keep
+    /// their stamp — the single-slot stamp shadowed the earlier fire, which
+    /// was then never resolved. The boot sweep resolves both: each thread
+    /// earns the watcher's retry marker, its notice, and a cleared stamp.
+    #[tokio::test]
+    async fn overlapping_unsettled_shutdown_fires_are_each_stamped_and_resolved() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let mut rx = mgr.subscribe_notifications();
+        let (mission, first) = shutdown_stamped_fixture(
+            &store,
+            vec!["darkirc".into()],
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        let second = push_history_thread(
+            &store,
+            &mission,
+            ThreadState::Failed,
+            crate::types::thread::EXECUTION_STOPPED_REASON,
+        )
+        .await;
+        let fire_locks = MissionLockRegistry::default();
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        record_unsettled_shutdown_fire(&store_dyn, &fire_locks, mission.id, second.id).await;
+
+        let stamped = store.load_mission(mission.id).await.unwrap().unwrap();
+        let mut stamped_ids = stamped_interrupted_threads(&stamped);
+        stamped_ids.sort_by_key(|id| id.0);
+        let mut expected = vec![first.id, second.id];
+        expected.sort_by_key(|id| id.0);
+        assert_eq!(stamped_ids, expected, "both unsettled fires keep a stamp");
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id]
+        );
+        for thread_id in [first.id, second.id] {
+            let saved = store.load_thread(thread_id).await.unwrap().unwrap();
+            let marker = RetryState::from_metadata(&saved.metadata)
+                .expect("each settled stop earns the watcher's retry marker");
+            assert_eq!(marker.attempt, 1);
+            assert!(marker.notified, "the boot notice reached the subscriber");
+        }
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            stamped_interrupted_threads(&saved).is_empty(),
+            "both stamps are resolved"
+        );
+        let mut noticed: Vec<ThreadId> = [&rx.try_recv(), &rx.try_recv()]
+            .into_iter()
+            .map(|notif| {
+                let notif = notif.as_ref().expect("each fire is owed a notice");
+                assert!(notif.is_error);
+                assert!(
+                    notif
+                        .response
+                        .as_deref()
+                        .is_some_and(|r| r.contains("interrupted by daemon shutdown")),
+                    "{:?}",
+                    notif.response
+                );
+                notif.thread_id
+            })
+            .collect();
+        noticed.sort_by_key(|id| id.0);
+        assert_eq!(noticed, expected);
+        assert!(rx.try_recv().is_err(), "exactly two notices");
+        mgr.shutdown().await;
+    }
+
+    /// WI#339 (AE-3): a legacy single-slot stamp written by a pre-WI#339
+    /// build is folded into the map when another unsettled fire is recorded,
+    /// so the older fire is not shadowed at the write either.
+    #[tokio::test]
+    async fn unsettled_shutdown_fire_folds_a_legacy_stamp_into_the_map() {
+        let store = Arc::new(TestStore::new());
+        let (mission, first) = shutdown_stamped_fixture(
+            &store,
+            Vec::new(),
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        // Rewrite the stamp in the legacy single-slot shape.
+        let mut legacy = store.load_mission(mission.id).await.unwrap().unwrap();
+        legacy.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: {
+            "thread_id": first.id,
+            "recorded_at": Utc::now().to_rfc3339(),
+        }});
+        store.save_mission(&legacy).await.unwrap();
+        let second = push_history_thread(
+            &store,
+            &mission,
+            ThreadState::Failed,
+            crate::types::thread::EXECUTION_STOPPED_REASON,
+        )
+        .await;
+
+        let fire_locks = MissionLockRegistry::default();
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        record_unsettled_shutdown_fire(&store_dyn, &fire_locks, mission.id, second.id).await;
+
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        let stamps = saved
+            .metadata
+            .get(PENDING_SHUTDOWN_INTERRUPTION_KEY)
+            .expect("the stamp survives");
+        assert!(
+            stamps.get("thread_id").is_none(),
+            "the legacy shape is folded into the map: {stamps}"
+        );
+        let mut stamped_ids = stamped_interrupted_threads(&saved);
+        stamped_ids.sort_by_key(|id| id.0);
+        let mut expected = vec![first.id, second.id];
+        expected.sort_by_key(|id| id.0);
+        assert_eq!(stamped_ids, expected);
+    }
+
+    /// WI#339 (AE-4): one unreadable mission row must not abort the boot
+    /// resolution for every other mission — the sweep warns and skips it,
+    /// leaving its stamp for the next boot.
+    #[tokio::test]
+    async fn boot_resolution_isolates_a_mission_load_failure() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (mission_a, thread_a) = shutdown_stamped_fixture(
+            &store,
+            Vec::new(),
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        let (mission_b, thread_b) = shutdown_stamped_fixture(
+            &store,
+            Vec::new(),
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        store.failing_mission_loads.write().await.push(mission_a.id);
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission_b.id],
+            "the corrupt row blocks only itself"
+        );
+        let resolved_b = store.load_mission(mission_b.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_threads(&resolved_b).is_empty());
+        let marker_b = RetryState::from_metadata(
+            &store
+                .load_thread(thread_b.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+        );
+        assert!(marker_b.is_some(), "mission B's fire is resolved");
+        store
+            .failing_mission_loads
+            .write()
+            .await
+            .retain(|id| *id != mission_a.id);
+        let still_stamped_a = store.load_mission(mission_a.id).await.unwrap().unwrap();
+        assert_eq!(
+            stamped_interrupted_threads(&still_stamped_a),
+            vec![thread_a.id],
+            "mission A's stamp is left for the next boot"
+        );
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission_a.id],
+            "the next boot resolves it once the row reads again"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#339 (AE-4): one unresolvable stamp blocks neither the mission's
+    /// other stamps nor the sweep — the bad stamp is left for the next boot.
+    #[tokio::test]
+    async fn boot_resolution_isolates_a_bad_stamp_within_a_mission() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (mission, first) = shutdown_stamped_fixture(
+            &store,
+            Vec::new(),
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON),
+        )
+        .await;
+        let second = push_history_thread(
+            &store,
+            &mission,
+            ThreadState::Failed,
+            crate::types::thread::EXECUTION_STOPPED_REASON,
+        )
+        .await;
+        let fire_locks = MissionLockRegistry::default();
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        record_unsettled_shutdown_fire(&store_dyn, &fire_locks, mission.id, second.id).await;
+        store.failing_thread_loads.write().await.push(first.id);
+
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id],
+            "the resolvable stamp still resolves"
+        );
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(
+            stamped_interrupted_threads(&saved),
+            vec![first.id],
+            "only the unreadable stamp is left for the next boot"
+        );
+        assert!(
+            store
+                .load_thread(second.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .get(RetryState::METADATA_KEY)
+                .is_some(),
+            "the readable fire earned its retry marker"
+        );
+        store
+            .failing_thread_loads
+            .write()
+            .await
+            .retain(|id| *id != first.id);
+        assert_eq!(
+            mgr.resolve_pending_shutdown_interruptions().await.unwrap(),
+            vec![mission.id],
+            "the next boot resolves the skipped stamp"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#339 (AE-5): a completion settling inside the shutdown grace has no
+    /// retry marker to carry the notice, and the broadcast consumer is
+    /// already gone — the notice is stamped on the mission row and delivered
+    /// once at boot, with the stamp removal as the acknowledgement.
+    #[tokio::test]
+    async fn shutdown_outcome_notice_is_stamped_and_delivered_once_at_boot() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "shutdown-notice",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.notify_channels = vec!["darkirc".into()];
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        let outcome = ThreadOutcome::Completed {
+            response: Some("run finished".to_string()),
+        };
+        let pending = process_mission_outcome_and_notify(
+            &store_dyn,
+            mission.id,
+            thread.id,
+            &outcome,
+            &mgr.notification_tx,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(pending.is_none(), "a completion plans no retry");
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        let entry = saved
+            .metadata
+            .get(PENDING_OUTCOME_NOTIFICATION_KEY)
+            .and_then(|stamps| stamps.get(thread.id.0.to_string()))
+            .expect("the owed notice is stamped, keyed by thread id");
+        assert_eq!(
+            entry.get("response").and_then(|v| v.as_str()),
+            Some("run finished")
+        );
+        assert_eq!(entry.get("is_error").and_then(|v| v.as_bool()), Some(false));
+
+        let mut rx = mgr.subscribe_notifications();
+        assert_eq!(
+            mgr.deliver_pending_outcome_notifications().await.unwrap(),
+            vec![mission.id]
+        );
+        let notif = rx.try_recv().expect("the owed notice is delivered at boot");
+        assert!(!notif.is_error);
+        assert_eq!(notif.response.as_deref(), Some("run finished"));
+        assert_eq!(notif.thread_id, thread.id);
+        assert_eq!(notif.notify_channels, vec!["darkirc".to_string()]);
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            saved
+                .metadata
+                .get(PENDING_OUTCOME_NOTIFICATION_KEY)
+                .is_none(),
+            "the acknowledgement clears the stamp"
+        );
+        assert!(
+            mgr.deliver_pending_outcome_notifications()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the acknowledged notice does not repeat"
+        );
+        assert!(rx.try_recv().is_err());
+        mgr.shutdown().await;
+    }
+
+    /// WI#339 (AE-5): MaxIterations is notified as an error and never
+    /// retried — at shutdown its notice is owed, so it is stamped and
+    /// delivered at boot like any other non-retry outcome.
+    #[tokio::test]
+    async fn shutdown_max_iterations_notice_is_stamped_and_delivered_at_boot() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "shutdown-max-iterations",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.notify_channels = vec!["darkirc".into()];
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        process_mission_outcome_and_notify(
+            &store_dyn,
+            mission.id,
+            thread.id,
+            &ThreadOutcome::MaxIterations,
+            &mgr.notification_tx,
+            true,
+        )
+        .await
+        .unwrap();
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            saved
+                .metadata
+                .get(PENDING_OUTCOME_NOTIFICATION_KEY)
+                .is_some(),
+            "the owed error notice is stamped"
+        );
+
+        let mut rx = mgr.subscribe_notifications();
+        assert_eq!(
+            mgr.deliver_pending_outcome_notifications().await.unwrap(),
+            vec![mission.id]
+        );
+        let notif = rx.try_recv().expect("the owed notice is delivered at boot");
+        assert!(notif.is_error);
+        assert!(
+            notif
+                .response
+                .as_deref()
+                .is_some_and(|r| r.contains("max iterations")),
+            "{:?}",
+            notif.response
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#339 (AE-5): an interruption with retries left at shutdown persists
+    /// the retry marker with `notified: false` — the marker carries the owed
+    /// notice, so no `pending_outcome_notification` stamp is written.
+    #[tokio::test]
+    async fn shutdown_interrupted_fire_notice_rides_the_retry_marker_not_the_stamp() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "shutdown-interrupted",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.notify_channels = vec!["darkirc".into()];
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread
+            .transition_to(ThreadState::Running, None)
+            .expect("created -> running");
+        thread
+            .transition_to(
+                ThreadState::Failed,
+                Some(crate::types::thread::EXECUTION_STOPPED_REASON.to_string()),
+            )
+            .expect("running -> failed");
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        let pending = process_mission_outcome_and_notify(
+            &store_dyn,
+            mission.id,
+            thread.id,
+            &ThreadOutcome::Stopped,
+            &mgr.notification_tx,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(pending.is_some(), "the interruption plans a retry");
+        let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
+        let marker = RetryState::from_metadata(&saved_thread.metadata)
+            .expect("the retry marker is persisted");
+        assert!(!marker.notified, "the marker carries the owed notice");
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            saved
+                .metadata
+                .get(PENDING_OUTCOME_NOTIFICATION_KEY)
+                .is_none(),
+            "no owed-notice stamp when the retry marker carries it"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// WI#339 (AE-5): a mission with no notify channels has nothing to
+    /// deliver, so a shutdown-window outcome writes no owed-notice stamp.
+    #[tokio::test]
+    async fn shutdown_outcome_without_notify_channels_is_not_stamped() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let mission = Mission::new(
+            project_id,
+            "test-user",
+            "shutdown-silent",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
+        let outcome = ThreadOutcome::Completed {
+            response: Some("run finished".to_string()),
+        };
+        process_mission_outcome_and_notify(
+            &store_dyn,
+            mission.id,
+            thread.id,
+            &outcome,
+            &mgr.notification_tx,
+            true,
+        )
+        .await
+        .unwrap();
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(
+            saved
+                .metadata
+                .get(PENDING_OUTCOME_NOTIFICATION_KEY)
+                .is_none(),
+            "nothing owed — nothing stamped"
+        );
         mgr.shutdown().await;
     }
 
