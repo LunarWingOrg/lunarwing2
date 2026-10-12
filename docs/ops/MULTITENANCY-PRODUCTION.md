@@ -528,6 +528,62 @@ rc-service lunarwing-<name> start
 rc-service lunarwing-<name> status
 ```
 
+#### Proxy URL boundary (WI#376)
+
+The proxy's `TENSORZERO_URL` is tenant-controlled data. OpenRC units now pass
+the fixed `--tensorzero-env` option, and the Python proxy reads the literal
+value exported by `lunarwing-openrc-env-exec` **after** `command_user` drops
+privileges. Rendering still shape-checks the URL, but never copies it into
+the init script or `command_args`. A changed `proxy.env` takes effect at the
+next start without re-rendering. Environment mode rejects an unset, empty,
+or whitespace-only value before opening a listener; it has no built-in URL
+fallback. Explicit `--tensorzero` and standalone defaults retain their prior
+behavior outside this mode; the two options are mutually exclusive.
+
+The regression test distinguishes generation from execution: expanding a
+variable in the generator's heredoc copies embedded `$()`/backtick text
+without recursively executing it. The previous script executed that copied
+text when OpenRC later parsed the init file as root, including during service
+operations other than startup. Shell-looking URL text now stays literal data.
+
+**Existing installations:** deploy both the patched mt-admin renderer and
+`tensorzero-proxy-configurations/lunarwing-proxy.py` in the tenant's checkout.
+From the patched admin checkout, replace installed units **before** invoking
+the old proxy service (even for status/stop):
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh render-units <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
+```
+
+Re-rendering replaces the vulnerable default in `/etc/init.d/`; updating the
+source checkout alone does not. An older tenant proxy rejects the new option
+and fails startup rather than silently selecting its legacy default. Keep
+the repaired unit on rollback; restore/update the compatible proxy code
+instead of restoring the URL-interpolating renderer. Root-owned conf.d
+overrides remain operator-controlled shell configuration.
+
+**Sibling render-site audit (`08-units-openrc.sh`):**
+
+| Sites | Values entering privileged shell code |
+|---|---|
+| Main daemon, XMPP bridge, WeeChat, WeeChat/DarkIRC adapters | Computed tenant paths, executable paths and operator defaults; env-file contents are loaded by the post-drop launcher, not copied into heredocs. |
+| PostgreSQL, vision, voice, DarkIRC daemon | Constructed container/config paths, registry ports, account IDs and admin-selected runtime/policy values; no tenant env values are interpolated. |
+| conf.d generation | Dependency names constructed from the sanitized tenant name and registry feature flags; the main daemon's existing operator conf.d content is preserved as configuration, not sourced by the renderer. |
+| Proxy | The only direct `_read_env_value` result in this module is now used for render-time validation only. The endpoint never enters generated shell text. |
+
+This audit covers the tenant-env-to-shell interpolation class. It relies on
+the existing admin trust boundary for registry/configuration and executable
+paths, and the public `render-units` path's tenant-name sanitization.
+
+`ic/scripts/tests/test-proxy-openrc-env-boundary.sh` renders and parses the
+actual init scripts with command-substitution, backtick and quote-breakout
+fixtures. It simulates OpenRC sourcing/argument handling using `/bin/sh`,
+checks `command_user`, then executes the real launcher and proxy configuration
+parser as a non-root tenant. It also covers env edits after rendering, missing
+startup data and the local HTTP forwarding smoke test. The existing
+shell-harness CI lane runs it automatically.
+
 ## PostgreSQL
 
 Each tenant gets its own Docker/Podman container named `lunarwing-pg-<name>`, bound to `127.0.0.1:<allocated-port>:5432`. The user and database are both `lunarwing`; the **password is a per-tenant random hex string** generated at `add-tenant` time, stored in `…/env/pg.secret` (0600, tenant-owned) and woven into the daemon's `DATABASE_URL`. Tenants created before this change keep their original `lunarwing` password until rotated — run `lunarwing-mt-admin.sh rotate-pg-password <name>` to move them onto a random one (it runs `ALTER ROLE`, updates `pg.secret` + `DATABASE_URL`, and prompts for a restart).

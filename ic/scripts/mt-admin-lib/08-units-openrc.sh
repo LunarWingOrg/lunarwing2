@@ -1029,8 +1029,9 @@ INITEOF
   fi
 
   # ── TensorZero proxy init script (only when enabled) ──
-  # The upstream is the tenant's own TENSORZERO_URL from proxy.env (WI#330:
-  # the fleet default used to render a developer-LAN address here).
+  # Validate the tenant's upstream as data, but NEVER bake it into this root-
+  # parsed shell script (WI#376). env-exec loads proxy.env after command_user
+  # drops privileges; the proxy reads TENSORZERO_URL without shell evaluation.
   if tenant_proxy_enabled "$name"; then
   local proxy_upstream
   proxy_upstream="$(_read_env_value "$env_dir/proxy.env" TENSORZERO_URL)"
@@ -1043,7 +1044,7 @@ INITEOF
 description="LunarWing TensorZero proxy ($name)"
 
 : "\${proxy_command:=$(command -v python3)}"
-: "\${proxy_args:=$proxy_bin --port $proxy_port --bind 127.0.0.1 --tensorzero $proxy_upstream}"
+: "\${proxy_args:=$proxy_bin --port $proxy_port --bind 127.0.0.1 --tensorzero-env}"
 : "\${proxy_user:=$name}"
 : "\${proxy_group:=$name}"
 : "\${proxy_pidfile:=$run_dir/proxy.pid}"
