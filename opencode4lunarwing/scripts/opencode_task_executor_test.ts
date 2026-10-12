@@ -18,6 +18,18 @@ interface MockOptions {
   partsPerCall?: Array<Array<{ type: string; text?: string }>>
   promptError?: Error
   assistantErrors?: Array<unknown | undefined>
+  /**
+   * Hang the prompt call from the SECOND call onward (turn 1 completes
+   * normally). Models a follow-up turn whose provider call never returns.
+   */
+  pendingPromptAfterFirst?: boolean
+  /**
+   * Model the real server contract for turn 2+: the prompt call cannot
+   * complete while a permission request is still unanswered. Used by the
+   * DW-10 stale-idle test so an early turn break (the bug) deadlocks the
+   * turn instead of silently passing.
+   */
+  resolvePromptAfterV2Reply?: boolean
 }
 
 function makeSdk(options: MockOptions = {}) {
@@ -51,9 +63,20 @@ function makeSdk(options: MockOptions = {}) {
       prompt: async (...args: unknown[]) => {
         promptArgs.push(args)
         captureSignal(args)
-        if (options.pendingPrompt) await new Promise(() => {})
-        if (options.promptError) throw options.promptError
         const callIndex = promptArgs.length - 1
+        if (options.pendingPrompt || (options.pendingPromptAfterFirst && callIndex >= 1)) {
+          await new Promise(() => {})
+        }
+        if (options.promptError) throw options.promptError
+        if (options.resolvePromptAfterV2Reply && callIndex >= 1) {
+          // The turn cannot complete while a permission ask is unanswered;
+          // the deadline keeps a buggy early turn break from hanging the
+          // suite — it fails the assertion below instead.
+          const deadline = Date.now() + 1_000
+          while (v2Replies === 0 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 1))
+          }
+        }
         const assistantError = options.assistantErrors?.[callIndex]
         return {
           data: {
@@ -435,8 +458,12 @@ assert.equal(followupArgs[0].sessionID, "session-1")
 assert.equal(followupArgs[0].parts.length, 1)
 assert.equal(followupArgs[0].parts[0]!.type, "text")
 assert.ok(
-  followupArgs[0].parts[0]!.text.startsWith("also fix the tests"),
-  "follow-up text must lead the injected prompt",
+  followupArgs[0].parts[0]!.text.startsWith("FOLLOW-UP INSTRUCTION (seq=1, FINAL) from the orchestrator:"),
+  "follow-up prompt must carry the orchestrator framing header (DW-13)",
+)
+assert.ok(
+  followupArgs[0].parts[0]!.text.includes("also fix the tests"),
+  "follow-up text must be inside the framed prompt",
 )
 assert.match(
   followupArgs[0].parts[0]!.text,
@@ -529,5 +556,193 @@ assert.equal(noFollowupResults.length, 1)
 assert.equal(noFollowupResults[0]!.status, "success")
 assert.equal(noFollowupSdk.promptArgs.length, 1)
 assert.equal(noFollowupQueue.closed, true, "finishing closes an empty queue too")
+
+// MR !1537 DW-3: a follow-up turn that FAILS after the main turn succeeded
+// must not fail the task — the result stays success and keeps the banked
+// deliverable, with the follow-up failure recorded as a [control] note.
+const followupFailSdk = makeSdk({
+  events: [
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+  partsPerCall: [
+    [{ type: "text", text: "MAIN DELIVERABLE" }],
+    [{ type: "text", text: "" }],
+  ],
+  assistantErrors: [undefined, { message: "invalid request: context length exceeded" }],
+})
+const followupFailQueue: FollowupQueue = {
+  prompts: [{ task_id: "task-followup-fail", seq: 1, prompt: "status?", done: false }],
+  closed: false,
+}
+const followupFailResults: Array<{ status: string; output: string; error: string | null }> = []
+await executeTask(
+  { task_id: "task-followup-fail", prompt: "build the feature" },
+  () => {},
+  (result) => followupFailResults.push(result),
+  undefined,
+  followupFailSdk.sdk,
+  followupFailQueue,
+)
+assert.equal(followupFailResults.length, 1)
+assert.equal(followupFailResults[0]!.status, "success")
+assert.equal(followupFailResults[0]!.error, null)
+assert.ok(
+  followupFailResults[0]!.output.includes("MAIN DELIVERABLE"),
+  `failed follow-up must not drop the deliverable, got: ${followupFailResults[0]!.output}`,
+)
+assert.ok(
+  followupFailResults[0]!.output.includes("[control] follow-up seq=1 failed"),
+  `follow-up failure must be recorded, got: ${followupFailResults[0]!.output}`,
+)
+assert.equal(followupFailQueue.closed, true, "failed follow-up closes the queue (DW-5)")
+
+// MR !1537 DW-3 (timeout variant): the follow-up does not extend the task
+// deadline, so a timeout mid-follow-up still reports the finished main turn
+// as success, not TimedOut with a dropped deliverable. The follow-up turn's
+// prompt call never returns, so the turn runs until the task deadline.
+const followupTimeoutSdk = makeSdk({
+  events: [{ type: "session.idle", properties: { sessionID: "session-1" } }],
+  partsPerCall: [[{ type: "text", text: "MAIN DELIVERABLE" }]],
+  pendingPromptAfterFirst: true,
+})
+const followupTimeoutQueue: FollowupQueue = {
+  prompts: [{ task_id: "task-followup-timeout", seq: 1, prompt: "status?", done: false }],
+  closed: false,
+}
+const followupTimeoutResults: Array<{ status: string; output: string; error: string | null }> = []
+await executeTask(
+  { task_id: "task-followup-timeout", prompt: "build the feature", timeout_ms: 100 },
+  () => {},
+  (result) => followupTimeoutResults.push(result),
+  undefined,
+  followupTimeoutSdk.sdk,
+  followupTimeoutQueue,
+)
+assert.equal(followupTimeoutResults.length, 1)
+assert.equal(
+  followupTimeoutResults[0]!.status,
+  "success",
+  `timeout mid-follow-up must not fail finished work, got: ${followupTimeoutResults[0]!.status}`,
+)
+assert.ok(followupTimeoutResults[0]!.output.includes("MAIN DELIVERABLE"))
+assert.ok(
+  followupTimeoutResults[0]!.output.includes("[control] follow-up seq=1 timed out"),
+  `got: ${followupTimeoutResults[0]!.output}`,
+)
+assert.equal(followupTimeoutQueue.closed, true)
+
+// MR !1537 DW-7: a main turn with only TOOL output (no assistant text) banks
+// the streamed tool output, so a follow-up's text doesn't replace it.
+const toolOnlySdk = makeSdk({
+  events: [
+    {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          sessionID: "session-1",
+          type: "tool",
+          tool: "bash",
+          state: { status: "completed", output: "wrote src/feature.rs (120 lines); tests pass" },
+        },
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+  partsPerCall: [[], [{ type: "text", text: "status: done" }]],
+})
+const toolOnlyQueue: FollowupQueue = {
+  prompts: [{ task_id: "task-tool-only", seq: 1, prompt: "status?", done: false }],
+  closed: false,
+}
+const toolOnlyResults: Array<{ status: string; output: string }> = []
+await executeTask(
+  { task_id: "task-tool-only", prompt: "build the feature" },
+  () => {},
+  (result) => toolOnlyResults.push(result),
+  undefined,
+  toolOnlySdk.sdk,
+  toolOnlyQueue,
+)
+assert.equal(toolOnlyResults.length, 1)
+assert.equal(toolOnlyResults[0]!.status, "success")
+assert.ok(
+  toolOnlyResults[0]!.output.includes("[bash] wrote src/feature.rs (120 lines); tests pass"),
+  `tool-only main turn must survive the follow-up, got: ${toolOnlyResults[0]!.output}`,
+)
+assert.ok(toolOnlyResults[0]!.output.includes("status: done"))
+
+// MR !1537 DW-10: a stale idle event published BEFORE the follow-up turn was
+// seen busy must not end that turn early — the turn must still answer its
+// permission ask and run to its real idle.
+const staleIdleSdk = makeSdk({
+  events: [
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+    // Stale replay of the previous turn's idle under the other event name:
+    { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    {
+      type: "permission.v2.asked",
+      properties: { id: "perm-stale", sessionID: "session-1" },
+    },
+    {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          sessionID: "session-1",
+          type: "text",
+          text: "follow-up answer",
+          time: { end: 1 },
+        },
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "session-1" } },
+  ],
+  partsPerCall: [
+    [{ type: "text", text: "MAIN DELIVERABLE" }],
+    [{ type: "text", text: "follow-up answer" }],
+  ],
+  resolvePromptAfterV2Reply: true,
+})
+const staleIdleQueue: FollowupQueue = {
+  prompts: [{ task_id: "task-stale-idle", seq: 1, prompt: "status?", done: false }],
+  closed: false,
+}
+const staleIdleResults: Array<{ status: string; output: string }> = []
+await executeTask(
+  { task_id: "task-stale-idle", prompt: "build the feature" },
+  () => {},
+  (result) => staleIdleResults.push(result),
+  undefined,
+  staleIdleSdk.sdk,
+  staleIdleQueue,
+)
+assert.equal(staleIdleResults.length, 1)
+assert.equal(staleIdleResults[0]!.status, "success")
+assert.equal(
+  staleIdleSdk.v2ReplyCount(),
+  1,
+  "stale idle must not skip the follow-up turn's permission reply (DW-10)",
+)
+assert.ok(
+  staleIdleResults[0]!.output.includes("follow-up answer"),
+  `stale idle must not cut the follow-up turn short, got: ${staleIdleResults[0]!.output}`,
+)
+
+// MR !1537 DW-5: the error path closes the queue — a task that fails hard
+// leaves no open queue for the bridge to ack into.
+const errorCloseSdk = makeSdk({ promptError: new Error("provider failed") })
+const errorCloseQueue: FollowupQueue = { prompts: [], closed: false }
+const errorCloseResults: Array<{ status: string }> = []
+await executeTask(
+  { task_id: "task-error-close", prompt: "test" },
+  () => {},
+  (result) => errorCloseResults.push(result),
+  undefined,
+  errorCloseSdk.sdk,
+  errorCloseQueue,
+)
+assert.equal(errorCloseResults[0]!.status, "error")
+assert.equal(errorCloseQueue.closed, true, "error path must close the queue")
 
 console.log("opencode task executor self-check passed")

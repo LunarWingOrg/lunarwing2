@@ -514,6 +514,12 @@ pub struct ExternalJobHandle {
     prompt_rx: Option<mpsc::Receiver<ControlPrompt>>,
     /// Next control-message sequence number (1-based, monotonic per job).
     next_seq: AtomicU64,
+    /// Seq of the accepted `done=true` wrap-up prompt, 0 while none has been
+    /// accepted (WI#328, MR !1537 review DW-4). Once set, `send_prompt`
+    /// rejects every later prompt — `done` means the channel is closed to
+    /// further input, and a queued-then-dropped prompt must never be acked
+    /// as accepted.
+    done_seq: AtomicU64,
     /// Capability learned from the worker's `ready` handshake (or the pooled
     /// connection's recorded handshake). Shared with the task loop, which
     /// sets it once the handshake completes.
@@ -533,6 +539,7 @@ impl ExternalJobHandle {
             prompt_tx,
             prompt_rx: Some(prompt_rx),
             next_seq: AtomicU64::new(0),
+            done_seq: AtomicU64::new(0),
             control_capability: Arc::new(AtomicU8::new(ControlCapability::Unknown.to_u8())),
             started: false,
         }
@@ -776,7 +783,11 @@ impl ExternalWorkerManager {
     /// as an unknown job, so job existence is not leaked), capability not
     /// advertised by the worker (`ExternalWorkerControlUnsupported`), full
     /// queue or per-job prompt cap (`ExternalWorkerControlQueueFull`), and
-    /// invalid content (`ExternalWorkerInvalidControlPrompt`).
+    /// invalid content (`ExternalWorkerInvalidControlPrompt`). Once a
+    /// `done=true` wrap-up prompt is accepted, every later prompt is rejected
+    /// (`ExternalWorkerTaskNotActive`, 409 on the web route): the worker
+    /// closes its side of the channel when the wrap-up lands, so accepting
+    /// more prompts would ack-and-drop them (MR !1537 review DW-4).
     ///
     /// Follow-up prompts do NOT extend the job's timeout/fuel budget — the
     /// task's existing deadline still applies (budget extension must be an
@@ -853,6 +864,17 @@ impl ExternalWorkerManager {
         if handle.prompt_tx.is_closed() {
             return Err(not_active("task already finished; control queue closed"));
         }
+        // DW-4: once a wrap-up (done=true) prompt is accepted the channel is
+        // closed to further input. Without this gate a post-done prompt was
+        // queued and acked as accepted but never delivered (the worker closes
+        // its side when the done prompt lands), which the audit trail then
+        // misreported as accepted.
+        let done_at = handle.done_seq.load(Ordering::Relaxed);
+        if done_at != 0 {
+            return Err(not_active(&format!(
+                "wrap-up already requested (done seq={done_at}); the control channel is closed to further prompts"
+            )));
+        }
         if handle.next_seq.load(Ordering::Relaxed) >= MAX_CONTROL_PROMPTS_PER_JOB {
             return Err(queue_full("per-job control prompt limit reached"));
         }
@@ -861,6 +883,9 @@ impl ExternalWorkerManager {
         }
 
         let seq = handle.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if done {
+            handle.done_seq.store(seq, Ordering::Relaxed);
+        }
         let prompt = ControlPrompt {
             seq,
             prompt: trimmed.to_string(),
@@ -2343,6 +2368,25 @@ async fn run_external_task(
     // an explicit rejection instead of a false "queued", and anything still
     // buffered is recorded as dropped.
     close_control_queue(job_id, prompt_rx, store).await;
+
+    // MR !1537 review DW-6: a prompt the daemon put on the wire but the
+    // worker never acked (e.g. the final-drain refusal whose ack is emitted
+    // after `task_result`, or a worker that went silent) must not look
+    // "delivered, then vanished" in the audit trail. Record each leftover
+    // delivered seq as unacked so the gap is explicit.
+    if !delivered_seqs.is_empty() {
+        let mut unacked: Vec<u64> = delivered_seqs.iter().copied().collect();
+        unacked.sort_unstable();
+        for seq in unacked {
+            persist_event(
+                store,
+                job_id,
+                "control_prompt",
+                &format!("unacked seq={seq}: task ended before the worker acked"),
+            )
+            .await;
+        }
+    }
 
     let task_result = match result {
         Ok(r) => r?,
@@ -4879,6 +4923,36 @@ mod tests {
         assert_eq!(second.seq, 2);
         assert_eq!(second.prompt, "second, wrap up");
         assert!(second.done);
+    }
+
+    #[tokio::test]
+    async fn send_prompt_rejects_after_done_accepted() {
+        // DW-4: once a wrap-up (done=true) prompt is accepted, every later
+        // prompt is rejected — the worker closes its side of the channel when
+        // the done prompt lands, so a queued post-done prompt would be acked
+        // accepted=true and silently dropped.
+        let mgr = control_test_manager();
+        let job_id = Uuid::new_v4();
+        reserve_capable(&mgr, job_id).await;
+
+        let seq = mgr
+            .send_prompt(job_id, "user", "wrap up", true)
+            .await
+            .unwrap();
+        assert_eq!(seq, 1);
+
+        let error = mgr
+            .send_prompt(job_id, "user", "one more thing", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OrchestratorError::ExternalWorkerTaskNotActive { .. }),
+            "post-done prompt must be rejected as not-active (409), got: {error}"
+        );
+        assert!(
+            error.to_string().contains("wrap-up already requested"),
+            "rejection must name the cause: {error}"
+        );
     }
 
     #[tokio::test]

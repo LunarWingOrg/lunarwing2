@@ -35,6 +35,11 @@ const WRAP_UP_SUFFIX =
 
 type StopReason = "timeout" | "cancelled"
 
+/** Settled outcome of a `session.prompt` call: the SDK result, or the error. */
+type PromptOutcome =
+  | { result: Awaited<ReturnType<OpencodeClient["session"]["prompt"]>> }
+  | { error: unknown }
+
 class TaskStoppedError extends Error {
   constructor(readonly reason: StopReason) {
     super(`Task ${reason}`)
@@ -126,6 +131,17 @@ export async function executeTask(
   let sessionID: string | undefined
   let closeEvents: (() => void) | undefined
   let output = ""
+  // Per-turn canonical assistant text (MR !1525 DI-3): every turn's prompt
+  // response contributes to the final result, so a short follow-up turn
+  // (e.g. "status?") can never replace the main deliverable. Declared
+  // function-scope so the catch path can still report banked turns (MR !1537
+  // review DW-3).
+  const canonicalTurns: string[] = []
+  // Seq of the follow-up prompt whose turn is currently running, undefined
+  // while the MAIN turn (or its retries) is in flight. Once any turn has
+  // succeeded, a failure/timeout in a follow-up turn must not change the
+  // task's terminal status (DW-3).
+  let currentFollowupSeq: number | undefined
   let deniedPermissions = 0
   let lastProgressAt = Date.now()
   const emitProgress = (delta: string) => {
@@ -230,18 +246,26 @@ export async function executeTask(
     )
     const eventIterator = events.stream[Symbol.asyncIterator]()
     closeEvents = () => void eventIterator.return?.()
-    // Per-turn canonical assistant text (MR !1525 DI-3): every turn's prompt
-    // response contributes to the final result, so a short follow-up turn
-    // (e.g. "status?") can never replace the main deliverable.
-    const canonicalTurns: string[] = []
 
     let nextPrompt = buildTaskPrompt(request)
     for (let attempt = 0; ; attempt++) {
       let sessionErrorMsg = ""
       const promptText = nextPrompt
+      // Streamed text/tool output for THIS turn attempt (MR !1537 DW-7): a
+      // turn whose assistant text is empty but whose tools produced output
+      // still banks that output, so a follow-up can't erase a tool-only main
+      // turn. Reset per attempt — failed attempts don't bank partial text.
+      let turnStreamed = ""
+      // DW-10: a stale idle event (published by a previous turn, possibly
+      // under both event names) must not end this turn before the session
+      // was observed busy or the prompt call settled.
+      let turnBusy = false
+      let turnSettled = false
       // Attach rejection handling immediately so a provider/API error cannot
       // become an unhandled rejection while the SSE loop is still draining.
-      const promptPromise = sdk.session
+      // The explicit PromptOutcome annotation keeps tsc's inference out of a
+      // self-referential loop through the SDK's conditional RequestResult.
+      const promptPromise: Promise<PromptOutcome> = sdk.session
         .prompt(
           {
             sessionID,
@@ -250,12 +274,15 @@ export async function executeTask(
           { throwOnError: true, signal: taskController.signal },
         )
         .then(
-          (result) => ({ result }),
-          (error: unknown) => ({ error }),
+          (result): PromptOutcome => ({ result }),
+          (error: unknown): PromptOutcome => ({ error }),
         )
-      const promptFailure = promptPromise.then((outcome) => {
+      const promptFailure = promptPromise.then((outcome: PromptOutcome) => {
         if (!("error" in outcome)) return new Promise<never>(() => {})
         return { kind: "prompt_error" as const }
+      })
+      void promptPromise.then(() => {
+        turnSettled = true
       })
 
       while (!stopReason) {
@@ -275,11 +302,13 @@ export async function executeTask(
         if (event.type === "message.part.updated") {
           const part = event.properties.part
           if (part.sessionID !== sessionID) continue
+          turnBusy = true
 
           if (part.type === "text" && part.time?.end) {
             const text = part.text?.trim()
             if (text) {
               output += text + "\n"
+              turnStreamed += text + "\n"
               emitProgress(text)
             }
           }
@@ -289,6 +318,7 @@ export async function executeTask(
             const toolName = part.tool || "unknown"
             const delta = `[${toolName}] ${toolOutput || "completed"}`
             output += delta + "\n"
+            turnStreamed += delta + "\n"
             emitProgress(delta)
           }
 
@@ -296,6 +326,7 @@ export async function executeTask(
             const toolName = part.tool || "unknown"
             const delta = `[${toolName}] ERROR: ${part.state.error}`
             output += delta + "\n"
+            turnStreamed += delta + "\n"
             emitProgress(delta)
           }
         }
@@ -335,13 +366,21 @@ export async function executeTask(
           )
         }
 
-        if (
-          (event.type === "session.status" &&
-            event.properties.sessionID === sessionID &&
-            event.properties.status?.type === "idle") ||
-          (event.type === "session.idle" && event.properties.sessionID === sessionID)
-        ) {
-          break
+        if (event.type === "session.status" && event.properties.sessionID === sessionID) {
+          if (event.properties.status?.type === "idle") {
+            // DW-10: an idle event only ends the turn once the turn was seen
+            // busy or the prompt call settled — a stale idle replayed from a
+            // previous turn (some builds publish both `session.status{idle}`
+            // and `session.idle`) must not cut this turn short.
+            if (turnBusy || turnSettled) break
+            continue
+          }
+          turnBusy = true
+        }
+
+        if (event.type === "session.idle" && event.properties.sessionID === sessionID) {
+          if (turnBusy || turnSettled) break
+          continue
         }
       }
 
@@ -355,15 +394,20 @@ export async function executeTask(
         sessionErrorMsg
 
       if (!promptError) {
-        // Turn finished cleanly; bank its canonical text (DI-3).
-        const turnText = extractAssistantText(promptData?.parts)
+        // Turn finished cleanly; bank its canonical text (DI-3) — or, when
+        // the assistant produced no text, this turn's streamed output (DW-7),
+        // so a tool-only main turn survives a later "status?" follow-up.
+        const turnText = extractAssistantText(promptData?.parts) || turnStreamed.trim()
         if (turnText) canonicalTurns.push(turnText)
         // A queued follow-up prompt (WI#328 runtime control channel)
         // continues the SAME session instead of resolving the task: the
         // daemon pushed it while the worker was busy and it is injected only
-        // here, at a turn boundary — never mid-call.
+        // here, at a turn boundary — never mid-call. The framing header
+        // attributes the instruction to the orchestrator so follow-up text
+        // can't masquerade as a worker-generated `[control]` note (DW-13).
         const followup = followups && !followups.closed ? followups.prompts.shift() : undefined
         if (followup) {
+          currentFollowupSeq = followup.seq
           emitProgress(
             `[control] Follow-up prompt received (seq=${followup.seq}${followup.done ? ", wrap-up requested" : ""})`,
           )
@@ -372,9 +416,13 @@ export async function executeTask(
             // queue so later prompts are acked accepted=false instead of
             // silently extending the run (DI-4).
             if (followups) followups.closed = true
-            nextPrompt = `${followup.prompt}\n\n${WRAP_UP_SUFFIX}`
+            nextPrompt =
+              `FOLLOW-UP INSTRUCTION (seq=${followup.seq}, FINAL) from the orchestrator:\n` +
+              `${followup.prompt}\n\n${WRAP_UP_SUFFIX}`
           } else {
-            nextPrompt = followup.prompt
+            nextPrompt =
+              `FOLLOW-UP INSTRUCTION (seq=${followup.seq}) from the orchestrator:\n` +
+              followup.prompt
           }
           attempt = -1 // each follow-up turn gets its own transient-retry budget
           continue
@@ -387,6 +435,18 @@ export async function executeTask(
       }
 
       if (!isRetryableProviderError(promptError) || attempt >= maxProviderRetries) {
+        // DW-3: a failed FOLLOW-UP turn must not fail the task — earlier
+        // turns already banked the deliverable. Record the failure in the
+        // output and resolve as success instead of throwing into the
+        // error/timed_out paths.
+        if (currentFollowupSeq !== undefined) {
+          const note = `[control] follow-up seq=${currentFollowupSeq} failed: ${promptError}`
+          console.warn(`[opencode_task_executor] task ${request.task_id}: ${note}`)
+          canonicalTurns.push(note)
+          emitProgress(note)
+          if (followups) followups.closed = true
+          break
+        }
         throw new Error(promptError)
       }
 
@@ -448,15 +508,40 @@ export async function executeTask(
       duration_ms: durationMs,
     })
   } catch (err) {
+    // DW-5: no path out of a task leaves the control queue open — a prompt
+    // landing during teardown (including the abortSession wait below) must be
+    // refused (accepted=false) instead of acked and silently dropped.
+    if (followups) followups.closed = true
     const durationMs = Date.now() - startTime
     const stopped = stopReason ?? (err instanceof TaskStoppedError ? err.reason : undefined)
     if (stopped) {
       closeEvents?.()
       await abortSession()
+      if (currentFollowupSeq !== undefined && stopped === "timeout") {
+        // DW-3: follow-up turns do not extend the task deadline, so a
+        // follow-up cut off by the task timeout must not turn finished work
+        // into TimedOut. Report the banked turns as success with the gap
+        // recorded.
+        const note = `[control] follow-up seq=${currentFollowupSeq} timed out before completing`
+        canonicalTurns.push(note)
+        onResult({
+          task_id: request.task_id,
+          status: "success",
+          output: canonicalTurns.join("\n\n"),
+          error: null,
+          duration_ms: Date.now() - startTime,
+        })
+        return
+      }
+      const banked = canonicalTurns.join("\n\n")
+      const cancelNote =
+        currentFollowupSeq !== undefined
+          ? `[control] follow-up seq=${currentFollowupSeq} cancelled before completing`
+          : ""
       onResult({
         task_id: request.task_id,
         status: stopped === "timeout" ? "timed_out" : "cancelled",
-        output: output.trim(),
+        output: cancelNote ? [banked, cancelNote].filter(Boolean).join("\n\n") : banked || output.trim(),
         error: stopped === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
         duration_ms: Date.now() - startTime,
       })
@@ -466,11 +551,13 @@ export async function executeTask(
     onResult({
       task_id: request.task_id,
       status: "error",
-      output: output.trim(),
+      output: canonicalTurns.join("\n\n") || output.trim(),
       error: errorMsg,
       duration_ms: durationMs,
     })
   } finally {
+    // DW-5: belt and braces — every exit path leaves the queue closed.
+    if (followups) followups.closed = true
     clearTimeout(timeout)
     if (progressHeartbeat) clearInterval(progressHeartbeat)
     abortSignal?.removeEventListener("abort", handleAbort)

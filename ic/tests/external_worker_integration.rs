@@ -179,6 +179,12 @@ enum MockBehavior {
     ControlChannel {
         messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     },
+    /// WI#328 (MR !1537 DW-6): like `ControlChannel`, but the worker never
+    /// acks the prompt — it answers the follow-up with a bare `task_result`.
+    /// The daemon must record the delivered seq as unacked at task end.
+    ControlChannelNoAck {
+        messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    },
     /// WI#328 (MR !1525 DI-9): worker that advertises `task_prompt`, then
     /// holds the task open forever — reading and forwarding envelopes (so the
     /// daemon's cancel reaches a live read loop) but never sending a
@@ -197,7 +203,9 @@ impl MockBehavior {
     /// Capabilities advertised in the mock's `ready` payload (WI#328).
     fn capabilities(&self) -> Vec<&'static str> {
         match self {
-            MockBehavior::ControlChannel { .. } | MockBehavior::ControlChannelHold { .. } => {
+            MockBehavior::ControlChannel { .. }
+            | MockBehavior::ControlChannelNoAck { .. }
+            | MockBehavior::ControlChannelHold { .. } => {
                 vec!["task_prompt"]
             }
             _ => vec![],
@@ -327,6 +335,66 @@ fn bad_subprotocol_response() -> ErrorResponse {
 /// set, the WS upgrade is rejected unless the client sends a matching
 /// `Authorization: Bearer <token>` header.
 #[allow(clippy::result_large_err)] // Err type is fixed by tungstenite's Callback trait
+/// WI#328 control-channel mock body (shared by `ControlChannel` and
+/// `ControlChannelNoAck`): forward every inbound envelope to `messages`; on
+/// `task_prompt`, optionally ack it, then finish the task successfully.
+async fn handle_control_channel(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    messages: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    ack_prompts: bool,
+) {
+    while let Some(Ok(message)) = ws.next().await {
+        let Ok(text) = message.to_text() else {
+            continue;
+        };
+        let Ok(msg_env) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        let msg_type = msg_env.get("type").and_then(|value| value.as_str());
+        if msg_type == Some("ping") {
+            let pong = envelope("pong", serde_json::json!({}));
+            if ws.send(Message::Text(pong.into())).await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let _ = messages.send(msg_env.clone());
+        if msg_type != Some("task_prompt") {
+            continue;
+        }
+        let task_id = msg_env["payload"]["task_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let seq = msg_env["payload"]["seq"].as_u64().unwrap_or(0);
+        if ack_prompts {
+            let ack = envelope(
+                "task_prompt_ack",
+                serde_json::json!({
+                    "task_id": task_id,
+                    "seq": seq,
+                    "accepted": true,
+                }),
+            );
+            if ws.send(Message::Text(ack.into())).await.is_err() {
+                return;
+            }
+        }
+        let r = envelope(
+            "task_result",
+            serde_json::json!({
+                "task_id": task_id,
+                "status": "success",
+                "output": "done after follow-up prompt",
+                "error": null,
+                "duration_ms": 5,
+            }),
+        );
+        let _ = ws.send(Message::Text(r.into())).await;
+        break;
+    }
+}
+
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     behavior: MockBehavior,
@@ -931,54 +999,14 @@ async fn handle_connection(
                 // finish. The read loop stays live, so `task_prompt` arrives
                 // mid-task exactly as it would for a real capable worker.
                 let _ = messages.send(req_envelope.clone());
-                while let Some(Ok(message)) = ws.next().await {
-                    let Ok(text) = message.to_text() else {
-                        continue;
-                    };
-                    let Ok(msg_env) = serde_json::from_str::<serde_json::Value>(text) else {
-                        continue;
-                    };
-                    let msg_type = msg_env.get("type").and_then(|value| value.as_str());
-                    if msg_type == Some("ping") {
-                        let pong = envelope("pong", serde_json::json!({}));
-                        if ws.send(Message::Text(pong.into())).await.is_err() {
-                            return;
-                        }
-                        continue;
-                    }
-                    let _ = messages.send(msg_env.clone());
-                    if msg_type != Some("task_prompt") {
-                        continue;
-                    }
-                    let task_id = msg_env["payload"]["task_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    let seq = msg_env["payload"]["seq"].as_u64().unwrap_or(0);
-                    let ack = envelope(
-                        "task_prompt_ack",
-                        serde_json::json!({
-                            "task_id": task_id,
-                            "seq": seq,
-                            "accepted": true,
-                        }),
-                    );
-                    if ws.send(Message::Text(ack.into())).await.is_err() {
-                        return;
-                    }
-                    let r = envelope(
-                        "task_result",
-                        serde_json::json!({
-                            "task_id": task_id,
-                            "status": "success",
-                            "output": "done after follow-up prompt",
-                            "error": null,
-                            "duration_ms": 5,
-                        }),
-                    );
-                    let _ = ws.send(Message::Text(r.into())).await;
-                    break;
-                }
+                handle_control_channel(&mut ws, messages, true).await;
+                // Loop: the connection may be pooled and reused.
+            }
+            MockBehavior::ControlChannelNoAck { ref messages } => {
+                // DW-6 shape: same control channel, but the worker answers the
+                // follow-up with a bare task_result — no task_prompt_ack.
+                let _ = messages.send(req_envelope.clone());
+                handle_control_channel(&mut ws, messages, false).await;
                 // Loop: the connection may be pooled and reused.
             }
             MockBehavior::ControlChannelHold {
@@ -5265,4 +5293,76 @@ async fn control_channel_cancel_closes_queue_immediately() {
             break;
         }
     }
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn control_channel_records_unacked_delivered_seq() {
+    // MR !1537 DW-6: a prompt the daemon delivered but the worker never acked
+    // (the worker answered with a bare task_result) must produce an explicit
+    // `unacked` row — "delivered, then vanished" is not a truthful audit.
+    let (store, _db_guard) = test_store().await;
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ControlChannelNoAck {
+        messages: message_tx,
+    })
+    .await;
+    let mgr =
+        Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]).with_store(store.clone()));
+    let job_id = Uuid::new_v4();
+    seed_agent_job(&store, job_id).await;
+    mgr.reserve_task(job_id, "mock", "user")
+        .await
+        .expect("reserve task");
+
+    let mgr_c = Arc::clone(&mgr);
+    let task = tokio::spawn(async move {
+        mgr_c
+            .execute_task(
+                job_id,
+                "mock",
+                "do the thing",
+                Some(10_000),
+                true,
+                TaskContext::default(),
+            )
+            .await
+    });
+    wait_for_capability(&mgr, job_id, ControlCapability::Supported).await;
+
+    let seq = mgr
+        .send_prompt(job_id, "user", "status?", false)
+        .await
+        .expect("send_prompt");
+    assert_eq!(seq, 1);
+
+    let res = timeout(TEST_BOUND, task)
+        .await
+        .expect("test timed out")
+        .expect("task panicked")
+        .expect("execute_task errored")
+        .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let _ = timeout(TEST_BOUND, message_rx.recv()).await; // task_request
+    let _ = timeout(TEST_BOUND, message_rx.recv()).await; // task_prompt
+
+    let events = persisted_event_contents(&store, job_id).await;
+    let prompt_rows: Vec<&str> = events
+        .iter()
+        .filter(|(kind, _)| kind == "control_prompt")
+        .map(|(_, content)| content.as_str())
+        .collect();
+    assert!(
+        prompt_rows.contains(&"delivered seq=1 done=false"),
+        "missing delivered row, got: {prompt_rows:?}"
+    );
+    assert!(
+        prompt_rows.iter().any(|c| c.starts_with("unacked seq=1")),
+        "missing unacked row, got: {prompt_rows:?}"
+    );
+    assert!(
+        !events.iter().any(|(kind, _)| kind == "control_ack"),
+        "no ack was sent, so no ack row may exist, got: {events:?}"
+    );
 }

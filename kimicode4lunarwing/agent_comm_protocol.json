@@ -90,7 +90,7 @@
         }
       },
       "task_prompt_ack": {
-        "description": "Worker → Agent: receipt for a delivered task_prompt (WI#328). Sent only by workers that advertise the task_prompt capability; accepted=false means the task was already finished, the queue was closed (final drain done or a done prompt consumed), or the payload was invalid",
+        "description": "Worker → Agent: receipt for a delivered task_prompt (WI#328). Sent only by workers that advertise the task_prompt capability; accepted=false means the task was already finished, the queue was closed (final drain done or a done prompt already accepted), the frame arrived on a connection that does not own the task, or the payload was invalid. A redelivered seq is deduped (acked accepted=true, not re-queued)",
         "payload": {
           "task_id":  "string",
           "seq":      "integer — echoes the task_prompt seq",

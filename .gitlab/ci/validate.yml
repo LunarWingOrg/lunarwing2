@@ -55,6 +55,34 @@ panic-policy:
   script:
     - bash .gitlab/scripts/panic-policy.sh
 
+# WI#328 (MR !1537 review DW-9): the opencode worker's TS bridge/executor
+# previously had no MR-pipeline gate at all — the only bun run was the manual
+# worker image build. This lane runs every bun self-test plus a strict
+# `tsc --noEmit` with pinned types on each MR/push.
+worker-opencode-ts:
+  stage: validate
+  needs: []
+  image:
+    # Same digest-pinned bun base as opencode4lunarwing/Dockerfile's builder.
+    name: "docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895"
+    entrypoint: [""]
+  tags:
+    - "$CI_LINT_RUNNER_TAG"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - cd opencode4lunarwing
+    - bun install --frozen-lockfile
+    - bun scripts/path_expand_test.ts
+    - bun scripts/opencode_result_test.ts
+    - bun scripts/task_prompt_test.ts
+    - bun scripts/lunarwing_bridge_test.ts
+    - bun scripts/opencode_task_executor_test.ts
+    - ./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json
+
 rustfmt:
   extends: .rust-job
   stage: validate
