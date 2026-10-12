@@ -474,6 +474,13 @@ impl ExternalWorkerManager {
             }
             config.tool_allowlist =
                 sanitize_tool_allowlist(&config.name, &config.tool_allowlist, cleartext_remote);
+            // MR !1506 CQ-10: cron tick jobs draw authority from the separate
+            // `cron.tool_allowlist`; sanitize it with the same rules.
+            if let Some(cron) = config.cron.as_mut() {
+                let cron_list_name = format!("{} (cron tick)", config.name);
+                cron.tool_allowlist =
+                    sanitize_tool_allowlist(&cron_list_name, &cron.tool_allowlist, cleartext_remote);
+            }
             let endpoints = config.endpoints();
             load_balancers.insert(
                 config.name.clone(),
@@ -648,7 +655,20 @@ impl ExternalWorkerManager {
         let store = self.store.clone();
         let tool_binding = ToolProxyBinding {
             proxy: self.tool_proxy.clone(),
-            allowlist: Arc::from(config.tool_allowlist.as_slice()),
+            // MR !1506 CQ-10: a cron tick job is standing, unattended tool
+            // authority — it draws from the mission's own `cron.tool_allowlist`
+            // (default empty), never the interactive worker-level list.
+            allowlist: if context.cron_tick.is_some() {
+                Arc::from(
+                    config
+                        .cron
+                        .as_ref()
+                        .map(|cron| cron.tool_allowlist.as_slice())
+                        .unwrap_or(&[]),
+                )
+            } else {
+                Arc::from(config.tool_allowlist.as_slice())
+            },
         };
         let active_handles = Arc::clone(&self.active_handles);
         let pool = Arc::clone(&self.pool);

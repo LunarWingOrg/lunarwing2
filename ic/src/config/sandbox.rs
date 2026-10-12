@@ -293,6 +293,17 @@ pub struct CronWorkerConfig {
     /// rejects the worker at load.
     #[serde(default)]
     pub timezone: Option<String>,
+    /// Tool-proxy authority for cron **tick** jobs (WI#324, MR !1506 CQ-10).
+    /// Deliberately separate from the worker-level `tool_allowlist`: a cron
+    /// mission fires unattended on a schedule, so tick jobs never inherit the
+    /// interactive list — grant the schedule its own (usually narrower) set
+    /// here. Default: empty — every `tool_call` from a tick job is denied.
+    /// Ordinary (non-tick) dispatches to the same worker still use the
+    /// worker-level list. Sanitized with the same rules as the worker-level
+    /// list at manager load (phase-1 positive set, denylist drops, cleartext
+    /// strip).
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
 }
 
 impl CronWorkerConfig {
@@ -519,6 +530,11 @@ pub struct ExternalWorkerConfig {
     /// (the proxy surface is the positive WI#324 phase-1 capability set,
     /// MR !1533 DP-2), and strips the whole list when the worker is reached
     /// over cleartext `ws://` on a non-loopback host.
+    ///
+    /// This list governs **ordinary (task-mode) dispatches only**. Cron tick
+    /// jobs on a `mode = "cron"` worker use `cron.tool_allowlist` instead
+    /// (MR !1506 CQ-10): a schedule is standing unattended authority, so the
+    /// mission's grant is an explicit separate decision.
     pub tool_allowlist: Vec<String>,
     /// Operating mode (default task). `Cron` arms the host-side mission
     /// supervisor. The worker still accepts ordinary bounded dispatches, but
@@ -595,6 +611,15 @@ impl ExternalWorkerConfig {
                 // of booting a worker whose mission supervisor can never run.
                 if config.is_cron() && !config.cron_block_valid(&mut seen_mission_ids) {
                     return None;
+                }
+                // MR !1506 CQ-10: tick jobs use `cron.tool_allowlist`, never the
+                // worker-level list. Say so when the split could surprise.
+                if config.is_cron() && !config.tool_allowlist.is_empty() {
+                    tracing::warn!(
+                        worker = %config.name,
+                        "External worker is mode=cron with a worker-level tool_allowlist; \
+                         cron tick jobs ignore it — grant tick authority via cron.tool_allowlist"
+                    );
                 }
                 // A [cron] block on a task-mode worker is ignored — say so
                 // instead of letting the operator believe a mission is armed.
