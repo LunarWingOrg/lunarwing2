@@ -512,7 +512,7 @@ export async function executeTask(
       notes.push(`[control] follow-up seq=${pending.seq} not run: task ended before this turn`)
     }
     const resultOutput = [banked || output.trim(), ...notes].filter(Boolean).join("\n\n")
-    const preserveSuccess = currentFollowupSeq !== undefined && canonicalTurns.length > 0
+    const preserveSuccess = currentFollowupSeq !== undefined && Boolean(banked || output.trim())
     if (stopped) {
       closeEvents?.()
       await abortSession()

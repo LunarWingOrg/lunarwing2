@@ -694,6 +694,63 @@ assert.ok(
 )
 assert.ok(toolOnlyResults[0]!.output.includes("status: done"))
 
+// !1552 ER-1: a main attempt performs a tool action, fails retryably, then
+// succeeds with no text. The streamed fallback makes that main turn successful;
+// a failed follow-up must preserve the same status and the tool output.
+{
+  const savedDelay = process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+  process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = "0"
+  const results: Array<{ status: string; output: string; error: string | null }> = []
+  try {
+    for (const withFollowup of [false, true]) {
+      const sdk = makeSdk({
+        events: [
+          {
+            type: "message.part.updated",
+            properties: {
+              part: {
+                sessionID: "session-1", type: "tool", tool: "bash",
+                state: { status: "completed", output: "wrote src/feature.rs" },
+              },
+            },
+          },
+          { type: "session.idle", properties: { sessionID: "session-1" } },
+          { type: "session.idle", properties: { sessionID: "session-1" } },
+          { type: "session.idle", properties: { sessionID: "session-1" } },
+        ],
+        parts: [],
+        assistantErrors: [
+          { message: "upstream provider timed out" }, undefined,
+          { message: "follow-up failed" },
+        ],
+      })
+      const queue: FollowupQueue = {
+        prompts: withFollowup
+          ? [{ task_id: "tool-retry", seq: 1, prompt: "status?", done: true }] : [],
+        closed: withFollowup,
+      }
+      await executeTask(
+        { task_id: "tool-retry", prompt: "build the feature" },
+        () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+      )
+      assert.equal(sdk.promptArgs.length, withFollowup ? 3 : 2)
+      assert.equal(queue.prompts.length, 0)
+      assert.equal(queue.closed, true)
+    }
+    assert.equal(results.length, 2)
+    for (const result of results) {
+      assert.match(result.output, /\[bash\] wrote src\/feature\.rs/)
+      assert.equal(result.status, "success", "a failed follow-up must preserve streamed main output")
+      assert.equal(result.error, null)
+    }
+    assert.equal(results[1]!.output,
+      `${results[0]!.output}\n\n[control] follow-up seq=1 failed: follow-up failed`)
+  } finally {
+    if (savedDelay === undefined) delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+    else process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = savedDelay
+  }
+}
+
 // MR !1537 DW-10: a stale idle event published BEFORE the follow-up turn was
 // seen busy must not end that turn early — the turn must still answer its
 // permission ask and run to its real idle.
