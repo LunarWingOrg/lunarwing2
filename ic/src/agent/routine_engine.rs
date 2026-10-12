@@ -3130,6 +3130,7 @@ mod tests {
             "routine_update",
             "routine_delete",
             "routine_fire",
+            "cron_mission",
             "restart",
         ];
         for tool in &denylisted {

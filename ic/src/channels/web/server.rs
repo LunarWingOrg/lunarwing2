@@ -31,6 +31,9 @@ use crate::agent::SessionManager;
 use crate::bootstrap::lunarwing_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthenticatedUser, UserIdentity, auth_middleware};
+use crate::channels::web::handlers::cron_workers::{
+    cron_worker_control_handler, cron_worker_status_handler,
+};
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
     jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
@@ -475,6 +478,10 @@ pub(super) async fn start_server_with_mascot(
         .merge(crate::channels::web::handlers::prompts::routes())
         // Jobs
         .route("/api/jobs", get(jobs_list_handler))
+        .route(
+            "/api/workers/{worker}/cron",
+            get(cron_worker_status_handler).post(cron_worker_control_handler),
+        )
         .route("/api/jobs/summary", get(jobs_summary_handler))
         .route("/api/jobs/{id}", get(jobs_detail_handler))
         .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))

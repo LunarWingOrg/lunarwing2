@@ -23,6 +23,7 @@ use crate::channels::web::ws::WsConnectionTracker;
 pub struct TestGatewayBuilder {
     msg_tx: Option<mpsc::Sender<IncomingMessage>>,
     llm_provider: Option<Arc<dyn crate::llm::LlmProvider>>,
+    external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
     user_id: String,
 }
 
@@ -31,6 +32,7 @@ impl Default for TestGatewayBuilder {
         Self {
             msg_tx: None,
             llm_provider: None,
+            external_worker_manager: None,
             user_id: "test-user".to_string(),
         }
     }
@@ -61,6 +63,15 @@ impl TestGatewayBuilder {
         self
     }
 
+    /// Supply a live external-worker manager for operator API tests.
+    pub fn external_worker_manager(
+        mut self,
+        manager: Arc<crate::orchestrator::ExternalWorkerManager>,
+    ) -> Self {
+        self.external_worker_manager = Some(manager);
+        self
+    }
+
     /// Build the `Arc<GatewayState>` without starting a server.
     pub fn build(self) -> Arc<GatewayState> {
         Arc::new(GatewayState {
@@ -75,7 +86,7 @@ impl TestGatewayBuilder {
             tool_registry: None,
             store: None,
             job_manager: None,
-            external_worker_manager: None,
+            external_worker_manager: self.external_worker_manager,
             prompt_queue: None,
             owner_id: self.user_id.clone(),
             default_sender_id: self.user_id,

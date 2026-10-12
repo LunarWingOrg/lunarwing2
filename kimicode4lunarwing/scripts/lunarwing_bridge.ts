@@ -27,7 +27,7 @@ import {
   type WsState,
 } from "./lunarwing_runtime.js"
 import { executeTask } from "./kimi_task_executor.js"
-import { resolveWorkspacePath, workspacePathsOverlap } from "./workspace_path.js"
+import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
 
 // A single malformed frame or a stray async error must not take the whole
 // worker process down (which would drop every in-flight task). Log and survive.
@@ -74,7 +74,7 @@ const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
 function taskWorkspace(request: TaskRequest): string {
-  return resolveWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT)
+  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
 }
 
 function abortSocketTasks(socket: BridgeSocket): void {

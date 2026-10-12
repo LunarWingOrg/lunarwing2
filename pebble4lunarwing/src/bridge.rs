@@ -329,8 +329,8 @@ async fn dispatch_task(
         .project_dir
         .clone()
         .unwrap_or_else(|| config.workspace_root.clone());
-    let workspace = match workspace_path::resolve_workspace_path(
-        &requested_dir,
+    let workspace = match workspace_path::resolve_task_workspace(
+        &request.context,
         std::path::Path::new(&config.workspace_root),
     ) {
         Ok(dir) => dir,
@@ -712,6 +712,29 @@ mod tests {
             "rejected task must register no cancel"
         );
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn cron_dispatch_bootstraps_missing_directory_before_executor() {
+        let config = test_config();
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let cancels = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut request = request_envelope("cron-first", Some("missions/pr-digest"));
+        request.payload["context"]["cron_tick"] = serde_json::json!({"event":"cron.tick"});
+        dispatch_task(request, &config, &out_tx, &cancels, &registry).await;
+        let result = next_envelope(&mut out_rx).await;
+        assert!(std::path::Path::new(&config.workspace_root)
+            .join("missions/pr-digest")
+            .is_dir());
+        // The fixture deliberately has no pebble executable: it must reach
+        // the executor, rather than fail the directory preflight (DN-2).
+        assert_eq!(result.msg_type, "task_result");
+        assert!(result.payload["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("failed to spawn pebble:"));
+        std::fs::remove_dir_all(config.workspace_root).unwrap();
     }
 
     /// Regression for WI#158: every task that completes naturally (not via
