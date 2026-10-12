@@ -749,6 +749,22 @@ From the agent side this is surfaced through `job_prompt`, which routes `externa
 
 Worker support today: the **opencode** worker (`opencode4lunarwing`) consumes `task_prompt` — it validates frames bridge-side (positive integer seq, non-empty 16 KiB NUL-free prompt, per-task queue bound, seq dedupe), binds every queue to the connection that owns the task (a foreign socket's prompt or cancel is refused), injects queued follow-ups into the same opencode session at the turn boundary (session idle, gated against stale idle replays) framed as `FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator`, closes the queue the moment a `done: true` prompt is accepted (the injected turn is the wrap-up turn), and closes it on every error/cancel/finish path so late frames are acked `accepted: false`. Its final `task_result` output accumulates every turn's canonical text — or the turn's streamed tool/text output when the assistant produced none — and a follow-up turn that fails or times out after the main turn succeeded resolves as `success` with a `[control] follow-up seq=N failed/timed out` note, so a late "status?" can never turn finished work into Failed/TimedOut or replace the deliverable. The kimi, opencode2, and pebble bridges do not advertise the capability (pebble runs its CLI one-shot with no session to inject into) and therefore reject prompts explicitly.
 
+`closed` seals **admission**, not consumption: already accepted prompts drain
+in FIFO order through the final `done=true` turn. Any terminal failure, timeout
+or cancellation records each remaining accepted prompt as
+`[control] follow-up seq=N not run`. Permission-reply and SSE errors follow the
+same policy as prompt errors. Preserving success requires actual completed
+assistant/tool output; control notes alone cannot turn empty or permission-denied
+work into success. Explicit cancellation remains `cancelled` and retains completed
+output. The 16 MiB daemon WebSocket limit rejects oversized results; it does not
+truncate accumulated output or guarantee delivery of an oversized deliverable.
+
+The daemon bounds prompts in UTF-8 bytes; the OpenCode bridge's additional
+length check uses 16,384 UTF-16 units. Its queue holds at most 64 pending prompts.
+Deduplication applies while admission is open; closed queues refuse redelivery
+too. Invalid instructions retain valid task/sequence identifiers in refusal
+acks; invalid identifiers themselves cannot be correlated.
+
 Interop: pre-WI#328 workers that never send `task_prompt_ack` still function — the daemon tolerates missing acks and ignores unknown message types, and newer workers must likewise ignore `task_prompt` if they do not implement prompting (they simply omit the capability, and the daemon never sends them the frame).
 
 ### Upgrade ordering

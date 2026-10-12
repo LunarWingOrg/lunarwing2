@@ -46,7 +46,7 @@
         "payload": {}
       },
       "task_prompt": {
-        "description": "Agent → Worker: follow-up prompt/directive for a RUNNING task (WI#328 runtime control channel; consumed by this worker — queued follow-ups are injected into the same opencode session at the turn boundary, never mid-call, framed as 'FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator'). A done=true prompt is the final wrap-up turn: the queue closes the moment the done prompt is accepted, and the daemon rejects post-done prompts itself. The final task_result output accumulates every turn's canonical text (or its streamed tool/text output when a turn produced no assistant text), so a short, failing, or timed-out follow-up never replaces the main deliverable",
+        "description": "Agent → Worker: follow-up prompt/directive for a RUNNING task (WI#328 runtime control channel; consumed by this worker — queued follow-ups are injected into the same opencode session at the turn boundary, never mid-call, framed as 'FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator'). A done=true prompt seals admission immediately; already accepted prompts drain in order, ending with the FINAL wrap-up turn. The daemon rejects post-done prompts itself. The final task_result accumulates completed turns' canonical or streamed output. Follow-up failures/timeouts preserve success only when completed output exists; unrun accepted prompts receive explicit control notes",
         "payload": {
           "task_id": "string",
           "seq":     "integer — monotonic per job, for ordering and dedupe",
@@ -89,7 +89,7 @@
         }
       },
       "task_prompt_ack": {
-        "description": "Worker → Agent: receipt for a delivered task_prompt (WI#328). Sent only by workers that advertise the task_prompt capability; accepted=false means the task was already finished, the queue was closed (final drain done or a done prompt already accepted), the frame arrived on a connection that does not own the task, or the payload was invalid. A redelivered seq is deduped (acked accepted=true, not re-queued)",
+        "description": "Worker → Agent: receipt for a delivered task_prompt (WI#328), not proof of execution. Sent only by capable workers. accepted=false means unknown/finished task, closed admission (including after done=true), foreign connection, invalid payload, or the 64-prompt worker queue cap. While admission is open a redelivered seq is acked accepted=true without re-queueing; closed admission refuses redeliveries too. Malformed instructions echo valid task_id/seq fields; invalid identifiers use empty task_id/seq=0 and cannot be correlated",
         "payload": {
           "task_id":  "string",
           "seq":      "integer — echoes the task_prompt seq",

@@ -30,6 +30,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
+import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { resolveTaskWorkspace } from "./workspace_path"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -129,6 +130,7 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
 async function handleTaskRequest(
   request: TaskRequest,
   ws: BridgeSocket,
+  sdkOverride?: OpencodeClient,
 ): Promise<void> {
   if (!request.task_id || !request.prompt) {
     const errMsg = createEnvelope("task_result", {
@@ -201,7 +203,7 @@ async function handleTaskRequest(
         console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
       },
       controller.signal,
-      undefined,
+      sdkOverride,
       promptQueue,
     )
   } finally {
@@ -240,13 +242,18 @@ function handleCancel(payload: { task_id: string }, ws: BridgeSocket): void {
  *    or a done=true prompt already accepted — DW-4),
  *  - a frame arriving on a socket that does not own the task (DW-8),
  *  - more than MAX_CONTROL_QUEUE_PER_TASK prompts waiting (DW-11).
- * A re-delivered seq is deduped (accepted=true, not enqueued twice) per the
- * protocol's ordering/dedupe contract (DW-13).
+ * While admission is open, a re-delivered seq is deduped (accepted=true,
+ * not enqueued twice). A closed queue refuses every frame, even redeliveries.
  */
 function handleTaskPrompt(payload: unknown, ws: BridgeSocket): void {
   const prompt = parseTaskPrompt(payload)
-  const taskId = prompt?.task_id ?? ""
-  const seq = prompt?.seq ?? 0
+  // Preserve valid correlation fields even when the instruction is invalid;
+  // otherwise the daemon cannot match the refusal to its delivered seq.
+  const record = payload !== null && typeof payload === "object"
+    ? payload as Record<string, unknown> : undefined
+  const taskId = typeof record?.task_id === "string" ? record.task_id : ""
+  const seq = typeof record?.seq === "number" && Number.isSafeInteger(record.seq) && record.seq > 0
+    ? record.seq : 0
   const refuse = (reason: string): void => {
     console.warn(`[bridge] task_prompt refused: ${reason}`)
     const ack: TaskPromptAck = { task_id: taskId, seq, accepted: false }
@@ -459,7 +466,7 @@ async function startClient(): Promise<void> {
 // listener roles only start when this file is the entrypoint, so importing
 // it in a test does not bind a port.
 
-export { handleCancel, handleMessage, handleTaskPrompt, activePromptQueues, activeTasks }
+export { handleCancel, handleMessage, handleTaskRequest, handleTaskPrompt, sendReady, activePromptQueues, activeTasks }
 
 // tsc has no type for Bun's import.meta.main; the cast keeps `tsc --noEmit`
 // clean without pulling in Bun types.

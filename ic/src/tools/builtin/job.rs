@@ -3785,23 +3785,11 @@ mod tests {
             .create_job_for_user("default", "External Job", "desc")
             .await
             .unwrap(); // safety: test
-        let now = Utc::now();
-        store
-            .save_sandbox_job(&SandboxJobRecord {
-                id: job_id,
-                task: "External Job".to_string(),
-                status: "running".to_string(),
-                user_id: "default".to_string(),
-                project_dir: "/tmp/wi328-test".to_string(),
-                success: None,
-                failure_reason: None,
-                created_at: now,
-                started_at: Some(now),
-                completed_at: None,
-                credential_grants_json: "[]".to_string(),
-            })
-            .await
-            .unwrap(); // safety: test
+        // This routing test only needs a persisted job and its external mode.
+        // Reuse the context instead of adding a SandboxJobRecord literal that
+        // breaks when !1548 adds the required job_mode field (EJ-1).
+        let job_ctx = cm.get_context(job_id).await.unwrap(); // safety: test
+        store.save_job(&job_ctx).await.unwrap(); // safety: test
         store
             .update_sandbox_job_mode(job_id, "external:harness")
             .await

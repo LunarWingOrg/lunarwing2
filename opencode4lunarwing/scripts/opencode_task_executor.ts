@@ -81,6 +81,15 @@ function isRetryableProviderError(message: string): boolean {
   )
 }
 
+function emptyOutputError(deniedPermissions: number): string {
+  if (deniedPermissions > 0) {
+    return `Task performed no actions: ${deniedPermissions} permission request(s) ` +
+      "were denied by the worker permission policy (the session permission " +
+      "configuration likely needs to match the opencode SDK — smoke-verify)."
+  }
+  return "opencode completed without assistant text or tool output"
+}
+
 function createSdk(directory?: string): OpencodeClient {
   const password = getPassword()
   const headers: Record<string, string> = {}
@@ -405,7 +414,9 @@ export async function executeTask(
         // here, at a turn boundary — never mid-call. The framing header
         // attributes the instruction to the orchestrator so follow-up text
         // can't masquerade as a worker-generated `[control]` note (DW-13).
-        const followup = followups && !followups.closed ? followups.prompts.shift() : undefined
+        // `closed` seals admission, not consumption: the bridge sets it when
+        // accepting done=true, including while earlier accepted turns wait.
+        const followup = followups?.prompts.shift()
         if (followup) {
           currentFollowupSeq = followup.seq
           emitProgress(
@@ -435,18 +446,8 @@ export async function executeTask(
       }
 
       if (!isRetryableProviderError(promptError) || attempt >= maxProviderRetries) {
-        // DW-3: a failed FOLLOW-UP turn must not fail the task — earlier
-        // turns already banked the deliverable. Record the failure in the
-        // output and resolve as success instead of throwing into the
-        // error/timed_out paths.
-        if (currentFollowupSeq !== undefined) {
-          const note = `[control] follow-up seq=${currentFollowupSeq} failed: ${promptError}`
-          console.warn(`[opencode_task_executor] task ${request.task_id}: ${note}`)
-          canonicalTurns.push(note)
-          emitProgress(note)
-          if (followups) followups.closed = true
-          break
-        }
+        // Share the terminal policy with permission/SSE failures. Control
+        // notes are not completed output and cannot manufacture success.
         throw new Error(promptError)
       }
 
@@ -473,28 +474,12 @@ export async function executeTask(
     const resultOutput = canonicalOutput || output.trim()
     const durationMs = Date.now() - startTime
 
-    // If every permission was denied and the task produced no output, it did
-    // nothing — report that instead of a silent "success".
-    if (deniedPermissions > 0 && !resultOutput) {
-      onResult({
-        task_id: request.task_id,
-        status: "error",
-        output: resultOutput,
-        error:
-          `Task performed no actions: ${deniedPermissions} permission request(s) ` +
-          `were denied by the worker permission policy (the session permission ` +
-          `configuration likely needs to match the opencode SDK — smoke-verify).`,
-        duration_ms: durationMs,
-      })
-      return
-    }
-
     if (!resultOutput) {
       onResult({
         task_id: request.task_id,
         status: "error",
         output: "",
-        error: "opencode completed without assistant text or tool output",
+        error: emptyOutputError(deniedPermissions),
         duration_ms: durationMs,
       })
       return
@@ -512,48 +497,44 @@ export async function executeTask(
     // landing during teardown (including the abortSession wait below) must be
     // refused (accepted=false) instead of acked and silently dropped.
     if (followups) followups.closed = true
-    const durationMs = Date.now() - startTime
     const stopped = stopReason ?? (err instanceof TaskStoppedError ? err.reason : undefined)
+    const errorMsg = opencodeErrorMessage(err)
+    const banked = canonicalTurns.join("\n\n")
+    const notes: string[] = []
+    if (currentFollowupSeq !== undefined) {
+      const outcome = stopped === "timeout" ? "timed out before completing"
+        : stopped === "cancelled" ? "cancelled before completing" : `failed: ${errorMsg}`
+      notes.push(`[control] follow-up seq=${currentFollowupSeq} ${outcome}`)
+    }
+    // Accepted does not promise execution: explicitly account for every turn
+    // still queued when any error/cancellation/timeout terminates this task.
+    for (const pending of followups?.prompts.splice(0) ?? []) {
+      notes.push(`[control] follow-up seq=${pending.seq} not run: task ended before this turn`)
+    }
+    const resultOutput = [banked || output.trim(), ...notes].filter(Boolean).join("\n\n")
+    const preserveSuccess = currentFollowupSeq !== undefined && canonicalTurns.length > 0
     if (stopped) {
       closeEvents?.()
       await abortSession()
-      if (currentFollowupSeq !== undefined && stopped === "timeout") {
-        // DW-3: follow-up turns do not extend the task deadline, so a
-        // follow-up cut off by the task timeout must not turn finished work
-        // into TimedOut. Report the banked turns as success with the gap
-        // recorded.
-        const note = `[control] follow-up seq=${currentFollowupSeq} timed out before completing`
-        canonicalTurns.push(note)
-        onResult({
-          task_id: request.task_id,
-          status: "success",
-          output: canonicalTurns.join("\n\n"),
-          error: null,
-          duration_ms: Date.now() - startTime,
-        })
-        return
-      }
-      const banked = canonicalTurns.join("\n\n")
-      const cancelNote =
-        currentFollowupSeq !== undefined
-          ? `[control] follow-up seq=${currentFollowupSeq} cancelled before completing`
-          : ""
+      // Only actual completed output preserves success through a follow-up
+      // timeout. Explicit cancellation always remains cancelled.
+      const timedOut = stopped === "timeout" && !preserveSuccess
       onResult({
         task_id: request.task_id,
-        status: stopped === "timeout" ? "timed_out" : "cancelled",
-        output: cancelNote ? [banked, cancelNote].filter(Boolean).join("\n\n") : banked || output.trim(),
-        error: stopped === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
+        status: stopped === "cancelled" ? "cancelled" : timedOut ? "timed_out" : "success",
+        output: resultOutput,
+        error: timedOut ? `Task timed out after ${timeoutMs}ms` : null,
         duration_ms: Date.now() - startTime,
       })
       return
     }
-    const errorMsg = opencodeErrorMessage(err)
     onResult({
       task_id: request.task_id,
-      status: "error",
-      output: canonicalTurns.join("\n\n") || output.trim(),
-      error: errorMsg,
-      duration_ms: durationMs,
+      status: preserveSuccess ? "success" : "error",
+      output: resultOutput,
+      error: preserveSuccess ? null : currentFollowupSeq !== undefined
+        ? `${emptyOutputError(deniedPermissions)}; follow-up failed: ${errorMsg}` : errorMsg,
+      duration_ms: Date.now() - startTime,
     })
   } finally {
     // DW-5: belt and braces — every exit path leaves the queue closed.

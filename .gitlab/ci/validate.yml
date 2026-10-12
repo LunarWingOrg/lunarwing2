@@ -63,8 +63,7 @@ worker-opencode-ts:
   stage: validate
   needs: []
   image:
-    # Same digest-pinned bun base as opencode4lunarwing/Dockerfile's builder.
-    name: "docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895"
+    name: "$CI_BUN_IMAGE"
     entrypoint: [""]
   tags:
     - "$CI_LINT_RUNNER_TAG"

@@ -152,7 +152,7 @@ export interface TaskPromptAck {
  * (a non-integer seq can never match an ack; an oversized prompt disagrees
  * with the daemon's own limit).
  */
-export const MAX_CONTROL_PROMPT_CODE_POINTS = 16 * 1024
+export const MAX_CONTROL_PROMPT_UTF16_UNITS = 16 * 1024
 export const MAX_CONTROL_QUEUE_PER_TASK = 64
 
 /**
@@ -174,7 +174,7 @@ export function parseTaskPrompt(payload: unknown): TaskPrompt | null {
   }
   if (typeof candidate.prompt !== "string") return null
   if (candidate.prompt.trim().length === 0) return null
-  if (candidate.prompt.length > MAX_CONTROL_PROMPT_CODE_POINTS) return null
+  if (candidate.prompt.length > MAX_CONTROL_PROMPT_UTF16_UNITS) return null
   // NUL bytes are rejected (text directives only); String.fromCharCode(0)
   // keeps the source free of literal-NUL/escape ambiguity.
   if (candidate.prompt.includes(String.fromCharCode(0))) return null
@@ -193,7 +193,8 @@ export function parseTaskPrompt(payload: unknown): TaskPrompt | null {
  * ACCEPTED (MR !1537 review DW-4) and refuses every later frame; the
  * executor sets it when the task is finishing — after the final
  * turn-boundary drain, on the error path, and on the cancel path (DW-5) —
- * so no more prompts will be consumed. The bridge rejects frames for a
+ * so no more prompts will be accepted. Already accepted prompts still drain
+ * after admission closes for done=true. The bridge rejects frames for a
  * closed/missing queue with `accepted: false` so the daemon audit reflects
  * the drop instead of a silent loss (MR !1525 DI-4).
  */

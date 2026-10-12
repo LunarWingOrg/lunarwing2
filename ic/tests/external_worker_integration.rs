@@ -185,6 +185,11 @@ enum MockBehavior {
     ControlChannelNoAck {
         messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     },
+    /// Ack the same delivered seq repeatedly, including refusal/legacy shapes.
+    ControlChannelAcks {
+        messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        accepted: Vec<Option<bool>>,
+    },
     /// WI#328 (MR !1525 DI-9): worker that advertises `task_prompt`, then
     /// holds the task open forever — reading and forwarding envelopes (so the
     /// daemon's cancel reaches a live read loop) but never sending a
@@ -205,6 +210,7 @@ impl MockBehavior {
         match self {
             MockBehavior::ControlChannel { .. }
             | MockBehavior::ControlChannelNoAck { .. }
+            | MockBehavior::ControlChannelAcks { .. }
             | MockBehavior::ControlChannelHold { .. } => {
                 vec!["task_prompt"]
             }
@@ -330,18 +336,12 @@ fn bad_subprotocol_response() -> ErrorResponse {
         .expect("valid error response")
 }
 
-/// Per-connection protocol handler. Implements the server side of
-/// `lunarwing-agent-v1` for the scripted behavior. When `expected_token` is
-/// set, the WS upgrade is rejected unless the client sends a matching
-/// `Authorization: Bearer <token>` header.
-#[allow(clippy::result_large_err)] // Err type is fixed by tungstenite's Callback trait
-/// WI#328 control-channel mock body (shared by `ControlChannel` and
-/// `ControlChannelNoAck`): forward every inbound envelope to `messages`; on
-/// `task_prompt`, optionally ack it, then finish the task successfully.
+/// WI#328: forward inbound envelopes; on `task_prompt`, send the scripted
+/// ack sequence (None omits `accepted`), then finish the task successfully.
 async fn handle_control_channel(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     messages: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
-    ack_prompts: bool,
+    accepted: &[Option<bool>],
 ) {
     while let Some(Ok(message)) = ws.next().await {
         let Ok(text) = message.to_text() else {
@@ -367,15 +367,12 @@ async fn handle_control_channel(
             .unwrap_or_default()
             .to_string();
         let seq = msg_env["payload"]["seq"].as_u64().unwrap_or(0);
-        if ack_prompts {
-            let ack = envelope(
-                "task_prompt_ack",
-                serde_json::json!({
-                    "task_id": task_id,
-                    "seq": seq,
-                    "accepted": true,
-                }),
-            );
+        for flag in accepted {
+            let mut payload = serde_json::json!({ "task_id": task_id, "seq": seq });
+            if let Some(flag) = flag {
+                payload["accepted"] = serde_json::json!(flag);
+            }
+            let ack = envelope("task_prompt_ack", payload);
             if ws.send(Message::Text(ack.into())).await.is_err() {
                 return;
             }
@@ -395,6 +392,10 @@ async fn handle_control_channel(
     }
 }
 
+/// Per-connection protocol handler. Implements the server side of
+/// `lunarwing-agent-v1` for the scripted behavior. When `expected_token` is
+/// set, the WS upgrade is rejected unless the client sends a matching
+/// `Authorization: Bearer <token>` header.
 #[allow(clippy::result_large_err)] // Err type is fixed by tungstenite's Callback trait
 async fn handle_connection(
     stream: tokio::net::TcpStream,
@@ -1000,15 +1001,22 @@ async fn handle_connection(
                 // finish. The read loop stays live, so `task_prompt` arrives
                 // mid-task exactly as it would for a real capable worker.
                 let _ = messages.send(req_envelope.clone());
-                handle_control_channel(&mut ws, messages, true).await;
+                handle_control_channel(&mut ws, messages, &[Some(true)]).await;
                 // Loop: the connection may be pooled and reused.
             }
             MockBehavior::ControlChannelNoAck { ref messages } => {
                 // DW-6 shape: same control channel, but the worker answers the
                 // follow-up with a bare task_result — no task_prompt_ack.
                 let _ = messages.send(req_envelope.clone());
-                handle_control_channel(&mut ws, messages, false).await;
+                handle_control_channel(&mut ws, messages, &[]).await;
                 // Loop: the connection may be pooled and reused.
+            }
+            MockBehavior::ControlChannelAcks {
+                ref messages,
+                ref accepted,
+            } => {
+                let _ = messages.send(req_envelope.clone());
+                handle_control_channel(&mut ws, messages, accepted).await;
             }
             MockBehavior::ControlChannelHold {
                 ref messages,
@@ -1036,6 +1044,19 @@ async fn handle_connection(
                         }),
                     );
                     if ws.send(Message::Text(forged.into())).await.is_err() {
+                        return;
+                    }
+                    // An in-order progress barrier lets the test prove the
+                    // forged ack was read before it starts the cancel handoff.
+                    let barrier = envelope(
+                        "task_progress",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "delta": "forged ack barrier",
+                            "done": false,
+                        }),
+                    );
+                    if ws.send(Message::Text(barrier.into())).await.is_err() {
                         return;
                     }
                 }
@@ -5130,6 +5151,71 @@ async fn control_channel_persists_delivery_and_ack_rows() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn control_channel_persists_refused_and_legacy_acks_once() {
+    // !1552 EJ-2: first ack wins, including accepted=false and legacy omission.
+    // A duplicate with the opposite value must neither add nor rewrite a row.
+    for (accepted, expected) in [
+        (vec![Some(false), Some(true)], "seq=1 accepted=false"),
+        (vec![None, Some(false)], "seq=1 accepted=true"),
+    ] {
+        let (store, _db_guard) = test_store().await;
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (url, _count) = spawn_mock_worker_async(MockBehavior::ControlChannelAcks {
+            messages: message_tx,
+            accepted,
+        })
+        .await;
+        let mgr =
+            Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]).with_store(store.clone()));
+        let job_id = Uuid::new_v4();
+        seed_agent_job(&store, job_id).await;
+        mgr.reserve_task(job_id, "mock", "user")
+            .await
+            .expect("reserve task");
+        let mgr_c = Arc::clone(&mgr);
+        let task = tokio::spawn(async move {
+            mgr_c
+                .execute_task(
+                    job_id,
+                    "mock",
+                    "build",
+                    Some(10_000),
+                    true,
+                    TaskContext::default(),
+                )
+                .await
+        });
+        wait_for_capability(&mgr, job_id, ControlCapability::Supported).await;
+        assert_eq!(
+            mgr.send_prompt(job_id, "user", "status?", false)
+                .await
+                .expect("send prompt"),
+            1
+        );
+        let result = timeout(TEST_BOUND, task)
+            .await
+            .expect("test timed out")
+            .expect("task panicked")
+            .expect("execute task")
+            .expect("task result");
+        assert_eq!(result.status, ExternalTaskStatus::Success);
+        let events = persisted_event_contents(&store, job_id).await;
+        let acks: Vec<_> = events
+            .iter()
+            .filter(|(kind, _)| kind == "control_ack")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(acks, vec![expected]);
+        assert!(
+            !events
+                .iter()
+                .any(|(_, text)| text.starts_with("unacked seq=1"))
+        );
+    }
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn control_channel_ignores_forged_ack() {
     // MR !1525 DI-9 (CT-8 mutation coverage): an ack for a seq the daemon
     // never delivered must NOT produce a control_ack row — deleting the
@@ -5164,8 +5250,21 @@ async fn control_channel_ignores_forged_ack() {
     });
     wait_for_capability(&mgr, job_id, ControlCapability::Supported).await;
 
-    // Clean up the held-open task; the forged ack (sent right after the
-    // task_request) is processed by the read loop long before this.
+    // Do not let cancellation win the select before the forged ack is read.
+    timeout(TEST_BOUND, async {
+        loop {
+            if persisted_event_contents(&store, job_id)
+                .await
+                .iter()
+                .any(|(kind, text)| kind == "message" && text == "forged ack barrier")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("forged ack barrier must be processed before cancellation");
     assert!(mgr.cancel_task(job_id).await);
     let res = timeout(TEST_BOUND, task)
         .await

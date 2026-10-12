@@ -14,6 +14,8 @@ interface MockOptions {
   pendingPrompt?: boolean
   pendingPermissionReply?: boolean
   pendingAbort?: boolean
+  permissionError?: Error
+  streamErrorAfterEvents?: Error
   parts?: Array<{ type: string; text?: string }>
   partsPerCall?: Array<Array<{ type: string; text?: string }>>
   promptError?: Error
@@ -50,6 +52,7 @@ function makeSdk(options: MockOptions = {}) {
     ]) {
       yield event
     }
+    if (options.streamErrorAfterEvents) throw options.streamErrorAfterEvents
     if (options.pendingAfterEvents) await new Promise(() => {})
   }
 
@@ -104,6 +107,7 @@ function makeSdk(options: MockOptions = {}) {
     permission: {
       reply: async (...args: unknown[]) => {
         captureSignal(args)
+        if (options.permissionError) throw options.permissionError
         if (options.pendingPermissionReply) await new Promise(() => {})
         return { data: true }
       },
@@ -114,6 +118,7 @@ function makeSdk(options: MockOptions = {}) {
           reply: async (...args: unknown[]) => {
             v2Replies++
             captureSignal(args)
+            if (options.permissionError) throw options.permissionError
             if (options.pendingPermissionReply) await new Promise(() => {})
             return { data: undefined }
           },
@@ -435,7 +440,7 @@ const followupSdk = makeSdk({
 })
 const followupQueue: FollowupQueue = {
   prompts: [{ task_id: "task-followup", seq: 1, prompt: "also fix the tests", done: true }],
-  closed: false,
+  closed: true, // the bridge closes admission as soon as done=true is accepted
 }
 const followupProgress: string[] = []
 const followupResults: Array<{ status: string; output: string; error: string | null }> = []
@@ -517,12 +522,15 @@ assert.ok(
 )
 assert.equal(multiTurnQueue.closed, true, "finishing closes the queue")
 
-// WI#328 (MR !1525 DI-4): a queue closed before the first turn boundary (a
-// prompt that raced the final drain) is not consumed — the bridge acks such
-// frames accepted=false, and the executor must never inject them.
+// !1552 EK-1: closing admission does not discard already accepted work. A
+// refused straggler is never enqueued by the bridge (covered in its suite).
+// The pending normal prompt AND final prompt must drain in FIFO order.
 const stragglerSdk = makeSdk()
 const stragglerQueue: FollowupQueue = {
-  prompts: [{ task_id: "task-straggler", seq: 9, prompt: "too late", done: false }],
+  prompts: [
+    { task_id: "task-straggler", seq: 9, prompt: "status?", done: false },
+    { task_id: "task-straggler", seq: 10, prompt: "wrap up", done: true },
+  ],
   closed: true,
 }
 const stragglerResults: Array<{ status: string }> = []
@@ -536,8 +544,8 @@ await executeTask(
 )
 assert.equal(stragglerResults.length, 1)
 assert.equal(stragglerResults[0]!.status, "success")
-assert.equal(stragglerSdk.promptArgs.length, 1, "closed-queue prompt must never be injected")
-assert.equal(stragglerQueue.prompts.length, 1, "refused prompt is left for the bridge to audit")
+assert.equal(stragglerSdk.promptArgs.length, 3, "closed admission must still drain accepted prompts")
+assert.equal(stragglerQueue.prompts.length, 0)
 
 // WI#328: with no queued follow-ups the first idle resolves the task exactly
 // as before (regression guard for the turn-boundary check).
@@ -572,8 +580,12 @@ const followupFailSdk = makeSdk({
   assistantErrors: [undefined, { message: "invalid request: context length exceeded" }],
 })
 const followupFailQueue: FollowupQueue = {
-  prompts: [{ task_id: "task-followup-fail", seq: 1, prompt: "status?", done: false }],
-  closed: false,
+  prompts: [
+    { task_id: "task-followup-fail", seq: 1, prompt: "status?", done: false },
+    { task_id: "task-followup-fail", seq: 2, prompt: "next", done: false },
+    { task_id: "task-followup-fail", seq: 3, prompt: "wrap up", done: true },
+  ],
+  closed: true,
 }
 const followupFailResults: Array<{ status: string; output: string; error: string | null }> = []
 await executeTask(
@@ -596,6 +608,10 @@ assert.ok(
   `follow-up failure must be recorded, got: ${followupFailResults[0]!.output}`,
 )
 assert.equal(followupFailQueue.closed, true, "failed follow-up closes the queue (DW-5)")
+assert.equal(followupFailSdk.promptArgs.length, 2)
+assert.match(followupFailResults[0]!.output, /\[control\] follow-up seq=2 not run/)
+assert.match(followupFailResults[0]!.output, /\[control\] follow-up seq=3 not run/)
+assert.equal(followupFailQueue.prompts.length, 0, "unrun accepted prompts must be accounted for")
 
 // MR !1537 DW-3 (timeout variant): the follow-up does not extend the task
 // deadline, so a timeout mid-follow-up still reports the finished main turn
@@ -607,8 +623,11 @@ const followupTimeoutSdk = makeSdk({
   pendingPromptAfterFirst: true,
 })
 const followupTimeoutQueue: FollowupQueue = {
-  prompts: [{ task_id: "task-followup-timeout", seq: 1, prompt: "status?", done: false }],
-  closed: false,
+  prompts: [
+    { task_id: "task-followup-timeout", seq: 1, prompt: "status?", done: false },
+    { task_id: "task-followup-timeout", seq: 2, prompt: "finish", done: true },
+  ],
+  closed: true,
 }
 const followupTimeoutResults: Array<{ status: string; output: string; error: string | null }> = []
 await executeTask(
@@ -631,6 +650,8 @@ assert.ok(
   `got: ${followupTimeoutResults[0]!.output}`,
 )
 assert.equal(followupTimeoutQueue.closed, true)
+assert.match(followupTimeoutResults[0]!.output, /\[control\] follow-up seq=2 not run/)
+assert.equal(followupTimeoutQueue.prompts.length, 0)
 
 // MR !1537 DW-7: a main turn with only TOOL output (no assistant text) banks
 // the streamed tool output, so a follow-up's text doesn't replace it.
@@ -676,58 +697,156 @@ assert.ok(toolOnlyResults[0]!.output.includes("status: done"))
 // MR !1537 DW-10: a stale idle event published BEFORE the follow-up turn was
 // seen busy must not end that turn early — the turn must still answer its
 // permission ask and run to its real idle.
-const staleIdleSdk = makeSdk({
-  events: [
-    { type: "session.idle", properties: { sessionID: "session-1" } },
-    // Stale replay of the previous turn's idle under the other event name:
-    { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
-    {
-      type: "permission.v2.asked",
-      properties: { id: "perm-stale", sessionID: "session-1" },
-    },
-    {
-      type: "message.part.updated",
-      properties: {
-        part: {
-          sessionID: "session-1",
-          type: "text",
-          text: "follow-up answer",
-          time: { end: 1 },
+for (const staleEvent of [
+  { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  { type: "session.idle", properties: { sessionID: "session-1" } },
+]) {
+  const staleIdleSdk = makeSdk({
+    events: [
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+      staleEvent,
+      {
+        type: "permission.v2.asked",
+        properties: { id: "perm-stale", sessionID: "session-1" },
+      },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            sessionID: "session-1",
+            type: "text",
+            text: "follow-up answer",
+            time: { end: 1 },
+          },
         },
       },
-    },
-    { type: "session.idle", properties: { sessionID: "session-1" } },
-  ],
-  partsPerCall: [
-    [{ type: "text", text: "MAIN DELIVERABLE" }],
-    [{ type: "text", text: "follow-up answer" }],
-  ],
-  resolvePromptAfterV2Reply: true,
-})
-const staleIdleQueue: FollowupQueue = {
-  prompts: [{ task_id: "task-stale-idle", seq: 1, prompt: "status?", done: false }],
-  closed: false,
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+    partsPerCall: [
+      [{ type: "text", text: "MAIN DELIVERABLE" }],
+      [{ type: "text", text: "follow-up answer" }],
+    ],
+    resolvePromptAfterV2Reply: true,
+  })
+  const staleIdleQueue: FollowupQueue = {
+    prompts: [{ task_id: "task-stale-idle", seq: 1, prompt: "status?", done: false }],
+    closed: false,
+  }
+  const staleIdleResults: Array<{ status: string; output: string }> = []
+  await executeTask(
+    { task_id: "task-stale-idle", prompt: "build the feature" },
+    () => {},
+    (result) => staleIdleResults.push(result),
+    undefined,
+    staleIdleSdk.sdk,
+    staleIdleQueue,
+  )
+  assert.equal(staleIdleResults.length, 1)
+  assert.equal(staleIdleResults[0]!.status, "success")
+  assert.equal(
+    staleIdleSdk.v2ReplyCount(),
+    1,
+    "stale idle must not skip the follow-up turn's permission reply (DW-10)",
+  )
+  assert.ok(
+    staleIdleResults[0]!.output.includes("follow-up answer"),
+    `stale idle must not cut the follow-up turn short, got: ${staleIdleResults[0]!.output}`,
+  )
 }
-const staleIdleResults: Array<{ status: string; output: string }> = []
-await executeTask(
-  { task_id: "task-stale-idle", prompt: "build the feature" },
-  () => {},
-  (result) => staleIdleResults.push(result),
-  undefined,
-  staleIdleSdk.sdk,
-  staleIdleQueue,
-)
-assert.equal(staleIdleResults.length, 1)
-assert.equal(staleIdleResults[0]!.status, "success")
-assert.equal(
-  staleIdleSdk.v2ReplyCount(),
-  1,
-  "stale idle must not skip the follow-up turn's permission reply (DW-10)",
-)
-assert.ok(
-  staleIdleResults[0]!.output.includes("follow-up answer"),
-  `stale idle must not cut the follow-up turn short, got: ${staleIdleResults[0]!.output}`,
-)
+
+// !1552 EK-2/4: permission/SSE failures during a follow-up preserve genuine
+// completed output, but control notes alone never turn empty/denied work into
+// success. Both permission event APIs reach the same failure policy.
+for (const failure of ["permission.asked", "permission.v2.asked", "stream", "prompt", "denied-main"] as const) {
+  for (const hasDeliverable of [true, false]) {
+    const events: unknown[] = [
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ]
+    if (failure === "denied-main") {
+      events.unshift({ type: "permission.asked", properties: { id: "main-permission", sessionID: "session-1" } })
+    }
+    if (failure.startsWith("permission")) {
+      events.push({ type: failure, properties: { id: "perm-fail", sessionID: "session-1" } })
+    }
+    const sdk = makeSdk({
+      events,
+      partsPerCall: [hasDeliverable ? [{ type: "text", text: "MAIN DELIVERABLE" }] : [], []],
+      permissionError: failure.startsWith("permission") ? new Error("permission reply failed: ECONNRESET") : undefined,
+      streamErrorAfterEvents: failure === "stream" ? new Error("SSE failed: ECONNRESET") : undefined,
+      assistantErrors: failure === "prompt" || failure === "denied-main"
+        ? [undefined, { message: "follow-up failed" }] : undefined,
+    })
+    const queue: FollowupQueue = {
+      prompts: [
+        { task_id: "failure", seq: 1, prompt: "status?", done: false },
+        { task_id: "failure", seq: 2, prompt: "finish", done: true },
+      ],
+      closed: true,
+    }
+    const results: Array<{ status: string; output: string; error: string | null }> = []
+    await executeTask(
+      { task_id: "failure", prompt: "build", timeout_ms: 2_000 },
+      () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+    )
+    assert.equal(results.length, 1)
+    assert.equal(results[0]!.status, hasDeliverable ? "success" : "error", failure)
+    assert.equal(results[0]!.output.includes("MAIN DELIVERABLE"), hasDeliverable)
+    assert.match(results[0]!.output, /\[control\] follow-up seq=1 failed/)
+    assert.match(results[0]!.output, /\[control\] follow-up seq=2 not run/)
+    if (!hasDeliverable) {
+      assert.match(results[0]!.error!, failure.startsWith("permission") || failure === "denied-main"
+        ? /permission request\(s\).*denied/ : /without assistant text or tool output/)
+    }
+    assert.equal(queue.prompts.length, 0)
+  }
+}
+
+// No completed output: a timed-out follow-up is still a timeout, not success.
+{
+  const sdk = makeSdk({ parts: [], pendingPromptAfterFirst: true })
+  const queue: FollowupQueue = {
+    prompts: [{ task_id: "empty-timeout", seq: 1, prompt: "status?", done: true }],
+    closed: true,
+  }
+  const results: Array<{ status: string }> = []
+  await executeTask(
+    { task_id: "empty-timeout", prompt: "build", timeout_ms: 50 },
+    () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+  )
+  assert.equal(results[0]!.status, "timed_out")
+}
+
+// Each turn gets the complete retry budget, even if the main turn used it up.
+{
+  const delay = process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+  const retries = process.env.OPENCODE_PROVIDER_MAX_RETRIES
+  process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = "0"
+  process.env.OPENCODE_PROVIDER_MAX_RETRIES = "1"
+  try {
+    const sdk = makeSdk({
+      assistantErrors: [{ message: "No provider available" }, undefined,
+        { message: "No provider available" }, undefined],
+      partsPerCall: [[], [{ type: "text", text: "MAIN DELIVERABLE" }], [],
+        [{ type: "text", text: "FOLLOW-UP ANSWER" }]],
+    })
+    const queue: FollowupQueue = {
+      prompts: [{ task_id: "retry-turns", seq: 1, prompt: "status?", done: false }], closed: false,
+    }
+    const results: Array<{ status: string; output: string }> = []
+    await executeTask(
+      { task_id: "retry-turns", prompt: "build" },
+      () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+    )
+    assert.equal(sdk.promptArgs.length, 4)
+    assert.equal(results[0]!.status, "success")
+    assert.equal(results[0]!.output, "MAIN DELIVERABLE\n\nFOLLOW-UP ANSWER")
+  } finally {
+    if (delay === undefined) delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+    else process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = delay
+    if (retries === undefined) delete process.env.OPENCODE_PROVIDER_MAX_RETRIES
+    else process.env.OPENCODE_PROVIDER_MAX_RETRIES = retries
+  }
+}
 
 // MR !1537 DW-5: the error path closes the queue — a task that fails hard
 // leaves no open queue for the bridge to ack into.
