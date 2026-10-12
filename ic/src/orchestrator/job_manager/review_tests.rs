@@ -182,14 +182,13 @@ async fn watcher_claim_prevents_late_completion_and_cleanup_removes_handle() {
 #[cfg(all(test, feature = "libsql"))]
 mod promotion {
     use super::*;
-    use crate::db::libsql::LibSqlBackend;
     use crate::error::WorkspaceError;
+    use crate::testing::FaultInjectingTestDb;
     use crate::tools::builtin::memory::FixedWorkspaceResolver;
     use crate::workspace::Workspace;
 
     struct Fixture {
-        _temp: tempfile::TempDir,
-        db: Arc<LibSqlBackend>,
+        db: FaultInjectingTestDb,
         workspace: Arc<Workspace>,
         staging: PathBuf,
         job_id: Uuid,
@@ -198,21 +197,15 @@ mod promotion {
     impl Fixture {
         async fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let db = Arc::new(
-                LibSqlBackend::new_local(&temp.path().join("test.db"))
-                    .await
-                    .unwrap(),
-            );
-            db.run_migrations().await.unwrap();
-            let workspace = Arc::new(
-                Workspace::new_with_db("owner", db.clone())
-                    .with_additional_read_scopes(vec!["shared".to_string()]),
-            );
             let staging = temp.path().join("staging");
             std::fs::create_dir_all(staging.join("projects")).unwrap();
             std::fs::write(staging.join("projects/out.md"), "replacement").unwrap();
+            let db = FaultInjectingTestDb::new_in(temp).await;
+            let workspace = Arc::new(
+                Workspace::new_with_db("owner", db.database())
+                    .with_additional_read_scopes(vec!["shared".to_string()]),
+            );
             Self {
-                _temp: temp,
                 db,
                 workspace,
                 staging,
@@ -296,16 +289,14 @@ mod promotion {
                 .unwrap()
                 .is_empty()
         );
-        let conn = fixture.db.connect().await.unwrap();
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM memory_chunks WHERE document_id = ?1",
-                [backup.id.to_string()],
-            )
-            .await
-            .unwrap();
         assert_eq!(
-            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            fixture
+                .db
+                .query_scalar_i64(
+                    "SELECT COUNT(*) FROM memory_chunks WHERE document_id = ?1",
+                    &backup.id.to_string(),
+                )
+                .await,
             0
         );
     }
@@ -313,7 +304,7 @@ mod promotion {
     #[tokio::test]
     async fn missing_primary_document_does_not_snapshot_an_inherited_document() {
         let fixture = Fixture::new().await;
-        let shared = Workspace::new_with_db("shared", fixture.db.clone());
+        let shared = Workspace::new_with_db("shared", fixture.db.database());
         shared
             .write("projects/out.md", "inherited project notes")
             .await
@@ -349,13 +340,10 @@ mod promotion {
             .write("projects/out.md", "prior notes")
             .await
             .unwrap();
-        let conn = fixture.db.connect().await.unwrap();
-        conn.execute(
-            "ALTER TABLE memory_documents RENAME TO unavailable_documents",
-            (),
-        )
-        .await
-        .unwrap();
+        fixture
+            .db
+            .execute_batch("ALTER TABLE memory_documents RENAME TO unavailable_documents")
+            .await;
         let summary = fixture.run().await;
         assert!(summary.records.is_empty());
         assert_eq!(summary.rejections.len(), 1);
@@ -364,20 +352,13 @@ mod promotion {
                 .reason
                 .starts_with("rollback source read failed:")
         );
-        let mut rows = conn
-            .query(
-                "SELECT content FROM unavailable_documents WHERE path = 'projects/out.md'",
-                (),
-            )
-            .await
-            .unwrap();
         assert_eq!(
-            rows.next()
-                .await
-                .unwrap()
-                .unwrap()
-                .get::<String>(0)
-                .unwrap(),
+            fixture
+                .db
+                .query_scalar_string(
+                    "SELECT content FROM unavailable_documents WHERE path = 'projects/out.md'",
+                )
+                .await,
             "prior notes"
         );
     }
@@ -392,16 +373,12 @@ mod promotion {
             .unwrap();
         fixture
             .db
-            .connect()
-            .await
-            .unwrap()
             .execute_batch(
                 "CREATE TRIGGER reject_backup BEFORE INSERT ON memory_documents
              WHEN NEW.path LIKE 'backups/harness/%'
              BEGIN SELECT RAISE(ABORT, 'snapshot fault'); END;",
             )
-            .await
-            .unwrap();
+            .await;
         let summary = fixture.run().await;
         assert!(summary.records.is_empty());
         assert!(
@@ -430,16 +407,12 @@ mod promotion {
             .unwrap();
         fixture
             .db
-            .connect()
-            .await
-            .unwrap()
             .execute_batch(
                 "CREATE TRIGGER reject_replacement BEFORE UPDATE ON memory_documents
              WHEN NEW.path = 'projects/out.md' AND NEW.content = 'replacement'
              BEGIN SELECT RAISE(ABORT, 'write fault'); END;",
             )
-            .await
-            .unwrap();
+            .await;
         let summary = fixture.run().await;
         assert!(summary.records.is_empty());
         assert!(

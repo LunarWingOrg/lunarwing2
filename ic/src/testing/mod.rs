@@ -62,6 +62,89 @@ pub async fn test_db() -> (Arc<dyn Database>, tempfile::TempDir) {
     (Arc::new(backend) as Arc<dyn Database>, dir)
 }
 
+/// libSQL test database with a raw-SQL hook for fault injection.
+///
+/// The architecture-boundary gate only permits `libsql::` driver types in the
+/// db layer and in test infrastructure, so tests outside `src/db/` that need
+/// schema-level faults (`ALTER TABLE`, `CREATE TRIGGER`) or raw assertions
+/// (e.g. "no chunks were written for this document") must go through this
+/// handle instead of naming driver types in their own module.
+#[cfg(feature = "libsql")]
+pub struct FaultInjectingTestDb {
+    backend: Arc<crate::db::libsql::LibSqlBackend>,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(feature = "libsql")]
+impl FaultInjectingTestDb {
+    /// Open a fresh migrated libSQL database in a temporary directory.
+    pub async fn new() -> Self {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        Self::new_in(dir).await
+    }
+
+    /// Open a fresh migrated libSQL database inside a caller-provided
+    /// temporary directory (the handle takes ownership of the guard).
+    pub async fn new_in(dir: tempfile::TempDir) -> Self {
+        use crate::db::libsql::LibSqlBackend;
+
+        let backend = LibSqlBackend::new_local(&dir.path().join("test.db"))
+            .await
+            .expect("failed to create test LibSqlBackend");
+        backend
+            .run_migrations()
+            .await
+            .expect("failed to run migrations");
+        Self {
+            backend: Arc::new(backend),
+            _dir: dir,
+        }
+    }
+
+    /// The database as the shared trait object.
+    pub fn database(&self) -> Arc<dyn Database> {
+        self.backend.clone()
+    }
+
+    /// Execute raw SQL statements (schema rewrites, fault triggers).
+    pub async fn execute_batch(&self, sql: &str) {
+        self.backend
+            .connect()
+            .await
+            .expect("failed to connect to test db")
+            .execute_batch(sql)
+            .await
+            .expect("failed to execute fault-injection SQL");
+    }
+
+    /// Run `sql` with one text bind parameter; first column of the first row.
+    pub async fn query_scalar_i64(&self, sql: &str, param: &str) -> i64 {
+        let conn = self.backend.connect().await.expect("failed to connect");
+        let mut rows = conn
+            .query(sql, [param.to_string()])
+            .await
+            .expect("scalar query failed");
+        rows.next()
+            .await
+            .expect("scalar query row failed")
+            .expect("scalar query returned no rows")
+            .get::<i64>(0)
+            .expect("scalar column is not i64")
+    }
+
+    /// Run `sql` (no params); first column of the first row as a `String`.
+    pub async fn query_scalar_string(&self, sql: &str) -> String {
+        let conn = self.backend.connect().await.expect("failed to connect");
+        let mut rows = conn.query(sql, ()).await.expect("scalar query failed");
+        rows.next()
+            .await
+            .expect("scalar query row failed")
+            .expect("scalar query returned no rows")
+            .get::<String>(0)
+            .expect("scalar column is not a string")
+    }
+}
+
 /// What kind of error the stub should produce when failing.
 #[derive(Clone, Copy, Debug)]
 pub enum StubErrorKind {
