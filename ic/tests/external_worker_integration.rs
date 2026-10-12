@@ -56,7 +56,8 @@ use lunarwing::error::OrchestratorError;
 use lunarwing::hooks::HookRegistry;
 use lunarwing::orchestrator::ExternalWorkerManager;
 use lunarwing::orchestrator::external_worker::{
-    ConversationMessage, CronCommandOrigin, ExternalTaskStatus, SUBPROTOCOL, TaskContext, ToolProxy,
+    ConversationMessage, CronCommandOrigin, CronTick, ExternalTaskStatus, SUBPROTOCOL, TaskContext,
+    ToolProxy,
 };
 use lunarwing::tools::Tool;
 use lunarwing::tools::builtin::CreateJobTool;
@@ -2392,6 +2393,168 @@ async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
     assert_eq!(seen[0], ("tenant-user".to_string(), job_id));
 }
 
+/// Build a tick-shaped task context (WI#325) for proxy-authority tests.
+fn cron_tick_context() -> TaskContext {
+    let mut context = TaskContext {
+        user_id: "tenant-user".to_string(),
+        ..Default::default()
+    };
+    context.cron_tick = Some(CronTick {
+        event: "cron.tick".to_string(),
+        mission_id: "test-mission".to_string(),
+        schedule: "0 15 10 * * *".to_string(),
+        goal: "Watch the herd".to_string(),
+        tick_index: 1,
+        chain_index: 0,
+        fired_at: "2026-10-12T10:15:00Z".to_string(),
+    });
+    context
+}
+
+#[tokio::test]
+async fn cron_tick_tool_calls_use_cron_allowlist_not_worker_allowlist() {
+    // MR !1506 CQ-10: a cron tick is standing, unattended tool authority —
+    // tick jobs draw from cron.tool_allowlist, never the worker-level list.
+    // Phase 1: worker-level grants the tool, cron list empty -> denied.
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![(
+            "knowledge_search".to_string(),
+            serde_json::json!({ "k": "v" }),
+        )],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = cron_config_with_schedule(&url, "0 15 10 * * *", 300, 2);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools.clone()));
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            Uuid::new_v4(),
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            cron_tick_context(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let reply = reply_rx.recv().await.expect("tool_result");
+    assert_eq!(
+        reply["payload"]["status"], "denied",
+        "a tick must not inherit the worker-level allowlist: {reply}"
+    );
+    assert!(
+        probe.seen.lock().expect("probe lock").is_empty(),
+        "a denied tick call must never reach the tool"
+    );
+
+    // Phase 2: the same grant under cron.tool_allowlist round-trips.
+    let (reply_tx2, mut reply_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let (url2, _count2) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![(
+            "knowledge_search".to_string(),
+            serde_json::json!({ "k": "v" }),
+        )],
+        replies: reply_tx2,
+    })
+    .await;
+    let mut cron_config = cron_config_with_schedule(&url2, "0 15 10 * * *", 300, 2);
+    cron_config
+        .cron
+        .as_mut()
+        .expect("cron block")
+        .tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr2 =
+        ExternalWorkerManager::new(vec![cron_config]).with_tool_proxy(test_proxy(tools.clone()));
+    let job_id2 = Uuid::new_v4();
+    let res2 = timeout(
+        TEST_BOUND,
+        mgr2.execute_task(
+            job_id2,
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            cron_tick_context(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res2.status, ExternalTaskStatus::Success);
+
+    let reply2 = reply_rx2.recv().await.expect("tool_result");
+    assert_eq!(reply2["payload"]["status"], "success");
+    let seen = probe.seen.lock().expect("probe lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], ("tenant-user".to_string(), job_id2));
+}
+
+#[tokio::test]
+async fn ordinary_dispatch_on_cron_worker_still_uses_worker_allowlist() {
+    // CQ-10 companion: a non-tick dispatch to a cron-mode worker is an
+    // interactive grant and keeps using the worker-level tool_allowlist.
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![(
+            "knowledge_search".to_string(),
+            serde_json::json!({ "k": "v" }),
+        )],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = cron_config_with_schedule(&url, "0 15 10 * * *", 300, 2);
+    config.tool_allowlist = vec!["knowledge_search".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+    let job_id = Uuid::new_v4();
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext {
+                user_id: "tenant-user".to_string(),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let reply = reply_rx.recv().await.expect("tool_result");
+    assert_eq!(
+        reply["payload"]["status"], "success",
+        "ordinary dispatches keep the worker-level grant: {reply}"
+    );
+    let seen = probe.seen.lock().expect("probe lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], ("tenant-user".to_string(), job_id));
+}
+
 #[tokio::test]
 async fn tool_call_denied_when_allowlist_empty() {
     // Deny-by-default: no tool_allowlist configured at all -> every tool_call
@@ -3438,6 +3601,7 @@ fn cron_config_with_schedule(
             allow_subminute_schedule: None,
             project_dir: None,
             timezone: None,
+            tool_allowlist: Vec::new(),
         }),
         ..Default::default()
     }
