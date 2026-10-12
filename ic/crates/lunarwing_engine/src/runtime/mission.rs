@@ -12442,10 +12442,8 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             "no marker may be written before the stamp-clearing save lands"
         );
         assert!(
-            stamped_interrupted_thread(
-                &store.load_mission(mission.id).await.unwrap().unwrap()
-            )
-            .is_some(),
+            stamped_interrupted_thread(&store.load_mission(mission.id).await.unwrap().unwrap())
+                .is_some(),
             "the stamp survives the failed save for the next boot"
         );
         assert!(
@@ -12523,14 +12521,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         // resolution reads the resumed state and not the stale Suspended row.
         let mut persisted_running = false;
         for _ in 0..200 {
-            if store
-                .load_thread(thread.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .state
-                == ThreadState::Running
-            {
+            if store.load_thread(thread.id).await.unwrap().unwrap().state == ThreadState::Running {
                 persisted_running = true;
                 break;
             }
