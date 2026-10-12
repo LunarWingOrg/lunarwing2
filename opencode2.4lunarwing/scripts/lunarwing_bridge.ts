@@ -25,7 +25,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
-import { resolveWorkspacePath, workspacePathsOverlap } from "./workspace_path"
+import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -48,7 +48,7 @@ const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
 function taskWorkspace(request: TaskRequest): string {
-  return resolveWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT)
+  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
 }
 
 function abortSocketTasks(socket: BridgeSocket): void {

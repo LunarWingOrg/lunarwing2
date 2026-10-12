@@ -112,6 +112,7 @@ fn seeded_default_permission_canonical(canonical_tool_name: &str) -> Option<Perm
         | "routine_create"
         | "routine_update"
         | "cancel_job"
+        | "cron_mission"
         | "job_prompt"
         | "routine_delete"
         | "routine_fire"

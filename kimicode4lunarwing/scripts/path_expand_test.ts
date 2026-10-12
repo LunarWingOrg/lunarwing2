@@ -1,9 +1,10 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { test } from "node:test"
-import { mkdirSync, mkdtempSync, symlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { expandWorkspacePath, resolveWorkspacePath, workspacePathsOverlap } from "./workspace_path.js"
+import { expandWorkspacePath, resolveWorkspacePath, resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
 
 const workspaceRoot = "/workspace"
 
@@ -52,3 +53,61 @@ test("workspacePathsOverlap: rejects equal and parent-child workspaces only", ()
 })
 
 console.log("path expand self-check passed")
+
+test("cron bootstrap creates a missing default dir, preserves state, and confines all writes", () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-"))
+  const outside = mkdtempSync(join(tmpdir(), "kimi-cron-outside-"))
+  try {
+    const context = { project_dir: "missions/pr-digest", cron_tick: { event: "cron.tick" } }
+    assert.throws(() => resolveTaskWorkspace({ project_dir: context.project_dir }, root), /ENOENT/)
+    assert.equal(existsSync(join(root, "missions")), false)
+    const dir = resolveTaskWorkspace(context, root)
+    assert.equal(dir, join(root, context.project_dir))
+    writeFileSync(join(dir, "state"), "tick one")
+    assert.equal(resolveTaskWorkspace(context, root), dir)
+    assert.equal(readFileSync(join(dir, "state"), "utf8"), "tick one")
+    symlinkSync(outside, join(root, "escape"))
+    symlinkSync(join(root, "missing"), join(root, "dangling"))
+    for (const project_dir of ["../outside/new", "/tmp/new", "~", "missions/../bad", "escape/new", "dangling/new"]) {
+      assert.throws(() => resolveTaskWorkspace({ ...context, project_dir }, root), /Invalid workspace path/)
+    }
+    assert.equal(existsSync(join(outside, "new")), false)
+    assert.equal(existsSync(join(root, "missing")), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test("cron bootstrap: a non-directory component is permanent and names the component", () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-file-"))
+  try {
+    writeFileSync(join(root, "missions"), "not a directory")
+    const context = { project_dir: "missions/pr-digest", cron_tick: { event: "cron.tick" } }
+    // ENOTDIR is in the permanent set (DS-2), so the host abandons the tick
+    // instead of retrying; the wrap names the failing component (DS-7).
+    assert.throws(
+      () => resolveTaskWorkspace(context, root),
+      /Invalid workspace path for cron tick:.*component 'missions'.*ENOTDIR/,
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("cron bootstrap: a FIFO component fails fast as permanent (pins O_DIRECTORY)", () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-fifo-"))
+  try {
+    execFileSync("mkfifo", [join(root, "missions")])
+    const context = { project_dir: "missions/x", cron_tick: { event: "cron.tick" } }
+    // DS-3: with O_DIRECTORY the FIFO open fails fast with ENOTDIR; without it
+    // the blocking FIFO open would hang the bridge event loop (surfacing only
+    // via the outer test timeout — that hang is the mutation this pins).
+    assert.throws(
+      () => resolveTaskWorkspace(context, root),
+      /Invalid workspace path for cron tick:.*component 'missions'.*ENOTDIR/,
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})

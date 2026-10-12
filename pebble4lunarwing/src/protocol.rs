@@ -25,6 +25,8 @@ pub struct ReadyPayload {
 #[serde(default)]
 pub struct TaskContext {
     pub project_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_tick: Option<serde_json::Value>,
     pub conversation_history: Vec<ConversationMessage>,
     pub environment: std::collections::HashMap<String, String>,
     pub user_id: String,

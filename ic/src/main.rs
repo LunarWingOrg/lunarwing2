@@ -418,6 +418,11 @@ async fn async_main() -> anyhow::Result<()> {
         components.db.as_ref(),
         components.secrets_store.as_ref(),
         Some(Arc::clone(&components.context_manager)),
+        Some(lunarwing::orchestrator::ToolProxyDeps {
+            tools: Arc::clone(&components.tools),
+            safety: Arc::clone(&components.safety),
+            hooks: Arc::clone(&components.hooks),
+        }),
     )
     .await;
     let container_job_manager = orch.container_job_manager;
@@ -1204,6 +1209,8 @@ async fn async_main() -> anyhow::Result<()> {
 
     if let Some(ref mgr) = external_worker_manager {
         mgr.spawn_eviction_task(shutdown_tx.subscribe());
+        // WI#325: mission supervisors for cron-mode external workers.
+        mgr.spawn_cron_supervisors(&config.owner_id, shutdown_tx.subscribe());
     }
 
     // Bundled MCP gateway control plane (opt-in via environment; see

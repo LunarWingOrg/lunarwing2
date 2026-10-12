@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
-import { mkdtempSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -22,7 +22,7 @@ async function freePort(): Promise<number> {
   return port
 }
 
-function startBridge(port: number, token: string): ChildProcessWithoutNullStreams {
+function startBridge(port: number, token: string, extraEnv: Record<string, string> = {}): ChildProcessWithoutNullStreams {
   const stateDir = mkdtempSync(join(tmpdir(), "kimi-bridge-"))
   return spawn(process.execPath, [bridgePath], {
     env: {
@@ -31,6 +31,7 @@ function startBridge(port: number, token: string): ChildProcessWithoutNullStream
       WS_BIND_HOST: "127.0.0.1",
       WS_PORT: String(port),
       WS_STATE_FILE: join(stateDir, "state.json"),
+      ...extraEnv,
     },
     stdio: ["pipe", "pipe", "pipe"],
   })
@@ -83,4 +84,38 @@ test("bridge server mode refuses empty auth token", async () => {
     child.once("error", reject)
   })
   assert.notEqual(code, 0)
+})
+
+test("cron first tick creates the default directory and executes through the real bridge", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-bridge-"))
+  const bin = join(root, "mock-kimi")
+  writeFileSync(bin, `#!/usr/bin/env node
+require("node:fs").writeFileSync("state", "first tick")
+console.log(JSON.stringify({ role: "assistant", content: "done" }))
+`, { mode: 0o755 })
+  const port = await freePort()
+  const child = startBridge(port, "cron-test-token", { WORKSPACE_ROOT: root, KIMI_BIN: bin })
+  let ws: WebSocket | undefined
+  try {
+    await waitForListening(child)
+    ws = await connect(port, "cron-test-token")
+    const result = new Promise<Record<string, unknown>>((resolve, reject) => {
+      ws!.on("message", data => {
+        const message = JSON.parse(data.toString())
+        if (message.type === "task_result") resolve(message.payload)
+      })
+      ws!.once("error", reject)
+    })
+    assert.equal(existsSync(join(root, "missions")), false)
+    ws.send(JSON.stringify({ type: "task_request", payload: {
+      task_id: "cron-first", prompt: "tick", timeout_ms: 10000,
+      context: { project_dir: "missions/pr-digest", cron_tick: { event: "cron.tick" } },
+    }}))
+    assert.equal((await result).status, "success")
+    assert.equal(readFileSync(join(root, "missions/pr-digest/state"), "utf8"), "first tick")
+  } finally {
+    ws?.close()
+    child.kill("SIGTERM")
+    rmSync(root, { recursive: true, force: true })
+  }
 })

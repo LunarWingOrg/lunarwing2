@@ -1,9 +1,10 @@
 import assert from "node:assert/strict"
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs"
+import { execFileSync } from "node:child_process"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { expandWorkspacePath, resolveWorkspacePath, workspacePathsOverlap } from "./workspace_path"
+import { expandWorkspacePath, resolveWorkspacePath, resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
 
 const workspaceRoot = "/workspace"
 
@@ -28,6 +29,34 @@ try {
   const escape = join(root, "escape")
   symlinkSync(tmpdir(), escape)
   assert.throws(() => resolveWorkspacePath("escape", root), /escapes WORKSPACE_ROOT/)
+  const cron = { project_dir: "missions/default", cron_tick: { event: "cron.tick" } }
+  assert.throws(() => resolveTaskWorkspace({ project_dir: cron.project_dir }, root), /ENOENT/)
+  assert.equal(resolveTaskWorkspace(cron, root), join(root, cron.project_dir))
+  assert.equal(resolveTaskWorkspace(cron, root), join(root, cron.project_dir))
+  for (const project_dir of ["../bad", "/tmp/bad", "~", "missions/../bad", "escape/cron-escape", "alias/new"]) {
+    assert.throws(() => resolveTaskWorkspace({ ...cron, project_dir }, root), /Invalid workspace path/)
+  }
+  assert.equal(existsSync(join(project, "new")), false)
+  // DS-3: assert the actual escape target was not created, not just a decoy.
+  assert.equal(existsSync(join(tmpdir(), "cron-escape")), false)
+  // DS-2/DS-7: a non-directory component is a permanent failure naming the component.
+  const fileRoot = mkdtempSync(join(tmpdir(), "oc2-cron-file-"))
+  try {
+    writeFileSync(join(fileRoot, "missions"), "not a directory")
+    assert.throws(
+      () => resolveTaskWorkspace({ project_dir: "missions/x", cron_tick: { event: "cron.tick" } }, fileRoot),
+      /Invalid workspace path for cron tick:.*component 'missions'.*ENOTDIR/,
+    )
+    // DS-3: a FIFO component fails fast with ENOTDIR via O_DIRECTORY; without
+    // it the blocking FIFO open would hang (outer timeout is the only tell).
+    execFileSync("mkfifo", [join(fileRoot, "fifo")])
+    assert.throws(
+      () => resolveTaskWorkspace({ project_dir: "fifo/x", cron_tick: { event: "cron.tick" } }, fileRoot),
+      /Invalid workspace path for cron tick:.*component 'fifo'.*ENOTDIR/,
+    )
+  } finally {
+    rmSync(fileRoot, { recursive: true, force: true })
+  }
 } finally {
   rmSync(root, { recursive: true, force: true })
 }
