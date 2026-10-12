@@ -48,6 +48,8 @@ OPENRC_CONFD_DIR="$FIXTURE/conf.d"
 # shellcheck disable=SC2034
 OPENRC_RUNLEVELS_DIR="$FIXTURE/runlevels"
 OPENRC_ENV_EXEC="$FIXTURE/env-exec"
+# Consumed by the renderer's backup_openrc_proxy_unit, like the vars above.
+# shellcheck disable=SC2034
 OPENRC_PROXY_BACKUP_DIR="$FIXTURE/backup-units"
 env_dir="$(tenant_env_dir)"
 mkdir -p "$env_dir" "$(tenant_lw_root)/tensorzero-proxy-configurations"
