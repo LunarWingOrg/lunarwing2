@@ -3705,12 +3705,18 @@ mod tests {
         let schema = proxied_catalog_schema("memory_write", original.clone());
         let props = schema["properties"].as_object().expect("properties");
         assert!(!props.contains_key("layer"), "layer must not be advertised");
-        assert!(!props.contains_key("force"), "layer-only force must not be advertised");
+        assert!(
+            !props.contains_key("force"),
+            "layer-only force must not be advertised"
+        );
         assert!(props.contains_key("content") && props.contains_key("target"));
         let required = schema["required"].as_array().expect("required");
         assert!(required.contains(&serde_json::json!("target")));
         // Other tools keep their own schema untouched.
-        assert_eq!(proxied_catalog_schema("memory_read", original.clone()), original);
+        assert_eq!(
+            proxied_catalog_schema("memory_read", original.clone()),
+            original
+        );
     }
 
     #[test]

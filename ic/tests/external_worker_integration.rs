@@ -2650,17 +2650,12 @@ async fn cron_allowlist_is_sanitized_at_manager_load() {
     })
     .await;
     let mut config2 = cron_config_with_schedule(&url2, "0 15 10 * * *", 300, 2);
-    config2
-        .cron
-        .as_mut()
-        .expect("cron block")
-        .tool_allowlist = vec![
+    config2.cron.as_mut().expect("cron block").tool_allowlist = vec![
         "*".to_string(),
         "shell".to_string(),
         "knowledge_search".to_string(),
     ];
-    let mgr2 =
-        ExternalWorkerManager::new(vec![config2]).with_tool_proxy(test_proxy(tools.clone()));
+    let mgr2 = ExternalWorkerManager::new(vec![config2]).with_tool_proxy(test_proxy(tools.clone()));
     let res2 = timeout(
         TEST_BOUND,
         mgr2.execute_task(
@@ -2687,7 +2682,10 @@ async fn cron_allowlist_is_sanitized_at_manager_load() {
         wildcard_reply["payload"]["status"], "denied",
         "the dropped \"*\" must not grant memory_read: {wildcard_reply}"
     );
-    let ok_reply = reply_rx2.recv().await.expect("knowledge_search tool_result");
+    let ok_reply = reply_rx2
+        .recv()
+        .await
+        .expect("knowledge_search tool_result");
     assert_eq!(ok_reply["payload"]["status"], "success");
     let seen = probe.seen.lock().expect("probe lock");
     assert_eq!(seen.len(), 1, "only the genuine grant may reach the tool");
@@ -3058,7 +3056,9 @@ async fn tool_catalog_advertises_the_proxied_memory_write_schema() {
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
 
     let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 1).await;
-    let entries = replies[0]["payload"]["tools"].as_array().expect("tools array");
+    let entries = replies[0]["payload"]["tools"]
+        .as_array()
+        .expect("tools array");
     assert_eq!(entries.len(), 1);
     let params = &entries[0]["parameters"];
     let props = params["properties"].as_object().expect("properties");
