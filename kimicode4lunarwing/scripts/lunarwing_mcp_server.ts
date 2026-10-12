@@ -23,6 +23,10 @@ const SERVER_VERSION = "1.0.0"
 // Echoed back to the client when it proposes a version; we speak the
 // tools-only subset common to all MCP revisions.
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+// An inbound line larger than this can never fit the relay's 256 KiB IPC
+// budget with room to spare; cap the stdin buffer so a runaway peer cannot
+// grow it without bound (MR !1549 EF-9).
+const MAX_STDIN_LINE_BYTES = 1024 * 1024
 
 function requestTimeoutMs(): number {
   const raw = Number.parseInt(process.env.LUNARWING_TOOL_PROXY_TIMEOUT_MS ?? "", 10)
@@ -206,7 +210,9 @@ async function main(): Promise<void> {
     while (newline >= 0) {
       const line = buffer.slice(0, newline).trim()
       buffer = buffer.slice(newline + 1)
-      if (line.length > 0) {
+      if (line.length > MAX_STDIN_LINE_BYTES) {
+        writeError(null, -32600, "request exceeds the 1 MiB line budget")
+      } else if (line.length > 0) {
         let parsed: JsonRpcRequest
         try {
           parsed = JSON.parse(line) as JsonRpcRequest
@@ -220,6 +226,13 @@ async function main(): Promise<void> {
         })
       }
       newline = buffer.indexOf("\n")
+    }
+    if (buffer.length > MAX_STDIN_LINE_BYTES) {
+      // A line this long without a terminator can never succeed at the
+      // relay; drop it instead of growing the buffer without bound.
+      console.error(`[${SERVER_NAME}] dropping oversized unterminated stdin line (${buffer.length} bytes)`)
+      writeError(null, -32600, "request exceeds the 1 MiB line budget")
+      buffer = ""
     }
   })
   // Keep the process alive until the CLI closes stdin.
