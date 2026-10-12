@@ -23,7 +23,7 @@ The `lunarwing-agent-v1` WebSocket subprotocol is shared with Pebble and OpenCod
 
 The Dockerfile installs the official Kimi Code CLI with `npm ci` from `kimi-cli/package-lock.json`; update that lock and the `KIMI_CODE_VERSION` default together. The bridge uses `scripts/package-lock.json`. Base images, Debian package indexes, rustup, and Go archives are pinned, so refresh their recorded digests/checksums deliberately rather than restoring unlocked installers.
 
-The in-image test gate runs `npm test` first, then re-runs just the real-CLI contract lane (`scripts/kimi_cli_contract_test.ts`) against the locked CLI — that lane self-skips on a host with no kimi binary, so the Dockerfile is the only place the flag contract (headless `-p` accepted, `--yolo` rejected alongside `-p`, and the baked `[[hooks]]` PreToolUse guard table valid) is asserted for real.
+The in-image test gate runs `npm test` first, then re-runs just the real-CLI contract lane (`scripts/kimi_cli_contract_test.ts`) against the locked CLI — that lane self-skips on a host with no kimi binary, so the Dockerfile is the only place the flag contract (headless `-p` accepted, `--yolo` rejected alongside `-p`, and the baked `[[hooks]]` PreToolUse guard table valid) is asserted for real. Since MR !1549 (WI#324 EF-5) the lane also pins the MCP contract the tool-proxy shim relies on: the CLI loads `$KIMI_CODE_HOME/mcp.json`, spawns the stdio server with parent-env pass-through, and completes `initialize` → `tools/list` over NDJSON.
 
 ## Do Not
 

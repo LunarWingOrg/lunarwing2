@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs"
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -19,7 +19,11 @@ import { test } from "node:test"
  *      (exit 64 / exit 2 / "unknown option"), and
  *   2. `--yolo` is rejected alongside `-p` (kimi-code 2.0.x+ enforces this
  *      explicitly: "error: Cannot combine --prompt with --yolo."), which is
- *      why kimi_task_executor.ts relies on config-only auto-approval.
+ *      why kimi_task_executor.ts relies on config-only auto-approval, and
+ *   3. (WI#324) the CLI loads `$KIMI_CODE_HOME/mcp.json`, spawns the stdio
+ *      MCP server with the parent env passed through, and completes
+ *      initialize -> tools/list over newline-delimited JSON-RPC — the
+ *      contract the lunarwing tool-proxy shim relies on.
  *
  * Determinism (the !1072 build failure): model/config resolution happens
  * BEFORE any provider contact, so an unconfigured environment fails with
@@ -296,6 +300,140 @@ test(
       probe.sawStreamJsonMeta,
       `startup probe must engage stream-json; stderr: ${probe.stderr.trim().slice(0, 300)}`,
     )
+  },
+)
+
+// WI#324 EF-5 (MR !1549): pin the real-CLI MCP contract the worker bridge
+// relies on — in print mode the CLI must read $KIMI_CODE_HOME/mcp.json,
+// spawn the stdio server, pass the parent env through to the MCP child, and
+// complete initialize -> notifications/initialized -> tools/list over
+// newline-delimited JSON-RPC. A recorder shim (written inline, baking in the
+// record path so the assertion does not itself depend on env pass-through)
+// logs the handshake and the proxied env vars.
+test(
+  "real CLI spawns mcp.json servers with env pass-through and runs the MCP handshake (WI#324)",
+  contractOpts,
+  async () => {
+    const mcpHome = mkdtempSync(join(tmpdir(), "kimi-mcp-home-"))
+    const kimiHome = join(mcpHome, ".kimi-code")
+    mkdirSync(kimiHome, { recursive: true })
+    const recordPath = join(mcpHome, "mcp-record.jsonl")
+    const shimPath = join(mcpHome, "recorder-shim.js")
+    // The CLI must get past model resolution (dead provider, no LLM spend)
+    // or it exits before loading mcp.json.
+    writeFileSync(
+      join(kimiHome, "config.toml"),
+      [
+        "default_model = \"tensorzero/FrontierCODEK\"",
+        "telemetry = false",
+        "",
+        "[providers.tensorzero]",
+        "type = \"openai\"",
+        "base_url = \"http://127.0.0.1:1/openai/v1\"",
+        "api_key = \"test\"",
+        "",
+        "[models.\"tensorzero/FrontierCODEK\"]",
+        "provider = \"tensorzero\"",
+        "model = \"tensorzero::function_name::FrontierCODEK\"",
+        "max_context_size = 859000",
+        "capabilities = [\"tool_use\"]",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    )
+    writeFileSync(
+      shimPath,
+      `#!/usr/bin/env node
+const fs = require("node:fs")
+const RECORD = ${JSON.stringify(recordPath)}
+fs.writeFileSync(RECORD, JSON.stringify({
+  event: "spawn",
+  task_id: process.env.LUNARWING_TASK_ID ?? null,
+  socket: process.env.LUNARWING_TOOL_PROXY_SOCKET ?? null,
+}) + "\\n")
+let buf = ""
+process.stdin.on("data", (chunk) => {
+  buf += chunk.toString("utf8")
+  let i = buf.indexOf("\\n")
+  while (i >= 0) {
+    const line = buf.slice(0, i)
+    buf = buf.slice(i + 1)
+    i = buf.indexOf("\\n")
+    if (!line.trim()) continue
+    let msg
+    try { msg = JSON.parse(line) } catch { continue }
+    if (msg.method) fs.appendFileSync(RECORD, msg.method + "\\n")
+    if (msg.method === "initialize" && msg.id !== undefined) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0", id: msg.id,
+        result: {
+          protocolVersion: "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "recorder", version: "0" },
+        },
+      }) + "\\n")
+    } else if (msg.method === "tools/list" && msg.id !== undefined) {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0", id: msg.id, result: { tools: [] },
+      }) + "\\n")
+    }
+  }
+})
+`,
+      { mode: 0o700 },
+    )
+    writeFileSync(
+      join(kimiHome, "mcp.json"),
+      JSON.stringify({ mcpServers: { lunarwing: { command: "node", args: [shimPath] } } }),
+      { mode: 0o600 },
+    )
+
+    const proc = spawn(
+      realKimiBin,
+      ["-p", "say hi", "--output-format", "stream-json"],
+      {
+        env: {
+          ...contractEnv(),
+          KIMI_CODE_HOME: kimiHome,
+          HOME: mcpHome,
+          LUNARWING_TASK_ID: "mcp-contract-task",
+          LUNARWING_TOOL_PROXY_SOCKET: "/tmp/nonexistent-contract.sock",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    )
+    let stderr = ""
+    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8") })
+    try {
+      const deadline = Date.now() + 30_000
+      let record = ""
+      while (Date.now() < deadline) {
+        try {
+          record = readFileSync(recordPath, "utf8")
+        } catch {
+          // not written yet
+        }
+        if (record.includes("tools/list")) break
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+      assert.ok(record.length > 0, `recorder shim was never spawned; stderr: ${stderr.trim().slice(0, 400)}`)
+      const spawnEvent = JSON.parse(record.split("\n")[0]) as Record<string, unknown>
+      assert.equal(
+        spawnEvent.task_id,
+        "mcp-contract-task",
+        "parent env must pass through to the MCP child (LUNARWING_TASK_ID)",
+      )
+      assert.equal(
+        spawnEvent.socket,
+        "/tmp/nonexistent-contract.sock",
+        "parent env must pass through to the MCP child (LUNARWING_TOOL_PROXY_SOCKET)",
+      )
+      assert.ok(record.includes("initialize\n"), `MCP initialize missing: ${record}`)
+      assert.ok(record.includes("tools/list\n"), `MCP tools/list missing: ${record}`)
+    } finally {
+      proc.kill("SIGTERM")
+      setTimeout(() => proc.kill("SIGKILL"), 5_000).unref()
+    }
   },
 )
 
