@@ -647,6 +647,7 @@ impl ToolRegistry {
         inject_tx: Option<tokio::sync::mpsc::Sender<crate::channels::IncomingMessage>>,
         prompt_queue: Option<PromptQueue>,
         secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+        workspace_resolver: Option<Arc<dyn crate::tools::builtin::memory::WorkspaceResolver>>,
     ) {
         let mut create_tool = CreateJobTool::new(Arc::clone(&context_manager));
         let scheduler_for_cancel = scheduler_slot.clone();
@@ -668,6 +669,9 @@ impl ToolRegistry {
         }
         if let Some(secrets) = secrets_store {
             create_tool = create_tool.with_secrets(secrets);
+        }
+        if let Some(resolver) = workspace_resolver {
+            create_tool = create_tool.with_workspace_resolver(resolver);
         }
         self.register_sync(Arc::new(create_tool));
         let mut list_tool = ListJobsTool::new(Arc::clone(&context_manager));

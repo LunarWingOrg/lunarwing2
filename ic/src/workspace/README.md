@@ -212,6 +212,15 @@ day file rejects until it is replaced or repaired by an operator.
 
 ### Prompt-File Shadow Backups (WI#286)
 
+Harness promotion also stores rollback snapshots under
+`backups/harness/<job_id>/<path>` using `write_backup_snapshot`. Like the
+shadow backups, these have an empty search-chunk projection: exact-path
+operator recovery remains available, but snapshots are neither embedded nor
+searchable. Promotion reads the primary write scope and rejects source-read
+errors other than `DocumentNotFound`, as well as snapshot-write failures.
+On a rejected replacement it removes an unused snapshot only after confirming
+the original is intact; uncertain outcomes retain the recovery data.
+
 A full-replace `write()` of a prompt-visible file destroys its prior content —
 the mechanism behind the incident where a session's context dump clobbered the
 curated `MEMORY.md`. Before replacing non-empty, differing content, `write()`

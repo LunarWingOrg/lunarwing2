@@ -219,6 +219,15 @@ impl Agent {
             match manager.stop_job(uuid).await {
                 Ok(()) => stopped = true,
                 Err(crate::error::OrchestratorError::ContainerNotFound { .. }) => {}
+                // DG-4: write-back promotion in progress — cancellation is
+                // refused until the staging walk and audit write finish.
+                Err(crate::error::OrchestratorError::InvalidContainerState { state, .. })
+                    if state.starts_with("finalizing") =>
+                {
+                    return Ok(format!(
+                        "Job {job_id} is finalizing write-back promotion; cancellation is refused — retry once it completes."
+                    ));
+                }
                 Err(error) => {
                     tracing::warn!(job_id = %uuid, "Failed to stop job container: {error}");
                 }
