@@ -395,6 +395,7 @@ async fn handle_control_channel(
     }
 }
 
+#[allow(clippy::result_large_err)] // Err type is fixed by tungstenite's Callback trait
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     behavior: MockBehavior,
