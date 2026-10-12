@@ -1091,6 +1091,12 @@ impl SecretValueRedactor {
         if self.folded_variants.is_empty() {
             return false;
         }
+        if !text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\')) {
+            return self
+                .folded_variants
+                .iter()
+                .any(|v| text.contains(v.expose_secret()));
+        }
         let folded = fold_line_breaks(text);
         self.folded_variants
             .iter()
@@ -1117,6 +1123,18 @@ impl SecretValueRedactor {
         use secrecy::ExposeSecret;
         if self.folded_variants.is_empty() {
             return text.to_string();
+        }
+        // Fast path: nothing to fold — match against the text as-is with an
+        // identity mapping, skipping the folded copy and index map.
+        if !text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\')) {
+            let mut out = text.to_string();
+            for variant in &self.folded_variants {
+                let variant = variant.expose_secret();
+                if out.contains(variant) {
+                    out = out.replace(variant, "[redacted-secret]");
+                }
+            }
+            return out;
         }
         let folded = fold_line_breaks(text);
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -2395,7 +2413,7 @@ mod tests {
         // scrubbed whole at any wrap width, and the variant count stays
         // bounded (no per-line explosion for MAX_SECRET_BYTES-sized values).
         use base64::Engine;
-        let value = "V".repeat(MAX_SECRET_BYTES as usize);
+        let value = "V".repeat(MAX_SECRET_BYTES);
         let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
         let total = redactor.direct_variants.len() + redactor.folded_variants.len();
         assert!(
