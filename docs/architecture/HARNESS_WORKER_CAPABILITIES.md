@@ -67,16 +67,36 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   60 columns, etc. For secrets whose encoded form is at most 4096 chars,
   individual wrap lines at the canonical widths are armed as well (a tool
   returning one line at a time); larger secrets rely on whole-blob fold
-  matching so the variant count stays bounded. Variants are sorted
-  longest-first across all mounted values. JSON object keys are also
-  scrubbed. The daemon re-scrubs event ingest and `/complete` before
+  matching so the variant count stays bounded.
+  - Size limit, stated plainly (EE-2): above the 4096-char encoding cap —
+    base64 of raw values over ~3 KiB, hex over ~2 KiB, and a 4096-byte RSA
+    PEM's base64 is already past it — ONLY the whole contiguous encoding is
+    matched. A partial or truncated print of such an encoding (`base64
+    secret | head -5`, or the 64 KiB shell-capture cut on a ≥48 KiB secret)
+    leaks almost everything printed; measured with real CLI output: 285
+    bytes for a 5-line head of a >3 KiB secret, 48,513 bytes for base64 of
+    a 48-64 KiB secret, 32,231 bytes for `xxd -p` of a ≥32 KiB secret.
+    Restoring partial coverage for large encodings needs aligned-chunk
+    variants in a per-job automaton — tracked in WI#383.
+  Variants are sorted longest-first across all mounted values. JSON object
+  keys are also scrubbed. The daemon re-scrubs event ingest and `/complete` before
   persistence and broadcast, using a redactor built **once per job and
-  cached** next to the held secrets (cleared on the same terminal paths).
+  cached** next to the held secrets (cleared on the same terminal paths; the
+  cache insert is skipped when a terminal clear raced the build — EE-4).
   - NOT covered (documented gaps): offset/grouped dump formats — plain
     `xxd`, `od`, `hexdump -C` — which interleave offsets and ASCII columns
     and never contain a contiguous encoded span; base32 and other alphabets;
     `rev`-style reorderings. Fold matching can over-redact when unrelated
     base64/hex-looking text spans a folded line break (safe direction).
+    Line-prefixed views defeat folding (EE-7): `read_file`'s `NNNNNN│ `
+    gutters and `cat -n` break the folded stream at every line, so wrapped
+    encodings of 57-4096-byte secrets leak in that presentation. The raw
+    value itself is matched only directly, never fold-matched (EE-8):
+    `fold -w N` of an unencoded token leaks from 16 bytes up to fully. Two
+    mounted values sharing a substring: the folded sweep merges overlapping
+    matches, but the direct pass replaces sequentially — in fold-free text
+    the non-overlapping tail of the second value can survive when only the
+    overlapping form is printed (EE-9 residual, WI#383).
   - Tools can truncate **before** this boundary: shell capture is capped at
     64 KiB and then reduced to a 32 KiB head/tail result. Fragments at those
     internal cuts may survive. The partial-prefix check only protects the
@@ -136,9 +156,15 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   probe is not treated as evidence of worker access. The runtime test checks
   both worker writes and daemon removal of worker-created subdirectories.
 - On job completion (`/complete`), after the container teardown is
-  confirmed, the daemon runs the promotion pipeline detached (the job sits
-  in a `Finalizing` state until it lands, so waiters cannot race it — CW-7;
-  stop/cancel/cleanup are refused or deferred while `Finalizing` — DH-4).
+  confirmed, the daemon runs the promotion pipeline detached. The job sits
+  in a `Finalizing` state until promotion lands, so `wait=true` pollers
+  cannot race it (CW-7), and stop/cancel/cleanup are refused or deferred
+  while `Finalizing` (DH-4). For the default `wait=false` shape, completion
+  is persisted, broadcast, and reflected in the parent's context BEFORE
+  promotion lands (EE-5): the parent agent is told the job finished while
+  promotion may still be running, and the promotion outcome reaches the
+  record only as the `harness_write_back` audit event — it is never
+  delivered to the parent.
   Stop and the exit watcher claim a terminal result under the same write
   lock used by completion; cleanup checks and removes atomically (EA-3):
   - **Allowlist is operator-fixed to `projects/**`** (CW-1). Callers may
@@ -222,10 +248,22 @@ cannot be listed).
   gaps (`jq -r .field` output is decoded text, not an armed encoding) and
   low-entropy line over-redaction; staged paths bypassing value scans
   and direct audit/result scrubbing; duplicate `/complete` handler side
-  effects beyond the manager's idempotence; temporary plaintext copies;
+  effects beyond the manager's idempotence (including a late `/complete`
+  turning a claimed `Stopped` into a persisted `completed` — EE-6, under
+  DZ-7); temporary plaintext copies;
   remaining preparation/cleanup orphans;
   no promotion deadline; remaining synchronous filesystem cleanup on async
   tasks; and stronger delivery, sparse-file and persisted-insert tests.
+- !1548 run-78 residuals (WI#383): partial/truncated prints of large
+  encodings leak near-wholly (EE-2 — needs the per-job automaton with
+  aligned chunks); line-prefixed views (`read_file`, `cat -n`) defeat
+  folding (EE-7); the raw value is never fold-matched (EE-8); the direct
+  pass does not merge overlapping values in fold-free text (EE-9 residual);
+  an event body uploaded slowly past a token revoke is persisted
+  daemon-side without the value scrub (EE-10); a per-line variant can split
+  a JSON escape and leave malformed scrubbed text for the model (EE-11); a
+  `wait=true` timeout during `Finalizing` reports `failed` while promotion
+  continues and leaks the handle (EE-12, under EA-5).
 - External-worker (opencode/pebble) secrets mounting — this WI covers the
   conventional harness only.
 - Concurrent-edit conflict policy: promotion snapshots the replaced content
