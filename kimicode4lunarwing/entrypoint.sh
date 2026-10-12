@@ -219,6 +219,21 @@ if grep -q 'set-kimi-base-url\.invalid' "$KIMI_CODE_HOME/config.toml" 2>/dev/nul
   die "KIMI_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-kimi <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
 fi
 
+# WI#324 worker-side tool bridge: register the thin stdio MCP server that
+# relays MCP tools/list + tools/call into tool_list/tool_call frames on the
+# hub WebSocket. User-level mcp.json is trusted (no workspace trust prompt);
+# written only when absent so an operator can override or disable the entry
+# ("enabled": false) without the entrypoint clobbering it. The shim
+# advertises zero tools unless the bridge injects the per-task proxy env, and
+# the hub stays deny-by-default without a tool_allowlist grant.
+if [ ! -f "$KIMI_CODE_HOME/mcp.json" ]; then
+  umask 0177
+  printf '%s\n' '{"mcpServers":{"lunarwing":{"command":"node","args":["/app/scripts/lunarwing_mcp_server.js"]}}}' \
+    > "$KIMI_CODE_HOME/mcp.json"
+  umask "$FILE_UMASK"
+  log "Registered lunarwing MCP tool-proxy server in $KIMI_CODE_HOME/mcp.json"
+fi
+
 # ── always start the health server in the background ──────────────────────────
 log "Starting health server on port $HEALTH_PORT"
 export WS_STATE_FILE

@@ -27,6 +27,7 @@ import {
   type WsState,
 } from "./lunarwing_runtime.js"
 import { executeTask } from "./kimi_task_executor.js"
+import { proxyEnvForTask, ToolProxyRelay } from "./lunarwing_tool_proxy.js"
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
 
 // A single malformed frame or a stray async error must not take the whole
@@ -73,6 +74,10 @@ type ActiveTask = { controller: AbortController; socket: BridgeSocket; workspace
 const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
+// WI#324 worker-side bridge: per-task unix sockets that the in-task MCP shim
+// (lunarwing_mcp_server.ts) uses to reach the hub's tool_call/tool_list frames.
+const toolProxyRelay = new ToolProxyRelay()
+
 function taskWorkspace(request: TaskRequest): string {
   return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
 }
@@ -118,6 +123,12 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
 
       case "cancel":
         handleCancel(envelope.payload, ws)
+        break
+
+      case "tool_result":
+      case "tool_catalog":
+        // WI#324: hub replies to this worker's tool_call / tool_list frames.
+        toolProxyRelay.handleHubFrame(ws, envelope)
         break
 
       case "ping":
@@ -218,6 +229,14 @@ async function handleTaskRequest(
   activeTasks.set(request.task_id, { controller, socket: ws, workspace })
   activeWorkspaces.set(workspace, request.task_id)
 
+  // WI#324: give the task's CLI a local tool-proxy socket so its MCP shim can
+  // reach the hub over this connection. A listen failure never fails the task
+  // — it just runs without LunarWing tools (hub stays deny-by-default).
+  const toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
+  const proxyEnv = toolProxy
+    ? proxyEnvForTask(request.task_id, toolProxy.socketPath)
+    : undefined
+
   try {
     await executeTask(
       request,
@@ -230,8 +249,10 @@ async function handleTaskRequest(
       },
       controller.signal,
       workspace,
+      proxyEnv,
     )
   } finally {
+    toolProxy?.close()
     activeTasks.delete(request.task_id)
     if (activeWorkspaces.get(workspace) === request.task_id) activeWorkspaces.delete(workspace)
   }
