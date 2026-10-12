@@ -478,8 +478,11 @@ impl ExternalWorkerManager {
             // `cron.tool_allowlist`; sanitize it with the same rules.
             if let Some(cron) = config.cron.as_mut() {
                 let cron_list_name = format!("{} (cron tick)", config.name);
-                cron.tool_allowlist =
-                    sanitize_tool_allowlist(&cron_list_name, &cron.tool_allowlist, cleartext_remote);
+                cron.tool_allowlist = sanitize_tool_allowlist(
+                    &cron_list_name,
+                    &cron.tool_allowlist,
+                    cleartext_remote,
+                );
             }
             let endpoints = config.endpoints();
             load_balancers.insert(
