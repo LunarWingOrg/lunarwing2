@@ -2518,8 +2518,7 @@ mod tests {
         for raw_len in 58usize..=62 {
             let value: String = "fake-ee3-fixture-".chars().cycle().take(raw_len).collect();
             assert_eq!(value.len(), raw_len);
-            let redactor =
-                SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
+            let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
             // Offset 0 with a suffix (`base64 -w64` of S+":"), and the value
             // embedded at byte offsets 1 and 2 inside a larger encoded blob.
             let blobs = [
@@ -2595,8 +2594,7 @@ mod tests {
         // serialized tool results leak whole.
         use base64::Engine;
         let value = "harness-fixture-with-at-least-61-bytes-for-real-shell-output-wrapping";
-        let redactor =
-            SecretValueRedactor::new([SecretString::from(value.to_string())].as_slice());
+        let redactor = SecretValueRedactor::new([SecretString::from(value.to_string())].as_slice());
         let b64 = base64::engine::general_purpose::STANDARD.encode(value);
         for separator in ["\n", "\r\n"] {
             let wrapped = b64
@@ -2607,13 +2605,11 @@ mod tests {
                 .join(separator);
             // Compact serialization: no real newlines, only escaped ones.
             let serialized =
-                serde_json::to_string(&serde_json::json!({ "output": wrapped }))
-                    .unwrap(); // safety: test
+                serde_json::to_string(&serde_json::json!({ "output": wrapped })).unwrap(); // safety: test
             assert!(!serialized.contains('\n'));
             assert!(serialized.contains("\\n"));
             let scrubbed = redactor.scrub(&serialized);
-            let cleaned: serde_json::Value =
-                serde_json::from_str(&scrubbed).unwrap(); // safety: test
+            let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
             assert_eq!(cleaned["output"], "[redacted-secret]");
         }
     }
