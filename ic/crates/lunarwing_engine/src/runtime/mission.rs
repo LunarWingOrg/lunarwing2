@@ -49,13 +49,30 @@ const RETRY_ATTEMPT_METADATA_KEY: &str = "retry_attempt";
 /// Marker for the debug line recorded when a join handle is lost before any
 /// outcome can be observed (interrupted lineage, WI#188).
 const JOIN_LOST_APPROACH_PREFIX: &str = "INTERRUPTED: thread join handle lost";
-/// Metadata key on a mission recording a fire whose thread had not settled
+/// Metadata key on a mission recording fires whose threads had not settled
 /// when the daemon's shutdown wait ended (WI#276 review): the watcher's stop
 /// request landed but the run's own save can outlive the outcome wait, so
 /// the mission-side outcome is recorded immediately and this stamp is left
 /// for the boot sweep, which resolves it against the thread's final
-/// persisted state (`{"thread_id": ..., "recorded_at": ...}`).
+/// persisted state. The value is a map keyed by thread id
+/// (`{"<thread_id>": {"recorded_at": ...}, ...}`) so two runs of one mission
+/// both unsettled at shutdown — the cron-tick + armed-retry overlap
+/// ENGINE-V2.md accepts — each keep their stamp (WI#339 AE-3); a single-slot
+/// stamp shadowed the earlier fire, which was then never resolved. Stamps
+/// written by older builds in the single-slot shape
+/// (`{"thread_id": ..., "recorded_at": ...}`) are still read and are folded
+/// into the map on the next write.
 const PENDING_SHUTDOWN_INTERRUPTION_KEY: &str = "pending_shutdown_interruption";
+/// Metadata key on a mission recording outcome notices owed but never
+/// delivered (WI#339 AE-5): during daemon shutdown the broadcast consumer is
+/// already gone, and only retry markers carry the `notified` flag, so a
+/// non-retry outcome — a completion, MaxIterations, budget exhaustion, or an
+/// exhausted retry chain settling inside the shutdown grace — never reached
+/// the mission's channels. The notice is stamped here
+/// (`{"<thread_id>": {"response": ..., "is_error": ..., "recorded_at": ...}}`,
+/// keyed by thread id like the interruption stamp) and the boot sweep
+/// delivers it once the consumer is wired.
+const PENDING_OUTCOME_NOTIFICATION_KEY: &str = "pending_outcome_notification";
 /// How long a mission run interrupted by daemon shutdown gets to stop and
 /// settle so its real outcome is recorded (WI#276). Kept well inside the
 /// time [`MissionManager::shutdown`] waits, leaving room to persist the
@@ -2841,10 +2858,11 @@ impl MissionManager {
     }
 
     /// Post-restart resolution (WI#276 review): a graceful shutdown whose
-    /// outcome wait expired stamped the mission with a pending shutdown
-    /// interruption. Resolve each stamp against the thread's final persisted
-    /// state — the stopped run's own save lands during teardown, after the
-    /// watcher's grace, and no watcher remains to process it.
+    /// outcome wait expired stamped the mission with pending shutdown
+    /// interruptions, one entry per unsettled thread (WI#339 AE-3). Resolve
+    /// each stamp against the thread's final persisted state — the stopped
+    /// run's own save lands during teardown, after the watcher's grace, and
+    /// no watcher remains to process it.
     ///
     /// - `Failed` with a host-stop reason (the stop landed, just late): plan
     ///   the retry the watcher would have planned, persist the marker,
@@ -2861,29 +2879,53 @@ impl MissionManager {
     /// - Anything else (still live, unreadable): leave the stamp for the
     ///   next boot.
     ///
-    /// Returns the missions whose stamp was resolved.
+    /// One unreadable row or unresolvable stamp blocks neither the mission's
+    /// other stamps nor the other missions (WI#339 AE-4): a corrupt row is a
+    /// warning and a `continue`, never an abort of the whole sweep.
+    ///
+    /// Returns the missions that had at least one stamp resolved.
     pub async fn resolve_pending_shutdown_interruptions(
         &self,
     ) -> Result<Vec<MissionId>, EngineError> {
         let mut resolved = Vec::new();
         for mission in self.store.list_all_missions_global().await? {
-            if stamped_interrupted_thread(&mission).is_none() {
+            if stamped_interrupted_threads(&mission).is_empty() {
                 continue;
             }
             let lock = mission_lock(&self.fire_locks, mission.id).await;
             let _guard = lock.lock().await;
             // Re-load under the fire lock: the listing snapshot may be stale,
             // and a concurrent fire must not interleave with the resolution.
-            let Some(mut current) = self.store.load_mission(mission.id).await? else {
-                continue;
+            let mut current = match self.store.load_mission(mission.id).await {
+                Ok(Some(current)) => current,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        mission_id = %mission.id,
+                        %error,
+                        "failed to re-load mission for shutdown-interruption resolution; \
+                         leaving its stamps for the next boot"
+                    );
+                    continue;
+                }
             };
-            let Some(thread_id) = stamped_interrupted_thread(&current) else {
-                continue;
-            };
-            if self
-                .resolve_stamped_interruption(&mut current, thread_id)
-                .await?
-            {
+            let mut resolved_any = false;
+            for thread_id in stamped_interrupted_threads(&current) {
+                match self.resolve_stamped_interruption(&mut current, thread_id).await {
+                    Ok(true) => resolved_any = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(
+                            mission_id = %mission.id,
+                            %thread_id,
+                            %error,
+                            "failed to resolve pending shutdown interruption; \
+                             leaving the stamp for the next boot"
+                        );
+                    }
+                }
+            }
+            if resolved_any {
                 resolved.push(mission.id);
             }
         }
@@ -2900,7 +2942,7 @@ impl MissionManager {
     ) -> Result<bool, EngineError> {
         let Some(thread) = self.store.load_thread(thread_id).await? else {
             // The thread record is gone; nothing left to resolve against.
-            clear_shutdown_interruption_stamp(mission);
+            clear_shutdown_interruption_stamp(mission, thread_id);
             mission.updated_at = Utc::now();
             self.store.save_mission(mission).await?;
             return Ok(true);
@@ -2925,14 +2967,14 @@ impl MissionManager {
                 %thread_id,
                 "pending shutdown interruption stamp failed the mission/thread parity checks; clearing it without acting"
             );
-            clear_shutdown_interruption_stamp(mission);
+            clear_shutdown_interruption_stamp(mission, thread_id);
             mission.updated_at = Utc::now();
             self.store.save_mission(mission).await?;
             return Ok(true);
         }
         match thread.state {
             ThreadState::Failed if thread.is_failed_by_restart() => {
-                clear_shutdown_interruption_stamp(mission);
+                clear_shutdown_interruption_stamp(mission, thread_id);
                 mission.updated_at = Utc::now();
                 self.store.save_mission(mission).await?;
                 Ok(true)
@@ -2949,7 +2991,7 @@ impl MissionManager {
                 if !mission.approach_history.contains(&entry) {
                     mission.record_approach(entry);
                 }
-                clear_shutdown_interruption_stamp(mission);
+                clear_shutdown_interruption_stamp(mission, thread_id);
                 mission.updated_at = Utc::now();
                 self.store.save_mission(mission).await?;
                 Ok(true)
@@ -2962,7 +3004,7 @@ impl MissionManager {
                 if !mission.approach_history.contains(&entry) {
                     mission.record_approach(entry);
                 }
-                clear_shutdown_interruption_stamp(mission);
+                clear_shutdown_interruption_stamp(mission, thread_id);
                 mission.updated_at = Utc::now();
                 self.store.save_mission(mission).await?;
                 Ok(true)
@@ -2970,7 +3012,7 @@ impl MissionManager {
             ThreadState::Suspended | ThreadState::Waiting => {
                 // Checkpoint resume or pending-gate reconciliation owns the
                 // thread's future from here.
-                clear_shutdown_interruption_stamp(mission);
+                clear_shutdown_interruption_stamp(mission, thread_id);
                 mission.updated_at = Utc::now();
                 self.store.save_mission(mission).await?;
                 Ok(true)
@@ -3003,7 +3045,7 @@ impl MissionManager {
                     .await;
             }
         }
-        clear_shutdown_interruption_stamp(mission);
+        clear_shutdown_interruption_stamp(mission, thread_id);
         mission.updated_at = Utc::now();
         self.store.save_mission(mission).await?;
         Ok(())
@@ -3041,6 +3083,86 @@ impl MissionManager {
                 is_error: true,
             })
             .is_ok()
+    }
+
+    /// Boot-time delivery of outcome notices owed but never delivered
+    /// (WI#339 AE-5): the watcher skips the broadcast once the daemon is
+    /// shutting down because its consumer is already gone, and only retry
+    /// markers carry the owed flag — a completion, MaxIterations, budget
+    /// exhaustion, or an exhausted retry chain settling inside the shutdown
+    /// grace was recorded but never reached the mission's channels. The
+    /// watcher stamps those notices on the mission row; this sweep emits
+    /// them once the bridge's consumer is wired, then clears the stamp.
+    ///
+    /// Per-mission isolation (WI#339 AE-4): one unreadable row warns and
+    /// skips to the next mission instead of aborting the sweep. Delivery is
+    /// best-effort with the removal as the acknowledgement: a crash between
+    /// the send and the save repeats the notice at the next boot (the same
+    /// semantics as WI#301's restart-loss acknowledgement). Run after the
+    /// notification consumer is subscribed.
+    ///
+    /// Returns the missions whose owed notices were delivered.
+    pub async fn deliver_pending_outcome_notifications(
+        &self,
+    ) -> Result<Vec<MissionId>, EngineError> {
+        let mut delivered = Vec::new();
+        for mission in self.store.list_all_missions_global().await? {
+            if mission
+                .metadata
+                .get(PENDING_OUTCOME_NOTIFICATION_KEY)
+                .is_none()
+            {
+                continue;
+            }
+            let lock = mission_lock(&self.fire_locks, mission.id).await;
+            let _guard = lock.lock().await;
+            // Re-load under the fire lock: the listing snapshot may be stale,
+            // and a concurrent fire must not interleave with the delivery.
+            let mut current = match self.store.load_mission(mission.id).await {
+                Ok(Some(current)) => current,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        mission_id = %mission.id,
+                        %error,
+                        "failed to re-load mission for owed outcome notices; \
+                         leaving them for the next boot"
+                    );
+                    continue;
+                }
+            };
+            let notices = take_pending_outcome_notifications(&mut current);
+            if notices.is_empty() {
+                continue;
+            }
+            for notice in &notices {
+                // Best-effort: the bridge consumer is wired before the
+                // recovery passes run. The stamp removal below is the
+                // acknowledgement regardless of the send result — the same
+                // tradeoff `notify_rearmed_retry` makes for retry notices.
+                let _ = self.notification_tx.send(MissionNotification {
+                    mission_id: current.id,
+                    mission_name: current.name.clone(),
+                    thread_id: notice.thread_id,
+                    user_id: current.user_id.clone(),
+                    notify_channels: current.notify_channels.clone(),
+                    response: Some(notice.response.clone()),
+                    is_error: notice.is_error,
+                });
+            }
+            current.updated_at = Utc::now();
+            match self.store.save_mission(&current).await {
+                Ok(()) => delivered.push(mission.id),
+                Err(error) => {
+                    warn!(
+                        mission_id = %mission.id,
+                        %error,
+                        "failed to clear delivered outcome notices; they repeat at the next boot"
+                    );
+                }
+            }
+        }
+        Ok(delivered)
     }
 
     /// Post-restart bookkeeping (WI#301): for every mission thread the
@@ -3292,37 +3414,157 @@ async fn record_unsettled_shutdown_fire(
         "INTERRUPTED: shutdown while the thread was still stopping ({thread_id})"
     ));
     release_terminal_trigger_key(&mut mission, &ThreadOutcome::Stopped);
-    let stamp = serde_json::json!({
-        "thread_id": thread_id,
-        "recorded_at": Utc::now().to_rfc3339(),
-    });
-    if let serde_json::Value::Object(map) = &mut mission.metadata {
-        map.insert(PENDING_SHUTDOWN_INTERRUPTION_KEY.to_string(), stamp);
-    } else {
-        mission.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: stamp });
-    }
+    insert_shutdown_interruption_stamp(&mut mission, thread_id);
     mission.updated_at = Utc::now();
     if let Err(e) = store.save_mission(&mission).await {
         warn!(mission_id = %mission_id, %thread_id, "failed to record unsettled shutdown fire: {e}");
     }
 }
 
-/// The thread id named by a mission's pending-shutdown-interruption stamp
-/// (WI#276 review), if the mission carries a well-formed one.
-fn stamped_interrupted_thread(mission: &Mission) -> Option<ThreadId> {
-    mission
-        .metadata
-        .get(PENDING_SHUTDOWN_INTERRUPTION_KEY)
-        .and_then(|stamp| stamp.get("thread_id"))
-        .and_then(|value| serde_json::from_value::<ThreadId>(value.clone()).ok())
+/// Add one thread's pending-shutdown-interruption stamp (WI#276 review). The
+/// value is a map keyed by thread id so overlapping unsettled fires of one
+/// mission each keep their stamp (WI#339 AE-3); a single-slot stamp shadowed
+/// the earlier fire, leaving it recorded but never resolved. A legacy
+/// single-slot stamp (`{"thread_id": ..., "recorded_at": ...}`, written by
+/// pre-WI#339 builds) found on the mission is folded into the map.
+fn insert_shutdown_interruption_stamp(mission: &mut Mission, thread_id: ThreadId) {
+    if !mission.metadata.is_object() {
+        mission.metadata = serde_json::json!({});
+    }
+    let Some(metadata) = mission.metadata.as_object_mut() else {
+        return; // safety: normalized to an object immediately above
+    };
+    let stamps = metadata
+        .entry(PENDING_SHUTDOWN_INTERRUPTION_KEY.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(legacy_thread) = stamps
+        .get("thread_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    {
+        let recorded_at = stamps
+            .get("recorded_at")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        *stamps = serde_json::json!({ legacy_thread: { "recorded_at": recorded_at } });
+    }
+    if !stamps.is_object() {
+        // A malformed value could never be resolved; replace it.
+        *stamps = serde_json::json!({});
+    }
+    if let Some(map) = stamps.as_object_mut() {
+        map.insert(
+            thread_id.0.to_string(),
+            serde_json::json!({ "recorded_at": Utc::now().to_rfc3339() }),
+        );
+    }
 }
 
-/// Clear the pending-shutdown-interruption stamp once the boot sweep has
-/// resolved it (WI#276 review).
-fn clear_shutdown_interruption_stamp(mission: &mut Mission) {
-    if let serde_json::Value::Object(map) = &mut mission.metadata {
-        map.remove(PENDING_SHUTDOWN_INTERRUPTION_KEY);
+/// The thread ids named by a mission's pending-shutdown-interruption stamps
+/// (WI#276 review; multi-slot since WI#339 AE-3). The legacy single-slot
+/// shape (`{"thread_id": ..., "recorded_at": ...}`) written by older builds
+/// is read as well. Entries whose key does not parse are skipped — the sweep
+/// cannot resolve a thread it cannot name, and the entry stays for the next
+/// boot.
+fn stamped_interrupted_threads(mission: &Mission) -> Vec<ThreadId> {
+    let Some(stamps) = mission.metadata.get(PENDING_SHUTDOWN_INTERRUPTION_KEY) else {
+        return Vec::new();
+    };
+    if let Some(legacy) = stamps.get("thread_id") {
+        return serde_json::from_value::<ThreadId>(legacy.clone())
+            .into_iter()
+            .collect();
     }
+    stamps
+        .as_object()
+        .map(|map| {
+            map.keys()
+                .filter_map(|key| {
+                    serde_json::from_value::<ThreadId>(serde_json::Value::String(key.clone())).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Clear one thread's pending-shutdown-interruption stamp once the boot
+/// sweep has resolved it (WI#276 review; per-thread since WI#339 AE-3). The
+/// key is removed once no entries remain. A legacy single-slot stamp clears
+/// wholesale — it names exactly one thread — and a malformed value is
+/// dropped rather than left to block resolution at every boot.
+fn clear_shutdown_interruption_stamp(mission: &mut Mission, thread_id: ThreadId) {
+    let serde_json::Value::Object(metadata) = &mut mission.metadata else {
+        return;
+    };
+    let remove_key = match metadata.get_mut(PENDING_SHUTDOWN_INTERRUPTION_KEY) {
+        Some(serde_json::Value::Object(stamps)) if stamps.contains_key("thread_id") => true,
+        Some(serde_json::Value::Object(stamps)) => {
+            stamps.remove(&thread_id.0.to_string());
+            stamps.is_empty()
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if remove_key {
+        metadata.remove(PENDING_SHUTDOWN_INTERRUPTION_KEY);
+    }
+}
+
+/// One owed outcome notice recovered from a mission's
+/// `pending_outcome_notification` stamp (WI#339 AE-5).
+struct PendingOutcomeNotice {
+    thread_id: ThreadId,
+    response: String,
+    is_error: bool,
+}
+
+/// Remove the owed-notice stamp from the mission, returning the well-formed
+/// entries. Malformed entries are dropped with a warning rather than
+/// re-flagged undelivered at every boot (WI#339 AE-4's per-row isolation,
+/// applied to notices).
+fn take_pending_outcome_notifications(mission: &mut Mission) -> Vec<PendingOutcomeNotice> {
+    let serde_json::Value::Object(metadata) = &mut mission.metadata else {
+        return Vec::new();
+    };
+    let Some(value) = metadata.remove(PENDING_OUTCOME_NOTIFICATION_KEY) else {
+        return Vec::new();
+    };
+    let serde_json::Value::Object(stamps) = value else {
+        warn!(
+            mission_id = %mission.id,
+            "dropping a malformed pending outcome notification stamp (not an object)"
+        );
+        return Vec::new();
+    };
+    stamps
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let thread_id =
+                serde_json::from_value::<ThreadId>(serde_json::Value::String(key.clone())).ok();
+            let response = value
+                .get("response")
+                .and_then(|response| response.as_str())
+                .map(str::to_string);
+            match (thread_id, response) {
+                (Some(thread_id), Some(response)) => Some(PendingOutcomeNotice {
+                    thread_id,
+                    response,
+                    is_error: value
+                        .get("is_error")
+                        .and_then(|is_error| is_error.as_bool())
+                        .unwrap_or(false),
+                }),
+                _ => {
+                    warn!(
+                        mission_id = %mission.id,
+                        thread_key = %key,
+                        "dropping a malformed pending outcome notification entry"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Whether the thread's terminal transition records a host-requested stop —
@@ -3716,17 +3958,76 @@ async fn process_mission_outcome_and_notify(
         notification_tx,
         &mission,
         thread_id,
-        effects.notify_response,
+        effects.notify_response.as_deref(),
         effects.is_error,
         shutting_down,
     );
 
-    if let Some(pending) = &effects.pending_retry
-        && let Err(e) = persist_retry_marker(&**store, thread_id, pending, notified).await
-    {
-        debug!(%thread_id, %e, "failed to persist retry marker");
+    match &effects.pending_retry {
+        Some(pending) => {
+            if let Err(e) = persist_retry_marker(&**store, thread_id, pending, notified).await {
+                debug!(%thread_id, %e, "failed to persist retry marker");
+            }
+        }
+        None if !notified => {
+            // No retry marker carries this owed notice (WI#339 AE-5): a
+            // completion, MaxIterations, budget exhaustion, or an exhausted
+            // retry chain settling while the broadcast consumer is already
+            // gone would otherwise never reach the mission's channels. Stamp
+            // it on the mission row; the boot sweep delivers it.
+            record_pending_outcome_notification(store, &mut mission, thread_id, &effects).await;
+        }
+        None => {}
     }
     Ok(effects.pending_retry)
+}
+
+/// Stamp an outcome notice owed but never delivered onto the mission row
+/// (WI#339 AE-5), keyed by thread id so overlapping fires each keep their
+/// notice. The mission row with the approach entry and dedup release already
+/// saved; this second save adds only the owed-notice stamp, so an abort in
+/// between loses the notice exactly as before WI#339 — never a mission-row
+/// update.
+async fn record_pending_outcome_notification(
+    store: &Arc<dyn Store>,
+    mission: &mut Mission,
+    thread_id: ThreadId,
+    effects: &OutcomeEffects,
+) {
+    let Some(response) = effects.notify_response.as_deref() else {
+        return;
+    };
+    if !mission.metadata.is_object() {
+        mission.metadata = serde_json::json!({});
+    }
+    let Some(metadata) = mission.metadata.as_object_mut() else {
+        return; // safety: normalized to an object immediately above
+    };
+    let notices = metadata
+        .entry(PENDING_OUTCOME_NOTIFICATION_KEY.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !notices.is_object() {
+        // A malformed value could never be delivered; replace it.
+        *notices = serde_json::json!({});
+    }
+    if let Some(map) = notices.as_object_mut() {
+        map.insert(
+            thread_id.0.to_string(),
+            serde_json::json!({
+                "response": response,
+                "is_error": effects.is_error,
+                "recorded_at": Utc::now().to_rfc3339(),
+            }),
+        );
+    }
+    mission.updated_at = Utc::now();
+    if let Err(e) = store.save_mission(mission).await {
+        warn!(
+            mission_id = %mission.id,
+            %thread_id,
+            "failed to stamp pending outcome notification: {e}"
+        );
+    }
 }
 
 /// Notification/retry effects of folding a terminal outcome into the mission
@@ -3933,13 +4234,15 @@ fn release_terminal_trigger_key(mission: &mut Mission, outcome: &ThreadOutcome) 
 /// Broadcast the outcome notice; returns whether it reached a receiver, for
 /// the retry marker's `notified` flag. During daemon shutdown the consumer
 /// is already gone — skip the dead send and report undelivered so the
-/// persisted marker re-notifies at boot (WI#276 review). `true` when there
-/// was nothing to deliver.
+/// persisted marker re-notifies at boot (WI#276 review). A non-retry outcome
+/// has no marker to carry that flag; its caller stamps the owed notice on
+/// the mission row for the boot sweep instead (WI#339 AE-5). `true` when
+/// there was nothing to deliver.
 fn send_outcome_notification(
     notification_tx: &tokio::sync::broadcast::Sender<MissionNotification>,
     mission: &Mission,
     thread_id: ThreadId,
-    response: Option<String>,
+    response: Option<&str>,
     is_error: bool,
     shutting_down: bool,
 ) -> bool {
@@ -3960,7 +4263,7 @@ fn send_outcome_notification(
             thread_id,
             user_id: mission.user_id.clone(),
             notify_channels: mission.notify_channels.clone(),
-            response: Some(response),
+            response: Some(response.to_string()),
             is_error,
         })
         .is_ok()
@@ -11483,11 +11786,12 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             "INTERRUPTED: shutdown while the thread was still stopping ({})",
             thread.id
         ));
-        let stamp = serde_json::json!({
-            "thread_id": thread.id,
-            "recorded_at": Utc::now().to_rfc3339(),
-        });
-        mission.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: stamp });
+        // The stamp shape the watcher writes: a map keyed by thread id
+        // (WI#339 AE-3). The legacy single-slot shape is covered by the
+        // WI#338 forgery tests, which write it verbatim.
+        mission.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: {
+            (thread.id.0.to_string()): { "recorded_at": Utc::now().to_rfc3339() },
+        }});
         store.save_thread(&thread).await.unwrap();
         store.save_mission(&mission).await.unwrap();
         (mission, thread)
@@ -11540,7 +11844,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             !saved.has_processed_trigger(&key),
             "the dedup key is released for redelivery"
         );
-        assert_eq!(stamped_interrupted_thread(&saved), Some(thread.id));
+        assert_eq!(stamped_interrupted_threads(&saved), vec![thread.id]);
     }
 
     /// WI#276 review, the reported scenario end-to-end: the stop request
@@ -11573,7 +11877,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         assert!(marker.notified, "the boot notice reached the subscriber");
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
         assert!(
-            stamped_interrupted_thread(&saved_mission).is_none(),
+            stamped_interrupted_threads(&saved_mission).is_empty(),
             "the stamp is resolved"
         );
         let notif = rx
@@ -11636,7 +11940,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
         assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
-        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(stamped_interrupted_threads(&saved_mission).is_empty());
         assert!(
             saved_mission
                 .approach_history
@@ -11670,7 +11974,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
         assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
-        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(stamped_interrupted_threads(&saved_mission).is_empty());
         assert!(
             rx.try_recv().is_err(),
             "WI#301's record pass owns the restart-lost notice"
@@ -11737,7 +12041,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let saved_thread = store.load_thread(thread.id).await.unwrap().unwrap();
         assert!(RetryState::from_metadata(&saved_thread.metadata).is_none());
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
-        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(stamped_interrupted_threads(&saved_mission).is_empty());
         mgr.shutdown().await;
     }
 
@@ -11794,7 +12098,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         );
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
         assert!(
-            stamped_interrupted_thread(&saved_mission).is_none(),
+            stamped_interrupted_threads(&saved_mission).is_empty(),
             "the forged stamp is cleared"
         );
         assert!(
@@ -11851,7 +12155,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let foreground_after = store.load_thread(foreground.id).await.unwrap().unwrap();
         assert!(RetryState::from_metadata(&foreground_after.metadata).is_none());
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
-        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(stamped_interrupted_threads(&saved_mission).is_empty());
         assert!(rx.try_recv().is_err());
         mgr.shutdown().await;
     }
@@ -11903,7 +12207,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let other_after = store.load_thread(other.id).await.unwrap().unwrap();
         assert!(RetryState::from_metadata(&other_after.metadata).is_none());
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
-        assert!(stamped_interrupted_thread(&saved_mission).is_none());
+        assert!(stamped_interrupted_threads(&saved_mission).is_empty());
         assert!(rx.try_recv().is_err());
         mgr.shutdown().await;
     }
