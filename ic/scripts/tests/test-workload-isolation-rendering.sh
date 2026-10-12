@@ -97,6 +97,7 @@ chmod() { :; }
 mkdir -p "$(tenant_repo t1)"
 export OPENRC_INITD_DIR="$MT_FIXTURE/init.d"
 export OPENRC_CONFD_DIR="$MT_FIXTURE/conf.d"
+export OPENRC_PROXY_BACKUP_DIR="$MT_FIXTURE/backup-units"
 
 # ── systemd unit rendering ───────────────────────────────────────────────────
 echo "== systemd unit rendering =="

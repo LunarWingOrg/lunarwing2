@@ -50,8 +50,8 @@ _ensure_cron_runlevel() {
   local want="${1:-}" cron
   for cron in ${want:+$want} fcron cronie dcron crond busybox-cron; do
     if [[ -x "/etc/init.d/$cron" ]]; then
-      _openrc_update add "$cron" default >/dev/null 2>&1 || true
-      _openrc_service "$cron" start >/dev/null 2>&1 || true
+      _openrc_update add "$cron" default || return 1
+      _openrc_service "$cron" start || return 1
       say "cron daemon '$cron' enabled + running"
       return 0
     fi

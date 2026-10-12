@@ -69,6 +69,7 @@ RELAY_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-relay-env-exec.py"
 RELAY_ENV_EXEC="/usr/local/libexec/lunarwing-relay-env-exec"
 OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
 OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
+OPENRC_PROXY_BACKUP_DIR="${LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR:-/var/lib/lunarwing/openrc-proxy-backups}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 # WI#330: no built-in default — the historical developer-LAN address was
@@ -573,6 +574,9 @@ Environment:
   LUNARWING_MT_STUDY_NOTES_REPO    Repository used when that checkout is first cloned
   LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT
                                    Root-owned snapshot directory used by the host scheduler
+  LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR
+                                   Private archive for superseded OpenRC proxy units
+                                   (default /var/lib/lunarwing/openrc-proxy-backups)
   LUNARWING_MT_BACKUP_DIR          Backup directory (default /var/lib/lunarwing-backups)
   LUNARWING_MT_BACKUP_KEEP         Keep last N dumps per tenant (default 7; 0 = keep all)
 
@@ -598,6 +602,9 @@ main() {
     exit 1
   fi
   shift || true
+
+  openrc_dispatch_preflight "$command_name" "$@" \
+    || die "OpenRC proxy migration required; refusing $command_name"
 
   # An explicitly-chosen runtime persists no matter which command runs.
   # Without this, commands that never touch containers (list-tenants, tokens,

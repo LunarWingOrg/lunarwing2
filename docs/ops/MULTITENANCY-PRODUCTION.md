@@ -554,22 +554,33 @@ without recursively executing it. The previous script executed that copied
 text when OpenRC later parsed the init file as root, including during service
 operations other than startup. Shell-looking URL text now stays literal data.
 
-**Existing installations — fleet-wide neutralize first (!1547 EG-1):** an
+**Existing installations — fleet-wide neutralize first (!1547 EG–E):** an
 OpenRC dependency-cache rebuild can source **every** installed init script
 as root. Repairing tenant A and restarting it while tenant B's old proxy
 unit remains is unsafe. Arrange a maintenance window with no concurrent
-OpenRC operations, including automated health/self-heal operations. The
-mt-admin guard covers its own commands, not other programs invoking OpenRC.
+OpenRC operations: pause the host health/self-heal cron
+(`lunarwing-mt-health` fcron/cron block running
+`/usr/local/lib/lunarwing-health/cron-wrapper.sh`, which drives
+`lunarwing-self-heal.sh`), the OpenRC watchdog
+(`/etc/cron.hourly/lunarwing-watchdog` or the managed fcron block), and do
+not run `ic/scripts/enable-health-fleet.sh` in the window. The mt-admin
+guard covers its own commands, not other programs invoking OpenRC.
 
-Before overwriting any units, inspect them as data, without service commands:
+Before overwriting any units, inspect them as data, without service commands.
+A naive grep for `$(`/backticks misses quote-closing redirection payloads;
+ask instead for any legacy `--tensorzero` value containing characters
+outside the URL set:
 
 ```bash
-sudo grep -nE 'proxy_args.*(\$\(|`|;|\||&)' /etc/init.d/lunarwing-proxy-*
+sudo grep -lE -- '--tensorzero ' /etc/init.d/lunarwing-proxy-* \
+  | sudo xargs -r grep -LE -- '--tensorzero []A-Za-z0-9._~:/?#@!*+,=[-]+}"$'
 ```
 
-A hit means that tenant may already have run code as root; preserve the
-installed units/logs outside `init.d` and investigate. Legitimate query
-delimiters can also match, so this is a detection signal, not proof of execution.
+A listed file means the unit carries a value outside plain URL characters —
+possibly an exploited payload such as `}">/etc/…` or `${` parameter
+expansion, and possibly a legitimate `&`/`;` query string, so this is a
+detection signal, not proof of execution. Preserve such units' bytes for
+investigation; mt-admin does this automatically on replacement (below).
 
 From the **patched admin checkout**, run the file-only migration first:
 
@@ -577,32 +588,49 @@ From the **patched admin checkout**, run the file-only migration first:
 sudo ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies
 ```
 
-This atomically replaces each proxy-enabled tenant's proxy unit and every
-installed registered proxy unit, including disabled tenants' leftover units.
-It neither reads tenant env data nor invokes OpenRC, the full tenant renderer,
-retirement hooks or sidecar lifecycle helpers. It works even when `proxy.env`
-is malformed or the tenant proxy code is still old. An unregistered or
-symlinked installed proxy unit blocks the migration: inspect and move that
-file outside `init.d` using file operations, then retry before invoking OpenRC.
+This replaces each proxy-enabled tenant's proxy unit and every installed
+registered proxy unit — including disabled tenants' leftover units —
+atomically **per file** (the fleet sweep itself is not a transaction). For
+each unit it replaces, it first copies the installed bytes verbatim to a
+private archive (`$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`, default
+`/var/lib/lunarwing/openrc-proxy-backups`, directory mode 0700, files mode
+0600, never executable, never sourced). The render aborts rather than
+replace a unit it cannot archive safely. It neither reads tenant env data
+nor invokes OpenRC, the full tenant renderer, retirement hooks or sidecar
+lifecycle helpers. It works even when `proxy.env` is malformed or the
+tenant proxy code is still old. An unregistered or symlinked installed
+proxy unit blocks the migration: inspect and move that file outside
+`init.d` using file operations, then retry before invoking OpenRC.
 The command does not change enablement flags or runlevels.
 
-Next update `tensorzero-proxy-configurations/lunarwing-proxy.py` in every
-proxy tenant's checkout and restart through mt-admin. The patched
-`upgrade-tenant` automatically performs the same fleet neutralization before
-backup/service probes, and on OpenRC also renders the target tenant's units
-before `stop_tenant` (then renders again after the build). `--skip-render`
-skips ordinary rendering, **not** the mandatory proxy security migration.
-For manually updated checkouts, use `render-units <tenant>` followed by
-`restart-tenant <tenant>` only after the fleet migration succeeds.
+Next, in the **same maintenance window**, update
+`tensorzero-proxy-configurations/lunarwing-proxy.py` in every proxy
+tenant's checkout before anything restarts that tenant: an older proxy
+rejects `--tensorzero-env`, and the daemon's conf.d hard-`need`s the proxy,
+so a reboot, self-heal run, watchdog run or `start-tenant` takes the whole
+tenant down until its checkout is updated. Then restart through mt-admin.
 
-All mt-admin OpenRC service/update calls check the installed proxy defaults
-before invoking OpenRC, and stop/status fail with the fleet render command
-when any legacy proxy remains. Updating a source checkout alone does not
-repair installed units. An older tenant proxy rejects the new option and
-fails startup rather than selecting its legacy default. Keep the repaired
-units on rollback; restore/update compatible proxy code instead of restoring
-the URL-interpolating renderer. Root-owned conf.d overrides remain trusted
-operator shell configuration.
+From deploying the patched mt-admin until `render-units --all-proxies`
+succeeds, every mt-admin command on OpenRC **except** `help`, the fleet
+migration and `upgrade-tenant` refuses up front with the migration command.
+The service/update wrappers return exit code **125** for a refusal — never
+an OpenRC service state — so `remove-tenant`, `restore-tenant`,
+`migrate-owner-scope` and the writer-quiescence probes cannot misread a
+refused or refused-looking status as "stopped".
+
+The patched `upgrade-tenant` performs the same fleet neutralization before
+backup/service probes even with `--skip-render` (`--skip-render` skips
+ordinary rendering, **not** the migration), validates the target tenant's
+proxy env before stopping (a full pre-stop re-render was deliberately
+rejected: stop must operate against the *installed* unit contract), and
+aborts if the tenant cannot be stopped rather than upgrading a still-running
+tenant. For manually updated checkouts, use `render-units <tenant>` followed
+by `restart-tenant <tenant>` only after the fleet migration succeeds.
+
+Updating a source checkout alone does not repair installed units. Keep the
+repaired units on rollback; restore/update compatible proxy code instead of
+restoring the URL-interpolating renderer. Root-owned conf.d overrides remain
+trusted operator shell configuration.
 
 **Sibling render-site audit:**
 

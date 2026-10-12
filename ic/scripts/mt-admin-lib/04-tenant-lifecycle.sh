@@ -366,6 +366,7 @@ tenant_writers_active() {
       [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
       rc=0
       state="$(_openrc_service "$service" status 2>&1)" || rc=$?
+      [[ "$rc" -ne 125 ]] || return 2
       case "$state" in
         # WI#137: the WeeChat unit reports "session is up" / "session is not
         # running" instead of the standard started/stopped wording. "not
@@ -759,6 +760,10 @@ remove_tenant() {
   local purge="${2:-false}"
 
   name="$(sanitize_name "$name")"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == openrc ]]; then
+    require_safe_openrc_proxy_units || die "OpenRC proxy migration required; refusing removal"
+  fi
   say "=== Removing tenant: $name ==="
   say ""
 
@@ -767,11 +772,11 @@ remove_tenant() {
 
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    stop_tenant_systemd "$name"
+    stop_tenant_systemd "$name" || die "stop failed; refusing removal of '$name'"
     uninstall_tenant_systemd "$name"
   else
-    stop_tenant_openrc "$name"
-    uninstall_tenant_openrc "$name"
+    stop_tenant_openrc "$name" || die "stop failed; refusing removal of '$name'"
+    uninstall_tenant_openrc "$name" || die "unit removal failed for '$name'"
   fi
   say ""
 
@@ -832,7 +837,7 @@ _render_tenant_units_locked() {
     _systemctl_user "$name" daemon-reload >/dev/null || return 1
   else
     render_voice_openrc_assets "$name" || return 1
-    render_tenant_openrc_units "$name"
+    render_tenant_openrc_units "$name" || return 1
   fi
   say "units re-rendered for '$name' (services NOT restarted)."
   say "run-command changes need a restart to apply: $0 restart-tenant $name"
@@ -1424,7 +1429,8 @@ upgrade_tenant_darkirc_locked() {
 # OpenRC/systemd themselves, so this works on any supported init system. See
 # docs/ops/TENANT-RENAME-MIGRATION-1.1.9.md for the 1.1.9 rename specifics.
 # OpenRC additionally neutralizes fleet proxy units before backup/probes, then
-# renders this tenant before stopping it (WI#376 / !1547).
+# validates proxy settings before stopping (WI#376 / !1547). Other units retain
+# their installed stop contract until the old processes have been stopped.
 upgrade_tenant() {
   local name="$1"
   shift
@@ -1511,10 +1517,10 @@ upgrade_tenant_locked() {
 
   previous_commit="$("${tgit[@]}" rev-parse --verify HEAD)" \
     || die "failed to record current tenant commit"
-  if [[ "$INIT_SYSTEM" == openrc && "$do_render" == true ]]; then
-    render_tenant_units "$name" || die "pre-stop OpenRC rendering failed; tenant was not stopped"
+  if [[ "$INIT_SYSTEM" == openrc ]] && tenant_proxy_enabled "$name"; then
+    validate_openrc_proxy_env "$name" || die "proxy validation failed; tenant was not stopped"
   fi
-  stop_tenant "$name"
+  stop_tenant "$name" || die "stop failed; not upgrading '$name'"
 
   say "checking out $target at $target_commit (as $name) ..."
   if [[ "$checkout_ref" != "$target" ]]; then

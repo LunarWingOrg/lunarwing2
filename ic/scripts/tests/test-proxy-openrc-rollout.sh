@@ -11,6 +11,7 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 export OPENRC_INITD_DIR="$fixture/init.d"
 export OPENRC_CONFD_DIR="$fixture/conf.d"
+export OPENRC_PROXY_BACKUP_DIR="$fixture/backup-units"
 export PORTS_REGISTRY="$fixture/ports.json"
 export INIT_SYSTEM=openrc
 mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR"
@@ -72,6 +73,34 @@ stop_tenant_openrc alice
 openrc_service_state lunarwing-proxy-alice >/dev/null
 [[ -s "$fixture/commands" && ! -e "$fixture/evaluated" ]] \
   || fail 'safe fleet did not permit OpenRC operations'
+
+# Replaced units are preserved outside init.d, private and never executable —
+# including any suspicious URL bytes, so evidence survives the migration.
+[[ -d "$OPENRC_PROXY_BACKUP_DIR" && ! -L "$OPENRC_PROXY_BACKUP_DIR" \
+  && "$(stat -c '%u:%a' -- "$OPENRC_PROXY_BACKUP_DIR")" == "$(id -u):700" ]] \
+  || fail 'backup archive directory unsafe'
+shopt -s nullglob
+backups=("$OPENRC_PROXY_BACKUP_DIR"/lunarwing-proxy-*)
+shopt -u nullglob
+[[ "${#backups[@]}" -ge 3 ]] || fail 'replaced units were not preserved'
+found_suspicious=0
+for backup in "${backups[@]}"; do
+  [[ -f "$backup" && ! -L "$backup" && ! -x "$backup" \
+    && "$(stat -c '%a:%h' -- "$backup")" == "600:1" ]] \
+    || fail "unsafe backup: $backup"
+  if grep -Fq -- '--tensorzero http://fixture.invalid/' "$backup"; then
+    found_suspicious=1
+  fi
+done
+[[ "$found_suspicious" == 1 ]] || fail 'backup copy lost the suspicious installed bytes'
+# A backup directory inside init.d must be refused rather than hand OpenRC an
+# unparseable copy where dependency scanning could pick it up.
+OPENRC_PROXY_BACKUP_DIR="$fixture/init.d/backups"
+if (render_proxy_openrc_unit alice) >"$fixture/backup-path.log" 2>&1; then
+  fail 'renderer accepted an archive directory inside init.d'
+fi
+[[ ! -e "$fixture/init.d/backups" ]] || fail 'renderer created the unsafe archive directory'
+OPENRC_PROXY_BACKUP_DIR="$fixture/backup-units"
 
 # Unknown and symlinked installed units must fail closed, not get ignored by
 # a registry-only sweep or followed to some other file.

@@ -395,20 +395,32 @@ require_safe_openrc_proxy_units() {
     if [[ ! -f "$path" || -L "$path" ]] || ! grep -Eq \
       '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"; then
       say "refusing OpenRC operation: unsafe legacy proxy unit $path; run: $0 render-units --all-proxies" >&2
-      return 1
+      return 125
     fi
   done
+}
+
+# Refuse before a dispatcher handler can perform writes or interpret a refused
+# probe as an inactive service. Keep help and the file-only migration paths open.
+openrc_dispatch_preflight() {
+  case "$1" in
+    help|--help|-h|upgrade-tenant) return 0 ;;
+    render-units) [[ $# -eq 2 && "$2" == --all-proxies ]] && return 0 ;;
+  esac
+  ensure_init_system || return 1
+  [[ "$INIT_SYSTEM" != openrc ]] || require_safe_openrc_proxy_units
 }
 
 _openrc_service() {
   # All mt-admin rc-service/rc-update calls go through these guards, including
   # worker, sidecar and cron operations which can also trigger a deptree rebuild.
-  require_safe_openrc_proxy_units || return 1
+  # 125 is a refused operation, never an OpenRC service state.
+  require_safe_openrc_proxy_units || return 125
   rc-service "$@"
 }
 
 _openrc_update() {
-  require_safe_openrc_proxy_units || return 1
+  require_safe_openrc_proxy_units || return 125
   rc-update "$@"
 }
 
@@ -445,7 +457,31 @@ render_all_openrc_proxy_units() {
   say "OpenRC proxy units neutralized fleet-wide (file writes only; services not restarted)."
 }
 
-# Pure proxy renderer shared by normal rendering and the fleet migration. The
+# Preserve the installed bytes before replacement, including suspicious URLs.
+# CLI writers require root; EUID also permits isolated non-root test fixtures.
+# The archive is private, outside init.d, non-executable, and never sourced.
+backup_openrc_proxy_unit() {
+  local path="$1" dir init_dir backup
+  [[ -e "$path" || -L "$path" ]] || return 0
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  darkirc_path_components_safe "$OPENRC_PROXY_BACKUP_DIR" || return 1
+  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" || return 1
+  init_dir="$(realpath -m -- "$OPENRC_INITD_DIR")" || return 1
+  [[ "$dir" != "$init_dir" && "$dir" != "$init_dir/"* ]] || return 1
+  if [[ ! -e "$dir" ]]; then
+    install -d -m 0700 -- "$dir" || return 1
+  fi
+  [[ -d "$dir" && ! -L "$dir" && "$(stat -c '%u:%a' -- "$dir")" == "$EUID:700" ]] \
+    || return 1
+  backup="$(mktemp "$dir/${path##*/}.XXXXXX")" || return 1
+  if ! cat -- "$path" >"$backup" || ! chmod 0600 "$backup"; then
+    rm -f -- "$backup"
+    return 1
+  fi
+  say "preserved installed proxy unit: $backup"
+}
+
+# File-only proxy renderer shared by normal rendering and the fleet migration. The
 # atomic replacement prevents dependency scanning from seeing a partial script.
 render_proxy_openrc_unit() {
   local name="$1" proxy_port proxy_bin env_dir run_dir log_dir path tmp
@@ -513,10 +549,25 @@ INITEOF
     rm -f -- "$tmp"
     return 1
   fi
+  if ! backup_openrc_proxy_unit "$path"; then
+    rm -f -- "$tmp"
+    say "cannot safely back up $path; installed unit was not replaced" >&2
+    return 1
+  fi
   if ! chmod 0755 "$tmp" || ! mv -T -- "$tmp" "$path"; then
     rm -f -- "$tmp"
     return 1
   fi
+}
+
+validate_openrc_proxy_env() {
+  local name="$1" env_file proxy_upstream
+  env_file="$(tenant_env_dir "$name")/proxy.env"
+  proxy_upstream="$(read_tenant_env_value "$name" "$env_file" TENSORZERO_URL)" \
+    || die "cannot safely read proxy.env for tenant '$name'"
+  [[ -n "$proxy_upstream" ]] \
+    || die "proxy enabled for tenant '$name' but $env_file has no TENSORZERO_URL; configure it before rendering or upgrading"
+  validate_llm_url "$proxy_upstream" "proxy.env TENSORZERO_URL ($name)"
 }
 
 install_openrc_env_exec() {
@@ -1160,12 +1211,7 @@ INITEOF
   # parsed shell script (WI#376). env-exec loads proxy.env after command_user
   # drops privileges; the proxy reads TENSORZERO_URL without shell evaluation.
   if tenant_proxy_enabled "$name"; then
-  local proxy_upstream
-  proxy_upstream="$(read_tenant_env_value "$name" "$env_dir/proxy.env" TENSORZERO_URL)" \
-    || die "cannot safely read proxy.env for tenant '$name'"
-  [[ -n "$proxy_upstream" ]] \
-    || die "proxy enabled for tenant '$name' but $env_dir/proxy.env has no TENSORZERO_URL; re-render with: $0 add-tenant $name --tensorzero-url <url>"
-  validate_llm_url "$proxy_upstream" "proxy.env TENSORZERO_URL ($name)"
+  validate_openrc_proxy_env "$name" || return 1
   render_proxy_openrc_unit "$name" || return 1
   fi
 
