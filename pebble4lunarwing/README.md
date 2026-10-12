@@ -88,6 +88,19 @@ See `.env.example` for the full list with descriptions.
 - `GET /health` — Worker status, uptime, version
 - `GET /ready` — WebSocket readiness and connection count
 
+## Exposure Policy (WI#357)
+
+Workers must never self-expose: no own tunnels, relays, pairing links, or
+public listeners, and no publishing session content to third-party services.
+LunarWing owns every public exposure path through the daemon's tunnel; the
+only instruction channel into this worker is the daemon's job dispatch → the
+bridge → pebble on loopback. Upstream pebble has no listener/pairing/sharing
+surface; its one outbound footgun is `pebble self-update` (fetches GitHub
+releases and replaces the binary) — do not expose it, and keep the pinned
+`PEBBLE_LOCK_SHA256` build contract intact. Full policy, controls, and the
+per-bump checklist: `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure
+policy (WI#357)".
+
 ## Protocol
 
 Speaks the `lunarwing-agent-v1` WebSocket subprotocol (the legacy `ironclaw-agent-v1` alias is no longer accepted). See `../opencode4lunarwing/agent_comm_protocol.json` for the full spec.
