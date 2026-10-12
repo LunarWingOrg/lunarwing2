@@ -79,7 +79,7 @@ pub struct FaultInjectingTestDb {
 impl FaultInjectingTestDb {
     /// Open a fresh migrated libSQL database in a temporary directory.
     pub async fn new() -> Self {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let dir = tempfile::tempdir().expect("failed to create temp dir"); // safety: test-only helper
         Self::new_in(dir).await
     }
 
@@ -90,11 +90,11 @@ impl FaultInjectingTestDb {
 
         let backend = LibSqlBackend::new_local(&dir.path().join("test.db"))
             .await
-            .expect("failed to create test LibSqlBackend");
+            .expect("failed to create test LibSqlBackend"); // safety: test-only helper
         backend
             .run_migrations()
             .await
-            .expect("failed to run migrations");
+            .expect("failed to run migrations"); // safety: test-only helper
         Self {
             backend: Arc::new(backend),
             _dir: dir,
@@ -111,37 +111,37 @@ impl FaultInjectingTestDb {
         self.backend
             .connect()
             .await
-            .expect("failed to connect to test db")
+            .expect("failed to connect to test db") // safety: test-only helper
             .execute_batch(sql)
             .await
-            .expect("failed to execute fault-injection SQL");
+            .expect("failed to execute fault-injection SQL"); // safety: test-only helper
     }
 
     /// Run `sql` with one text bind parameter; first column of the first row.
     pub async fn query_scalar_i64(&self, sql: &str, param: &str) -> i64 {
-        let conn = self.backend.connect().await.expect("failed to connect");
+        let conn = self.backend.connect().await.expect("failed to connect"); // safety: test-only helper
         let mut rows = conn
             .query(sql, [param.to_string()])
             .await
-            .expect("scalar query failed");
+            .expect("scalar query failed"); // safety: test-only helper
         rows.next()
             .await
-            .expect("scalar query row failed")
-            .expect("scalar query returned no rows")
+            .expect("scalar query row failed") // safety: test-only helper
+            .expect("scalar query returned no rows") // safety: test-only helper
             .get::<i64>(0)
-            .expect("scalar column is not i64")
+            .expect("scalar column is not i64") // safety: test-only helper
     }
 
     /// Run `sql` (no params); first column of the first row as a `String`.
     pub async fn query_scalar_string(&self, sql: &str) -> String {
-        let conn = self.backend.connect().await.expect("failed to connect");
-        let mut rows = conn.query(sql, ()).await.expect("scalar query failed");
+        let conn = self.backend.connect().await.expect("failed to connect"); // safety: test-only helper
+        let mut rows = conn.query(sql, ()).await.expect("scalar query failed"); // safety: test-only helper
         rows.next()
             .await
-            .expect("scalar query row failed")
-            .expect("scalar query returned no rows")
+            .expect("scalar query row failed") // safety: test-only helper
+            .expect("scalar query returned no rows") // safety: test-only helper
             .get::<String>(0)
-            .expect("scalar column is not a string")
+            .expect("scalar column is not a string") // safety: test-only helper
     }
 }
 
