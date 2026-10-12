@@ -781,7 +781,55 @@ stamped stays WI#301's record case; a run that completed needs no retry; a
 run that failed on its own during teardown is record-only, because the
 persisted row does not carry the failure kind and WI#302 forbids retrying
 budget exhaustion; a suspended or waiting thread stays with checkpoint or
-gate recovery. Because the watcher no longer hides the thread, stop
+gate recovery.
+
+The stamp is also cleared WITHOUT a retry whenever the fire's future
+already has an owner (WI#337): the stamped thread carries a persisted
+retry marker (the retry is already armed — the boot sweep re-armed it this
+boot, or the pre-crash watcher persisted it before dying), the thread is
+`Running` again (checkpoint recovery resumed it ahead of the resolution,
+so its live watcher owns the outcome), or the stamped thread is no longer
+the mission's newest fire (a later fire superseded it). Resolving any of
+those into a fresh retry would arm the same retry twice — payload-less
+cron/manual fires would then run twice, contradicting the "suppresses the
+armed retry instead of doubling" invariant — so the resolution only
+clears the stamp and records a `SHUTDOWN RESOLUTION: ... already owned
+...; not auto-refired` approach entry naming the owner. A stamp is also
+resolved record-only when it is older than 24 hours
+(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`): the resolution is a next-boot
+affair, and a stamp that old was left behind by an older build or by a
+downtime long enough that cadence or operator re-fires already superseded
+the interrupted fire. A missing or unparseable `recorded_at` counts as
+stale (every writer stamps it, so its absence means the stamp is
+malformed); a future-dated `recorded_at` is never stale, so clock skew
+cannot silently drop a fire. The stale and already-owned clears are
+deliberately silent toward channels — no interruption notice is emitted
+for a fire the mission does not re-arm — and both are recorded in the
+approach history. Note the asymmetry with the marker path: the boot sweep
+re-arms a persisted retry marker of any age, so after a downtime longer
+than the stamp window a fire that settled within the grace is still
+retried (marker path) while one that settled after the grace is
+record-only (stamp path).
+
+For the settled-stop arm the resolution's durable writes follow the
+outcome processor's Q-4 order: the mission row — stamp cleared — saves
+BEFORE the retry marker, so no crash prefix can leave a marker beside a
+still-stamped mission (the combination the next boot's sweep and
+resolution would otherwise arm twice). The trade-off is an accepted loss
+window: a crash between that save and the marker write loses the fire
+silently, the same accepted class as the pre-WI#188 loss (no trace, or a
+mission row without a marker) — with the already-owned guard above, the
+reverse order would be lossless only for the double-arm it used to risk,
+so the mission row stays the first write. The interruption notice is sent
+only after the marker persists, so a crash can never leave a delivered
+"retry scheduled" notice without the persisted retry behind it; the
+notice's acknowledgement rides a second marker write, and a crash before
+it simply lets the next boot's sweep re-emit the notice. A retry armed by
+the resolution is admitted into the same process-local `recovered_retries`
+set the sweep uses, so a later sweep pass in the same process cannot arm
+it a second time.
+
+Because the watcher no longer hides the thread, stop
 requests, injected messages, and `is_running` now reach watched mission
 threads during normal operation as well — so pausing or retiring
 conversation-insights now really stops its workers. A thread stopped while
