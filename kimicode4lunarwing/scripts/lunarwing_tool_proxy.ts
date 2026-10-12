@@ -87,14 +87,24 @@ export class ToolProxyRelay {
   private readonly tasks = new Map<string, TaskProxy>()
 
   /** Start the per-task IPC server. Returns the socket path, or null when the
-   * server could not be started (the task then simply runs without tools). */
+   * server could not be started (the task then simply runs without tools).
+   * Never throws: the filesystem setup runs on a shared, same-uid /tmp tree
+   * that a concurrent task process could sabotage (MR !1549 EF-2). */
   async startTask(taskId: string, hubSocket: { send(data: string): void }): Promise<TaskProxyHandle | null> {
     if (this.tasks.has(taskId)) return null
     const socketPath = taskSocketPath(taskId)
-    mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 })
-    // A stale socket file from a crashed earlier task would make listen()
-    // fail with EADDRINUSE; remove it (the path is hash-bound to this task).
-    rmSync(socketPath, { force: true })
+    try {
+      mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 })
+      // A stale socket file from a crashed earlier task would make listen()
+      // fail with EADDRINUSE; remove it (the path is hash-bound to this task).
+      rmSync(socketPath, { force: true })
+    } catch (err) {
+      console.error(
+        `[tool-proxy] task ${taskId}: proxy dir setup failed (task runs without tools):`,
+        err instanceof Error ? err.message : err,
+      )
+      return null
+    }
 
     const task: TaskProxy = {
       taskId,
@@ -160,7 +170,16 @@ export class ToolProxyRelay {
     // shim's next connect() retry; it gets ECONNREFUSED from the closed
     // server, which the shim surfaces as a tool error.
     task.server.close()
-    rmSync(task.socketPath, { force: true })
+    try {
+      rmSync(task.socketPath, { force: true })
+    } catch (err) {
+      // Best effort (EF-2): a sabotaged proxy dir must not throw out of task
+      // teardown — the finally in the bridge still has to release the slot.
+      console.error(
+        `[tool-proxy] task ${taskId}: socket cleanup failed:`,
+        err instanceof Error ? err.message : err,
+      )
+    }
     for (const [, perSocket] of this.pendingBySocket) {
       for (const [key, waiter] of perSocket) {
         if (waiter.taskId !== taskId) continue
@@ -174,6 +193,19 @@ export class ToolProxyRelay {
   /** Number of tasks with a live IPC server (test introspection). */
   get activeTaskCount(): number {
     return this.tasks.size
+  }
+
+  /** Hub socket closed: fail every waiter parked on it and drop the map, so
+   * reconnects never accumulate stale pending state (MR !1549 EF-9). Tasks'
+   * IPC servers stay up; their next request just fails to reach the hub. */
+  dropHubSocket(hubSocket: object): void {
+    const pending = this.pendingBySocket.get(hubSocket)
+    if (!pending) return
+    this.pendingBySocket.delete(hubSocket)
+    for (const [, waiter] of pending) {
+      clearTimeout(waiter.timer)
+      waiter.resolve({ error: "hub connection closed before the tool reply arrived" })
+    }
   }
 
   private acceptConnection(

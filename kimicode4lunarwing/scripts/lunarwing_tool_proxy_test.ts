@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -229,6 +229,65 @@ test("closing a task fails its in-flight calls", async () => {
   assert.equal(response.ok, true)
   // The relay synthesizes an error payload so the shim never hangs.
   assert.equal(typeof response.error, "string")
+})
+
+test("startTask returns null instead of throwing when the proxy dir is unusable (EF-2)", async () => {
+  // MR !1549 EF-2: the proxy dir is a same-uid shared /tmp tree — a task
+  // process can replace it with a plain file or chmod it. The relay must
+  // degrade to "task runs without tools", never throw into the bridge.
+  const filePath = join(workDir, "proxy-as-file")
+  writeFileSync(filePath, "not a directory")
+  process.env.LUNARWING_TOOL_PROXY_DIR = filePath
+  try {
+    const hub = new FakeHubSocket()
+    const handle = await relay.startTask("task-sabotaged", hub)
+    assert.equal(handle, null)
+    assert.equal(relay.activeTaskCount, 0)
+    assert.equal(hub.sent.length, 0)
+  } finally {
+    process.env.LUNARWING_TOOL_PROXY_DIR = workDir
+  }
+})
+
+test("closeTask never throws even when the socket path cannot be removed (EF-2)", async () => {
+  const sub = mkdtempSync(join(workDir, "close-sabotage-"))
+  process.env.LUNARWING_TOOL_PROXY_DIR = sub
+  const hub = new FakeHubSocket()
+  const handle = await relay.startTask("task-close-sabotage", hub)
+  assert.ok(handle)
+  // Replace the proxy dir with a plain file: rmSync(socketPath) then fails
+  // with ENOTDIR, which closeTask must swallow (teardown continues).
+  rmSync(sub, { recursive: true, force: true })
+  writeFileSync(sub, "not a directory")
+  try {
+    handle.close()
+    assert.equal(relay.activeTaskCount, 0)
+  } finally {
+    process.env.LUNARWING_TOOL_PROXY_DIR = workDir
+    rmSync(sub, { force: true })
+  }
+})
+
+test("dropHubSocket fails pending waiters and frees the socket's pending map (EF-9)", async () => {
+  const hub = new FakeHubSocket()
+  const handle = await relay.startTask("task-drop", hub)
+  assert.ok(handle)
+
+  const responsePromise = ipcRequest(handle.socketPath, {
+    op: "call",
+    call_id: "call-drop",
+    name: "memory_read",
+    arguments: {},
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  assert.equal(hub.sent.length, 1)
+  relay.dropHubSocket(hub)
+  const response = await responsePromise
+  assert.equal(response.ok, true)
+  assert.match(String(response.error), /hub connection closed/)
+  // A second drop is a no-op — the entry is gone, not lingering empty.
+  relay.dropHubSocket(hub)
+  handle.close()
 })
 
 test("socket path is filesystem-safe and unique per task id", () => {

@@ -120,6 +120,59 @@ console.log(JSON.stringify({ role: "assistant", content: "done" }))
   }
 })
 
+test("a sabotaged tool-proxy directory neither fails the task nor leaks its slot (EF-2)", async () => {
+  // MR !1549 EF-2: the proxy dir lives on a same-uid shared /tmp tree; another
+  // process can replace it with a plain file. startTask must degrade to
+  // "no tools", the task must still report a task_result, and the
+  // concurrency slot must be released for the next task.
+  const root = mkdtempSync(join(tmpdir(), "kimi-proxy-sabotage-"))
+  const bin = join(root, "mock-kimi")
+  writeFileSync(bin, `#!/usr/bin/env node
+const sock = process.env.LUNARWING_TOOL_PROXY_SOCKET
+console.log(JSON.stringify({ role: "assistant", content: sock ? "HAS_PROXY_ENV" : "NO_PROXY_ENV" }))
+`, { mode: 0o755 })
+  const proxyDirFile = join(root, "proxy-as-file")
+  writeFileSync(proxyDirFile, "not a directory")
+  const port = await freePort()
+  const child = startBridge(port, "sabotage-token", {
+    WORKSPACE_ROOT: root,
+    KIMI_BIN: bin,
+    LUNARWING_TOOL_PROXY_DIR: proxyDirFile,
+  })
+  let ws: WebSocket | undefined
+  try {
+    await waitForListening(child)
+    ws = await connect(port, "sabotage-token")
+    const runTask = (taskId: string) => new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`task ${taskId} never reported a result`)), 15000)
+      ws!.on("message", function onMessage(data) {
+        const message = JSON.parse(data.toString())
+        if (message.type === "task_result" && message.payload.task_id === taskId) {
+          clearTimeout(timer)
+          ws!.off("message", onMessage)
+          resolve(message.payload)
+        }
+      })
+      ws!.once("error", reject)
+      ws!.send(JSON.stringify({ type: "task_request", payload: {
+        task_id: taskId, prompt: "hi", timeout_ms: 10000,
+      }}))
+    })
+    const first = await runTask("sabotage-1")
+    assert.equal(first.status, "success")
+    assert.match(String(first.output), /NO_PROXY_ENV/,
+      "proxy setup failure must degrade to a tool-less task, not a throw")
+    // The slot was released: a second task on the same socket also completes.
+    const second = await runTask("sabotage-2")
+    assert.equal(second.status, "success")
+    assert.match(String(second.output), /NO_PROXY_ENV/)
+  } finally {
+    ws?.close()
+    child.kill("SIGTERM")
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("task MCP shim reaches hub tools through the bridge tool-proxy relay", async () => {
   // WI#324 full worker-side path: hub task_request -> bridge starts a per-task
   // proxy socket -> the task's CLI (mock kimi standing in for the MCP shim)

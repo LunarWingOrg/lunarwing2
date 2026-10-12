@@ -27,7 +27,7 @@ import {
   type WsState,
 } from "./lunarwing_runtime.js"
 import { executeTask } from "./kimi_task_executor.js"
-import { proxyEnvForTask, ToolProxyRelay } from "./lunarwing_tool_proxy.js"
+import { proxyEnvForTask, ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.js"
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
 
 // A single malformed frame or a stray async error must not take the whole
@@ -230,14 +230,17 @@ async function handleTaskRequest(
   activeWorkspaces.set(workspace, request.task_id)
 
   // WI#324: give the task's CLI a local tool-proxy socket so its MCP shim can
-  // reach the hub over this connection. A listen failure never fails the task
-  // — it just runs without LunarWing tools (hub stays deny-by-default).
-  const toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
-  const proxyEnv = toolProxy
-    ? proxyEnvForTask(request.task_id, toolProxy.socketPath)
-    : undefined
-
+  // reach the hub over this connection. A listen/fs failure never fails the
+  // task — it just runs without LunarWing tools (hub stays deny-by-default).
+  // startTask runs INSIDE the try (MR !1549 EF-2): an unexpected throw must
+  // still hit the finally below so the concurrency slot and workspace lock
+  // are released and the hub is not left waiting on a task_result.
+  let toolProxy: TaskProxyHandle | null = null
   try {
+    toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
+    const proxyEnv = toolProxy
+      ? proxyEnvForTask(request.task_id, toolProxy.socketPath)
+      : undefined
     await executeTask(
       request,
       (progress: TaskProgress) => {
@@ -338,6 +341,7 @@ function startServer(): void {
 
     ws.on("close", () => {
       abortSocketTasks(ws as unknown as BridgeSocket)
+      toolProxyRelay.dropHubSocket(ws as unknown as BridgeSocket)
       if (pingTimer) clearInterval(pingTimer)
       connectionCount--
       updateState()
@@ -409,6 +413,7 @@ async function startClient(): Promise<void> {
 
       ws.addEventListener("close", (event: WebSocket.CloseEvent) => {
         abortSocketTasks(bridgeSocket)
+        toolProxyRelay.dropHubSocket(bridgeSocket)
         console.log(`[bridge] disconnected from hub: ${event.code} ${event.reason}`)
         updateState(false)
         scheduleReconnect()
