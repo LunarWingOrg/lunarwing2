@@ -132,7 +132,8 @@ migrate_owner_scope() {
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     _systemctl_user "$name" stop "lunarwing-${name}.service" 2>/dev/null || true
   else
-    rc-service "lunarwing-${name}" stop >/dev/null 2>&1 || true
+    _openrc_service "lunarwing-${name}" stop \
+      || die "stop failed; refusing owner-scope migration for '$name'"
   fi
 
   # Connect over the container's LOCAL SOCKET — psql runs INSIDE the pg container via

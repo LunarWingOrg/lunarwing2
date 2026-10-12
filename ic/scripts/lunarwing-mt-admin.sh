@@ -69,6 +69,7 @@ RELAY_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-relay-env-exec.py"
 RELAY_ENV_EXEC="/usr/local/libexec/lunarwing-relay-env-exec"
 OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
 OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
+OPENRC_PROXY_BACKUP_DIR="${LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR:-/var/lib/lunarwing/openrc-proxy-backups}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 # WI#330: no built-in default — the historical developer-LAN address was
@@ -425,15 +426,19 @@ Commands:
                                    Workers: pebble, opencode, kimi, opencode2
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
+  render-units --all-proxies      OpenRC only: replace proxy units fleet-wide without
+                                  invoking OpenRC (WI#376 neutralize-first migration)
   upgrade-tenant <name> --target <ref>
                                   In-place upgrade: backup, fetch, clean-tree gate,
                                   stop, checkout <ref> (as tenant user), rebuild
                                    with WASM and selected OpenCode/Kimi workers, re-render
                                   units, patch env, start.
+                                  OpenRC neutralizes fleet proxy units before probes/stop.
                                   Long-running — run inside tmux.
     --source-repo <path>           Point the tenant's git origin at this repo first
     --no-backup                    Skip the pre-upgrade Postgres backup
-    --skip-render                  Keep existing unit files (run render-units later;
+    --skip-render                  Keep other unit files; OpenRC proxy neutralization
+                                   is mandatory (run render-units later;
                                    must happen before v2.0.0 for pre-1.1.9 tenants)
   rotate-pg-password <name>       Generate a new random PG password (ALTER ROLE + env update)
   psql <name> [psql args...]      Run psql inside the tenant's own PostgreSQL
@@ -569,6 +574,9 @@ Environment:
   LUNARWING_MT_STUDY_NOTES_REPO    Repository used when that checkout is first cloned
   LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT
                                    Root-owned snapshot directory used by the host scheduler
+  LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR
+                                   Private archive for superseded OpenRC proxy units
+                                   (default /var/lib/lunarwing/openrc-proxy-backups)
   LUNARWING_MT_BACKUP_DIR          Backup directory (default /var/lib/lunarwing-backups)
   LUNARWING_MT_BACKUP_KEEP         Keep last N dumps per tenant (default 7; 0 = keep all)
 
@@ -594,6 +602,9 @@ main() {
     exit 1
   fi
   shift || true
+
+  openrc_dispatch_preflight "$command_name" "$@" \
+    || die "OpenRC proxy migration required; refusing $command_name"
 
   # An explicitly-chosen runtime persists no matter which command runs.
   # Without this, commands that never touch containers (list-tenants, tokens,
@@ -1158,9 +1169,13 @@ main() {
 
     render-units)
       require_root
-      [[ -n "${1:-}" ]] || die "usage: render-units <name>"
-      ports_registry_init
-      render_tenant_units "$1"
+      [[ $# -eq 1 ]] || die "usage: render-units <name>|--all-proxies"
+      if [[ "$1" == --all-proxies ]]; then
+        render_all_openrc_proxy_units
+      else
+        ports_registry_init
+        render_tenant_units "$1"
+      fi
       ;;
 
     upgrade-tenant)

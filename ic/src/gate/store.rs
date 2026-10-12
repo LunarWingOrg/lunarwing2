@@ -352,6 +352,35 @@ impl PendingGateStore {
         Ok(())
     }
 
+    /// Remove a gate by key only if its stored request id still matches.
+    ///
+    /// Cleanup paths that declared a gate stale from an earlier snapshot must
+    /// not remove a *replacement* gate inserted under the same `(user, thread)`
+    /// key while the decision was in flight (WI#332). The comparison happens
+    /// under the key reservation and the index lock, so a concurrent insert or
+    /// take cannot slip between check and removal. `RequestIdMismatch` means
+    /// the stored gate is not the snapshotted one and was left untouched.
+    pub async fn discard_if_request(
+        &self,
+        key: &PendingGateKey,
+        request_id: Uuid,
+    ) -> Result<(), GateStoreError> {
+        let _reservation = self.key_locks.reserve(key).await;
+        {
+            let mut inner = self.inner.lock().await;
+            let gate = inner.by_key.get(key).ok_or(GateStoreError::NotFound)?;
+            if gate.request_id != request_id {
+                return Err(GateStoreError::RequestIdMismatch);
+            }
+            let gate = inner.by_key.remove(key).ok_or(GateStoreError::NotFound)?;
+            inner.by_request_id.remove(&gate.request_id);
+        }
+        if let Some(ref persistence) = self.persistence {
+            persistence.remove(key).await?;
+        }
+        Ok(())
+    }
+
     /// Restore pending gates from persistent storage on startup.
     /// Prune expired disk entries too: the memory-only sweeper cannot see them.
     /// Returns the number of non-expired gates restored.
@@ -886,6 +915,61 @@ mod tests {
         // Gate still accessible for take
         let taken = store.take_verified(&key, request_id, "web").await;
         assert!(taken.is_ok());
+    }
+
+    // ── Request-id-checked discard (WI#332) ──────────────────
+
+    #[tokio::test]
+    async fn test_discard_if_request_removes_only_the_matching_gate() {
+        let store = PendingGateStore::in_memory();
+        let gate = sample_gate("web");
+        let key = gate.key();
+        let request_id = gate.request_id;
+        store.insert(gate).await.unwrap();
+
+        // A stale snapshot's request id must not remove the stored gate.
+        assert!(matches!(
+            store.discard_if_request(&key, Uuid::new_v4()).await,
+            Err(GateStoreError::RequestIdMismatch)
+        ));
+        assert!(store.peek(&key).await.is_some());
+
+        // The matching request id discards.
+        store.discard_if_request(&key, request_id).await.unwrap();
+        assert!(store.peek(&key).await.is_none());
+        assert!(matches!(
+            store.discard_if_request(&key, request_id).await,
+            Err(GateStoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_discard_if_request_protects_a_replacement_gate() {
+        // WI#332: the dead-thread sweep decides from a snapshot; a replacement
+        // gate inserted under the same key before the discard lands must win.
+        let store = PendingGateStore::in_memory();
+        let tid = ThreadId::new();
+        let stale = sample_gate_with("alice", tid, "web", 300);
+        let stale_id = stale.request_id;
+        store.insert(stale).await.unwrap();
+
+        // Simulate the resolution path consuming the snapshotted gate and a
+        // replacement being parked under the same key.
+        let key = PendingGateKey {
+            user_id: "alice".into(),
+            thread_id: tid,
+        };
+        store.discard(&key).await.unwrap();
+        let replacement = sample_gate_with("alice", tid, "web", 300);
+        let replacement_id = replacement.request_id;
+        store.insert(replacement).await.unwrap();
+
+        assert!(matches!(
+            store.discard_if_request(&key, stale_id).await,
+            Err(GateStoreError::RequestIdMismatch)
+        ));
+        let view = store.peek(&key).await.expect("replacement must survive");
+        assert_eq!(view.request_id, replacement_id.to_string());
     }
 
     #[tokio::test]

@@ -422,7 +422,7 @@ setup_cgroups() {
   _openrc_cgroup_login_hook_install || die "failed to install the PAM cgroup login hook"
   _openrc_cgroup_pam_wire || die "failed to wire the PAM cgroup login hook"
   _openrc_cgroups_locald_render || die "failed to render the boot-time cgroup setup"
-  if rc-update show default 2>/dev/null | grep -qw local; then
+  if _openrc_update show default 2>/dev/null | grep -qw local; then
     :
   else
     say "WARNING: the 'local' service is not in the default runlevel; boot-time cgroup setup will not run (fix: rc-update add local default)" >&2

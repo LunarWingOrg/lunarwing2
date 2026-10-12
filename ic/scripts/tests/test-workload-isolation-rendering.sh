@@ -88,12 +88,16 @@ tenant_proxy_enabled()   { return 1; }
 tenant_darkirc_enabled() { return 1; }
 ensure_container_runtime() { :; }
 install_openrc_env_exec() { :; }
+# This rendering fixture uses synthetic accounts; the proxy boundary harness
+# separately exercises read_tenant_env_value with a real unprivileged identity.
+read_tenant_env_value() { _read_env_value "$2" "$3"; }
 chown() { :; }
 chmod() { :; }
 
 mkdir -p "$(tenant_repo t1)"
 export OPENRC_INITD_DIR="$MT_FIXTURE/init.d"
 export OPENRC_CONFD_DIR="$MT_FIXTURE/conf.d"
+export OPENRC_PROXY_BACKUP_DIR="$MT_FIXTURE/backup-units"
 
 # ── systemd unit rendering ───────────────────────────────────────────────────
 echo "== systemd unit rendering =="
@@ -171,8 +175,8 @@ assert_contains "OpenRC conf.d preserves rc_ulimit" "$daemon_confd" 'rc_ulimit="
 assert_contains "OpenRC conf.d preserves unrelated settings" "$daemon_confd" 'operator_setting="preserve-me"'
 
 tenant_proxy_enabled() { return 0; }
-# WI#330: the proxy unit renders the tenant's own TENSORZERO_URL from
-# proxy.env (never a fleet literal), so the fixture provides one.
+# WI#330/376: rendering validates the tenant's TENSORZERO_URL from proxy.env;
+# the OpenRC proxy loads its value only after dropping to the tenant.
 mkdir -p "$(tenant_env_dir t1)"
 printf 'TENSORZERO_URL=http://tz-fixture:3030/openai/v1\n' >"$(tenant_env_dir t1)/proxy.env"
 render_tenant_openrc_units t1

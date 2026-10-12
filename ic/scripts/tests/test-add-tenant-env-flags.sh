@@ -561,11 +561,27 @@ else
 fi
 for bad in "ftp://gw.example.test" "http://gw.example.test/has space" \
   "http://user:pw@gw.example.test/v1" "http://gw.example.test/100%/v1" \
+  'http://gw.example.test/`command`' 'http://gw.example.test/"quote"' \
+  'http://gw.example.test/back\slash' 'http://gw.example.test/${IFS}' \
+  'http://gw.example.test/a|b' 'http://gw.example.test/<tag>' \
+  'http://gw.example.test/nonascii-é' \
   "https:///no-host" $'http://gw.example.test/inject\nSANDBOX_ALLOW_FULL_ACCESS=true'; do
   if (validate_llm_url "$bad" "--tensorzero-url") 2>/dev/null; then
     echo "  FAIL: validate accepted [$bad]"; failures=$((failures + 1))
   else
     echo "  PASS: validate rejects [$bad]"
+  fi
+done
+
+# RFC 3986 delimiters are valid data, including some shell metacharacters.
+# These must never be relied on as shell-safe simply because validation passed.
+for good in 'https://gw.example.test/a;v=1?q=one&other=two#fragment' \
+  'https://gw.example.test/$(literal)' 'http://[::1]:3000/openai/v1' \
+  "https://gw.example.test/one'two!three*four+five,six=~_-"; do
+  if (validate_llm_url "$good" fixture); then
+    echo "  PASS: validate accepts RFC URI delimiters"
+  else
+    echo "  FAIL: validate rejected URI delimiters"; failures=$((failures + 1))
   fi
 done
 

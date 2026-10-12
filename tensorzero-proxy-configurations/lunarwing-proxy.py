@@ -10,11 +10,13 @@ Also forces tool_choice=none on all requests to prevent tool_calls responses.
 
 Usage:
     python3 lunarwing-proxy.py --port 3002 --tensorzero http://192.168.1.157:3000
+    TENSORZERO_URL=http://127.0.0.1:3000 python3 lunarwing-proxy.py --tensorzero-env
     
 Then point LunarWing at http://192.168.1.157:3002 instead of :3000
 """
 
 import json
+import os
 import socketserver
 import http.server
 import urllib.request
@@ -186,14 +188,30 @@ class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="LunarWing → TensorZero Proxy")
+    parser.add_argument("--port", "-p", type=int, default=PROXY_PORT)
+    upstream = parser.add_mutually_exclusive_group()
+    upstream.add_argument("--tensorzero", "-t", type=str, default=TENSORZERO_URL)
+    upstream.add_argument(
+        "--tensorzero-env", action="store_true",
+        help="Require TENSORZERO_URL from the environment (no built-in fallback)",
+    )
+    parser.add_argument("--bind", "-b", type=str, default="0.0.0.0")
+    args = parser.parse_args(argv)
+    if args.tensorzero_env:
+        # OpenRC loads this only after dropping to the tenant. Keep the value
+        # as data: never put tenant env contents into privileged shell code.
+        args.tensorzero = os.environ.get("TENSORZERO_URL")
+        if not args.tensorzero or not args.tensorzero.strip():
+            parser.error("TENSORZERO_URL is required with --tensorzero-env")
+    return args
+
+
 def main():
     global TENSORZERO_URL, PROXY_PORT
 
-    parser = argparse.ArgumentParser(description="LunarWing → TensorZero Proxy")
-    parser.add_argument("--port", "-p", type=int, default=PROXY_PORT)
-    parser.add_argument("--tensorzero", "-t", type=str, default=TENSORZERO_URL)
-    parser.add_argument("--bind", "-b", type=str, default="0.0.0.0")
-    args = parser.parse_args()
+    args = parse_args()
 
     TENSORZERO_URL = args.tensorzero.rstrip("/")
     PROXY_PORT = args.port

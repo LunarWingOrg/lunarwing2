@@ -17,7 +17,7 @@ use crate::agent::dispatcher::{
 };
 use crate::agent::session::{MAX_PENDING_MESSAGES, PendingApproval, Session, Thread, ThreadState};
 use crate::agent::submission::SubmissionResult;
-use crate::channels::web::util::truncate_preview;
+use crate::channels::web::util::{truncate_preview, truncate_preview_middle};
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
@@ -1001,10 +1001,14 @@ impl Agent {
                         other => truncate_preview(&other.to_string(), 500),
                     };
                     obj["result_preview"] = serde_json::Value::String(preview);
-                    // Store full result (truncated to ~1000 chars) for LLM context rebuild
+                    // Store full result (truncated to ~1000 chars) for LLM context rebuild.
+                    // Keep head AND tail: list-tool pagination envelopes
+                    // (next_cursor/truncated/complete) live at the very end,
+                    // and a head-only cut would lose the real cursor across a
+                    // DB round trip (WI#351).
                     let full_result = match result {
-                        serde_json::Value::String(s) => truncate_preview(s, 1000),
-                        other => truncate_preview(&other.to_string(), 1000),
+                        serde_json::Value::String(s) => truncate_preview_middle(s, 1000),
+                        other => truncate_preview_middle(&other.to_string(), 1000),
                     };
                     obj["result"] = serde_json::Value::String(full_result);
                 }

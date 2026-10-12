@@ -680,7 +680,8 @@ render_tenant_systemd_units() {
   # dialed an endpoint that could never answer).
   if tenant_proxy_enabled "$name"; then
   local proxy_upstream
-  proxy_upstream="$(_read_env_value "$env_dir/proxy.env" TENSORZERO_URL)"
+  proxy_upstream="$(read_tenant_env_value "$name" "$env_dir/proxy.env" TENSORZERO_URL)" \
+    || die "cannot safely read proxy.env for tenant '$name'"
   [[ -n "$proxy_upstream" ]] \
     || die "proxy enabled for tenant '$name' but $env_dir/proxy.env has no TENSORZERO_URL; re-render with: $0 add-tenant $name --tensorzero-url <url>"
   validate_llm_url "$proxy_upstream" "proxy.env TENSORZERO_URL ($name)"

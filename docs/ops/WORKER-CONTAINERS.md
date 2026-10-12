@@ -146,6 +146,8 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 
 Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
 
+In the fat (`--with-toolchains`) image the Rust/Go toolchains are anchored against the `/etc/profile` PATH reset in upstream pebble's `/bin/sh -lc` task shell (WI#334): an `/etc/profile.d` snippet plus real-binary `/usr/local/bin` symlinks and a `rustup` wrapper keep `cargo`/`go` on PATH after the reset, proven at build time in both the real spawn mode and a fully sanitised shell, and re-probed by the smoke script at the end of every fat mt-admin build (which targets a candidate tag and re-tags `:latest` only after the probe passes, using the build's own container runtime and `--pull=never`). Re-check any built image or running worker with `pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh image [ref]` / `container <name>`; see `docs/ops/PEBBLE-WORKER.md` "Task-Shell Toolchain PATH".
+
 Upstream's pinned lockfile ships rustls 0.23.41 (RUSTSEC-2026-0285, fixed >= 0.23.45) and has no newer release, so the reviewed patched lock is committed at `pebble4lunarwing/upstream/Cargo.lock` and copied over the checkout during the image build; it also retires upstream's yanked `chacha20 0.10.1` pin (0.10.2). The Dockerfile supplies the canonical reviewed `PEBBLE_LOCK_SHA256` default for CI, mt-admin, Compose, and plain Docker builds. `scripts/verify_upstream_lock.py` verifies that digest and compares complete parsed package records (including additions/removals, source, checksum, and dependencies; records are keyed by `(name, version, source)` so multi-version crates such as `cpufeatures`/`getrandom` are fully covered), allowing changes only to rustls/rustls-webpki/chacha20 and rejecting a no-op override so the input is retired once upstream ships its own fix. `.gitlab/deliverables.json` explicitly classifies this lock-only override under `build_inputs`, with ci-config regression checks and worker-image candidate coverage; it is not a standalone Cargo root.
 
 ## Opencode Worker
@@ -668,8 +670,14 @@ missing env var, instead of dying at the first LLM request after N retries.
 Multi-tenant provisioning has **no built-in LLM endpoint default**: `add-tenant`
 fails loudly unless it is given `--tensorzero-url` (or fleet
 `LUNARWING_MT_TENSORZERO_URL`), or `--llm-base-url` for a non-proxy tenant.
-The tenant's TensorZero proxy units render the tenant's own `TENSORZERO_URL`
-from `proxy.env`, not a fleet literal.
+The tenant's TensorZero proxy uses its own `TENSORZERO_URL` from `proxy.env`,
+not a fleet literal. systemd passes the validated URL as an argument; OpenRC
+passes `--tensorzero-env` and loads the URL only after dropping to the tenant
+(WI#376), so tenant data never becomes root-parsed init-script text. Existing
+OpenRC deployments must first neutralize installed proxy units fleet-wide with
+`render-units --all-proxies`, then update tenant proxy code before restarting.
+The patched `upgrade-tenant` performs this mandatory neutralization before
+service operations; see [the proxy URL boundary](MULTITENANCY-PRODUCTION.md#proxy-url-boundary-wi376).
 
 mt-admin renders `OPENCODE_BASE_URL` / `KIMI_BASE_URL` / `OPENCODE2_BASE_URL`
 into the tenant's `lunarwing.env`. Resolution order per worker:

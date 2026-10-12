@@ -258,8 +258,8 @@ _register_babysitter() {
   [[ "$MT_ROOTLESS" == "true" ]] || return 0
   # render_container_babysitter_unit installs the helper itself (covers pg + workers).
   render_container_babysitter_unit "$name" "$type" "$container" "$uid" "$home"
-  rc-update add "${container}-sup" default >/dev/null 2>&1 || true
-  rc-service "${container}-sup" start >/dev/null 2>&1 || true
+  _openrc_update add "${container}-sup" default >/dev/null 2>&1 || true
+  _openrc_service "${container}-sup" start >/dev/null 2>&1 || true
 }
 
 # Deregister a babysitter unit (stop + boot-disable + remove).
@@ -268,8 +268,8 @@ _deregister_babysitter() {
   ensure_init_system
   [[ "$INIT_SYSTEM" == "openrc" ]] || return 0
   [[ -f "/etc/init.d/${container}-sup" ]] || return 0
-  rc-service "${container}-sup" stop >/dev/null 2>&1 || true
-  rc-update del "${container}-sup" default >/dev/null 2>&1 || true
+  _openrc_service "${container}-sup" stop >/dev/null 2>&1 || true
+  _openrc_update del "${container}-sup" default >/dev/null 2>&1 || true
   rm -f "/etc/init.d/${container}-sup"
 }
 
@@ -574,7 +574,7 @@ _vision_daemon_running() {
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service" >/dev/null 2>&1
   else
-    rc-service "lunarwing-${name}" status >/dev/null 2>&1
+    _openrc_service "lunarwing-${name}" status >/dev/null 2>&1
   fi
 }
 
@@ -639,8 +639,8 @@ _wait_tenant_vision_healthy() {
 _stop_vision_openrc_supervisor() {
   local container="$1" supervisor="${1}-sup"
   [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$supervisor" ]] || return 0
-  rc-service "$supervisor" stop >/dev/null 2>&1 && return 0
-  rc-service "$supervisor" status 2>&1 | grep -Eqi 'stopped|inactive|dead'
+  _openrc_service "$supervisor" stop >/dev/null 2>&1 && return 0
+  _openrc_service "$supervisor" status 2>&1 | grep -Eqi 'stopped|inactive|dead'
 }
 
 _create_vision_container() {
@@ -701,7 +701,7 @@ _reconcile_vision_container() {
     say "config, image, or health ownership changed for $container; force-recreating"
     _stop_vision_supervision "$name" "$container" || return 1
     if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$container" ]]; then
-      rc-service "$container" stop >/dev/null 2>&1 || true
+      _openrc_service "$container" stop >/dev/null 2>&1 || true
     fi
     _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
     _ctr "$name" rm -f "$container" >/dev/null || return 1
@@ -802,7 +802,7 @@ stop_tenant_vision() {
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
     _stop_vision_openrc_supervisor "$container" || return 1
     if [[ -f "$OPENRC_INITD_DIR/$container" ]]; then
-      rc-service "$container" stop >/dev/null 2>&1 || true
+      _openrc_service "$container" stop >/dev/null 2>&1 || true
     fi
   else
     _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
@@ -990,8 +990,8 @@ _wait_tenant_voice_healthy() {
 _stop_voice_openrc_supervisor() {
   local container="$1" supervisor="${1}-sup"
   [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$supervisor" ]] || return 0
-  rc-service "$supervisor" stop >/dev/null 2>&1 && return 0
-  rc-service "$supervisor" status 2>&1 | grep -Eqi 'stopped|inactive|dead'
+  _openrc_service "$supervisor" stop >/dev/null 2>&1 && return 0
+  _openrc_service "$supervisor" status 2>&1 | grep -Eqi 'stopped|inactive|dead'
 }
 
 _create_voice_container() {
@@ -1059,7 +1059,7 @@ _reconcile_voice_container() {
     say "config, image, or health ownership changed for $container; force-recreating"
     _stop_voice_supervision "$name" "$container" || return 1
     if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$container" ]]; then
-      rc-service "$container" stop >/dev/null 2>&1 || true
+      _openrc_service "$container" stop >/dev/null 2>&1 || true
     fi
     _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
     _ctr "$name" rm -f "$container" >/dev/null || return 1
@@ -1155,7 +1155,7 @@ stop_tenant_voice() {
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
     _stop_voice_openrc_supervisor "$container_name" || return 1
     if [[ -f "$OPENRC_INITD_DIR/${container_name}" ]]; then
-      rc-service "$container_name" stop >/dev/null 2>&1 || true
+      _openrc_service "$container_name" stop >/dev/null 2>&1 || true
     fi
   else
     _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 || true
@@ -1363,7 +1363,7 @@ _voice_daemon_running() {
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service" >/dev/null 2>&1
   else
-    rc-service "lunarwing-${name}" status >/dev/null 2>&1
+    _openrc_service "lunarwing-${name}" status >/dev/null 2>&1
   fi
 }
 
@@ -1465,10 +1465,10 @@ remove_tenant_voice_unit() {
     rm -f "$(_hash_dir "$name")/${container_name}.hash"
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
   else
-    rc-service "${container_name}-sup" stop >/dev/null 2>&1 || true
-    rc-update del "${container_name}-sup" default >/dev/null 2>&1 || true
+    _openrc_service "${container_name}-sup" stop >/dev/null 2>&1 || true
+    _openrc_update del "${container_name}-sup" default >/dev/null 2>&1 || true
     rm -f "$OPENRC_INITD_DIR/${container_name}-sup"
-    rc-update del "$container_name" default >/dev/null 2>&1 || true
+    _openrc_update del "$container_name" default >/dev/null 2>&1 || true
     rm -f "$OPENRC_INITD_DIR/$container_name"
     rm -f "$(_hash_dir "$name")/${container_name}.hash"
   fi
