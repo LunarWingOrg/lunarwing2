@@ -199,7 +199,7 @@
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/359
 23. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/336
 24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/335
-25. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/376
+25. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/376 - see open items that are not solved yet from merged MR https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1547
 26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/375
 27. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/374
 28. [ ] fix issues in CI/CD (if any) - See Pipeline Number 5503 for latest master pipeline run and see if anything is not GREEN
