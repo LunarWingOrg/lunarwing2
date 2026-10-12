@@ -42,6 +42,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cron_worker;
 pub mod external_worker;
 pub mod job_manager;
 pub mod reaper;

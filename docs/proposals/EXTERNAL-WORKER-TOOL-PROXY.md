@@ -350,9 +350,8 @@ the wire contract above is the bridge's specification.
 
 ## Land-order note (MR !1540 review #7716)
 
-**!1541 (item 6 / WI#325) first, then !1540.** !1541 remains open as of this
-DX fix; its target integration is pending, not claimed complete. Once it
-lands, back-merge the new target into this branch and:
+**!1541 (item 6 / WI#325) landed first** (target `84861d1b0`); this branch
+back-merges it. The integration below is done in that merge commit:
 
 - Keep both sides of the goals, `config/sandbox.rs`, `settings.rs`, and
   integration-test conflicts. Produce one `impl Default for ExternalWorkerConfig`
@@ -363,7 +362,8 @@ lands, back-merge the new target into this branch and:
   `&watch::Receiver<Option<CancelReason>>`. These breaks are outside conflict
   markers: the read loop and `wait_for_cancellation` have already changed
   in !1541 (previously !1531). The proxy select arm ignores the reason.
-- Require green `rust-check-*` and `rust-test-*` on that combined head.
+- Merge only on green `rust-check-*` and `rust-test-*` for the combined head
+  (merging is not CI-gated).
 
 Item 7's closed !1532 wiring conflict (`main.rs`, `orchestrator/mod.rs`)
 needs both trailing `setup_orchestrator` dependencies (`workspace_resolver`

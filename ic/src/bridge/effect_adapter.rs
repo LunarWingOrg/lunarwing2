@@ -2185,6 +2185,8 @@ fn is_v1_only_tool(name: &str) -> bool {
         name,
         "cancel_job"
             | "cancel-job"
+            | "cron_mission"
+            | "cron-mission"
             | "build_software"
             | "build-software"
             | "routine_create"

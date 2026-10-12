@@ -27,7 +27,9 @@ use crate::db::Database;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::ExternalWorkerManager;
 use crate::orchestrator::auth::{CredentialGrant, SandboxJobGrants};
-use crate::orchestrator::external_worker::{ExternalTaskStatus, build_task_context};
+use crate::orchestrator::external_worker::{
+    CronCommandOrigin, ExternalTaskStatus, build_task_context,
+};
 use crate::orchestrator::job_manager::{
     ContainerJobManager, ContainerJobRequest, JobMode, MAX_WORKER_MCP_SERVERS, snapshot_worker_mcp,
 };
@@ -2081,6 +2083,116 @@ impl Tool for CancelJobTool {
     }
 }
 
+/// Tool for driving cron-mode external worker missions at runtime (WI#325).
+///
+/// `cancel_job` ends only the currently-running tick job — the mission fires
+/// again at the next schedule. This tool pauses/resumes the mission itself
+/// (persisted, so a pause survives restarts) and reports its status. The
+/// ownership gate mirrors `cancel_job`: only the mission's owning user may
+/// drive it.
+pub struct CronMissionTool {
+    external_worker_manager: Arc<ExternalWorkerManager>,
+}
+
+impl CronMissionTool {
+    pub fn new(mgr: Arc<ExternalWorkerManager>) -> Self {
+        Self {
+            external_worker_manager: mgr,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CronMissionTool {
+    fn name(&self) -> &str {
+        "cron_mission"
+    }
+
+    fn description(&self) -> &str {
+        "Pause, resume, or inspect a cron-mode external worker mission. Pausing stops future \
+         scheduled ticks (and survives restarts) until resumed; the currently running tick job \
+         is not cancelled — use cancel_job for that. Works only on workers configured with \
+         mode = \"cron\"."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["pause", "resume", "status"],
+                    "description": "pause: stop future ticks until resumed; resume: clear the pause and reset the circuit breaker; status: report mission state"
+                },
+                "worker": {
+                    "type": "string",
+                    "description": "Name of the cron-mode external worker hosting the mission"
+                }
+            },
+            "required": ["action", "worker"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+        let action = require_str(&params, "action")?;
+        let worker = require_str(&params, "worker")?;
+        let manager = &self.external_worker_manager;
+        let as_tool_error = |e: crate::error::OrchestratorError| {
+            ToolError::ExecutionFailed(format!("cron mission '{worker}': {e}"))
+        };
+        match action {
+            "pause" => manager
+                .pause_cron_mission(worker, &ctx.user_id, CronCommandOrigin::OwnerTool)
+                .await
+                .map_err(as_tool_error)?,
+            "resume" => manager
+                .resume_cron_mission(worker, &ctx.user_id, CronCommandOrigin::OwnerTool)
+                .await
+                .map_err(as_tool_error)?,
+            "status" => {}
+            other => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "unknown cron_mission action '{other}' (expected pause|resume|status)"
+                )));
+            }
+        }
+        let status = manager
+            .cron_mission_status(worker, &ctx.user_id)
+            .await
+            .map_err(as_tool_error)?;
+        let result = serde_json::to_value(&status)
+            .unwrap_or_else(|_| serde_json::json!({"error": "status serialization failed"}));
+        Ok(ToolOutput::success(
+            serde_json::json!({
+                "action": action,
+                "mission": result,
+            }),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
+    }
+
+    /// Never autonomous (WI#325 review): an owner routine processing injected
+    /// content must not be able to silently pause a mission, and `resume`
+    /// resets the runaway circuit breaker — that escape hatch is for the
+    /// interactive owner only. The name is also on `AUTONOMOUS_TOOL_DENYLIST`.
+    fn allows_autonomous_execution(&self) -> bool {
+        false
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+}
+
 /// Tool for reading sandbox job event logs.
 ///
 /// Lets the main agent inspect what a running (or completed) container job has
@@ -2423,6 +2535,54 @@ mod tests {
         assert!(props.contains_key("max_iterations")); // safety: test
         assert!(!props.contains_key("wait")); // safety: test
         assert!(!props.contains_key("mode")); // safety: test
+    }
+
+    /// WI#325: the cron_mission tool surfaces the supervisor/owner gate errors
+    /// instead of panicking or silently succeeding.
+    #[tokio::test]
+    async fn cron_mission_tool_errors_without_supervisor() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let tool = CronMissionTool::new(manager);
+        let ctx = JobContext::default();
+
+        let err = tool
+            .execute(
+                serde_json::json!({"action": "status", "worker": "nope"}),
+                &ctx,
+            )
+            .await
+            .expect_err("unknown worker must error"); // safety: test
+        assert!(err.to_string().contains("not configured for cron mode")); // safety: test
+
+        let err = tool
+            .execute(
+                serde_json::json!({"action": "bogus", "worker": "nope"}),
+                &ctx,
+            )
+            .await
+            .expect_err("unknown action must error"); // safety: test
+        assert!(err.to_string().contains("unknown cron_mission action")); // safety: test
+    }
+
+    /// WI#325 (MR !1522 DE-1): cron_mission is lifecycle control — it can
+    /// pause a mission and its `resume` resets the runaway circuit breaker —
+    /// so it must never be reachable from autonomous runs, even when the
+    /// caller's user_id is the owner. Both gates are asserted: the per-tool
+    /// opt-out and the static denylist through `autonomous_allowed_tool_names`.
+    #[tokio::test]
+    async fn cron_mission_tool_is_excluded_from_autonomous_runs() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let tool = CronMissionTool::new(Arc::clone(&manager));
+        assert!(!tool.allows_autonomous_execution());
+        assert!(crate::tools::is_autonomous_tool_denylisted("cron_mission"));
+
+        let registry = Arc::new(crate::tools::ToolRegistry::new());
+        registry.register_sync(Arc::new(CronMissionTool::new(manager)));
+        let allowed = crate::tools::autonomous_allowed_tool_names(&registry, None, "default").await;
+        assert!(
+            !allowed.contains("cron_mission"),
+            "cron_mission must not be available to autonomous runs"
+        );
     }
 
     #[test]

@@ -111,6 +111,7 @@ export function serializeEnvelopeWithinLimit(envelope: Envelope, maxBytes: numbe
 
 export interface TaskContext {
   project_dir?: string
+  cron_tick?: unknown
   conversation_history?: Array<{ role: string; content: string }>
   environment?: Record<string, string>
   user_id?: string

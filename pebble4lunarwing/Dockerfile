@@ -22,6 +22,10 @@ WORKDIR /build
 
 COPY pebble4lunarwing/Cargo.toml pebble4lunarwing/Cargo.lock ./bridge/
 COPY pebble4lunarwing/src ./bridge/src
+# Test before the release build: the workspace-path confinement and cron
+# bootstrap suites (including the FIFO/O_DIRECTORY and transient-classification
+# pins) must gate the image, not just host-side runs (MR !1531 DR-3).
+RUN cd bridge && cargo test --locked
 RUN cd bridge && cargo build --release --locked
 
 RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \

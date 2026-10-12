@@ -79,6 +79,32 @@ struct TaskProgressPayload {
     done: bool,
 }
 
+/// A structured `cron.tick` event carried into a cron-mode worker job (WI#325).
+///
+/// The host-side cron supervisor attaches this to `TaskContext` on every tick
+/// dispatch so the worker surfaces as a live mission: it learns the mission
+/// id, the schedule it is firing on, the durable goal, and its position in
+/// the tick/re-entry chain — no bespoke worker integration required. Older
+/// workers simply ignore the unknown context field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CronTick {
+    /// Always `"cron.tick"` — lets workers pattern-match the event.
+    pub event: String,
+    /// Stable mission identifier (config `mission_id` or `cron-worker-<name>`).
+    pub mission_id: String,
+    /// Cron expression the mission fires on.
+    pub schedule: String,
+    /// The mission's durable goal text.
+    pub goal: String,
+    /// Persisted, 1-based scheduled tick counter; 0 denotes a manual test fire.
+    pub tick_index: u64,
+    /// Which attempt of this tick this job is (0 = first dispatch,
+    /// >0 = supervisor re-entry after wedge/failure).
+    pub chain_index: u32,
+    /// RFC3339 time the tick fired.
+    pub fired_at: String,
+}
+
 /// Context passed to external workers with task requests.
 ///
 /// All fields are optional with serde defaults for backward compatibility —
@@ -103,6 +129,10 @@ pub struct TaskContext {
     pub user_id: String,
     /// Arbitrary metadata key-value pairs.
     pub metadata: HashMap<String, String>,
+    /// Structured `cron.tick` event; present only on cron-mode dispatches
+    /// (WI#325). Omitted entirely for ordinary task dispatches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_tick: Option<CronTick>,
 }
 
 pub fn build_task_context(
@@ -118,6 +148,7 @@ pub fn build_task_context(
         environment,
         conversation_history,
         metadata,
+        cron_tick: None,
     }
 }
 
@@ -296,17 +327,99 @@ struct ToolProxyBinding {
 
 // ── External job handle ─────────────────────────────────────────────
 
+/// Why an external worker task is being cancelled (WI#325).
+///
+/// The cancel watch channel carries the reason so the persisted job record
+/// and `job_events` distinguish a supervisor cancelling a wedged cron tick
+/// from an owner cancelling a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Owner-initiated cancel (`cancel_job` tool, web route, `cancel_task`).
+    User,
+    /// Daemon shutdown drain.
+    Shutdown,
+    /// Cron mission supervisor cancelled a wedged tick job (WI#325).
+    CronSupervisor,
+}
+
+impl CancelReason {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::User => "Cancelled by user",
+            Self::Shutdown => "Cancelled by daemon shutdown",
+            Self::CronSupervisor => "Cancelled by cron supervisor (heartbeat lapse)",
+        }
+    }
+}
+
+/// Commands accepted by a running cron mission supervisor (WI#325).
+///
+/// Sent over the per-mission mpsc channel so manual fires and pause/resume
+/// stay serialized with the scheduled loop — a manual tick can never overlap
+/// a scheduled tick on the same worker workspace.
+pub enum CronCommand {
+    /// Fire one tick immediately (test-only surface; tick_index 0).
+    FireNow,
+    /// Pause the mission: scheduled fires are skipped until resumed. The
+    /// pause is persisted and survives daemon restarts.
+    Pause(CronCommandOrigin),
+    /// Resume a paused mission and reset the circuit breaker.
+    Resume(CronCommandOrigin),
+    /// Query mission status (reply carries the persisted + live state).
+    Status(tokio::sync::oneshot::Sender<CronMissionStatus>),
+}
+
+/// Where an owner cron command entered the system (MR !1531 DQ-5). The
+/// `cron_paused`/`cron_resumed` audit rows carry it so the trail can tell
+/// the LLM tool apart from the HTTP recovery route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronCommandOrigin {
+    /// The `cron_mission` builtin tool inside an LLM turn.
+    OwnerTool,
+    /// The `POST /api/workers/{worker}/cron` web-gateway route.
+    OwnerApi,
+}
+
+impl CronCommandOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerTool => "owner_tool",
+            Self::OwnerApi => "owner_api",
+        }
+    }
+}
+
+/// Live + persisted state of one cron mission (WI#325).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CronMissionStatus {
+    pub mission_id: String,
+    pub worker_name: String,
+    pub paused: bool,
+    pub tick_index: u64,
+    pub consecutive_abandoned: u32,
+}
+
+/// Owner-scoped control channel registration for one cron mission (WI#325).
+pub(crate) struct CronMissionControl {
+    pub owner_id: String,
+    pub tx: tokio::sync::mpsc::Sender<CronCommand>,
+}
+
 /// Handle to a running external worker task.
 pub struct ExternalJobHandle {
     pub job_id: Uuid,
     pub worker_name: String,
-    cancel_tx: watch::Sender<bool>,
+    cancel_tx: watch::Sender<Option<CancelReason>>,
     started: bool,
 }
 
 impl ExternalJobHandle {
     pub fn cancel(&self) {
-        self.cancel_tx.send_replace(true);
+        self.cancel_with(CancelReason::User);
+    }
+
+    pub fn cancel_with(&self, reason: CancelReason) {
+        self.cancel_tx.send_replace(Some(reason));
     }
 }
 
@@ -324,6 +437,18 @@ pub struct ExternalWorkerManager {
     /// frames get an explicit error reply rather than being dropped.
     tool_proxy: Option<ToolProxy>,
     active_handles: Arc<RwLock<HashMap<Uuid, ExternalJobHandle>>>,
+    /// Owner-scoped control channels of running cron mission supervisors
+    /// (WI#325), keyed by worker name. Registered synchronously by
+    /// `spawn_cron_supervisors` (std lock: only brief, await-free sections
+    /// touch it) so a command issued right after spawn never races
+    /// registration.
+    pub(crate) cron_controls: Arc<std::sync::RwLock<HashMap<String, CronMissionControl>>>,
+    /// The daemon owner id cron missions belong to (WI#325), recorded by
+    /// `spawn_cron_supervisors`. Lets the command gate reject non-owners
+    /// with one uniform error before any worker-mode lookup, so the error
+    /// surface cannot be used to probe which workers are cron-mode (MR
+    /// !1522 DE-9).
+    pub(crate) cron_owner_id: std::sync::RwLock<Option<String>>,
 }
 
 impl ExternalWorkerManager {
@@ -373,6 +498,8 @@ impl ExternalWorkerManager {
             store: None,
             tool_proxy: None,
             active_handles: Arc::new(RwLock::new(HashMap::new())),
+            cron_controls: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            cron_owner_id: std::sync::RwLock::new(None),
         }
     }
 
@@ -414,6 +541,27 @@ impl ExternalWorkerManager {
         self.workers.is_empty()
     }
 
+    /// Configs of workers running in cron (mission) mode (WI#325).
+    pub(crate) fn cron_worker_configs(&self) -> Vec<ExternalWorkerConfig> {
+        self.workers
+            .values()
+            .filter(|worker| worker.is_cron())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn context_manager_handle(&self) -> Option<&Arc<ContextManager>> {
+        self.context_manager.as_ref()
+    }
+
+    pub(crate) fn store_handle(&self) -> Option<&Arc<dyn Database>> {
+        self.store.as_ref()
+    }
+
+    pub(crate) fn event_tx_handle(&self) -> Option<&broadcast::Sender<(Uuid, String, SseEvent)>> {
+        self.job_event_tx.as_ref()
+    }
+
     /// Reserve a job ID before exposing its context or DB record to cancellation callers.
     pub async fn reserve_task(
         &self,
@@ -433,7 +581,7 @@ impl ExternalWorkerManager {
                 job_id,
             });
         }
-        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (cancel_tx, _cancel_rx) = watch::channel(None);
         handles.insert(
             job_id,
             ExternalJobHandle {
@@ -517,7 +665,7 @@ impl ExternalWorkerManager {
                 handle.started = true;
                 handle.cancel_tx.subscribe()
             } else {
-                let (cancel_tx, cancel_rx) = watch::channel(false);
+                let (cancel_tx, cancel_rx) = watch::channel(None);
                 handles.insert(
                     job_id,
                     ExternalJobHandle {
@@ -531,11 +679,15 @@ impl ExternalWorkerManager {
             }
         };
 
-        if *cancel_rx.borrow() {
+        let pre_cancel_reason = *cancel_rx.borrow();
+        if let Some(reason) = pre_cancel_reason {
             let result = ExternalTaskResult {
                 status: ExternalTaskStatus::Cancelled,
                 output: String::new(),
-                error: Some("Cancelled before external worker dispatch".to_string()),
+                error: Some(format!(
+                    "{} before external worker dispatch",
+                    reason.message()
+                )),
                 duration_ms: 0,
             };
             record_external_task_cancelled(
@@ -544,7 +696,7 @@ impl ExternalWorkerManager {
                 event_tx.as_ref(),
                 context_manager.as_ref(),
                 store.as_ref(),
-                result.error.as_deref().unwrap_or("Cancelled by user"),
+                result.error.as_deref().unwrap_or(reason.message()),
             )
             .await;
             active_handles.write().await.remove(&job_id);
@@ -696,8 +848,15 @@ impl ExternalWorkerManager {
 
     /// Cancel an active external worker task.
     pub async fn cancel_task(&self, job_id: Uuid) -> bool {
+        self.cancel_task_with_reason(job_id, CancelReason::User)
+            .await
+    }
+
+    /// Cancel with an explicit reason (WI#325): the persisted record and
+    /// `job_events` distinguish supervisor cancels from owner cancels.
+    pub async fn cancel_task_with_reason(&self, job_id: Uuid, reason: CancelReason) -> bool {
         if let Some(handle) = self.active_handles.read().await.get(&job_id) {
-            handle.cancel();
+            handle.cancel_with(reason);
             return true;
         }
         false
@@ -752,7 +911,7 @@ impl ExternalWorkerManager {
                 "Shutdown: signalling cancel to in-flight external worker tasks"
             );
             for handle in handles.values() {
-                handle.cancel();
+                handle.cancel_with(CancelReason::Shutdown);
             }
         }
 
@@ -1256,7 +1415,7 @@ async fn run_external_task(
     event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
     context_manager: Option<&Arc<ContextManager>>,
     store: Option<&Arc<dyn Database>>,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: watch::Receiver<Option<CancelReason>>,
     context: TaskContext,
     tool_binding: ToolProxyBinding,
     pool: &WorkerConnectionPool,
@@ -1702,7 +1861,7 @@ async fn run_external_task(
                         }
                     }
                 }
-                _ = wait_for_cancellation(&mut cancel_rx) => {
+                reason = wait_for_cancellation(&mut cancel_rx) => {
                     send_cancel_envelope(&mut write, job_id).await;
                     // Bounded handoff (WI#149): wait for the worker's terminal
                     // frame (a `task_result` for this job) or socket close
@@ -1738,7 +1897,7 @@ async fn run_external_task(
                     return Ok(ExternalTaskResult {
                         status: ExternalTaskStatus::Cancelled,
                         output: accumulated_output.clone(),
-                        error: Some("Cancelled by user".to_string()),
+                        error: Some(reason.message().to_string()),
                         duration_ms: 0,
                     });
                 }
@@ -1796,7 +1955,10 @@ async fn run_external_task(
             false,
             JobState::Cancelled,
             "cancelled",
-            "Cancelled by user".to_string(),
+            task_result
+                .error
+                .clone()
+                .unwrap_or_else(|| CancelReason::User.message().to_string()),
         ),
         ExternalTaskStatus::TimedOut => {
             // WI#263: a worker-reported timeout (e.g. the kimi silence
@@ -1938,10 +2100,13 @@ async fn run_external_task(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-async fn wait_for_cancellation(cancel_rx: &mut watch::Receiver<bool>) {
+async fn wait_for_cancellation(
+    cancel_rx: &mut watch::Receiver<Option<CancelReason>>,
+) -> CancelReason {
     loop {
-        if *cancel_rx.borrow() {
-            return;
+        let reason = *cancel_rx.borrow();
+        if let Some(reason) = reason {
+            return reason;
         }
         if cancel_rx.changed().await.is_err() {
             std::future::pending::<()>().await;
@@ -2467,7 +2632,7 @@ struct ToolCallCtx<'a> {
 async fn handle_tool_call(
     ctx: &ToolCallCtx<'_>,
     call: ToolCallPayload,
-    cancel_rx: &watch::Receiver<bool>,
+    cancel_rx: &watch::Receiver<Option<CancelReason>>,
 ) -> Envelope {
     if let Some(reply) = frame_binding_rejection(ctx, &call).await {
         return reply;
@@ -2916,7 +3081,7 @@ async fn execute_proxied_call(
     proxy: &ToolProxy,
     call: &ToolCallPayload,
     prepared: PreparedCall,
-    cancel_rx: &watch::Receiver<bool>,
+    cancel_rx: &watch::Receiver<Option<CancelReason>>,
 ) -> Envelope {
     // Hooks may rewrite params after preflight; enforce the same destination
     // policy on the final arguments before executing the vetted instance.
@@ -4009,6 +4174,7 @@ mod tests {
             metadata: [("priority".to_string(), "high".to_string())]
                 .into_iter()
                 .collect(),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&ctx).unwrap();

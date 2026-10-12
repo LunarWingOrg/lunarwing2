@@ -30,8 +30,8 @@ pub use extension_tools::{
 pub use file::{ApplyPatchTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use http::{HttpTool, extract_host_from_params};
 pub use job::{
-    CancelJobTool, CreateJobTool, JobEventsTool, JobPromptTool, JobStatusTool, ListJobsTool,
-    PromptQueue, SchedulerSlot,
+    CancelJobTool, CreateJobTool, CronMissionTool, JobEventsTool, JobPromptTool, JobStatusTool,
+    ListJobsTool, PromptQueue, SchedulerSlot,
 };
 pub use json::JsonTool;
 pub use knowledge::{
