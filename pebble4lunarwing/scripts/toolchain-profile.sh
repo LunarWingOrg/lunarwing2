@@ -17,42 +17,44 @@
 #
 # Non-login sanitised shells (no profile sourcing at all) are covered by the
 # /usr/local/bin real-binary symlinks and the rustup wrapper installed
-# alongside this file (see pebble4lunarwing/Dockerfile). The PATH ordering
-# below keeps the rustup proxies ahead of those symlinks so
-# rust-toolchain.toml and `cargo +toolchain` keep working in login shells.
-#
-# Every PATH edit is guarded on the directory existing, so this file is
-# inert in the slim (WITH_TOOLCHAINS=false) image where the toolchain
-# directories do not exist.
+# alongside this file (see pebble4lunarwing/Dockerfile). The PATH restore
+# below reproduces the image ENV order — rustup proxies first (so
+# rust-toolchain.toml and `cargo +toolchain` keep working), then GOROOT/bin,
+# then GOPATH/bin — so login shells resolve go through GOROOT just like the
+# image ENV, and only sanitised shells resolve through the symlinks.
 
 export RUSTUP_HOME="${RUSTUP_HOME:-/usr/local/rustup}"
 export CARGO_HOME="${CARGO_HOME:-/usr/local/cargo}"
 export GOROOT="${GOROOT:-/usr/local/go}"
 export GOPATH="${GOPATH:-/root/go}"
 
-# Rust first: the rustup proxies in CARGO_HOME must sort ahead of the
-# /usr/local/bin real-binary symlinks (see the header).
-if [ -d "${CARGO_HOME}/bin" ]; then
-  case ":${PATH}:" in
-    *":${CARGO_HOME}/bin:"*) ;;
-    *) PATH="${CARGO_HOME}/bin:${PATH}" ;;
+# _lw_tc_prepend DIR: prepend DIR to PATH once, but only when DIR is an
+# absolute path to an existing directory. A relative or empty home must
+# never become a PATH entry (it would resolve against the caller's current
+# directory), and an empty/unset PATH must gain no empty entry (same
+# meaning). The existence guard keeps this file inert in the slim
+# (WITH_TOOLCHAINS=false) image, where the toolchain directories do not
+# exist.
+_lw_tc_prepend() {
+  case $1 in
+    /*) ;;
+    *) return 0 ;;
   esac
-fi
+  [ -d "$1" ] || return 0
+  if [ -z "${PATH:-}" ]; then
+    PATH="$1"
+    return 0
+  fi
+  case ":${PATH}:" in
+    *":$1:"*) ;;
+    *) PATH="$1:${PATH}" ;;
+  esac
+}
 
-if [ -d "${GOROOT}/bin" ]; then
-  case ":${PATH}:" in
-    *":${GOROOT}/bin:"*) ;;
-    *) PATH="${PATH}:${GOROOT}/bin" ;;
-  esac
-fi
-
-# GOPATH/bin holds `go install`ed tools (goimports, ...); the login reset
-# drops it just like the toolchain dirs.
-if [ -d "${GOPATH}/bin" ]; then
-  case ":${PATH}:" in
-    *":${GOPATH}/bin:"*) ;;
-    *) PATH="${PATH}:${GOPATH}/bin" ;;
-  esac
-fi
+# Prepend in reverse priority order; the last prepend sorts first.
+_lw_tc_prepend "${GOPATH}/bin"
+_lw_tc_prepend "${GOROOT}/bin"
+_lw_tc_prepend "${CARGO_HOME}/bin"
+unset -f _lw_tc_prepend
 
 export PATH
