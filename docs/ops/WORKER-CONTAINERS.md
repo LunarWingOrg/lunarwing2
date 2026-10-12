@@ -146,7 +146,7 @@ Control 11 audit of the other lanes (2026-10-12, against pinned sources):
   is not enforced. Mitigation is control 1 (egress allowlist) or a lane
   hardening pass; recorded here per the bump-checklist rule.
 
-
+## LunarWing Worker
 
 The main sandbox worker. Its runtime image includes Git, build-essential, Node.js/npm, Python 3, Rust, and GitHub CLI; it does not install a Claude Code executable. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.
 
