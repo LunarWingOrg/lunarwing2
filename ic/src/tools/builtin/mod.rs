@@ -5,7 +5,7 @@ mod echo;
 pub mod extension_tools;
 mod file;
 mod http;
-mod job;
+pub(crate) mod job;
 mod json;
 pub mod knowledge;
 pub mod memory;

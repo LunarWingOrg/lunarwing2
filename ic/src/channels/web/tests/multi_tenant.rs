@@ -232,6 +232,7 @@ fn make_sandbox_job(user_id: &str, task: &str) -> crate::history::SandboxJobReco
         started_at: Some(now),
         completed_at: Some(now),
         credential_grants_json: "[]".to_string(),
+        job_mode: "worker".to_string(),
     }
 }
 
@@ -485,6 +486,41 @@ mod jobs_isolation {
             resp.status(),
             StatusCode::NOT_FOUND,
             "bob should not be able to restart alice's job"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jobs_restart_refuses_harness_mode() {
+        // CV-9 (WI#326): a persisted harness job must NOT restart as a plain
+        // worker — the 409 tells the operator to re-dispatch with
+        // mode 'harness' instead.
+        let (db, _dir) = test_db().await;
+        let mut alice_job = make_sandbox_job("alice", "harness task");
+        alice_job.status = "failed".to_string();
+        alice_job.success = Some(false);
+        alice_job.job_mode = "harness".to_string();
+        db.save_sandbox_job(&alice_job).await.unwrap();
+        // The mode must round-trip through the initial insert.
+        let stored_mode = db.get_sandbox_job_mode(alice_job.id).await.unwrap();
+        assert_eq!(stored_mode.as_deref(), Some("harness"));
+
+        let state = build_state(Some(db), None);
+        let auth = two_user_auth();
+        let app = jobs_router(state, auth);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/jobs/{}/restart", alice_job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("Harness jobs cannot be restarted"),
+            "unexpected refusal body: {text}"
         );
     }
 
