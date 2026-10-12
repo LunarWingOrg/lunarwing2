@@ -4819,6 +4819,45 @@ mod tests {
         MissionManager::new(store, thread_manager)
     }
 
+    /// Build a MissionManager whose threads run on the given backend — for
+    /// tests that need a run to stay in-flight instead of completing on the
+    /// first model response (WI#337 end-to-end).
+    fn make_mission_manager_with_llm(
+        store: Arc<dyn Store>,
+        llm: Arc<dyn crate::traits::llm::LlmBackend>,
+    ) -> MissionManager {
+        let caps = CapabilityRegistry::new();
+        let thread_manager = Arc::new(ThreadManager::new(
+            llm,
+            Arc::new(MockEffects),
+            Arc::clone(&store),
+            Arc::new(caps),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        MissionManager::new(store, thread_manager)
+    }
+
+    /// Backend whose model call never resolves, so a run stays in-flight
+    /// until a stop request cancels the pending future (WI#337 end-to-end).
+    struct PendingLlm;
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for PendingLlm {
+        async fn complete(
+            &self,
+            _: &[crate::types::message::ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            futures::future::pending().await
+        }
+
+        fn model_name(&self) -> &str {
+            "pending"
+        }
+    }
+
     /// WI#295: the bridge derives `tool_info`'s `callable` from
     /// [`MissionManager::leases`], which must be the lease manager of the
     /// thread manager this mission manager runs threads on — the set the
@@ -12426,6 +12465,162 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         );
         assert!(rx.try_recv().is_ok(), "the notice follows the marker");
         mgr.shutdown().await;
+    }
+
+    /// WI#337's asked end-to-end: a checkpointed stamped thread is resumed
+    /// by checkpoint recovery, so the resolution sees it Running and clears
+    /// the stamp WITHOUT arming a retry (the resumed run's live watcher owns
+    /// the outcome). When the resumed run is then stopped within the
+    /// shutdown grace, the watcher persists the retry marker — and the next
+    /// boot's sweep arms exactly one retry: advancing past the backoff fires
+    /// exactly one new run. Before the guard, the stamp survived the Running
+    /// resolution and the next boot's resolution armed a SECOND retry beside
+    /// the sweep's.
+    #[tokio::test(start_paused = true)]
+    async fn resumed_stamped_thread_stopped_in_grace_arms_exactly_one_retry() {
+        let store = Arc::new(TestStore::new());
+        // Boot N: the resumed run blocks inside the model call, so it is
+        // still Running when the resolution and the shutdown stop reach it.
+        let boot_n = Arc::new(make_mission_manager_with_llm(
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(PendingLlm),
+        ));
+        boot_n.arm_retry_wake().await;
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "resumed",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.notify_channels = vec!["darkirc".into()];
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Suspended;
+        thread.metadata = serde_json::json!({ "runtime_checkpoint": { "persisted_state": {} } });
+        mission.thread_history.push(thread.id);
+        mission.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: {
+            "thread_id": thread.id,
+            "recorded_at": Utc::now().to_rfc3339(),
+        }});
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        boot_n.bootstrap_project(project_id).await.unwrap();
+
+        // Checkpoint recovery resumes the thread; its live watcher owns the
+        // outcome from here.
+        assert_eq!(
+            boot_n.resume_recoverable_threads().await.unwrap(),
+            vec![thread.id]
+        );
+        // Wait until the resumed run's Running state has persisted, so the
+        // resolution reads the resumed state and not the stale Suspended row.
+        let mut persisted_running = false;
+        for _ in 0..200 {
+            if store
+                .load_thread(thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                == ThreadState::Running
+            {
+                persisted_running = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(persisted_running, "the resumed run reaches Running");
+
+        // The resolution clears the stamp without arming a retry…
+        assert_eq!(
+            boot_n
+                .resolve_pending_shutdown_interruptions()
+                .await
+                .unwrap(),
+            vec![mission.id]
+        );
+        let after_resolution = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert!(stamped_interrupted_thread(&after_resolution).is_none());
+        assert!(
+            after_resolution
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains("already owned")),
+            "{:?}",
+            after_resolution.approach_history
+        );
+        assert_eq!(after_resolution.thread_history.len(), 1);
+        assert!(
+            RetryState::from_metadata(
+                &store
+                    .load_thread(thread.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+            )
+            .is_none(),
+            "no retry marker — the resumed run is still in flight"
+        );
+
+        // …then a graceful shutdown stops the resumed run inside the grace:
+        // the watcher's Q-4 write persists the marker for the next boot.
+        boot_n.shutdown().await;
+        let stopped = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert_eq!(stopped.state, ThreadState::Failed, "{:?}", stopped.state);
+        let marker = RetryState::from_metadata(&stopped.metadata)
+            .expect("the in-grace stop persists the retry marker");
+        assert_eq!(marker.attempt, 1);
+
+        // Boot N+1: the sweep arms the marker; no stamp is left to resolve.
+        let boot_n1 = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        boot_n1.arm_retry_wake().await;
+        assert_eq!(
+            boot_n1.recover_pending_mission_retries().await.unwrap(),
+            vec![mission.id]
+        );
+        assert!(
+            boot_n1
+                .resolve_pending_shutdown_interruptions()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the stamp was cleared at boot N, before the in-grace stop"
+        );
+
+        // Exactly one retry fires when the backoff elapses; a second arm
+        // (the pre-fix double) would add a second history entry. Yield first
+        // so the armed timer task registers its sleep before time advances.
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            let current = store.load_mission(mission.id).await.unwrap().unwrap();
+            if current.thread_history.len() > 1 {
+                break;
+            }
+        }
+        // Let any second arm's wake fire too before judging.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let final_mission = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(
+            final_mission.thread_history.len(),
+            2,
+            "exactly one retry fire — the pre-fix double-arm would add two"
+        );
+        boot_n1.shutdown().await;
     }
 
     /// WI#338: retry recovery scans `thread_history` from the same
