@@ -16,7 +16,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::channels::web::util::truncate_preview;
+use crate::channels::web::util::{truncate_preview, truncate_preview_middle};
 use crate::llm::{ChatMessage, ToolCall, generate_tool_call_id};
 
 /// A session containing one or more threads.
@@ -541,7 +541,11 @@ impl Thread {
                             serde_json::Value::String(s) => s.clone(),
                             other => other.to_string(),
                         };
-                        truncate_preview(&raw, 1000)
+                        // Keep head AND tail: list-tool envelopes serialize
+                        // pagination metadata (next_cursor/truncated/complete)
+                        // at the very end, and a head-only cut made a later
+                        // "next page" turn improvise cursors (WI#351).
+                        truncate_preview_middle(&raw, 1000)
                     } else {
                         "OK".to_string()
                     };
@@ -817,6 +821,58 @@ mod tests {
 
         assert_eq!(turn.tool_calls.len(), 1);
         assert!(turn.tool_calls[0].result.is_some());
+    }
+
+    /// WI#351 regression: an earlier turn's long list-tool result carries its
+    /// pagination envelope at the tail. When a later turn asks for the next
+    /// page, context reconstruction (`Thread::messages()`) must surface the
+    /// real cursor — not a head-only preview that amputated it — while the
+    /// preview stays bounded.
+    #[test]
+    fn test_earlier_turn_tool_result_preserves_pagination_tail() {
+        let pagination_tail =
+            r#""truncated": true, "complete": false, "next_cursor": "cursor-xyz-789"}"#;
+        let long_result = format!(
+            "{{\"items\": [{}{}], {}",
+            "\"row\", ".repeat(600),
+            "\"row-final\"",
+            pagination_tail
+        );
+        assert!(long_result.len() > 1000);
+
+        let mut thread = Thread::new(Uuid::new_v4());
+        let turn = thread.start_turn("list all items");
+        turn.record_tool_call("list_items", serde_json::json!({"limit": 100}));
+        turn.record_tool_result(serde_json::Value::String(long_result));
+        thread.complete_turn("Here is the first page.");
+        // Subsequent user turn requesting the next page.
+        thread.start_turn("show the next page");
+        thread.complete_turn("Here is page two.");
+
+        let messages = thread.messages();
+        let tool_messages: Vec<&ChatMessage> = messages
+            .iter()
+            .filter(|m| m.role == crate::llm::Role::Tool)
+            .collect();
+        assert_eq!(tool_messages.len(), 1);
+
+        let preview = &tool_messages[0].content;
+        // The real cursor survives context reconstruction.
+        assert!(preview.contains("cursor-xyz-789"));
+        assert!(preview.contains("\"truncated\": true"));
+        assert!(preview.contains("\"complete\": false"));
+        // The preview stays bounded and marks the elision.
+        assert!(preview.len() <= 1000);
+        assert!(preview.contains("middle elided"));
+        assert!(preview.starts_with("{\"items\": ["));
+
+        // The next-page request is present as the latest user message.
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::Role::User)
+            .expect("thread has user turns");
+        assert_eq!(last_user.content, "show the next page");
     }
 
     #[test]
