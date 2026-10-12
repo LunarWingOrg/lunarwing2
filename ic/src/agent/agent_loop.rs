@@ -1823,6 +1823,30 @@ impl Agent {
                 Submission::NewThread => {
                     return crate::bridge::handle_new_thread(self, message).await;
                 }
+                // WI#332: an approval on a routed channel that matched no
+                // engine gate falls through to the legacy v1 path below. Log
+                // the request/scope ids so an approval that was never matched
+                // to an engine gate (the WI#320 symptom) is diagnosable from
+                // logs instead of vanishing into the v1 stale-approval debug.
+                // `scope` is conversation_scope(): a room or buffer id on
+                // non-gateway channels, not necessarily an engine thread id.
+                Submission::ExecApproval { request_id, .. } => {
+                    tracing::warn!(
+                        user_id = %message.user_id,
+                        channel = %message.channel,
+                        request_id = %request_id,
+                        scope = message.conversation_scope().unwrap_or("none"),
+                        "engine v2: approval matched no engine gate; falling through to legacy path"
+                    );
+                }
+                Submission::ApprovalResponse { .. } => {
+                    tracing::warn!(
+                        user_id = %message.user_id,
+                        channel = %message.channel,
+                        scope = message.conversation_scope().unwrap_or("none"),
+                        "engine v2: approval response matched no engine gate; falling through to legacy path"
+                    );
+                }
                 _ => {}
             }
         }
