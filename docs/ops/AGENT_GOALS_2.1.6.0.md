@@ -231,7 +231,7 @@
 25. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/376 - see open items that are not solved yet from merged MR https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1547
 26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/375
 27. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/374 - last attempt was (see comments on MR and address any issues that may be blockers): https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1554
-28. [ ] fix issues in CI/CD (if any) - See Pipeline Number 5543 for latest master pipeline run and see if anything is not GREEN
+28. [ ] fix issues in CI/CD (if any) - See Pipeline Number 5562 for latest master pipeline run and see if anything is not GREEN
 29. [x] (S) (H) MASCOT ANIMS
 30. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/373
 31. [ ] review all currently open work items - create audit document for 2.1.6.0 in docs/ops - there are similar docs in docs/ops for 2.1.5.0 and 2.1.4.0 and earlier releases so you can use those as references - you can sort doc by label of release ( i.e. 2.1.5.0, 2.1.6.0 )
