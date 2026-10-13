@@ -711,7 +711,11 @@ when the mission's `retry_policy` has attempts left, schedules a delayed
 re-fire with exponential backoff (default 1m → 2m → 4m, capped at 1h;
 `initial_delay_secs = 60`, `backoff_multiplier = 2.0`, `max_delay_secs = 3600`,
 `max_retries = 3`; all four scalars are exposed by `mission_update`, or can
-be set through the persisted `retry_policy`). Each retry respawn passes
+be set through the persisted `retry_policy`). The interruption path above
+describes a mission that is still Active: a thread signal-stopped while its
+mission is no longer Active (the operator pause that stops its workers, a
+retirement) is instead recorded quietly as `STOPPED: mission <status> while
+the thread ran` — no error notification, no retry (below). Each retry respawn passes
 the normal budget gate and increments `threads_today`, so retries draw from
 the same daily budget — a budget-exhausted re-fire is abandoned, and a paused
 or terminal mission suppresses its own pending retry. A terminal
@@ -778,9 +782,17 @@ daemon); the post-restart sweep re-arms the retry from the marker, with the
 usual fresh backoff and attempt accounting (an interrupted fire costs one
 retry attempt). Outcome writes are ordered so the retry marker is the final
 commit write: the mission row (approach history plus the dedup release) is
-saved first, so an abort in the window leaves either no trace (the clean
-pre-WI#188 loss, with the key already released for redelivery) or a mission
-row without a marker — never a marker whose release never saved. Markers
+saved first, so an abort in the window leaves either no trace or a mission
+row without a marker (the key already released for redelivery) — never a
+marker whose release never saved. The no-trace leg is not always the clean
+pre-WI#188 loss: the settled stop persists the thread row
+`Failed("execution stopped")` before the watcher's mission save, so an
+abort in that narrower span leaves the dedup key still recorded on the old
+mission row with no marker and no stamp — every boot sweep skips the fire,
+a silent loss with a stuck key that also suppresses an external redelivery
+of the same payload (the Q-4 residual, WI#341; the abort-window test
+`outcome_processing_writes_no_marker_when_the_mission_save_fails` pins the
+"old row still holds the key" state). Markers
 written in the opposite order by older builds can still pair a live marker
 with a recorded key; the sweep releases that stale key before re-arming.
 The shutdown-time "retry scheduled" broadcast has no live consumer, so the
@@ -894,9 +906,26 @@ external redelivery suppresses the armed retry instead of doubling the
 work. Operators of side-effecting missions should treat an interruption
 retry like any at-least-once redelivery.
 
-These recovery markers are additive thread metadata; no database migration is
-needed. Downgrading restores the older completion/recovery behavior and does
-not reconstruct interrupted work. Operators should inspect interrupted fires
+These recovery markers are additive metadata and need no database
+migration — thread metadata for the retry marker and the restart stamp,
+mission metadata for the shutdown-interruption stamps
+(`pending_shutdown_interruption`) and the owed outcome notices
+(`pending_outcome_notification`). Downgrading restores the older
+completion/recovery behavior and does not reconstruct interrupted work. An
+older build never clears the mission-side stamps: they sit unread until a
+re-upgrade, whose boot sweep resolves each interruption stamp younger than
+24 hours (`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) into the retry it names —
+record-only beyond that — and emits every owed outcome notice it finds,
+with no age bound on either emission beyond the stamp age check. The
+upgrade direction has its own wrinkle: every live pre-upgrade retry marker
+deserializes with `notified: false` (the field is newer than those
+markers), so the first boot after the upgrade emits "Mission fire
+interrupted; retry N of M re-armed after daemon restart" once per marker —
+including markers whose original notice was delivered before the upgrade,
+and markers of runs that genuinely failed inside the shutdown grace rather
+than being interrupted. The boot wording can therefore mismatch a marker's
+origin; carrying the stop reason in `RetryState` so the notice can name it
+is a possible follow-up. Operators should inspect interrupted fires
 before manually refiring tasks with external side effects.
 
 All non-manual missions (cron, channel events, system events and webhooks)

@@ -95,7 +95,9 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
   separate from the channel spool. A graceful shutdown no longer loses a
   mid-run mission fire: the run is stopped within a short grace, the
   interruption is recorded, and a persisted retry marker re-fires it after
-  restart (WI#276; see ENGINE-V2.md, mission retries). A run that cannot
+  restart within the mission's retry policy (WI#276; see ENGINE-V2.md,
+  mission retries — a policy with no attempts left records the interruption
+  without a re-fire). A run that cannot
   stop within the grace is still recorded and stamped at shutdown; the boot
   sweep resolves the stamp against the thread's final state and retries a
   settled stop, while a hard kill stays restart recovery's record-only case
