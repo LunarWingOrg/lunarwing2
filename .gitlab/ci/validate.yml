@@ -82,6 +82,33 @@ worker-opencode-ts:
     - bun scripts/opencode_task_executor_test.ts
     - ./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json
 
+# WI#324 (MR !1590 review GB-2): the kimi worker TS suites previously ran only
+# in the manual protected candidate image build, so bridge/tool-proxy
+# regressions reached main without any MR-pipeline execution. This lane runs
+# the same npm ci + tsc + npm test sequence as the Dockerfile builder stage on
+# each MR/push, on the same digest-pinned node image. The real-CLI contract
+# lane (kimi_cli_contract_test) self-skips here — no kimi binary — and the
+# protected image build remains the only place it executes against the real
+# CLI.
+worker-kimi-ts:
+  stage: validate
+  needs: []
+  image:
+    name: "$CI_NODE_IMAGE"
+    entrypoint: [""]
+  tags:
+    - "$CI_LINT_RUNNER_TAG"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - cd kimicode4lunarwing/scripts
+    - npm ci --ignore-scripts
+    - npx tsc -p tsconfig.json
+    - npm test
+
 rustfmt:
   extends: .rust-job
   stage: validate
