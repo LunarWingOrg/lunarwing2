@@ -59,7 +59,8 @@ container: never point an entry that has a `tool_allowlist` at the same
 endpoint as a `mode = "cron"` entry — give a cron mission its own
 container. Two cron entries pointing at the same container likewise
 share one authority domain (one mission's tick can borrow the other's
-`cron.tool_allowlist` through a concurrent tick's relay socket); the
+`cron.tool_allowlist` through another tick's relay socket, concurrent
+or later — a leftover process can wait for it); the
 code does not detect or prevent that pairing — tracked as WI#396. (The manager also strips the worker-level list of a non-cron
 entry whose endpoint shares a cron entry's container. The comparison uses
 a normalized endpoint key — loopback spellings folded into one class,
