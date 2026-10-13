@@ -233,10 +233,18 @@ COPY --from=builder /build/opencode/packages/protocol/src /app/node_modules/@ope
 COPY --from=builder /build/opencode/packages/protocol/package.json /app/node_modules/@opencode/protocol/package.json
 
 COPY --chown=opencode2:opencode2 entrypoint.sh health_server.py agent_comm_protocol.json ./
-COPY --chown=opencode2:opencode2 scripts/ ./scripts/
-COPY --chown=opencode2:opencode2 config/ ./config/
+# WI#357 (run-79 EI-5): the exposure controls (wrapper, policy assert,
+# compile-out guard, lane config) must be root-owned and read-only — the
+# agent user gets edit/write on the workspace, so an agent-writable config
+# could append an allow rule or "share":"auto" that the v2 config watcher
+# would reload, and an agent-writable bridge ruleset would take effect at
+# the next bridge restart. The entrypoint re-derives the runtime config
+# from this read-only copy at every boot (workspace copy is untrusted).
+COPY scripts/ ./scripts/
+COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/health_server.py
+RUN chmod +x /app/entrypoint.sh /app/health_server.py \
+    && chmod -R a-w /app/scripts /app/config
 
 # WI#357: install the exposure-guard wrapper as the only PATH-visible
 # opencode entrypoint, then fail the BUILD when the policy regresses:

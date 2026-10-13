@@ -34,6 +34,9 @@ DOCKERFILE_LINES = (
     "RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode \\\n"
     "    && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --binary /usr/local/lib/opencode2/opencode\n",
     "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode\n",
+    "COPY scripts/ ./scripts/\n",
+    "COPY config/ ./config/\n",
+    "RUN chmod -R a-w /app/scripts /app/config\n",
 )
 
 
@@ -143,6 +146,45 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         result = self.run_guard(self.root)
         self.assertEqual(result.returncode, 1)
         self.assertIn("compile-out", result.stderr)
+
+    def test_dockerfile_agent_owned_scripts_fails(self):
+        # run-79 EI-5: the controls must not live in agent-writable files.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        dockerfile.write_text(
+            dockerfile.read_text().replace(
+                "COPY scripts/ ./scripts/",
+                "COPY --chown=opencode2:opencode2 scripts/ ./scripts/",
+            ),
+            encoding="utf-8",
+        )
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("root-owned", result.stderr)
+
+    def test_dockerfile_agent_owned_config_fails(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        dockerfile.write_text(
+            dockerfile.read_text().replace(
+                "COPY config/ ./config/",
+                "COPY --chown=opencode2:opencode2 config/ ./config/",
+            ),
+            encoding="utf-8",
+        )
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("root-owned", result.stderr)
+
+    def test_dockerfile_without_readonly_chmod_fails(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        dockerfile.write_text(
+            dockerfile.read_text().replace(
+                "RUN chmod -R a-w /app/scripts /app/config", "RUN true"
+            ),
+            encoding="utf-8",
+        )
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("read-only", result.stderr)
 
     def test_executor_missing_deny_fails(self):
         executor = self.root / "opencode2.4lunarwing" / "scripts" / "opencode_task_executor.ts"

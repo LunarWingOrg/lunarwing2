@@ -35,6 +35,22 @@ grep -q 'exposure_policy_assert.py' "$dockerfile" \
 grep -q 'compile_out_remote_tunnel.py' "$dockerfile" \
     || fail "Dockerfile lost the OpenTunnel compile-out build patch (control 8)"
 
+# WI#357 (run-79 EI-5): the exposure controls must be root-owned and
+# read-only in the image; agent-writable scripts/config would let the agent
+# rewrite the very guards that constrain it.
+if grep -Eq 'COPY[^#]*--chown=opencode2[^#]*\bscripts/' "$dockerfile"; then
+    fail "Dockerfile hands /app/scripts to the agent uid — scripts must be root-owned"
+fi
+if grep -Eq 'COPY[^#]*--chown=opencode2[^#]*\bconfig/' "$dockerfile"; then
+    fail "Dockerfile hands /app/config to the agent uid — config must be root-owned"
+fi
+grep -q '^COPY scripts/ ./scripts/$' "$dockerfile" \
+    || fail "Dockerfile lost the root-owned COPY of scripts/"
+grep -q '^COPY config/ ./config/$' "$dockerfile" \
+    || fail "Dockerfile lost the root-owned COPY of config/"
+grep -q 'chmod -R a-w /app/scripts /app/config' "$dockerfile" \
+    || fail "Dockerfile must mark /app/scripts and /app/config read-only (run-79 EI-5)"
+
 # The bridge session ruleset must deny the self-exposure subcommands; the
 # denies must come after the allow-all shell rule to win under findLast.
 executor="$lane/scripts/opencode_task_executor.ts"
