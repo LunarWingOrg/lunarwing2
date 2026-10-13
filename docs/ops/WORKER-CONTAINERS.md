@@ -58,11 +58,15 @@ The strip is applied per worker entry, but the authority domain is the
 container: never point an entry that has a `tool_allowlist` at the same
 endpoint as a `mode = "cron"` entry — give a cron mission its own
 container. (The manager also strips the worker-level list of a non-cron
-entry whose endpoint URL exactly matches a cron entry's endpoint, but
-exact-string matching cannot catch aliases such as `localhost` vs
-`127.0.0.1`, so the rule stands on its own.) A borrowed call is recorded
-in the `job_events` — and counted against the 100-frame budget — of the
-job whose relay socket was used, not of the job that issued it.
+entry whose endpoint shares a cron entry's container. The comparison uses
+a normalized endpoint key — loopback spellings folded into one class,
+host lowercased, scheme-default port applied, path and query ignored —
+so one host:port that path-routes several containers strips all of them
+(fails closed); exotic aliases such as `/etc/hosts` names remain the
+operator's responsibility, and the rule stands on its own.) A borrowed
+call is recorded in the `job_events` — and counted against the
+100-frame budget — of the job whose relay socket was used, not of the
+job that issued it.
 
 ## Generic shell sandbox network policy (WI#154/155)
 

@@ -203,6 +203,38 @@ fn is_loopback(host: &str) -> bool {
         || host == "0.0.0.0"
 }
 
+/// Normalized container identity of a worker endpoint URL for the
+/// shared-endpoint strip (MR !1571 review FE-1): the strip must catch the
+/// obvious re-spellings of the same container, not just the exact URL
+/// string. The host is lowercased, every loopback spelling folds into one
+/// class, the scheme-default port (80 for ws/http, 443 for wss/https) is
+/// applied when the URL omits it, and the path and query are ignored. One
+/// host:port that path-routes several containers therefore collapses to a
+/// single key and strips all of them — a false share fails closed, while a
+/// missed alias would silently keep the grant. An unparseable URL keeps
+/// only its exact raw string as the key (exact-match behavior).
+fn endpoint_container_key(url: &str) -> String {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return url.to_string();
+    };
+    let Some(host) = uri.host() else {
+        return url.to_string();
+    };
+    // Lowercase BEFORE the loopback fold: do not rely on the http::Uri
+    // parser's host normalization for mixed-case loopback spellings.
+    let lowered = host.to_ascii_lowercase();
+    let host = if is_loopback(&lowered) {
+        "loopback".to_string()
+    } else {
+        lowered
+    };
+    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("wss" | "https") => 443,
+        _ => 80,
+    });
+    format!("{host}:{port}")
+}
+
 /// Operator-facing explanation appended to a worker handshake rejection when
 /// the failure signature matches a subprotocol mismatch (HTTP 400/426 with no
 /// echoed `Sec-WebSocket-Protocol`), the visible symptom of the daemon
@@ -653,24 +685,32 @@ impl ExternalWorkerManager {
         // list would be borrowable by that container's ticks through a
         // concurrent task's relay socket — re-opening the cross-task
         // grant-borrow path the per-entry strip above closed. Strip such a
-        // shared-endpoint entry's worker-level list too. This is an exact
-        // URL match only: aliases (localhost vs 127.0.0.1, /etc/hosts names)
-        // are the operator's responsibility — see WORKER-CONTAINERS.md.
-        let cron_endpoint_urls: std::collections::HashSet<String> = workers
+        // shared-endpoint entry's worker-level list too. Endpoints are
+        // compared by normalized container key (MR !1571 review FE-1), so
+        // the obvious re-spellings (localhost vs 127.0.0.1, host case, the
+        // scheme-default port, path/query differences) are caught; a
+        // host:port that path-routes several containers collapses to one
+        // key and strips all of them (fails closed). Exotic aliases
+        // (/etc/hosts names) remain the operator's responsibility — see
+        // WORKER-CONTAINERS.md.
+        let cron_endpoint_keys: std::collections::HashSet<String> = workers
             .values()
             .filter(|config| config.is_cron())
-            .flat_map(|config| config.endpoints().into_iter().map(|endpoint| endpoint.url))
+            .flat_map(|config| {
+                config
+                    .endpoints()
+                    .into_iter()
+                    .map(|endpoint| endpoint_container_key(&endpoint.url))
+            })
             .collect();
-        if !cron_endpoint_urls.is_empty() {
+        if !cron_endpoint_keys.is_empty() {
             for config in workers.values_mut() {
                 if config.is_cron() || config.tool_allowlist.is_empty() {
                     continue;
                 }
-                if config
-                    .endpoints()
-                    .iter()
-                    .any(|endpoint| cron_endpoint_urls.contains(&endpoint.url))
-                {
+                if config.endpoints().iter().any(|endpoint| {
+                    cron_endpoint_keys.contains(&endpoint_container_key(&endpoint.url))
+                }) {
                     tracing::error!(
                         "External worker '{}' shares an endpoint with a mode=cron worker; \
                          stripping its worker-level tool_allowlist — one container is one \
@@ -4401,22 +4441,57 @@ mod tests {
         // 'memory'/'daily_log'/'heartbeat'/'bootstrap' layer shortcuts the
         // DX-2 guard always denies on this surface — the catalog must send
         // a proxied description naming only explicit workspace paths.
+        // MR !1571 review FE-5: pin the exact text — the previous contains
+        // loop passed vacuously for any description containing the word
+        // "denied" (which the real text does).
         let desc = proxied_catalog_description("memory_write", "original");
-        for denied in ["'memory'", "'daily_log'", "'heartbeat'", "'bootstrap'"] {
-            assert!(
-                !desc.contains(denied) || desc.contains("denied"),
-                "proxied description may only name {denied} as denied: {desc}"
-            );
-        }
-        assert!(
-            desc.contains("notes/today.md"),
-            "proxied description must name explicit workspace paths: {desc}"
+        assert_eq!(
+            desc,
+            "Write to persistent memory in the tenant workspace at an explicit path \
+             (target is REQUIRED on this surface, e.g. 'notes/today.md' or \
+             'projects/alpha/notes.md'). The named shortcuts ('memory', 'daily_log', \
+             'heartbeat', 'bootstrap'), identity/config files, lorebooks, daily logs \
+             and 'engine/**' paths are denied by the proxy boundary. \
+             Never pass absolute filesystem paths like '/Users/...' or 'C:\\...'."
         );
         // Other tools keep their own description untouched.
         assert_eq!(
             proxied_catalog_description("memory_read", "original"),
             "original"
         );
+    }
+
+    #[test]
+    fn endpoint_container_key_normalizes_aliases() {
+        // MR !1571 review FE-1: the shared-endpoint strip keys on a
+        // normalized container identity, so the obvious re-spellings of the
+        // same endpoint are caught.
+        let cron = endpoint_container_key("ws://127.0.0.1:9/ws/agent");
+        // Exact string.
+        assert_eq!(endpoint_container_key("ws://127.0.0.1:9/ws/agent"), cron);
+        // Loopback spellings fold into one class.
+        assert_eq!(endpoint_container_key("ws://localhost:9/ws/agent"), cron);
+        assert_eq!(endpoint_container_key("ws://[::1]:9/ws/agent"), cron);
+        assert_eq!(endpoint_container_key("ws://LOCALHOST:9/ws/agent"), cron);
+        // Path and query are ignored.
+        assert_eq!(
+            endpoint_container_key("ws://127.0.0.1:9/ws/agent?a=1"),
+            cron
+        );
+        assert_eq!(endpoint_container_key("ws://127.0.0.1:9/ws/agent/"), cron);
+        // Host case and scheme-default port normalize.
+        assert_eq!(
+            endpoint_container_key("wss://KIMI.example/ws/agent"),
+            endpoint_container_key("wss://kimi.example:443/ws/agent")
+        );
+        assert_eq!(
+            endpoint_container_key("ws://kimi.example/ws/agent"),
+            endpoint_container_key("ws://kimi.example:80/ws/agent")
+        );
+        // A different port is a different container.
+        assert_ne!(endpoint_container_key("ws://127.0.0.1:10/ws/agent"), cron);
+        // An unparseable URL keeps only its exact raw string as the key.
+        assert_eq!(endpoint_container_key("not a url"), "not a url");
     }
 
     #[test]

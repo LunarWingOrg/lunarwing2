@@ -2767,8 +2767,10 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
     // domain is the container. A task-mode entry pointing at the same
     // endpoint as a cron entry would let that container's ticks borrow its
     // grants through a concurrent task's relay socket, so the manager also
-    // strips the worker-level list of a non-cron entry whose endpoint URL
-    // exactly matches a cron entry's endpoint.
+    // strips the worker-level list of a non-cron entry whose endpoint
+    // shares a cron entry's container (normalized key, MR !1571 FE-1:
+    // loopback spellings folded, host lowercased, scheme-default port
+    // applied, path/query ignored).
     let probe = ProbeEchoTool::phase1();
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools.register(probe.clone()).await;
@@ -2783,7 +2785,7 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
     })
     .await;
     // Control: a task-mode worker on its own endpoint keeps its grant
-    // (the shared-endpoint strip is an exact-URL match only).
+    // (the shared-endpoint strip keys on the normalized host:port).
     let (ctrl_reply_tx, mut ctrl_reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ctrl_url, _ctrl_count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
         calls: vec![(
@@ -2802,6 +2804,19 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
         tool_allowlist: vec!["knowledge_search".to_string()],
         ..Default::default()
     };
+    // MR !1571 review FE-1: the strip compares endpoints by normalized
+    // container key, so a re-spelled alias of the cron entry's endpoint
+    // (here: localhost for 127.0.0.1 — dialable, so the dispatch reaches the
+    // same mock) is stripped too, not just the exact URL string.
+    let alias_url = shared_url.replacen("127.0.0.1", "localhost", 1);
+    assert_ne!(alias_url, shared_url, "the test URL must be re-spelled");
+    let alias_config = ExternalWorkerConfig {
+        name: "mock-alias".to_string(),
+        url: alias_url,
+        timeout_ms: 30_000,
+        tool_allowlist: vec!["knowledge_search".to_string()],
+        ..Default::default()
+    };
     let ctrl_config = ExternalWorkerConfig {
         name: "mock-standalone".to_string(),
         url: ctrl_url.clone(),
@@ -2809,8 +2824,9 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
         tool_allowlist: vec!["knowledge_search".to_string()],
         ..Default::default()
     };
-    let mgr = ExternalWorkerManager::new(vec![cron_config, shared_config, ctrl_config])
-        .with_tool_proxy(test_proxy(tools));
+    let mgr =
+        ExternalWorkerManager::new(vec![cron_config, shared_config, alias_config, ctrl_config])
+            .with_tool_proxy(test_proxy(tools));
 
     // The entry sharing the cron worker's endpoint is stripped: denied.
     let job_id = Uuid::new_v4();
@@ -2838,6 +2854,34 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
     assert_eq!(
         reply["payload"]["status"], "denied",
         "an entry sharing a cron worker's endpoint must be stripped at load: {reply}"
+    );
+
+    // The alias entry (same container, re-spelled URL) is stripped: denied.
+    let alias_job_id = Uuid::new_v4();
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            alias_job_id,
+            "mock-alias",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext {
+                user_id: "tenant-user".to_string(),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let reply = reply_rx.recv().await.expect("tool_result");
+    assert_eq!(
+        reply["payload"]["status"], "denied",
+        "an entry aliasing a cron worker's endpoint must be stripped at load: {reply}"
     );
 
     // The control entry on its own endpoint keeps its grant: success.
@@ -3375,9 +3419,15 @@ async fn tool_catalog_advertises_the_proxied_memory_write_schema() {
     // must not promise a backup the proxy boundary can never produce.
     let desc = entries[0]["description"].as_str().expect("description");
     assert!(
-        desc.contains("notes/today.md") && !desc.contains("for curated long-term facts"),
-        "the proxied description must name explicit workspace paths, not the tool's own \
-         layer-shortcut text: {desc}"
+        desc.contains("notes/today.md"),
+        "the proxied description must name explicit workspace paths: {desc}"
+    );
+    // MR !1571 review FE-5: pin that the catalog entry is NOT the tool's own
+    // description — the `!contains("for curated long-term facts")` clause
+    // this replaces was vacuous against the probe's "gate probe" text.
+    assert_ne!(
+        desc, "gate probe",
+        "the catalog must carry the proxied description, not the tool's own: {desc}"
     );
     let append_desc = params["properties"]["append"]["description"]
         .as_str()
