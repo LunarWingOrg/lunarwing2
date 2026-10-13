@@ -6,14 +6,26 @@
 # public exposure path (ic/src/tunnel); the only legitimate instruction
 # channel into this worker is the daemon's job dispatch -> the in-container
 # bridge -> the opencode API on loopback. This wrapper refuses the upstream
-# command surface that could break that rule, even when invoked through
-# layers the permission ruleset cannot see (bash -c, absolute paths):
+# command surface that could break that rule.
 #
-#   opencode service ...   service mode; v2.0.26+ couples it to the hosted
-#                          OpenTunnel relay (no self-host option)
-#   opencode pair ...      issues pairing links into the agent API
-#   opencode serve --hostname <non-loopback>
-#                          the worker's server must stay on loopback
+# This is a NAIVE-USE guard, not a security boundary: the real binary stays
+# executable by the agent uid (the entrypoint's own serve runs through this
+# wrapper as that uid), so a deliberately obfuscated invocation (exec'ing
+# the real binary path, os.execv, Bun.spawn) passes it. The boundary against
+# a compromised agent is the deferred egress allowlist (WI#357 control 1).
+#
+# Every argv token is scanned (run-79 EI-2/EI-3, run-84 EU-2), because the
+# CLI accepts global/root flags before the subcommand (--print-logs,
+# --log-level=DEBUG, --auto, …) and serve accepts multiple --hostname
+# values:
+#
+#   opencode service ...      service mode; v2.0.26+ couples it to the
+#                             hosted OpenTunnel relay (no self-host option)
+#   opencode pair ...         issues pairing links into the agent API
+#   opencode serve --service  service mode via the serve flag
+#   opencode ... --hostname <non-loopback>
+#                             the worker's server must stay on loopback
+#                             (every --hostname occurrence is checked)
 #
 # Everything else execs the real binary unchanged.
 set -eu
@@ -33,37 +45,21 @@ is_loopback() {
   esac
 }
 
-case "${1:-}" in
-  service)
-    refuse "service" "service mode is disabled in LunarWing worker images"
-    ;;
-  pair)
-    refuse "pair" "pairing links are disabled in LunarWing worker images"
-    ;;
-  serve)
-    # Parse args after the subcommand for an explicit --hostname; refuse
-    # non-loopback binds. No --hostname means upstream's loopback default.
-    hostname=""
-    want_next=0
-    first=1
-    for arg in "$@"; do
-      if [ "$first" = 1 ]; then
-        first=0
-        continue
-      fi
-      if [ "$want_next" = 1 ]; then
-        hostname="$arg"
-        break
-      fi
-      case "$arg" in
-        --hostname) want_next=1 ;;
-        --hostname=*) hostname="${arg#--hostname=}"; break ;;
-      esac
-    done
-    if [ -n "$hostname" ] && ! is_loopback "$hostname"; then
-      refuse "serve --hostname $hostname" "the worker's opencode server must bind loopback only"
-    fi
-    ;;
-esac
+want_host=0
+for arg in "$@"; do
+  if [ "$want_host" = 1 ]; then
+    want_host=0
+    is_loopback "$arg" || refuse "--hostname $arg" "the worker's opencode server must bind loopback only"
+    continue
+  fi
+  case "$arg" in
+    service) refuse "service" "service mode is disabled in LunarWing worker images" ;;
+    pair) refuse "pair" "pairing links are disabled in LunarWing worker images" ;;
+    --service | --service=*) refuse "serve --service" "service mode is disabled in LunarWing worker images" ;;
+    --hostname) want_host=1 ;;
+    --hostname=*) is_loopback "${arg#--hostname=}" || refuse "--hostname ${arg#--hostname=}" "the worker's opencode server must bind loopback only" ;;
+  esac
+done
+[ "$want_host" = 0 ] || refuse "--hostname" "missing value — the worker's opencode server must bind loopback only"
 
 exec "$REAL_OPENCODE" "$@"

@@ -104,8 +104,11 @@ export type ResultCallback = (result: TaskResult) => void
 // rules below must come AFTER the allow-* entries to win (WI#357: workers
 // must never self-expose). The shell tool wildcard-matches each parsed
 // command's full text against resource; the leading * covers absolute-path
-// and sudo-prefixed invocations of the binary. Obfuscated invocation
-// (`bash -c ...`) is the in-image wrapper's layer, not this one's.
+// and sudo-prefixed invocations of the binary. This ruleset and the
+// in-image wrapper are NAIVE-USE guards, not a boundary: both miss
+// whitespace/quote-obfuscated command text, and the real binary stays
+// directly executable by the agent uid — the boundary against a
+// compromised agent is the egress allowlist (WI#357 control 1, deferred).
 function sessionPermissions(): Array<{ action: string; resource: string; effect: "allow" | "deny" }> {
   return [
     { action: "edit", resource: "*", effect: "allow" },

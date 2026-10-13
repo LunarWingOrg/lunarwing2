@@ -150,6 +150,50 @@ class ExposureGuardWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 77)
         self.assertIn("refused 'opencode pair'", result.stderr)
 
+    def test_leading_global_flag_bypass_forms_refused(self) -> None:
+        # run-79 EI-2 / run-84 EU-2: the v2 CLI takes global/root flags before
+        # the subcommand, so a $1-only dispatch misses these.
+        for form in (
+            ("--print-logs", "service", "install"),
+            ("--print-logs", "serve", "--hostname", "0.0.0.0"),
+            ("--log-level", "DEBUG", "service"),
+            ("--log-level=DEBUG", "pair"),
+            ("--auto", "pair"),
+        ):
+            result = self.run_wrapper(*form)
+            self.assertEqual(result.returncode, 77, (form, result.stderr))
+            self.assertIn("refused", result.stderr)
+
+    def test_service_flag_refused(self) -> None:
+        # run-79 EI-3: serve --service is service mode via a flag.
+        for form in (
+            ("serve", "--service"),
+            ("serve", "--service=true"),
+            ("--service",),
+            ("run", "--service", "prompt"),
+        ):
+            result = self.run_wrapper(*form)
+            self.assertEqual(result.returncode, 77, (form, result.stderr))
+            self.assertIn("service mode is disabled", result.stderr)
+
+    def test_every_hostname_occurrence_is_checked(self) -> None:
+        # EU-2: last-value-wins parsing means a second --hostname 0.0.0.0
+        # behind a loopback first value still binds all interfaces.
+        for form in (
+            ("serve", "--hostname", "127.0.0.1", "--hostname", "0.0.0.0"),
+            ("--hostname", "0.0.0.0", "serve"),
+            ("web", "--hostname", "0.0.0.0"),
+            ("--hostname=0.0.0.0",),
+        ):
+            result = self.run_wrapper(*form)
+            self.assertEqual(result.returncode, 77, (form, result.stderr))
+            self.assertIn("loopback only", result.stderr)
+
+    def test_dangling_hostname_value_refused(self) -> None:
+        result = self.run_wrapper("serve", "--hostname")
+        self.assertEqual(result.returncode, 77)
+        self.assertIn("missing value", result.stderr)
+
     def test_non_loopback_serve_refused(self) -> None:
         for form in (("serve", "--hostname", "0.0.0.0"), ("serve", "--hostname=10.0.0.5")):
             result = self.run_wrapper(*form)
@@ -160,7 +204,10 @@ class ExposureGuardWrapperTests(unittest.TestCase):
         for form in (
             ("serve", "--port", "4096", "--hostname", "127.0.0.1"),
             ("serve", "--hostname=::1"),
+            ("serve", "--hostname", "localhost"),
+            ("serve", "--hostname", "[::1]"),
             ("serve", "--port", "4096"),
+            ("--hostname=127.0.0.1", "serve", "--port", "4096"),
         ):
             result = self.run_wrapper(*form)
             self.assertEqual(result.returncode, 0, (form, result.stderr))
@@ -172,7 +219,12 @@ class ExposureGuardWrapperTests(unittest.TestCase):
         result = self.run_wrapper("--version")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("refused", result.stderr)
-        for form in (("run", "fix", "the", "tests"), ("acp",), ()):  # no echo flags
+        for form in (
+            ("run", "fix", "the", "tests"),
+            ("run", "restart the service and pair the devices"),
+            ("acp",),
+            (),
+        ):  # no echo flags
             result = self.run_wrapper(*form)
             self.assertEqual(result.returncode, 0, (form, result.stderr))
             self.assertEqual(result.stdout.strip(), " ".join(form))
