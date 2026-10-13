@@ -2408,6 +2408,14 @@ mod tests {
     #[test]
     fn webhook_cadence_requires_and_retains_explicit_secret() {
         assert!(parse_cadence_with_secret("webhook:Build/Ready", None).is_err());
+        // WI#359 (run-91 FH-3): unpresentable secrets are rejected too —
+        // empty, whitespace-only, padded, non-ASCII.
+        for secret in ["", "  ", " padded", "padded ", "non-ascii-sëcret"] {
+            assert!(
+                parse_cadence_with_secret("webhook:Build/Ready", Some(secret)).is_err(),
+                "secret {secret:?} must be rejected"
+            );
+        }
         assert!(matches!(
             parse_cadence_with_secret("webhook:Build/Ready", Some("secret-value"))
                 .expect("webhook cadence"),
@@ -5602,6 +5610,9 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             "goal": "report on events",
             "cadence": "webhook:events",
             "webhook_secret": "super-secret-value",
+            // Run-91 FI-M14: a mis-keyed credential kwarg must be redacted
+            // by the same recursive predicate, not ride the hook payload.
+            "hmac_secret": "super-secret-2",
         });
         let result = adapter
             .execute_action("mission_create", params, &lease(), &mission_create_ctx())
@@ -5616,7 +5627,9 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             .expect("the hook saw the mission_create call");
         assert_eq!(tool_name, "mission_create");
         assert_eq!(hook_params["webhook_secret"], "[REDACTED]");
+        assert_eq!(hook_params["hmac_secret"], "[REDACTED]");
         assert!(!hook_params.to_string().contains("super-secret-value"));
+        assert!(!hook_params.to_string().contains("super-secret-2"));
         assert_eq!(hook_params["name"], "hooky");
     }
 

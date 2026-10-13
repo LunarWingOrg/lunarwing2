@@ -6619,7 +6619,17 @@ mod tests {
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project = ProjectId::new();
 
-        for secret in [None, Some(String::new())] {
+        // WI#359 (run-91 FH-3): unpresentable secrets are rejected on both
+        // entry points — missing, empty, whitespace-only, padded, non-ASCII.
+        let unusable: Vec<Option<String>> = vec![
+            None,
+            Some(String::new()),
+            Some("  ".to_string()),
+            Some(" padded".to_string()),
+            Some("padded ".to_string()),
+            Some("non-ascii-sëcret".to_string()),
+        ];
+        for secret in &unusable {
             let result = mgr
                 .create_mission(
                     project,
@@ -6628,12 +6638,12 @@ mod tests {
                     "must reject",
                     MissionCadence::Webhook {
                         path: "hook".into(),
-                        secret,
+                        secret: secret.clone(),
                     },
                     Vec::new(),
                 )
                 .await;
-            assert!(result.is_err());
+            assert!(result.is_err(), "create must reject secret {secret:?}");
         }
 
         let id = mgr
@@ -6647,20 +6657,22 @@ mod tests {
             )
             .await
             .unwrap();
-        let result = mgr
-            .update_mission(
-                id,
-                "test-user",
-                MissionUpdate {
-                    cadence: Some(MissionCadence::Webhook {
-                        path: "hook".into(),
-                        secret: None,
-                    }),
-                    ..MissionUpdate::default()
-                },
-            )
-            .await;
-        assert!(result.is_err());
+        for (index, secret) in unusable.iter().enumerate() {
+            let result = mgr
+                .update_mission(
+                    id,
+                    "test-user",
+                    MissionUpdate {
+                        cadence: Some(MissionCadence::Webhook {
+                            path: format!("hook-{index}"),
+                            secret: secret.clone(),
+                        }),
+                        ..MissionUpdate::default()
+                    },
+                )
+                .await;
+            assert!(result.is_err(), "update must reject secret {secret:?}");
+        }
     }
 
     #[tokio::test]
@@ -7422,6 +7434,74 @@ mod tests {
         assert_eq!(
             store.load_mission(paused_id).await.unwrap().unwrap().status,
             MissionStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_claim_check_and_save_are_serialized_against_resume() {
+        // WI#359 (run-91 FH-4, mutation FH-M4): resume holds the shared
+        // claim lock across check+save — a terminal-to-Active resume racing
+        // a create on one path must not leave two owners. Same barrier rig
+        // as the update-side pin: both checks complete before either save.
+        let mut raw_store = TestStore::new();
+        raw_store.list_all_missions_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
+        let store = Arc::new(raw_store);
+        let mgr = Arc::new(make_mission_manager(store.clone() as Arc<dyn Store>));
+        let project = ProjectId::new();
+        let mut existing = Mission::new(
+            project,
+            "user-b",
+            "b-hook",
+            "goal",
+            MissionCadence::Webhook {
+                path: "events".into(),
+                secret: Some("b-secret".into()),
+            },
+        );
+        existing.status = MissionStatus::Completed;
+        store.save_mission(&existing).await.unwrap();
+
+        let create_mgr = Arc::clone(&mgr);
+        let create = tokio::spawn(async move {
+            create_mgr
+                .create_mission(
+                    project,
+                    "user-a",
+                    "a-hook",
+                    "goal",
+                    MissionCadence::Webhook {
+                        path: "events".into(),
+                        secret: Some("a-secret".into()),
+                    },
+                    Vec::new(),
+                )
+                .await
+        });
+        let resume_mgr = Arc::clone(&mgr);
+        let resume_id = existing.id;
+        let resume =
+            tokio::spawn(async move { resume_mgr.resume_mission(resume_id, "user-b").await });
+        let (created, resumed) = tokio::join!(create, resume);
+        let created = created.expect("create task panicked");
+        let resumed = resumed.expect("resume task panicked");
+
+        let claims = store
+            .list_all_missions(project)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|mission| {
+                !mission.is_terminal()
+                    && matches!(&mission.cadence, MissionCadence::Webhook { path, .. } if path == "events")
+            })
+            .count();
+        assert_eq!(
+            claims, 1,
+            "exactly one mission may hold the webhook path claim (create: {created:?}, resume: {resumed:?})"
+        );
+        assert!(
+            created.is_ok() != resumed.is_ok(),
+            "exactly one of the racing transitions may succeed (create: {created:?}, resume: {resumed:?})"
         );
     }
 

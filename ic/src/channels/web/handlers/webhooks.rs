@@ -26,11 +26,15 @@ fn validate_webhook_secret(
     trigger: &Trigger,
     provided_secret: &str,
 ) -> Result<(), (StatusCode, String)> {
-    // Require webhook secret — routines without a secret cannot be triggered via webhook
+    // Require webhook secret — routines without a secret cannot be triggered via webhook.
+    // WI#359 (run-91 FH-1): a stored secret that can never be presented on
+    // the wire (empty, padded, non-ASCII) must never authenticate — `ct_eq`
+    // treats two empty slices as equal, so a legacy `secret: ""` row was
+    // fireable by anyone who knew its path.
     let expected_secret = match trigger {
         Trigger::Webhook {
             secret: Some(s), ..
-        } => s,
+        } if lunarwing_engine::usable_webhook_secret(s) => s,
         _ => {
             return Err((
                 StatusCode::FORBIDDEN,
@@ -266,6 +270,31 @@ mod tests {
         let result = validate_webhook_secret(&trigger, "");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// WI#359 (run-91 FH-1): a stored secret that can never be presented on
+    /// the wire must never authenticate — `ct_eq("", "")` is true, so a
+    /// legacy `secret: ""` row was fireable with an empty (or missing)
+    /// header. The stored secret is now gated by `usable_webhook_secret`.
+    #[test]
+    fn test_validate_rejects_unusable_stored_secret() {
+        for stored in ["", "  ", " padded", "padded ", "non-ascii-sëcret"] {
+            let trigger = Trigger::Webhook {
+                path: Some("my-hook".to_string()),
+                secret: Some(stored.to_string()),
+            };
+            // Neither the exact stored value, nor an empty header, nor any
+            // guess may authenticate.
+            for provided in [stored, "", "anything"] {
+                let (status, _) = validate_webhook_secret(&trigger, provided)
+                    .expect_err("unusable stored secret must never validate");
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "stored {stored:?} with provided {provided:?} must be 403"
+                );
+            }
+        }
     }
 
     /// Constant-time comparison: secrets of different lengths are still rejected
