@@ -201,13 +201,16 @@ case "$MODE" in
   cli)
     log "Mode: CLI — running opencode with args: $*"
     cd "$WORKSPACE_ROOT"
-    exec "$OPENCODE_BIN" run "$@"
+    # WI#373: the prompt runs untrusted agent code — never inherit the
+    # bridge's hub-handshake credential.
+    exec env -u AGENT_AUTH_TOKEN "$OPENCODE_BIN" run "$@"
     ;;
 
   acp)
     log "Mode: ACP — launching opencode ACP bridge"
     cd "$WORKSPACE_ROOT"
-    exec "$OPENCODE_BIN" acp "$@"
+    # WI#373: same one-shot task boundary as cli mode.
+    exec env -u AGENT_AUTH_TOKEN "$OPENCODE_BIN" acp "$@"
     ;;
 
   websocket)
