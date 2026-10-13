@@ -370,11 +370,12 @@ pub enum WorkspaceError {
     /// backup generations are already at the cap: the next rotation would
     /// discard the second-oldest generation, which is the only reserved copy
     /// of that version (the pinned `.1` is positional — it holds the content
-    /// that preceded the day's first replace, not necessarily the poison;
-    /// WI#335). The replace was not applied. Agent tool lanes opt into this
-    /// refusal via the `*_with_daily_log_cap_guard` write methods so a
-    /// steered agent cannot evict generations with ordinary replaces;
-    /// operator routes (`write`/`write_to_layer` via web/CLI) keep rotating.
+    /// that preceded the day's first backed-up replace in that scope, not
+    /// necessarily the poison; WI#335). The replace was not applied. Agent
+    /// tool lanes opt into this refusal via the `*_with_daily_log_cap_guard`
+    /// write methods so a steered agent cannot evict generations with
+    /// ordinary replaces; operator routes (`write`/`write_to_layer` via
+    /// web/CLI) keep rotating.
     #[error(
         "Replace of daily log '{path}' not applied: {generations} backup generations are \
          already retained and the next replace would discard the second-oldest one; ask the \
