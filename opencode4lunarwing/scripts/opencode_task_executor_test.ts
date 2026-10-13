@@ -891,6 +891,42 @@ assert.ok(toolOnlyResults[0]!.output.includes("status: done"))
   assert.match(results[0]!.output, /\[control\] follow-up seq=1 timed out before completing/)
 }
 
+// !1566 EZ-6 (run-85 review): the per-turn `turnToolOutput` reset when a
+// follow-up starts must be pinned — without it a tool-only main turn followed
+// by a silent clean follow-up banks the same tool line twice.
+{
+  const sdk = makeSdk({
+    events: [
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            sessionID: "session-1", type: "tool", tool: "bash",
+            state: { status: "completed", output: "wrote src/feature.rs" },
+          },
+        },
+      },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+    partsPerCall: [[], []],
+  })
+  const queue: FollowupQueue = {
+    prompts: [{ task_id: "ez6", seq: 1, prompt: "status?", done: false }],
+    closed: false,
+  }
+  const results: Array<{ status: string; output: string; error: string | null }> = []
+  await executeTask(
+    { task_id: "ez6", prompt: "build" },
+    () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+  )
+  assert.equal(results.length, 1)
+  assert.equal(sdk.promptArgs.length, 2)
+  assert.equal(results[0]!.status, "success")
+  const occurrences = results[0]!.output.split("[bash] wrote src/feature.rs").length - 1
+  assert.equal(occurrences, 1, "a silent follow-up must not re-bank the main turn's tool output")
+}
+
 // !1552 ER-2: nothing runs after the FINAL turn — a remainder queued behind
 // a done prompt becomes a "not run" note instead of a post-wrap-up turn.
 {
