@@ -1,8 +1,12 @@
 # External Worker Cron Mode (WI#325)
 
 Status: implemented in v2.1.6.0; revised after the MR !1509 (CU-1..CU-10),
-!1522 (DE-1..DE-10), and !1531 (DN/DO) reviews. WI#325 remains open:
-audio capture and its proposed scope-out still require the WI owner's decision.
+!1522 (DE-1..DE-10), and !1531 (DN/DO) reviews. WI#325 was closed out
+2026-10-13 on the owner's instruction ("verify and close out when possible"):
+the audio-capture scope-out is accepted — no audio path exists in external
+workers today, and ask 4's log half is covered by `job_events` + workspace
+state files. Residual review nits stay tracked by WI#375 (child of #325),
+plus WI#370/WI#371.
 Work item: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
 
 ## Problem
@@ -316,8 +320,10 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   lifecycle machine — it is never an engine `Mission` at all.
 - [~] Session audio/log capture — text session logs are covered by
   `job_events` + workspace state files; **audio capture is not implemented**
-   (no audio path exists in external workers today). Deferring it needs the
-   WI owner's acceptance; this branch does not claim that acceptance.
+   (no audio path exists in external workers today). The WI owner accepted
+   this scope-out at close-out (2026-10-13, "verify and close out when
+   possible"); the audio half is future work if a worker ever gains an
+   audio path.
 
 ## Owner recovery API (MR !1531 DN-3)
 
@@ -416,7 +422,8 @@ curl --fail -H "Authorization: Bearer $GATEWAY_AUTH_TOKEN" \
 - Migrating existing engine missions wholesale (additive; see WI#324 for the
   proxied tool path that lets workers call `memory_*`/`knowledge_*`).
 - Hub-mediated cross-thread coordination (KV + advisory locks) — WI#324 phase 2.
-- Audio session capture (no audio path exists in external workers today).
+- Audio session capture (no audio path exists in external workers today);
+  the scope-out was accepted by the WI owner at close-out (2026-10-13).
 - Per-tick credential grants: `create_job` can inject named tenant secrets
   per job; tick jobs currently dispatch with an empty environment and
   `credential_grants_json = "[]"`. Follow-up if missions need tenant secrets.
