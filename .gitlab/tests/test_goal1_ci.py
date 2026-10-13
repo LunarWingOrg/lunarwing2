@@ -280,12 +280,20 @@ class BunImageTieTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = pathlib.Path(temporary.name)
         self.dockerfile = self.root / "Dockerfile"
+        # Sibling fixture: the CI_NODE_IMAGE tie also runs here, so pin a
+        # matching kimi Dockerfile to keep the bun cases hermetic.
+        self.kimi_dockerfile = self.root / "Dockerfile.kimi"
+        self.kimi_dockerfile.write_text(
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         pin = f"docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST}"
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
             "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
             "CI_GITLEAKS_IMAGE": f"docker.io/zricethezav/gitleaks:v8.30.1@sha256:{self.OTHER_DIGEST}",
             "CI_BUN_IMAGE": pin,
+            "CI_NODE_IMAGE": f"docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST}",
         }
         self.merged = {
             ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
@@ -301,7 +309,11 @@ class BunImageTieTests(unittest.TestCase):
 
     def errors(self):
         errors = []
-        with mock.patch.object(config, "OPENCODE_DOCKERFILE", self.dockerfile):
+        with mock.patch.multiple(
+            config,
+            OPENCODE_DOCKERFILE=self.dockerfile,
+            KIMI_DOCKERFILE=self.kimi_dockerfile,
+        ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
         return errors
 
@@ -332,6 +344,93 @@ class BunImageTieTests(unittest.TestCase):
     def test_uppercase_digest_bun_from_is_caught(self):
         self.write_dockerfile(
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST.upper()} AS builder\n"
+        )
+        self.assertTrue(any("not pinned" in error for error in self.errors()))
+
+
+class NodeImageTieTests(unittest.TestCase):
+    """WI#324 (MR !1590 review GB-2) ties CI_NODE_IMAGE to the kimi worker
+    Dockerfile's node FROM digest(s), failing closed like the bun tie."""
+
+    NODE_DIGEST = "83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5"
+    BUN_DIGEST = "9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895"
+    OTHER_DIGEST = "0" * 64
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.dockerfile = self.root / "Dockerfile"
+        # Sibling fixture: the CI_BUN_IMAGE tie also runs here, so pin a
+        # matching opencode Dockerfile to keep the node cases hermetic.
+        self.opencode_dockerfile = self.root / "Dockerfile.opencode"
+        self.opencode_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
+        self.variables = {
+            "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
+            "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
+            "CI_GITLEAKS_IMAGE": f"docker.io/zricethezav/gitleaks:v8.30.1@sha256:{self.OTHER_DIGEST}",
+            "CI_BUN_IMAGE": f"docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST}",
+            "CI_NODE_IMAGE": f"docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST}",
+        }
+        self.merged = {
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
+            ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
+            "rust-test-postgres-integration": {
+                "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
+            },
+        }
+
+    def write_dockerfile(self, text: str) -> None:
+        self.dockerfile.write_text(text, encoding="utf-8")
+
+    def errors(self):
+        errors = []
+        with mock.patch.multiple(
+            config,
+            OPENCODE_DOCKERFILE=self.opencode_dockerfile,
+            KIMI_DOCKERFILE=self.dockerfile,
+        ):
+            config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
+        return errors
+
+    def test_matching_digests_pass(self):
+        # The real Dockerfile has two node stages (builder + runtime).
+        self.write_dockerfile(
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n"
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS runtime\n"
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_digest_mismatch_is_caught(self):
+        self.write_dockerfile(
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST[:-1]}0 AS builder\n"
+        )
+        self.assertTrue(any("CI_NODE_IMAGE digest must match" in error for error in self.errors()))
+
+    def test_missing_dockerfile_is_caught(self):
+        self.assertTrue(any("Dockerfile missing" in error for error in self.errors()))
+
+    def test_no_node_from_is_caught(self):
+        self.write_dockerfile(f"FROM docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}\n")
+        self.assertTrue(any("no node FROM" in error for error in self.errors()))
+
+    def test_nodejs_named_from_is_caught(self):
+        # A non-node image whose name merely starts with "node" must fail
+        # closed as "no node FROM line", not silently match the tie.
+        self.write_dockerfile(f"FROM docker.io/library/nodejs:24@sha256:{self.NODE_DIGEST}\n")
+        self.assertTrue(any("no node FROM" in error for error in self.errors()))
+
+    def test_tag_only_node_from_is_caught(self):
+        self.write_dockerfile("FROM docker.io/library/node:22-bookworm-slim AS builder\n")
+        self.assertTrue(any("not pinned" in error for error in self.errors()))
+
+    def test_uppercase_digest_node_from_is_caught(self):
+        self.write_dockerfile(
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST.upper()} AS builder\n"
         )
         self.assertTrue(any("not pinned" in error for error in self.errors()))
 
