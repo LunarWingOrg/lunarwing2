@@ -671,7 +671,7 @@ impl MissionManager {
                     .map(|(id, owner)| format!("{id} (owner: {owner})"))
                     .collect::<Vec<_>>()
                     .join(", "),
-                "webhook path has multiple non-terminal owners; every matching fire will deliver to each of them — rotate or pause the duplicates"
+                "webhook path has multiple non-terminal owners; a fire delivers to every Active holder while Paused holders still block new claims — rotate or complete the duplicates"
             );
         }
         let mut active_ids = Vec::new();
@@ -908,38 +908,7 @@ impl MissionManager {
         // the single-owner rule below can tell a new/changed claim from an
         // untouched one (dormant rows hold no claim — see live_webhook_claim).
         let old_webhook_path = live_webhook_claim(&mission.cadence).map(str::to_string);
-        if let Some(name) = updates.name {
-            mission.name = name;
-        }
-        if let Some(goal) = updates.goal {
-            mission.goal = goal;
-        }
-        if let Some(mut cadence) = updates.cadence {
-            if let MissionCadence::Webhook { secret, .. } = &mut cadence
-                && secret.is_none()
-                && let MissionCadence::Webhook {
-                    secret: existing_secret,
-                    ..
-                } = &mission.cadence
-            {
-                *secret = existing_secret.clone();
-            }
-            validate_cadence_event_registration(&cadence)?;
-            mission.cadence = cadence;
-            refresh_next_fire_at(&mut mission, Utc::now())?;
-        }
-        if let Some(secret) = updates.webhook_secret {
-            let MissionCadence::Webhook {
-                secret: mission_secret,
-                ..
-            } = &mut mission.cadence
-            else {
-                return Err(EngineError::Effect {
-                    reason: "webhook_secret requires webhook cadence".into(),
-                });
-            };
-            *mission_secret = Some(secret);
-        }
+        apply_mission_update_fields(&mut mission, updates)?;
         validate_webhook_cadence(&mission.cadence)?;
         // WI#352 (AO-1): the webhook single-owner rule applies here too —
         // but only to new claims (run-51 CJ-6). An update that leaves the
@@ -967,21 +936,6 @@ impl MissionManager {
                 Some(mission.id),
             )
             .await?;
-        }
-        if let Some(channels) = updates.notify_channels {
-            mission.notify_channels = channels;
-        }
-        if let Some(max) = updates.max_threads_per_day {
-            mission.max_threads_per_day = max;
-        }
-        if let Some(policy) = updates.retry_policy {
-            mission.retry_policy = policy;
-        }
-        if let Some(criteria) = updates.success_criteria {
-            mission.success_criteria = Some(criteria);
-        }
-        if let Some(focus) = updates.current_focus {
-            mission.current_focus = focus;
         }
 
         mission.updated_at = chrono::Utc::now();
@@ -3880,6 +3834,66 @@ fn webhook_claim_changed(old_claim: Option<&str>, new_cadence: &MissionCadence) 
         MissionCadence::Webhook { path, .. } => Some(path.as_str()) != old_claim,
         _ => false,
     }
+}
+
+/// Apply an update's field edits to `mission` (WI#359 run-91 FH-6a, split
+/// out of `update_mission` under the 100-line rule). A cadence replacement
+/// carries the existing webhook secret over when the update omits it, and
+/// every cadence change re-runs event-registration validation and the
+/// next-fire recompute. `validate_webhook_cadence` runs afterwards in the
+/// caller, once the final cadence is known.
+fn apply_mission_update_fields(
+    mission: &mut Mission,
+    updates: MissionUpdate,
+) -> Result<(), EngineError> {
+    if let Some(name) = updates.name {
+        mission.name = name;
+    }
+    if let Some(goal) = updates.goal {
+        mission.goal = goal;
+    }
+    if let Some(mut cadence) = updates.cadence {
+        if let MissionCadence::Webhook { secret, .. } = &mut cadence
+            && secret.is_none()
+            && let MissionCadence::Webhook {
+                secret: existing_secret,
+                ..
+            } = &mission.cadence
+        {
+            *secret = existing_secret.clone();
+        }
+        validate_cadence_event_registration(&cadence)?;
+        mission.cadence = cadence;
+        refresh_next_fire_at(mission, Utc::now())?;
+    }
+    if let Some(secret) = updates.webhook_secret {
+        let MissionCadence::Webhook {
+            secret: mission_secret,
+            ..
+        } = &mut mission.cadence
+        else {
+            return Err(EngineError::Effect {
+                reason: "webhook_secret requires webhook cadence".into(),
+            });
+        };
+        *mission_secret = Some(secret);
+    }
+    if let Some(channels) = updates.notify_channels {
+        mission.notify_channels = channels;
+    }
+    if let Some(max) = updates.max_threads_per_day {
+        mission.max_threads_per_day = max;
+    }
+    if let Some(policy) = updates.retry_policy {
+        mission.retry_policy = policy;
+    }
+    if let Some(criteria) = updates.success_criteria {
+        mission.success_criteria = Some(criteria);
+    }
+    if let Some(focus) = updates.current_focus {
+        mission.current_focus = focus;
+    }
+    Ok(())
 }
 
 fn validate_webhook_cadence(cadence: &MissionCadence) -> Result<(), EngineError> {

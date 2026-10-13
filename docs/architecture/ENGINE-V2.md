@@ -1143,8 +1143,13 @@ ToolStarted/ToolCompleted channel status summary (AQ-5); the persisted
 `ApprovalRequested` thread
 event stores display parameters with the same predicate redacted,
 recursively (a positional `_args[0]` payload included), and for
-`http`/`web_fetch` also with credential-like header values blanked and URL
-query credentials stripped (WI#359 CJ-11) rather
+`http`/`web_fetch` also with credential-like header values blanked (matched
+by header name against the union of the header heuristic and the shared
+credential-key list, or by an auth-scheme value prefix; the string form of
+`headers` is parsed, redacted inside, and re-serialised, failing closed on
+unparseable input) and URL credentials stripped (userinfo removed,
+credential-like query values replaced by `[REDACTED]`, the fragment
+dropped) (WI#359 CJ-11, run-91 FI-1..FI-4) rather
 than the raw call parameters — the pending gate still holds the raw copy
 for resume, and the thread transcript's action arguments plus the
 `MessageAdded` content previews remain pre-existing at-rest classes (AQ-4,
@@ -1168,9 +1173,10 @@ the row otherwise (WI#359 CO-3). Dormant (secret-less or unpresentable
 whitespace/non-visible-ASCII secret) non-terminal rows still block other
 users' claims on their path (WI#359 CO-3); startup logs a warning for
 every legacy multi-owner path it re-activates (WI#359); two conflicting
-Paused missions cannot both resume — each resume re-checks the rule, so
-the second is refused (WI#359 CL-4); and create-dedup compares webhook
-cadences by
+Paused missions cannot resume — each resume re-checks the rule and finds
+the other non-terminal holder, so both are refused until one is deleted,
+completed, or moved off the path (WI#359 CL-4, run-91 FH-5); and
+create-dedup compares webhook cadences by
 path only, so a rotated secret is not a spurious cadence difference (AO-7)
 — the dedup hit discards the supplied secret and flags
 `webhook_secret_applied: false` with a pointer to `mission_update`.

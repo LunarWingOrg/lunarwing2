@@ -212,11 +212,9 @@ impl RateLimiter {
         self.check_internal(user_id, tool_name, config, true).await
     }
 
-    /// Atomically reserve all buckets, or charge none. The error identifies
-    /// the first refused bucket. Repeated keys are checked against every
-    /// supplied config but charged once.
-    /// Atomically check every bucket and, only if all are allowed, record one
-    /// hit per distinct bucket key.
+    /// Atomically check every bucket and, only if all are allowed, record
+    /// one hit per distinct bucket key — otherwise charge none. Repeated
+    /// keys are checked against every supplied config but charged once.
     ///
     /// The error carries `(bucket_index, retry_after, limit_type)` of the
     /// first exceeded bucket — never the `Allowed` variant, so a caller
