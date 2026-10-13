@@ -98,6 +98,9 @@ function emptyOutputError(deniedPermissions: number): string {
 
 // Values that must never survive into a job record via the serve-log tail:
 // the bridge's own credential env plus everything this task injected.
+// Beyond the fixed names, any env name matching the secret patterns is
+// selected too, so credentials mt-admin injects via --env-file or compose
+// EXTRA_ENV_FILE (provider keys and friends) are covered (run-92 FJ-6).
 const SECRET_SCRUB_ENV_KEYS = [
   "OPENCODE_SERVER_PASSWORD",
   "TENSORZERO_API_KEY",
@@ -108,10 +111,26 @@ const SECRET_SCRUB_ENV_KEYS = [
   "PASEO_TOKEN",
 ]
 
+const SECRET_ENV_NAME_PATTERN = /(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL|AUTH)/
+
+function secretEnvValues(env: Record<string, string | undefined>): string[] {
+  const values: string[] = []
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string" || value.length === 0) continue
+    if (SECRET_SCRUB_ENV_KEYS.includes(key) || SECRET_ENV_NAME_PATTERN.test(key)) {
+      values.push(value)
+    }
+  }
+  return values
+}
+
+// Snapshot at module load: tasks inject their context.environment into
+// process.env, and a task value named TENSORZERO_API_KEY must not shadow the
+// boot value — the boot value is the one serve actually logs (run-92 FJ-6).
+const BOOT_SECRET_ENV_VALUES = secretEnvValues(process.env)
+
 function secretScrubValues(request: TaskRequest): string[] {
-  const values = SECRET_SCRUB_ENV_KEYS.map((key) => process.env[key]).filter(
-    (value): value is string => typeof value === "string" && value.length > 0,
-  )
+  const values = [...BOOT_SECRET_ENV_VALUES]
   for (const value of Object.values(request.context?.environment ?? {})) {
     if (typeof value === "string" && value.length > 0) values.push(value)
   }

@@ -49,13 +49,20 @@ const GENERIC_SERVER_ERROR = /unexpected server error/i
 const TAIL_BYTES = 8192
 const TAIL_LINES = 25
 const LINE_LIMIT = 400
-const READ_RETRIES = 5
+// The Effect file logger batches writes on a 1 s window ("Do not set
+// batchWindow to 0", upstream logging.ts), and the cause line can land just
+// after the failing HTTP response — the retry budget must cover that flush
+// window with margin. Only the generic-500 path ever reaches this loop.
+const READ_RETRIES = 16
 const READ_RETRY_DELAY_MS = 100
 const REF_PATTERN = /^err_[0-9a-f]{1,64}$/
-const ERROR_LEVEL_TOKEN = /(?:^|\s)level=Error(?:\s|$)/
+// The real formatter's level token: opencode's logger emits
+// ["level", output.level] and effect's formatStructured uppercases it
+// (logLevel.toUpperCase()), so a real 500 logs `level=ERROR` — never
+// `level=Error` (verified at the pinned cb7d8b2f, run-92 FJ-1).
+const ERROR_LEVEL_TOKEN = /(?:^|\s)level=ERROR(?:\s|$)/
 const REDACTED = "[redacted]"
 const MIN_SCRUB_SECRET_LENGTH = 8
-const MAX_SCRUB_SECRETS = 64
 
 export interface ServeLogOptions {
   ref?: string
@@ -67,7 +74,7 @@ export interface ServeLogOptions {
 }
 
 export function resolveServeLogPath(
-  env: { OPENCODE_SERVE_LOG?: string; XDG_DATA_HOME?: string },
+  env: Record<string, string | undefined>,
   home: string,
 ): string | undefined {
   const override = env.OPENCODE_SERVE_LOG
@@ -161,9 +168,21 @@ function capLine(line: string): string {
 
 function scrubSecrets(line: string, secrets: string[]): string {
   let scrubbed = line
-  for (const secret of secrets.slice(0, MAX_SCRUB_SECRETS)) {
-    if (secret.length < MIN_SCRUB_SECRET_LENGTH) continue
-    if (scrubbed.includes(secret)) scrubbed = scrubbed.split(secret).join(REDACTED)
+  // Longest first: a secret containing a shorter secret must not leave its
+  // suffix behind after the shorter one is replaced. There is no count cap —
+  // a cap would silently let later values through.
+  const eligible = secrets
+    .filter((secret) => secret.length >= MIN_SCRUB_SECRET_LENGTH)
+    .sort((a, b) => b.length - a.length)
+  for (const secret of eligible) {
+    // The structured logger JSON-quotes any value containing whitespace,
+    // '"' or a backslash, so the escaped rendering must be scrubbed too.
+    const forms = [secret]
+    const escaped = JSON.stringify(secret).slice(1, -1)
+    if (escaped !== secret) forms.push(escaped)
+    for (const form of forms) {
+      if (scrubbed.includes(form)) scrubbed = scrubbed.split(form).join(REDACTED)
+    }
   }
   return scrubbed
 }
@@ -174,8 +193,13 @@ function selectTailLines(window: LogWindow, ref: string | undefined, secrets: st
   lines = lines.filter((line) => ERROR_LEVEL_TOKEN.test(line))
   // With the response's ref, attach only that request's line — one serve
   // process serves every task and user of the tenant, so uncorrelated error
-  // lines could leak another task's failure into this job's record.
-  if (ref !== undefined) lines = lines.filter((line) => line.includes(`ref=${ref}`))
+  // lines could leak another task's failure into this job's record. Match
+  // the exact space-delimited token so a longer ref sharing the same prefix
+  // cannot satisfy a substring test.
+  if (ref !== undefined) {
+    const token = `ref=${ref}`
+    lines = lines.filter((line) => line.split(" ").includes(token))
+  }
   return lines
     .map((line) => capLine(scrubSecrets(line, secrets)))
     .filter((line) => line.trim().length > 0)
@@ -194,6 +218,12 @@ export async function withServeLogDetail(
   const path = options.logPath ?? SERVE_LOG_PATH
   if (path === undefined) return message
   const ref = typeof options.ref === "string" ? options.ref : undefined
+  // Fail-closed without a ref: every ERROR line since task start would
+  // otherwise be eligible, and concurrent tasks of other users share this
+  // serve log (their session.error/info.error messages carry no ref). The
+  // pinned middleware always sets a ref on these 500s, so nothing real is
+  // lost (run-92 FJ-5).
+  if (ref === undefined) return message
   const secrets = options.secrets ?? []
   let lines: string[] = []
   for (let attempt = 0; attempt < READ_RETRIES; attempt++) {

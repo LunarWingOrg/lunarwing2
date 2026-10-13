@@ -1254,13 +1254,24 @@ assert.equal(errorCloseQueue.closed, true, "error path must close the queue")
 // path resolution can be pointed at a fixture: a generic serve 500 (SDK shape
 // with cause.body.data.ref) is enriched with the structured-log line carrying
 // the same ref — only lines appended after the task started, with the
-// bridge's secrets scrubbed.
+// bridge's secrets scrubbed. The fixture secret is built at runtime so no
+// literal in this file trips secret-detection (run-92 FJ-3), and both secret
+// channels are covered: the boot env value (module-load snapshot, FJ-6) and
+// a task context.environment value that shadows it in process.env.
 {
   const GENERIC_MSG = "Unexpected server error. Check server logs for details."
-  const PRE = "timestamp=2026-10-12T00:00:00.000Z level=Error run=run01 message=failed ref=err_pre0001 error=earlier tenant task failed"
+  const FIXTURE_SECRET = ["fixture", "scrub", "value", "0042"].join("-")
+  const FIXTURE_TASK_SECRET = ["task", "override", "value", "0043"].join("-")
+  // Pattern-only name (no entry in the fixed key list): mt-admin injects
+  // provider credentials like this via --env-file / EXTRA_ENV_FILE.
+  const FIXTURE_PATTERN_SECRET = ["pattern", "only", "value", "0044"].join("-")
+  const PRE_REF = "err_01d0c0de"
+  const CRASH_REF = "err_feedbeef"
+  const PRE = `timestamp=2026-10-12T00:00:00.000Z level=ERROR run=run01 message=failed ref=${PRE_REF} error=earlier tenant task failed`
   const CRASH =
-    "timestamp=2026-10-12T00:00:01.000Z level=Error run=run01 message=failed ref=err_feedbee " +
-    "error=TypeError: undefined is not an object (evaluating 'a.name') token=sk-live-secret0042"
+    `timestamp=2026-10-12T00:00:01.000Z level=ERROR run=run01 message=failed ref=${CRASH_REF} ` +
+    `error=TypeError: undefined is not an object (evaluating 'a.name') token=${FIXTURE_SECRET} ` +
+    `key2=${FIXTURE_TASK_SECRET} pat=${FIXTURE_PATTERN_SECRET}`
   const dir = mkdtempSync(join(tmpdir(), "executor-serve-log-"))
   try {
     const logPath = join(dir, "opencode.log")
@@ -1274,7 +1285,7 @@ const logPath = ${JSON.stringify(logPath)}
 writeFileSync(logPath, ${JSON.stringify(PRE)} + "\\n")
 const prompt = async () => {
   appendFileSync(logPath, ${JSON.stringify(CRASH)} + "\\n")
-  throw new Error(${JSON.stringify(GENERIC_MSG)}, { cause: { body: { name: "UnknownError", data: { message: ${JSON.stringify(GENERIC_MSG)}, ref: "err_feedbee" } }, status: 500 } })
+  throw new Error(${JSON.stringify(GENERIC_MSG)}, { cause: { body: { name: "UnknownError", data: { message: ${JSON.stringify(GENERIC_MSG)}, ref: ${JSON.stringify(CRASH_REF)} } }, status: 500 } })
 }
 const sdk = {
   session: {
@@ -1286,14 +1297,22 @@ const sdk = {
   },
 }
 const results = []
-await executeTask({ task_id: "task-serve-log", prompt: "test" }, () => {}, (r) => results.push(r), undefined, sdk)
+await executeTask(
+  { task_id: "task-serve-log", prompt: "test", context: { environment: { TENSORZERO_API_KEY: ${JSON.stringify(FIXTURE_TASK_SECRET)} } } },
+  () => {}, (r) => results.push(r), undefined, sdk,
+)
 console.log(JSON.stringify(results[0]?.error ?? ""))
 `
-    let out: string
+    let out = ""
     let bunAvailable = true
     try {
       out = execFileSync("bun", ["-e", script], {
-        env: { ...process.env, OPENCODE_SERVE_LOG: logPath, TENSORZERO_API_KEY: "sk-live-secret0042" },
+        env: {
+          ...process.env,
+          OPENCODE_SERVE_LOG: logPath,
+          TENSORZERO_API_KEY: FIXTURE_SECRET,
+          GITEA_TOKEN: FIXTURE_PATTERN_SECRET,
+        },
         encoding: "utf8",
       })
     } catch (error) {
@@ -1306,10 +1325,12 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
       const errorMessage = JSON.parse(out) as string
       assert.ok(errorMessage.startsWith(GENERIC_MSG))
       assert.ok(errorMessage.includes("opencode serve log tail:"))
-      assert.ok(errorMessage.includes("ref=err_feedbee"), "ref line missing from the enriched error")
+      assert.ok(errorMessage.includes(`ref=${CRASH_REF}`), "ref line missing from the enriched error")
       assert.ok(errorMessage.includes("TypeError: undefined is not an object"))
-      assert.ok(!errorMessage.includes("err_pre0001"), "pre-task line leaked past the task-start offset")
-      assert.ok(!errorMessage.includes("sk-live-secret0042"), "secret survived the scrub")
+      assert.ok(!errorMessage.includes(PRE_REF), "pre-task line leaked past the task-start offset")
+      assert.ok(!errorMessage.includes(FIXTURE_SECRET), "boot secret survived the scrub")
+      assert.ok(!errorMessage.includes(FIXTURE_TASK_SECRET), "task env secret survived the scrub")
+      assert.ok(!errorMessage.includes(FIXTURE_PATTERN_SECRET), "pattern-named secret survived the scrub")
       assert.ok(errorMessage.includes("[redacted]"))
     }
   } finally {
