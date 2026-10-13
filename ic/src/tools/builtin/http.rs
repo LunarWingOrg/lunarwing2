@@ -205,6 +205,22 @@ pub(crate) fn build_pinned_client(
         .map_err(|e| ToolError::ExternalService(format!("failed to build HTTP client: {}", e)))
 }
 
+/// Send an HTTP request without exposing its URL through an error message.
+/// Query credentials may have been injected from the secrets store (FS-5),
+/// so strip the entire URL rather than relying on credential-name heuristics.
+async fn send_request(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Response, ToolError> {
+    request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            ToolError::Timeout(timeout)
+        } else {
+            ToolError::ExternalService(error.without_url().to_string())
+        }
+    })
+}
+
 /// Check whether an IPv4 address falls in a disallowed range (private,
 /// loopback, link-local, multicast, unspecified, or cloud metadata).
 fn is_disallowed_ipv4(v4: &Ipv4Addr) -> bool {
@@ -636,21 +652,11 @@ impl Tool for HttpTool {
                     reqwest::redirect::Policy::none(),
                 )?;
 
-                let resp = hop_client
-                    .get(parsed_url.clone())
-                    .header(
-                        reqwest::header::ACCEPT,
-                        "text/markdown, text/html;q=0.9, application/json;q=0.9, */*;q=0.8",
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        if e.is_timeout() {
-                            ToolError::Timeout(effective_timeout)
-                        } else {
-                            ToolError::ExternalService(e.to_string())
-                        }
-                    })?;
+                let hop_request = hop_client.get(parsed_url.clone()).header(
+                    reqwest::header::ACCEPT,
+                    "text/markdown, text/html;q=0.9, application/json;q=0.9, */*;q=0.8",
+                );
+                let resp = send_request(hop_request, effective_timeout).await?;
 
                 let status = resp.status().as_u16();
                 if (300..400).contains(&status) {
@@ -708,13 +714,7 @@ impl Tool for HttpTool {
                 break resp;
             }
         } else {
-            let resp = request.send().await.map_err(|e| {
-                if e.is_timeout() {
-                    ToolError::Timeout(effective_timeout)
-                } else {
-                    ToolError::ExternalService(e.to_string())
-                }
-            })?;
+            let resp = send_request(request, effective_timeout).await?;
 
             let status = resp.status().as_u16();
 
@@ -770,7 +770,10 @@ impl Tool for HttpTool {
         let mut stream = response.bytes_stream();
         while let Some(chunk) = StreamExt::next(&mut stream).await {
             let chunk = chunk.map_err(|e| {
-                ToolError::ExternalService(format!("failed to read response body: {}", e))
+                ToolError::ExternalService(format!(
+                    "failed to read response body: {}",
+                    e.without_url()
+                ))
             })?;
             if body.len() + chunk.len() > max_size {
                 return Err(ToolError::ExecutionFailed(format!(
@@ -1440,6 +1443,55 @@ mod tests {
             reqwest::redirect::Policy::none(),
         );
         assert!(client.is_ok(), "should build client successfully");
+    }
+
+    #[tokio::test]
+    async fn test_send_request_error_omits_injected_query_credentials() {
+        // Exercise a real reqwest send failure without external DNS/network.
+        // The shared send path serves both simple GETs and non-simple requests.
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let closer = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                drop(socket);
+            });
+            let timeout = Duration::from_secs(2);
+            let client = Client::builder()
+                .no_proxy()
+                .timeout(timeout)
+                .build()
+                .unwrap();
+            let request = client
+                .request(method, format!("http://{address}/request"))
+                // An arbitrary key name: removal cannot depend on a key list
+                // or on the secret matching a known token prefix (FS-5).
+                .query(&[("custom_parameter", "injected-query-credential")]);
+            let error = send_request(request, timeout).await.unwrap_err();
+            closer.await.unwrap();
+            let ToolError::ExternalService(message) = error else {
+                panic!("expected a send failure, got {error:?}");
+            };
+            assert!(message.contains("error sending request"), "{message}");
+            assert!(!message.contains("injected-query-credential"), "{message}");
+            assert!(!message.contains("custom_parameter"), "{message}");
+            assert!(!message.contains(&address.to_string()), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_request_preserves_timeout_classification() {
+        // Hold a listening socket without answering; the request must time out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let timeout = Duration::from_millis(1);
+        let request = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{}/request", listener.local_addr().unwrap()))
+            .timeout(timeout);
+        let error = send_request(request, timeout).await.unwrap_err();
+        assert!(matches!(error, ToolError::Timeout(duration) if duration == timeout));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

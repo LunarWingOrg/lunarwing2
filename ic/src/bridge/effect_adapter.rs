@@ -43,7 +43,7 @@ pub struct EffectBridgeAdapter {
     globally_auto_approved: bool,
     /// DB-backed settings store for persisted `tool_permissions.*` checks.
     settings_store: RwLock<Option<Arc<dyn SettingsStore + Send + Sync>>>,
-    /// Per-user per-tool sliding window rate limiter.
+    /// Per-user per-tool fixed window rate limiter.
     rate_limiter: RateLimiter,
     /// Mission manager for handling mission_* function calls.
     mission_manager: RwLock<Option<Arc<lunarwing_engine::MissionManager>>>,
@@ -669,8 +669,9 @@ impl EffectBridgeAdapter {
     ///   with `approval_already_granted` and skips this pause;
     /// - a per-user per-verb rate limit applies, plus an aggregate per-user
     ///   bucket across the run-spawning verbs (WI#352, run-33 AQ-12; the
-    ///   stop verbs stay per-verb only, run-51 CJ-1);
-    /// - `ToolCall` hooks run with [`MISSION_SENSITIVE_PARAMS`] redacted.
+    ///   stop verbs use per-verb caller-class buckets, run-51 CJ-1);
+    /// - `ToolCall` hooks run with credential-like parameter values redacted
+    ///   (the shared WI#359 CJ-10 predicate, recursive into `_args[0]`).
     ///
     /// The approval-tier gates deliberately do not map: mission verbs carry
     /// `ApprovalRequirement::Never` semantics by this gate's own choice —
@@ -769,7 +770,9 @@ impl EffectBridgeAdapter {
 
         let hook_event = HookEvent::ToolCall {
             tool_name: action_name.to_string(),
-            parameters: crate::tools::redact_params(parameters, MISSION_SENSITIVE_PARAMS),
+            // WI#359 (CJ-10): one shared credential-key predicate, recursive
+            // so a positional `_args[0]` payload is covered too.
+            parameters: lunarwing_safety::redact_credential_params(parameters),
             user_id: context.user_id.clone(),
             context: format!("engine_v2:{}", context.thread_id),
         };
@@ -807,8 +810,6 @@ impl EffectBridgeAdapter {
         user_id: &str,
         thread_type: lunarwing_engine::ThreadType,
     ) -> Option<EngineError> {
-        use crate::tools::rate_limiter::RateLimitResult;
-
         let run_spawning = MISSION_RUN_SPAWNING_ACTION_NAMES.contains(&action_name);
         let verb_key = if matches!(action_name, "mission_pause" | "mission_delete") {
             format!("{action_name}@{thread_type:?}")
@@ -821,7 +822,7 @@ impl EffectBridgeAdapter {
         if run_spawning {
             buckets.push((MISSION_AGGREGATE_RATE_KEY, &aggregate));
         }
-        if let Err((index, RateLimitResult::Limited { retry_after, .. })) = self
+        if let Err((index, retry_after, _limit_type)) = self
             .rate_limiter
             .check_and_record_all(user_id, &buckets)
             .await
@@ -1801,10 +1802,15 @@ fn parse_cadence_with_secret(
 ) -> Result<lunarwing_engine::types::mission::MissionCadence, EngineError> {
     let mut cadence = parse_cadence(value)?;
     if let lunarwing_engine::MissionCadence::Webhook { secret, .. } = &mut cadence {
+        // WI#359 (CO-2): one shared predicate — the secret must be
+        // presentable on the wire, not merely non-empty.
         let provided = webhook_secret
-            .filter(|value| !value.is_empty())
+            .filter(|value| lunarwing_engine::usable_webhook_secret(value))
             .ok_or_else(|| {
-                invalid_cadence(value, "webhook cadence requires non-empty webhook_secret")
+                invalid_cadence(
+                    value,
+                    "webhook cadence requires a usable webhook_secret (non-empty, no leading/trailing whitespace, visible ASCII)",
+                )
             })?;
         *secret = Some(provided.to_string());
     }
@@ -1880,12 +1886,6 @@ pub(crate) const MISSION_RUN_SPAWNING_ACTION_NAMES: &[&str] = &[
 pub(crate) fn is_mission_action_name(name: &str) -> bool {
     MISSION_ACTION_NAMES.contains(&name)
 }
-
-/// Mission parameters that must never reach a hook payload or an approval
-/// prompt: `webhook_secret` (accepted by `mission_create`/`mission_update`)
-/// is a shared-secret credential. [`crate::tools::redact_params`] no-ops on
-/// verbs whose parameters do not contain the key.
-pub(crate) const MISSION_SENSITIVE_PARAMS: &[&str] = &["webhook_secret"];
 
 /// Per-user rate limit applied to each mission verb (WI#308). Mission calls
 /// had no rate limit before; the budget matches `memory_write`'s (a cheap
@@ -2408,6 +2408,14 @@ mod tests {
     #[test]
     fn webhook_cadence_requires_and_retains_explicit_secret() {
         assert!(parse_cadence_with_secret("webhook:Build/Ready", None).is_err());
+        // WI#359 (run-91 FH-3): unpresentable secrets are rejected too —
+        // empty, whitespace-only, padded, non-ASCII.
+        for secret in ["", "  ", " padded", "padded ", "non-ascii-sëcret"] {
+            assert!(
+                parse_cadence_with_secret("webhook:Build/Ready", Some(secret)).is_err(),
+                "secret {secret:?} must be rejected"
+            );
+        }
         assert!(matches!(
             parse_cadence_with_secret("webhook:Build/Ready", Some("secret-value"))
                 .expect("webhook cadence"),
@@ -5354,6 +5362,67 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         );
     }
 
+    /// WI#359 (CN-1): deterministic lockstep variant of the overshoot test
+    /// above. The state write guard is held while all 50 contenders queue
+    /// behind it on a current_thread runtime; dropping it releases them in
+    /// lockstep. A non-atomic check-then-record helper would let every
+    /// queued contender pass its check before any record lands — failing
+    /// this test deterministically rather than probabilistically.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_mission_calls_cannot_overshoot_budget_lockstep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (adapter, mgr, _) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let adapter = Arc::new(adapter);
+        let guard = adapter.rate_limiter.hold_state_for_lockstep().await;
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let adapter = adapter.clone();
+            let started = started.clone();
+            tasks.spawn(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                adapter
+                    .execute_action(
+                        "mission_fire",
+                        serde_json::json!({"name":"missing"}),
+                        &lease(),
+                        &mission_create_ctx(),
+                    )
+                    .await
+            });
+        }
+        // Drive every contender to the limiter's lock queue before release.
+        while started.load(Ordering::SeqCst) < 50 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(_) => admitted += 1,
+                Err(EngineError::Effect { reason }) => assert!(reason.contains("rate limited")),
+                other => panic!("unexpected gate result: {other:?}"),
+            }
+        }
+        assert_eq!(admitted, 20);
+        let user = mission_create_ctx().user_id;
+        assert_eq!(
+            adapter.rate_limiter.get_usage(&user, "mission_fire").await,
+            Some((20, 20))
+        );
+        assert_eq!(
+            adapter
+                .rate_limiter
+                .get_usage(&user, MISSION_AGGREGATE_RATE_KEY)
+                .await,
+            Some((20, 20))
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_mission_calls_cannot_overshoot_budget() {
         let (adapter, mgr, _) = adapter_with_mission_manager_parts();
@@ -5429,6 +5498,29 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 );
             }
         }
+        // WI#359 (CO-5): pin WHICH bucket constructor fired — the
+        // caller-class keys carry the charges (20 Ok calls prove execute
+        // ran past the gate), and the shared bare-verb key stays empty.
+        let user = foreground.user_id.as_str();
+        for verb in ["mission_pause", "mission_delete"] {
+            for class in ["Mission", "Foreground"] {
+                assert_eq!(
+                    adapter
+                        .rate_limiter
+                        .get_usage(user, &format!("{verb}@{class}"))
+                        .await,
+                    Some((20, 20)),
+                    "{verb}@{class} bucket must hold the 20 admitted calls"
+                );
+            }
+            assert!(
+                matches!(
+                    adapter.rate_limiter.get_usage(user, verb).await,
+                    None | Some((0, 0))
+                ),
+                "the bare {verb} bucket must not be charged for stop calls"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5471,16 +5563,15 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         }
 
         // CJ-2: the refused call was checked against both budgets before
-        // either recorded, so it did not spend a per-verb token. (The
-        // limiter creates a zeroed state entry on a bare `check`, so the
-        // pin is zero recorded calls, not a missing entry.)
+        // either recorded, so it did not spend a per-verb token. WI#359
+        // (CK-4a): a bare check may or may not create the zeroed state
+        // entry — the pin is zero recorded calls, either shape.
         let usage = adapter
             .rate_limiter
             .get_usage(&ctx.user_id, "mission_create")
             .await;
-        assert_eq!(
-            usage,
-            Some((0, 0)),
+        assert!(
+            matches!(usage, None | Some((0, 0))),
             "an aggregate-refused call must not record per-verb usage: {usage:?}"
         );
 
@@ -5519,6 +5610,9 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             "goal": "report on events",
             "cadence": "webhook:events",
             "webhook_secret": "super-secret-value",
+            // Run-91 FI-M14: a mis-keyed credential kwarg must be redacted
+            // by the same recursive predicate, not ride the hook payload.
+            "hmac_secret": "super-secret-2",
         });
         let result = adapter
             .execute_action("mission_create", params, &lease(), &mission_create_ctx())
@@ -5533,7 +5627,9 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             .expect("the hook saw the mission_create call");
         assert_eq!(tool_name, "mission_create");
         assert_eq!(hook_params["webhook_secret"], "[REDACTED]");
+        assert_eq!(hook_params["hmac_secret"], "[REDACTED]");
         assert!(!hook_params.to_string().contains("super-secret-value"));
+        assert!(!hook_params.to_string().contains("super-secret-2"));
         assert_eq!(hook_params["name"], "hooky");
     }
 
@@ -6083,6 +6179,116 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             }
             other => panic!("expected webhook cadence, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn mission_create_dedup_with_same_secret_still_reports_secret_not_applied() {
+        // WI#359 (CK-3a): the `webhook_secret_applied: false` flag must be
+        // unconditional — a dedup re-create carrying the SAME secret gets the
+        // same flag and note, so the response is no secret-equality oracle.
+        let (adapter, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+        let ctx = mission_create_ctx();
+
+        let first = adapter
+            .handle_mission_call(
+                "mission_create",
+                &serde_json::json!({
+                    "name": "hook-digest",
+                    "goal": "digest",
+                    "cadence": "webhook:events",
+                    "webhook_secret": "same-secret",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!first.is_error, "{:?}", first.output);
+        assert_eq!(first.output["deduplicated"], false);
+
+        let second = adapter
+            .handle_mission_call(
+                "mission_create",
+                &serde_json::json!({
+                    "name": "hook-digest",
+                    "goal": "digest",
+                    "cadence": "webhook:events",
+                    "webhook_secret": "same-secret",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!second.is_error, "{:?}", second.output);
+        assert_eq!(second.output["deduplicated"], true);
+        assert_eq!(second.output["cadence_differs"], false);
+        assert_eq!(
+            second.output["webhook_secret_applied"], false,
+            "the flag must not change when the presented secret happens to match"
+        );
+        let note = second.output["webhook_secret_note"]
+            .as_str()
+            .expect("secret note present");
+        assert!(
+            note.contains("mission_update"),
+            "note must point at mission_update: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_create_and_update_saturate_max_threads_per_day() {
+        // WI#359 (CK-3b): 2^32 must saturate to u32::MAX, never wrap to 0
+        // ("unlimited") — create and update paths alike.
+        let (adapter, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+        let ctx = mission_create_ctx();
+
+        let created = adapter
+            .handle_mission_call(
+                "mission_create",
+                &serde_json::json!({
+                    "name": "saturated",
+                    "goal": "g",
+                    "max_threads_per_day": 4294967296_u64,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!created.is_error, "{:?}", created.output);
+        let id = lunarwing_engine::MissionId(
+            uuid::Uuid::parse_str(created.output["mission_id"].as_str().expect("mission_id"))
+                .expect("uuid"),
+        );
+        let persisted = mgr.get_mission(id).await.expect("load").expect("mission");
+        assert_eq!(
+            persisted.max_threads_per_day,
+            u32::MAX,
+            "create must saturate"
+        );
+
+        let updated = adapter
+            .handle_mission_call(
+                "mission_update",
+                &serde_json::json!({
+                    "id": created.output["mission_id"],
+                    "max_threads_per_day": 4294967296_u64,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!updated.is_error, "{:?}", updated.output);
+        let persisted = mgr.get_mission(id).await.expect("load").expect("mission");
+        assert_eq!(
+            persisted.max_threads_per_day,
+            u32::MAX,
+            "update must saturate"
+        );
     }
 
     #[tokio::test]

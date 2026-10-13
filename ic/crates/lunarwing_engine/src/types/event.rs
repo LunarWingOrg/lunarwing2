@@ -9,35 +9,24 @@ use uuid::Uuid;
 
 use crate::types::capability::LeaseId;
 
-/// Parameter keys whose values must never appear in a human-readable summary
-/// or a persisted event payload (WI#352, run-33 AQ-4/AQ-5). Exact match on the
-/// top-level object key. `webhook_secret` is the `mission_create` /
-/// `mission_update` shared-secret credential; the rest are common credential
-/// key names an LLM may supply verbatim on a freeform tool call.
-pub(crate) const SENSITIVE_PARAM_KEYS: &[&str] = &[
-    "api_key",
-    "auth_token",
-    "password",
-    "secret",
-    "token",
-    "webhook_secret",
-];
-
 /// Generate a short human-readable summary of tool parameters for display.
 ///
 /// For `http`: shows the URL. For `web_search`: shows the query.
 /// For other tools: shows the first string argument, truncated.
 /// Returns `None` for empty or unrecognizable params.
 ///
-/// The generic fallback skips values keyed under [`SENSITIVE_PARAM_KEYS`] so a
-/// credential (e.g. a `mission_create` `webhook_secret`) cannot ride the
-/// summary into a channel status line or a persisted event (WI#352, AQ-5).
+/// The generic fallback skips values whose keys look credential-like
+/// ([`lunarwing_safety::is_credential_param_key`]) so a credential (e.g. a
+/// `mission_create` `webhook_secret`) cannot ride the summary into a
+/// channel status line or a persisted event (WI#352, AQ-5; WI#359, CJ-10).
 pub fn summarize_params(action_name: &str, params: &serde_json::Value) -> Option<String> {
     let summary = match action_name {
         "http" | "web_fetch" => params
             .get("url")
             .and_then(|v| v.as_str())
-            .map(|u| truncate(u, 80)),
+            // WI#359 (CJ-11): the URL can carry `?api_key=…` — sanitize
+            // before it reaches params_summary and the channel status.
+            .map(|u| truncate(&lunarwing_safety::sanitize_url_credentials(u), 80)),
         "web_search" | "llm_context" => params
             .get("query")
             .and_then(|v| v.as_str())
@@ -62,12 +51,13 @@ pub fn summarize_params(action_name: &str, params: &serde_json::Value) -> Option
             .get("content")
             .and_then(|v| v.as_str())
             .map(|c| truncate(c, 40)),
+        _ if action_name.starts_with("mission_") => summarize_mission_params(params),
         _ => {
-            // Generic: show the first string value whose key is not on the
-            // sensitive-key deny list (WI#352, AQ-5).
+            // Generic: show the first string value whose key is not
+            // credential-like (WI#352 AQ-5, WI#359 CJ-10).
             if let Some(obj) = params.as_object() {
                 obj.iter()
-                    .filter(|(key, _)| !SENSITIVE_PARAM_KEYS.contains(&key.as_str()))
+                    .filter(|(key, _)| !lunarwing_safety::is_credential_param_key(key))
                     .find_map(|(_, v)| v.as_str())
                     .map(|s| truncate(s, 50))
             } else {
@@ -78,26 +68,146 @@ pub fn summarize_params(action_name: &str, params: &serde_json::Value) -> Option
     summary.filter(|s| !s.is_empty())
 }
 
-/// Return a display copy of `params` with every [`SENSITIVE_PARAM_KEYS`] value
-/// replaced by `"[REDACTED]"` (WI#352, run-33 AQ-4).
+/// WI#359 (CJ-10): mission verbs summarize as name/id only — arbitrary
+/// kwargs (e.g. a mis-keyed `hmac_secret`) or a positional `_args[0]`
+/// payload must never ride the summary into a status line or event.
+fn summarize_mission_params(params: &serde_json::Value) -> Option<String> {
+    for key in ["name", "id"] {
+        if let Some(value) = params.get(key).and_then(|v| v.as_str()) {
+            return Some(truncate(value, 50));
+        }
+    }
+    // Positional form: `_args[0]` is the positional name/id — a string
+    // summarizes directly; a dict (mission_update({"id": …, …})) yields
+    // only its name/id field, never an arbitrary value.
+    let first = params
+        .get("_args")
+        .and_then(|args| args.as_array())
+        .and_then(|args| args.first());
+    if let Some(first) = first {
+        if let Some(value) = first.as_str() {
+            return Some(truncate(value, 50));
+        }
+        for key in ["name", "id"] {
+            if let Some(value) = first.get(key).and_then(|v| v.as_str()) {
+                return Some(truncate(value, 50));
+            }
+        }
+    }
+    None
+}
+
+/// Return a display copy of `params` with credential material replaced by
+/// `"[REDACTED]"` (WI#352 run-33 AQ-4/AQ-5, WI#359 CJ-10/CJ-11).
+///
+/// Credential-like keys are matched via the shared
+/// [`lunarwing_safety::is_credential_param_key`] heuristic, recursing into
+/// nested objects and arrays (a positional `_args[0]` payload included).
+/// For `http`/`web_fetch`, credential-like header values, URL query credentials
+/// and string-encoded JSON/form body credentials are redacted too — those calls
+/// are approval-gated precisely because they can carry manually supplied credentials.
 ///
 /// Used when a gated call's parameters are persisted in an
 /// [`EventKind::ApprovalRequested`] event: the event history is an at-rest
 /// record, not the resume path, so it keeps only the redacted copy. The
 /// pending gate holds the raw parameters for the actual resume.
-pub fn redact_event_params(params: &serde_json::Value) -> serde_json::Value {
-    let mut redacted = params.clone();
-    if let Some(obj) = redacted.as_object_mut() {
-        for key in SENSITIVE_PARAM_KEYS {
-            if obj.contains_key(*key) {
-                obj.insert(
-                    (*key).to_string(),
-                    serde_json::Value::String("[REDACTED]".into()),
-                );
-            }
-        }
+pub fn redact_event_params(action_name: &str, params: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = lunarwing_safety::redact_credential_params(params);
+    if matches!(action_name, "http" | "web_fetch") {
+        redact_http_surface(&mut redacted);
     }
     redacted
+}
+
+/// WI#359 (CJ-11): blank credential-like header values and sanitize the
+/// URL and string body in `http`/`web_fetch` params. Null/empty credential
+/// values are left alone — redacting them would falsely claim one was present.
+fn redact_http_surface(redacted: &mut serde_json::Value) {
+    if let Some(url) = redacted.get("url").and_then(|v| v.as_str()) {
+        let sanitized = lunarwing_safety::sanitize_url_credentials(url);
+        redacted["url"] = serde_json::Value::String(sanitized);
+    }
+    if let Some(serde_json::Value::String(body)) = redacted.get_mut("body") {
+        // Run-97 FS-1: the HTTP tool accepts JSON encoded as a string or a
+        // raw form body. Redact inside the string before persisting it, even
+        // when no headers were supplied. Keep the display value a string.
+        *body = match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(parsed) => lunarwing_safety::redact_credential_params(&parsed).to_string(),
+            Err(_) => lunarwing_safety::redact_form_credentials(body),
+        };
+    }
+    let Some(headers) = redacted.get_mut("headers") else {
+        return;
+    };
+    if let serde_json::Value::String(raw) = headers {
+        // Run-91 FI-1: the http tool also accepts `headers` as a JSON
+        // string, and the approval gate runs on the coerced copy — the
+        // persisted event would otherwise keep the exact credential that
+        // caused the gate. Parse, redact inside, and re-serialise;
+        // anything unparseable fails closed.
+        let raw = std::mem::take(raw);
+        *headers = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(mut parsed) => {
+                redact_header_pairs(&mut parsed);
+                serde_json::Value::String(parsed.to_string())
+            }
+            Err(_) => serde_json::Value::String("[REDACTED]".into()),
+        };
+    } else {
+        redact_header_pairs(headers);
+    }
+}
+
+/// Whether one header name/value pair carries a credential (run-91
+/// FI-2/FI-3): the name check unions the header heuristic with the shared
+/// credential-key list (so `X-Goog-Api-Key`, `apikey`, or `api_key` are
+/// caught), plus vendor `…Key` names except `…IdempotencyKey` (run-97 FS-2,
+/// display-only). A value starting with an auth-scheme prefix (`Bearer `,
+/// `Basic `, …) is redacted even under an innocuous name.
+fn header_pair_is_credential(name: &str, value: &serde_json::Value) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    lunarwing_safety::header_name_carries_credentials(name)
+        || lunarwing_safety::is_credential_param_key(name)
+        || (normalized.ends_with("key") && !normalized.ends_with("idempotencykey"))
+        || value
+            .as_str()
+            .is_some_and(lunarwing_safety::header_value_carries_credentials)
+}
+
+/// Blank credential-carrying header values in object or array form.
+fn redact_header_pairs(headers: &mut serde_json::Value) {
+    let is_present = |value: &serde_json::Value| {
+        !value.is_null() && !matches!(value, serde_json::Value::String(s) if s.is_empty())
+    };
+    match headers {
+        serde_json::Value::Object(map) => {
+            for (name, value) in map.iter_mut() {
+                if header_pair_is_credential(name, value) && is_present(value) {
+                    *value = serde_json::Value::String("[REDACTED]".into());
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                let credential =
+                    match (item.get("name").and_then(|n| n.as_str()), item.get("value")) {
+                        (Some(name), Some(value)) => header_pair_is_credential(name, value),
+                        _ => false,
+                    };
+                if credential
+                    && let Some(value) = item.get_mut("value")
+                    && is_present(value)
+                {
+                    *value = serde_json::Value::String("[REDACTED]".into());
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -253,13 +363,14 @@ pub enum EventKind {
     ApprovalRequested {
         action_name: String,
         call_id: String,
-        /// Display copy of the gated call's parameters with
-        /// [`SENSITIVE_PARAM_KEYS`] values redacted (WI#352, run-33 AQ-4):
-        /// this event is persisted in the thread's event history, which is an
-        /// at-rest record, not the resume path. The raw parameters live on
-        /// the host's pending gate (unredacted, needed to resume) and in the
-        /// thread transcript's action arguments (a pre-existing at-rest
-        /// class).
+        /// Display copy of the gated call's parameters with credential
+        /// values redacted (WI#352 run-33 AQ-4, WI#359 CJ-10/CJ-11 — shared
+        /// `lunarwing_safety` predicate, recursive, http header/query/body
+        /// surfaces included): this event is persisted in the thread's event
+        /// history, which is an at-rest record, not the resume path. The raw
+        /// parameters live on the host's pending gate (unredacted, needed to
+        /// resume) and in the thread transcript's action arguments (a
+        /// pre-existing at-rest class).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parameters: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -314,36 +425,73 @@ mod tests {
         let secret_only = serde_json::json!({"webhook_secret": "super-secret-value"});
         assert_eq!(summarize_params("mission_create", &secret_only), None);
 
-        // Run-51 CJ-8: serde_json is built without preserve_order, so keys
-        // sort — the sensitive key must sort BEFORE the benign one or the
-        // pre-fix code (first string value wins) would pass this test too.
-        // "webhook_secret" < "zzz" and "auth_token" < "name" alphabetically.
-        let secret_sorts_first = serde_json::json!({
+        // WI#359 (CJ-10): mission verbs summarize as name/id/`_args[0]`
+        // only — arbitrary kwargs (benign or not) never surface, so a
+        // mis-keyed credential cannot ride the summary.
+        let arbitrary_kwarg = serde_json::json!({
             "webhook_secret": "super-secret-value",
             "zzz": "benign-tail",
         });
-        let summary = summarize_params("mission_create", &secret_sorts_first)
-            .expect("the benign value still summarizes");
-        assert_eq!(summary, "benign-tail");
-        assert!(!summary.contains("super-secret-value"));
+        assert_eq!(summarize_params("mission_create", &arbitrary_kwarg), None);
 
-        let token_sorts_first = serde_json::json!({
+        // ...but the mission's own name/id still summarize.
+        let named = serde_json::json!({
             "auth_token": "super-secret-value",
             "name": "n",
         });
-        let summary =
-            summarize_params("mission_update", &token_sorts_first).expect("name summarizes");
+        let summary = summarize_params("mission_update", &named).expect("name summarizes");
         assert_eq!(summary, "n");
 
-        // The CodeAct call shape from the work item: `_args` is an array
-        // (never a string), so the only string value is the deny-listed one.
+        // A mis-keyed credential kwarg (hmac_secret is not on any exact
+        // list) must not surface either.
+        let miskeyed = serde_json::json!({
+            "id": "m-1",
+            "hmac_secret": "super-secret-value",
+        });
+        let summary = summarize_params("mission_update", &miskeyed).expect("id summarizes");
+        assert_eq!(summary, "m-1");
+        assert!(!summary.contains("super-secret-value"));
+
+        // The CodeAct call shape from the work item: `_args` is an array;
+        // its first element is the positional name/id and may summarize,
+        // but a nested secret never does.
         let codeact = serde_json::json!({
             "_args": ["digest", "report on events"],
             "webhook_secret": "super-secret-value",
         });
-        assert_eq!(summarize_params("mission_create", &codeact), None);
+        let summary =
+            summarize_params("mission_create", &codeact).expect("positional name summarizes");
+        assert_eq!(summary, "digest");
+        assert!(!summary.contains("super-secret-value"));
+
+        // Positional dict form: mission_update({"id": …, "webhook_secret": …})
+        // summarizes the dict's id, never the secret.
+        let positional_dict = serde_json::json!({
+            "_args": [{"id": "m-9", "webhook_secret": "super-secret-value"}],
+        });
+        let summary =
+            summarize_params("mission_update", &positional_dict).expect("dict id summarizes");
+        assert_eq!(summary, "m-9");
+        assert!(!summary.contains("super-secret-value"));
 
         for key in ["api_key", "auth_token", "password", "secret", "token"] {
+            let params = serde_json::json!({key: "super-secret-value"});
+            assert_eq!(
+                summarize_params("some_custom_tool", &params),
+                None,
+                "{key} must be deny-listed"
+            );
+        }
+
+        // WI#359 (CJ-10): the generic fallback uses the shared normalized
+        // credential-key predicate, not an exact list.
+        for key in [
+            "hmac_secret",
+            "access_token",
+            "client_secret",
+            "apiKey",
+            "x-auth",
+        ] {
             let params = serde_json::json!({key: "super-secret-value"});
             assert_eq!(
                 summarize_params("some_custom_tool", &params),
@@ -354,13 +502,25 @@ mod tests {
     }
 
     #[test]
+    fn summarize_params_http_url_drops_query_credentials() {
+        // WI#359 (CJ-11): the http summary puts the URL into params_summary
+        // and the channel status — credential query values must not survive.
+        let params = serde_json::json!({
+            "url": "https://api.example.com/data?api_key=abc123&page=2",
+        });
+        let summary = summarize_params("http", &params).expect("url summarizes");
+        assert!(!summary.contains("abc123"), "api_key leaked: {summary}");
+        assert!(summary.contains("page=2"), "safe param dropped: {summary}");
+    }
+
+    #[test]
     fn redact_event_params_replaces_only_sensitive_values() {
         let params = serde_json::json!({
             "name": "digest",
             "webhook_secret": "super-secret-value",
             "max_threads_per_day": 5,
         });
-        let redacted = redact_event_params(&params);
+        let redacted = redact_event_params("mission_update", &params);
         assert_eq!(redacted["webhook_secret"], "[REDACTED]");
         assert_eq!(redacted["name"], "digest");
         assert_eq!(redacted["max_threads_per_day"], 5);
@@ -370,7 +530,279 @@ mod tests {
 
         // Non-object params pass through unchanged.
         let scalar = serde_json::json!("webhook_secret");
-        assert_eq!(redact_event_params(&scalar), scalar);
+        assert_eq!(redact_event_params("mission_update", &scalar), scalar);
+    }
+
+    #[test]
+    fn redact_event_params_recurses_into_positional_args() {
+        // WI#359 (CJ-10): mission_update({"id":…,"webhook_secret":s}) hides
+        // the secret under `_args[0]` — a top-level-only pass misses it.
+        let params = serde_json::json!({
+            "_args": [{"id": "m-1", "webhook_secret": "super-secret-value"}],
+        });
+        let redacted = redact_event_params("mission_update", &params);
+        assert_eq!(redacted["_args"][0]["webhook_secret"], "[REDACTED]");
+        assert_eq!(redacted["_args"][0]["id"], "m-1");
+        assert!(!redacted.to_string().contains("super-secret-value"));
+
+        // Mis-keyed kwargs (not on any exact list) are redacted too.
+        let miskeyed = serde_json::json!({"id": "m-1", "hmac_secret": "super-secret-value"});
+        let redacted = redact_event_params("mission_update", &miskeyed);
+        assert_eq!(redacted["hmac_secret"], "[REDACTED]");
+        assert_eq!(redacted["id"], "m-1");
+    }
+
+    #[test]
+    fn redact_event_params_http_surface_blanks_credentials() {
+        // WI#359 (CJ-11): http calls are approval-gated precisely because
+        // they can carry manually supplied credentials — the persisted
+        // event must not keep header values or URL query credentials raw.
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": "https://user:pass@api.example.com/data?api_key=abc123&page=2",
+            "headers": [
+                {"name": "Authorization", "value": "Bearer raw-token"},
+                {"name": "Content-Type", "value": "application/json"},
+            ],
+        });
+        let redacted = redact_event_params("http", &params);
+        let url = redacted["url"].as_str().expect("url stays a string");
+        assert!(!url.contains("abc123"), "query credential leaked: {url}");
+        assert!(!url.contains("user:pass"), "userinfo leaked: {url}");
+        assert!(url.contains("page=2"), "safe query param dropped: {url}");
+        assert_eq!(redacted["headers"][0]["value"], "[REDACTED]");
+        assert_eq!(redacted["headers"][1]["value"], "application/json");
+        assert!(!redacted.to_string().contains("raw-token"));
+
+        // Object-form headers are covered too.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": {"X-Api-Key": "raw-key", "Accept": "text/html"},
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"]["X-Api-Key"], "[REDACTED]");
+        assert_eq!(redacted["headers"]["Accept"], "text/html");
+    }
+
+    #[test]
+    fn redact_event_params_http_string_headers_are_redacted_fail_closed() {
+        // Run-91 FI-1: the http tool accepts `headers` as a JSON string and
+        // the approval gate runs on the coerced copy, so the persisted
+        // event must not keep the raw string either.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": "[{\"name\":\"Authorization\",\"value\":\"Bearer raw-token\"}]",
+        });
+        let redacted = redact_event_params("http", &params);
+        let headers = redacted["headers"].as_str().expect("stays a string");
+        assert!(
+            !headers.contains("raw-token"),
+            "credential leaked: {headers}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(headers).expect("re-serialised headers stay valid JSON");
+        assert_eq!(parsed[0]["value"], "[REDACTED]");
+        assert_eq!(parsed[0]["name"], "Authorization");
+
+        // Object form inside the string is covered too.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": "{\"X-Api-Key\":\"raw-key\"}",
+        });
+        let redacted = redact_event_params("http", &params);
+        let headers = redacted["headers"].as_str().expect("stays a string");
+        assert!(!headers.contains("raw-key"), "credential leaked: {headers}");
+
+        // An unparseable string fails closed.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": "Authorization: Bearer raw-token",
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"], "[REDACTED]");
+
+        // web_fetch shares the http branch.
+        let params = serde_json::json!({
+            "url": "https://api.example.com/data?access_token=raw-token",
+            "headers": [{"name": "Authorization", "value": "Bearer raw-token"}],
+        });
+        let redacted = redact_event_params("web_fetch", &params);
+        assert_eq!(redacted["headers"][0]["value"], "[REDACTED]");
+        let url = redacted["url"].as_str().expect("url stays a string");
+        assert!(!url.contains("raw-token"), "query credential leaked: {url}");
+    }
+
+    #[test]
+    fn redact_event_params_http_value_prefix_credential_is_redacted() {
+        // Run-91 FI-2: the approval gate reacts to auth-scheme value
+        // prefixes, so redaction must blank them even under an innocuous
+        // header name — in both array and object form.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": [{"name": "X-Custom", "value": "Bearer raw-token"}],
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"][0]["value"], "[REDACTED]");
+
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": {"X-Custom": "Basic dXNlcjpwYXNz"},
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"]["X-Custom"], "[REDACTED]");
+
+        // An empty value under a credential name is left alone — redacting
+        // it would falsely claim a credential was present (pins the
+        // array-branch is_present guard).
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": [{"name": "Authorization", "value": ""}],
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"][0]["value"], "");
+    }
+
+    #[test]
+    fn redact_event_params_http_uses_the_shared_credential_key_list() {
+        // Run-91 FI-3: header and query checks union the http heuristic
+        // with the shared credential-key list, so the documented schema
+        // shape (array form) and provider key styles are covered.
+        let params = serde_json::json!({
+            "url": "https://api.example.com/data?x-api-key=raw-key&q=hello",
+            "headers": [{"name": "X-Goog-Api-Key", "value": "raw-goog-key"}],
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"][0]["value"], "[REDACTED]");
+        let url = redacted["url"].as_str().expect("url stays a string");
+        assert!(!url.contains("raw-key"), "query credential leaked: {url}");
+        assert!(url.contains("q=hello"), "safe query param dropped: {url}");
+
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": {"apikey": "raw-key"},
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"]["apikey"], "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_event_params_http_string_json_body_blanks_nested_credentials() {
+        let body = serde_json::json!({
+            "client_secret": "body-credential-client",
+            "nested": [{"password": "body-credential-password", "scope": "read"}],
+            "refresh_token": "",
+            "optional_secret": null,
+        });
+        let expected = serde_json::json!({
+            "client_secret": "[REDACTED]",
+            "nested": [{"password": "[REDACTED]", "scope": "read"}],
+            "refresh_token": "",
+            "optional_secret": null,
+        });
+        for (body, expected) in [
+            (body.clone(), expected.clone()),
+            (serde_json::json!([body]), serde_json::json!([expected])),
+        ] {
+            for action in ["http", "web_fetch"] {
+                // No headers: the body pass must not be skipped by the
+                // header-only early return (run-97 FS-1).
+                let raw = body.to_string();
+                let params = serde_json::json!({"method": "POST", "body": raw});
+                let redacted = redact_event_params(action, &params);
+                let parsed: serde_json::Value =
+                    serde_json::from_str(redacted["body"].as_str().unwrap()).unwrap();
+                assert_eq!(parsed, expected);
+                assert!(!redacted.to_string().contains("body-credential"));
+                assert_eq!(params["body"], raw, "execution parameters must stay raw");
+            }
+        }
+    }
+
+    #[test]
+    fn redact_event_params_http_form_body_blanks_credentials() {
+        let raw = "grant_type=refresh_token&client_secret=form-secret&refresh_token=form-token\
+                   &api%5Fkey=encoded-key&scope=read%20write&flag&password=";
+        let params = serde_json::json!({
+            "method": "POST",
+            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            "body": raw,
+        });
+        for action in ["http", "web_fetch"] {
+            let redacted = redact_event_params(action, &params);
+            assert_eq!(
+                redacted["body"],
+                "grant_type=refresh_token&client_secret=[REDACTED]&refresh_token=[REDACTED]\
+                 &api%5Fkey=[REDACTED]&scope=read%20write&flag&password="
+            );
+            assert_eq!(redacted["headers"], params["headers"]);
+            assert_eq!(params["body"], raw, "execution parameters must stay raw");
+        }
+    }
+
+    #[test]
+    fn redact_event_params_http_body_preserves_plain_text_and_empty_values() {
+        for body in [
+            serde_json::json!(""),
+            serde_json::json!("plain text body"),
+            serde_json::json!("flag&message=two+words"),
+            serde_json::Value::Null,
+        ] {
+            let params = serde_json::json!({"body": body});
+            assert_eq!(redact_event_params("http", &params), params);
+        }
+    }
+
+    #[test]
+    fn redact_event_params_http_vendor_key_headers_are_redacted() {
+        // Run-97 FS-2: header-only display heuristic, including JSON-string
+        // headers. Idempotency keys and ordinary metadata remain visible.
+        for name in [
+            "Ocp-Apim-Subscription-Key",
+            "x-functions-key",
+            "X-Key",
+            "Key",
+            "X-Client-Key",
+            "X-Access-Key",
+            "AccessKey",
+            "X_CLIENT_KEY",
+        ] {
+            let object = serde_json::json!({
+                name: "vendor-credential",
+                "X-Idempotency-Key": "retry-id",
+                "Content-Type": "application/json",
+                "Accept": "text/html",
+            });
+            let array = serde_json::json!([
+                {"name": name, "value": "vendor-credential"},
+                {"name": "X-Idempotency-Key", "value": "retry-id"},
+                {"name": "Content-Type", "value": "application/json"},
+                {"name": "Accept", "value": "text/html"},
+            ]);
+            let mut expected_object = object.clone();
+            expected_object[name] = serde_json::json!("[REDACTED]");
+            let mut expected_array = array.clone();
+            expected_array[0]["value"] = serde_json::json!("[REDACTED]");
+            for (headers, expected) in [(object, expected_object), (array, expected_array)] {
+                for encoded in [false, true] {
+                    let input = if encoded {
+                        serde_json::json!(headers.to_string())
+                    } else {
+                        headers.clone()
+                    };
+                    let params = serde_json::json!({"headers": input});
+                    for action in ["http", "web_fetch"] {
+                        let redacted = redact_event_params(action, &params);
+                        let actual = if encoded {
+                            serde_json::from_str(redacted["headers"].as_str().unwrap()).unwrap()
+                        } else {
+                            redacted["headers"].clone()
+                        };
+                        assert_eq!(actual, expected, "{action}: {name}, encoded={encoded}");
+                        assert!(params.to_string().contains("vendor-credential"));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -844,6 +844,21 @@ fn parse_routine_trigger(params: &Value) -> Result<NormalizedTriggerRequest, Too
         "webhook" => {
             let path = string_field(params, "request", "path", &["webhook_path"]);
             let secret = string_field(params, "request", "secret", &["webhook_secret"]);
+            // WI#359 (run-91 FH-1): reject secrets that can never be
+            // presented on the wire at creation — a stored `""` previously
+            // made the routine fireable by anyone who knew its path
+            // (`ct_eq("", "")` is true). The fire-side guard in the webhook
+            // handler covers legacy rows; `routine_update` cannot change a
+            // trigger, so create is the only write path.
+            if let Some(secret) = &secret
+                && !lunarwing_engine::usable_webhook_secret(secret)
+            {
+                return Err(ToolError::InvalidParameters(
+                    "webhook secret must be non-empty, free of leading/trailing whitespace, \
+                     and visible ASCII (an interior tab is allowed)"
+                        .to_string(),
+                ));
+            }
             Ok(NormalizedTriggerRequest::Webhook { path, secret })
         }
         other => Err(ToolError::InvalidParameters(format!(
@@ -2786,5 +2801,41 @@ mod tests {
         assert_eq!(run["id"], "22222222-2222-2222-2222-222222222222");
         assert_eq!(run["duration_secs"], 60);
         assert_eq!(run["result_summary"], "insights written");
+    }
+
+    /// WI#359 (run-91 FH-1): routine_create must reject webhook secrets
+    /// that can never be presented on the wire — a stored `""` was
+    /// previously fireable by anyone who knew the path, because
+    /// `ct_eq("", "")` is true.
+    #[test]
+    fn routine_create_rejects_unusable_webhook_secret() {
+        for secret in ["", "  ", " padded", "padded ", "non-ascii-sëcret"] {
+            let params = serde_json::json!({
+                "request": {"kind": "webhook", "path": "hook", "secret": secret}
+            });
+            let result = parse_routine_trigger(&params);
+            assert!(
+                matches!(result, Err(ToolError::InvalidParameters(_))),
+                "secret {secret:?} must be rejected: {result:?}"
+            );
+        }
+        // A presentable secret (interior tab included, FH-2) still parses.
+        for secret in ["s3cret-token", "with interior space", "tab\tinside"] {
+            let params = serde_json::json!({
+                "request": {"kind": "webhook", "path": "hook", "secret": secret}
+            });
+            let result = parse_routine_trigger(&params);
+            assert!(
+                matches!(result, Ok(NormalizedTriggerRequest::Webhook { .. })),
+                "secret {secret:?} must be accepted: {result:?}"
+            );
+        }
+        // A missing secret stays allowed (the routine is dormant, and the
+        // handler answers 403 for it).
+        let params = serde_json::json!({"request": {"kind": "webhook", "path": "hook"}});
+        assert!(matches!(
+            parse_routine_trigger(&params),
+            Ok(NormalizedTriggerRequest::Webhook { secret: None, .. })
+        ));
     }
 }

@@ -1,7 +1,8 @@
-//! Broad detection of manually-provided credentials in HTTP request parameters.
+//! Credential detection and display/storage redaction for HTTP parameters.
 //!
 //! Used by the built-in HTTP tool to decide whether approval is needed when
 //! the LLM provides auth data directly in headers or URL query parameters.
+//! The redaction helpers also cover credential-keyed JSON and form bodies.
 
 /// Check whether HTTP request parameters contain manually-provided credentials.
 ///
@@ -76,6 +77,168 @@ fn header_name_is_credential(name: &str) -> bool {
     }
 
     AUTH_HEADER_SUBSTRINGS.iter().any(|sub| lower.contains(sub))
+}
+
+/// WI#359 (CJ-11): public view of the header-name credential heuristic so
+/// the engine's event redaction can blank credential-like header values.
+pub fn header_name_carries_credentials(name: &str) -> bool {
+    header_name_is_credential(name)
+}
+
+/// WI#359 (CJ-11): public view of the query-parameter credential heuristic
+/// so URL sanitizers can redact credential-like query values.
+pub fn query_param_carries_credentials(name: &str) -> bool {
+    query_param_is_credential(name)
+}
+
+/// WI#359 (run-91 FI-2): public view of the header-value credential
+/// heuristic (auth-scheme prefixes such as `Bearer ` or `Basic `) so the
+/// engine's event redaction blanks a credential header even when its name
+/// is innocuous — the approval gate already reacts to these values.
+pub fn header_value_carries_credentials(value: &str) -> bool {
+    header_value_is_credential(value)
+}
+
+/// Substrings matched against the normalized parameter key (lowercase, `_`
+/// and `-` stripped, so `apiKey`/`api_key`/`api-key` all fold to `apikey`).
+/// WI#359 (CJ-10): one shared credential-key list for the engine's event
+/// redaction/summaries and the bridge's mission-hook redaction.
+/// Deliberately broad — this is a redaction path, where over-redaction
+/// costs display quality (e.g. an `author` key matches `auth`) and
+/// under-redaction leaks credentials into persisted events.
+const CREDENTIAL_KEY_SUBSTRINGS: &[&str] = &[
+    "secret",
+    "token",
+    "passw",
+    "apikey",
+    "auth",
+    "credential",
+    "privatekey",
+    "cookie",
+    "bearer",
+    "signature",
+];
+
+/// Whether a parameter key commonly carries credentials (WI#359, CJ-10).
+///
+/// Normalizes the key (lowercase, `_`/`-` stripped) and substring-matches
+/// against [`CREDENTIAL_KEY_SUBSTRINGS`], so `hmac_secret`, `access_token`,
+/// `client_secret`, `private_key`, `refresh_token`, and `apiKey` all match.
+pub fn is_credential_param_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    CREDENTIAL_KEY_SUBSTRINGS
+        .iter()
+        .any(|sub| normalized.contains(sub))
+}
+
+/// Return a display/storage copy of `params` with every credential-keyed
+/// value replaced by `"[REDACTED]"`, recursing into nested objects and
+/// arrays (WI#359, CJ-10 — a positional `mission_update({…})` payload hides
+/// keys under `_args[0]`, so a top-level-only pass misses them).
+///
+/// `null` and empty-string values are left untouched: redacting them would
+/// claim a credential was present where there is none (WI#359 info item).
+pub fn redact_credential_params(params: &serde_json::Value) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let redacted = if is_credential_param_key(key)
+                        && !value.is_null()
+                        && !matches!(value, serde_json::Value::String(s) if s.is_empty())
+                    {
+                        serde_json::Value::String("[REDACTED]".into())
+                    } else {
+                        redact_credential_params(value)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_credential_params).collect())
+        }
+        _ => params.clone(),
+    }
+}
+
+/// Return a copy of `url_str` with credential material removed (WI#359,
+/// CJ-11): userinfo stripped, credential-like query parameter values
+/// replaced by `[REDACTED]`, and the fragment dropped (run-91 FI-4 — the
+/// fragment never reaches the server but can carry credentials, e.g. the
+/// OAuth implicit flow's `#access_token=…`). Unparseable URLs cannot be
+/// analyzed, so only the portion before any `?`/`#` is kept.
+///
+/// The query is rewritten pair-by-pair from the raw string so untouched
+/// pairs survive byte-for-byte (run-91 FI-7): rebuilding through the
+/// `url` crate's serializer would render the marker as `%5BREDACTED%5D`,
+/// turn `%20` into `+`, and grow `=` on flag params. A credential-named
+/// pair with an empty value (`?api_key=`) is left alone — redacting it
+/// would falsely claim a credential was present.
+pub fn sanitize_url_credentials(url_str: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url_str) else {
+        return url_str
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(url_str)
+            .to_string();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_fragment(None);
+    match parsed.query() {
+        None | Some("") => parsed.set_query(None),
+        Some(raw) => {
+            let redacted = redact_query_credentials(raw);
+            parsed.set_query(Some(&redacted));
+        }
+    }
+    parsed.to_string()
+}
+
+/// Redact credential values in a form-encoded HTTP body (run-97 FS-1).
+///
+/// Uses the same decoded-key heuristics as URL queries, preserving untouched
+/// pairs, empty values and free text byte-for-byte. This is a display/storage
+/// copy; the original body remains available for execution.
+pub fn redact_form_credentials(body: &str) -> String {
+    redact_query_credentials(body)
+}
+
+/// Redact credential values in a raw query string, preserving every
+/// untouched pair byte-for-byte. The key check unions the query heuristic
+/// with the shared credential-key list (run-91 FI-3), so names like
+/// `x-api-key`, `private_key`, or `X-Amz-Signature` are caught too.
+fn redact_query_credentials(raw_query: &str) -> String {
+    raw_query
+        .split('&')
+        .map(|pair| {
+            let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+            let name = decode_query_component(raw_name);
+            let credential =
+                query_param_carries_credentials(&name) || is_credential_param_key(&name);
+            if credential && !raw_value.is_empty() {
+                format!("{raw_name}=[REDACTED]")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Decode one raw query component (percent-escapes and `+`) so the key
+/// check sees the same name the server would; the raw form is what gets
+/// re-emitted.
+fn decode_query_component(raw: &str) -> String {
+    url::form_urlencoded::parse(format!("{raw}=").as_bytes())
+        .next()
+        .map(|(name, _)| name.into_owned())
+        .unwrap_or_else(|| raw.to_string())
 }
 
 fn header_value_is_credential(value: &str) -> bool {
@@ -377,6 +540,189 @@ mod tests {
         assert!(!url_contains_userinfo(&serde_json::json!({
             "url": "https://api.example.com/data"
         })));
+    }
+
+    // ── WI#359 (CJ-10): shared credential-key predicate ────────────────
+
+    #[test]
+    fn credential_param_key_normalizes_and_substring_matches() {
+        for key in [
+            "api_key",
+            "apiKey",
+            "api-key",
+            "webhook_secret",
+            "hmac_secret",
+            "access_token",
+            "client_secret",
+            "private_key",
+            "refresh_token",
+            "Authorization",
+            "x_auth",
+            "session_cookie",
+            "user_password",
+            "bearer",
+            "request_signature",
+            "aws_credentials",
+        ] {
+            assert!(is_credential_param_key(key), "'{key}' must match");
+        }
+        for key in ["url", "name", "id", "goal", "query", "content", "path"] {
+            assert!(!is_credential_param_key(key), "'{key}' must not match");
+        }
+    }
+
+    #[test]
+    fn redact_credential_params_recurses_and_preserves_non_credentials() {
+        let params = serde_json::json!({
+            "id": "mission-1",
+            "hmac_secret": "s3cr3t",
+            "_args": [{"webhook_secret": "nested-secret", "name": "ok"}],
+            "headers": [{"name": "Authorization", "value": "Bearer raw"}],
+        });
+        let redacted = redact_credential_params(&params);
+        assert_eq!(redacted["hmac_secret"], "[REDACTED]");
+        assert_eq!(redacted["_args"][0]["webhook_secret"], "[REDACTED]");
+        assert_eq!(redacted["_args"][0]["name"], "ok");
+        assert_eq!(redacted["id"], "mission-1");
+        // Array-item "name" keys are not credential keys; the http-specific
+        // pass handles header values (redact_event_params).
+        assert_eq!(redacted["headers"][0]["value"], "Bearer raw");
+    }
+
+    #[test]
+    fn redact_credential_params_leaves_null_and_empty_values_alone() {
+        // WI#359 info item: redacting null/"" would falsely claim a
+        // credential was present.
+        let params = serde_json::json!({"webhook_secret": null, "api_key": ""});
+        let redacted = redact_credential_params(&params);
+        assert_eq!(redacted["webhook_secret"], serde_json::Value::Null);
+        assert_eq!(redacted["api_key"], "");
+    }
+
+    // ── WI#359 (CJ-11): URL credential sanitization ────────────────────
+
+    #[test]
+    fn sanitize_url_redacts_credential_query_values_and_userinfo() {
+        let sanitized = sanitize_url_credentials(
+            "https://user:pass@api.example.com/data?api_key=abc123&page=2&sig=deadbeef",
+        );
+        assert!(
+            !sanitized.contains("abc123"),
+            "api_key value leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("deadbeef"),
+            "sig value leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("user:pass"),
+            "userinfo leaked: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("page=2"),
+            "safe param dropped: {sanitized}"
+        );
+        assert!(sanitized.starts_with("https://api.example.com/data"));
+    }
+
+    #[test]
+    fn sanitize_url_unparseable_drops_query_and_fragment() {
+        assert_eq!(sanitize_url_credentials("not a url?api_key=x"), "not a url");
+        assert_eq!(sanitize_url_credentials("plain"), "plain");
+    }
+
+    // ── WI#359 run-91 (FI-2/FI-3/FI-4/FI-7) ────────────────────────────
+
+    #[test]
+    fn header_value_carries_credentials_matches_auth_scheme_prefixes() {
+        // FI-2: the approval gate reacts to these values, so redaction must
+        // recognize them even under an innocuous header name.
+        assert!(header_value_carries_credentials("Bearer abc123"));
+        assert!(header_value_carries_credentials("Basic dXNlcjpwYXNz"));
+        assert!(header_value_carries_credentials(
+            "AWS4-HMAC-SHA256 Credential=x"
+        ));
+        assert!(!header_value_carries_credentials("application/json"));
+        assert!(!header_value_carries_credentials(""));
+    }
+
+    #[test]
+    fn sanitize_url_drops_the_fragment() {
+        // FI-4: the fragment can carry credentials (OAuth implicit flow)
+        // and never reaches the server, so it is dropped, matching the
+        // unparseable-URL branch.
+        let sanitized = sanitize_url_credentials("https://h.example/cb#access_token=X");
+        assert_eq!(sanitized, "https://h.example/cb");
+        let sanitized = sanitize_url_credentials("https://h.example/cb?token=X#frag?api_key=Y");
+        assert!(
+            !sanitized.contains('Y'),
+            "fragment query leaked: {sanitized}"
+        );
+        assert!(!sanitized.contains('X'), "token value leaked: {sanitized}");
+        assert!(!sanitized.contains('#'), "fragment kept: {sanitized}");
+    }
+
+    #[test]
+    fn sanitize_url_query_uses_the_shared_credential_key_list() {
+        // FI-3: the query check unions the query heuristic with the shared
+        // credential-key list.
+        let sanitized = sanitize_url_credentials(
+            "https://api.example.com/d?x-api-key=V&private_key=W&X-Amz-Signature=S&q=hello",
+        );
+        for leaked in ["V", "W", "S"] {
+            assert!(
+                !sanitized.contains(&format!("={leaked}")),
+                "value {leaked} leaked: {sanitized}"
+            );
+        }
+        assert!(
+            sanitized.contains("q=hello"),
+            "safe param dropped: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_preserves_untouched_pairs_byte_for_byte() {
+        // FI-7: no re-encoding drift, the marker renders literally, an empty
+        // credential value is left alone (redacting it would falsely claim
+        // a credential was present), and flag params keep their bare form.
+        let sanitized =
+            sanitize_url_credentials("https://api.example.com/d?q=a%20b&flag&api_key=&token=abc");
+        assert!(sanitized.contains("q=a%20b"), "encoding drift: {sanitized}");
+        assert!(
+            sanitized.contains("&flag&"),
+            "flag param grew '=': {sanitized}"
+        );
+        assert!(
+            sanitized.contains("api_key=&"),
+            "empty value redacted: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("token=[REDACTED]"),
+            "marker percent-encoded or missing: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("abc"),
+            "token value leaked: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn redact_form_credentials_preserves_safe_pairs_and_empty_values() {
+        let body = "grant_type=refresh_token&client_secret=form-secret&refresh_token=form-token\
+                    &api%5Fkey=encoded-key&scope=read%20write&flag&password=&client_secret=another";
+        assert_eq!(
+            redact_form_credentials(body),
+            "grant_type=refresh_token&client_secret=[REDACTED]&refresh_token=[REDACTED]\
+             &api%5Fkey=[REDACTED]&scope=read%20write&flag&password=&client_secret=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redact_form_credentials_preserves_plain_text_and_empty_bodies() {
+        for body in ["", "plain text body", "a=1&b=two+words", "flag&empty="] {
+            assert_eq!(redact_form_credentials(body), body);
+        }
     }
 
     /// Adversarial tests for credential detection with Unicode, control chars,

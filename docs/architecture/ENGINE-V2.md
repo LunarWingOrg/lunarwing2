@@ -1099,19 +1099,28 @@ their per-verb budgets cannot sum to 80 run-spawning mutations/minute.
 The stop verbs pause/delete use per-verb **caller-class** buckets: Mission
 threads cannot spend Foreground stop tokens, while each class still has a
 20/minute, 200/hour cap for each stop verb. Caller class comes from the host
-execution context, not tool parameters. Read-only verbs stay per-verb only
+execution context, not tool parameters — and it is not a trust class
+(WI#359 CN-3): all of one user's Mission-class threads share one
+`@Mission` stop bucket per stop verb (the mission prompt steers threads to
+`mission_pause`), and the list/history verbs and the run-spawning
+aggregate are still shared between Foreground and Mission. Read-only
+verbs stay per-verb only
 so inspection cannot starve a mutation budget. Per user, total dispatches
 are bounded at 180/minute (60 aggregate + 40 stop calls per permitted caller
 class, Foreground and Mission + 20 each for list/history); with only one
 caller class the bound remains 140/minute. Multi-bucket admission checks
-and records under one write lock: a refused call spends no tokens in any
-bucket, and concurrent batches cannot overshoot either cap. Both limiters
+and records under one write lock: a call the limiter refuses spends no
+tokens in any bucket (the limiter charges before the `ToolCall` hooks run,
+so a hook refusal is a different, post-charge path — WI#359 CN-2), and
+concurrent batches cannot overshoot either cap. Both limiters
 use fixed windows (a window boundary can briefly admit up to 2x the
 minute budget) and reset on restart. AQ-12 deliberately leaves open:
 `mission_create` alone still allows 200 creates/hour (its per-verb
 hour budget), there is no active-mission cap, and `max_threads_per_day=0`
 (unlimited) remains accepted on create and update; and
-`ToolCall` hooks run with `webhook_secret` redacted (the approval prompt's
+`ToolCall` hooks run with credential-like parameter values redacted (the
+shared WI#359 CJ-10 predicate, recursive into positional `_args[0]`
+payloads; the approval prompt's
 display parameters are redacted the same way, while the persisted gate keeps
 the real parameters for execution). The approval-tier gates deliberately do
 not map: the verbs carry `ApprovalRequirement::Never` semantics by this
@@ -1126,24 +1135,62 @@ applies to mission calls as before.
 
 Related secret-handling and webhook-ownership rules (WI#352, the !1462
 run-33 residual): the generic fallback of `summarize_params` skips values
-under a sensitive-key deny list (`webhook_secret`, `api_key`, `auth_token`,
-`password`, `secret`, `token` — the named-tool branches are unchanged), so
-a verb's `webhook_secret` cannot surface in the ToolStarted/ToolCompleted
-channel status summary (AQ-5); the persisted `ApprovalRequested` thread
-event stores display parameters with the same deny list redacted rather
-than the raw call parameters — the pending gate still holds the raw copy
-for resume, and the thread transcript's action arguments remain a
-pre-existing at-rest class (AQ-4); the webhook single-owner rule (a fire
-matches every Active mission on a path, so an active path may only have
-one owner) is enforced — per project, not globally — on create, on an
-update that sets a Webhook cadence, changes the path, or adds a nonempty
-secret to a dormant secret-less claim, and on resume
-(AO-1); updates that leave the claim untouched are not re-checked, so
+whose keys look credential-like (the shared WI#359 CJ-10 normalized
+predicate — `webhook_secret`, `api_key`, `hmac_secret`, `apiKey`,
+`access_token`, …), and `mission_*` verbs summarize as name/id/`_args[0]`
+only, so a verb's `webhook_secret` cannot surface in the
+ToolStarted/ToolCompleted channel status summary (AQ-5); the persisted
+`ApprovalRequested` thread
+event stores display parameters with the same predicate redacted,
+recursively (a positional `_args[0]` payload included), and for
+`http`/`web_fetch` also with credential-like header values blanked (matched
+by header name against the union of the header heuristic and the shared
+credential-key list and normalized names ending in `key` except
+`idempotencykey`, or by an auth-scheme value prefix; the string form of
+`headers` is parsed, redacted inside, and re-serialised, failing closed on
+unparseable input) and URL credentials stripped (userinfo removed,
+credential-like query values replaced by `[REDACTED]`, the fragment
+dropped). String-form HTTP bodies are parsed as JSON, recursively redacted
+and re-serialised; non-JSON strings use the form/query credential-key
+redactor, preserving untouched pairs and empty values. The header `…key`
+extension is display-only (WI#359 CJ-11, run-91 FI-1..FI-4, run-97 FS-1/FS-2).
+The event keeps this redacted copy rather than the raw call parameters —
+the pending gate still holds the raw copy
+for resume, and the thread transcript's action arguments plus the
+`MessageAdded` content previews remain pre-existing at-rest classes (AQ-4,
+WI#359 CL-4); the webhook single-owner rule (a fire
+matches every Active mission on a path **across projects** — the route is
+one public endpoint — with each candidate checked against its own
+configured secret in constant time, so a non-terminal path may only have
+one owner) is enforced — per project, not globally (WI#359 CJ-5 keeps the
+documented per-project scope; cross-project conflicts on one path are
+possible and each mission's own secret remains the fire-time control) — on
+create, on an
+update that switches to a Webhook cadence from another cadence, changes
+the path, or adds a usable
+secret to a dormant claim, and on resume
+(AO-1); updates that leave the claim untouched are not re-checked (a
+same-path re-set is deliberately not checked), so
 under a legacy two-owner conflict either owner can still rotate a leaked
-secret or lower a budget; and create-dedup compares webhook cadences by
+secret — but a dormant row's owner cannot lower a budget or make any other
+update without first supplying a usable secret, because validation rejects
+the row otherwise (WI#359 CO-3). Dormant (secret-less or unpresentable
+whitespace/non-visible-ASCII secret) non-terminal rows still block other
+users' claims on their path (WI#359 CO-3); startup logs a warning for
+every legacy multi-owner path it re-activates (WI#359); two conflicting
+Paused missions cannot resume — each resume re-checks the rule and finds
+the other non-terminal holder, so both are refused until one is deleted,
+completed, or moved off the path (WI#359 CL-4, run-91 FH-5); and
+create-dedup compares webhook cadences by
 path only, so a rotated secret is not a spurious cadence difference (AO-7)
 — the dedup hit discards the supplied secret and flags
 `webhook_secret_applied: false` with a pointer to `mission_update`.
+
+The built-in HTTP tool strips the full request URL from reqwest send errors
+before producing `ExternalService` text (run-97 FS-5). This covers both
+simple-GET redirect hops and non-simple requests, including query credentials
+injected from the secrets store under arbitrary names. Response-body errors
+also drop any attached URL; timeouts keep their existing typed classification.
 
 Two scope properties follow and are stated deliberately (WI#308 asked for
 the supervised-mode consequence, not just the gate ordering). First,
