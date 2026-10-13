@@ -180,4 +180,59 @@ if ! (
 fi
 [[ -e "$fixture/restore-ran" ]] || fail 'restore with rc 3 did not reach pg_restore'
 
+# FL-2: the systemd restore probe classifies by rc AND printed state — a
+# crash-looping Restart=always unit reads rc 3 while activating/deactivating
+# and must be indeterminate, never "stopped". The stub systemctl on PATH makes
+# the branch reachable where no real systemd exists; _systemctl_user is
+# stubbed to the matrix row.
+mkdir -p "$fixture/bin"
+printf '#!/bin/sh\nexit 0\n' >"$fixture/bin/systemctl"
+chmod +x "$fixture/bin/systemctl"
+while IFS=, read -r probe_rc probe_state probe_expect; do
+  rm -f -- "$fixture/restore-ran"
+  (
+    INIT_SYSTEM=systemd
+    PATH="$fixture/bin:$PATH"
+    _systemctl_user() { printf '%s\n' "$probe_state"; return "$probe_rc"; }
+    _ctr() {
+      if [[ "$*" == *pg_restore* ]]; then
+        printf 'restore\n' >>"$fixture/restore-ran"
+      else
+        printf 'true\n'
+      fi
+    }
+    rc=0
+    ( restore_tenant_postgres alice "$fixture/backup.dump" true ) \
+      >"$fixture/probe.log" 2>&1 || rc=$?
+    printf '%s' "$rc" >"$fixture/probe.rc"
+  )
+  rc="$(cat "$fixture/probe.rc")"
+  case "$probe_expect" in
+    proceeds)
+      [[ "$rc" == 0 && -e "$fixture/restore-ran" ]] \
+        || fail "systemd rc=$probe_rc state=$probe_state: restore did not proceed"
+      ;;
+    active)
+      [[ "$rc" != 0 && ! -e "$fixture/restore-ran" ]] \
+        || fail "systemd rc=$probe_rc state=$probe_state: active daemon reached pg_restore"
+      grep -Fq 'stop the daemon first' "$fixture/probe.log" \
+        || fail "systemd rc=$probe_rc state=$probe_state: wrong refusal"
+      ;;
+    refuse)
+      [[ "$rc" != 0 && ! -e "$fixture/restore-ran" ]] \
+        || fail "systemd rc=$probe_rc state=$probe_state: indeterminate state reached pg_restore"
+      grep -Fq 'cannot confirm' "$fixture/probe.log" \
+        || fail "systemd rc=$probe_rc state=$probe_state: refused without the fail-closed reason"
+      ;;
+  esac
+done <<'MATRIX'
+0,active,active
+3,inactive,proceeds
+3,failed,proceeds
+3,activating,refuse
+3,deactivating,refuse
+4,inactive,proceeds
+1,,refuse
+MATRIX
+
 printf 'ALL TESTS PASSED\n'
