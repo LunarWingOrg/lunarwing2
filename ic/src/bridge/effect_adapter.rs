@@ -5354,6 +5354,67 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         );
     }
 
+    /// WI#359 (CN-1): deterministic lockstep variant of the overshoot test
+    /// above. The state write guard is held while all 50 contenders queue
+    /// behind it on a current_thread runtime; dropping it releases them in
+    /// lockstep. A non-atomic check-then-record helper would let every
+    /// queued contender pass its check before any record lands — failing
+    /// this test deterministically rather than probabilistically.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_mission_calls_cannot_overshoot_budget_lockstep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (adapter, mgr, _) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr).await;
+        let adapter = Arc::new(adapter);
+        let guard = adapter.rate_limiter.hold_state_for_lockstep().await;
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let adapter = adapter.clone();
+            let started = started.clone();
+            tasks.spawn(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                adapter
+                    .execute_action(
+                        "mission_fire",
+                        serde_json::json!({"name":"missing"}),
+                        &lease(),
+                        &mission_create_ctx(),
+                    )
+                    .await
+            });
+        }
+        // Drive every contender to the limiter's lock queue before release.
+        while started.load(Ordering::SeqCst) < 50 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(_) => admitted += 1,
+                Err(EngineError::Effect { reason }) => assert!(reason.contains("rate limited")),
+                other => panic!("unexpected gate result: {other:?}"),
+            }
+        }
+        assert_eq!(admitted, 20);
+        let user = mission_create_ctx().user_id;
+        assert_eq!(
+            adapter.rate_limiter.get_usage(&user, "mission_fire").await,
+            Some((20, 20))
+        );
+        assert_eq!(
+            adapter
+                .rate_limiter
+                .get_usage(&user, MISSION_AGGREGATE_RATE_KEY)
+                .await,
+            Some((20, 20))
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_mission_calls_cannot_overshoot_budget() {
         let (adapter, mgr, _) = adapter_with_mission_manager_parts();

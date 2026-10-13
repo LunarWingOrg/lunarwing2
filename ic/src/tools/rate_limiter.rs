@@ -118,6 +118,12 @@ impl ToolRateLimitState {
     }
 }
 
+/// Opaque test-only write guard over the limiter state (WI#359, CN-1).
+#[cfg(test)]
+pub(crate) struct StateLockstepGuard<'a> {
+    _guard: tokio::sync::RwLockWriteGuard<'a, HashMap<(String, String), ToolRateLimitState>>,
+}
+
 /// In-memory rate limiter for tool invocations.
 ///
 /// Keyed by `(user_id, tool_name)` so each user has independent limits.
@@ -252,6 +258,16 @@ impl RateLimiter {
         config: &ToolRateLimitConfig,
     ) -> RateLimitResult {
         self.check_internal(user_id, tool_name, config, false).await
+    }
+
+    /// WI#359 (CN-1): test-only handle for the deterministic lockstep
+    /// overshoot rig — hold the state write lock while contender tasks
+    /// queue behind it, then drop to release them in lockstep.
+    #[cfg(test)]
+    pub(crate) async fn hold_state_for_lockstep(&self) -> StateLockstepGuard<'_> {
+        StateLockstepGuard {
+            _guard: self.state.write().await,
+        }
     }
 
     /// Get current usage for a (user, tool) pair.
