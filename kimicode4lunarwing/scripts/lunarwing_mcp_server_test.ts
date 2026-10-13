@@ -324,3 +324,45 @@ test("oversized requests never recover nested argument ids (FE-2)", async () => 
     shim.kill()
   }
 })
+
+test("a line crossing the cap together with its newline takes the in-loop path (FE-6)", async () => {
+  // MR !1571 run-90 FE-6: the in-loop oversized branch (a COMPLETE line over
+  // the 1 MiB cap, answered with recoverRequestIdFromEdges(line, line)) was
+  // unexercised — every oversized test sent 3 MiB lines, which always exceed
+  // the buffer before their newline arrives and so take the
+  // unterminated-buffer discard path. Write a line just over the cap in two
+  // parts: the first stays under the cap (buffered; no newline, so the
+  // discard path cannot trip), the second carries the tail plus the
+  // terminating newline, so the whole line is sliced and answered inside the
+  // line loop. A nested id-first pair at the arguments' head must not beat
+  // the real top-level id (SDK order at the line's end).
+  const shim = startShim({})
+  try {
+    const replies: Array<Record<string, unknown>> = []
+    shim.stdout.on("data", (chunk: Buffer) => {
+      for (const line of chunk.toString("utf8").split("\n")) {
+        if (!line.trim()) continue
+        replies.push(JSON.parse(line) as Record<string, unknown>)
+      }
+    })
+    const head =
+      `{"method":"tools/call","params":{"name":"memory_read","arguments":{"jsonrpc":"2.0","id":99,"path":"`
+    const tail = `"}},"jsonrpc":"2.0","id":44}`
+    // 1 MiB + 100 chars total: over the cap, but the first write (all but the
+    // last 200 chars) stays under it.
+    const padding = "x".repeat(1024 * 1024 + 100 - head.length - tail.length)
+    const line = head + padding + tail
+    shim.stdin.write(line.slice(0, line.length - 200))
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    shim.stdin.write(line.slice(line.length - 200) + "\n")
+    // The in-order ping is a barrier: inspect every preceding error, rather
+    // than waiting for an id a regressed shim may never answer.
+    const pong = await rpc(shim, { jsonrpc: "2.0", id: 7, method: "ping" })
+    assert.deepEqual(pong, { jsonrpc: "2.0", id: 7, result: {} })
+    const errors = replies.filter((reply) => reply.error !== undefined)
+    assert.deepEqual(errors.map((reply) => reply.id), [44])
+    assert.deepEqual(errors.map((reply) => (reply.error as { code: number }).code), [-32600])
+  } finally {
+    shim.kill()
+  }
+})

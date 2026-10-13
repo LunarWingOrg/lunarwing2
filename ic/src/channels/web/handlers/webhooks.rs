@@ -21,21 +21,26 @@ use crate::channels::web::server::GatewayState;
 ///
 /// Returns `Ok(())` if the routine has a configured secret and the provided
 /// secret matches via constant-time comparison. Returns an appropriate HTTP
-/// error if the secret is missing (403) or invalid (401).
+/// error if the stored secret is missing/unusable (403) or the provided one
+/// does not match (401).
 fn validate_webhook_secret(
     trigger: &Trigger,
     provided_secret: &str,
 ) -> Result<(), (StatusCode, String)> {
-    // Require webhook secret — routines without a secret cannot be triggered via webhook
+    // Require webhook secret — routines without a secret cannot be triggered via webhook.
+    // WI#359 (run-91 FH-1): a stored secret that can never be presented on
+    // the wire (empty, padded, non-ASCII) must never authenticate — `ct_eq`
+    // treats two empty slices as equal, so a legacy `secret: ""` row was
+    // fireable by anyone who knew its path.
     let expected_secret = match trigger {
         Trigger::Webhook {
             secret: Some(s), ..
-        } => s,
+        } if lunarwing_engine::usable_webhook_secret(s) => s,
         _ => {
             return Err((
                 StatusCode::FORBIDDEN,
-                "Webhook secret not configured for this routine. \
-                 Set a secret with: lunarwing routine update <id> --webhook-secret <secret>"
+                "Webhook secret is not configured or is unusable for this routine. \
+                 Delete and re-create the routine with routine_create and a usable webhook secret."
                     .to_string(),
             ));
         }
@@ -128,6 +133,19 @@ pub async fn webhook_trigger_handler(
     })))
 }
 
+/// Extract the `X-Webhook-Secret` header value for a mission webhook fire.
+///
+/// WI#359 (CO-1): an empty or whitespace-only value maps to `None` ("no
+/// secret provided") so a legacy mission stored with an empty secret can
+/// never be authenticated by presenting an empty header.
+fn mission_webhook_secret(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
 /// Handle incoming webhook POST to `/api/missions/webhook/{path}`.
 ///
 /// This endpoint routes payloads to Engine V2 `Webhook`-cadence missions.
@@ -146,10 +164,7 @@ pub async fn mission_webhook_handler(
         ));
     }
 
-    let secret = headers
-        .get("x-webhook-secret")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let secret = mission_webhook_secret(&headers);
 
     let payload = parse_mission_webhook_payload(&body)?;
 
@@ -180,6 +195,24 @@ mod tests {
         assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 
+    /// WI#359 (CO-1): an empty or whitespace-only `X-Webhook-Secret` header
+    /// must map to `None` so it can never authenticate a legacy mission
+    /// stored with an empty secret.
+    #[test]
+    fn empty_mission_webhook_secret_header_maps_to_none() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(mission_webhook_secret(&headers), None);
+        headers.insert("x-webhook-secret", "".parse().unwrap());
+        assert_eq!(mission_webhook_secret(&headers), None);
+        headers.insert("x-webhook-secret", "   ".parse().unwrap());
+        assert_eq!(mission_webhook_secret(&headers), None);
+        headers.insert("x-webhook-secret", "real-secret".parse().unwrap());
+        assert_eq!(
+            mission_webhook_secret(&headers).as_deref(),
+            Some("real-secret")
+        );
+    }
+
     /// Routines with `secret: None` must be rejected with 403.
     #[test]
     fn test_validate_rejects_missing_secret() {
@@ -194,6 +227,8 @@ mod tests {
             msg.contains("not configured"),
             "Error should tell user to configure a secret, got: {msg}"
         );
+        assert!(msg.contains("re-create") && msg.contains("routine_create"));
+        assert!(!msg.contains("lunarwing routine update"));
     }
 
     /// Non-webhook triggers must be rejected with 403.
@@ -238,6 +273,31 @@ mod tests {
         let result = validate_webhook_secret(&trigger, "");
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// WI#359 (run-91 FH-1): a stored secret that can never be presented on
+    /// the wire must never authenticate — `ct_eq("", "")` is true, so a
+    /// legacy `secret: ""` row was fireable with an empty (or missing)
+    /// header. The stored secret is now gated by `usable_webhook_secret`.
+    #[test]
+    fn test_validate_rejects_unusable_stored_secret() {
+        for stored in ["", "  ", " padded", "padded ", "non-ascii-sëcret"] {
+            let trigger = Trigger::Webhook {
+                path: Some("my-hook".to_string()),
+                secret: Some(stored.to_string()),
+            };
+            // Neither the exact stored value, nor an empty header, nor any
+            // guess may authenticate.
+            for provided in [stored, "", "anything"] {
+                let (status, _) = validate_webhook_secret(&trigger, provided)
+                    .expect_err("unusable stored secret must never validate");
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "stored {stored:?} with provided {provided:?} must be 403"
+                );
+            }
+        }
     }
 
     /// Constant-time comparison: secrets of different lengths are still rejected

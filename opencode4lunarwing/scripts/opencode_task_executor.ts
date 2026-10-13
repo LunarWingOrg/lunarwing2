@@ -14,7 +14,13 @@ import {
   type TaskResult,
   DEFAULT_TIMEOUT_MS,
 } from "./lunarwing_runtime"
-import { extractAssistantText, opencodeErrorMessage } from "./opencode_result"
+import {
+  extractAssistantText,
+  opencodeErrorRef,
+  opencodeErrorMessage,
+  serveLogStartSize,
+  withServeLogDetail,
+} from "./opencode_result"
 import { expandWorkspacePath } from "./workspace_path"
 
 const OPENCODE_HOST = process.env.OPENCODE_SERVE_HOST || "127.0.0.1"
@@ -90,6 +96,47 @@ function emptyOutputError(deniedPermissions: number): string {
   return "opencode completed without assistant text or tool output"
 }
 
+// Values that must never survive into a job record via the serve-log tail:
+// the bridge's own credential env plus everything this task injected.
+// Beyond the fixed names, any env name matching the secret patterns is
+// selected too, so credentials mt-admin injects via --env-file or compose
+// EXTRA_ENV_FILE (provider keys and friends) are covered (run-92 FJ-6).
+const SECRET_SCRUB_ENV_KEYS = [
+  "OPENCODE_SERVER_PASSWORD",
+  "TENSORZERO_API_KEY",
+  "OPENAI_API_KEY",
+  "AGENT_AUTH_TOKEN",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "PASEO_TOKEN",
+]
+
+const SECRET_ENV_NAME_PATTERN = /(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL|AUTH)/
+
+function secretEnvValues(env: Record<string, string | undefined>): string[] {
+  const values: string[] = []
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string" || value.length === 0) continue
+    if (SECRET_SCRUB_ENV_KEYS.includes(key) || SECRET_ENV_NAME_PATTERN.test(key)) {
+      values.push(value)
+    }
+  }
+  return values
+}
+
+// Snapshot at module load: tasks inject their context.environment into
+// process.env, and a task value named TENSORZERO_API_KEY must not shadow the
+// boot value — the boot value is the one serve actually logs (run-92 FJ-6).
+const BOOT_SECRET_ENV_VALUES = secretEnvValues(process.env)
+
+function secretScrubValues(request: TaskRequest): string[] {
+  const values = [...BOOT_SECRET_ENV_VALUES]
+  for (const value of Object.values(request.context?.environment ?? {})) {
+    if (typeof value === "string" && value.length > 0) values.push(value)
+  }
+  return values
+}
+
 function createSdk(directory?: string): OpencodeClient {
   const password = getPassword()
   const headers: Record<string, string> = {}
@@ -125,6 +172,10 @@ export async function executeTask(
   const workDir = request.context?.project_dir
     ? resolveWorkDir(request.context.project_dir)
     : WORKSPACE_ROOT
+  // Boundary for serve-log enrichment (WI#374): only log lines appended after
+  // the task started can belong to it — one serve process serves the whole
+  // tenant container.
+  const serveLogStart = serveLogStartSize()
 
   const injectedKeys: string[] = []
   const savedValues: Record<string, string | undefined> = {}
@@ -170,6 +221,7 @@ export async function executeTask(
 
   let stopReason: StopReason | undefined
   let resolveStop: (reason: StopReason) => void = () => {}
+  let serverErrorRef: string | undefined
   const stopPromise = new Promise<StopReason>((resolve) => {
     resolveStop = resolve
   })
@@ -353,7 +405,10 @@ export async function executeTask(
 
         if (event.type === "session.error") {
           if (event.properties.sessionID !== sessionID) continue
-          if (!sessionErrorMsg) sessionErrorMsg = opencodeErrorMessage(event.properties.error)
+          if (!sessionErrorMsg) {
+            sessionErrorMsg = opencodeErrorMessage(event.properties.error)
+            serverErrorRef ??= opencodeErrorRef(event.properties.error)
+          }
         }
 
         if (event.type === "permission.asked") {
@@ -408,10 +463,14 @@ export async function executeTask(
 
       const promptOutcome = await waitForStop(promptPromise)
       const promptData = "result" in promptOutcome ? promptOutcome.result.data : undefined
+      const promptErrorObject = "error" in promptOutcome ? promptOutcome.error : undefined
+      const infoError = promptData?.info.error
       const promptError =
-        ("error" in promptOutcome ? opencodeErrorMessage(promptOutcome.error) : "") ||
-        (promptData?.info.error ? opencodeErrorMessage(promptData.info.error) : "") ||
+        (promptErrorObject ? opencodeErrorMessage(promptErrorObject) : "") ||
+        (infoError ? opencodeErrorMessage(infoError) : "") ||
         sessionErrorMsg
+      serverErrorRef ??=
+        opencodeErrorRef(promptErrorObject) ?? (infoError ? opencodeErrorRef(infoError) : undefined)
 
       if (!promptError) {
         // Turn finished cleanly; bank its canonical text (DI-3) — or, when
@@ -550,12 +609,24 @@ export async function executeTask(
       })
       return
     }
+    // Only the plain-error branch is enriched with the serve-log tail;
+    // follow-up failure paths keep their explicit outcome text, and
+    // preserved success never carries an error.
+    let error: string | null = null
+    if (!preserveSuccess) {
+      error = currentFollowupSeq !== undefined
+        ? `${emptyOutputError(deniedPermissions)}; follow-up failed: ${errorMsg}`
+        : await withServeLogDetail(errorMsg, {
+            ref: serverErrorRef ?? opencodeErrorRef(err),
+            startOffset: serveLogStart,
+            secrets: secretScrubValues(request),
+          })
+    }
     onResult({
       task_id: request.task_id,
       status: preserveSuccess ? "success" : "error",
       output: resultOutput,
-      error: preserveSuccess ? null : currentFollowupSeq !== undefined
-        ? `${emptyOutputError(deniedPermissions)}; follow-up failed: ${errorMsg}` : errorMsg,
+      error,
       duration_ms: Date.now() - startTime,
     })
   } finally {

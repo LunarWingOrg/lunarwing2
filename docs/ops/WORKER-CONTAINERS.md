@@ -58,11 +58,15 @@ The strip is applied per worker entry, but the authority domain is the
 container: never point an entry that has a `tool_allowlist` at the same
 endpoint as a `mode = "cron"` entry — give a cron mission its own
 container. (The manager also strips the worker-level list of a non-cron
-entry whose endpoint URL exactly matches a cron entry's endpoint, but
-exact-string matching cannot catch aliases such as `localhost` vs
-`127.0.0.1`, so the rule stands on its own.) A borrowed call is recorded
-in the `job_events` — and counted against the 100-frame budget — of the
-job whose relay socket was used, not of the job that issued it.
+entry whose endpoint shares a cron entry's container. The comparison uses
+a normalized endpoint key — loopback spellings folded into one class,
+host lowercased, scheme-default port applied, path and query ignored —
+so one host:port that path-routes several containers strips all of them
+(fails closed); exotic aliases such as `/etc/hosts` names remain the
+operator's responsibility, and the rule stands on its own.) A borrowed
+call is recorded in the `job_events` — and counted against the
+100-frame budget — of the job whose relay socket was used, not of the
+job that issued it.
 
 ## Generic shell sandbox network policy (WI#154/155)
 
@@ -219,11 +223,14 @@ The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Bu
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
+**Known issue (WI#320 F4, tracked as WI#333; WI#374 reported the same crash on a 2.1.6.0 test tenant):** at the pinned v1.18.25 the `mode: "opencode"` lane is broken in the LunarWing worker shape — every task fails with `external worker 'opencode' failed: Unexpected server error` because `opencode serve` crashes in `SystemPrompt.environment` (`undefined is not an object (evaluating 'a.name')`) while assembling the prompt, before any model call, and answers the SDK with that bare HTTP 500 wrapper. No config remediation (base-URL override, MCP/plugin strip, git-init workspace) avoids it, and v1.18.29 is worse (see the pin note above), so the lane cannot be fixed from this repo until upstream ships a fix; the opencode2 lane below is the working one. To surface the root cause, the worker attaches a bounded, ref-correlated, error-level tail of serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/opencode.log` — verified at the pinned ref: serve logs 500 causes there as `level=ERROR` lines with a unique `ref=` id, and the 500 body carries the same ref) to these job errors — only the failing request's line attaches, and a 500 without a ref attaches nothing — so the crash's real stack line reaches `list_jobs`/`job_status`. The v1 lane is expected to be retired in v2.1.7.0 (goals item 34: "prob rm opencode v1 in .1.7.0").
+
 ## OpenCode 2 Worker (opencode2)
 
 The OpenCode **2** lane, run as a separate external worker per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
-keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
+keeps its v1.18.25 pin (last dispatch-verified release; see the known
+issue above); v2 is opt-in per tenant until upstream's
 2.0.x patch stack settles. Do not configure both lanes on the same
 tenant during the transition (agent routing confusion — plan §5).
 

@@ -195,6 +195,7 @@ pub async fn execute_action_calls(
                         action_name: call.action_name.clone(),
                         call_id: call.id.clone(),
                         parameters: Some(crate::types::event::redact_event_params(
+                            &call.action_name,
                             &call.parameters,
                         )),
                         description: None,
@@ -451,7 +452,10 @@ fn classify_exec_result(
                 // copy so ApprovalRequested.parameters no longer holds a
                 // webhook_secret (scoped so, run-51 CJ-9: message previews
                 // and thread transcripts are separate at-rest classes).
-                parameters: Some(crate::types::event::redact_event_params(&parameters)),
+                parameters: Some(crate::types::event::redact_event_params(
+                    &call.action_name,
+                    &parameters,
+                )),
                 description: None,
                 allow_always: match *resume_kind {
                     crate::gate::ResumeKind::Approval { allow_always } => Some(allow_always),
