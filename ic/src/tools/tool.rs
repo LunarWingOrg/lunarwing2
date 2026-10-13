@@ -433,6 +433,12 @@ pub trait Tool: Send + Sync {
     /// Redaction only applies to the observability and audit paths, not execution.
     ///
     /// Use this for tools that accept plaintext secrets as parameters (e.g. `secret_save`).
+    ///
+    /// This is the exact-match, per-tool contract — a tool can name a
+    /// credential parameter that the shared heuristic cannot know (e.g. a
+    /// plain `value` key). The engine event/mission-hook surfaces use the
+    /// normalized `lunarwing_safety::is_credential_param_key` predicate
+    /// instead (WI#359, CJ-10); the two are deliberately distinct.
     fn sensitive_params(&self) -> &[&str] {
         &[]
     }
