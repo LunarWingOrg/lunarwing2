@@ -279,7 +279,10 @@ MATRIX
 # preflight, so it carries its own proxy-unit guard — a legacy unit must
 # refuse before the root health cron is armed in the migration window. The id
 # stub only clears the script's root gate; the refusal comes from the real
-# sourced mt-admin guard against the real legacy unit file.
+# sourced mt-admin guard against the real legacy unit file. Detection is
+# forced through the documented override because sourcing mt-admin resets
+# INIT_SYSTEM and the script re-detects (a stub systemctl from the FL-2
+# matrix must not flip this pin to the systemd lane).
 printf ': "${proxy_args:=proxy --tensorzero http://fixture.invalid}"\n' \
   >"$OPENRC_INITD_DIR/lunarwing-proxy-deadline"
 mkdir -p "$fixture/bin"
@@ -287,7 +290,8 @@ printf '#!/bin/sh\nprintf "0\\n"\n' >"$fixture/bin/id"
 chmod +x "$fixture/bin/id"
 health_fleet_script="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../enable-health-fleet.sh"
 rc=0
-( PATH="$fixture/bin:$PATH" LUNARWING_MT_OPENRC_INITD_DIR="$OPENRC_INITD_DIR" \
+( PATH="$fixture/bin:$PATH" LUNARWING_SERVICE_MANAGER=openrc \
+    LUNARWING_MT_OPENRC_INITD_DIR="$OPENRC_INITD_DIR" \
     bash "$health_fleet_script" \
     --dry-run --yes --allow-down ) >"$fixture/healthfleet.log" 2>&1 || rc=$?
 [[ "$rc" != 0 ]] || fail 'enable-health-fleet armed the cron beside a legacy unit'
