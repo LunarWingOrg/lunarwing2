@@ -205,7 +205,11 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   authority domain. The strip is applied per worker entry, but the
   authority domain is the container: never point an entry that has a
   `tool_allowlist` at the same endpoint as a `mode = "cron"` entry; give a
-  cron mission its own container. The manager additionally strips the
+  cron mission its own container. Two cron entries pointing at the same
+  container likewise share one authority domain (one mission's tick can
+  borrow the other's `cron.tool_allowlist` through a concurrent tick's
+  relay socket); the code does not detect or prevent that pairing —
+  tracked as WI#396 (MR !1582 review FT-3). The manager additionally strips the
   worker-level list of a non-cron entry whose endpoint shares a cron
   entry's container (MR !1561 EV-1). The comparison uses a normalized
   endpoint key (MR !1571 review FE-1): loopback spellings fold into one

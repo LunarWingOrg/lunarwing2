@@ -57,7 +57,10 @@ as an error): a cron worker container never holds more than its
 The strip is applied per worker entry, but the authority domain is the
 container: never point an entry that has a `tool_allowlist` at the same
 endpoint as a `mode = "cron"` entry — give a cron mission its own
-container. (The manager also strips the worker-level list of a non-cron
+container. Two cron entries pointing at the same container likewise
+share one authority domain (one mission's tick can borrow the other's
+`cron.tool_allowlist` through a concurrent tick's relay socket); the
+code does not detect or prevent that pairing — tracked as WI#396. (The manager also strips the worker-level list of a non-cron
 entry whose endpoint shares a cron entry's container. The comparison uses
 a normalized endpoint key — loopback spellings folded into one class,
 host lowercased, scheme-default port applied, path and query ignored —
