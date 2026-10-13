@@ -7010,6 +7010,16 @@ mod tests {
                     !entity.contains(&a_id.0.to_string()),
                     "must not leak the holding mission's UUID: {entity}"
                 );
+                // WI#359 (CL-3): the holder's owner and mission name are
+                // identifying too and must stay out of the error.
+                assert!(
+                    !entity.contains("user-a"),
+                    "must not leak the holding mission's owner: {entity}"
+                );
+                assert!(
+                    !entity.contains("a-hook"),
+                    "must not leak the holding mission's name: {entity}"
+                );
             }
             other => panic!("expected AccessDenied, got {other:?}"),
         }
@@ -7206,7 +7216,43 @@ mod tests {
             )
             .await
             .unwrap();
+            // WI#359 (CO-5): the repaired row really moved onto the free
+            // path with the rotated secret.
+            assert!(
+                matches!(store.load_mission(b.id).await.unwrap().unwrap().cadence,
+                MissionCadence::Webhook { path, secret: stored }
+                    if path == "free" && stored.as_deref() == Some("new-secret"))
+            );
         }
+
+        // WI#359 (CO-5) positive case: a dormant row adding a usable secret
+        // on an UNCLAIMED path is a new claim with no conflict — it succeeds.
+        let quiet = Mission::new(
+            project,
+            "user-b",
+            "quiet-hook",
+            "goal",
+            MissionCadence::Webhook {
+                path: "quiet".into(),
+                secret: None,
+            },
+        );
+        store.save_mission(&quiet).await.unwrap();
+        mgr.update_mission(
+            quiet.id,
+            "user-b",
+            MissionUpdate {
+                webhook_secret: Some("quiet-secret".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(store.load_mission(quiet.id).await.unwrap().unwrap().cadence,
+            MissionCadence::Webhook { path, secret: stored }
+                if path == "quiet" && stored.as_deref() == Some("quiet-secret"))
+        );
     }
 
     #[test]

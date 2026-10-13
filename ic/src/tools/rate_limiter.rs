@@ -330,7 +330,12 @@ mod tests {
                     .await,
                 Err((1, _, _))
             ));
-            assert_eq!(limiter.get_usage("owner", "create").await, Some((0, 0)));
+            // WI#359 (CK-4a): a bare check may or may not create the zeroed
+            // state entry — the pin is "no recorded calls", either shape.
+            assert!(matches!(
+                limiter.get_usage("owner", "create").await,
+                None | Some((0, 0))
+            ));
             assert_eq!(limiter.get_usage("owner", "aggregate").await, Some((1, 1)));
         }
         let exhausted = ToolRateLimitConfig::new(0, 0);

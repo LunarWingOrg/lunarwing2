@@ -5471,16 +5471,15 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         }
 
         // CJ-2: the refused call was checked against both budgets before
-        // either recorded, so it did not spend a per-verb token. (The
-        // limiter creates a zeroed state entry on a bare `check`, so the
-        // pin is zero recorded calls, not a missing entry.)
+        // either recorded, so it did not spend a per-verb token. WI#359
+        // (CK-4a): a bare check may or may not create the zeroed state
+        // entry — the pin is zero recorded calls, either shape.
         let usage = adapter
             .rate_limiter
             .get_usage(&ctx.user_id, "mission_create")
             .await;
-        assert_eq!(
-            usage,
-            Some((0, 0)),
+        assert!(
+            matches!(usage, None | Some((0, 0))),
             "an aggregate-refused call must not record per-verb usage: {usage:?}"
         );
 
