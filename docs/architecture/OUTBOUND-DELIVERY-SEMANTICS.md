@@ -93,10 +93,10 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
   (e.g. XEP-0198 acks) is not part of this contract.
 - **Mission-run ledger.** The engine-side half of WI#270's long-term fix is
   separate from the channel spool. A graceful shutdown no longer loses a
-  mid-run fire of an Active mission, outside one narrow abort window (a
-  mission paused or retired mid-run records a quiet stop; an abort between
-  the settled stop and the mission-row save loses the fire with its dedup
-  key still recorded — see ENGINE-V2.md): the run is stopped within a short
+  mid-run fire of an Active mission, with two exceptions (a mission paused
+  or retired mid-run records a quiet stop; an abort between the settled
+  stop and the mission-row save loses the fire with its dedup key still
+  recorded — see ENGINE-V2.md): the run is stopped within a short
   grace, the interruption is recorded, and a persisted retry marker re-fires
   it after restart within the mission's retry policy (WI#276; see
   ENGINE-V2.md, mission retries — a policy with no attempts left records the
