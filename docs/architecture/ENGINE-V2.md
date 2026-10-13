@@ -1145,12 +1145,17 @@ event stores display parameters with the same predicate redacted,
 recursively (a positional `_args[0]` payload included), and for
 `http`/`web_fetch` also with credential-like header values blanked (matched
 by header name against the union of the header heuristic and the shared
-credential-key list, or by an auth-scheme value prefix; the string form of
+credential-key list and normalized names ending in `key` except
+`idempotencykey`, or by an auth-scheme value prefix; the string form of
 `headers` is parsed, redacted inside, and re-serialised, failing closed on
 unparseable input) and URL credentials stripped (userinfo removed,
 credential-like query values replaced by `[REDACTED]`, the fragment
-dropped) (WI#359 CJ-11, run-91 FI-1..FI-4) rather
-than the raw call parameters — the pending gate still holds the raw copy
+dropped). String-form HTTP bodies are parsed as JSON, recursively redacted
+and re-serialised; non-JSON strings use the form/query credential-key
+redactor, preserving untouched pairs and empty values. The header `…key`
+extension is display-only (WI#359 CJ-11, run-91 FI-1..FI-4, run-97 FS-1/FS-2).
+The event keeps this redacted copy rather than the raw call parameters —
+the pending gate still holds the raw copy
 for resume, and the thread transcript's action arguments plus the
 `MessageAdded` content previews remain pre-existing at-rest classes (AQ-4,
 WI#359 CL-4); the webhook single-owner rule (a fire
@@ -1180,6 +1185,12 @@ create-dedup compares webhook cadences by
 path only, so a rotated secret is not a spurious cadence difference (AO-7)
 — the dedup hit discards the supplied secret and flags
 `webhook_secret_applied: false` with a pointer to `mission_update`.
+
+The built-in HTTP tool strips the full request URL from reqwest send errors
+before producing `ExternalService` text (run-97 FS-5). This covers both
+simple-GET redirect hops and non-simple requests, including query credentials
+injected from the secrets store under arbitrary names. Response-body errors
+also drop any attached URL; timeouts keep their existing typed classification.
 
 Two scope properties follow and are stated deliberately (WI#308 asked for
 the supervised-mode consequence, not just the gate ordering). First,

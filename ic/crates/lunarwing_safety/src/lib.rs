@@ -17,7 +17,7 @@ mod validator;
 pub use credential_detect::{
     header_name_carries_credentials, header_value_carries_credentials, is_credential_param_key,
     params_contain_manual_credentials, query_param_carries_credentials, redact_credential_params,
-    sanitize_url_credentials,
+    redact_form_credentials, sanitize_url_credentials,
 };
 pub use leak_detector::{
     LeakAction, LeakDetectionError, LeakDetector, LeakMatch, LeakPattern, LeakScanResult,

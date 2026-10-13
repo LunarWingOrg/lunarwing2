@@ -1,7 +1,8 @@
-//! Broad detection of manually-provided credentials in HTTP request parameters.
+//! Credential detection and display/storage redaction for HTTP parameters.
 //!
 //! Used by the built-in HTTP tool to decide whether approval is needed when
 //! the LLM provides auth data directly in headers or URL query parameters.
+//! The redaction helpers also cover credential-keyed JSON and form bodies.
 
 /// Check whether HTTP request parameters contain manually-provided credentials.
 ///
@@ -197,6 +198,15 @@ pub fn sanitize_url_credentials(url_str: &str) -> String {
         }
     }
     parsed.to_string()
+}
+
+/// Redact credential values in a form-encoded HTTP body (run-97 FS-1).
+///
+/// Uses the same decoded-key heuristics as URL queries, preserving untouched
+/// pairs, empty values and free text byte-for-byte. This is a display/storage
+/// copy; the original body remains available for execution.
+pub fn redact_form_credentials(body: &str) -> String {
+    redact_query_credentials(body)
 }
 
 /// Redact credential values in a raw query string, preserving every
@@ -695,6 +705,24 @@ mod tests {
             !sanitized.contains("abc"),
             "token value leaked: {sanitized}"
         );
+    }
+
+    #[test]
+    fn redact_form_credentials_preserves_safe_pairs_and_empty_values() {
+        let body = "grant_type=refresh_token&client_secret=form-secret&refresh_token=form-token\
+                    &api%5Fkey=encoded-key&scope=read%20write&flag&password=&client_secret=another";
+        assert_eq!(
+            redact_form_credentials(body),
+            "grant_type=refresh_token&client_secret=[REDACTED]&refresh_token=[REDACTED]\
+             &api%5Fkey=[REDACTED]&scope=read%20write&flag&password=&client_secret=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redact_form_credentials_preserves_plain_text_and_empty_bodies() {
+        for body in ["", "plain text body", "a=1&b=two+words", "flag&empty="] {
+            assert_eq!(redact_form_credentials(body), body);
+        }
     }
 
     /// Adversarial tests for credential detection with Unicode, control chars,

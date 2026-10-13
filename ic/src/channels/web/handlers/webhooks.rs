@@ -21,7 +21,8 @@ use crate::channels::web::server::GatewayState;
 ///
 /// Returns `Ok(())` if the routine has a configured secret and the provided
 /// secret matches via constant-time comparison. Returns an appropriate HTTP
-/// error if the secret is missing (403) or invalid (401).
+/// error if the stored secret is missing/unusable (403) or the provided one
+/// does not match (401).
 fn validate_webhook_secret(
     trigger: &Trigger,
     provided_secret: &str,
@@ -38,8 +39,8 @@ fn validate_webhook_secret(
         _ => {
             return Err((
                 StatusCode::FORBIDDEN,
-                "Webhook secret not configured for this routine. \
-                 Set a secret with: lunarwing routine update <id> --webhook-secret <secret>"
+                "Webhook secret is not configured or is unusable for this routine. \
+                 Delete and re-create the routine with routine_create and a usable webhook secret."
                     .to_string(),
             ));
         }
@@ -226,6 +227,8 @@ mod tests {
             msg.contains("not configured"),
             "Error should tell user to configure a secret, got: {msg}"
         );
+        assert!(msg.contains("re-create") && msg.contains("routine_create"));
+        assert!(!msg.contains("lunarwing routine update"));
     }
 
     /// Non-webhook triggers must be rejected with 403.
