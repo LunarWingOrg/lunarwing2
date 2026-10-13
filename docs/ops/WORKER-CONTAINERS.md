@@ -19,12 +19,16 @@ Each lane enforces the strip at its task-process boundary:
 - **Kimi** — the executor deletes `AGENT_AUTH_TOKEN` from the assembled
   per-task env after all merges (bridge env spread, task-supplied
   `context.environment`, proxy `extraEnv`), so neither inheritance nor
-  task-supplied env can deliver it. Pinned by the executor self-test.
+  task-supplied env can deliver it. Pinned by the executor self-test. The
+  one-shot `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (shape pinned by
+  the entrypoint config self-test).
 - **OpenCode / OpenCode 2** — the entrypoint launches `opencode serve` via
   `env -u AGENT_AUTH_TOKEN`: the server process runs all task code (every
   bash tool child inherits its env), while the separately exec'd bridge keeps
-  its own copy. Pinned by the worker entrypoint harness, which asserts both
-  directions (serve sees it absent, bridge sees it present).
+  its own copy. The one-shot `cli` and `acp` modes exec the task process the
+  same way. Pinned by the worker entrypoint harness, which asserts both
+  directions (serve sees it absent, bridge sees it present) plus every
+  one-shot mode.
 - **Pebble** — `spawn_pebble` rebuilds the child env via `env_clear()` +
   `strip_bridge_credentials` (everything else preserved: PATH, locale,
   `PEBBLE_*` provider variables) and drops task-supplied re-injections.
