@@ -10,7 +10,9 @@ case "$PEBBLE_MODE" in
     ;;
   cli)
     echo "[entrypoint] running pebble in CLI mode"
-    exec pebble --permission-mode "${PEBBLE_PERMISSION_MODE:-danger-full-access}" \
+    # WI#373: the prompt runs untrusted agent code — never inherit the
+    # bridge's hub-handshake credential.
+    exec env -u AGENT_AUTH_TOKEN pebble --permission-mode "${PEBBLE_PERMISSION_MODE:-danger-full-access}" \
                 --model "${PEBBLE_MODEL:-openai/gpt-5.2}" \
                 --output-format "${PEBBLE_OUTPUT_FORMAT:-text}" \
                 "$@"

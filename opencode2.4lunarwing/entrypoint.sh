@@ -209,13 +209,16 @@ case "$MODE" in
   cli)
     log "Mode: CLI — running opencode with args: $*"
     cd "$WORKSPACE_ROOT"
-    exec "$OPENCODE_BIN" run "$@"
+    # WI#373: the prompt runs untrusted agent code — never inherit the
+    # bridge's hub-handshake credential.
+    exec env -u AGENT_AUTH_TOKEN "$OPENCODE_BIN" run "$@"
     ;;
 
   acp)
     log "Mode: ACP — launching opencode ACP bridge"
     cd "$WORKSPACE_ROOT"
-    exec "$OPENCODE_BIN" acp "$@"
+    # WI#373: same one-shot task boundary as cli mode.
+    exec env -u AGENT_AUTH_TOKEN "$OPENCODE_BIN" acp "$@"
     ;;
 
   websocket)
@@ -232,7 +235,12 @@ case "$MODE" in
     export OPENCODE_PASSWORD OPENCODE_SERVER_PASSWORD="$OPENCODE_PASSWORD"
 
     cd "$WORKSPACE_ROOT"
-    "$OPENCODE_BIN" serve \
+    # WI#373: the serve process runs all task code (every bash tool child
+    # inherits its env), so strip the bridge's hub-handshake credential from
+    # the server env. The bridge keeps its own copy for the WebSocket
+    # handshake; the server never needs it. OPENCODE_PASSWORD stays — the
+    # server itself enforces it.
+    env -u AGENT_AUTH_TOKEN "$OPENCODE_BIN" serve \
       --port "$OPENCODE_SERVE_PORT" \
       --hostname "$OPENCODE_SERVE_HOST" &
     OPENCODE_PID=$!

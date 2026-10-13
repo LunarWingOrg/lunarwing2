@@ -17,6 +17,25 @@ const UNTRUSTED_HISTORY_INSTRUCTION: &str =
 const UNTRUSTED_HISTORY_BEGIN: &str = "--- BEGIN UNTRUSTED CONVERSATION HISTORY ---";
 const UNTRUSTED_HISTORY_END: &str = "--- END UNTRUSTED CONVERSATION HISTORY ---";
 
+/// Env key carrying the bridge's hub-handshake credential (WI#373). The
+/// spawned task process runs untrusted job code and must never see it: the
+/// value would let any task impersonate the daemon toward this worker (and,
+/// on tenants still provisioned with the pre-WI#205 fallback, the whole
+/// gateway bearer).
+const BRIDGE_AUTH_ENV_KEY: &str = "AGENT_AUTH_TOKEN";
+
+/// Bridge env rebuilt for a spawned task minus the bridge's own credentials
+/// (WI#373). Everything else is preserved — PATH, locale and the PEBBLE_*
+/// provider variables the task legitimately needs.
+fn strip_bridge_credentials(
+    env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let denied = std::ffi::OsStr::new(BRIDGE_AUTH_ENV_KEY);
+    env.into_iter()
+        .filter(|(key, _)| key.as_os_str() != denied)
+        .collect()
+}
+
 pub struct ExecutorConfig {
     pub pebble_bin: String,
     pub model: String,
@@ -135,8 +154,15 @@ fn spawn_pebble(
     .stderr(Stdio::piped())
     .kill_on_drop(true);
 
+    // WI#373: the child env is rebuilt from the bridge env with the
+    // handshake credential dropped — plain inheritance would leak it into
+    // every task — and task-supplied env cannot re-inject it.
+    cmd.env_clear();
+    cmd.envs(strip_bridge_credentials(std::env::vars_os()));
     for (key, value) in &request.context.environment {
-        cmd.env(key, value);
+        if key.as_str() != BRIDGE_AUTH_ENV_KEY {
+            cmd.env(key, value);
+        }
     }
 
     cmd.spawn()
@@ -386,6 +412,7 @@ enum Outcome {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::protocol::{ConversationMessage, TaskContext, TaskRequest};
@@ -581,5 +608,99 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn strip_bridge_credentials_drops_only_the_handshake_token() {
+        let kept = strip_bridge_credentials([
+            ("PATH".into(), "/usr/bin".into()),
+            ("PEBBLE_API_KEY".into(), "llm-key".into()),
+            ("AGENT_AUTH_TOKEN".into(), "bridge-secret".into()),
+            ("agent_auth_token".into(), "case-variant".into()),
+        ]);
+        let names: Vec<&str> = kept
+            .iter()
+            .map(|(key, _)| key.to_str().expect("utf-8 key"))
+            .collect();
+        // Exact-key match only: the credential is dropped, unrelated keys
+        // (including case variants) are preserved.
+        assert_eq!(names, ["PATH", "PEBBLE_API_KEY", "agent_auth_token"]);
+    }
+
+    // WI#373 regression: with the bridge credential present in the parent
+    // env AND injected via task-supplied environment, the spawned task
+    // process must still see neither. Runs as its own child test process so
+    // the credential can be placed in the (process-global) parent env — the
+    // crate forbids unsafe code, so std::env::set_var is not an option.
+    #[tokio::test]
+    async fn spawned_task_env_omits_the_hub_handshake_token() {
+        const CHILD_MARKER: &str = "PEBBLE_WI373_CHILD";
+        const TEST_PATH: &str = "executor::tests::spawned_task_env_omits_the_hub_handshake_token";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let exe = std::env::current_exe().expect("test binary path");
+            let out = std::process::Command::new(exe)
+                .args(["--exact", TEST_PATH, "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env(BRIDGE_AUTH_ENV_KEY, "bridge-secret-64hex")
+                .output()
+                .expect("re-exec test binary");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "child phase failed:\nstdout: {text}\nstderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        // Child phase: this process carries the credential; spawn the probe
+        // stub through the real spawn_pebble and inspect its environment.
+        // The stub lives next to the test binary because temp dirs can be
+        // mounted noexec on dev VMs.
+        let exe_dir = std::env::current_exe()
+            .expect("test binary path")
+            .parent()
+            .expect("exe directory")
+            .to_path_buf();
+        let stub = exe_dir.join("pebble-env-probe-stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ -n \"$AGENT_AUTH_TOKEN\" ]; then echo TOKEN_PRESENT; else echo TOKEN_OK; fi\n",
+        )
+        .expect("write probe stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make probe stub executable");
+
+        let root = exe_dir.join("pebble-wi373-root");
+        std::fs::create_dir_all(&root).expect("create workspace root");
+        let config = ExecutorConfig {
+            pebble_bin: stub.to_str().expect("utf-8 stub path").to_string(),
+            model: "m".to_string(),
+            permission_mode: "danger-full-access".to_string(),
+            workspace_root: root.to_str().expect("utf-8 root").to_string(),
+        };
+        let mut req = request("read env", vec![]);
+        // Attacker-controllable task input attempting to re-inject the
+        // bridge credential name for its own run.
+        req.context.environment = HashMap::from([(
+            BRIDGE_AUTH_ENV_KEY.to_string(),
+            "forged-by-task".to_string(),
+        )]);
+
+        let child = spawn_pebble(&config, &req).expect("spawn probe stub");
+        let out = child
+            .wait_with_output()
+            .await
+            .expect("probe stub completes");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "probe stub exit: {text}");
+        assert!(
+            text.contains("TOKEN_OK") && !text.contains("TOKEN_PRESENT"),
+            "hub-handshake token reached the task env: {text}"
+        );
+
+        std::fs::remove_file(&stub).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

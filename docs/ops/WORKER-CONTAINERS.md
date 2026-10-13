@@ -5,6 +5,43 @@ Several container images provide sandboxed and persistent job execution for Luna
 Nanocode is retired and has no active source, build, or runtime image definition.
 See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 
+## Hub-handshake credential boundary (WI#373)
+
+Every worker container receives `AGENT_AUTH_TOKEN` — the tenant-scoped
+`WORKER_AUTH_TOKEN` (WI#205; legacy tenants fall back to the gateway bearer)
+that authenticates the daemon→worker WebSocket handshake. Only the **bridge
+process** needs it. Task code is untrusted, so no task process may inherit it:
+a leaked token lets any job impersonate the daemon toward that worker (and,
+where the legacy fallback still applies, toward the whole gateway surface).
+
+Each lane enforces the strip at its task-process boundary:
+
+- **Kimi** — the executor deletes `AGENT_AUTH_TOKEN` from the assembled
+  per-task env after all merges (bridge env spread, task-supplied
+  `context.environment`, proxy `extraEnv`), so neither inheritance nor
+  task-supplied env can deliver it. Pinned by the executor self-test. The
+  one-shot `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (shape pinned by
+  the entrypoint config self-test).
+- **OpenCode / OpenCode 2** — the entrypoint launches `opencode serve` via
+  `env -u AGENT_AUTH_TOKEN`: the server process runs all task code (every
+  bash tool child inherits its env), while the separately exec'd bridge keeps
+  its own copy. The one-shot `cli` and `acp` modes exec the task process the
+  same way. Pinned by the worker entrypoint harness, which asserts both
+  directions (serve sees it absent, bridge sees it present) plus every
+  one-shot mode.
+- **Pebble** — `spawn_pebble` rebuilds the child env via `env_clear()` +
+  `strip_bridge_credentials` (everything else preserved: PATH, locale,
+  `PEBBLE_*` provider variables) and drops task-supplied re-injections.
+  Pinned by a self-exec regression test that carries the token in the parent
+  env and probes the real spawned environment through a stub. The one-shot
+  `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (harness-pinned).
+
+Residual, out of scope for WI#373: the OpenCode serve password
+(`OPENCODE_SERVER_PASSWORD`) is necessarily present in the serve process env —
+the server enforces it itself, and task code already runs inside that trust
+boundary. The LLM provider keys (`KIMI_API_KEY`, `TENSORZERO_API_KEY`, …) are
+deliberately *not* stripped: task execution needs them.
+
 ## WebSocket message limits
 
 The daemon accepts external-worker messages and individual WebSocket frames
