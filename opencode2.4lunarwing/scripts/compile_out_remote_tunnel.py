@@ -14,8 +14,14 @@ style as prepare_reproducible_build.py, which fails the build on drift):
   moves/renames (references remain but the expected path is gone), the build
   FAILS rather than silently shipping a live tunnel.
 - After stubbing, no source file may still reference the @opentunnel
-  packages; the runtime stage separately asserts the built binary carries no
-  relay markers (exposure_policy_assert.py --binary).
+  packages (any quoted @opentunnel/* specifier: static, dynamic, require);
+  the runtime stage separately asserts the built binary carries no relay
+  markers (exposure_policy_assert.py --binary).
+
+Scanned surface (run-79 EI-4): packages/{cli,server,schema,core}/src,
+*.ts and *.tsx, with @opentunnel dependencies collected from every
+packages/*/package.json. The runtime-stage binary marker scan remains the
+backstop if upstream drifts past even this.
 
 usage: compile_out_remote_tunnel.py [upstream repo root]
 """
@@ -27,11 +33,12 @@ import pathlib
 import re
 import sys
 
-SCAN_ROOTS = ("packages/cli/src", "packages/server/src", "packages/schema/src")
+SCAN_ROOTS = ("packages/cli/src", "packages/server/src", "packages/schema/src", "packages/core/src")
 MODULE = pathlib.Path("packages/cli/src/services/remote-tunnel.ts")
-PACKAGE_JSON = pathlib.Path("packages/cli/package.json")
 CONTENT_MARKERS = ("opentunnel", "RemoteTunnel", "remote-tunnel")
-OPENTUNNEL_PACKAGE_RE = re.compile(r'from\s+["\']@opentunnel/')
+# Any quoted @opentunnel/* package specifier: static `from "..."`, dynamic
+# `import("...")`, and `require("...")` alike (run-79 EI-4).
+OPENTUNNEL_PACKAGE_RE = re.compile(r"[\"']@opentunnel/[^\"']*[\"']")
 IMPORTER_USE_RE = re.compile(r"\bRemoteTunnel\.(\w+)")
 
 # The export surface importers may use; anything new fails the build until
@@ -80,9 +87,25 @@ def scan_sources(root: pathlib.Path) -> dict[pathlib.Path, str]:
         directory = root / relative
         if not directory.is_dir():
             raise fail(f"expected upstream source dir {relative} is missing — layout drift")
-        for path in sorted(directory.rglob("*.ts")):
+        for path in sorted(directory.rglob("*.ts")) + sorted(directory.rglob("*.tsx")):
             files[path] = path.read_text(encoding="utf-8", errors="replace")
     return files
+
+
+def declared_tunnel_dependencies(root: pathlib.Path) -> list[str]:
+    """@opentunnel deps from EVERY workspace manifest, not just the CLI's
+    (run-79 EI-4: a moved module would declare its deps elsewhere)."""
+    names: set[str] = set()
+    for manifest in sorted((root / "packages").glob("*/package.json")):
+        try:
+            parsed = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise fail(f"{manifest} does not parse — cannot audit OpenTunnel dependencies")
+        dependencies = {**parsed.get("dependencies", {}), **parsed.get("devDependencies", {})}
+        names.update(name for name in dependencies if "opentunnel" in name)
+    if not (root / "packages" / "cli" / "package.json").is_file():
+        raise fail("expected packages/cli/package.json is missing — layout drift")
+    return sorted(names)
 
 
 def main() -> None:
@@ -90,9 +113,7 @@ def main() -> None:
     module = root / MODULE
     sources = scan_sources(root)
 
-    manifest = json.loads((root / PACKAGE_JSON).read_text(encoding="utf-8"))
-    dependencies = {**manifest.get("dependencies", {}), **manifest.get("devDependencies", {})}
-    tunnel_deps = sorted(name for name in dependencies if "opentunnel" in name)
+    tunnel_deps = declared_tunnel_dependencies(root)
 
     referencing = {
         path: text

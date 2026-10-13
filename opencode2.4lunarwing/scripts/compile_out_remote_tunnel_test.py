@@ -18,7 +18,7 @@ import unittest
 
 SCRIPT = pathlib.Path(__file__).resolve().parent / "compile_out_remote_tunnel.py"
 
-SCAN_ROOTS = ("packages/cli/src", "packages/server/src", "packages/schema/src")
+SCAN_ROOTS = ("packages/cli/src", "packages/server/src", "packages/schema/src", "packages/core/src")
 MODULE = "packages/cli/src/services/remote-tunnel.ts"
 
 REAL_MODULE = (
@@ -125,6 +125,57 @@ class CompileOutRemoteTunnelTests(unittest.TestCase):
         result = run_guard(self.root)
         self.assertEqual(result.returncode, 1)
         self.assertIn("layout drift", result.stderr)
+
+    # ── run-79 EI-4: the old scan left these drift shapes passing ──────────
+
+    def test_module_moved_into_core_fails_closed(self) -> None:
+        # Old SCAN_ROOTS ignored packages/core/src, so a marker-bearing file
+        # there with the module gone audited as "no OpenTunnel surface".
+        write_tree(self.root, with_tunnel=False)
+        (self.root / "packages/core/src/remote").mkdir(parents=True)
+        (self.root / "packages/core/src/remote/tunnel.ts").write_text(
+            'import { Client } from "@opentunnel/client"\n'
+            "export const ensure = () => Client.layer()\n",
+            encoding="utf-8",
+        )
+        result = run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("moved or renamed", result.stderr)
+
+    def test_tsx_importer_fails_closed(self) -> None:
+        write_tree(self.root, with_tunnel=False)
+        (self.root / "packages/cli/src/tunnel-panel.tsx").write_text(
+            "// settings surface that would expose RemoteTunnel\n", encoding="utf-8"
+        )
+        result = run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("moved or renamed", result.stderr)
+
+    def test_dynamic_import_leftover_fails_closed(self) -> None:
+        # Old OPENTUNNEL_PACKAGE_RE matched only `from "@opentunnel/…"`, so a
+        # dynamic import survived stubbing; the leftover check had no test.
+        write_tree(self.root, with_tunnel=True)
+        (self.root / "packages/cli/src/lazy-tunnel.ts").write_text(
+            'const client = await import("@opentunnel/client")\n'
+            "export const load = () => client\n",
+            encoding="utf-8",
+        )
+        result = run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("imports remain after stubbing", result.stderr)
+        self.assertIn("lazy-tunnel.ts", result.stderr)
+
+    def test_dependency_declared_outside_cli_fails_closed(self) -> None:
+        # Old dep collection read only packages/cli/package.json.
+        write_tree(self.root, with_tunnel=False)
+        (self.root / "packages/core").mkdir(parents=True, exist_ok=True)
+        (self.root / "packages/core/package.json").write_text(
+            json.dumps({"name": "@opencode/core", "dependencies": {"@opentunnel/client": "0.2.0"}}),
+            encoding="utf-8",
+        )
+        result = run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("moved or renamed", result.stderr)
 
 
 if __name__ == "__main__":
