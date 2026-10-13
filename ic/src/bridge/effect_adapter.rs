@@ -6086,6 +6086,108 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
     }
 
     #[tokio::test]
+    async fn mission_create_dedup_with_same_secret_still_reports_secret_not_applied() {
+        // WI#359 (CK-3a): the `webhook_secret_applied: false` flag must be
+        // unconditional — a dedup re-create carrying the SAME secret gets the
+        // same flag and note, so the response is no secret-equality oracle.
+        let (adapter, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+        let ctx = mission_create_ctx();
+
+        let first = adapter
+            .handle_mission_call(
+                "mission_create",
+                &serde_json::json!({
+                    "name": "hook-digest",
+                    "goal": "digest",
+                    "cadence": "webhook:events",
+                    "webhook_secret": "same-secret",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!first.is_error, "{:?}", first.output);
+        assert_eq!(first.output["deduplicated"], false);
+
+        let second = adapter
+            .handle_mission_call(
+                "mission_create",
+                &serde_json::json!({
+                    "name": "hook-digest",
+                    "goal": "digest",
+                    "cadence": "webhook:events",
+                    "webhook_secret": "same-secret",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!second.is_error, "{:?}", second.output);
+        assert_eq!(second.output["deduplicated"], true);
+        assert_eq!(second.output["cadence_differs"], false);
+        assert_eq!(
+            second.output["webhook_secret_applied"], false,
+            "the flag must not change when the presented secret happens to match"
+        );
+        let note = second.output["webhook_secret_note"]
+            .as_str()
+            .expect("secret note present");
+        assert!(
+            note.contains("mission_update"),
+            "note must point at mission_update: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_create_and_update_saturate_max_threads_per_day() {
+        // WI#359 (CK-3b): 2^32 must saturate to u32::MAX, never wrap to 0
+        // ("unlimited") — create and update paths alike.
+        let (adapter, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+        let ctx = mission_create_ctx();
+
+        let created = adapter
+            .handle_mission_call(
+                "mission_create",
+                &serde_json::json!({
+                    "name": "saturated",
+                    "goal": "g",
+                    "max_threads_per_day": 4294967296_u64,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!created.is_error, "{:?}", created.output);
+        let id = lunarwing_engine::MissionId(
+            uuid::Uuid::parse_str(created.output["mission_id"].as_str().expect("mission_id"))
+                .expect("uuid"),
+        );
+        let persisted = mgr.get_mission(id).await.expect("load").expect("mission");
+        assert_eq!(persisted.max_threads_per_day, u32::MAX, "create must saturate");
+
+        let updated = adapter
+            .handle_mission_call(
+                "mission_update",
+                &serde_json::json!({
+                    "id": created.output["mission_id"],
+                    "max_threads_per_day": 4294967296_u64,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("handled")
+            .expect("no transport error");
+        assert!(!updated.is_error, "{:?}", updated.output);
+        let persisted = mgr.get_mission(id).await.expect("load").expect("mission");
+        assert_eq!(persisted.max_threads_per_day, u32::MAX, "update must saturate");
+    }
+
+    #[tokio::test]
     async fn mission_update_tool_sets_current_focus_end_to_end() {
         let (adapter, mgr) = adapter_with_mission_manager();
         adapter.set_mission_manager(Arc::clone(&mgr)).await;
