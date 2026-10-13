@@ -7,7 +7,7 @@ import { join } from "node:path"
 import { executeTask } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "guard-env" | "auth-token-env" | "hang" | "silent-hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -52,6 +52,20 @@ const guard = process.env.KIMI_CODE_DANGEROUS_COMMAND_GUARD || "<unset>"
 const reminder = process.env.KIMI_CODE_PERMISSION_MODE_REMINDER || "<unset>"
 const messages = [
   { role: "assistant", content: "guard=" + guard + " reminder=" + reminder },
+]
+for (const m of messages) {
+  process.stdout.write(JSON.stringify(m) + "\\n")
+}
+process.exit(0)
+`
+      break
+    case "auth-token-env":
+      // WI#373: reports whether the bridge's hub-handshake credential leaked
+      // into the task process env — via inheritance or task-env injection.
+      script = `#!/usr/bin/env node
+const token = process.env.AGENT_AUTH_TOKEN || "<unset>"
+const messages = [
+  { role: "assistant", content: "token=" + token },
 ]
 for (const m of messages) {
   process.stdout.write(JSON.stringify(m) + "\\n")
@@ -236,6 +250,33 @@ test("executeTask: task environment cannot disable the dangerous-command guard (
   assert.ok(result, "result was not emitted")
   assert.equal(result!.status, "success")
   assert.equal(result!.output, "guard=<unset> reminder=<unset>")
+})
+
+test("executeTask: hub-handshake token never reaches the task env (WI#373)", async () => {
+  const bin = makeMockKimi("auth-token-env")
+  const request: TaskRequest = {
+    task_id: "auth-token-env-test",
+    prompt: "read env",
+    timeout_ms: 10_000,
+    // Attacker-controllable task input attempting to re-inject the bridge's
+    // credential name for its own run.
+    context: { environment: { AGENT_AUTH_TOKEN: "forged-by-task" } },
+  }
+  // Simulate the bridge process env: the handshake credential is present in
+  // process.env (server-role bridge requires it) and must not be inherited.
+  const prev = process.env.AGENT_AUTH_TOKEN
+  process.env.AGENT_AUTH_TOKEN = "bridge-secret-64hex"
+  try {
+    const { result } = await runExecutor(request, bin)
+    assert.ok(result, "result was not emitted")
+    assert.equal(result!.status, "success")
+    assert.equal(result!.output, "token=<unset>")
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_AUTH_TOKEN
+    else process.env.AGENT_AUTH_TOKEN = prev
+  }
+  // The bridge's own credential is untouched by the task run.
+  assert.equal(process.env.AGENT_AUTH_TOKEN, prev)
 })
 
 test("executeTask: pre-aborted signal returns cancelled without spawning", async () => {

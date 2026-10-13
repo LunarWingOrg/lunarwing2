@@ -127,7 +127,9 @@ capabilities = ["tool_use"]
 })
 
 test("entrypoint CLI mode forces print and stream-json", () => {
-  assert.match(entrypoint, /exec kimi -p "\$\*" --output-format stream-json/)
+  // WI#373: the strip must stay in front of the exec — the one-shot prompt
+  // runs untrusted agent code and must not inherit AGENT_AUTH_TOKEN.
+  assert.match(entrypoint, /exec env -u AGENT_AUTH_TOKEN kimi -p "\$\*" --output-format stream-json/)
 })
 
 test("entrypoint rejects missing config source instead of reusing stale config", () => {

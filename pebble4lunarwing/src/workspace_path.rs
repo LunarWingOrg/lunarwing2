@@ -58,7 +58,7 @@ pub(crate) fn workspace_paths_overlap(left: &Path, right: &Path) -> bool {
 /// Linux workers provide /proc/self/fd; `O_NOFOLLOW` rejects symlink components
 /// before the next mkdir, including swaps by another task in the workspace.
 fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
-    use std::fs::{OpenOptions, create_dir};
+    use std::fs::{create_dir, OpenOptions};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
