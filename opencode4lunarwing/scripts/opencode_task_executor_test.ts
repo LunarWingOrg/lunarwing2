@@ -1,4 +1,9 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 
@@ -1243,5 +1248,73 @@ await executeTask(
 )
 assert.equal(errorCloseResults[0]!.status, "error")
 assert.equal(errorCloseQueue.closed, true, "error path must close the queue")
+
+
+// WI#374 wiring pin, end to end in a subprocess so the module-load serve-log
+// path resolution can be pointed at a fixture: a generic serve 500 (SDK shape
+// with cause.body.data.ref) is enriched with the structured-log line carrying
+// the same ref — only lines appended after the task started, with the
+// bridge's secrets scrubbed.
+{
+  const GENERIC_MSG = "Unexpected server error. Check server logs for details."
+  const PRE = "timestamp=2026-10-12T00:00:00.000Z level=Error run=run01 message=failed ref=err_pre0001 error=earlier tenant task failed"
+  const CRASH =
+    "timestamp=2026-10-12T00:00:01.000Z level=Error run=run01 message=failed ref=err_feedbee " +
+    "error=TypeError: undefined is not an object (evaluating 'a.name') token=sk-live-secret0042"
+  const dir = mkdtempSync(join(tmpdir(), "executor-serve-log-"))
+  try {
+    const logPath = join(dir, "opencode.log")
+    const executorUrl = pathToFileURL(
+      join(import.meta.dir ?? fileURLToPath(new URL(".", import.meta.url)), "opencode_task_executor.ts"),
+    ).href
+    const script = `
+const { executeTask } = await import(${JSON.stringify(executorUrl)})
+const { appendFileSync, writeFileSync } = await import("node:fs")
+const logPath = ${JSON.stringify(logPath)}
+writeFileSync(logPath, ${JSON.stringify(PRE)} + "\\n")
+const prompt = async () => {
+  appendFileSync(logPath, ${JSON.stringify(CRASH)} + "\\n")
+  throw new Error(${JSON.stringify(GENERIC_MSG)}, { cause: { body: { name: "UnknownError", data: { message: ${JSON.stringify(GENERIC_MSG)}, ref: "err_feedbee" } }, status: 500 } })
+}
+const sdk = {
+  session: {
+    create: async () => ({ data: { id: "session-1" } }),
+    prompt,
+  },
+  event: {
+    subscribe: async () => ({ stream: (async function* () { yield { type: "session.idle", properties: { sessionID: "session-1" } } })() }),
+  },
+}
+const results = []
+await executeTask({ task_id: "task-serve-log", prompt: "test" }, () => {}, (r) => results.push(r), undefined, sdk)
+console.log(JSON.stringify(results[0]?.error ?? ""))
+`
+    let out: string
+    let bunAvailable = true
+    try {
+      out = execFileSync("bun", ["-e", script], {
+        env: { ...process.env, OPENCODE_SERVE_LOG: logPath, TENSORZERO_API_KEY: "sk-live-secret0042" },
+        encoding: "utf8",
+      })
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") throw error
+      bunAvailable = false
+    }
+    if (!bunAvailable) {
+      console.log("serve-log wiring pin skipped (bun not on PATH)")
+    } else {
+      const errorMessage = JSON.parse(out) as string
+      assert.ok(errorMessage.startsWith(GENERIC_MSG))
+      assert.ok(errorMessage.includes("opencode serve log tail:"))
+      assert.ok(errorMessage.includes("ref=err_feedbee"), "ref line missing from the enriched error")
+      assert.ok(errorMessage.includes("TypeError: undefined is not an object"))
+      assert.ok(!errorMessage.includes("err_pre0001"), "pre-task line leaked past the task-start offset")
+      assert.ok(!errorMessage.includes("sk-live-secret0042"), "secret survived the scrub")
+      assert.ok(errorMessage.includes("[redacted]"))
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
 
 console.log("opencode task executor self-check passed")
