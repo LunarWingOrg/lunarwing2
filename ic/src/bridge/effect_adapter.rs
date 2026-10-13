@@ -810,8 +810,6 @@ impl EffectBridgeAdapter {
         user_id: &str,
         thread_type: lunarwing_engine::ThreadType,
     ) -> Option<EngineError> {
-        use crate::tools::rate_limiter::RateLimitResult;
-
         let run_spawning = MISSION_RUN_SPAWNING_ACTION_NAMES.contains(&action_name);
         let verb_key = if matches!(action_name, "mission_pause" | "mission_delete") {
             format!("{action_name}@{thread_type:?}")
@@ -824,7 +822,7 @@ impl EffectBridgeAdapter {
         if run_spawning {
             buckets.push((MISSION_AGGREGATE_RATE_KEY, &aggregate));
         }
-        if let Err((index, RateLimitResult::Limited { retry_after, .. })) = self
+        if let Err((index, retry_after, _limit_type)) = self
             .rate_limiter
             .check_and_record_all(user_id, &buckets)
             .await

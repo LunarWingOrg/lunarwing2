@@ -209,16 +209,26 @@ impl RateLimiter {
     /// Atomically reserve all buckets, or charge none. The error identifies
     /// the first refused bucket. Repeated keys are checked against every
     /// supplied config but charged once.
+    /// Atomically check every bucket and, only if all are allowed, record one
+    /// hit per distinct bucket key.
+    ///
+    /// The error carries `(bucket_index, retry_after, limit_type)` of the
+    /// first exceeded bucket — never the `Allowed` variant, so a caller
+    /// cannot fail open by matching only `Limited` (WI#359, CN-5).
     pub async fn check_and_record_all(
         &self,
         user_id: &str,
         buckets: &[(&str, &ToolRateLimitConfig)],
-    ) -> Result<(), (usize, RateLimitResult)> {
+    ) -> Result<(), (usize, Duration, LimitType)> {
         let mut state = self.state.write().await;
         for (index, (key, config)) in buckets.iter().enumerate() {
             let result = Self::check_state(&mut state, user_id, key, config, false);
-            if !result.is_allowed() {
-                return Err((index, result));
+            if let RateLimitResult::Limited {
+                retry_after,
+                limit_type,
+            } = result
+            {
+                return Err((index, retry_after, limit_type));
             }
         }
         // No await or lock release between the checks and reservations.
@@ -318,7 +328,7 @@ mod tests {
                 limiter
                     .check_and_record_all("owner", &[("create", &verb), ("aggregate", &aggregate)])
                     .await,
-                Err((1, RateLimitResult::Limited { .. }))
+                Err((1, _, _))
             ));
             assert_eq!(limiter.get_usage("owner", "create").await, Some((0, 0)));
             assert_eq!(limiter.get_usage("owner", "aggregate").await, Some((1, 1)));
@@ -328,9 +338,41 @@ mod tests {
             limiter
                 .check_and_record_all("owner", &[("pause", &exhausted), ("aggregate", &verb)])
                 .await,
-            Err((0, RateLimitResult::Limited { .. }))
+            Err((0, _, _))
         ));
         assert_eq!(limiter.get_usage("owner", "aggregate").await, Some((1, 1)));
+    }
+
+    #[tokio::test]
+    async fn multi_bucket_duplicate_keys_charge_once() {
+        // WI#359 (CN-4): a repeated bucket key must be charged a single hit,
+        // not one per occurrence — the second `k` is skipped by the
+        // duplicate-key branch.
+        let limiter = RateLimiter::new();
+        let two = ToolRateLimitConfig::new(2, 2);
+        let nine = ToolRateLimitConfig::new(9, 9);
+        assert!(
+            limiter
+                .check_and_record_all("owner", &[("k", &two), ("k", &two), ("j", &nine)])
+                .await
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .check_and_record_all("owner", &[("k", &two), ("k", &two), ("j", &nine)])
+                .await
+                .is_ok()
+        );
+        // k is at (2, 2) — exactly one charge per call, not two — so the
+        // third call fails on k at index 0.
+        assert!(matches!(
+            limiter
+                .check_and_record_all("owner", &[("k", &two), ("k", &two), ("j", &nine)])
+                .await,
+            Err((0, _, _))
+        ));
+        assert_eq!(limiter.get_usage("owner", "k").await, Some((2, 2)));
+        assert_eq!(limiter.get_usage("owner", "j").await, Some((2, 2)));
     }
 
     #[tokio::test]
