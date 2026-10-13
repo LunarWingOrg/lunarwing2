@@ -57,13 +57,21 @@ as an error): a cron worker container never holds more than its
 The strip is applied per worker entry, but the authority domain is the
 container: never point an entry that has a `tool_allowlist` at the same
 endpoint as a `mode = "cron"` entry — give a cron mission its own
-container. (The manager also strips the worker-level list of a non-cron
+container. Two cron entries pointing at the same container likewise
+share one authority domain (one mission's tick can borrow the other's
+`cron.tool_allowlist` through a concurrent tick's relay socket); the
+code does not detect or prevent that pairing — tracked as WI#396. (The manager also strips the worker-level list of a non-cron
 entry whose endpoint shares a cron entry's container. The comparison uses
 a normalized endpoint key — loopback spellings folded into one class,
 host lowercased, scheme-default port applied, path and query ignored —
 so one host:port that path-routes several containers strips all of them
-(fails closed); exotic aliases such as `/etc/hosts` names remain the
-operator's responsibility, and the rule stands on its own.) A borrowed
+(fails closed). The key names a host:port listener, not the container
+itself: a container that is also published on a second host port, or
+reached behind a proxy on another port, is not caught; a real host
+literally named `loopback` folds into the loopback class and can only
+over-strip, which fails closed. Those, and exotic aliases such as
+`/etc/hosts` names, remain the operator's responsibility — the rule
+stands on its own.) A borrowed
 call is recorded in the `job_events` — and counted against the
 100-frame budget — of the job whose relay socket was used, not of the
 job that issued it.
