@@ -263,7 +263,10 @@ Enforced controls (opencode2 lane unless noted):
    `USER 10003:10003`, and Dockerfile parser directives
    (`# escape=`, `# syntax=`, `# check=`) are refused outright, since a
    custom escape character would invalidate the guard's continuation
-   joining.
+   joining. Run-103 GD-1: the directive refusal also covers the grammar's
+   whitespace-around-`=` spellings (`# escape = \``) and a UTF-8 BOM prefix
+   (Docker strips a leading BOM before parsing) — either hid a directive
+   the old regex never matched.
    `.gitlab/tests/test_worker_exposure_policy.py` regression-covers it,
    including no-git lanes. The guard also runs the exposure/wrapper,
    compile-out, and non-root boot configuration suites on merge requests.
@@ -275,7 +278,17 @@ Enforced controls (opencode2 lane unless noted):
    markers. A final `--image-filesystem` assertion checks actual ownership
    and modes of the boot files and `scripts/`+`config/` after all image steps;
    the image fails if they are not root-owned read-only or `/app` permits
-   non-root replacement of its children.
+   non-root replacement of its children. Run-103 GD-2: the v2
+   `--image-filesystem` path additionally verifies the *installed wrapper*:
+   `/usr/local/bin/opencode` must be a regular non-symlink, root-owned file
+   with no group/other write bit, byte-identical to
+   `scripts/opencode-exposure-guard.sh`, and `shutil.which("opencode")`
+   must resolve to it (no earlier `PATH` dir shadows it); the real binary
+   at `/usr/local/lib/opencode2/opencode` is re-scanned for tunnel markers.
+   A same-stage `RUN` between the wrapper-install scan and the final
+   assertion therefore cannot swap the wrapper (or the binary) in
+   unnoticed — pinned by unit tests with injected paths, since the image
+   build itself is a protected-pipeline gate.
 6. **Runtime smoke (DEFERRED to WI#345):** live `service.json`/`opentunnel`
    dir/listener assertions against a running container belong to the WI#345
    runtime-smoke suite, which does not exist yet. Control 9 covers the
