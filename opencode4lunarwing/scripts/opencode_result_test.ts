@@ -204,22 +204,27 @@ console.log(JSON.stringify({
 }))
 `
     let out = ""
+    let bunAvailable = true
     try {
       out = execFileSync("bun", ["-e", script], {
         env: { ...process.env, OPENCODE_SERVE_LOG: modLog },
         encoding: "utf8",
       })
     } catch (error) {
-      console.log(`module-load pin skipped (no bun: ${error instanceof Error ? error.message : error})`)
-      out = '{"first":true,"second":true}'
+      if ((error as { code?: string }).code !== "ENOENT") throw error
+      bunAvailable = false
     }
-    const parsed = JSON.parse(out) as { first: boolean; second: boolean }
-    assert.equal(parsed.first, true, "enrichment did not use the module-load path")
-    assert.equal(
-      parsed.second,
-      true,
-      "a post-load env mutation retargeted or disabled enrichment",
-    )
+    if (!bunAvailable) {
+      console.log("module-load pin skipped (bun not on PATH)")
+    } else {
+      const parsed = JSON.parse(out) as { first: boolean; second: boolean }
+      assert.equal(parsed.first, true, "enrichment did not use the module-load path")
+      assert.equal(
+        parsed.second,
+        true,
+        "a post-load env mutation retargeted or disabled enrichment",
+      )
+    }
   } finally {
     rmSync(fixtureDir, { recursive: true, force: true })
   }
