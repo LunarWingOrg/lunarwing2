@@ -887,11 +887,13 @@ impl MissionManager {
         // the single-owner rule below can tell a new/changed claim from an
         // untouched one. Secret-less legacy rows are dormant: adding a usable
         // secret creates a claim even if the path itself does not change.
+        // WI#359 (CO-2): a stored secret that can never be presented on the
+        // wire (whitespace-padded, non-visible-ASCII) is dormant too.
         let old_webhook_path = match &mission.cadence {
             MissionCadence::Webhook {
                 path,
                 secret: Some(secret),
-            } if !secret.is_empty() => Some(path.clone()),
+            } if crate::types::mission::usable_webhook_secret(secret) => Some(path.clone()),
             _ => None,
         };
         if let Some(name) = updates.name {
@@ -1699,11 +1701,14 @@ impl MissionManager {
                 } => {
                     mission_path == path
                         && match (mission_secret.as_deref(), secret) {
-                            // WI#359 (CO-1): an empty configured secret must
-                            // never authenticate a fire — `ct_eq` treats two
-                            // empty slices as equal, and the gateway maps an
-                            // empty `X-Webhook-Secret:` header to `Some("")`.
-                            (Some(expected), Some(provided)) if !expected.is_empty() => {
+                            // WI#359 (CO-1/CO-2): a stored secret that can
+                            // never be presented on the wire (empty,
+                            // whitespace-padded, non-visible-ASCII) is
+                            // dormant — `ct_eq` treats two empty slices as
+                            // equal, and the gateway trims header values.
+                            (Some(expected), Some(provided))
+                                if crate::types::mission::usable_webhook_secret(expected) =>
+                            {
                                 bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
                             }
                             // No configured secret => not triggerable (defense in depth).
@@ -3776,10 +3781,12 @@ fn is_settled_host_stop(thread: &crate::types::thread::Thread) -> bool {
 
 fn validate_webhook_cadence(cadence: &MissionCadence) -> Result<(), EngineError> {
     if let MissionCadence::Webhook { secret, .. } = cadence
-        && secret.as_deref().is_none_or(str::is_empty)
+        && secret
+            .as_deref()
+            .is_none_or(|value| !crate::types::mission::usable_webhook_secret(value))
     {
         return Err(EngineError::Effect {
-            reason: "webhook cadence requires non-empty webhook_secret".into(),
+            reason: "webhook cadence requires a usable webhook_secret (non-empty, no leading/trailing whitespace, visible ASCII)".into(),
         });
     }
     Ok(())
@@ -7048,7 +7055,10 @@ mod tests {
             },
         );
         store.save_mission(&a).await.unwrap();
-        for secret in [None, Some(String::new())] {
+        // WI#359 (CO-2): whitespace-only secrets are dormant too — they can
+        // never be presented on the wire, so adding a usable secret is a new
+        // claim that must pass the single-owner check.
+        for secret in [None, Some(String::new()), Some("  ".to_string())] {
             let b = Mission::new(
                 project,
                 "user-b",

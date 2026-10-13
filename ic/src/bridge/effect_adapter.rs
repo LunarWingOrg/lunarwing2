@@ -1801,10 +1801,15 @@ fn parse_cadence_with_secret(
 ) -> Result<lunarwing_engine::types::mission::MissionCadence, EngineError> {
     let mut cadence = parse_cadence(value)?;
     if let lunarwing_engine::MissionCadence::Webhook { secret, .. } = &mut cadence {
+        // WI#359 (CO-2): one shared predicate — the secret must be
+        // presentable on the wire, not merely non-empty.
         let provided = webhook_secret
-            .filter(|value| !value.is_empty())
+            .filter(|value| lunarwing_engine::usable_webhook_secret(value))
             .ok_or_else(|| {
-                invalid_cadence(value, "webhook cadence requires non-empty webhook_secret")
+                invalid_cadence(
+                    value,
+                    "webhook cadence requires a usable webhook_secret (non-empty, no leading/trailing whitespace, visible ASCII)",
+                )
             })?;
         *secret = Some(provided.to_string());
     }
