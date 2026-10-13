@@ -268,5 +268,73 @@ class WorkerVersionPinTests(unittest.TestCase):
         self.assertTrue(any("kimi" in error for error in self.errors()))
 
 
+class BunImageTieTests(unittest.TestCase):
+    """MR !1552 ER-5 ties CI_BUN_IMAGE to the worker Dockerfile's oven/bun
+    FROM digest(s); MR !1566 EZ-3 makes that cross-check fail closed."""
+
+    BUN_DIGEST = "9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895"
+    OTHER_DIGEST = "0" * 64
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.dockerfile = self.root / "Dockerfile"
+        pin = f"docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST}"
+        self.variables = {
+            "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
+            "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
+            "CI_GITLEAKS_IMAGE": f"docker.io/zricethezav/gitleaks:v8.30.1@sha256:{self.OTHER_DIGEST}",
+            "CI_BUN_IMAGE": pin,
+        }
+        self.merged = {
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
+            ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
+            "rust-test-postgres-integration": {
+                "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
+            },
+        }
+
+    def write_dockerfile(self, text: str) -> None:
+        self.dockerfile.write_text(text, encoding="utf-8")
+
+    def errors(self):
+        errors = []
+        with mock.patch.object(config, "OPENCODE_DOCKERFILE", self.dockerfile):
+            config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
+        return errors
+
+    def test_matching_digests_pass(self):
+        self.write_dockerfile(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n"
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS runtime\n"
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_digest_mismatch_is_caught(self):
+        self.write_dockerfile(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST[:-1]}0 AS builder\n"
+        )
+        self.assertTrue(any("CI_BUN_IMAGE digest must match" in error for error in self.errors()))
+
+    def test_missing_dockerfile_is_caught(self):
+        self.assertTrue(any("Dockerfile missing" in error for error in self.errors()))
+
+    def test_no_bun_from_is_caught(self):
+        self.write_dockerfile(f"FROM docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}\n")
+        self.assertTrue(any("no oven/bun FROM" in error for error in self.errors()))
+
+    def test_tag_only_bun_from_is_caught(self):
+        self.write_dockerfile("FROM docker.io/oven/bun:debian AS builder\n")
+        self.assertTrue(any("not pinned" in error for error in self.errors()))
+
+    def test_uppercase_digest_bun_from_is_caught(self):
+        self.write_dockerfile(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST.upper()} AS builder\n"
+        )
+        self.assertTrue(any("not pinned" in error for error in self.errors()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -366,6 +366,23 @@ pub enum WorkspaceError {
     #[error("Invalid lorebook document '{path}': {reason}")]
     InvalidLorebook { path: String, reason: String },
 
+    /// A full replace of a daily log was refused because the day's numbered
+    /// backup generations are already at the cap: the next rotation would
+    /// discard the second-oldest generation, which is the only reserved copy
+    /// of that version (the pinned `.1` is positional — it holds the content
+    /// that preceded the day's first backed-up replace in that scope, not
+    /// necessarily the poison; WI#335). The replace was not applied. Agent
+    /// tool lanes opt into this refusal via the `*_with_daily_log_cap_guard`
+    /// write methods so a steered agent cannot evict generations with
+    /// ordinary replaces; operator routes (`write`/`write_to_layer` via
+    /// web/CLI) keep rotating.
+    #[error(
+        "Replace of daily log '{path}' not applied: {generations} backup generations are \
+         already retained and the next replace would discard the second-oldest one; ask the \
+         operator to replace today's log via the web memory editor or CLI"
+    )]
+    DailyLogBackupCapReached { path: String, generations: u32 },
+
     #[error("Append not supported for '{path}': {reason}")]
     AppendNotSupported { path: String, reason: String },
 
@@ -419,6 +436,20 @@ pub enum OrchestratorError {
 
     #[error("Cron mission on worker '{worker_name}' belongs to a different owner")]
     CronMissionNotOwned { worker_name: String },
+
+    #[error("External job {job_id} cannot receive control messages: {reason}")]
+    ExternalWorkerTaskNotActive { job_id: Uuid, reason: String },
+
+    #[error("External job {job_id} rejected control prompt: {reason}")]
+    ExternalWorkerInvalidControlPrompt { job_id: Uuid, reason: String },
+
+    #[error(
+        "External job {job_id} cannot receive control messages: worker '{worker_name}' does not advertise the task_prompt capability"
+    )]
+    ExternalWorkerControlUnsupported { job_id: Uuid, worker_name: String },
+
+    #[error("External job {job_id} control channel is at capacity: {reason}")]
+    ExternalWorkerControlQueueFull { job_id: Uuid, reason: String },
 }
 
 /// Worker errors (container-side execution).

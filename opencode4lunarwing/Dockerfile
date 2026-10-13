@@ -13,6 +13,8 @@ ARG SOURCE_REVISION=unknown
 # ──────────────────────
 # Stage 1: build opencode from source
 # ──────────────────────
+# The bun digest below must stay equal to CI_BUN_IMAGE in
+# .gitlab/ci/defaults.yml (enforced by validate_config.py).
 FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS builder
 
 ARG OPENCODE_VERSION
@@ -232,6 +234,7 @@ RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
     && bun scripts/path_expand_test.ts \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
+    && bun scripts/lunarwing_bridge_test.ts \
     && python3 scripts/study_notes_config_test.py
 
 # ── XDG directories for opencode state ────────────────────────
