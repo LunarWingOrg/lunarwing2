@@ -300,6 +300,18 @@ export async function executeTask(
     // attacker-controllable task input, not operator config.
     delete env.KIMI_CODE_DANGEROUS_COMMAND_GUARD
     delete env.KIMI_CODE_PERMISSION_MODE_REMINDER
+    // WI#373: AGENT_AUTH_TOKEN is the bridge's hub-handshake credential. The
+    // task process runs untrusted job code, so it must never inherit the
+    // token. Deleted after every merge (process.env spread, task env, extra
+    // proxy env) so nothing can re-inject it; the bridge keeps its own copy.
+    if (Object.hasOwn(request.context?.environment ?? {}, "AGENT_AUTH_TOKEN")) {
+      // FY-5: a credential grant reusing the bridge's handshake key is
+      // dropped — say so instead of letting the value vanish silently.
+      console.warn(
+        `[kimi executor] dropped task-supplied env entry AGENT_AUTH_TOKEN for task ${request.task_id}: reserved for the bridge handshake (WI#373)`,
+      )
+    }
+    delete env.AGENT_AUTH_TOKEN
     const kimiHome = kimiCodeHome()
     if (kimiHome) {
       env.KIMI_CODE_HOME = kimiHome
