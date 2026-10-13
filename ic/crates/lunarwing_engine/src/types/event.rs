@@ -385,8 +385,7 @@ mod tests {
             "auth_token": "super-secret-value",
             "name": "n",
         });
-        let summary =
-            summarize_params("mission_update", &named).expect("name summarizes");
+        let summary = summarize_params("mission_update", &named).expect("name summarizes");
         assert_eq!(summary, "n");
 
         // A mis-keyed credential kwarg (hmac_secret is not on any exact
@@ -432,7 +431,13 @@ mod tests {
 
         // WI#359 (CJ-10): the generic fallback uses the shared normalized
         // credential-key predicate, not an exact list.
-        for key in ["hmac_secret", "access_token", "client_secret", "apiKey", "x-auth"] {
+        for key in [
+            "hmac_secret",
+            "access_token",
+            "client_secret",
+            "apiKey",
+            "x-auth",
+        ] {
             let params = serde_json::json!({key: "super-secret-value"});
             assert_eq!(
                 summarize_params("some_custom_tool", &params),

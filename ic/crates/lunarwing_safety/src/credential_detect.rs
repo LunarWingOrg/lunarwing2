@@ -557,10 +557,22 @@ mod tests {
         let sanitized = sanitize_url_credentials(
             "https://user:pass@api.example.com/data?api_key=abc123&page=2&sig=deadbeef",
         );
-        assert!(!sanitized.contains("abc123"), "api_key value leaked: {sanitized}");
-        assert!(!sanitized.contains("deadbeef"), "sig value leaked: {sanitized}");
-        assert!(!sanitized.contains("user:pass"), "userinfo leaked: {sanitized}");
-        assert!(sanitized.contains("page=2"), "safe param dropped: {sanitized}");
+        assert!(
+            !sanitized.contains("abc123"),
+            "api_key value leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("deadbeef"),
+            "sig value leaked: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("user:pass"),
+            "userinfo leaked: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("page=2"),
+            "safe param dropped: {sanitized}"
+        );
         assert!(sanitized.starts_with("https://api.example.com/data"));
     }
 

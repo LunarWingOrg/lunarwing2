@@ -202,7 +202,10 @@ mod tests {
         headers.insert("x-webhook-secret", "   ".parse().unwrap());
         assert_eq!(mission_webhook_secret(&headers), None);
         headers.insert("x-webhook-secret", "real-secret".parse().unwrap());
-        assert_eq!(mission_webhook_secret(&headers).as_deref(), Some("real-secret"));
+        assert_eq!(
+            mission_webhook_secret(&headers).as_deref(),
+            Some("real-secret")
+        );
     }
 
     /// Routines with `secret: None` must be rejected with 403.

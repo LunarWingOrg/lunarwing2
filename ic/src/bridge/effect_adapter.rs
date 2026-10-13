@@ -5490,6 +5490,29 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 );
             }
         }
+        // WI#359 (CO-5): pin WHICH bucket constructor fired — the
+        // caller-class keys carry the charges (20 Ok calls prove execute
+        // ran past the gate), and the shared bare-verb key stays empty.
+        let user = foreground.user_id.as_str();
+        for verb in ["mission_pause", "mission_delete"] {
+            for class in ["Mission", "Foreground"] {
+                assert_eq!(
+                    adapter
+                        .rate_limiter
+                        .get_usage(user, &format!("{verb}@{class}"))
+                        .await,
+                    Some((20, 20)),
+                    "{verb}@{class} bucket must hold the 20 admitted calls"
+                );
+            }
+            assert!(
+                matches!(
+                    adapter.rate_limiter.get_usage(user, verb).await,
+                    None | Some((0, 0))
+                ),
+                "the bare {verb} bucket must not be charged for stop calls"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6228,7 +6251,11 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 .expect("uuid"),
         );
         let persisted = mgr.get_mission(id).await.expect("load").expect("mission");
-        assert_eq!(persisted.max_threads_per_day, u32::MAX, "create must saturate");
+        assert_eq!(
+            persisted.max_threads_per_day,
+            u32::MAX,
+            "create must saturate"
+        );
 
         let updated = adapter
             .handle_mission_call(
@@ -6244,7 +6271,11 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             .expect("no transport error");
         assert!(!updated.is_error, "{:?}", updated.output);
         let persisted = mgr.get_mission(id).await.expect("load").expect("mission");
-        assert_eq!(persisted.max_threads_per_day, u32::MAX, "update must saturate");
+        assert_eq!(
+            persisted.max_threads_per_day,
+            u32::MAX,
+            "update must saturate"
+        );
     }
 
     #[tokio::test]

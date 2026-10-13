@@ -1583,7 +1583,9 @@ async fn handle_execute_actions_parallel(
                         EventKind::ApprovalRequested {
                             action_name: pc.name.clone(),
                             call_id: pc.call_id.clone(),
-                            parameters: Some(crate::types::event::redact_event_params(&pc.name, &pc.params)),
+                            parameters: Some(crate::types::event::redact_event_params(
+                                &pc.name, &pc.params,
+                            )),
                             description: None,
                             allow_always: None,
                             gate_name: None,

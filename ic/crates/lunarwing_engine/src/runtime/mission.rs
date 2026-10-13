@@ -959,9 +959,7 @@ impl MissionManager {
         } else {
             None
         };
-        if makes_new_claim
-            && let MissionCadence::Webhook { path, .. } = &mission.cadence
-        {
+        if makes_new_claim && let MissionCadence::Webhook { path, .. } = &mission.cadence {
             self.ensure_webhook_path_unclaimed(
                 mission.project_id,
                 path,
@@ -7297,7 +7295,11 @@ mod tests {
             other_project,
         ];
         let conflicts = conflicting_webhook_claims(&missions);
-        assert_eq!(conflicts.len(), 1, "only the live two-owner path conflicts: {conflicts:?}");
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "only the live two-owner path conflicts: {conflicts:?}"
+        );
         let (pid, path, holders) = &conflicts[0];
         assert_eq!(*pid, project);
         assert_eq!(path, "events");
