@@ -223,6 +223,64 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("verify installed policy-file ownership", result.stderr)
 
+    def test_dockerfile_compile_out_run_commented_out_fails(self):
+        # Run-90 FC-4 G1: a deleted/commented compile-out RUN must fail even
+        # though the script stays named in COPY lines and comments.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for replacement in (
+            "# RUN python3 /build/compile_out_remote_tunnel.py /build/opencode\n",
+            "COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py\n",
+        ):
+            with self.subTest(replacement=replacement.split(" ", 1)[0]):
+                mutated = original.replace(
+                    "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode\n",
+                    replacement,
+                )
+                # The name survives, so the old anywhere-grep would have passed.
+                self.assertIn("compile_out_remote_tunnel.py", mutated)
+                dockerfile.write_text(mutated, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("lost the OpenTunnel compile-out RUN", result.stderr)
+        dockerfile.write_text(original, encoding="utf-8")
+
+    def test_dockerfile_binary_marker_scan_dropped_fails(self):
+        # Run-90 FC-4 G5: dropping only the --binary scan used to pass because
+        # the final --image-filesystem RUN still names exposure_policy_assert.py.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        marker = ("    && python3 /app/scripts/exposure_policy_assert.py "
+                  "--lane /app --profile opencode2 "
+                  "--binary /usr/local/lib/opencode2/opencode\n")
+        self.assertIn(marker, original)
+        dockerfile.write_text(
+            original.replace(marker, marker.replace(
+                " --binary /usr/local/lib/opencode2/opencode", "")),
+            encoding="utf-8",
+        )
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("binary marker scan", result.stderr)
+        dockerfile.write_text(original, encoding="utf-8")
+
+    def test_dockerfile_repermissioning_guarded_paths_fails(self):
+        # Run-90 FC-4 G3b: no RUN may hand the guarded paths back to a
+        # writable state, even after the final --image-filesystem assertion.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for line in (
+            "RUN chown -R opencode2:opencode2 /app/scripts /app/config\n",
+            "RUN chmod u+w /app/entrypoint.sh\n",
+            "RUN chmod -R a-w /app/scripts && chmod u+w /app/config\n",
+        ):
+            with self.subTest(line=line):
+                dockerfile.write_text(original + line, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("re-permission", result.stderr)
+        dockerfile.write_text(original, encoding="utf-8")
+
     def test_executor_missing_deny_fails(self):
         executor = self.root / "opencode2.4lunarwing" / "scripts" / "opencode_task_executor.ts"
         executor.write_text(
