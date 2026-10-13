@@ -9,6 +9,7 @@ argument contract is asserted without needing the pinned image.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import pathlib
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 LANE_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ASSERT = LANE_ROOT / "scripts" / "exposure_policy_assert.py"
@@ -353,6 +355,95 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             result = self.run_wrapper(*form)
             self.assertEqual(result.returncode, 0, (form, result.stderr))
             self.assertEqual(result.stdout.strip(), " ".join(form))
+
+
+class InstalledWrapperTests(unittest.TestCase):
+    """Run-103 GD-2 pins: --image-filesystem must verify the shipped wrapper.
+
+    A RUN in the final stage between the wrapper-install scan and the final
+    assertion can replace the wrapper (or the real binary) while every text
+    check still passes. The filesystem check refuses each replacement shape.
+    Paths are injected so the scenarios run against temporary trees.
+    """
+
+    def setUp(self) -> None:
+        # shutil.which needs the wrapper executable; /tmp is noexec on some
+        # dev hosts, so the fixture must live on the exec-capable repo tree
+        # (same shape as the CI guard suite's fixtures).
+        temporary = tempfile.TemporaryDirectory(dir=LANE_ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.lane = write_lane(self.root)
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        self.wrapper_path = self.bin_dir / "opencode"
+        shutil.copy(WRAPPER, self.wrapper_path)
+        self.wrapper_path.chmod(0o755)
+        self.binary_path = self.root / "lib" / "opencode2" / "opencode"
+        self.binary_path.parent.mkdir(parents=True)
+        self.binary_path.write_bytes(b"\x7fELF clean pinned build")
+        spec = importlib.util.spec_from_file_location("exposure_policy_assert", ASSERT)
+        if spec is None or spec.loader is None:  # pragma: no cover - import shape
+            raise AssertionError("cannot load exposure_policy_assert")
+        self.assert_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.assert_module)
+
+    def check(self, *path: pathlib.Path) -> list[str]:
+        self.assert_module.failures.clear()
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join(str(p) for p in path)}):
+            self.assert_module.check_installed_wrapper(
+                self.lane,
+                self.wrapper_path,
+                self.binary_path,
+                owner_uid=os.geteuid(),
+            )
+        return list(self.assert_module.failures)
+
+    def test_as_built_passes(self) -> None:
+        self.assertEqual(self.check(self.bin_dir), [])
+
+    def test_wrapper_replaced_by_the_real_binary_fails(self) -> None:
+        self.wrapper_path.write_bytes(self.binary_path.read_bytes())
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("byte-identical", failures[0])
+
+    def test_wrapper_symlink_fails(self) -> None:
+        self.wrapper_path.unlink()
+        self.wrapper_path.symlink_to(WRAPPER)
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("regular file", failures[0])
+
+    def test_wrapper_group_writable_fails(self) -> None:
+        self.wrapper_path.chmod(0o775)
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("group- or other-writable", failures[0])
+
+    def test_real_binary_with_tunnel_marker_fails(self) -> None:
+        self.binary_path.write_bytes(
+            b"\x7fELF tampered build embedding https://opentunnel.xyz relay"
+        )
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("opentunnel", failures[0])
+
+    def test_earlier_path_dir_shadowing_the_wrapper_fails(self) -> None:
+        shadow = self.root / "shadow"
+        shadow.mkdir()
+        decoy = shadow / "opencode"
+        shutil.copy("/bin/echo", decoy)
+        decoy.chmod(0o755)
+        failures = self.check(shadow, self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("shadows", failures[0])
+
+    def test_missing_wrapper_fails(self) -> None:
+        self.wrapper_path.unlink()
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("missing or unreadable", failures[0])
 
 
 if __name__ == "__main__":

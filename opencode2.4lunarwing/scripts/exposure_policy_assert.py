@@ -25,7 +25,11 @@ Assertions (opencode2 lane):
   6. --binary PATH: the built opencode binary contains no OpenTunnel client
      markers (controls 5 + 8).
   7. --image-filesystem: the installed boot files, scripts and config are
-     root-owned and read-only (image builds only).
+     root-owned and read-only (image builds only). For the v2 profile the
+     installed wrapper is verified too: /usr/local/bin/opencode must be the
+     byte-identical root-owned read-only exposure guard, PATH must resolve
+     'opencode' to it, and the real binary is re-scanned for OpenTunnel
+     markers (run-103 GD-2).
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1.18.25 has no service mode or
@@ -38,6 +42,8 @@ import argparse
 import json
 import pathlib
 import re
+import shutil
+import stat
 import sys
 
 LANE_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -258,6 +264,58 @@ def check_image_filesystem(lane: pathlib.Path) -> None:
         check("image boot files, scripts and config are root-owned and read-only")
 
 
+def check_installed_wrapper(
+    lane: pathlib.Path,
+    wrapper_path: pathlib.Path = pathlib.Path("/usr/local/bin/opencode"),
+    binary_path: pathlib.Path = pathlib.Path("/usr/local/lib/opencode2/opencode"),
+    *,
+    owner_uid: int = 0,
+) -> None:
+    """Run-103 GD-2: verify the shipped wrapper, not the Dockerfile's claim.
+
+    A RUN in the final stage between the wrapper-install scan and the
+    --image-filesystem assertion can replace the wrapper (or the real
+    binary) after every text check passed; only the installed filesystem
+    cannot lie. The wrapper must be the byte-identical, owner-only-writable
+    exposure guard, PATH must resolve 'opencode' to it, and the real binary
+    is re-scanned for OpenTunnel markers. Image builds only (v2 profile).
+    """
+    try:
+        metadata = wrapper_path.lstat()
+    except OSError as error:
+        fail(f"installed wrapper {wrapper_path} is missing or unreadable: {error}")
+        return
+    if wrapper_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        fail(f"installed wrapper {wrapper_path} must be a regular file, not a symlink")
+        return
+    if metadata.st_uid != owner_uid:
+        fail(f"installed wrapper {wrapper_path} must be owned by uid {owner_uid}")
+        return
+    if metadata.st_mode & 0o022:
+        fail(f"installed wrapper {wrapper_path} must not be group- or other-writable")
+        return
+    source = lane / "scripts" / "opencode-exposure-guard.sh"
+    try:
+        installed = wrapper_path.read_bytes()
+        expected = source.read_bytes()
+    except OSError as error:
+        fail(f"installed wrapper comparison unreadable: {error}")
+        return
+    if installed != expected:
+        fail(f"installed wrapper {wrapper_path} is not byte-identical to {source} — "
+             "replaced after the scan (run-103 GD-2)")
+        return
+    resolved = shutil.which("opencode")
+    if resolved is None or pathlib.Path(resolved) != wrapper_path:
+        fail(f"'opencode' on PATH must resolve to the wrapper {wrapper_path} "
+             f"(got {resolved!r}) — an earlier PATH dir shadows the guard")
+        return
+    check_binary(binary_path)
+    if not failures:
+        check(f"installed wrapper {wrapper_path} is the exposure guard "
+              "and the real binary carries no tunnel markers")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -308,6 +366,8 @@ def main() -> int:
         check_binary(args.binary)
     if args.image_filesystem:
         check_image_filesystem(lane)
+        if is_v2:
+            check_installed_wrapper(lane)
 
     if failures:
         print(f"exposure policy: {len(failures)} check(s) FAILED for {lane}", file=sys.stderr)
