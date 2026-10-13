@@ -2885,6 +2885,7 @@ async fn proxied_calls_persist_canonical_tool_events() {
         started_at: Some(chrono::Utc::now()),
         completed_at: None,
         credential_grants_json: String::new(),
+        job_mode: "worker".to_string(),
     })
     .await
     .expect("seed parent job row");
@@ -3338,6 +3339,7 @@ async fn tool_call_cap_bounds_frames_and_marker_rows() {
         started_at: Some(chrono::Utc::now()),
         completed_at: None,
         credential_grants_json: String::new(),
+        job_mode: "worker".to_string(),
     })
     .await
     .expect("seed parent job row");

@@ -423,6 +423,7 @@ async fn async_main() -> anyhow::Result<()> {
             safety: Arc::clone(&components.safety),
             hooks: Arc::clone(&components.hooks),
         }),
+        components.workspace_resolver.clone(),
     )
     .await;
     let container_job_manager = orch.container_job_manager;
@@ -801,6 +802,7 @@ async fn async_main() -> anyhow::Result<()> {
             None
         },
         components.secrets_store.clone(),
+        components.workspace_resolver.clone(),
     );
 
     // ── Gateway channel ────────────────────────────────────────────────
