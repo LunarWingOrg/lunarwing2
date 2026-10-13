@@ -9,7 +9,7 @@ Persistent container worker for upstream opencode. The WebSocket bridge is TypeS
 - `scripts/lunarwing_bridge.ts` — The WebSocket server/client. Changes here affect protocol behavior.
 - `scripts/opencode_task_executor.ts` — Task execution via opencode SDK. Controls session creation, permissions, event streaming.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
-- `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp.
+- `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp. In websocket mode it also captures `opencode serve` output to `OPENCODE_SERVE_LOG` (default `/var/log/lunarwing/opencode-serve.log`) for error enrichment.
 - `config/opencode.json` — Mounted into container; controls LLM provider, plugins, MCP servers.
 
 ## Protocol Compatibility
