@@ -1479,14 +1479,18 @@ stop_tenant_openrc() {
   local name="$1"
   require_safe_openrc_proxy_units || return 1
   local stop_failed=false worker
-  _openrc_stop_service "lunarwing-${name}" || stop_failed=true
-  _openrc_stop_service "xmpp-bridge-${name}" || stop_failed=true
+  # Every unit is stopped only when its init script is installed: an absent
+  # unit is already stopped, so a partially provisioned or partially removed
+  # tenant never makes remove-tenant/upgrade-tenant permanently refuse (EQ-2).
+  # A refusal (125) or a failed stop of an installed unit still fails the stop.
+  _openrc_stop_service_if_installed "lunarwing-${name}" || stop_failed=true
+  _openrc_stop_service_if_installed "xmpp-bridge-${name}" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-proxy-${name}" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-weechat-adapter-${name}" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-weechat-${name}" || stop_failed=true
   if tenant_darkirc_enabled "$name"; then
-    _openrc_stop_service "lunarwing-darkirc-adapter-${name}" || stop_failed=true
-    _openrc_stop_service "lunarwing-darkirc-${name}" || stop_failed=true
+    _openrc_stop_service_if_installed "lunarwing-darkirc-adapter-${name}" || stop_failed=true
+    _openrc_stop_service_if_installed "lunarwing-darkirc-${name}" || stop_failed=true
   fi
   # Container babysitters must stop before their containers or they immediately respawn them.
   for worker in nanocode pebble opencode kimi opencode2 vision voice; do
@@ -1496,7 +1500,7 @@ stop_tenant_openrc() {
   _openrc_stop_service_if_installed "lunarwing-voice-${name}" || stop_failed=true
   # Postgres last: the daemon depends on it, so it stops after its consumers.
   _openrc_stop_service_if_installed "lunarwing-pg-${name}-sup" || stop_failed=true
-  _openrc_stop_service "lunarwing-pg-${name}" || stop_failed=true
+  _openrc_stop_service_if_installed "lunarwing-pg-${name}" || stop_failed=true
   if [[ "$stop_failed" == true ]]; then
     say "OpenRC tenant shutdown completed with service stop errors for $name"
     return 1
