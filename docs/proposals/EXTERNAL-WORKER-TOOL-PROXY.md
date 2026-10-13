@@ -207,8 +207,9 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   `tool_allowlist` at the same endpoint as a `mode = "cron"` entry; give a
   cron mission its own container. Two cron entries pointing at the same
   container likewise share one authority domain (one mission's tick can
-  borrow the other's `cron.tool_allowlist` through a concurrent tick's
-  relay socket); the code does not detect or prevent that pairing —
+  borrow the other's `cron.tool_allowlist` through another tick's relay
+  socket, concurrent or later — a leftover process can wait for it);
+  the code does not detect or prevent that pairing —
   tracked as WI#396 (MR !1582 review FT-3). The manager additionally strips the
   worker-level list of a non-cron entry whose endpoint shares a cron
   entry's container (MR !1561 EV-1). The comparison uses a normalized
