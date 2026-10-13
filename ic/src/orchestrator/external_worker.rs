@@ -203,16 +203,21 @@ fn is_loopback(host: &str) -> bool {
         || host == "0.0.0.0"
 }
 
-/// Normalized container identity of a worker endpoint URL for the
+/// Normalized host:port listener identity of a worker endpoint URL for the
 /// shared-endpoint strip (MR !1571 review FE-1): the strip must catch the
-/// obvious re-spellings of the same container, not just the exact URL
+/// obvious re-spellings of the same listener, not just the exact URL
 /// string. The host is lowercased, every loopback spelling folds into one
 /// class, the scheme-default port (80 for ws/http, 443 for wss/https) is
 /// applied when the URL omits it, and the path and query are ignored. One
 /// host:port that path-routes several containers therefore collapses to a
 /// single key and strips all of them — a false share fails closed, while a
-/// missed alias would silently keep the grant. An unparseable URL keeps
-/// only its exact raw string as the key (exact-match behavior).
+/// missed alias would silently keep the grant. The key names a listener,
+/// not the container itself (MR !1582 review FT-2): a container also
+/// reachable on a second host port, or behind a proxy on another port, is
+/// not caught, and a real host literally named `loopback` collides with
+/// the loopback class (it can only over-strip, which fails closed) — both
+/// remain the operator's responsibility. An unparseable URL keeps only its
+/// exact raw string as the key (exact-match behavior).
 fn endpoint_container_key(url: &str) -> String {
     let Ok(uri) = url.parse::<http::Uri>() else {
         return url.to_string();
@@ -686,13 +691,18 @@ impl ExternalWorkerManager {
         // concurrent task's relay socket — re-opening the cross-task
         // grant-borrow path the per-entry strip above closed. Strip such a
         // shared-endpoint entry's worker-level list too. Endpoints are
-        // compared by normalized container key (MR !1571 review FE-1), so
-        // the obvious re-spellings (localhost vs 127.0.0.1, host case, the
+        // compared by normalized key (MR !1571 review FE-1), so the obvious
+        // re-spellings (localhost vs 127.0.0.1, host case, the
         // scheme-default port, path/query differences) are caught; a
         // host:port that path-routes several containers collapses to one
-        // key and strips all of them (fails closed). Exotic aliases
-        // (/etc/hosts names) remain the operator's responsibility — see
-        // WORKER-CONTAINERS.md.
+        // key and strips all of them (fails closed). The key names a
+        // host:port listener, not the container itself (MR !1582 review
+        // FT-2): a container also published on a second host port, or
+        // reached behind a proxy on another port, is not caught; those,
+        // exotic aliases (/etc/hosts names), and a real host literally
+        // named `loopback` (it folds into the loopback class and can only
+        // over-strip, which fails closed) remain the operator's
+        // responsibility — see WORKER-CONTAINERS.md.
         let cron_endpoint_keys: std::collections::HashSet<String> = workers
             .values()
             .filter(|config| config.is_cron())
@@ -712,7 +722,8 @@ impl ExternalWorkerManager {
                     cron_endpoint_keys.contains(&endpoint_container_key(&endpoint.url))
                 }) {
                     tracing::error!(
-                        "External worker '{}' shares an endpoint with a mode=cron worker; \
+                        "External worker '{}' shares an endpoint with a mode=cron worker \
+                         (compared by host and port; path and query are ignored); \
                          stripping its worker-level tool_allowlist — one container is one \
                          authority domain, so a cron tick in that container could otherwise \
                          borrow this entry's grants through a concurrent task's relay socket. \
