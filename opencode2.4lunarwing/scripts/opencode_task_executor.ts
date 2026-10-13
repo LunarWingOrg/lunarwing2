@@ -100,6 +100,12 @@ export type ResultCallback = (result: TaskResult) => void
 
 // v2 permission ruleset: allow the sandboxed tool surface, deny the
 // interactive ones the worker cannot answer (mirrors the v1 worker policy).
+// Evaluation is findLast over [agent rules, ...session rules], so the deny
+// rules below must come AFTER the allow-* entries to win (WI#357: workers
+// must never self-expose). The shell tool wildcard-matches each parsed
+// command's full text against resource; the leading * covers absolute-path
+// and sudo-prefixed invocations of the binary. Obfuscated invocation
+// (`bash -c ...`) is the in-image wrapper's layer, not this one's.
 function sessionPermissions(): Array<{ action: string; resource: string; effect: "allow" | "deny" }> {
   return [
     { action: "edit", resource: "*", effect: "allow" },
@@ -112,6 +118,9 @@ function sessionPermissions(): Array<{ action: string; resource: string; effect:
     { action: "webfetch", resource: "*", effect: "allow" },
     { action: "question", resource: "*", effect: "deny" },
     { action: "subagent", resource: "*", effect: "deny" },
+    { action: "shell", resource: "*opencode service *", effect: "deny" },
+    { action: "shell", resource: "*opencode pair *", effect: "deny" },
+    { action: "shell", resource: "*opencode serve *", effect: "deny" },
   ]
 }
 
