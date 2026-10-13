@@ -445,6 +445,20 @@ class InstalledWrapperTests(unittest.TestCase):
         self.assertEqual(len(failures), 1, failures)
         self.assertIn("missing or unreadable", failures[0])
 
+    def test_image_filesystem_path_wires_the_check_in(self) -> None:
+        # The scenarios above call the function directly (GD-3: the image
+        # build is the only place --image-filesystem runs, and it is a
+        # protected-pipeline gate) — pin the main() wiring so the check
+        # cannot be dropped from the shipped invocation unnoticed.
+        source = ASSERT.read_text(encoding="utf-8")
+        wiring = (
+            "    if args.image_filesystem:\n"
+            "        check_image_filesystem(lane)\n"
+            "        if is_v2:\n"
+            "            check_installed_wrapper(lane)\n"
+        )
+        self.assertIn(wiring, source)
+
 
 if __name__ == "__main__":
     unittest.main()
