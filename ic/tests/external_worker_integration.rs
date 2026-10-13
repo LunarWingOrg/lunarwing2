@@ -2524,6 +2524,11 @@ async fn cron_worker_worker_level_allowlist_is_stripped_at_load() {
     // grant. A cron worker's worker-level list would therefore be standing
     // authority for every tick, so the manager strips it at load: even an
     // ordinary (non-tick) dispatch to a cron-mode worker is denied.
+    //
+    // MR !1561 EV-6: the cron list is kept non-empty so this test still
+    // pins that the tool binding is keyed on `context.cron_tick`, not on
+    // `config.is_cron()` — with is_cron() keying, this ordinary dispatch
+    // would draw the cron list and the call below would succeed.
     let probe = ProbeEchoTool::phase1();
     let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
     tools.register(probe.clone()).await;
@@ -2540,6 +2545,11 @@ async fn cron_worker_worker_level_allowlist_is_stripped_at_load() {
 
     let mut config = cron_config_with_schedule(&url, "0 15 10 * * *", 300, 2);
     config.tool_allowlist = vec!["knowledge_search".to_string()];
+    config
+        .cron
+        .as_mut()
+        .expect("cron block")
+        .tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
     let job_id = Uuid::new_v4();
     let res = timeout(
@@ -2571,6 +2581,117 @@ async fn cron_worker_worker_level_allowlist_is_stripped_at_load() {
         probe.seen.lock().expect("probe lock").is_empty(),
         "a denied call must never reach the tool"
     );
+}
+
+#[tokio::test]
+async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
+    // MR !1561 EV-1: the strip is per config entry, but the authority
+    // domain is the container. A task-mode entry pointing at the same
+    // endpoint as a cron entry would let that container's ticks borrow its
+    // grants through a concurrent task's relay socket, so the manager also
+    // strips the worker-level list of a non-cron entry whose endpoint URL
+    // exactly matches a cron entry's endpoint.
+    let probe = ProbeEchoTool::phase1();
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools.register(probe.clone()).await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (shared_url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![(
+            "knowledge_search".to_string(),
+            serde_json::json!({ "k": "v" }),
+        )],
+        replies: reply_tx,
+    })
+    .await;
+    // Control: a task-mode worker on its own endpoint keeps its grant
+    // (the shared-endpoint strip is an exact-URL match only).
+    let (ctrl_reply_tx, mut ctrl_reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ctrl_url, _ctrl_count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![(
+            "knowledge_search".to_string(),
+            serde_json::json!({ "k": "v" }),
+        )],
+        replies: ctrl_reply_tx,
+    })
+    .await;
+
+    let cron_config = cron_config_with_schedule(&shared_url, "0 15 10 * * *", 300, 2);
+    let shared_config = ExternalWorkerConfig {
+        name: "mock-interactive".to_string(),
+        url: shared_url.clone(),
+        timeout_ms: 30_000,
+        tool_allowlist: vec!["knowledge_search".to_string()],
+        ..Default::default()
+    };
+    let ctrl_config = ExternalWorkerConfig {
+        name: "mock-standalone".to_string(),
+        url: ctrl_url.clone(),
+        timeout_ms: 30_000,
+        tool_allowlist: vec!["knowledge_search".to_string()],
+        ..Default::default()
+    };
+    let mgr = ExternalWorkerManager::new(vec![cron_config, shared_config, ctrl_config])
+        .with_tool_proxy(test_proxy(tools));
+
+    // The entry sharing the cron worker's endpoint is stripped: denied.
+    let job_id = Uuid::new_v4();
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock-interactive",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext {
+                user_id: "tenant-user".to_string(),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let reply = reply_rx.recv().await.expect("tool_result");
+    assert_eq!(
+        reply["payload"]["status"], "denied",
+        "an entry sharing a cron worker's endpoint must be stripped at load: {reply}"
+    );
+
+    // The control entry on its own endpoint keeps its grant: success.
+    let ctrl_job_id = Uuid::new_v4();
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            ctrl_job_id,
+            "mock-standalone",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext {
+                user_id: "tenant-user".to_string(),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    assert_eq!(res.status, ExternalTaskStatus::Success);
+
+    let reply = ctrl_reply_rx.recv().await.expect("tool_result");
+    assert_eq!(
+        reply["payload"]["status"], "success",
+        "an unrelated task-mode worker must keep its grant: {reply}"
+    );
+    let seen = probe.seen.lock().expect("probe lock");
+    assert_eq!(seen.len(), 1, "only the control call may reach the tool");
+    assert_eq!(seen[0], ("tenant-user".to_string(), ctrl_job_id));
 }
 
 #[tokio::test]
@@ -3070,6 +3191,22 @@ async fn tool_catalog_advertises_the_proxied_memory_write_schema() {
     assert!(
         required.contains(&serde_json::json!("target")),
         "the proxied schema must require target: {params}"
+    );
+    // MR !1561 EV-2: the catalog description must not advertise the
+    // always-denied layer shortcuts as usable targets, and the append text
+    // must not promise a backup the proxy boundary can never produce.
+    let desc = entries[0]["description"].as_str().expect("description");
+    assert!(
+        desc.contains("notes/today.md") && !desc.contains("for curated long-term facts"),
+        "the proxied description must name explicit workspace paths, not the tool's own \
+         layer-shortcut text: {desc}"
+    );
+    let append_desc = params["properties"]["append"]["description"]
+        .as_str()
+        .expect("append description");
+    assert!(
+        !append_desc.contains("previous version is kept"),
+        "the proxied append text must not promise a backup: {append_desc}"
     );
 }
 
