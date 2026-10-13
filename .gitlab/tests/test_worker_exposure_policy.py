@@ -34,6 +34,11 @@ COMPILE_OUT_RUN = "RUN python3 /build/compile_out_remote_tunnel.py /build/openco
 BUILD_RUN = 'RUN OPENCODE_VERSION="${OPENCODE_VERSION#v}" bun run build -- --single\n'
 READONLY_RUN = "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json\n"
 FILESYSTEM_ASSERTION = "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem\n"
+BINARY_SCAN_RUN = (
+    "RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode \\\n"
+    "    && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 "
+    "--binary /usr/local/lib/opencode2/opencode\n"
+)
 
 DOCKERFILE_LINES = (
     "FROM example.invalid/bun AS builder\n",
@@ -42,13 +47,13 @@ DOCKERFILE_LINES = (
     BUILD_RUN,
     "FROM example.invalid/bun AS runtime\n",
     "COPY --from=builder /out/bin/opencode /usr/local/lib/opencode2/opencode\n",
-    "RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode \\\n"
-    "    && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --binary /usr/local/lib/opencode2/opencode\n",
+    BINARY_SCAN_RUN,
     "COPY scripts/ ./scripts/\n",
     "COPY config/ ./config/\n",
     "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./\n",
     READONLY_RUN,
     FILESYSTEM_ASSERTION,
+    "USER 10003:10003\n",
 )
 
 
@@ -408,6 +413,67 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 result = self.run_guard(self.root)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("read-only", result.stderr)
+
+    def test_dockerfile_binary_scan_must_share_the_assert_stage(self):
+        # Run-97 FQ-1: BuildKit and buildah skip unused stages, so the exact
+        # wrapper-install + marker-scan line in a dead (or wrong) stage
+        # satisfies the presence check while the shipped image has neither
+        # the wrapper (control 2) nor the marker scan (control 5). The runtime
+        # stage then restores a plain binary at the wrapper path.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        self.assertIn(BINARY_SCAN_RUN, original)
+        replaced = original.replace(
+            BINARY_SCAN_RUN,
+            "RUN cp /usr/local/lib/opencode2/opencode /usr/local/bin/opencode\n",
+        )
+        for name, mutated in {
+            "dead-stage": "FROM example.invalid/bun AS deadscan\n" + BINARY_SCAN_RUN + replaced,
+            "builder-stage": replaced.replace(
+                "FROM example.invalid/bun AS builder\n",
+                "FROM example.invalid/bun AS builder\n" + BINARY_SCAN_RUN,
+            ),
+        }.items():
+            with self.subTest(name=name):
+                dockerfile.write_text(mutated, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("same stage", result.stderr)
+        dockerfile.write_text(original, encoding="utf-8")
+
+    def test_dockerfile_last_user_must_be_agent_uid(self):
+        # Run-97 FQ-2: a USER root tail (or a missing group) would void the
+        # root-owned read-only controls outside mt-admin-managed deployments.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for name, mutated in {
+            "root-user": original + "USER root\n",
+            "numeric-root": original + "USER 0:0\n",
+            "no-group": original.replace("USER 10003:10003", "USER 10003"),
+        }.items():
+            with self.subTest(name=name):
+                dockerfile.write_text(mutated, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("last USER", result.stderr)
+        dockerfile.write_text(original, encoding="utf-8")
+
+    def test_dockerfile_parser_directive_comments_fail(self):
+        # Run-97 FQ-3: with escape=` Docker treats a trailing backslash as a
+        # literal, so a LABEL line ending in "\" followed by RUN after the
+        # final assertion passes the guard's continuation joining while Docker
+        # executes the RUN. Refuse the directives instead of emulating the
+        # parser grammar.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        tail = "LABEL hidden=yes \\\nRUN chown -R opencode2:opencode2 /app\n"
+        for directive in ("# escape=`\n", "# SyNtAx=docker/dockerfile:1\n", "  # check=true\n"):
+            with self.subTest(directive=directive.strip()):
+                dockerfile.write_text(directive + original + tail, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("parser directive", result.stderr)
+        dockerfile.write_text(original, encoding="utf-8")
 
     def test_executor_missing_deny_fails(self):
         executor = self.root / "opencode2.4lunarwing" / "scripts" / "opencode_task_executor.ts"

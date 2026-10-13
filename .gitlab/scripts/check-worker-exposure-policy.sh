@@ -40,9 +40,17 @@ dockerfile_code=""
 _join=""
 while IFS= read -r _raw || [[ -n "$_raw" ]]; do
     _line="${_raw#"${_raw%%[![:space:]]*}"}"
-    if [[ -z "$_line" || "$_line" == \#* ]]; then
+    if [[ "$_line" == \#* ]]; then
+        # Run-97 FQ-3: a parser directive changes how Docker itself parses the
+        # file (escape=` makes every backslash a literal, so this script's
+        # continuation joining no longer matches Docker's instruction split).
+        # Refuse the directives outright instead of parsing Docker's grammar.
+        if [[ "${_line,,}" =~ ^#[[:space:]]*(escape|syntax|check)= ]]; then
+            fail "Dockerfile parser directives (# escape=/# syntax=/# check=) are not allowed (run-97 FQ-3): ${_line}"
+        fi
         continue
     fi
+    [[ -n "$_line" ]] || continue
     if [[ "$_line" == *\\ ]]; then
         _part="${_line%\\}"
         _join+="${_part%"${_part##*[![:space:]]}"} "
@@ -71,6 +79,17 @@ compile_out_copied=0
 compile_out_ran=0
 guarded_build=0
 filesystem_checked=0
+# Run-97 FQ-1: the wrapper install + binary marker scan must live in the same
+# stage as the final --image-filesystem assertion — BuildKit and buildah skip
+# unused stages, so the exact line in a dead stage satisfies presence checks
+# while the shipped image has neither the wrapper (control 2) nor the marker
+# scan (control 5).
+stage_index=0
+scan_stage=""
+assert_stage=""
+# Run-97 FQ-2: a USER root tail would void the root-owned read-only controls
+# outside mt-admin-managed deployments (mt-admin itself checks the image user).
+last_user=""
 while IFS= read -r docker_line; do
     [[ -n "$docker_line" ]] || continue
     instruction="${docker_line%%[[:space:]]*}"
@@ -82,11 +101,15 @@ while IFS= read -r docker_line; do
     fi
     if [[ "$instruction" == FROM ]]; then
         stage=""
+        stage_index=$((stage_index + 1))
         compile_out_copied=0
         compile_out_ran=0
         if [[ "${docker_line^^}" =~ [[:space:]]AS[[:space:]]BUILDER$ ]]; then
             stage=builder
         fi
+    fi
+    if [[ "$instruction" == USER ]]; then
+        last_user="$docker_line"
     fi
     # Match the Dockerfile's variable reference literally, without expansion.
     # shellcheck disable=SC2016
@@ -106,6 +129,10 @@ while IFS= read -r docker_line; do
             ;;
         'RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem')
             filesystem_checked=1
+            assert_stage=$stage_index
+            ;;
+        "$binary_scan")
+            scan_stage=$stage_index
             ;;
     esac
 done <<<"$dockerfile_code"
@@ -113,6 +140,10 @@ done <<<"$dockerfile_code"
     || fail "Dockerfile lost the OpenTunnel compile-out RUN with its source COPY before the builder build (control 8, run-96 FP-1)"
 ((filesystem_checked)) \
     || fail "Dockerfile must verify installed policy-file ownership and modes (FB-4)"
+[[ -n "$scan_stage" && "$scan_stage" == "$assert_stage" ]] \
+    || fail "Dockerfile wrapper install + binary marker scan must run in the same stage as the final --image-filesystem assertion (run-97 FQ-1: unused stages are skipped at build time)"
+[[ -n "$last_user" && "$last_user" == "USER 10003:10003" ]] \
+    || fail "Dockerfile's last USER instruction must be exactly 'USER 10003:10003' (run-97 FQ-2)"
 
 # WI#357 (run-79 EI-5): the exposure controls must be root-owned and
 # read-only in the image; agent-writable scripts/config would let the agent
