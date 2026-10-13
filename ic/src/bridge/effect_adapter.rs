@@ -670,7 +670,8 @@ impl EffectBridgeAdapter {
     /// - a per-user per-verb rate limit applies, plus an aggregate per-user
     ///   bucket across the run-spawning verbs (WI#352, run-33 AQ-12; the
     ///   stop verbs stay per-verb only, run-51 CJ-1);
-    /// - `ToolCall` hooks run with [`MISSION_SENSITIVE_PARAMS`] redacted.
+    /// - `ToolCall` hooks run with credential-like parameter values redacted
+    ///   (the shared WI#359 CJ-10 predicate, recursive into `_args[0]`).
     ///
     /// The approval-tier gates deliberately do not map: mission verbs carry
     /// `ApprovalRequirement::Never` semantics by this gate's own choice —
@@ -769,7 +770,9 @@ impl EffectBridgeAdapter {
 
         let hook_event = HookEvent::ToolCall {
             tool_name: action_name.to_string(),
-            parameters: crate::tools::redact_params(parameters, MISSION_SENSITIVE_PARAMS),
+            // WI#359 (CJ-10): one shared credential-key predicate, recursive
+            // so a positional `_args[0]` payload is covered too.
+            parameters: lunarwing_safety::redact_credential_params(parameters),
             user_id: context.user_id.clone(),
             context: format!("engine_v2:{}", context.thread_id),
         };
@@ -1885,12 +1888,6 @@ pub(crate) const MISSION_RUN_SPAWNING_ACTION_NAMES: &[&str] = &[
 pub(crate) fn is_mission_action_name(name: &str) -> bool {
     MISSION_ACTION_NAMES.contains(&name)
 }
-
-/// Mission parameters that must never reach a hook payload or an approval
-/// prompt: `webhook_secret` (accepted by `mission_create`/`mission_update`)
-/// is a shared-secret credential. [`crate::tools::redact_params`] no-ops on
-/// verbs whose parameters do not contain the key.
-pub(crate) const MISSION_SENSITIVE_PARAMS: &[&str] = &["webhook_secret"];
 
 /// Per-user rate limit applied to each mission verb (WI#308). Mission calls
 /// had no rate limit before; the budget matches `memory_write`'s (a cheap

@@ -1454,7 +1454,7 @@ async fn preflight_action(
                 events.push(EventKind::ApprovalRequested {
                     action_name: action_name.into(),
                     call_id: call_id.into(),
-                    parameters: Some(crate::types::event::redact_event_params(params)),
+                    parameters: Some(crate::types::event::redact_event_params(action_name, params)),
                     description: None,
                     allow_always: None,
                     gate_name: None,
@@ -1923,7 +1923,7 @@ async fn resolve_tool_completion(
             events.push(EventKind::ApprovalRequested {
                 action_name: action_name.clone(),
                 call_id: call_id.clone(),
-                parameters: Some(crate::types::event::redact_event_params(&parameters)),
+                parameters: Some(crate::types::event::redact_event_params(&action_name, &parameters)),
                 description: None,
                 allow_always: match &resume_kind {
                     crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),

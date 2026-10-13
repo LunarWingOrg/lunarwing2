@@ -170,7 +170,7 @@ pub fn sanitize_url_credentials(url_str: &str) -> String {
             .to_string();
     };
     let _ = parsed.set_username("");
-    parsed.set_password(None);
+    let _ = parsed.set_password(None);
     let sanitized: Vec<(String, String)> = parsed
         .query_pairs()
         .map(|(name, value)| {
