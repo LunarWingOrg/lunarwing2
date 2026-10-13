@@ -51,6 +51,12 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(dir=ROOT)
         self.addCleanup(temporary.cleanup)
         self.root = pathlib.Path(temporary.name)
+        # FC-8: TemporaryDirectory is 0700; in root CI the no-git lane's PATH
+        # lives under this root while the boot suite drops to uid 10003, which
+        # could not traverse a 0700 parent ("Permission denied: 'bash'",
+        # ci-config jobs 106699/106728). The fixture must be world-traversable;
+        # contents stay 0644/0755, so nothing becomes writable for others.
+        self.root.chmod(0o755)
         script_dir = self.root / ".gitlab" / "scripts"
         script_dir.mkdir(parents=True)
         shutil.copy(SCRIPT, script_dir / SCRIPT.name)

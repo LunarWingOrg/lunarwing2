@@ -44,8 +44,9 @@ def write_lane(root: pathlib.Path, *, name: str = "opencode2.4lunarwing") -> pat
         "# comment naming opencode service mode is prose, not an invocation\n"
         'OPENCODE_SERVE_HOST="${OPENCODE_SERVE_HOST:-127.0.0.1}"\n'
         'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"\n'
-        'SERVICE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"\n'
+        'SERVICE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"\n'
         'mkdir -p "$SERVICE_CONFIG_DIR"\n'
+        'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"\n'
         "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\"\n"
         'mkdir -p "$WORKSPACE_ROOT/.opencode"\n'
         'rm -f "$WORKSPACE_ROOT/.opencode/opencode2.json"\n'
@@ -146,6 +147,21 @@ class ExposurePolicyAssertTests(unittest.TestCase):
                 result = run_assert("--lane", str(self.lane))
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("must write service.json with disabled=true", result.stderr)
+
+    def test_service_reset_must_remove_plants_before_writing(self) -> None:
+        # FB-6: a bare redirect hangs on a planted FIFO, crashes on a
+        # directory, and follows a planted symlink onto the agent's file; the
+        # reset must remove whatever sits at the path first.
+        entrypoint = self.lane / "entrypoint.sh"
+        original = entrypoint.read_text(encoding="utf-8")
+        removal = 'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"'
+        for replacement in ("", "# " + removal, removal.replace("service.json", "wrong.json"),
+                            removal.replace(" -rf", "")):
+            with self.subTest(replacement=replacement):
+                entrypoint.write_text(original.replace(removal, replacement), encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must remove a planted service.json", result.stderr)
 
     def test_password_mentioned_only_in_comment_fails(self) -> None:
         # run-79 EI-8: a substring check is satisfied by prose; the structural

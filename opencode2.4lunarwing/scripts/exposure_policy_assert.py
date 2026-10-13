@@ -170,13 +170,18 @@ def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
         service_setup = (
             'SERVICE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"',
             'mkdir -p "$SERVICE_CONFIG_DIR"',
-            'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"',
             "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\"",
         )
         if all(line in boot.splitlines() for line in service_setup):
             check("entrypoint.sh disables implicit shared-service startup at boot")
         else:
             fail(f"{entrypoint} must write service.json with disabled=true before mode dispatch")
+        # FB-6: without the removal a planted FIFO/dir/symlink at the reset
+        # path hangs the boot, crashes it, or redirects the write.
+        if 'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"' in boot.splitlines():
+            check("entrypoint.sh removes a planted service.json before the reset")
+        else:
+            fail(f"{entrypoint} must remove a planted service.json before the reset")
         # run-79 EI-5: the workspace config copy is untrusted — it must be
         # regenerated from the root-owned /app/config at every boot (copy or
         # symlink). The live copy remains agent-writable within a session.
