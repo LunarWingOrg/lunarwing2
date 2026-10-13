@@ -44,6 +44,15 @@
       "ping": {
         "description": "Agent → Worker: keep-alive probe",
         "payload": {}
+      },
+      "task_prompt": {
+        "description": "Agent → Worker: follow-up prompt/directive for a RUNNING task (WI#328 runtime control channel; consumed by this worker — queued follow-ups are injected into the same opencode session at the turn boundary, never mid-call, framed as 'FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator'). A done=true prompt seals admission immediately; already accepted prompts drain in order, ending with the FINAL wrap-up turn. The daemon rejects post-done prompts itself. The final task_result accumulates completed turns' canonical or streamed output. Follow-up failures/timeouts preserve success only when completed output exists; unrun accepted prompts receive explicit control notes",
+        "payload": {
+          "task_id": "string",
+          "seq":     "integer — monotonic per job, for ordering and dedupe",
+          "prompt":  "string — TEXT directive only; validated daemon-side (16 KiB cap, no NUL bytes)",
+          "done":    "boolean — true signals 'no more prompts coming, wrap up cleanly'"
+        }
       }
     },
 
@@ -73,9 +82,18 @@
       "ready": {
         "description": "Worker → Agent: sent once on connect to signal readiness",
         "payload": {
-          "worker_id": "string",
-          "version":   "string",
-          "mode":      "string — websocket"
+          "worker_id":     "string",
+          "version":       "string",
+          "mode":          "string — websocket",
+          "capabilities":  "array of string — optional capability advertisement (WI#328); this worker advertises 'task_prompt' and consumes runtime control prompts"
+        }
+      },
+      "task_prompt_ack": {
+        "description": "Worker → Agent: receipt for a delivered task_prompt (WI#328), not proof of execution. Sent only by capable workers. accepted=false means unknown/finished task, closed admission (including after done=true), foreign connection, invalid payload, or the 64-prompt worker queue cap. While admission is open a redelivered seq is acked accepted=true without re-queueing; closed admission refuses redeliveries too. Malformed instructions echo valid task_id/seq fields; invalid identifiers use empty task_id/seq=0 and cannot be correlated",
+        "payload": {
+          "task_id":  "string",
+          "seq":      "integer — echoes the task_prompt seq",
+          "accepted": "boolean"
         }
       }
     }

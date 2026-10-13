@@ -12,7 +12,7 @@ const WS_PATH = process.env.WS_PATH || "/ws/agent"
 async function checkHealth(): Promise<boolean> {
   try {
     const res = await fetch(`http://${WS_HOST}:${HEALTH_PORT}/health`)
-    const data = await res.json()
+    const data = (await res.json()) as { status?: string; uptime_seconds?: number }
     if (data.status === "ok") {
       console.log(`[smoke] health: OK (uptime=${data.uptime_seconds}s)`)
       return true
@@ -28,7 +28,7 @@ async function checkHealth(): Promise<boolean> {
 async function checkReady(): Promise<boolean> {
   try {
     const res = await fetch(`http://${WS_HOST}:${HEALTH_PORT}/ready`)
-    const data = await res.json()
+    const data = (await res.json()) as { ready?: boolean }
     if (data.ready) {
       console.log(`[smoke] ready: OK`)
       return true

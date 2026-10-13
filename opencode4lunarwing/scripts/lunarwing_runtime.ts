@@ -122,10 +122,100 @@ export interface TaskResult {
   duration_ms: number
 }
 
+// ── Runtime control channel (WI#328) ─────────────────────────────────────────
+
+/** Capability string advertised in `ready` by workers that consume `task_prompt`. */
+export const CAPABILITY_TASK_PROMPT = "task_prompt"
+
+/** Agent → Worker: follow-up prompt/directive for a RUNNING task. */
+export interface TaskPrompt {
+  task_id: string
+  /** Monotonic per-job sequence number assigned by the daemon. */
+  seq: number
+  prompt: string
+  /** True signals "no more prompts coming; wrap up cleanly". */
+  done: boolean
+}
+
+/** Worker → Agent: receipt for a `task_prompt` frame. */
+export interface TaskPromptAck {
+  task_id: string
+  seq: number
+  /** False when the task was already finished/wrapping up. */
+  accepted: boolean
+}
+
+/**
+ * Daemon-side bounds a capable worker mirrors before queueing (MR !1537
+ * review DW-11): the daemon validates before enqueue, and the bridge
+ * re-validates so a malformed frame is refused instead of wedging the queue
+ * (a non-integer seq can never match an ack; an oversized prompt disagrees
+ * with the daemon's own limit).
+ */
+export const MAX_CONTROL_PROMPT_UTF16_UNITS = 16 * 1024
+export const MAX_CONTROL_QUEUE_PER_TASK = 64
+
+/**
+ * Validate a raw `task_prompt` payload. Returns the typed prompt, or null
+ * when the frame is malformed (wrong types, non-positive/non-integer seq,
+ * empty/oversized/NUL-carrying prompt, non-boolean done). Text directives
+ * only — the channel never carries shell/exec passthrough.
+ */
+export function parseTaskPrompt(payload: unknown): TaskPrompt | null {
+  if (payload === null || typeof payload !== "object") return null
+  const candidate = payload as Record<string, unknown>
+  if (typeof candidate.task_id !== "string" || candidate.task_id.length === 0) return null
+  if (
+    typeof candidate.seq !== "number" ||
+    !Number.isSafeInteger(candidate.seq) ||
+    candidate.seq <= 0
+  ) {
+    return null
+  }
+  if (typeof candidate.prompt !== "string") return null
+  if (candidate.prompt.trim().length === 0) return null
+  if (candidate.prompt.length > MAX_CONTROL_PROMPT_UTF16_UNITS) return null
+  // NUL bytes are rejected (text directives only); String.fromCharCode(0)
+  // keeps the source free of literal-NUL/escape ambiguity.
+  if (candidate.prompt.includes(String.fromCharCode(0))) return null
+  if (typeof candidate.done !== "boolean") return null
+  return {
+    task_id: candidate.task_id,
+    seq: candidate.seq,
+    prompt: candidate.prompt,
+    done: candidate.done,
+  }
+}
+
+/**
+ * Shared follow-up queue between the bridge (producer) and the executor
+ * (consumer). The bridge sets `closed` as soon as a done=true prompt is
+ * ACCEPTED (MR !1537 review DW-4) and refuses every later frame; the
+ * executor sets it when the task is finishing — after the final
+ * turn-boundary drain, on the error path, and on the cancel path (DW-5) —
+ * so no more prompts will be accepted. Already accepted prompts still drain
+ * after admission closes for done=true. The bridge rejects frames for a
+ * closed/missing queue with `accepted: false` so the daemon audit reflects
+ * the drop instead of a silent loss (MR !1525 DI-4).
+ */
+export interface FollowupQueue {
+  prompts: TaskPrompt[]
+  closed: boolean
+  /**
+   * Seq values already queued for this task (MR !1537 review DW-13): the
+   * protocol promises ordering + dedupe, so a re-delivered seq is acked
+   * accepted=true but not enqueued twice. Maintained by the bridge; the
+   * executor never writes it.
+   */
+  seenSeqs?: Set<number>
+}
+
 export interface ReadyPayload {
   worker_id: string
   version: string
   mode: string
+  /** Optional capability advertisement (WI#328); absent means none. */
+  capabilities?: string[]
 }
 
 // ── State File (IPC with health_server.py) ────────────────────────────────────
