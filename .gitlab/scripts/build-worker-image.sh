@@ -46,13 +46,25 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         image_name=worker-opencode2
         context=opencode2.4lunarwing
         dockerfile_dir=opencode2.4lunarwing
+        # WI#357 exposure-policy inputs executed by the build (CY-4
+        # precedent: build-executed scripts must hash into worker-inputs):
+        # the wrapper is installed over the binary path, the assert runs
+        # against the lane + built binary, and the compile-out patch runs
+        # against the upstream checkout; their self-tests execute in-image.
         input_files='opencode2.4lunarwing/Dockerfile
+opencode2.4lunarwing/entrypoint.sh
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts
 opencode2.4lunarwing/scripts/sdk_surface_assert.ts
 opencode2.4lunarwing/scripts/opencode_task_executor.ts
-opencode2.4lunarwing/scripts/opencode_task_executor_test.ts'
+opencode2.4lunarwing/scripts/opencode_task_executor_test.ts
+opencode2.4lunarwing/scripts/opencode-exposure-guard.sh
+opencode2.4lunarwing/scripts/exposure_policy_assert.py
+opencode2.4lunarwing/scripts/exposure_policy_assert_test.py
+opencode2.4lunarwing/scripts/entrypoint_config_test.py
+opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
+opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
         source_ref=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
         build_args="OPENCODE_VERSION=v2.0.24
 OPENCODE_REF=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
