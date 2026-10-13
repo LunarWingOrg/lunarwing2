@@ -788,6 +788,46 @@ whole-image builds remain the protected worker publication gate.
 
 All worker images use the `lunarwing-agent-v1` WebSocket subprotocol; the legacy `ironclaw-agent-v1` alias is no longer accepted. Messages are JSON envelopes with `id`, `type`, `timestamp`, `payload`. The worker sends `ready` on connect, receives `task_request`, streams `task_progress`, and sends a final `task_result`.
 
+### Runtime control channel (WI#328)
+
+External worker jobs are no longer fire-and-forget: while a task runs, the daemon can deliver follow-up prompts and text directives into it over the same per-task WebSocket connection. The channel is **capability-gated**: a worker advertises `capabilities: ["task_prompt"]` in its `ready` payload, and the daemon rejects prompts for jobs whose worker never advertised it (`ExternalWorkerControlUnsupported`, HTTP 400) instead of reporting a false "queued". Prompts submitted before the handshake completes are rejected as still-connecting (HTTP 409). Two envelope types extend the protocol:
+
+- `task_prompt` (daemon → worker): `{task_id, seq, prompt, done}`. `prompt` is follow-up instruction text (TEXT directives only — validated daemon-side before enqueue; no shell/exec passthrough, 16 KiB cap, no NUL bytes). `seq` is monotonic per job for ordering and dedupe. `done: true` signals "no more prompts coming, wrap up cleanly" — it grants **one final wrap-up turn**: the daemon rejects every later prompt (HTTP 409) from the moment the wrap-up is accepted, and in the opencode worker the bridge closes the task's queue at accept time so a post-done frame is refused instead of queued-and-dropped. Workers must hold queued prompts until the current turn/LLM call ends — never mid-call.
+- `task_prompt_ack` (worker → daemon): `{task_id, seq, accepted}` — a receipt meaning "the worker received and queued it". The daemon records acks only for seqs it actually delivered, and the persisted `control_ack` row carries the `accepted` flag (absent counts as accepted), so a worker-refused prompt is auditable as such rather than masquerading as delivered. A delivered seq whose ack never arrives (e.g. the worker's final-drain refusal races `task_result`) is persisted as an explicit `unacked` `control_prompt` row when the task ends, so the audit trail shows the gap instead of implying delivery.
+
+Delivery is **at-most-once** and honest about it: the daemon's per-job control queue is bounded (32 in flight, 64 per job total — a full queue or cap rejects with HTTP 429), a failed send drops the prompt with a `delivery_failed` job event instead of killing the task, the queue is closed the moment the task's read loop exits (including at the start of the cancel handoff) so late senders get an explicit rejection (HTTP 409), and prompts still queued when the task ends are recorded as `dropped`. There is no redelivery; callers that need certainty should check the job event log for the `delivered`/`control_ack` rows. Every enqueue (with SHA-256 digest and length — never the prompt text), delivery, drop, and ack is persisted in the job event log (`control_prompt` / `control_ack` event types) for an auditable control history. Enqueued prompts do **not** extend the task's timeout/fuel budget.
+
+From the agent side this is surfaced through `job_prompt`, which routes `external:`-mode jobs with a live task handle to the control channel instead of rejecting them — note that an "Always allow" approval grant on `job_prompt` now also reaches credentialed external workers, not just local sandbox jobs. From the browser side, `POST /api/jobs/{id}/prompt` routes the same way and job detail reports `can_prompt: true` only for running external jobs whose worker advertised the capability.
+
+Worker support today: the **opencode** worker (`opencode4lunarwing`) consumes `task_prompt` — it validates frames bridge-side (positive integer seq, non-empty 16 KiB NUL-free prompt, per-task queue bound, seq dedupe), binds every queue to the connection that owns the task (a foreign socket's prompt or cancel is refused), injects queued follow-ups into the same opencode session at the turn boundary (session idle, gated against stale idle replays) framed as `FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator`, closes the queue the moment a `done: true` prompt is accepted (the injected turn is the wrap-up turn), and closes it on every error/cancel/finish path so late frames are acked `accepted: false`. Its final `task_result` output accumulates every turn's canonical text — or the turn's streamed tool/text output when the assistant produced none — and a follow-up turn that fails or times out after the main turn banked completed output resolves as `success` with a `[control] follow-up seq=N failed/timed out` note (without completed output the failure/timeout stands — control notes alone cannot manufacture success), so a late "status?" can never turn finished work into Failed/TimedOut or replace the deliverable. The kimi, opencode2, and pebble bridges do not advertise the capability (pebble runs its CLI one-shot with no session to inject into) and therefore reject prompts explicitly.
+
+`closed` seals **admission**, not consumption: already accepted prompts drain
+in FIFO order through the final `done=true` turn. Any terminal failure, timeout
+or cancellation records each remaining accepted prompt as
+`[control] follow-up seq=N not run`. Permission-reply and SSE errors follow the
+same policy as prompt errors. Preserving success requires actual completed
+assistant/tool output; control notes alone cannot turn empty or permission-denied
+work into success. Explicit cancellation remains `cancelled` and retains completed
+output. The 16 MiB daemon WebSocket limit rejects oversized results; it does not
+truncate accumulated output or guarantee delivery of an oversized deliverable.
+The normal terminal path delivers the banked canonical turns joined. When no
+turn was banked, the task resolves `error`; accumulated output is delivered as
+diagnostics only (FG-1). Success is
+preserved through a failed or timed-out follow-up only when a turn was banked
+(canonical text, streamed text, or completed-tool output of that turn),
+including tool output from a main attempt retried successfully with no text;
+a later failed follow-up preserves that main turn's success (ER-1). Raw
+accumulated output feeds the delivered text on the failure paths but never
+the success decision itself.
+
+The daemon bounds prompts in UTF-8 bytes; the OpenCode bridge's additional
+length check uses 16,384 UTF-16 units. Its queue holds at most 64 pending prompts.
+Deduplication applies while admission is open; closed queues refuse redelivery
+too. Invalid instructions retain valid task/sequence identifiers in refusal
+acks; invalid identifiers themselves cannot be correlated.
+
+Interop: pre-WI#328 workers that never send `task_prompt_ack` still function — the daemon tolerates missing acks and ignores unknown message types, and newer workers must likewise ignore `task_prompt` if they do not implement prompting (they simply omit the capability, and the daemon never sends them the frame).
+
 ### Upgrade ordering
 
 Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers only `lunarwing-agent-v1` and cannot connect to a worker container that still only accepts the legacy name — every dispatch to such a worker fails the WebSocket upgrade (HTTP 400, no echoed subprotocol) and surfaces as an external-worker connection failure whose reason includes the `lunarwing-agent-v1` / `ironclaw-agent-v1` hint. Workers are protocol-compatible in the other direction (2.1.1 workers accept the primary name only, which pre-2.1.1 daemons also offer), so the safe upgrade order is **workers first, then the daemon**, or — simplest — recreate worker containers in the same maintenance window as the daemon. mt-admin managed upgrades (`build-tenant`, `build-pebble-worker`, `build-opencode-worker`, `build-kimi-worker`) already rebuild and recreate worker containers as part of a tenant upgrade; only manual deployments can strand a legacy-only worker.

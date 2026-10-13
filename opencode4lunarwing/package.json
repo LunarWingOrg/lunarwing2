@@ -1,0 +1,11 @@
+{
+  "name": "lunarwing-opencode-worker",
+  "private": true,
+  "description": "Type pins for the opencode worker bridge/executor self-tests and the CI tsc --noEmit lane (MR !1537 DW-9). Not shipped into the image — the Dockerfile builds the SDK from the pinned opencode source instead.",
+  "devDependencies": {
+    "@opencode-ai/sdk": "1.18.25",
+    "@types/node": "26.6.5",
+    "bun-types": "1.4.0",
+    "typescript": "5.9.3"
+  }
+}

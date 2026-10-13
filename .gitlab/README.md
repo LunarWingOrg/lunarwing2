@@ -61,8 +61,8 @@ Pinned images:
 `ci-config` enforces Rust 1.96.1 across `ic/Cargo.toml` `rust-version`,
 `ic/rust-toolchain.toml`, and both primary/MSRV image tags. It also requires
 both Rust jobs to use same digest-pinned image and keeps README digest in sync.
-Job images are declared through the `CI_LINT_IMAGE`, `CI_RUST_IMAGE`, and
-`CI_GITLEAKS_IMAGE` variables in `defaults.yml`; `ci-config` expands those
+Job images are declared through the `CI_LINT_IMAGE`, `CI_RUST_IMAGE`,
+`CI_GITLEAKS_IMAGE`, and `CI_BUN_IMAGE` variables in `defaults.yml`; `ci-config` expands those
 variables before checking pins, so overrides must stay digest-pinned too.
 
 ### Rustup component downloads and runner DNS
@@ -137,7 +137,7 @@ Permanent mitigations, in order of preference:
    `@sha256` pin. Then set project/group CI variables (unprotected,
    unmasked — image names are not secrets), e.g.
    `CI_LINT_IMAGE=registry.git.lunarwing.org/lunarwing/lunarwing2/ci/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b`
-   and likewise for `CI_RUST_IMAGE` / `CI_GITLEAKS_IMAGE`. Runners
+   and likewise for `CI_RUST_IMAGE` / `CI_GITLEAKS_IMAGE` / `CI_BUN_IMAGE`. Runners
    authenticate to the GitLab registry automatically with the job token, so
    pulls stop counting against Docker Hub entirely. When bumping an image,
    update the pinned default in `defaults.yml` and re-mirror.
@@ -206,6 +206,14 @@ candidate job — the scan can only succeed after a candidate publishes
   policy, changed-line panic policy, rustfmt, and locked Cargo metadata.
 - Protected release-tag syntax, release-note codename, and four-part to
   three-part Cargo version mapping.
+- `worker-opencode-ts`: the five OpenCode worker Bun self-tests (including
+  bridge-to-executor control-channel regressions) and strict `tsc --noEmit`.
+  Runs on every MR/branch push and protected release tag to catch cross-file
+  protocol drift; it intentionally has no path-only `changes:` filter.
+  Dependencies use `bun install --frozen-lockfile`; this MR validation job
+  publishes no shared cache, preserving the protected-cache-writer policy.
+  Override `CI_BUN_IMAGE` with a mirror of the pinned digest to avoid
+  Docker Hub quotas. Worker image rebuilds remain a separate protected gate.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL

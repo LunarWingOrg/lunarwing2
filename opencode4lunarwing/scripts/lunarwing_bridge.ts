@@ -10,11 +10,16 @@
 import {
   createEnvelope,
   parseEnvelope,
+  parseTaskPrompt,
   writeWsState,
+  MAX_CONTROL_QUEUE_PER_TASK,
   SUBPROTOCOL,
   WORKER_ID,
   WORKER_VERSION,
+  CAPABILITY_TASK_PROMPT,
   type Envelope,
+  type FollowupQueue,
+  type TaskPromptAck,
   type TaskRequest,
   type WsState,
 } from "./lunarwing_runtime"
@@ -25,6 +30,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
+import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { resolveTaskWorkspace } from "./workspace_path"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -47,6 +53,16 @@ type ActiveTask = { controller: AbortController; socket: BridgeSocket; workspace
 const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
+// WI#328 runtime control channel: queued `task_prompt` follow-ups per running
+// task. The executor drains a task's queue at turn boundaries (session idle),
+// never mid-call — mirroring the daemon's "no mid-prompt injection" contract.
+// The queue object is shared with the executor, which closes it when the task
+// finishes (or a done prompt is consumed) so late frames are refused. The
+// bridge closes it even earlier — as soon as a done=true prompt is ACCEPTED
+// (MR !1537 review DW-4) — and every frame is bound to the socket that owns
+// the task (DW-8), so one connection cannot feed another task's session.
+const activePromptQueues = new Map<string, FollowupQueue>()
+
 function taskWorkspace(request: TaskRequest): string {
   return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
 }
@@ -66,6 +82,10 @@ function sendReady(ws: BridgeSocket): void {
     worker_id: WORKER_ID,
     version: WORKER_VERSION,
     mode: "websocket",
+    // WI#328: this worker consumes task_prompt follow-ups. Workers that omit
+    // the capability get an explicit daemon-side rejection instead of
+    // silently dropping the frame.
+    capabilities: [CAPABILITY_TASK_PROMPT],
   })
   ws.send(JSON.stringify(msg))
 }
@@ -88,7 +108,11 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
         break
 
       case "cancel":
-        handleCancel(envelope.payload as { task_id: string })
+        handleCancel(envelope.payload as { task_id: string }, ws)
+        break
+
+      case "task_prompt":
+        handleTaskPrompt(envelope.payload, ws)
         break
 
       case "ping":
@@ -106,6 +130,7 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
 async function handleTaskRequest(
   request: TaskRequest,
   ws: BridgeSocket,
+  sdkOverride?: OpencodeClient,
 ): Promise<void> {
   if (!request.task_id || !request.prompt) {
     const errMsg = createEnvelope("task_result", {
@@ -162,6 +187,8 @@ async function handleTaskRequest(
   const controller = new AbortController()
   activeTasks.set(request.task_id, { controller, socket: ws, workspace })
   activeWorkspaces.set(workspace, request.task_id)
+  const promptQueue: FollowupQueue = { prompts: [], closed: false, seenSeqs: new Set() }
+  activePromptQueues.set(request.task_id, promptQueue)
 
   try {
     await executeTask(
@@ -176,21 +203,111 @@ async function handleTaskRequest(
         console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
       },
       controller.signal,
+      sdkOverride,
+      promptQueue,
     )
   } finally {
     activeTasks.delete(request.task_id)
+    activePromptQueues.delete(request.task_id)
     if (activeWorkspaces.get(workspace) === request.task_id) activeWorkspaces.delete(workspace)
   }
 }
 
-function handleCancel(payload: { task_id: string }): void {
+function handleCancel(payload: { task_id: string }, ws: BridgeSocket): void {
   const task = activeTasks.get(payload.task_id)
+  if (task && task.socket !== ws) {
+    // DW-8: a socket may only cancel its OWN tasks. Cross-socket cancel is
+    // refused loudly; the owning daemon's task keeps running.
+    console.warn(`[bridge] cancel: task ${payload.task_id} belongs to a different connection`)
+    return
+  }
   if (task) {
     console.log(`[bridge] task ${payload.task_id}: cancelled`)
     task.controller.abort()
   } else {
     console.warn(`[bridge] cancel: task ${payload.task_id} not found`)
   }
+}
+
+/**
+ * WI#328: queue a daemon follow-up prompt for a running task and ack it.
+ * The ack means "the worker received and queued it" — the executor injects
+ * queued prompts at the next turn boundary (session idle), never mid-call.
+ *
+ * Refusals (acked accepted=false so the daemon's audit log reflects the drop
+ * instead of a false delivery, MR !1525 DI-4):
+ *  - malformed payload (DW-11: non-integer/non-positive seq, empty or
+ *    oversized prompt, NUL bytes, non-boolean done),
+ *  - unknown or finished task, or a queue already closed (final drain done,
+ *    or a done=true prompt already accepted — DW-4),
+ *  - a frame arriving on a socket that does not own the task (DW-8),
+ *  - more than MAX_CONTROL_QUEUE_PER_TASK prompts waiting (DW-11).
+ * While admission is open, a re-delivered seq is deduped (accepted=true,
+ * not enqueued twice). A closed queue refuses every frame, even redeliveries.
+ */
+function handleTaskPrompt(payload: unknown, ws: BridgeSocket): void {
+  const prompt = parseTaskPrompt(payload)
+  // Preserve valid correlation fields even when the instruction is invalid;
+  // otherwise the daemon cannot match the refusal to its delivered seq.
+  const record = payload !== null && typeof payload === "object"
+    ? payload as Record<string, unknown> : undefined
+  const taskId = typeof record?.task_id === "string" ? record.task_id : ""
+  const seq = typeof record?.seq === "number" && Number.isSafeInteger(record.seq) && record.seq > 0
+    ? record.seq : 0
+  const refuse = (reason: string): void => {
+    console.warn(`[bridge] task_prompt refused: ${reason}`)
+    const ack: TaskPromptAck = { task_id: taskId, seq, accepted: false }
+    // Spread reifies the interface into an object-literal type so it stays
+    // assignable to createEnvelope's Record<string, unknown> under tsc.
+    ws.send(JSON.stringify(createEnvelope("task_prompt_ack", { ...ack })))
+  }
+  if (!prompt) {
+    refuse("malformed payload")
+    return
+  }
+  const queue = activePromptQueues.get(prompt.task_id)
+  const owner = activeTasks.get(prompt.task_id)
+  if (!queue || !owner) {
+    refuse("unknown or finished task")
+    return
+  }
+  if (owner.socket !== ws) {
+    // DW-8: the frame arrived on a different connection than the task's
+    // owner. Refuse it — the owning daemon never sees its audit ack either
+    // way, and the foreign session is not fed.
+    refuse("task belongs to a different connection")
+    return
+  }
+  if (queue.closed) {
+    refuse("control queue closed")
+    return
+  }
+  const seen = queue.seenSeqs ?? new Set<number>()
+  queue.seenSeqs = seen
+  if (seen.has(prompt.seq)) {
+    // Duplicate seq (a retransmitted frame): ack again without queueing a
+    // duplicate. The daemon itself never redelivers — delivery is at-most-once.
+    const ack: TaskPromptAck = { task_id: prompt.task_id, seq: prompt.seq, accepted: true }
+    ws.send(JSON.stringify(createEnvelope("task_prompt_ack", { ...ack })))
+    return
+  }
+  if (queue.prompts.length >= MAX_CONTROL_QUEUE_PER_TASK) {
+    refuse("per-task control queue limit reached")
+    return
+  }
+  seen.add(prompt.seq)
+  queue.prompts.push(prompt)
+  if (prompt.done) {
+    // DW-4: `done` closes the channel the moment it is ACCEPTED, not when
+    // the executor happens to consume it — a prompt accepted after this
+    // point would be queued behind a wrap-up and silently never run.
+    queue.closed = true
+  }
+  console.log(
+    `[bridge] task ${prompt.task_id}: follow-up prompt seq=${prompt.seq} queued${prompt.done ? " (wrap-up; queue closed)" : ""}`,
+  )
+  const ack: TaskPromptAck = { task_id: prompt.task_id, seq: prompt.seq, accepted: true }
+  ws.send(JSON.stringify(createEnvelope("task_prompt_ack", { ...ack })))
 }
 
 // ── Server Role ───────────────────────────────────────────────────────────────
@@ -345,12 +462,24 @@ async function startClient(): Promise<void> {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+//
+// Exported for the self-test (lunarwing_bridge_test.ts, MR !1537 DW-9); the
+// listener roles only start when this file is the entrypoint, so importing
+// it in a test does not bind a port.
 
-if (WS_ROLE === "server") {
-  startServer()
-} else if (WS_ROLE === "client") {
-  startClient()
-} else {
-  console.error(`[bridge] unknown WS_ROLE: ${WS_ROLE}`)
-  process.exit(1)
+export { handleCancel, handleMessage, handleTaskRequest, handleTaskPrompt, sendReady, activePromptQueues, activeTasks }
+
+// tsc has no type for Bun's import.meta.main; the cast keeps `tsc --noEmit`
+// clean without pulling in Bun types.
+const isEntrypoint = (import.meta as unknown as { main?: boolean }).main === true
+
+if (isEntrypoint) {
+  if (WS_ROLE === "server") {
+    startServer()
+  } else if (WS_ROLE === "client") {
+    startClient()
+  } else {
+    console.error(`[bridge] unknown WS_ROLE: ${WS_ROLE}`)
+    process.exit(1)
+  }
 }

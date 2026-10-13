@@ -61,6 +61,15 @@
           "tools": "array of { name, description, parameters (JSON schema) } — empty array on failure",
           "error": "string — present alongside tools: [] on failure (fail-closed)"
         }
+      },
+      "task_prompt": {
+        "description": "Agent → Worker: follow-up prompt/directive for a RUNNING task (WI#328 runtime control channel; not currently consumed by this worker — it does not advertise the task_prompt capability, so the daemon never sends this frame to it)",
+        "payload": {
+          "task_id": "string",
+          "seq":     "integer — monotonic per job, for ordering and dedupe",
+          "prompt":  "string — TEXT directive only; validated daemon-side (16 KiB cap, no NUL bytes)",
+          "done":    "boolean — true signals 'no more prompts coming, wrap up cleanly'"
+        }
       }
     },
 
@@ -103,9 +112,18 @@
       "ready": {
         "description": "Worker → Agent: sent once on connect to signal readiness",
         "payload": {
-          "worker_id": "string",
-          "version":   "string",
-          "mode":      "string — websocket"
+          "worker_id":     "string",
+          "version":       "string",
+          "mode":          "string — websocket",
+          "capabilities":  "array of string — optional capability advertisement (WI#328); 'task_prompt' means the worker consumes runtime control prompts (this worker does not advertise it)"
+        }
+      },
+      "task_prompt_ack": {
+        "description": "Worker → Agent: receipt for a delivered task_prompt (WI#328), not proof of execution. Sent only by capable workers. accepted=false means unknown/finished task, closed admission (including after done=true), foreign connection, invalid payload, or the 64-prompt worker queue cap. While admission is open a redelivered seq is acked accepted=true without re-queueing; closed admission refuses redeliveries too. Malformed instructions echo valid task_id/seq fields; invalid identifiers use empty task_id/seq=0 and cannot be correlated",
+        "payload": {
+          "task_id":  "string",
+          "seq":      "integer — echoes the task_prompt seq",
+          "accepted": "boolean"
         }
       }
     }
