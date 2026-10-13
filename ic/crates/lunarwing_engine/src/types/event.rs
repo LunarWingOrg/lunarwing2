@@ -604,6 +604,16 @@ mod tests {
         });
         let redacted = redact_event_params("http", &params);
         assert_eq!(redacted["headers"], "[REDACTED]");
+
+        // web_fetch shares the http branch.
+        let params = serde_json::json!({
+            "url": "https://api.example.com/data?access_token=raw-token",
+            "headers": [{"name": "Authorization", "value": "Bearer raw-token"}],
+        });
+        let redacted = redact_event_params("web_fetch", &params);
+        assert_eq!(redacted["headers"][0]["value"], "[REDACTED]");
+        let url = redacted["url"].as_str().expect("url stays a string");
+        assert!(!url.contains("raw-token"), "query credential leaked: {url}");
     }
 
     #[test]
@@ -624,6 +634,16 @@ mod tests {
         });
         let redacted = redact_event_params("http", &params);
         assert_eq!(redacted["headers"]["X-Custom"], "[REDACTED]");
+
+        // An empty value under a credential name is left alone — redacting
+        // it would falsely claim a credential was present (pins the
+        // array-branch is_present guard).
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": [{"name": "Authorization", "value": ""}],
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"][0]["value"], "");
     }
 
     #[test]
