@@ -9,6 +9,8 @@ Persistent container worker for upstream Kimi Code CLI (MoonshotAI/kimi-code). T
 - `scripts/lunarwing_bridge.ts` — The WebSocket server/client. Changes here affect protocol behavior.
 - `scripts/kimi_task_executor.ts` — Task execution via the Kimi Code CLI subprocess. Controls process spawn, stream-json parsing, timeout/cancel.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
+- `scripts/lunarwing_tool_proxy.ts` — WI#324 worker-side relay: per-task unix socket that turns the in-task MCP shim's requests into `tool_call`/`tool_list` hub frames and routes replies back by call id.
+- `scripts/lunarwing_mcp_server.ts` — WI#324 thin stdio MCP server the CLI spawns per task (registered in `$KIMI_CODE_HOME/mcp.json` by entrypoint.sh). Advertises zero tools without the per-task proxy env; the hub stays deny-by-default without a `tool_allowlist` grant.
 - `entrypoint.sh` — Startup orchestration. Two modes: websocket, cli.
 - `config/config.toml` — Kimi Code CLI default config (model, provider, thinking, fail-closed permission policy). Baked into the image. Default provider is the TensorZero gateway (function `tensorzero::function_name::FrontierCODEK`), not the managed api.kimi.com service — see README. Since WI#330 the baked `base_url` is an `.invalid` placeholder that `entrypoint.sh` refuses to run; mt-admin renders `KIMI_BASE_URL` per tenant (default: the tenant's own LLM endpoint).
 - `hooks/headless_command_guard.mjs` — WI#206 fail-closed PreToolUse guard. The 2.0.2 behavior was live-verified; the 2.1.1 CLI contract gate still needs a protected worker image build. Print mode forces the auto policy, the upstream dangerous-command guard is skipped in auto mode, and `[[permission.rules]]` never load from config — this hook is the only in-CLI enforcement point for the headless lane.
@@ -21,7 +23,7 @@ The `lunarwing-agent-v1` WebSocket subprotocol is shared with Pebble and OpenCod
 
 The Dockerfile installs the official Kimi Code CLI with `npm ci` from `kimi-cli/package-lock.json`; update that lock and the `KIMI_CODE_VERSION` default together. The bridge uses `scripts/package-lock.json`. Base images, Debian package indexes, rustup, and Go archives are pinned, so refresh their recorded digests/checksums deliberately rather than restoring unlocked installers.
 
-The in-image test gate runs `npm test` first, then re-runs just the real-CLI contract lane (`scripts/kimi_cli_contract_test.ts`) against the locked CLI — that lane self-skips on a host with no kimi binary, so the Dockerfile is the only place the flag contract (headless `-p` accepted, `--yolo` rejected alongside `-p`, and the baked `[[hooks]]` PreToolUse guard table valid) is asserted for real.
+The in-image test gate runs `npm test` first, then re-runs just the real-CLI contract lane (`scripts/kimi_cli_contract_test.ts`) against the locked CLI — that lane self-skips on a host with no kimi binary, so the Dockerfile is the only place the flag contract (headless `-p` accepted, `--yolo` rejected alongside `-p`, and the baked `[[hooks]]` PreToolUse guard table valid) is asserted for real. Since MR !1549 (WI#324 EF-5) the lane also pins the MCP contract the tool-proxy shim relies on: the CLI loads `$KIMI_CODE_HOME/mcp.json`, spawns the stdio server with parent-env pass-through, and completes `initialize` → `tools/list` over NDJSON.
 
 ## Do Not
 

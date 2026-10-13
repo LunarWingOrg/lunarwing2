@@ -293,6 +293,23 @@ pub struct CronWorkerConfig {
     /// rejects the worker at load.
     #[serde(default)]
     pub timezone: Option<String>,
+    /// Tool-proxy authority for cron **tick** jobs (WI#324, MR !1506 CQ-10).
+    /// Deliberately separate from the worker-level `tool_allowlist`: a cron
+    /// mission fires unattended on a schedule, so tick jobs never inherit the
+    /// interactive list — grant the schedule its own (usually narrower) set
+    /// here. Default: empty — every `tool_call` from a tick job is denied.
+    /// Sanitized with the same rules as the worker-level list at manager load
+    /// (phase-1 positive set, denylist drops, cleartext strip).
+    /// MR !1549 EF-1: a cron worker's worker-level list is stripped at
+    /// manager load (one container = one authority domain), so this is the
+    /// ONLY proxy authority a cron worker container holds — ordinary
+    /// dispatches to it get no proxied tools either.
+    /// Serialized only when non-empty (MR !1549 EF-6): `CronWorkerConfig` is
+    /// `deny_unknown_fields`, so an older binary rejects any config carrying
+    /// this field at all — write-backs must not introduce
+    /// `tool_allowlist = []` or a rollback could no longer boot the config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_allowlist: Vec<String>,
 }
 
 impl CronWorkerConfig {
@@ -519,6 +536,15 @@ pub struct ExternalWorkerConfig {
     /// (the proxy surface is the positive WI#324 phase-1 capability set,
     /// MR !1533 DP-2), and strips the whole list when the worker is reached
     /// over cleartext `ws://` on a non-loopback host.
+    ///
+    /// This list governs **ordinary (task-mode) dispatches only**. Cron tick
+    /// jobs on a `mode = "cron"` worker use `cron.tool_allowlist` instead
+    /// (MR !1506 CQ-10): a schedule is standing unattended authority, so the
+    /// mission's grant is an explicit separate decision. On a cron-mode worker
+    /// this worker-level list is stripped at manager load (MR !1549 EF-1): one
+    /// worker container is one authority domain shared by every concurrent and
+    /// successive job in it, so a tick could otherwise borrow the interactive
+    /// grant through another task's relay socket.
     pub tool_allowlist: Vec<String>,
     /// Operating mode (default task). `Cron` arms the host-side mission
     /// supervisor. The worker still accepts ordinary bounded dispatches, but
@@ -595,6 +621,19 @@ impl ExternalWorkerConfig {
                 // of booting a worker whose mission supervisor can never run.
                 if config.is_cron() && !config.cron_block_valid(&mut seen_mission_ids) {
                     return None;
+                }
+                // MR !1506 CQ-10 / MR !1549 EF-1: tick jobs use
+                // `cron.tool_allowlist`, never the worker-level list, and the
+                // manager strips a cron worker's worker-level list at load
+                // (one container = one authority domain). Say so when a
+                // configured list would otherwise silently vanish.
+                if config.is_cron() && !config.tool_allowlist.is_empty() {
+                    tracing::warn!(
+                        worker = %config.name,
+                        "External worker is mode=cron with a worker-level tool_allowlist; \
+                         the manager strips it at load — grant tick authority via \
+                         cron.tool_allowlist (ordinary dispatches get no proxied tools)"
+                    );
                 }
                 // A [cron] block on a task-mode worker is ignored — say so
                 // instead of letting the operator believe a mission is armed.

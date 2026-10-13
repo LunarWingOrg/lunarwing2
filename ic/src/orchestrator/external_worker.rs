@@ -474,6 +474,33 @@ impl ExternalWorkerManager {
             }
             config.tool_allowlist =
                 sanitize_tool_allowlist(&config.name, &config.tool_allowlist, cleartext_remote);
+            // MR !1506 CQ-10: cron tick jobs draw authority from the separate
+            // `cron.tool_allowlist`; sanitize it with the same rules.
+            if let Some(cron) = config.cron.as_mut() {
+                let cron_list_name = format!("{} (cron tick)", config.name);
+                cron.tool_allowlist = sanitize_tool_allowlist(
+                    &cron_list_name,
+                    &cron.tool_allowlist,
+                    cleartext_remote,
+                );
+            }
+            // MR !1549 EF-1: a worker container is one authority domain
+            // shared by every concurrent and successive job running in it —
+            // any same-uid process can connect to another task's tool-proxy
+            // relay socket and borrow that job's grant. A worker-level list
+            // on a cron-mode worker would therefore be standing authority
+            // available to every tick, defeating the CQ-10 split. Strip it:
+            // a cron worker container never holds more than
+            // `cron.tool_allowlist`.
+            if config.is_cron() && !config.tool_allowlist.is_empty() {
+                tracing::error!(
+                    "External worker '{}' is mode=cron but sets a worker-level tool_allowlist; \
+                     stripping it — a cron worker container holds only cron.tool_allowlist \
+                     authority (ordinary dispatches to it get no proxied tools)",
+                    config.name
+                );
+                config.tool_allowlist = Vec::new();
+            }
             let endpoints = config.endpoints();
             load_balancers.insert(
                 config.name.clone(),
@@ -648,7 +675,20 @@ impl ExternalWorkerManager {
         let store = self.store.clone();
         let tool_binding = ToolProxyBinding {
             proxy: self.tool_proxy.clone(),
-            allowlist: Arc::from(config.tool_allowlist.as_slice()),
+            // MR !1506 CQ-10: a cron tick job is standing, unattended tool
+            // authority — it draws from the mission's own `cron.tool_allowlist`
+            // (default empty), never the interactive worker-level list.
+            allowlist: if context.cron_tick.is_some() {
+                Arc::from(
+                    config
+                        .cron
+                        .as_ref()
+                        .map(|cron| cron.tool_allowlist.as_slice())
+                        .unwrap_or(&[]),
+                )
+            } else {
+                Arc::from(config.tool_allowlist.as_slice())
+            },
         };
         let active_handles = Arc::clone(&self.active_handles);
         let pool = Arc::clone(&self.pool);
@@ -3221,13 +3261,45 @@ async fn build_tool_catalog(
                     // the catalog entry even when the registry uses an alias.
                     name: name.clone(),
                     description: tool.description().to_string(),
-                    parameters: tool.parameters_schema(),
+                    parameters: proxied_catalog_schema(&resolved, tool.parameters_schema()),
                 });
             }
         }
         tools.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     }
     Envelope::new("tool_catalog", serde_json::json!({ "tools": tools }))
+}
+
+/// MR !1549 EF-4: the catalog must advertise the schema the proxy boundary
+/// actually accepts. The DX-2 guard denies any explicit `layer`, and an
+/// omitted `target` resolves to `daily_log`, which the prompt-file
+/// classification rejects — so the tool's own schema (layer accepted, target
+/// defaulting to daily_log) would advertise calls that are always denied.
+/// The proxied memory_write schema drops `layer` (and the layer-only
+/// `force`), makes `target` required, and describes the allowed paths.
+fn proxied_catalog_schema(resolved_name: &str, original: serde_json::Value) -> serde_json::Value {
+    if resolved_name != "memory_write" {
+        return original;
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The content to write to memory. Be concise but include relevant context."
+            },
+            "target": {
+                "type": "string",
+                "description": "Workspace-memory path to write, e.g. 'notes/today.md' or 'projects/alpha/notes.md'. REQUIRED on this surface: there is no default — the named shortcuts ('memory', 'daily_log', 'heartbeat', 'bootstrap'), identity/config files, lorebooks, daily logs and 'engine/**' paths are all denied by the proxy boundary."
+            },
+            "append": {
+                "type": "boolean",
+                "description": "If true, append to existing content; if false, replace it (the previous version is kept at backups/<path>.bak).",
+                "default": true
+            }
+        },
+        "required": ["content", "target"]
+    })
 }
 
 /// Marker prefix workers use for synthetic keep-alive progress (WI#263).
@@ -3618,6 +3690,33 @@ mod tests {
         let probe: TypeProbe<'_> = serde_json::from_str(raw).expect("escaped type");
         assert_eq!(probe.msg_type, "tool_call");
         assert!(matches!(probe.msg_type, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn proxied_memory_write_schema_drops_layer_and_requires_target() {
+        // MR !1549 EF-4: the DX-2 guard denies any explicit `layer` and an
+        // omitted target resolves to the always-denied daily_log — the
+        // catalog must not advertise a shape that can never succeed.
+        let original = serde_json::json!({
+            "type": "object",
+            "properties": { "content": {"type": "string"}, "layer": {"type": "string"} },
+            "required": ["content"]
+        });
+        let schema = proxied_catalog_schema("memory_write", original.clone());
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(!props.contains_key("layer"), "layer must not be advertised");
+        assert!(
+            !props.contains_key("force"),
+            "layer-only force must not be advertised"
+        );
+        assert!(props.contains_key("content") && props.contains_key("target"));
+        let required = schema["required"].as_array().expect("required");
+        assert!(required.contains(&serde_json::json!("target")));
+        // Other tools keep their own schema untouched.
+        assert_eq!(
+            proxied_catalog_schema("memory_read", original.clone()),
+            original
+        );
     }
 
     #[test]

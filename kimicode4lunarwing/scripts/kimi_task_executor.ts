@@ -135,6 +135,10 @@ export async function executeTask(
   onResult: ResultCallback,
   abortSignal?: AbortSignal,
   resolvedWorkDir?: string,
+  // WI#324: bridge-injected bindings (tool-proxy socket, task id). Applied
+  // AFTER request.context.environment so task-supplied env can never shadow
+  // the proxy binding for the MCP shim.
+  extraEnv?: Record<string, string>,
 ): Promise<void> {
   const startTime = Date.now()
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
@@ -288,6 +292,8 @@ export async function executeTask(
     // process.env — concurrent tasks in different workspaces must not see
     // each other's variables (no mutation means nothing to leak or restore).
     const env: NodeJS.ProcessEnv = { ...process.env, ...request.context?.environment }
+    // WI#324: the bridge's tool-proxy binding overrides task-supplied env.
+    if (extraEnv) Object.assign(env, extraEnv)
     // WI#206: a task (or a prompt-injected command inside it) must not be able
     // to lower its own approval policy. These are stripped per task even
     // though the entrypoint also unsets them — request.context.environment is
