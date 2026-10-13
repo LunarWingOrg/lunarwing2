@@ -2692,12 +2692,20 @@ async fn dispatch_control_prompt(
 /// envelope (WI#328). The channel carries TEXT directives only; content was
 /// validated at enqueue. Callers decide what a send failure means —
 /// [`dispatch_control_prompt`] treats it as a lost prompt, not a dead task.
-async fn deliver_control_prompt(
-    write: &mut WsWrite,
+/// Generic over the stream so tests can exercise the real wire format over
+/// an in-memory duplex pair (MR !1552 review EJ-4).
+async fn deliver_control_prompt<S>(
+    write: &mut futures::stream::SplitSink<
+        WebSocketStream<S>,
+        tokio_tungstenite::tungstenite::Message,
+    >,
     job_id: Uuid,
     worker_name: &str,
     control: &ControlPrompt,
-) -> Result<(), OrchestratorError> {
+) -> Result<(), OrchestratorError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let env = Envelope::new(
         "task_prompt",
         serde_json::json!({
@@ -4725,28 +4733,41 @@ mod tests {
             .await;
     }
 
-    #[test]
-    fn task_prompt_envelope_shape() {
+    #[tokio::test]
+    async fn task_prompt_envelope_over_wire() {
+        // EJ-4: exercise the real deliver_control_prompt serialization and
+        // framing instead of hand-building a parallel JSON literal.
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (mut write, _client_read) = client_ws.split();
+        let (_server_write, mut server_read) = server_ws.split();
+
         let job_id = Uuid::new_v4();
         let control = ControlPrompt {
             seq: 3,
             prompt: "wrap up".to_string(),
             done: true,
         };
-        let env = Envelope::new(
-            "task_prompt",
-            serde_json::json!({
-                "task_id": job_id.to_string(),
-                "seq": control.seq,
-                "prompt": control.prompt,
-                "done": control.done,
-            }),
-        );
-        let json = serde_json::to_string(&env).unwrap();
-        assert!(json.contains("\"type\":\"task_prompt\""));
-        assert!(json.contains("\"seq\":3"));
-        assert!(json.contains("\"done\":true"));
-        assert!(json.contains(&format!("\"task_id\":\"{job_id}\"")));
+        deliver_control_prompt(&mut write, job_id, "harness", &control)
+            .await
+            .unwrap();
+
+        let message = server_read.next().await.unwrap().unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+            panic!("expected a text frame, got {message:?}");
+        };
+        let env: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(env["type"], "task_prompt");
+        assert!(env["id"].is_string());
+        assert!(env["timestamp"].is_string());
+        assert_eq!(env["payload"]["task_id"], job_id.to_string());
+        assert_eq!(env["payload"]["seq"], 3);
+        assert_eq!(env["payload"]["prompt"], "wrap up");
+        assert_eq!(env["payload"]["done"], true);
     }
 
     #[test]
