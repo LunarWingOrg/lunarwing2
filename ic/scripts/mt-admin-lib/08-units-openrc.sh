@@ -1523,7 +1523,17 @@ _openrc_stop_service() {
 
 _openrc_stop_service_if_installed() {
   local service="$1"
-  [[ -f "$OPENRC_INITD_DIR/$service" && ! -L "$OPENRC_INITD_DIR/$service" ]] || return 0
+  local path="$OPENRC_INITD_DIR/$service"
+  # Only a truly absent unit is "already stopped" (EQ-2). A present but
+  # non-regular or symlinked entry is not ours to classify (FL-3): refuse
+  # rather than let remove-tenant/upgrade-tenant proceed without a stop.
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    say "refusing to skip stop: $path exists but is not a regular init script"
+    return 1
+  fi
   _openrc_stop_service "$service"
 }
 

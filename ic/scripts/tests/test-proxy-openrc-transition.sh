@@ -235,4 +235,44 @@ done <<'MATRIX'
 1,,refuse
 MATRIX
 
+# FL-3/FL-4 stop classification: only a truly absent unit is "already
+# stopped" (EQ-2). An installed unit whose stop fails, and a present but
+# symlinked unit (not mt-admin's to classify), both fail the stop; an empty
+# init.d stops nothing and succeeds without a single rc-service call.
+(
+  OPENRC_INITD_DIR="$fixture/empty-initd"
+  mkdir -p "$OPENRC_INITD_DIR"
+  rm -f -- "$fixture/service-calls"
+  rc=0
+  ( stop_tenant_openrc alice ) >"$fixture/stop.log" 2>&1 || rc=$?
+  [[ "$rc" == 0 ]] || fail 'empty init.d did not stop cleanly'
+  [[ ! -e "$fixture/service-calls" ]] || fail 'empty init.d made rc-service calls'
+)
+(
+  OPENRC_INITD_DIR="$fixture/failing-initd"
+  mkdir -p "$OPENRC_INITD_DIR"
+  printf '# unit\n' >"$OPENRC_INITD_DIR/lunarwing-alice"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-alice"
+  rc-service() { printf 'rc-service %s\n' "$*" >>"$fixture/service-calls"; return 1; }
+  rm -f -- "$fixture/service-calls"
+  rc=0
+  ( stop_tenant_openrc alice ) >"$fixture/stop.log" 2>&1 || rc=$?
+  [[ "$rc" == 1 ]] || fail 'a failed stop of an installed unit did not fail the stop'
+  grep -Fq 'lunarwing-alice stop' "$fixture/service-calls" \
+    || fail 'installed unit was never asked to stop'
+)
+(
+  OPENRC_INITD_DIR="$fixture/symlink-initd"
+  mkdir -p "$OPENRC_INITD_DIR"
+  ln -s "$fixture/missing-target" "$OPENRC_INITD_DIR/lunarwing-alice"
+  rm -f -- "$fixture/service-calls"
+  rc=0
+  ( stop_tenant_openrc alice ) >"$fixture/stop.log" 2>&1 || rc=$?
+  [[ "$rc" == 1 ]] || fail 'a symlinked unit counted as already stopped'
+  [[ ! -e "$fixture/service-calls" ]] \
+    || fail 'symlinked unit reached rc-service instead of being refused'
+  grep -Fq 'not a regular init script' "$fixture/stop.log" \
+    || fail 'symlinked unit refusal did not name the reason'
+)
+
 printf 'ALL TESTS PASSED\n'
