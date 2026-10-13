@@ -257,6 +257,13 @@ export async function executeTask(
     closeEvents = () => void eventIterator.return?.()
 
     let nextPrompt = buildTaskPrompt(request)
+    // Completed tool output of the CURRENT turn, accumulated across its retry
+    // attempts (MR !1552 ES-1): turnStreamed resets per attempt, so a tool-only
+    // turn whose first attempt produced output and then failed retryably would
+    // otherwise bank nothing when the retry succeeds silently. Only completed
+    // tools count — never tool errors, partial text, or retry diagnostics — so
+    // a failing turn cannot manufacture success.
+    let turnToolOutput = ""
     for (let attempt = 0; ; attempt++) {
       let sessionErrorMsg = ""
       const promptText = nextPrompt
@@ -328,6 +335,7 @@ export async function executeTask(
             const delta = `[${toolName}] ${toolOutput || "completed"}`
             output += delta + "\n"
             turnStreamed += delta + "\n"
+            turnToolOutput += delta + "\n"
             emitProgress(delta)
           }
 
@@ -406,7 +414,7 @@ export async function executeTask(
         // Turn finished cleanly; bank its canonical text (DI-3) — or, when
         // the assistant produced no text, this turn's streamed output (DW-7),
         // so a tool-only main turn survives a later "status?" follow-up.
-        const turnText = extractAssistantText(promptData?.parts) || turnStreamed.trim()
+        const turnText = extractAssistantText(promptData?.parts) || turnStreamed.trim() || turnToolOutput.trim()
         if (turnText) canonicalTurns.push(turnText)
         // A queued follow-up prompt (WI#328 runtime control channel)
         // continues the SAME session instead of resolving the task: the
@@ -435,6 +443,7 @@ export async function executeTask(
               `FOLLOW-UP INSTRUCTION (seq=${followup.seq}) from the orchestrator:\n` +
               followup.prompt
           }
+          turnToolOutput = "" // the follow-up starts a fresh turn
           attempt = -1 // each follow-up turn gets its own transient-retry budget
           continue
         }
@@ -512,7 +521,7 @@ export async function executeTask(
       notes.push(`[control] follow-up seq=${pending.seq} not run: task ended before this turn`)
     }
     const resultOutput = [banked || output.trim(), ...notes].filter(Boolean).join("\n\n")
-    const preserveSuccess = currentFollowupSeq !== undefined && Boolean(banked || output.trim())
+    const preserveSuccess = currentFollowupSeq !== undefined && canonicalTurns.length > 0
     if (stopped) {
       closeEvents?.()
       await abortSession()

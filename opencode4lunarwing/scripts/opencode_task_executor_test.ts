@@ -751,6 +751,146 @@ assert.ok(toolOnlyResults[0]!.output.includes("status: done"))
   }
 }
 
+// !1552 ES-1 (run-82 review): with an EMPTY main turn, a failing turn's own
+// partial stream, tool errors, or retry diagnostics must not manufacture
+// success — only banked completed output (canonicalTurns) preserves it.
+// G1: the follow-up streams a tool ERROR, then fails.
+{
+  const sdk = makeSdk({
+    events: [
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            sessionID: "session-1", type: "tool", tool: "bash",
+            state: { status: "error", error: "permission denied" },
+          },
+        },
+      },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+    parts: [],
+    assistantErrors: [undefined, { message: "follow-up failed" }],
+  })
+  const queue: FollowupQueue = {
+    prompts: [{ task_id: "es1-g1", seq: 1, prompt: "status?", done: false }],
+    closed: false,
+  }
+  const results: Array<{ status: string; output: string; error: string | null }> = []
+  await executeTask(
+    { task_id: "es1-g1", prompt: "build" },
+    () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+  )
+  assert.equal(results.length, 1)
+  assert.equal(results[0]!.status, "error", "a failing turn's tool error must not preserve success")
+  assert.match(results[0]!.error!, /without assistant text or tool output; follow-up failed: follow-up failed/)
+  assert.match(results[0]!.output, /\[control\] follow-up seq=1 failed: follow-up failed/)
+}
+
+// G2: the follow-up streams partial text, then fails.
+{
+  const sdk = makeSdk({
+    events: [
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            sessionID: "session-1", type: "text",
+            text: "Let me start by", time: { end: 1 },
+          },
+        },
+      },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+    parts: [],
+    assistantErrors: [undefined, { message: "follow-up failed" }],
+  })
+  const queue: FollowupQueue = {
+    prompts: [{ task_id: "es1-g2", seq: 1, prompt: "status?", done: false }],
+    closed: false,
+  }
+  const results: Array<{ status: string; output: string; error: string | null }> = []
+  await executeTask(
+    { task_id: "es1-g2", prompt: "build" },
+    () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+  )
+  assert.equal(results.length, 1)
+  assert.equal(results[0]!.status, "error", "a failing turn's partial text must not preserve success")
+  assert.match(results[0]!.error!, /without assistant text or tool output; follow-up failed: follow-up failed/)
+}
+
+// G3: the main turn is retried once (only retry diagnostics in `output`),
+// then the follow-up fails.
+{
+  const savedDelay = process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+  process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = "0"
+  try {
+    const sdk = makeSdk({
+      events: [
+        { type: "session.idle", properties: { sessionID: "session-1" } },
+        { type: "session.idle", properties: { sessionID: "session-1" } },
+        { type: "session.idle", properties: { sessionID: "session-1" } },
+      ],
+      parts: [],
+      assistantErrors: [
+        { message: "upstream provider timed out" }, undefined,
+        { message: "follow-up failed" },
+      ],
+    })
+    const queue: FollowupQueue = {
+      prompts: [{ task_id: "es1-g3", seq: 1, prompt: "status?", done: false }],
+      closed: false,
+    }
+    const results: Array<{ status: string; output: string; error: string | null }> = []
+    await executeTask(
+      { task_id: "es1-g3", prompt: "build" },
+      () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+    )
+    assert.equal(results.length, 1)
+    assert.equal(sdk.promptArgs.length, 3)
+    assert.equal(results[0]!.status, "error", "retry diagnostics must not preserve success")
+    assert.match(results[0]!.error!, /without assistant text or tool output; follow-up failed: follow-up failed/)
+  } finally {
+    if (savedDelay === undefined) delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+    else process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = savedDelay
+  }
+}
+
+// G4: the FINAL turn streams partial text, then hits the task timeout.
+{
+  const sdk = makeSdk({
+    events: [
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+      {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            sessionID: "session-1", type: "text",
+            text: "Let me start by", time: { end: 1 },
+          },
+        },
+      },
+    ],
+    parts: [],
+    pendingAfterEvents: true,
+  })
+  const queue: FollowupQueue = {
+    prompts: [{ task_id: "es1-g4", seq: 1, prompt: "wrap up", done: true }],
+    closed: true,
+  }
+  const results: Array<{ status: string; output: string; error: string | null }> = []
+  await executeTask(
+    { task_id: "es1-g4", prompt: "build", timeout_ms: 50 },
+    () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+  )
+  assert.equal(results.length, 1)
+  assert.equal(results[0]!.status, "timed_out", "a timed-out empty FINAL turn must stay timed_out")
+  assert.equal(results[0]!.error, "Task timed out after 50ms")
+  assert.match(results[0]!.output, /\[control\] follow-up seq=1 timed out before completing/)
+}
+
 // MR !1537 DW-10: a stale idle event published BEFORE the follow-up turn was
 // seen busy must not end that turn early — the turn must still answer its
 // permission ask and run to its real idle.
