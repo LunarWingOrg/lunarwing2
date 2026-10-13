@@ -254,3 +254,81 @@ setTimeout(() => {
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test("a closed hub socket fails the task's in-flight tool call at once", async () => {
+  // MR !1571 run-87 residual gap: the bridge's two dropHubSocket call sites
+  // (both close handlers) were unpinned — deleting both left every suite
+  // green. The mock CLI below ignores the abort's SIGTERM, so the only thing
+  // that can answer its parked IPC call quickly is the relay's dropHubSocket
+  // wired into the close handler: without it the waiter parks until the
+  // proxy timeout and the abort's SIGKILL (kill grace, default 7 s) reaps
+  // the CLI first — no marker with the closed-hub text ever appears.
+  const root = mkdtempSync(join(tmpdir(), "kimi-proxy-drop-"))
+  const bin = join(root, "mock-kimi")
+  const marker = join(root, "ipc-reply.json")
+  writeFileSync(bin, `#!/usr/bin/env node
+const fs = require("node:fs")
+const net = require("node:net")
+process.on("SIGTERM", () => {})
+const conn = net.connect(process.env.LUNARWING_TOOL_PROXY_SOCKET)
+conn.on("connect", () => {
+  conn.write(JSON.stringify({
+    op: "call", call_id: "drop1", name: "memory_read", arguments: {},
+  }) + "\\n")
+})
+let buf = ""
+conn.on("data", (d) => {
+  buf += d.toString()
+  const i = buf.indexOf("\\n")
+  if (i < 0) return
+  fs.writeFileSync(${JSON.stringify(marker)}, buf.slice(0, i))
+  process.exit(0)
+})
+`, { mode: 0o755 })
+  const proxyDir = join(root, "proxy")
+  const port = await freePort()
+  const child = startBridge(port, "drop-test-token", {
+    WORKSPACE_ROOT: root,
+    KIMI_BIN: bin,
+    LUNARWING_TOOL_PROXY_DIR: proxyDir,
+    // Keep the proxy timeout far above the observation window so only the
+    // dropHubSocket wiring can produce the marker in time.
+    LUNARWING_TOOL_PROXY_TIMEOUT_MS: "60000",
+  })
+  let ws: WebSocket | undefined
+  try {
+    await waitForListening(child)
+    ws = await connect(port, "drop-test-token")
+    const sawCall = new Promise<void>((resolve, reject) => {
+      ws!.on("message", (data) => {
+        const message = JSON.parse(data.toString())
+        if (message.type === "tool_call" && message.payload.call_id === "drop1") resolve()
+      })
+      ws!.once("error", reject)
+    })
+    ws.send(JSON.stringify({ type: "task_request", payload: {
+      task_id: "drop-task", prompt: "read a note", timeout_ms: 30000,
+    }}))
+    // Park the call in the relay: the hub observes the frame but never
+    // answers, then closes the connection.
+    await sawCall
+    ws.close()
+    const deadline = Date.now() + 5000
+    let body = ""
+    while (Date.now() < deadline) {
+      if (existsSync(marker)) {
+        body = readFileSync(marker, "utf8")
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.notEqual(body, "", "the IPC call must be answered promptly after the hub socket closed")
+    const reply = JSON.parse(body) as { status?: unknown; error?: unknown }
+    assert.equal(reply.status, "error")
+    assert.match(String(reply.error), /hub connection closed/)
+  } finally {
+    ws?.close()
+    child.kill("SIGTERM")
+    rmSync(root, { recursive: true, force: true })
+  }
+})
