@@ -2228,16 +2228,19 @@ mod tests {
             // Replaces 1..=cap+1 fill every numbered generation without taking
             // the discard branch (the last one occupies the cap slot).
             for version in 1..=(cap + 1) {
-                write.execute(
-                    serde_json::json!({
-                        "content": format!("version {version}"),
-                        "target": "daily_log",
-                        "append": false,
-                    }),
-                    &ctx,
-                )
-                .await
-                .unwrap_or_else(|e| panic!("replace {version} below/at the cap must succeed: {e}"));
+                write
+                    .execute(
+                        serde_json::json!({
+                            "content": format!("version {version}"),
+                            "target": "daily_log",
+                            "append": false,
+                        }),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("replace {version} below/at the cap must succeed: {e}")
+                    });
             }
             assert!(
                 workspace
