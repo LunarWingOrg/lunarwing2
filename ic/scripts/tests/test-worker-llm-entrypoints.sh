@@ -247,6 +247,36 @@ def run_oneshot_startup(worker, mode):
             f"{worker} {mode}: hub-handshake token reached the one-shot task env (WI#373)"
 
 
+def run_pebble_cli_startup():
+    """WI#373 (pebble cli mode): same one-shot boundary; the pebble process
+    must not inherit the hub-handshake credential."""
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with tempfile.TemporaryDirectory(prefix="pebble-cli373-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        mark = root / "pebble-cli-env.txt"
+        stub = bin_dir / "pebble"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"if [ -n \"$AGENT_AUTH_TOKEN\" ]; then echo PRESENT > {mark};"
+            f" else echo ABSENT > {mark}; fi\n"
+            "exit 0\n"
+        )
+        stub.chmod(0o755)
+        result = subprocess.run(
+            ["bash", "-s", "--", "probe prompt"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "cli",
+                 "AGENT_AUTH_TOKEN": "bridge-secret-64hex"},
+            capture_output=True, timeout=60)
+        assert result.returncode == 0, f"pebble cli: entrypoint failed: {result.stderr}"
+        assert mark.exists(), f"pebble cli: stub did not run: {result.stderr}"
+        assert mark.read_text().strip() == "ABSENT", \
+            "pebble cli: hub-handshake token reached the one-shot task env (WI#373)"
+
+
 for worker in workers:
     key = f"{worker.upper()}_BASE_URL"
     for label, overrides in (
@@ -286,4 +316,6 @@ for worker in ("kimi", "opencode", "opencode2"):
     for mode in modes:
         run_oneshot_startup(worker, mode)
         print(f"PASS: {worker} {mode} one-shot runs without the hub-handshake token (WI#373)")
+run_pebble_cli_startup()
+print("PASS: pebble cli one-shot runs without the hub-handshake token (WI#373)")
 PY
