@@ -2545,11 +2545,7 @@ async fn cron_worker_worker_level_allowlist_is_stripped_at_load() {
 
     let mut config = cron_config_with_schedule(&url, "0 15 10 * * *", 300, 2);
     config.tool_allowlist = vec!["knowledge_search".to_string()];
-    config
-        .cron
-        .as_mut()
-        .expect("cron block")
-        .tool_allowlist = vec!["knowledge_search".to_string()];
+    config.cron.as_mut().expect("cron block").tool_allowlist = vec!["knowledge_search".to_string()];
     let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
     let job_id = Uuid::new_v4();
     let res = timeout(

@@ -3774,7 +3774,9 @@ mod tests {
         // the proxy boundary can never produce (the backups/<path>.bak
         // shadow copy is kept only for prompt-visible files, which the
         // boundary denies).
-        let append_desc = props["append"]["description"].as_str().expect("append desc");
+        let append_desc = props["append"]["description"]
+            .as_str()
+            .expect("append desc");
         assert!(
             !append_desc.contains("previous version is kept"),
             "the proxied append text must not promise a backup: {append_desc}"
@@ -3808,7 +3810,10 @@ mod tests {
             "proxied description must name explicit workspace paths: {desc}"
         );
         // Other tools keep their own description untouched.
-        assert_eq!(proxied_catalog_description("memory_read", "original"), "original");
+        assert_eq!(
+            proxied_catalog_description("memory_read", "original"),
+            "original"
+        );
     }
 
     #[test]
