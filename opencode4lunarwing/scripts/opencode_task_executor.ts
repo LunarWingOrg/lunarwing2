@@ -13,7 +13,7 @@ import {
   type TaskResult,
   DEFAULT_TIMEOUT_MS,
 } from "./lunarwing_runtime"
-import { extractAssistantText, opencodeErrorMessage } from "./opencode_result"
+import { extractAssistantText, opencodeErrorMessage, withServeLogDetail } from "./opencode_result"
 import { expandWorkspacePath } from "./workspace_path"
 
 const OPENCODE_HOST = process.env.OPENCODE_SERVE_HOST || "127.0.0.1"
@@ -425,7 +425,7 @@ export async function executeTask(
       task_id: request.task_id,
       status: "error",
       output: output.trim(),
-      error: errorMsg,
+      error: await withServeLogDetail(errorMsg),
       duration_ms: durationMs,
     })
   } finally {
