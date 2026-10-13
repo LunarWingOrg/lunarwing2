@@ -941,8 +941,21 @@ impl MissionManager {
             MissionCadence::Webhook { path, .. } => Some(path.as_str()),
             _ => None,
         };
+        // WI#359 (CJ-4): the check-then-save sequence must be atomic
+        // against creates and other claim transitions — this mission's own
+        // fire lock does not serialize against those. Hold the shared
+        // create/claim lock from the check until the save below. Lock
+        // order is fire lock → create lock; `create_mission_detailed`
+        // never takes a fire lock, so no ABBA.
+        let makes_new_claim = new_webhook_path.is_some()
+            && new_webhook_path.as_deref() != old_webhook_path.as_deref();
+        let _claim_guard = if makes_new_claim {
+            Some(self.mission_create_lock.lock().await)
+        } else {
+            None
+        };
         if let Some(path) = new_webhook_path
-            && Some(path) != old_webhook_path.as_deref()
+            && makes_new_claim
         {
             self.ensure_webhook_path_unclaimed(
                 mission.project_id,
@@ -1050,6 +1063,15 @@ impl MissionManager {
         // WI#352 (AO-1): re-check the webhook single-owner rule before
         // reactivating — legacy data or a pre-rule conflict could leave two
         // owners on the path, and a fire matches every Active mission on it.
+        // WI#359 (CJ-4): hold the shared create/claim lock across the check
+        // and the save so a concurrent create or claim-changing update
+        // cannot slip a second owner onto the path between them. Lock order
+        // is fire lock → create lock (see update_mission).
+        let _claim_guard = if matches!(mission.cadence, MissionCadence::Webhook { .. }) {
+            Some(self.mission_create_lock.lock().await)
+        } else {
+            None
+        };
         if let MissionCadence::Webhook { path, .. } = &mission.cadence {
             self.ensure_webhook_path_unclaimed(
                 mission.project_id,
@@ -4883,6 +4905,11 @@ mod tests {
         failing_mission_saves: tokio::sync::RwLock<Vec<MissionId>>,
         failing_thread_loads: tokio::sync::RwLock<Vec<ThreadId>>,
         failing_thread_saves: tokio::sync::RwLock<Vec<ThreadId>>,
+        /// CJ-4 test hook: when set, `list_all_missions` waits on this
+        /// barrier (bounded by a timeout) before answering, so two racing
+        /// webhook-claim checks can be forced to both complete before
+        /// either save lands.
+        list_all_missions_barrier: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl TestStore {
@@ -4896,6 +4923,7 @@ mod tests {
                 failing_mission_saves: tokio::sync::RwLock::new(Vec::new()),
                 failing_thread_loads: tokio::sync::RwLock::new(Vec::new()),
                 failing_thread_saves: tokio::sync::RwLock::new(Vec::new()),
+                list_all_missions_barrier: None,
             }
         }
 
@@ -5054,14 +5082,23 @@ mod tests {
             &self,
             project_id: ProjectId,
         ) -> Result<Vec<Mission>, EngineError> {
-            Ok(self
+            // CJ-4 hook: snapshot FIRST, then wait on the barrier — a race
+            // repro needs both contenders to check against state from before
+            // either save. Bounded: a serialized (post-fix) contender blocks
+            // on the claim lock instead of reaching this barrier, so an
+            // unbounded wait would deadlock the test.
+            let snapshot: Vec<Mission> = self
                 .missions
                 .read()
                 .await
                 .values()
                 .filter(|m| m.project_id == project_id)
                 .cloned()
-                .collect())
+                .collect();
+            if let Some(barrier) = &self.list_all_missions_barrier {
+                let _ = tokio::time::timeout(Duration::from_millis(500), barrier.wait()).await;
+            }
+            Ok(snapshot)
         }
         async fn list_all_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
             Ok(self.missions.read().await.values().cloned().collect())
@@ -7099,6 +7136,79 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn webhook_claim_check_and_save_are_serialized_against_create() {
+        // WI#359 (CJ-4): `create_mission_detailed` holds the shared claim
+        // lock across check+save, but update/resume used to hold only their
+        // own mission's fire lock — two transitions could both pass
+        // `ensure_webhook_path_unclaimed` and both save, leaving two owners
+        // on one path. The store barrier forces both checks to complete
+        // before either save; exactly one claim may land.
+        let mut raw_store = TestStore::new();
+        raw_store.list_all_missions_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
+        let store = Arc::new(raw_store);
+        let mgr = Arc::new(make_mission_manager(store.clone() as Arc<dyn Store>));
+        let project = ProjectId::new();
+        let existing = Mission::new(project, "user-b", "b-hook", "goal", MissionCadence::Manual);
+        store.save_mission(&existing).await.unwrap();
+
+        let create_mgr = Arc::clone(&mgr);
+        let create = tokio::spawn(async move {
+            create_mgr
+                .create_mission(
+                    project,
+                    "user-a",
+                    "a-hook",
+                    "goal",
+                    MissionCadence::Webhook {
+                        path: "events".into(),
+                        secret: Some("a-secret".into()),
+                    },
+                    Vec::new(),
+                )
+                .await
+        });
+        let update_mgr = Arc::clone(&mgr);
+        let update_id = existing.id;
+        let update = tokio::spawn(async move {
+            update_mgr
+                .update_mission(
+                    update_id,
+                    "user-b",
+                    MissionUpdate {
+                        cadence: Some(MissionCadence::Webhook {
+                            path: "events".into(),
+                            secret: Some("b-secret".into()),
+                        }),
+                        ..MissionUpdate::default()
+                    },
+                )
+                .await
+        });
+        let (created, updated) = tokio::join!(create, update);
+        let created = created.expect("create task panicked");
+        let updated = updated.expect("update task panicked");
+
+        let claims = store
+            .list_all_missions(project)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|mission| {
+                !mission.is_terminal()
+                    && matches!(&mission.cadence, MissionCadence::Webhook { path, .. } if path == "events")
+            })
+            .count();
+        assert_eq!(
+            claims, 1,
+            "exactly one mission may hold the webhook path claim (create: {created:?}, update: {updated:?})"
+        );
+        assert!(
+            created.is_ok() != updated.is_ok(),
+            "exactly one of the racing transitions may succeed (create: {created:?}, update: {updated:?})"
+        );
     }
 
     #[tokio::test]
