@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { test } from "node:test"
-import { WebSocket } from "ws"
+import { WebSocket, WebSocketServer } from "ws"
 
 import { SUBPROTOCOL } from "./lunarwing_runtime.js"
 
@@ -328,6 +328,101 @@ conn.on("data", (d) => {
     assert.match(String(reply.error), /hub connection closed/)
   } finally {
     ws?.close()
+    child.kill("SIGTERM")
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a closed hub socket fails the task's in-flight tool call at once (client role)", async () => {
+  // MR !1582 run-97 FT-1: the server-role test above pins only the
+  // server-mode dropHubSocket call site — deleting the client-mode one (the
+  // close listener in startClient) left every suite green. Same shape with
+  // the roles reversed: a ws server plays the hub, the bridge dials out to
+  // it (WS_ROLE=client), the hub sends the task after `ready` and closes on
+  // the parked tool_call, and only the client close handler's dropHubSocket
+  // wiring can answer the mock CLI's IPC call promptly with the closed-hub
+  // error (without it the waiter parks until the proxy timeout and the
+  // abort's SIGKILL reaps the SIGTERM-ignoring CLI first — no marker).
+  const root = mkdtempSync(join(tmpdir(), "kimi-proxy-drop-client-"))
+  const bin = join(root, "mock-kimi")
+  const marker = join(root, "ipc-reply.json")
+  writeFileSync(bin, `#!/usr/bin/env node
+const fs = require("node:fs")
+const net = require("node:net")
+process.on("SIGTERM", () => {})
+const conn = net.connect(process.env.LUNARWING_TOOL_PROXY_SOCKET)
+conn.on("connect", () => {
+  conn.write(JSON.stringify({
+    op: "call", call_id: "cdrop1", name: "memory_read", arguments: {},
+  }) + "\\n")
+})
+let buf = ""
+conn.on("data", (d) => {
+  buf += d.toString()
+  const i = buf.indexOf("\\n")
+  if (i < 0) return
+  fs.writeFileSync(${JSON.stringify(marker)}, buf.slice(0, i))
+  process.exit(0)
+})
+`, { mode: 0o755 })
+  const proxyDir = join(root, "proxy")
+  const hubPort = await freePort()
+  const hub = new WebSocketServer({
+    host: "127.0.0.1",
+    port: hubPort,
+    path: "/kimi",
+    handleProtocols: (protocols: Set<string>): string | false =>
+      protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false,
+  })
+  await new Promise<void>((resolve) => hub.once("listening", resolve))
+  const child = startBridge(await freePort(), "client-drop-token", {
+    WS_ROLE: "client",
+    WS_URL: `ws://127.0.0.1:${hubPort}/kimi`,
+    WORKSPACE_ROOT: root,
+    KIMI_BIN: bin,
+    LUNARWING_TOOL_PROXY_DIR: proxyDir,
+    // Keep the proxy timeout far above the observation window so only the
+    // dropHubSocket wiring can produce the marker in time.
+    LUNARWING_TOOL_PROXY_TIMEOUT_MS: "60000",
+  })
+  try {
+    const sawCall = new Promise<WebSocket>((resolve, reject) => {
+      hub.on("connection", (hubSide) => {
+        hubSide.on("message", (data) => {
+          const message = JSON.parse(data.toString())
+          if (message.type === "ready") {
+            hubSide.send(JSON.stringify({ type: "task_request", payload: {
+              task_id: "client-drop-task", prompt: "read a note", timeout_ms: 30000,
+            }}))
+          }
+          if (message.type === "tool_call" && message.payload.call_id === "cdrop1") {
+            resolve(hubSide)
+          }
+        })
+        hubSide.once("error", reject)
+      })
+    })
+    // Park the call in the relay: the hub observes the frame but never
+    // answers, then closes the connection. Closing the server afterwards
+    // keeps the bridge's reconnect from dispatching a second task.
+    const hubSide = await sawCall
+    hubSide.close()
+    hub.close()
+    const deadline = Date.now() + 5000
+    let body = ""
+    while (Date.now() < deadline) {
+      if (existsSync(marker)) {
+        body = readFileSync(marker, "utf8")
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.notEqual(body, "", "the IPC call must be answered promptly after the hub socket closed")
+    const reply = JSON.parse(body) as { status?: unknown; error?: unknown }
+    assert.equal(reply.status, "error")
+    assert.match(String(reply.error), /hub connection closed/)
+  } finally {
+    hub.close()
     child.kill("SIGTERM")
     rmSync(root, { recursive: true, force: true })
   }

@@ -87,6 +87,15 @@ case "$INIT_SYSTEM" in
   *) _die "health pipeline is not wired for INIT_SYSTEM=$INIT_SYSTEM" ;;
 esac
 
+# WI#376 EQ-3: never arm the root health cron inside the proxy migration
+# window — the cron drives `rc-service ... status` as root, which is exactly
+# what the window must prevent. This script sources mt-admin directly, so
+# main()'s openrc_dispatch_preflight never runs; check explicitly here. The
+# DOWN-probe below hides the refusal behind >/dev/null 2>&1, which made every
+# tenant merely look DOWN while --allow-down still armed the cron.
+[[ "$INIT_SYSTEM" != openrc ]] || require_safe_openrc_proxy_units \
+  || _die "unsafe legacy proxy units installed; run first: ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies"
+
 [[ -f "$PORTS_REGISTRY" ]] || _die "ports registry not found: $PORTS_REGISTRY"
 mapfile -t TENANTS < <(jq -r '.tenants | keys[]' "$PORTS_REGISTRY" 2>/dev/null || true)
 [[ ${#TENANTS[@]} -gt 0 ]] || _die "no tenants in $PORTS_REGISTRY — nothing to monitor"

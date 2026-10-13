@@ -369,7 +369,20 @@ restore_tenant_postgres() {
   # state is indeterminate, never assume "stopped".
   local daemon_state="unknown"
   if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v systemctl >/dev/null 2>&1; then
-    if _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service" 2>/dev/null; then daemon_state="active"; else daemon_state="stopped"; fi
+    # systemctl's exit codes are per-state, not per-liveness: rc 3 covers
+    # inactive AND activating/deactivating, so a crash-looping Restart=always
+    # unit reads rc 3 while it restarts every few seconds. Capture the printed
+    # state and classify rc+state pairs; only positively-stopped states count
+    # (EQ-8 rc 4 = no such unit; FL-2: anything else is indeterminate and must
+    # fail closed, never read as "stopped").
+    local is_active_rc=0 is_active_out=""
+    is_active_out="$(_systemctl_user "$name" is-active "lunarwing-${name}.service" 2>/dev/null)" \
+      || is_active_rc=$?
+    case "$is_active_rc:$is_active_out" in
+      0:*) daemon_state="active" ;;
+      3:inactive|3:failed|4:inactive) daemon_state="stopped" ;;
+      *) daemon_state="unknown" ;;
+    esac
   elif [[ "$INIT_SYSTEM" == "openrc" ]] && command -v rc-service >/dev/null 2>&1; then
     local status_rc=0
     _openrc_service "lunarwing-${name}" status >/dev/null 2>&1 || status_rc=$?

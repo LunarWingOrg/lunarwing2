@@ -554,16 +554,20 @@ without recursively executing it. The previous script executed that copied
 text when OpenRC later parsed the init file as root, including during service
 operations other than startup. Shell-looking URL text now stays literal data.
 
-**Existing installations — fleet-wide neutralize first (!1547 EG–E):** an
+**Existing installations — fleet-wide neutralize first (!1547 EG-1):** an
 OpenRC dependency-cache rebuild can source **every** installed init script
 as root. Repairing tenant A and restarting it while tenant B's old proxy
 unit remains is unsafe. Arrange a maintenance window with no concurrent
-OpenRC operations: pause the host health/self-heal cron
-(`lunarwing-mt-health` fcron/cron block running
-`/usr/local/lib/lunarwing-health/cron-wrapper.sh`, which drives
-`lunarwing-self-heal.sh`), the OpenRC watchdog
-(`/etc/cron.hourly/lunarwing-watchdog` or the managed fcron block), and do
-not run `ic/scripts/enable-health-fleet.sh` in the window. The mt-admin
+OpenRC operations: pause the host health/self-heal cron (the
+`lunarwing-mt-health` fcron/cron block whose line runs
+`/usr/local/sbin/lunarwing-mt-health`, which execs
+`/usr/local/lib/lunarwing-health/cron-wrapper.sh` and drives
+`lunarwing-self-heal.sh`) and the OpenRC watchdog
+(`/etc/cron.hourly/lunarwing-watchdog`, `/etc/periodic/hourly/lunarwing-watchdog`,
+or the managed fcron block). Pause them by commenting out the crontab/fcron
+entries — do **not** `rc-service fcron stop`, which is itself an OpenRC
+operation — and do not run `ic/scripts/enable-health-fleet.sh` in the
+window (it now refuses on OpenRC until the fleet is repaired). The mt-admin
 guard covers its own commands, not other programs invoking OpenRC.
 
 Before overwriting any units, inspect them as data, without service commands.
@@ -590,12 +594,19 @@ sudo ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies
 
 This replaces each proxy-enabled tenant's proxy unit and every installed
 registered proxy unit — including disabled tenants' leftover units —
-atomically **per file** (the fleet sweep itself is not a transaction). For
-each unit it replaces, it first copies the installed bytes verbatim to a
-private archive (`$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`, default
+atomically **per file** (the fleet sweep itself is not a transaction).
+For each installed unit that fails the safe-unit contract (legacy or
+damaged), it first copies the installed bytes verbatim to a private
+archive (`$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`, default
 `/var/lib/lunarwing/openrc-proxy-backups`, directory mode 0700, files mode
-0600, never executable, never sourced). The render aborts rather than
-replace a unit it cannot archive safely. It neither reads tenant env data
+0600, never executable, never sourced); already-safe units are replaced
+without archiving, so repeated sweeps and upgrades do not grow the
+archive. The archive is retained indefinitely for investigation —
+legacy units may carry payload URLs with query-string tokens — and is
+deliberately left behind by `remove-tenant --purge`; prune it manually
+with `rm` once the preserved bytes are no longer needed. The render aborts
+rather than replace a unit it cannot archive safely, and the refusal names
+the reason. It neither reads tenant env data
 nor invokes OpenRC, the full tenant renderer, retirement hooks or sidecar
 lifecycle helpers. It works even when `proxy.env` is malformed or the
 tenant proxy code is still old. An unregistered or symlinked installed
@@ -613,10 +624,18 @@ tenant down until its checkout is updated. Then restart through mt-admin.
 From deploying the patched mt-admin until `render-units --all-proxies`
 succeeds, every mt-admin command on OpenRC **except** `help`, the fleet
 migration and `upgrade-tenant` refuses up front with the migration command.
+Only a positively detected systemd host skips that file-only guard: when no
+init system can be detected at all (CI containers, chroots), the guard still
+inspects the installed unit files and refuses unsafe ones, and each command's
+own detection then reports the accurate "could not detect a supported service
+manager" error after its usage checks — a detection failure is never itself
+reported as "migration required".
 The service/update wrappers return exit code **125** for a refusal — never
 an OpenRC service state — so `remove-tenant`, `restore-tenant`,
 `migrate-owner-scope` and the writer-quiescence probes cannot misread a
-refused or refused-looking status as "stopped".
+refused or refused-looking status as "stopped". At the CLI boundary,
+`writers-active` maps a dispatcher refusal to exit **2** (unknown), never
+1 (stopped), matching its 0/1/2 state contract.
 
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips
@@ -656,7 +675,7 @@ startup data and unsafe env-file rejection on both init systems. The harness
 explicitly invokes all six tests in `test_lunarwing_proxy.py`, including the
 local HTTP forwarding smoke test, in the shell-harness CI lane. The rollout
 harness simulates fleet-wide dependency scanning and checks that legacy units
-block stop/status/update, while the upgrade harness pins neutralize/render/stop
+block stop/status/update, while the upgrade harness pins neutralize/validate/stop
 ordering and the `--skip-render` exception.
 
 ## PostgreSQL
