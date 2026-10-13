@@ -18,10 +18,12 @@ const UNTRUSTED_HISTORY_BEGIN: &str = "--- BEGIN UNTRUSTED CONVERSATION HISTORY 
 const UNTRUSTED_HISTORY_END: &str = "--- END UNTRUSTED CONVERSATION HISTORY ---";
 
 /// Env key carrying the bridge's hub-handshake credential (WI#373). The
-/// spawned task process runs untrusted job code and must never see it: the
-/// value would let any task impersonate the daemon toward this worker (and,
-/// on tenants still provisioned with the pre-WI#205 fallback, the whole
-/// gateway bearer).
+/// spawned task process runs untrusted job code and must never see it: one
+/// value is shared by every worker lane of the tenant, so it would let any
+/// task impersonate the daemon toward all of the tenant's worker ports —
+/// and, where the WI#210 last-resort fallback still applies (an unwritable
+/// worker env file), toward the whole gateway bearer; normally mt-admin
+/// mints and persists a scoped token on the first lifecycle pass.
 const BRIDGE_AUTH_ENV_KEY: &str = "AGENT_AUTH_TOKEN";
 
 /// Bridge env rebuilt for a spawned task minus the bridge's own credentials
@@ -160,9 +162,17 @@ fn spawn_pebble(
     cmd.env_clear();
     cmd.envs(strip_bridge_credentials(std::env::vars_os()));
     for (key, value) in &request.context.environment {
-        if key.as_str() != BRIDGE_AUTH_ENV_KEY {
-            cmd.env(key, value);
+        if key.as_str() == BRIDGE_AUTH_ENV_KEY {
+            // A credential grant (or forged task entry) reusing the bridge's
+            // own handshake key is dropped; say so instead of letting the
+            // value vanish silently (run-98 FY-5).
+            eprintln!(
+                "[exec] {}: dropped task-supplied env entry {BRIDGE_AUTH_ENV_KEY}: reserved for the bridge handshake (WI#373)",
+                request.task_id
+            );
+            continue;
         }
+        cmd.env(key, value);
     }
 
     cmd.spawn()
@@ -651,6 +661,14 @@ mod tests {
                 "child phase failed:\nstdout: {text}\nstderr: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
+            // FY-3: a drifted TEST_PATH makes the child run zero tests and
+            // libtest still exits 0 — require the child's own result line so
+            // this pin cannot pass vacuously.
+            assert!(
+                text.contains("test result: ok. 1 passed"),
+                "child phase ran no tests (drifted TEST_PATH?):\nstdout: {text}\nstderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             return;
         }
 
@@ -658,6 +676,9 @@ mod tests {
         // stub through the real spawn_pebble and inspect its environment.
         // The stub lives next to the test binary because temp dirs can be
         // mounted noexec on dev VMs.
+        let parent_token = std::env::var(BRIDGE_AUTH_ENV_KEY)
+            .expect("child phase must run with the bridge credential in its env");
+        assert_eq!(parent_token, "bridge-secret-64hex");
         let exe_dir = std::env::current_exe()
             .expect("test binary path")
             .parent()
