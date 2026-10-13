@@ -347,7 +347,10 @@ fn map_write_err(e: crate::error::WorkspaceError) -> ToolError {
             ToolError::ContentRejected(existing_content_rejection_message(&path, &reason))
         }
         WorkspaceError::DailyLogBackupCapReached { path, generations } => {
-            ToolError::ExecutionFailed(format!(
+            // NotAuthorized, not ExecutionFailed: an operator action unblocks
+            // it (web memory editor / CLI), and a failure-shaped message
+            // could read as transient and invite retries (run-85 EY-4).
+            ToolError::NotAuthorized(format!(
                 "Replace of daily log '{path}' not applied: {generations} backup generations \
                  are already retained and another replace would discard the second-oldest one \
                  (WI#335). Nothing was written and no generation was lost; appends still work. \
@@ -427,7 +430,9 @@ fn injection_rejection_message(path: &str, reason: &str) -> String {
 /// file short enough to rewrite exactly in one call, and only when every
 /// flagged line is plainly an ordinary note. The message stays backup-neutral:
 /// since WI#288 `write()` keeps a rolling shadow slot (daily logs also keep
-/// numbered generations, the first of the day pinned as evidence) and
+/// numbered generations, the first of the day pinned positionally — it holds
+/// the day's first backed-up version, not necessarily the poisoned one;
+/// WI#335) and
 /// `write_to_layer()` keeps a scope-aware shadow slot, so the replaced version
 /// is operator-recoverable — but the `backups/` subtree is reserved and never
 /// agent-visible, so the guidance neither promises nor mentions it.
@@ -2262,8 +2267,8 @@ mod tests {
                 .await
                 .expect_err("tool replace must fail closed at the cap");
             let message = match err {
-                ToolError::ExecutionFailed(message) => message,
-                other => panic!("expected a classified execution failure, got: {other:?}"),
+                ToolError::NotAuthorized(message) => message,
+                other => panic!("expected a classified not-authorized refusal, got: {other:?}"),
             };
             assert!(
                 message.contains("not applied") && message.contains("operator"),
@@ -2302,6 +2307,189 @@ mod tests {
                     .content,
                 "version 2",
                 "the operator replace discarded .2 and shifted the rest down"
+            );
+        }
+
+        /// WI#335 run-85 EY-2: the explicit-path replace lane (`target:
+        /// "daily/<date>.md"`, the catch-all arm of the tool dispatch) takes
+        /// the same guarded write as the named `daily_log` target — this pin
+        /// survives reverting that lane to the unguarded `write`.
+        #[tokio::test]
+        async fn explicit_daily_path_tool_replace_fails_closed_at_backup_generation_cap() {
+            let (workspace, _db, _temp_dir) = setup_workspace_with_db().await;
+            let write = MemoryWriteTool::from_workspace(Arc::clone(&workspace));
+            let ctx = JobContext::default();
+            let cap = crate::workspace::MAX_DAILY_LOG_BACKUP_GENERATIONS;
+
+            // Learn today's daily-log path date-agnostically through the
+            // named target, then drive every replace through the explicit
+            // path (the catch-all lane).
+            let first = write
+                .execute(
+                    serde_json::json!({"content": "version 0", "target": "daily_log"}),
+                    &ctx,
+                )
+                .await
+                .expect("seed today's log");
+            let path = first.result["path"]
+                .as_str()
+                .expect("daily log path")
+                .to_string();
+            let backup_path = format!("backups/{path}.bak");
+
+            for version in 1..=(cap + 1) {
+                write
+                    .execute(
+                        serde_json::json!({
+                            "content": format!("version {version}"),
+                            "target": &path,
+                            "append": false,
+                        }),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("explicit-path replace {version} below/at the cap must succeed: {e}")
+                    });
+            }
+
+            let err = write
+                .execute(
+                    serde_json::json!({
+                        "content": "version blocked",
+                        "target": &path,
+                        "append": false,
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect_err("explicit-path tool replace must fail closed at the cap");
+            match err {
+                ToolError::NotAuthorized(message) => assert!(
+                    message.contains("not applied") && message.contains("operator"),
+                    "the refusal must tell the agent to use the operator route: {message}"
+                ),
+                other => panic!("expected a classified not-authorized refusal, got: {other:?}"),
+            }
+            assert_eq!(
+                workspace.read(&path).await.expect("read log").content,
+                format!("version {}", cap + 1),
+                "the refused explicit-path replace must not touch the day log"
+            );
+            assert_eq!(
+                workspace
+                    .read(&format!("{backup_path}.2"))
+                    .await
+                    .expect("second-oldest generation")
+                    .content,
+                "version 1",
+                "the refused explicit-path replace must not discard or shift any generation"
+            );
+
+            // The operator route is unlimited on the same saturated day.
+            workspace
+                .write(&path, "version blocked")
+                .await
+                .expect("operator replace still rotates at the cap");
+            assert_eq!(
+                workspace
+                    .read(&format!("{backup_path}.2"))
+                    .await
+                    .expect("second-oldest generation after operator rotate")
+                    .content,
+                "version 2",
+                "the operator replace discarded .2 and shifted the rest down"
+            );
+        }
+
+        /// WI#335 run-85 EY-2: the layer replace lane (the
+        /// `write_to_layer_with_daily_log_cap_guard` arm) fails closed at the
+        /// cap in the layer's scope too — this pin survives reverting that
+        /// lane to the unguarded `write_to_layer`.
+        #[tokio::test]
+        async fn layer_tool_replace_fails_closed_at_backup_generation_cap() {
+            let (workspace, _db, _temp_dir) = setup_workspace_with_db().await;
+            let write = MemoryWriteTool::from_workspace(Arc::clone(&workspace));
+            let ctx = JobContext::default();
+            let cap = crate::workspace::MAX_DAILY_LOG_BACKUP_GENERATIONS;
+
+            let first = write
+                .execute(
+                    serde_json::json!({
+                        "content": "version 0",
+                        "target": "daily_log",
+                        "layer": "private",
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect("seed the layer-scoped day log");
+            let path = first.result["path"]
+                .as_str()
+                .expect("daily log path")
+                .to_string();
+            let backup_path = format!("backups/{path}.bak");
+
+            for version in 1..=(cap + 1) {
+                write
+                    .execute(
+                        serde_json::json!({
+                            "content": format!("version {version}"),
+                            "target": "daily_log",
+                            "layer": "private",
+                            "append": false,
+                        }),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("layer replace {version} below/at the cap must succeed: {e}")
+                    });
+            }
+
+            let err = write
+                .execute(
+                    serde_json::json!({
+                        "content": "version blocked",
+                        "target": "daily_log",
+                        "layer": "private",
+                        "append": false,
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect_err("layer tool replace must fail closed at the cap");
+            match err {
+                ToolError::NotAuthorized(message) => assert!(
+                    message.contains("not applied") && message.contains("operator"),
+                    "the refusal must tell the agent to use the operator route: {message}"
+                ),
+                other => panic!("expected a classified not-authorized refusal, got: {other:?}"),
+            }
+            assert_eq!(
+                workspace
+                    .read(&format!("{backup_path}.2"))
+                    .await
+                    .expect("second-oldest layer generation")
+                    .content,
+                "version 1",
+                "the refused layer replace must not discard or shift any generation"
+            );
+
+            // The operator layer route keeps rotating on the same saturated
+            // day.
+            workspace
+                .write_to_layer("private", &path, "version blocked", false)
+                .await
+                .expect("operator layer replace still rotates at the cap");
+            assert_eq!(
+                workspace
+                    .read(&format!("{backup_path}.2"))
+                    .await
+                    .expect("second-oldest layer generation after operator rotate")
+                    .content,
+                "version 2",
+                "the operator layer replace discarded .2 and shifted the rest down"
             );
         }
 

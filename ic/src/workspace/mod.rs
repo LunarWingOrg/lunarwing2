@@ -4820,7 +4820,8 @@ mod runtime_index_tests {
     /// the first generation of the day stays pinned, the second-oldest
     /// generation is discarded and the rest shift down, so the free-slot probe
     /// stays bounded. The pin is positional, not evidential (WI#335): `.1`
-    /// holds the content that preceded the day's first replace, and keeping a
+    /// holds the content that preceded the day's first backed-up replace in
+    /// that scope, and keeping a
     /// steered agent from rotating later generations out of the reserved
     /// store with ordinary replaces is the tool lane's job
     /// (`memory_write` fails closed at the cap), not this rotation's.
