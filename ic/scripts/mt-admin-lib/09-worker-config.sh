@@ -2095,6 +2095,31 @@ restart_worker() {
 # mt-admin publishes exactly those to HOST loopback; every published mapping
 # must also carry a loopback HostIp. Anything else is reported and fails the
 # audit. Read-only: no container or unit state is changed.
+#
+# Run-79 EI-6 hardening:
+#   - an inspect FAILURE is a finding, never a "not running — skipped"
+#     (only a genuinely absent container is skipped);
+#   - a published mapping with an empty/missing HostIp is all-interfaces
+#     (Docker records 0.0.0.0 publishes as "HostIp":""), never "nothing to
+#     check";
+#   - sockets are read HOST-side from /proc/<container pid>/net — running
+#     `cat` inside the untrusted container let a root-in-container agent
+#     (pebble) forge the audit output;
+#   - UDP listeners are audited too, not only TCP.
+_worker_listeners_read() {  # <tenant> <container pid> — host-side netns read
+  local name="$1" pid="$2" uid home
+  if [[ "$MT_ROOTLESS" == "true" ]]; then
+    uid="$(id -u "$name" 2>/dev/null)" || return 1
+    home="$(getent passwd "$name" | cut -d: -f6)"
+    ( cd / && exec sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
+        sh -c 'cat /proc/$1/net/tcp /proc/$1/net/tcp6 /proc/$1/net/udp /proc/$1/net/udp6 2>/dev/null' _sh "$pid" ) \
+      || true
+  else
+    cat "/proc/${pid}/net/tcp" "/proc/${pid}/net/tcp6" \
+        "/proc/${pid}/net/udp" "/proc/${pid}/net/udp6" 2>/dev/null || true
+  fi
+}
+
 worker_listeners() {  # <tenant>
   local name="$1"
   name="$(sanitize_name "$name")"
@@ -2103,23 +2128,41 @@ worker_listeners() {  # <tenant>
   require_cmd jq
 
   local findings=0 lane container wss_port bindings bad listeners report rc
+  local inspect_out state pid
   local -a lanes=(pebble opencode opencode2 kimi)
   for lane in "${lanes[@]}"; do
     container="lunarwing-${lane}-${name}"
-    if ! _ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null | grep -q true; then
+    inspect_out="$(_ctr "$name" inspect -f '{{.State.Running}} {{.State.Pid}}' "$container" 2>&1 || true)"
+    inspect_out="${inspect_out%%$'\n'*}"  # Go template emits one line + newline
+    if [[ "$inspect_out" =~ ^(true|false)\ [0-9]+$ ]]; then
+      state="${inspect_out%% *}"
+      pid="${inspect_out#* }"
+    elif [[ "$inspect_out" == *"no such"* || "$inspect_out" == *"not found"* ]]; then
+      say "$lane: not present ($container) — skipped"
+      continue
+    else
+      say "$lane: $container — INSPECT FAILED (counted as a finding, never a silent skip): ${inspect_out//$'\n'/ }"
+      findings=$((findings + 1))
+      continue
+    fi
+    if [[ "$state" != "true" ]]; then
       say "$lane: not running ($container) — skipped"
       continue
     fi
     wss_port="$(ports_get "$name" "${lane}_wss" 2>/dev/null || true)"
-    say "$lane: $container (bridge ws port ${wss_port:-unknown}, health 8443)"
+    say "$lane: $container pid $pid (bridge ws port ${wss_port:-unknown}, health 8443)"
 
-    # Published mappings: every HostIp must be host loopback.
+    # Published mappings: every HostIp must be host loopback. Docker records
+    # an all-interfaces publish as "HostIp":"" — treat empty/missing as
+    # all-interfaces (run-79 EI-6), never as "nothing to check".
     bindings="$(_ctr "$name" inspect -f '{{json .HostConfig.PortBindings}}' "$container" 2>/dev/null || true)"
     if [[ -n "$bindings" && "$bindings" != "null" ]]; then
       bad="$(printf '%s' "$bindings" | jq -r '
         to_entries[] | .key as $port | .value[] |
-        select(.HostIp != null and .HostIp != "" and .HostIp != "127.0.0.1" and .HostIp != "::1") |
-        "\($port) -> HostIp \(.HostIp)"' 2>/dev/null || echo JQ_PARSE_ERROR)"
+        (.HostIp // "") as $ip |
+        select($ip != "127.0.0.1" and $ip != "::1") |
+        ($ip | if . == "" then "0.0.0.0 (empty HostIp — Docker all-interfaces publish)" else . end) as $display |
+        "\($port) -> HostIp \($display)"' 2>/dev/null || echo JQ_PARSE_ERROR)"
       if [[ "$bad" == "JQ_PARSE_ERROR" ]]; then
         say "  WARNING: could not parse PortBindings for $container"
         findings=$((findings + 1))
@@ -2131,14 +2174,14 @@ worker_listeners() {  # <tenant>
       fi
     fi
 
-    # In-container listeners: the worker images ship neither ss nor netstat,
-    # so read /proc/net/tcp{,6} (always present) and parse hex addr:port on
-    # the host. State 0A is LISTEN. v4 hex is little-endian (0100007F is
-    # 127.0.0.1); v6 loopback is ...01000000, unspecified all zeros.
-    listeners="$(_ctr "$name" exec "$container" sh -c \
-      'cat /proc/net/tcp; cat /proc/net/tcp6 2>/dev/null' 2>/dev/null || true)"
+    # In-container listeners, read host-side from the container's netns via
+    # /proc/<pid>/net (see _worker_listeners_read). State 0A is TCP LISTEN;
+    # 07 is UDP UNCONN (the "listening" state for UDP). v4 hex is
+    # little-endian (0100007F is 127.0.0.1); v6 loopback is ...01000000,
+    # unspecified all zeros.
+    listeners="$(_worker_listeners_read "$name" "$pid")"
     if [[ -z "$listeners" ]]; then
-      say "  WARNING: could not read /proc/net/tcp* in $container"
+      say "  WARNING: could not read /proc/$pid/net/{tcp,tcp6,udp,udp6} for $container"
       findings=$((findings + 1))
       continue
     fi
@@ -2149,7 +2192,7 @@ worker_listeners() {  # <tenant>
           n = n * 16 + index("0123456789ABCDEF", toupper(substr(h, i, 1))) - 1
         return n
       }
-      $4 == "0A" {
+      $4 == "0A" || $4 == "07" {
         split($2, parts, ":")
         hex = parts[1]
         port = hex2dec(parts[2])
