@@ -659,6 +659,21 @@ impl MissionManager {
         missions: Vec<Mission>,
         self_improvement_on: bool,
     ) -> Result<usize, EngineError> {
+        // WI#359: startup does not re-check webhook ownership — legacy
+        // two-owner duplicates that are both non-terminal keep firing.
+        // Surface them like the parked-recurring report does.
+        for (project_id, path, holders) in conflicting_webhook_claims(&missions) {
+            warn!(
+                project_id = %project_id,
+                path = %path,
+                holders = %holders
+                    .iter()
+                    .map(|(id, owner)| format!("{id} (owner: {owner})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "webhook path has multiple non-terminal owners; every matching fire will deliver to each of them — rotate or pause the duplicates"
+            );
+        }
         let mut active_ids = Vec::new();
         for candidate in missions {
             let lock = mission_lock(&self.fire_locks, candidate.id).await;
@@ -3799,6 +3814,51 @@ fn is_settled_host_stop(thread: &crate::types::thread::Thread) -> bool {
             _ => None,
         })
         .unwrap_or(false)
+}
+
+/// WI#359 (info item): find webhook paths claimed by more than one owner's
+/// non-terminal mission within a project. A fire matches every Active
+/// mission on the path, so legacy two-owner duplicates keep firing for each
+/// owner. Rows with an unusable (dormant) secret do not count as live
+/// claims. Returns `(project_id, path, [(mission_id, owner)])` per
+/// conflicting path.
+fn conflicting_webhook_claims(
+    missions: &[Mission],
+) -> Vec<(ProjectId, String, Vec<(MissionId, String)>)> {
+    let mut claims: std::collections::HashMap<(ProjectId, &str), Vec<&Mission>> =
+        std::collections::HashMap::new();
+    for mission in missions {
+        if mission.is_terminal() {
+            continue;
+        }
+        if let MissionCadence::Webhook {
+            path,
+            secret: Some(secret),
+        } = &mission.cadence
+            && crate::types::mission::usable_webhook_secret(secret)
+        {
+            claims
+                .entry((mission.project_id, path.as_str()))
+                .or_default()
+                .push(mission);
+        }
+    }
+    let mut conflicts = Vec::new();
+    for ((project_id, path), holders) in claims {
+        let distinct_owners: std::collections::HashSet<&str> =
+            holders.iter().map(|m| m.user_id.as_str()).collect();
+        if distinct_owners.len() > 1 {
+            conflicts.push((
+                project_id,
+                path.to_string(),
+                holders
+                    .iter()
+                    .map(|m| (m.id, m.user_id.clone()))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+    conflicts
 }
 
 fn validate_webhook_cadence(cadence: &MissionCadence) -> Result<(), EngineError> {
@@ -7136,6 +7196,49 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[test]
+    fn conflicting_webhook_claims_flags_only_live_multi_owner_paths() {
+        // WI#359 (info item): startup surfaces legacy two-owner duplicates.
+        let project = ProjectId::new();
+        let webhook = |path: &str, secret: &str| MissionCadence::Webhook {
+            path: path.into(),
+            secret: Some(secret.into()),
+        };
+        let a = Mission::new(project, "user-a", "a", "g", webhook("events", "sa"));
+        let b = Mission::new(project, "user-b", "b", "g", webhook("events", "sb"));
+        let mut terminal = Mission::new(project, "user-c", "c", "g", webhook("events", "sc"));
+        terminal.status = MissionStatus::Completed;
+        let dormant = Mission::new(project, "user-d", "d", "g", webhook("events", "  "));
+        let same_owner = Mission::new(project, "user-a", "a2", "g", webhook("events", "sa2"));
+        let other_path = Mission::new(project, "user-e", "e", "g", webhook("other", "se"));
+        let other_project = Mission::new(
+            ProjectId::new(),
+            "user-f",
+            "f",
+            "g",
+            webhook("events", "sf"),
+        );
+        let missions = [
+            a.clone(),
+            b.clone(),
+            terminal,
+            dormant,
+            same_owner,
+            other_path,
+            other_project,
+        ];
+        let conflicts = conflicting_webhook_claims(&missions);
+        assert_eq!(conflicts.len(), 1, "only the live two-owner path conflicts: {conflicts:?}");
+        let (pid, path, holders) = &conflicts[0];
+        assert_eq!(*pid, project);
+        assert_eq!(path, "events");
+        // user-a holds two rows (a, a2); user-b holds one — three holders,
+        // two distinct owners.
+        assert_eq!(holders.len(), 3);
+        assert!(holders.contains(&(a.id, "user-a".to_string())));
+        assert!(holders.contains(&(b.id, "user-b".to_string())));
     }
 
     #[tokio::test]
