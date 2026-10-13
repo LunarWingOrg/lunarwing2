@@ -52,7 +52,7 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 
 ## Getting started
 
-The browser-based onboarding console is the recommended setup path for beginners. It wraps the multi-tenant admin scripts and shows configuration, output, validation, and recovery guidance in one local interface. Run from the repository root (does require root/sudo access to run):
+The browser-based onboarding console is the recommended setup path for beginners. It wraps the multi-tenant admin scripts and shows configuration, output, validation, and recovery guidance in one local interface. Run from the repository root. The demo needs no privileges; the doctor check and the real console need root/sudo
 
 ```bash
 # 1. Look around safely — no tenants, no host changes
@@ -113,4 +113,4 @@ LunarWing focuses on user freedom, self-hostable infrastructure, and open protoc
 
 [![Chat on IRC](https://img.shields.io/badge/IRC-%23lunarwing-00b0aa?style=for-the-badge&labelColor=000000)](https://web.libera.chat/?channel=#lunarwing)
 
-LunarWing is fully funded and maintained by a thriving community of volunteers, ranging from individuals to small organizations. The LunarWing organization ensures project governance. Everything we make strives to eventually be licensed under [AGPL-3.0-or-later](LICENSE) or already is.
+LunarWing is fully funded and maintained by a thriving community of volunteers, ranging from individuals to small organizations. The LunarWing organization ensures project governance. This repository is AGPL-3.0-or-later (see LICENSE.md) [AGPL-3.0-or-later](LICENSE). Vendored third-party crates under ic/vendor/ keep their own licenses. The companion apps are licensed separately.
