@@ -22,7 +22,9 @@ contract. Results/progress between 1 and 16 MiB are accepted (MR !1540 DX-1/DX-3
 Note the interplay with the WI#324 tool proxy (MR !1549 EF-9): raising the
 hub's tool-output safety cap (`SAFETY_MAX_OUTPUT_LENGTH`, default 100,000
 bytes) past the worker bridge's inbound `maxPayload` (Kimi default 1 MiB)
-means a large `tool_result` is dropped by the worker's own WS layer — keep
+means a large `tool_result` trips the worker's own WS layer — ws 8.21.1
+closes the connection with a 1009 (message too big) error, and the bridge
+then aborts the task that was running on that socket (MR !1561 EV-5). Keep
 the worker's `WS_MAX_PAYLOAD_BYTES` at or above the hub cap when tuning it.
 
 ## Worker-side tool proxy bridge (WI#324)
@@ -52,6 +54,15 @@ could borrow a concurrent interactive job's grant this way, a `mode = "cron"`
 worker's worker-level `tool_allowlist` is stripped at manager load (logged
 as an error): a cron worker container never holds more than its
 `cron.tool_allowlist`, and ordinary dispatches to it get no proxied tools.
+The strip is applied per worker entry, but the authority domain is the
+container: never point an entry that has a `tool_allowlist` at the same
+endpoint as a `mode = "cron"` entry — give a cron mission its own
+container. (The manager also strips the worker-level list of a non-cron
+entry whose endpoint URL exactly matches a cron entry's endpoint, but
+exact-string matching cannot catch aliases such as `localhost` vs
+`127.0.0.1`, so the rule stands on its own.) A borrowed call is recorded
+in the `job_events` — and counted against the 100-frame budget — of the
+job whose relay socket was used, not of the job that issued it.
 
 ## Generic shell sandbox network policy (WI#154/155)
 

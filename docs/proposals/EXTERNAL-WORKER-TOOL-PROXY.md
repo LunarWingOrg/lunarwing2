@@ -202,7 +202,16 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   than `cron.tool_allowlist`, and ordinary dispatches to a cron-mode worker
   get no proxied tools. Per-user isolation likewise requires per-user
   workers — jobs of two daemon users sharing one worker container share one
-  authority domain:
+  authority domain. The strip is applied per worker entry, but the
+  authority domain is the container: never point an entry that has a
+  `tool_allowlist` at the same endpoint as a `mode = "cron"` entry; give a
+  cron mission its own container. The manager additionally strips the
+  worker-level list of a non-cron entry whose endpoint URL exactly matches
+  a cron entry's endpoint (MR !1561 EV-1), but exact-string matching cannot
+  catch aliases such as `localhost` vs `127.0.0.1`, so the rule stands on
+  its own. A borrowed call is recorded in the `job_events` — and counted
+  against the 100-frame budget — of the job whose relay socket was used,
+  not of the job that issued it:
 
   ```toml
   [[sandbox.external_workers]]
@@ -219,12 +228,17 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   tool_allowlist = ["knowledge_search"]
   ```
 
-  Rollback note (MR !1549 EF-6): `CronWorkerConfig` is
-  `deny_unknown_fields`, so a binary older than this change rejects any
-  config carrying `cron.tool_allowlist` — even `[]` from a settings
-  write-back. The field is therefore serialized only when non-empty; a
-  rollback only fails to boot if an operator set a non-empty cron list
-  (which the old binary could not honor anyway).
+  Rollback note (MR !1549 EF-6, corrected MR !1561 EV-5):
+  `CronWorkerConfig` is `deny_unknown_fields`, so a binary older than this
+  change cannot parse a config carrying `cron.tool_allowlist` — even `[]`
+  from a settings write-back. The field is therefore serialized only when
+  non-empty. What an older binary does with a config that still carries it
+  depends on the source: with the **default** config path it boots anyway
+  and ignores the whole `config.toml` (parse failure is only a `warn!`;
+  `config/mod.rs`), a DB-stored workers array is skipped with a warning,
+  and only an explicit `--config` path fails the boot. Either way the old
+  binary could not honor a non-empty cron list, so the loss is confined to
+  the case the field exists for.
 
 ## Execution gates (MR !1506 CQ-1)
 
