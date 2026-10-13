@@ -8,6 +8,7 @@
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import {
   buildTaskPrompt,
+  type FollowupQueue,
   type TaskRequest,
   type TaskProgress,
   type TaskResult,
@@ -24,8 +25,20 @@ const RETRY_PROMPT =
   "The previous model request failed transiently. Continue this task from the current session and " +
   "workspace state. Do not repeat completed work. Inspect existing changes and proceed from " +
   "the next incomplete step."
+// Appended to a follow-up prompt carrying done=true (WI#328): the injected
+// turn is the wrap-up turn — the worker must not start new lines of work
+// after it, and the queue is closed so nothing can extend the run further.
+const WRAP_UP_SUFFIX =
+  "[control] This is the final instruction for this task: no further follow-up prompts will be " +
+  "accepted. Answer it against the current session state, then consider the task complete — do " +
+  "not start new lines of work."
 
 type StopReason = "timeout" | "cancelled"
+
+/** Settled outcome of a `session.prompt` call: the SDK result, or the error. */
+type PromptOutcome =
+  | { result: Awaited<ReturnType<OpencodeClient["session"]["prompt"]>> }
+  | { error: unknown }
 
 class TaskStoppedError extends Error {
   constructor(readonly reason: StopReason) {
@@ -68,6 +81,15 @@ function isRetryableProviderError(message: string): boolean {
   )
 }
 
+function emptyOutputError(deniedPermissions: number): string {
+  if (deniedPermissions > 0) {
+    return `Task performed no actions: ${deniedPermissions} permission request(s) ` +
+      "were denied by the worker permission policy (the session permission " +
+      "configuration likely needs to match the opencode SDK — smoke-verify)."
+  }
+  return "opencode completed without assistant text or tool output"
+}
+
 function createSdk(directory?: string): OpencodeClient {
   const password = getPassword()
   const headers: Record<string, string> = {}
@@ -92,6 +114,7 @@ export async function executeTask(
   onResult: ResultCallback,
   abortSignal?: AbortSignal,
   sdkOverride?: OpencodeClient,
+  followups?: FollowupQueue,
 ): Promise<void> {
   const startTime = Date.now()
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
@@ -117,6 +140,17 @@ export async function executeTask(
   let sessionID: string | undefined
   let closeEvents: (() => void) | undefined
   let output = ""
+  // Per-turn canonical assistant text (MR !1525 DI-3): every turn's prompt
+  // response contributes to the final result, so a short follow-up turn
+  // (e.g. "status?") can never replace the main deliverable. Declared
+  // function-scope so the catch path can still report banked turns (MR !1537
+  // review DW-3).
+  const canonicalTurns: string[] = []
+  // Seq of the follow-up prompt whose turn is currently running, undefined
+  // while the MAIN turn (or its retries) is in flight. Once any turn has
+  // succeeded, a failure/timeout in a follow-up turn must not change the
+  // task's terminal status (DW-3).
+  let currentFollowupSeq: number | undefined
   let deniedPermissions = 0
   let lastProgressAt = Date.now()
   const emitProgress = (delta: string) => {
@@ -221,14 +255,26 @@ export async function executeTask(
     )
     const eventIterator = events.stream[Symbol.asyncIterator]()
     closeEvents = () => void eventIterator.return?.()
-    let finalPromptData: Awaited<ReturnType<typeof sdk.session.prompt>>["data"] | undefined
 
+    let nextPrompt = buildTaskPrompt(request)
     for (let attempt = 0; ; attempt++) {
       let sessionErrorMsg = ""
-      const promptText = attempt === 0 ? buildTaskPrompt(request) : RETRY_PROMPT
+      const promptText = nextPrompt
+      // Streamed text/tool output for THIS turn attempt (MR !1537 DW-7): a
+      // turn whose assistant text is empty but whose tools produced output
+      // still banks that output, so a follow-up can't erase a tool-only main
+      // turn. Reset per attempt — failed attempts don't bank partial text.
+      let turnStreamed = ""
+      // DW-10: a stale idle event (published by a previous turn, possibly
+      // under both event names) must not end this turn before the session
+      // was observed busy or the prompt call settled.
+      let turnBusy = false
+      let turnSettled = false
       // Attach rejection handling immediately so a provider/API error cannot
       // become an unhandled rejection while the SSE loop is still draining.
-      const promptPromise = sdk.session
+      // The explicit PromptOutcome annotation keeps tsc's inference out of a
+      // self-referential loop through the SDK's conditional RequestResult.
+      const promptPromise: Promise<PromptOutcome> = sdk.session
         .prompt(
           {
             sessionID,
@@ -237,12 +283,15 @@ export async function executeTask(
           { throwOnError: true, signal: taskController.signal },
         )
         .then(
-          (result) => ({ result }),
-          (error: unknown) => ({ error }),
+          (result): PromptOutcome => ({ result }),
+          (error: unknown): PromptOutcome => ({ error }),
         )
-      const promptFailure = promptPromise.then((outcome) => {
+      const promptFailure = promptPromise.then((outcome: PromptOutcome) => {
         if (!("error" in outcome)) return new Promise<never>(() => {})
         return { kind: "prompt_error" as const }
+      })
+      void promptPromise.then(() => {
+        turnSettled = true
       })
 
       while (!stopReason) {
@@ -262,11 +311,13 @@ export async function executeTask(
         if (event.type === "message.part.updated") {
           const part = event.properties.part
           if (part.sessionID !== sessionID) continue
+          turnBusy = true
 
           if (part.type === "text" && part.time?.end) {
             const text = part.text?.trim()
             if (text) {
               output += text + "\n"
+              turnStreamed += text + "\n"
               emitProgress(text)
             }
           }
@@ -276,6 +327,7 @@ export async function executeTask(
             const toolName = part.tool || "unknown"
             const delta = `[${toolName}] ${toolOutput || "completed"}`
             output += delta + "\n"
+            turnStreamed += delta + "\n"
             emitProgress(delta)
           }
 
@@ -283,6 +335,7 @@ export async function executeTask(
             const toolName = part.tool || "unknown"
             const delta = `[${toolName}] ERROR: ${part.state.error}`
             output += delta + "\n"
+            turnStreamed += delta + "\n"
             emitProgress(delta)
           }
         }
@@ -322,13 +375,21 @@ export async function executeTask(
           )
         }
 
-        if (
-          (event.type === "session.status" &&
-            event.properties.sessionID === sessionID &&
-            event.properties.status?.type === "idle") ||
-          (event.type === "session.idle" && event.properties.sessionID === sessionID)
-        ) {
-          break
+        if (event.type === "session.status" && event.properties.sessionID === sessionID) {
+          if (event.properties.status?.type === "idle") {
+            // DW-10: an idle event only ends the turn once the turn was seen
+            // busy or the prompt call settled — a stale idle replayed from a
+            // previous turn (some builds publish both `session.status{idle}`
+            // and `session.idle`) must not cut this turn short.
+            if (turnBusy || turnSettled) break
+            continue
+          }
+          turnBusy = true
+        }
+
+        if (event.type === "session.idle" && event.properties.sessionID === sessionID) {
+          if (turnBusy || turnSettled) break
+          continue
         }
       }
 
@@ -342,11 +403,51 @@ export async function executeTask(
         sessionErrorMsg
 
       if (!promptError) {
-        finalPromptData = promptData
+        // Turn finished cleanly; bank its canonical text (DI-3) — or, when
+        // the assistant produced no text, this turn's streamed output (DW-7),
+        // so a tool-only main turn survives a later "status?" follow-up.
+        const turnText = extractAssistantText(promptData?.parts) || turnStreamed.trim()
+        if (turnText) canonicalTurns.push(turnText)
+        // A queued follow-up prompt (WI#328 runtime control channel)
+        // continues the SAME session instead of resolving the task: the
+        // daemon pushed it while the worker was busy and it is injected only
+        // here, at a turn boundary — never mid-call. The framing header
+        // attributes the instruction to the orchestrator so follow-up text
+        // can't masquerade as a worker-generated `[control]` note (DW-13).
+        // `closed` seals admission, not consumption: the bridge sets it when
+        // accepting done=true, including while earlier accepted turns wait.
+        const followup = followups?.prompts.shift()
+        if (followup) {
+          currentFollowupSeq = followup.seq
+          emitProgress(
+            `[control] Follow-up prompt received (seq=${followup.seq}${followup.done ? ", wrap-up requested" : ""})`,
+          )
+          if (followup.done) {
+            // done=true: this injected turn is the wrap-up turn. Close the
+            // queue so later prompts are acked accepted=false instead of
+            // silently extending the run (DI-4).
+            if (followups) followups.closed = true
+            nextPrompt =
+              `FOLLOW-UP INSTRUCTION (seq=${followup.seq}, FINAL) from the orchestrator:\n` +
+              `${followup.prompt}\n\n${WRAP_UP_SUFFIX}`
+          } else {
+            nextPrompt =
+              `FOLLOW-UP INSTRUCTION (seq=${followup.seq}) from the orchestrator:\n` +
+              followup.prompt
+          }
+          attempt = -1 // each follow-up turn gets its own transient-retry budget
+          continue
+        }
+        // Finishing: close the queue BEFORE resolving so a prompt landing
+        // after this drain is refused (accepted=false) rather than queued
+        // into a buffer nothing will ever read (DI-4).
+        if (followups) followups.closed = true
         break
       }
 
       if (!isRetryableProviderError(promptError) || attempt >= maxProviderRetries) {
+        // Share the terminal policy with permission/SSE failures. Control
+        // notes are not completed output and cannot manufacture success.
         throw new Error(promptError)
       }
 
@@ -358,6 +459,8 @@ export async function executeTask(
       emitProgress(delta)
       console.warn(`[opencode_task_executor] task ${request.task_id}: ${delta} ${promptError}`)
 
+      nextPrompt = RETRY_PROMPT
+
       const delayResult = await Promise.race([
         new Promise<undefined>((resolve) => setTimeout(resolve, retryDelayMs)),
         stopPromise,
@@ -367,32 +470,16 @@ export async function executeTask(
       }
     }
 
-    const canonicalOutput = extractAssistantText(finalPromptData?.parts)
+    const canonicalOutput = canonicalTurns.join("\n\n")
     const resultOutput = canonicalOutput || output.trim()
     const durationMs = Date.now() - startTime
-
-    // If every permission was denied and the task produced no output, it did
-    // nothing — report that instead of a silent "success".
-    if (deniedPermissions > 0 && !resultOutput) {
-      onResult({
-        task_id: request.task_id,
-        status: "error",
-        output: resultOutput,
-        error:
-          `Task performed no actions: ${deniedPermissions} permission request(s) ` +
-          `were denied by the worker permission policy (the session permission ` +
-          `configuration likely needs to match the opencode SDK — smoke-verify).`,
-        duration_ms: durationMs,
-      })
-      return
-    }
 
     if (!resultOutput) {
       onResult({
         task_id: request.task_id,
         status: "error",
         output: "",
-        error: "opencode completed without assistant text or tool output",
+        error: emptyOutputError(deniedPermissions),
         duration_ms: durationMs,
       })
       return
@@ -406,29 +493,52 @@ export async function executeTask(
       duration_ms: durationMs,
     })
   } catch (err) {
-    const durationMs = Date.now() - startTime
+    // DW-5: no path out of a task leaves the control queue open — a prompt
+    // landing during teardown (including the abortSession wait below) must be
+    // refused (accepted=false) instead of acked and silently dropped.
+    if (followups) followups.closed = true
     const stopped = stopReason ?? (err instanceof TaskStoppedError ? err.reason : undefined)
+    const errorMsg = opencodeErrorMessage(err)
+    const banked = canonicalTurns.join("\n\n")
+    const notes: string[] = []
+    if (currentFollowupSeq !== undefined) {
+      const outcome = stopped === "timeout" ? "timed out before completing"
+        : stopped === "cancelled" ? "cancelled before completing" : `failed: ${errorMsg}`
+      notes.push(`[control] follow-up seq=${currentFollowupSeq} ${outcome}`)
+    }
+    // Accepted does not promise execution: explicitly account for every turn
+    // still queued when any error/cancellation/timeout terminates this task.
+    for (const pending of followups?.prompts.splice(0) ?? []) {
+      notes.push(`[control] follow-up seq=${pending.seq} not run: task ended before this turn`)
+    }
+    const resultOutput = [banked || output.trim(), ...notes].filter(Boolean).join("\n\n")
+    const preserveSuccess = currentFollowupSeq !== undefined && Boolean(banked || output.trim())
     if (stopped) {
       closeEvents?.()
       await abortSession()
+      // Only actual completed output preserves success through a follow-up
+      // timeout. Explicit cancellation always remains cancelled.
+      const timedOut = stopped === "timeout" && !preserveSuccess
       onResult({
         task_id: request.task_id,
-        status: stopped === "timeout" ? "timed_out" : "cancelled",
-        output: output.trim(),
-        error: stopped === "timeout" ? `Task timed out after ${timeoutMs}ms` : null,
+        status: stopped === "cancelled" ? "cancelled" : timedOut ? "timed_out" : "success",
+        output: resultOutput,
+        error: timedOut ? `Task timed out after ${timeoutMs}ms` : null,
         duration_ms: Date.now() - startTime,
       })
       return
     }
-    const errorMsg = opencodeErrorMessage(err)
     onResult({
       task_id: request.task_id,
-      status: "error",
-      output: output.trim(),
-      error: errorMsg,
-      duration_ms: durationMs,
+      status: preserveSuccess ? "success" : "error",
+      output: resultOutput,
+      error: preserveSuccess ? null : currentFollowupSeq !== undefined
+        ? `${emptyOutputError(deniedPermissions)}; follow-up failed: ${errorMsg}` : errorMsg,
+      duration_ms: Date.now() - startTime,
     })
   } finally {
+    // DW-5: belt and braces — every exit path leaves the queue closed.
+    if (followups) followups.closed = true
     clearTimeout(timeout)
     if (progressHeartbeat) clearInterval(progressHeartbeat)
     abortSignal?.removeEventListener("abort", handleAbort)

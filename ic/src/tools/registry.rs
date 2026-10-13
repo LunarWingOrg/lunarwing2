@@ -657,6 +657,7 @@ impl ToolRegistry {
         let jm_for_cancel = job_manager.clone();
         let store_for_cancel = store.clone();
         let ewm_for_cancel = external_worker_manager.clone();
+        let ewm_for_prompt = external_worker_manager.clone();
         if let Some(jm) = job_manager {
             create_tool = create_tool.with_sandbox(jm, store.clone());
         }
@@ -707,9 +708,17 @@ impl ToolRegistry {
             job_tool_count += 1;
         }
 
-        // Register prompt tool if queue is available
-        if let Some(pq) = prompt_queue {
-            let mut prompt_tool = JobPromptTool::new(pq, Arc::clone(&context_manager));
+        // Register the prompt tool when a queue is available OR external
+        // workers exist (WI#328, MR !1508 review CT-7): in external-only
+        // deployments (sandbox disabled) the control channel is the only
+        // prompt path. The tool keeps the queue Optional (MR !1525 DI-6) so
+        // the local path can reject honestly when no queue exists instead of
+        // reporting "Prompt queued" into a buffer nothing drains.
+        if prompt_queue.is_some() || ewm_for_prompt.is_some() {
+            let mut prompt_tool = JobPromptTool::new(prompt_queue, Arc::clone(&context_manager));
+            if let Some(ewm) = ewm_for_prompt {
+                prompt_tool = prompt_tool.with_external_workers(ewm);
+            }
             if let Some(prompt_store) = store {
                 prompt_tool = prompt_tool.with_store(prompt_store);
             }

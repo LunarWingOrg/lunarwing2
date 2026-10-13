@@ -1460,7 +1460,14 @@ async fn register_tick_job(
     title: &str,
     description: &str,
 ) -> DispatchOutcome {
-    if let Err(error) = ctx.manager.reserve_task(job_id, &ctx.worker.name).await {
+    // The reservation must carry the mission owner: `send_prompt` re-checks
+    // the caller against it, so any other value would reject the owner's own
+    // control prompts (MR !1537 review DW-2).
+    if let Err(error) = ctx
+        .manager
+        .reserve_task(job_id, &ctx.worker.name, ctx.owner_id)
+        .await
+    {
         tracing::warn!(%job_id, worker = %ctx.worker.name, "Cron tick reservation failed: {error}");
         return DispatchOutcome::Capacity(format!("task reservation failed: {error}"));
     }

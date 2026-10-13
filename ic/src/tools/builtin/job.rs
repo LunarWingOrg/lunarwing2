@@ -915,9 +915,11 @@ impl CreateJobTool {
 
         let grants_json = serde_json::to_string(&options.credential_grants).unwrap_or_default();
 
-        ewm.reserve_task(job_id, worker_name).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("failed to reserve external job: {e}"))
-        })?;
+        ewm.reserve_task(job_id, worker_name, &ctx.user_id)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("failed to reserve external job: {e}"))
+            })?;
         if let Err(error) = self
             .context_manager
             .register_sandbox_job(job_id, &ctx.user_id, task, task)
@@ -2330,10 +2332,16 @@ impl Tool for JobEventsTool {
 /// polls for queued prompts between turns and feeds them into the next
 /// `claude --resume` invocation, enabling interactive multi-turn sessions
 /// with long-running sandbox jobs.
+///
+/// `prompt_queue` is `None` on sandbox-disabled deployments (the tool stays
+/// registered so external-worker jobs remain promptable via the control
+/// channel — WI#328); the local path then rejects honestly instead of
+/// queueing into a buffer nothing drains (MR !1525 DI-6).
 pub struct JobPromptTool {
-    prompt_queue: PromptQueue,
+    prompt_queue: Option<PromptQueue>,
     context_manager: Arc<ContextManager>,
     store: Option<Arc<dyn Database>>,
+    external_worker_manager: Option<Arc<ExternalWorkerManager>>,
 }
 
 /// Type alias matching `crate::channels::web::server::PromptQueue`.
@@ -2347,16 +2355,24 @@ pub type PromptQueue = Arc<
 >;
 
 impl JobPromptTool {
-    pub fn new(prompt_queue: PromptQueue, context_manager: Arc<ContextManager>) -> Self {
+    pub fn new(prompt_queue: Option<PromptQueue>, context_manager: Arc<ContextManager>) -> Self {
         Self {
             prompt_queue,
             context_manager,
             store: None,
+            external_worker_manager: None,
         }
     }
 
     pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Inject the external worker manager so follow-up prompts can reach
+    /// RUNNING external jobs over the runtime control channel (WI#328).
+    pub fn with_external_workers(mut self, mgr: Arc<ExternalWorkerManager>) -> Self {
+        self.external_worker_manager = Some(mgr);
         self
     }
 }
@@ -2368,11 +2384,14 @@ impl Tool for JobPromptTool {
     }
 
     fn description(&self) -> &str {
-        "Send a follow-up prompt to a running Claude Code sandbox job. The prompt is \
-         queued and delivered on the next poll cycle. Use this to give the sub-agent \
-         additional instructions, answer its questions, or tell it to wrap up. This does \
-         not cancel work; use cancel_job for cancellation. External workers do not support \
-         follow-up prompts."
+        "Send a follow-up prompt to a running job. For Claude Code sandbox jobs the prompt is \
+         queued and delivered on the next poll cycle. For external workers (opencode, harness, \
+         etc.) the prompt travels over the runtime control channel: the worker applies it after \
+         its current turn ends, never mid-call, and only workers that advertise the \
+         `task_prompt` capability accept it — others reject with an explicit error. Use this to \
+         give the sub-agent additional instructions, answer its questions, or tell it to wrap \
+         up. A wrap-up (done=true) applies after the current turn and closes the channel to \
+         further prompts. This does not cancel work; use cancel_job for cancellation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2438,16 +2457,6 @@ impl Tool for JobPromptTool {
             )));
         }
 
-        if let Some(ref store) = self.store
-            && let Ok(Some(mode)) = store.get_sandbox_job_mode(job_id).await
-            && mode.starts_with("external:")
-        {
-            return Err(ToolError::ExecutionFailed(format!(
-                "job {job_id} uses external worker '{}'; external jobs cannot receive job_prompt. Use cancel_job to stop it",
-                mode.trim_start_matches("external:")
-            )));
-        }
-
         let content = params
             .get("content")
             .and_then(|v| v.as_str())
@@ -2458,13 +2467,73 @@ impl Tool for JobPromptTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // External worker jobs receive follow-up prompts over the runtime
+        // control channel (WI#328). Route on the manager's live state first
+        // (MR !1508 review CT-7): an active handle is authoritative, while a
+        // missing/errored store lookup must never fall through to the Claude
+        // Code prompt queue — nothing drains that queue for an external job
+        // and the tool would still have reported "Prompt queued".
+        if let Some(ref ewm) = self.external_worker_manager
+            && ewm.is_task_active(job_id).await
+        {
+            let seq = ewm
+                .send_prompt(job_id, &ctx.user_id, content, done)
+                .await
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "failed to queue control prompt for external job {job_id}: {e}"
+                    ))
+                })?;
+            let result = serde_json::json!({
+                "job_id": job_id.to_string(),
+                "status": "queued",
+                "message": format!(
+                    "Prompt queued for external worker (control channel seq={seq})"
+                ),
+                "seq": seq,
+                "done": done,
+            });
+            return Ok(ToolOutput::success(result, start.elapsed()));
+        }
+
+        // No active external task handle: if the job's recorded mode says
+        // external, say so honestly instead of queueing into the void.
+        if let Some(ref store) = self.store {
+            match store.get_sandbox_job_mode(job_id).await {
+                Ok(Some(mode)) if mode.starts_with("external:") => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "external job {job_id} has no active worker task (it may have finished or \
+                         failed to start); follow-up prompts are not possible. Use job_status to \
+                         check it, or cancel_job to stop it"
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "failed to look up the mode of job {job_id}: {e}"
+                    )));
+                }
+            }
+        }
+
         let prompt = crate::orchestrator::api::PendingPrompt {
             content: content.to_string(),
             done,
         };
 
+        // MR !1525 DI-6: on sandbox-disabled deployments the tool is
+        // registered for the external control channel only and carries no
+        // real queue — reject local jobs honestly instead of a false
+        // "Prompt queued" into a buffer nothing drains.
+        let Some(ref prompt_queue) = self.prompt_queue else {
+            return Err(ToolError::ExecutionFailed(format!(
+                "job {job_id} is not an external worker job and this deployment has no local \
+                 prompt queue (sandbox is disabled); follow-up prompts are not possible for it"
+            )));
+        };
+
         {
-            let mut queue = self.prompt_queue.lock().await;
+            let mut queue = prompt_queue.lock().await;
             queue.entry(job_id).or_default().push_back(prompt);
         }
 
@@ -2591,10 +2660,8 @@ mod tests {
 
         let manager = Arc::new(ContextManager::new(5));
         let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
-            name: "opencode".to_string(),
-            url: "ws://127.0.0.1:20007/ws/agent".to_string(),
             timeout_ms: 900_000,
-            ..Default::default()
+            ..ExternalWorkerConfig::test_config("opencode", "ws://127.0.0.1:20007/ws/agent")
         }]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
 
@@ -2640,12 +2707,9 @@ mod tests {
         use crate::config::ExternalWorkerConfig;
 
         let manager = Arc::new(ContextManager::new(5));
-        let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
-            name: "opencode".to_string(),
-            url: "ws://127.0.0.1:9/ws/agent".to_string(),
-            timeout_ms: 900_000,
-            ..Default::default()
-        }]));
+        let workers = Arc::new(ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("opencode", "ws://127.0.0.1:9/ws/agent"),
+        ]));
         let tool = CreateJobTool::new(manager).with_external_workers(workers, None);
         let error = tool
             .execute(
@@ -3457,7 +3521,7 @@ mod tests {
 
     fn test_prompt_tool(queue: PromptQueue) -> JobPromptTool {
         let cm = Arc::new(ContextManager::new(5));
-        JobPromptTool::new(queue, cm)
+        JobPromptTool::new(Some(queue), cm)
     }
 
     #[tokio::test]
@@ -3470,7 +3534,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(Arc::clone(&queue), cm);
+        let tool = JobPromptTool::new(Some(Arc::clone(&queue)), cm);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string(),
@@ -3601,7 +3665,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(queue, cm);
+        let tool = JobPromptTool::new(Some(queue), cm);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string(),
@@ -3625,6 +3689,137 @@ mod tests {
         );
     }
 
+    /// WI#328: an active external job (live manager handle + advertised
+    /// `task_prompt` capability) is routed onto the runtime control channel.
+    #[tokio::test]
+    async fn test_job_prompt_tool_routes_active_external_job_to_control_channel() {
+        use crate::config::ExternalWorkerConfig;
+        use crate::orchestrator::ExternalWorkerManager;
+        use crate::orchestrator::external_worker::ControlCapability;
+
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = cm
+            .create_job_for_user("default", "External Job", "desc")
+            .await
+            .unwrap(); // safety: test
+
+        let ewm = Arc::new(ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
+        ]));
+        ewm.reserve_task(job_id, "harness", "default")
+            .await
+            .unwrap(); // safety: test
+        ewm.force_control_capability(job_id, ControlCapability::Supported)
+            .await;
+
+        let queue: PromptQueue =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let tool = JobPromptTool::new(Some(queue), cm).with_external_workers(ewm);
+
+        let params = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "content": "status?",
+            "done": true,
+        });
+        let ctx = JobContext::default();
+        let result = tool.execute(params, &ctx).await.unwrap(); // safety: test
+        assert_eq!(result.result["status"], "queued"); // safety: test
+        assert_eq!(result.result["seq"], 1); // safety: test
+        assert_eq!(result.result["done"], true); // safety: test
+    }
+
+    /// WI#328 (MR !1508 CT-1): a worker that did not advertise `task_prompt`
+    /// produces an explicit error, not a false "queued".
+    #[tokio::test]
+    async fn test_job_prompt_tool_rejects_external_job_without_capability() {
+        use crate::config::ExternalWorkerConfig;
+        use crate::orchestrator::ExternalWorkerManager;
+        use crate::orchestrator::external_worker::ControlCapability;
+
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = cm
+            .create_job_for_user("default", "External Job", "desc")
+            .await
+            .unwrap(); // safety: test
+
+        let ewm = Arc::new(ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
+        ]));
+        ewm.reserve_task(job_id, "harness", "default")
+            .await
+            .unwrap(); // safety: test
+        ewm.force_control_capability(job_id, ControlCapability::Unsupported)
+            .await;
+
+        let queue: PromptQueue =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let tool = JobPromptTool::new(Some(queue), cm).with_external_workers(ewm);
+
+        let params = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "content": "hello",
+        });
+        let ctx = JobContext::default();
+        let err = tool.execute(params, &ctx).await.unwrap_err().to_string(); // safety: test
+        assert!(
+            err.contains("does not advertise the task_prompt capability"),
+            "expected capability rejection, got: {err}"
+        );
+    }
+
+    /// WI#328 (MR !1508 CT-7): a job recorded as external with NO live task
+    /// handle must fail honestly instead of queueing into the Claude Code
+    /// prompt queue that nothing drains for external jobs.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_job_prompt_tool_external_without_active_handle_errors() {
+        use crate::config::ExternalWorkerConfig;
+        use crate::orchestrator::ExternalWorkerManager;
+
+        // Routed through crate::testing::test_db() so no new direct
+        // db::libsql usage appears outside db/testing (check-boundaries).
+        let (store, _db_guard) = crate::testing::test_db().await;
+
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = cm
+            .create_job_for_user("default", "External Job", "desc")
+            .await
+            .unwrap(); // safety: test
+        // This routing test only needs a persisted job and its external mode.
+        // Reuse the context instead of adding a SandboxJobRecord literal that
+        // breaks when !1548 adds the required job_mode field (EJ-1).
+        let job_ctx = cm.get_context(job_id).await.unwrap(); // safety: test
+        store.save_job(&job_ctx).await.unwrap(); // safety: test
+        store
+            .update_sandbox_job_mode(job_id, "external:harness")
+            .await
+            .unwrap(); // safety: test
+
+        let ewm = Arc::new(ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("harness", "ws://127.0.0.1:9/ws/agent"),
+        ]));
+        // Deliberately no reserve_task: the job has no active handle.
+
+        let queue: PromptQueue =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let tool = JobPromptTool::new(Some(Arc::clone(&queue)), cm)
+            .with_external_workers(ewm)
+            .with_store(store);
+
+        let params = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "content": "hello",
+        });
+        let ctx = JobContext::default();
+        let err = tool.execute(params, &ctx).await.unwrap_err().to_string(); // safety: test
+        assert!(
+            err.contains("no active worker task"),
+            "expected honest not-active error, got: {err}"
+        );
+        // Nothing may have landed in the sandbox prompt queue.
+        assert!(queue.lock().await.is_empty()); // safety: test
+    }
+
     #[tokio::test]
     async fn test_job_prompt_tool_rejects_completed_job() {
         let cm = Arc::new(ContextManager::new(5));
@@ -3643,7 +3838,7 @@ mod tests {
 
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = JobPromptTool::new(queue, cm);
+        let tool = JobPromptTool::new(Some(queue), cm);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string(),
@@ -3658,6 +3853,32 @@ mod tests {
             err.contains("cannot receive follow-up prompts"),
             "expected completed-job rejection, got: {}",
             err
+        );
+    }
+
+    /// WI#328 (MR !1525 DI-6): on a sandbox-disabled deployment the tool
+    /// carries no real prompt queue (registered only for the external control
+    /// channel). A prompt for a local job must fail honestly instead of
+    /// reporting "Prompt queued" into a buffer nothing drains.
+    #[tokio::test]
+    async fn test_job_prompt_tool_queueless_rejects_local_job() {
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = cm
+            .create_job_for_user("default", "Local Job", "desc")
+            .await
+            .unwrap(); // safety: test
+
+        let tool = JobPromptTool::new(None, cm);
+
+        let params = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "content": "hello",
+        });
+        let ctx = JobContext::default();
+        let err = tool.execute(params, &ctx).await.unwrap_err().to_string(); // safety: test
+        assert!(
+            err.contains("no local prompt queue"),
+            "expected queueless rejection, got: {err}"
         );
     }
 
