@@ -15,9 +15,13 @@ Assertions (opencode2 lane):
   3. config/opencode2.json carries the shell deny rules for the
      self-exposure subcommands (control 2, config layer).
   4. entrypoint.sh starts the server with a password and a loopback default
-     hostname, and never invokes service mode (controls 2 + 4).
-  5. scripts/opencode-exposure-guard.sh exists and refuses the service/pair
-     subcommands (control 2, wrapper layer).
+     hostname, never invokes service mode, never passes --service, defaults
+     OPENCODE_BIN to the exposure-guard wrapper (not the real binary), and
+     re-derives the runtime config from /app/config at boot (controls 2+4;
+     structural checks — comments cannot satisfy them).
+  5. scripts/opencode-exposure-guard.sh exists and scans every argv token:
+     service/pair subcommands, the --service flag, and every --hostname
+     occurrence (control 2, wrapper layer).
   6. --binary PATH: the built opencode binary contains no OpenTunnel client
      markers (controls 5 + 8).
 
@@ -88,6 +92,25 @@ def check_config(lane: pathlib.Path, config_name: str, is_v2: bool) -> None:
         check("opencode2.json carries the self-exposure shell deny rules")
 
 
+def serve_invocation_lines(code: str) -> list[str]:
+    r"""Lines of the '$OPENCODE_BIN" serve' invocation, joining continuations.
+
+    The serve command spans several shell lines (trailing backslashes), so a
+    plain '--hostname in code' check could be satisfied by an unrelated line
+    (run-79 EI-8). Returns [] when no serve invocation exists.
+    """
+    lines = code.splitlines()
+    for index, line in enumerate(lines):
+        if re.search(r'"?\$OPENCODE_BIN"?\s+serve\b', line):
+            block = [line.rstrip("\\").rstrip()]
+            cursor = index + 1
+            while cursor < len(lines) and lines[cursor - 1].rstrip().endswith("\\"):
+                block.append(lines[cursor].rstrip("\\").rstrip())
+                cursor += 1
+            return block
+    return []
+
+
 def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
     entrypoint = lane / "entrypoint.sh"
     try:
@@ -106,21 +129,46 @@ def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
             break
     else:
         check("entrypoint.sh never invokes service mode or pairing")
+    if "--service" in code:
+        # run-79 EI-3: serve --service is service mode via a flag.
+        fail(f"{entrypoint} passes --service — service mode is forbidden")
+    else:
+        check("entrypoint.sh never passes --service")
     if 'OPENCODE_SERVE_HOST="${OPENCODE_SERVE_HOST:-127.0.0.1}"' in text:
         check("entrypoint.sh defaults the server bind to loopback")
     else:
         fail(f"{entrypoint} lost its loopback OPENCODE_SERVE_HOST default")
-    if re.search(r'"?\$OPENCODE_BIN"?\s+serve\s', code) and "--hostname" in code:
+    serve_lines = serve_invocation_lines(code)
+    if serve_lines and any("--hostname" in line for line in serve_lines):
         check("entrypoint.sh starts the server with an explicit --hostname")
     else:
         fail(f"{entrypoint} must start the server via serve with --hostname")
     if is_v2:
+        # run-79 EI-3: OPENCODE_BIN must resolve to the wrapper, not the real
+        # binary at /usr/local/lib/opencode2/opencode.
+        if 'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"' in text:
+            check("entrypoint.sh runs opencode through the exposure-guard wrapper")
+        else:
+            fail(f"{entrypoint} must default OPENCODE_BIN to the wrapper at "
+                 "/usr/local/bin/opencode (not the real binary)")
         # v2 mandates Basic auth on serve; v1.18.25's serve has no auth
-        # support, so the password invariant is v2-only.
-        if "OPENCODE_PASSWORD" in text:
+        # support, so the password invariant is v2-only. Structural: the
+        # export must be executable code, not prose naming the variable
+        # (run-79 EI-8 — a comment could satisfy a substring check).
+        if re.search(r'^\s*export OPENCODE_PASSWORD\b', code, re.MULTILINE):
             check("entrypoint.sh sets a server password")
         else:
-            fail(f"{entrypoint} must set OPENCODE_PASSWORD before serve")
+            fail(f"{entrypoint} must export OPENCODE_PASSWORD before serve")
+        # run-79 EI-5: the workspace config copy is untrusted — it must be
+        # regenerated from the root-owned /app/config at every boot (copy or
+        # symlink), so agent edits cannot persist across restarts.
+        copies = 'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in code
+        links = 'ln -sfn /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in code
+        if copies or links:
+            check("entrypoint.sh re-derives the runtime config from /app/config at boot")
+        else:
+            fail(f"{entrypoint} must materialize the runtime config from "
+                 "/app/config/opencode2.json (copy or symlink) at every boot")
 
 
 def check_wrapper(lane: pathlib.Path) -> None:
@@ -131,15 +179,23 @@ def check_wrapper(lane: pathlib.Path) -> None:
         fail(f"{wrapper} is missing — the binary wrapper is the control-2 layer that "
              "permission rules cannot cover (bash -c, absolute paths)")
         return
-    for subcommand in ("service", "pair"):
-        if re.search(rf"^\s*{subcommand}\)", text, re.MULTILINE):
-            check(f"wrapper refuses 'opencode {subcommand}'")
-        else:
-            fail(f"{wrapper} must refuse the '{subcommand}' subcommand")
-    if "is_loopback" in text and "--hostname" in text:
-        check("wrapper enforces loopback-only serve")
+    # run-79 EI-2/EI-3, run-84 EU-2: the wrapper must scan EVERY argv token —
+    # a \$1-only dispatch misses global flags before the subcommand and
+    # repeated --hostname values.
+    required_fragments = (
+        ('for arg in "$@"', "scan every argv token"),
+        ("service) refuse", "refuse the 'service' subcommand"),
+        ("pair) refuse", "refuse the 'pair' subcommand"),
+        ("--service | --service=*) refuse", "refuse the --service flag"),
+        ('--hostname=*) is_loopback', "check every --hostname=value occurrence"),
+        ('[ "$want_host" = 0 ]', "refuse a dangling --hostname"),
+    )
+    missing = [what for fragment, what in required_fragments if fragment not in text]
+    if missing:
+        fail(f"{wrapper} lost required guard shape: {missing} — the wrapper must "
+             "scan every argv token, not only $1")
     else:
-        fail(f"{wrapper} must refuse non-loopback serve --hostname")
+        check("wrapper scans every argv token (service/pair/--service/--hostname)")
 
 
 def check_binary(binary: pathlib.Path) -> None:

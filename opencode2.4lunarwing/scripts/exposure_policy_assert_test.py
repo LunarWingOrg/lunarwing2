@@ -43,8 +43,13 @@ def write_lane(root: pathlib.Path, *, name: str = "opencode2.4lunarwing") -> pat
     (lane / "entrypoint.sh").write_text(
         "# comment naming opencode service mode is prose, not an invocation\n"
         'OPENCODE_SERVE_HOST="${OPENCODE_SERVE_HOST:-127.0.0.1}"\n'
-        'OPENCODE_PASSWORD="${OPENCODE_PASSWORD:-x}"\n'
-        '"$OPENCODE_BIN" serve --port "$OPENCODE_SERVE_PORT" --hostname "$OPENCODE_SERVE_HOST"\n',
+        'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"\n'
+        'mkdir -p "$WORKSPACE_ROOT/.opencode"\n'
+        'rm -f "$WORKSPACE_ROOT/.opencode/opencode2.json"\n'
+        'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"\n'
+        'export OPENCODE_PASSWORD="${OPENCODE_PASSWORD:-x}"\n'
+        '"$OPENCODE_BIN" serve --port "$OPENCODE_SERVE_PORT" \\\n'
+        '  --hostname "$OPENCODE_SERVE_HOST"\n',
         encoding="utf-8",
     )
     shutil.copy(WRAPPER, lane / "scripts" / WRAPPER.name)
@@ -100,6 +105,94 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         result = run_assert("--lane", str(self.lane))
         self.assertEqual(result.returncode, 1)
         self.assertIn("invokes 'opencode service'", result.stderr)
+
+    def test_service_flag_in_entrypoint_fails(self) -> None:
+        entrypoint = self.lane / "entrypoint.sh"
+        entrypoint.write_text(
+            entrypoint.read_text(encoding="utf-8").replace(
+                '"$OPENCODE_BIN" serve --port',
+                '"$OPENCODE_BIN" serve --service --port',
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("passes --service", result.stderr)
+
+    def test_opencode_bin_pointing_at_real_binary_fails(self) -> None:
+        entrypoint = self.lane / "entrypoint.sh"
+        entrypoint.write_text(
+            entrypoint.read_text(encoding="utf-8").replace(
+                ":-/usr/local/bin/opencode}", ":-/usr/local/lib/opencode2/opencode}"
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("OPENCODE_BIN", result.stderr)
+
+    def test_password_mentioned_only_in_comment_fails(self) -> None:
+        # run-79 EI-8: a substring check is satisfied by prose; the structural
+        # export check is not.
+        entrypoint = self.lane / "entrypoint.sh"
+        entrypoint.write_text(
+            entrypoint.read_text(encoding="utf-8").replace(
+                'export OPENCODE_PASSWORD="${OPENCODE_PASSWORD:-x}"\n',
+                "# OPENCODE_PASSWORD is set by the operator, trust us\n",
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("export OPENCODE_PASSWORD", result.stderr)
+
+    def test_hostname_on_unrelated_line_only_fails(self) -> None:
+        # run-79 EI-8: --hostname must be on the serve invocation itself.
+        entrypoint = self.lane / "entrypoint.sh"
+        entrypoint.write_text(
+            entrypoint.read_text(encoding="utf-8").replace(
+                '"$OPENCODE_BIN" serve --port "$OPENCODE_SERVE_PORT" \\\n'
+                '  --hostname "$OPENCODE_SERVE_HOST"\n',
+                '"$OPENCODE_BIN" serve --port "$OPENCODE_SERVE_PORT"\n'
+                'echo "--hostname is documented elsewhere"\n',
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("with --hostname", result.stderr)
+
+    def test_workspace_config_not_rederived_fails(self) -> None:
+        entrypoint = self.lane / "entrypoint.sh"
+        entrypoint.write_text(
+            entrypoint.read_text(encoding="utf-8").replace(
+                'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"\n',
+                'true\n',
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must materialize the runtime config", result.stderr)
+
+    def test_wrapper_first_token_dispatch_regression_fails(self) -> None:
+        # run-79 EI-2 shape: a \$1-only dispatch misses leading global flags.
+        wrapper = self.lane / "scripts" / WRAPPER.name
+        text = wrapper.read_text(encoding="utf-8")
+        start = text.index('want_host=0')
+        end = text.index('exec "$REAL_OPENCODE"')
+        wrapper.write_text(
+            text[:start]
+            + 'case "${1:-}" in\n'
+            + '  service) refuse "service" "service mode is disabled" ;;\n'
+            + '  pair) refuse "pair" "pairing links are disabled" ;;\n'
+            + "esac\n\n"
+            + text[end:],
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("every argv token", result.stderr)
 
     def test_non_loopback_default_fails(self) -> None:
         entrypoint = self.lane / "entrypoint.sh"
