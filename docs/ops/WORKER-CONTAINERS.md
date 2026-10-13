@@ -173,13 +173,17 @@ Enforced controls (opencode2 lane unless noted):
    ruleset ordering, the wrapper (every-token scan), the Dockerfile wiring
    including the root-owned read-only boot files + `scripts/`+`config/`, and runs
    git-free (the ci-config image ships no git). The Dockerfile checks are
-   anchored over comment-stripped, continuation-joined lines — a deleted or
-   commented-out compile-out RUN or binary marker scan cannot pass by keeping
-   the script name in COPY lines or comments — and no RUN may chown/chmod
-   the guarded policy paths other than the shipped exec-bit and `a-w` lines,
-   so a late re-permission step after the final assertion fails the guard
-   (run-90 FC-4). `.gitlab/tests/test_worker_exposure_policy.py`
-   regression-covers it,
+   anchored over comment-stripped, continuation-joined lines. The exact
+   compile-out source COPY and RUN must occur in `AS builder`, in that order,
+   before the native build RUN. The wrapper-install/binary-scan RUN and the
+   read-only chmod RUN (with optional exec-bit prefix) must each match a whole
+   instruction, so a suffix such as `|| true` cannot hide a failed scan.
+   After the final `--image-filesystem` RUN, only `EXPOSE`, `HEALTHCHECK`,
+   `USER`, `ENTRYPOINT`, `CMD`, `LABEL` and `STOPSIGNAL` are allowed
+   (case-insensitively). Later COPY/ADD/RUN steps or new stages are refused
+   regardless of command spelling; earlier filesystem changes are checked
+   by the image-build assertion (run-96 FP-1, closing the run-90 FC-4 gaps).
+   `.gitlab/tests/test_worker_exposure_policy.py` regression-covers it,
    including no-git lanes. The guard also runs the exposure/wrapper,
    compile-out, and non-root boot configuration suites on merge requests.
 5. **Build-time assertion.** The opencode2 Dockerfile runs

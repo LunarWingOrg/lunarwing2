@@ -32,8 +32,9 @@ python3 "$lane/scripts/entrypoint_config_test.py" || failed=1
 # The wrapper must actually be installed over the pinned binary path, and
 # each build-time policy step must be an anchored RUN: a deleted RUN used to
 # pass because the script stayed named in COPY lines and comments (run-90
-# FC-4 G1/G5). Greps run over comment-stripped, continuation-joined logical
-# lines (pure bash: the ci-config image has no awk/sed, run-79 EI-1).
+# FC-4 G1/G5). Checks run over comment-stripped, continuation-joined logical
+# lines with case-normalized instructions (pure bash: the ci-config image
+# has no awk/sed, run-79 EI-1).
 dockerfile="$lane/Dockerfile"
 dockerfile_code=""
 _join=""
@@ -47,18 +48,70 @@ while IFS= read -r _raw || [[ -n "$_raw" ]]; do
         _join+="${_part%"${_part##*[![:space:]]}"} "
         continue
     fi
-    dockerfile_code+="${_join}${_line}"$'\n'
+    _line="${_join}${_line%"${_line##*[![:space:]]}"}"
+    _instruction="${_line%%[[:space:]]*}"
+    dockerfile_code+="${_instruction^^}${_line#"$_instruction"}"$'\n'
     _join=""
 done < "$dockerfile"
-grep -q 'COPY --from=builder /out/bin/opencode /usr/local/lib/opencode2/opencode' <<<"$dockerfile_code" \
+[[ -z "$_join" ]] || fail "Dockerfile ends with an unfinished continuation"
+grep -Fxq 'COPY --from=builder /out/bin/opencode /usr/local/lib/opencode2/opencode' <<<"$dockerfile_code" \
     || fail "Dockerfile no longer moves the pinned binary to /usr/local/lib/opencode2/opencode"
-grep -q 'install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode' <<<"$dockerfile_code" \
-    || fail "Dockerfile no longer installs the exposure-guard wrapper as /usr/local/bin/opencode"
-grep -q -- 'exposure_policy_assert.py --lane /app --profile opencode2 --binary /usr/local/lib/opencode2/opencode' <<<"$dockerfile_code" \
-    || fail "Dockerfile lost the build-time binary marker scan (exposure_policy_assert --binary, run-90 FC-4 G5)"
-grep -q '^RUN python3 /build/compile_out_remote_tunnel.py /build/opencode$' <<<"$dockerfile_code" \
-    || fail "Dockerfile lost the OpenTunnel compile-out RUN (control 8, run-90 FC-4 G1)"
-grep -q '^RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem$' <<<"$dockerfile_code" \
+binary_scan='RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode'
+binary_scan+=' && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --binary /usr/local/lib/opencode2/opencode'
+grep -Fxq "$binary_scan" <<<"$dockerfile_code" \
+    || fail "Dockerfile no longer installs the exposure-guard wrapper with the build-time binary marker scan (run-90 FC-4 G5)"
+
+# Run-96 FP-1: presence alone does not prove that the patch reaches the
+# shipped binary. Require its exact COPY and RUN in AS builder, in that
+# order, before the pinned native build RUN (not after it or in a dead stage).
+# The filesystem assertion must be the final filesystem-changing step:
+# allow only metadata afterwards, rather than enumerating chmod/chown forms.
+stage=""
+compile_out_copied=0
+compile_out_ran=0
+guarded_build=0
+filesystem_checked=0
+while IFS= read -r docker_line; do
+    [[ -n "$docker_line" ]] || continue
+    instruction="${docker_line%%[[:space:]]*}"
+    if ((filesystem_checked)); then
+        case "$instruction" in
+            EXPOSE|HEALTHCHECK|USER|ENTRYPOINT|CMD|LABEL|STOPSIGNAL) ;;
+            *) fail "Dockerfile must not change the filesystem or re-permission paths after --image-filesystem: ${docker_line}" ;;
+        esac
+    fi
+    if [[ "$instruction" == FROM ]]; then
+        stage=""
+        compile_out_copied=0
+        compile_out_ran=0
+        if [[ "${docker_line^^}" =~ [[:space:]]AS[[:space:]]BUILDER$ ]]; then
+            stage=builder
+        fi
+    fi
+    # Match the Dockerfile's variable reference literally, without expansion.
+    # shellcheck disable=SC2016
+    case "$docker_line" in
+        'COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py')
+            if [[ "$stage" == builder ]]; then compile_out_copied=1; fi
+            ;;
+        'RUN python3 /build/compile_out_remote_tunnel.py /build/opencode')
+            if [[ "$stage" == builder ]] && ((compile_out_copied)); then compile_out_ran=1; fi
+            ;;
+        'RUN OPENCODE_VERSION="${OPENCODE_VERSION#v}" bun run build -- --single')
+            if [[ "$stage" == builder ]] && ((compile_out_ran)); then
+                guarded_build=1
+            else
+                fail "Dockerfile must run the OpenTunnel compile-out in AS builder before bun run build -- --single"
+            fi
+            ;;
+        'RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem')
+            filesystem_checked=1
+            ;;
+    esac
+done <<<"$dockerfile_code"
+((guarded_build)) \
+    || fail "Dockerfile lost the OpenTunnel compile-out RUN with its source COPY before the builder build (control 8, run-96 FP-1)"
+((filesystem_checked)) \
     || fail "Dockerfile must verify installed policy-file ownership and modes (FB-4)"
 
 # WI#357 (run-79 EI-5): the exposure controls must be root-owned and
@@ -70,32 +123,19 @@ fi
 if grep -Eq '^\s*COPY\s+[^#]*--chown=[^#]*\bconfig/' <<<"$dockerfile_code"; then
     fail "Dockerfile hands /app/config to the agent uid — config must be root-owned"
 fi
-grep -q '^COPY scripts/ ./scripts/$' <<<"$dockerfile_code" \
+grep -Fxq 'COPY scripts/ ./scripts/' <<<"$dockerfile_code" \
     || fail "Dockerfile lost the root-owned COPY of scripts/"
-grep -q '^COPY config/ ./config/$' <<<"$dockerfile_code" \
+grep -Fxq 'COPY config/ ./config/' <<<"$dockerfile_code" \
     || fail "Dockerfile lost the root-owned COPY of config/"
 if grep -Eq '^\s*COPY\s+[^#]*--chown=[^#]*\b(entrypoint\.sh|health_server\.py|agent_comm_protocol\.json)\b' <<<"$dockerfile_code"; then
     fail "Dockerfile hands boot files to the agent uid — boot files must be root-owned (FB-4)"
 fi
-grep -q '^COPY entrypoint.sh health_server.py agent_comm_protocol.json ./$' <<<"$dockerfile_code" \
+grep -Fxq 'COPY entrypoint.sh health_server.py agent_comm_protocol.json ./' <<<"$dockerfile_code" \
     || fail "Dockerfile lost the root-owned COPY of the boot files (FB-4)"
-grep -Eq 'chmod -R a-w /app/scripts /app/config /app/entrypoint\.sh /app/health_server\.py /app/agent_comm_protocol\.json' <<<"$dockerfile_code" \
+# One whole instruction, not a substring allowlist: neither the optional
+# exec-bit prefix nor the a-w command may hide a suffix restoring write access.
+grep -Eq '^RUN (chmod \+x /app/entrypoint\.sh /app/health_server\.py && )?chmod -R a-w /app/scripts /app/config /app/entrypoint\.sh /app/health_server\.py /app/agent_comm_protocol\.json$' <<<"$dockerfile_code" \
     || fail "Dockerfile must mark scripts, config and boot files read-only (FB-4)"
-
-# Run-90 FC-4 G3b: nothing may re-permission the guarded policy paths — any
-# chown/chmod RUN touching them, other than the two shipped lines (the exec
-# bit before the a-w step, and the a-w itself), fails the guard. This also
-# catches a late `chown -R` / `chmod u+w` placed after the final assertion,
-# which the image-filesystem check cannot see.
-while IFS= read -r perm_line; do
-    case "$perm_line" in
-        *"chmod +x /app/entrypoint.sh /app/health_server.py"*) ;;
-        *"chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json"*) ;;
-        *)
-            fail "Dockerfile must not re-permission the guarded policy paths (run-90 FC-4): ${perm_line}"
-            ;;
-    esac
-done < <(grep -E '(^|[;[:space:]])ch(own|mod)[[:space:]][^#]*(/app/(scripts|config|entrypoint\.sh|health_server\.py|agent_comm_protocol\.json))' <<<"$dockerfile_code")
 
 # The bridge session ruleset must deny the self-exposure subcommands; the
 # denies must come after the allow-all shell rule to win under findLast.

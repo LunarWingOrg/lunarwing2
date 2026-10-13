@@ -29,16 +29,26 @@ function sessionPermissions() {
 }
 """
 
+COMPILE_OUT_COPY = "COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py\n"
+COMPILE_OUT_RUN = "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode\n"
+BUILD_RUN = 'RUN OPENCODE_VERSION="${OPENCODE_VERSION#v}" bun run build -- --single\n'
+READONLY_RUN = "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json\n"
+FILESYSTEM_ASSERTION = "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem\n"
+
 DOCKERFILE_LINES = (
+    "FROM example.invalid/bun AS builder\n",
+    COMPILE_OUT_COPY,
+    COMPILE_OUT_RUN,
+    BUILD_RUN,
+    "FROM example.invalid/bun AS runtime\n",
     "COPY --from=builder /out/bin/opencode /usr/local/lib/opencode2/opencode\n",
     "RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode \\\n"
     "    && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --binary /usr/local/lib/opencode2/opencode\n",
-    "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode\n",
     "COPY scripts/ ./scripts/\n",
     "COPY config/ ./config/\n",
     "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./\n",
-    "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json\n",
-    "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem\n",
+    READONLY_RUN,
+    FILESYSTEM_ASSERTION,
 )
 
 
@@ -266,7 +276,7 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
 
     def test_dockerfile_repermissioning_guarded_paths_fails(self):
         # Run-90 FC-4 G3b: no RUN may hand the guarded paths back to a
-        # writable state, even after the final --image-filesystem assertion.
+        # writable state after the final --image-filesystem assertion.
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         original = dockerfile.read_text()
         for line in (
@@ -280,6 +290,124 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("re-permission", result.stderr)
         dockerfile.write_text(original, encoding="utf-8")
+
+    def test_dockerfile_changes_after_filesystem_assertion_fail(self):
+        # Run-96 FP-1: classify instructions, not shell command spellings.
+        # All these changes would escape the already-executed image check.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for tail in (
+            "COPY --chmod=0777 entrypoint.sh /app/entrypoint.sh\n",
+            "COPY --chown=opencode2 entrypoint.sh /app/entrypoint.sh\n",
+            "ADD --chown=opencode2 entrypoint.sh /app/entrypoint.sh\n",
+            "copy --chmod=0777 entrypoint.sh /app/entrypoint.sh\n",
+            "CoPy --chmod=0777 entrypoint.sh /app/entrypoint.sh\n",
+            "COPY --chmod=0777 \\\n    entrypoint.sh /app/entrypoint.sh\n",
+            'COPY ["entrypoint.sh", "/app/entrypoint.sh"]\n',
+            "COPY --from=writable /app/entrypoint.sh /app/entrypoint.sh\n",
+            'RUN ["chmod", "a+w", "/app/entrypoint.sh"]\n',
+            "RUN /bin/chmod a+w /app/entrypoint.sh\n",
+            "RUN install -o 10003 entrypoint.sh /app/entrypoint.sh\n",
+            "RUN ln -sf /home/opencode2/entrypoint.sh /app/entrypoint.sh\n",
+            "RUN cp -p /home/opencode2/entrypoint.sh /app/entrypoint.sh\n",
+            "RUN setfacl -m u:10003:rw /app/entrypoint.sh\n",
+            "WORKDIR /app\nRUN chmod a+w entrypoint.sh\n",
+            "RUN chown -R opencode2 /app\n",
+            "RUN chmod -R a+w /app//scripts\n",
+            "RUN find /app -type f -exec chmod a+w {} +\n",
+            'RUN path=/app/entrypoint.sh; chmod a+w "$path"\n',
+            "RUN chmod +x /app/entrypoint.sh /app/health_server.py && chown -R opencode2 /app/scripts\n",
+            'VOLUME ["/app"]\n',
+            "ONBUILD RUN chmod a+w /app/entrypoint.sh\n",
+            "ENV MUTABLE_PATH=/app\n",
+            "ARG MUTABLE_PATH=/app\n",
+            'SHELL ["/bin/sh", "-c"]\n',
+            "FROM example.invalid/bun AS unchecked\n",
+        ):
+            with self.subTest(tail=tail):
+                # A dead stage with agent-writable content for COPY --from.
+                planted_stage = (
+                    "FROM example.invalid/bun AS writable\nWORKDIR /app\n"
+                    "COPY entrypoint.sh ./\nRUN chmod a+w entrypoint.sh\n"
+                )
+                dockerfile.write_text(planted_stage + original + tail, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("after --image-filesystem", result.stderr)
+
+    def test_dockerfile_metadata_after_filesystem_assertion_passes(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        dockerfile.write_text(
+            dockerfile.read_text()
+            + '\n# Mixed-case metadata and continued instructions are allowed.\n'
+            + 'eXpOsE 8443\nhealthcheck --interval=30s \\\n    CMD curl -sf http://127.0.0.1:8443/health || exit 1\n'
+            + 'user 10003:10003\nentrypoint ["/app/entrypoint.sh"]\n'
+            + 'cmd ["--mode", "websocket"]\nLABEL policy="WI357"\nstopsignal SIGTERM\n',
+            encoding="utf-8",
+        )
+        result = self.run_guard(self.root, without_git=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dockerfile_compile_out_must_precede_builder_build(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        without_patch = original.replace(COMPILE_OUT_RUN, "")
+        for name, mutated in {
+            "after-build": without_patch.replace(BUILD_RUN, BUILD_RUN + COMPILE_OUT_RUN),
+            "unused-stage": (
+                "FROM example.invalid/bun AS unused\n"
+                + COMPILE_OUT_COPY + COMPILE_OUT_RUN + without_patch
+            ),
+            "runtime-stage": without_patch.replace(READONLY_RUN, COMPILE_OUT_RUN + READONLY_RUN),
+            "missing-build": original.replace(BUILD_RUN, ""),
+        }.items():
+            with self.subTest(name=name):
+                dockerfile.write_text(mutated, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("compile-out", result.stderr)
+
+    def test_dockerfile_compile_out_requires_exact_source_copy(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for name, mutated in {
+            "commented-copy": original.replace(COMPILE_OUT_COPY, "# " + COMPILE_OUT_COPY),
+            "wrong-source": original.replace("COPY scripts/compile_out_remote_tunnel.py", "COPY other.py"),
+            "dot-is-literal": original.replace("COPY scripts/compile_out_remote_tunnel.py", "COPY scripts/compile_out_remote_tunnelXpy"),
+            "copy-after-run": original.replace(COMPILE_OUT_COPY + COMPILE_OUT_RUN, COMPILE_OUT_RUN + COMPILE_OUT_COPY),
+        }.items():
+            with self.subTest(name=name):
+                dockerfile.write_text(mutated, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("compile-out", result.stderr)
+
+    def test_dockerfile_binary_scan_cannot_mask_failure(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        marker = "--binary /usr/local/lib/opencode2/opencode\n"
+        for suffix in (" || true", " ; true", " \\\n    || true"):
+            with self.subTest(suffix=suffix):
+                dockerfile.write_text(original.replace(marker, marker.rstrip() + suffix + "\n"))
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("binary marker scan", result.stderr)
+
+    def test_dockerfile_readonly_step_must_be_exact(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        exec_prefix = "RUN chmod +x /app/entrypoint.sh /app/health_server.py && "
+        for replacement in (
+            READONLY_RUN.rstrip() + " && chown -R opencode2 /app/scripts\n",
+            exec_prefix + "chown -R opencode2 /app/scripts\n",
+            exec_prefix + READONLY_RUN.removeprefix("RUN ").rstrip() + " && chmod u+w /app/config\n",
+            READONLY_RUN.replace("entrypoint.sh", "entrypointXsh"),
+        ):
+            with self.subTest(replacement=replacement):
+                dockerfile.write_text(original.replace(READONLY_RUN, replacement), encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("read-only", result.stderr)
 
     def test_executor_missing_deny_fails(self):
         executor = self.root / "opencode2.4lunarwing" / "scripts" / "opencode_task_executor.ts"
