@@ -369,7 +369,19 @@ restore_tenant_postgres() {
   # state is indeterminate, never assume "stopped".
   local daemon_state="unknown"
   if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v systemctl >/dev/null 2>&1; then
-    if _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service" 2>/dev/null; then daemon_state="active"; else daemon_state="stopped"; fi
+    # Mirror the OpenRC branch: only positively-known states classify. rc 3
+    # (not running) and 4 (no such unit) are stopped; anything else — e.g. 1,
+    # an unreachable user manager — is indeterminate and must fail closed,
+    # never read as "stopped" (EQ-8; the branch previously mapped every
+    # is-active failure to stopped, against the comment above).
+    local is_active_rc=0
+    _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service" 2>/dev/null \
+      || is_active_rc=$?
+    case "$is_active_rc" in
+      0) daemon_state="active" ;;
+      3|4) daemon_state="stopped" ;;
+      *) daemon_state="unknown" ;;
+    esac
   elif [[ "$INIT_SYSTEM" == "openrc" ]] && command -v rc-service >/dev/null 2>&1; then
     local status_rc=0
     _openrc_service "lunarwing-${name}" status >/dev/null 2>&1 || status_rc=$?

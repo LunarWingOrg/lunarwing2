@@ -1579,11 +1579,17 @@ cleanup_legacy_weechat_openrc() {
 }
 
 uninstall_tenant_openrc() {
-  local name="$1"
+  local name="$1" svc failed=false
   for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-opencode2-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-voice-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-opencode2-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}-sup"; do
     _openrc_update del "$svc" default 2>/dev/null || true
-    rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
+    # rm failures must reach the caller's '|| die': previously the trailing
+    # say always returned 0, making that guard dead code (EQ-8).
+    rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc" || failed=true
   done
+  if [[ "$failed" == true ]]; then
+    say "failed to remove one or more OpenRC unit files for $name" >&2
+    return 1
+  fi
   say "uninstalled OpenRC services for $name"
 }
 
