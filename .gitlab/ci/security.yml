@@ -52,6 +52,20 @@ default-graph-advisory-guard:
   script:
     - bash .gitlab/scripts/check-default-graph-advisories.sh
 
+# WI#357 control 4: workers must never self-expose. Pins the opencode
+# lanes' exposure policy without an image build: share/update pins, shell
+# deny rules (config + bridge session ruleset, ordering included), the
+# loopback/password serve invariants, the binary wrapper, and the Dockerfile
+# wiring for the build-time assertion and the OpenTunnel compile-out patch.
+worker-exposure-policy-guard:
+  extends:
+    - .shell-job
+    - .full-validation-context
+  stage: security
+  needs: []
+  script:
+    - bash .gitlab/scripts/check-worker-exposure-policy.sh
+
 secret-detection:
   extends: .gitleaks-job
   stage: security
