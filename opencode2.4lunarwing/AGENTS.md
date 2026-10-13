@@ -82,7 +82,9 @@ build with the default root HOME.
   or a non-loopback `serve`; never enable session sharing (`share` stays
   `"disabled"`) or self-update (`update` stays `"disable"`). Keep the
   guards in place: the every-token wrapper at `/usr/local/bin/opencode`,
-  the boot-time `service.json` reset (`disabled: true`, so server-backed
+  the boot-time `service.json` reset (`disabled: true`, resolved via
+  `OPENCODE_CONFIG_DIR` or `${XDG_CONFIG_HOME:-~/.config}/opencode` like
+  upstream, removing any agent plant at the path first, so server-backed
   commands default to private servers), the session/config permission denies,
   the root-owned read-only `entrypoint.sh`, `health_server.py`,
   `agent_comm_protocol.json`, `scripts/`+`config/`, the image build assertions, and
@@ -107,6 +109,6 @@ build assertions fail if the tunnel survives.
 
 - `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`--service`/non-loopback `--hostname` (naive-use guard).
 - `scripts/exposure_policy_assert.py` — shared static policy checker (image build + CI guard); `--image-filesystem` also checks installed ownership and modes.
-- `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots and HOME/XDG service defaults.
+- `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots, HOME/XDG/`OPENCODE_CONFIG_DIR` service defaults, and agent plants (FIFO/dir/symlink) at the reset path.
 - `scripts/compile_out_remote_tunnel.py` — fail-closed build patch that compiles the OpenTunnel client out; drift scan over `packages/{cli,server,schema,core}/src` (ts+tsx, any quoted `@opentunnel/*` specifier, all workspace manifests).
 - `scripts/opencode_task_executor.ts` — `sessionPermissions()` carries the shell deny rules (after the allow-all rule; ordering matters).

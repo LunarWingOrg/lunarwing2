@@ -145,10 +145,14 @@ Enforced controls (opencode2 lane unless noted):
    `--service` flag, and every `--hostname` occurrence (loopback only).
    Server-backed commands such as `run` and `session list` can spawn the real
    binary directly via `Service.ensure`, bypassing the wrapper. At each boot
-   the entrypoint writes `{"disabled": true}` to
-   `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/service.json`, so those commands
-   default to private, command-scoped servers instead of a shared service.
-   This reset discards prior service settings; the bridge's explicit foreground
+   the entrypoint removes whatever sits at
+   `${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/service.json`
+   (upstream's resolution order, run-90 FB-6/FB-7) and writes
+   `{"disabled": true}` there, so those commands default to private,
+   command-scoped servers instead of a shared service. The removal also
+   defeats an agent-planted FIFO/directory/symlink at the reset path, which
+   would otherwise hang the boot, crash it, or redirect the write. This reset
+   discards prior service settings; the bridge's explicit foreground
    `serve` still uses its loopback hostname and per-boot password. These layers
    are naive-use guards: the agent can rewrite its live service config or
    invoke the real binary directly.
@@ -168,8 +172,14 @@ Enforced controls (opencode2 lane unless noted):
    `worker-exposure-policy-guard`, security stage) asserts the pins, the
    ruleset ordering, the wrapper (every-token scan), the Dockerfile wiring
    including the root-owned read-only boot files + `scripts/`+`config/`, and runs
-   git-free (the ci-config image ships no git);
-   `.gitlab/tests/test_worker_exposure_policy.py` regression-covers it,
+   git-free (the ci-config image ships no git). The Dockerfile checks are
+   anchored over comment-stripped, continuation-joined lines — a deleted or
+   commented-out compile-out RUN or binary marker scan cannot pass by keeping
+   the script name in COPY lines or comments — and no RUN may chown/chmod
+   the guarded policy paths other than the shipped exec-bit and `a-w` lines,
+   so a late re-permission step after the final assertion fails the guard
+   (run-90 FC-4). `.gitlab/tests/test_worker_exposure_policy.py`
+   regression-covers it,
    including no-git lanes. The guard also runs the exposure/wrapper,
    compile-out, and non-root boot configuration suites on merge requests.
 5. **Build-time assertion.** The opencode2 Dockerfile runs
@@ -209,7 +219,11 @@ Enforced controls (opencode2 lane unless noted):
    from `/proc/<container pid>/net/{tcp,tcp6,udp,udp6}`** (running `cat`
    inside the untrusted container would let a root-in-container agent forge
    the audit), TCP LISTEN (0A) and UDP UNCONN (07) alike. It fails on any
-   non-loopback bind beyond bridge-WS + health, on any published mapping
+   non-loopback bind beyond bridge-WS + health — and the expected-port
+   exemption is TCP LISTEN only: those are the ports mt-admin publishes, so a
+   UDP bind on 8443 or the WS port is unpublished and still a finding, with
+   the protocol labelled on every reported line (run-90 FC-2). It fails on
+   any published mapping
    off host loopback — an empty/missing `HostIp` counts as all-interfaces
    (Docker's shape; podman reports `0.0.0.0`) — and an inspect failure is a
    finding, never a silent skip. Absence requires a failed inspect with a
