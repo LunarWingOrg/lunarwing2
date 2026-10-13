@@ -43,7 +43,7 @@ pub struct EffectBridgeAdapter {
     globally_auto_approved: bool,
     /// DB-backed settings store for persisted `tool_permissions.*` checks.
     settings_store: RwLock<Option<Arc<dyn SettingsStore + Send + Sync>>>,
-    /// Per-user per-tool sliding window rate limiter.
+    /// Per-user per-tool fixed window rate limiter.
     rate_limiter: RateLimiter,
     /// Mission manager for handling mission_* function calls.
     mission_manager: RwLock<Option<Arc<lunarwing_engine::MissionManager>>>,
@@ -669,7 +669,7 @@ impl EffectBridgeAdapter {
     ///   with `approval_already_granted` and skips this pause;
     /// - a per-user per-verb rate limit applies, plus an aggregate per-user
     ///   bucket across the run-spawning verbs (WI#352, run-33 AQ-12; the
-    ///   stop verbs stay per-verb only, run-51 CJ-1);
+    ///   stop verbs use per-verb caller-class buckets, run-51 CJ-1);
     /// - `ToolCall` hooks run with credential-like parameter values redacted
     ///   (the shared WI#359 CJ-10 predicate, recursive into `_args[0]`).
     ///

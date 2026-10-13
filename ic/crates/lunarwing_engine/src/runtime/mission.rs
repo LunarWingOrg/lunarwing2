@@ -732,8 +732,8 @@ impl MissionManager {
     /// Webhook paths are project-wide unique: firing matches every Active
     /// mission on the path, so two users owning the same path would each
     /// receive every delivery (MR !885 review). A create that would claim
-    /// another user's active path is rejected; a path held only by terminal
-    /// missions is free to reclaim.
+    /// another user's non-terminal path is rejected; a path held only by
+    /// terminal missions is free to reclaim.
     pub async fn create_mission(
         &self,
         project_id: ProjectId,
@@ -807,7 +807,8 @@ impl MissionManager {
             });
         }
         // Webhook path ownership: a fire matches every Active mission on the
-        // path regardless of owner, so an active path may only have one owner.
+        // path regardless of owner, so a non-terminal path may only have one
+        // owner.
         if let MissionCadence::Webhook { path, .. } = &cadence {
             self.ensure_webhook_path_unclaimed(project_id, path, &user_id, None)
                 .await?;
@@ -829,13 +830,18 @@ impl MissionManager {
     }
 
     /// Enforce the webhook single-owner rule: a fire matches every Active
-    /// mission on the path regardless of owner, so an active path may only
-    /// have one owner. Enforced at the transitions that create or reactivate
-    /// a claim — create, a cadence-setting or path-changing update, and
-    /// resume (WI#352, AO-1); updates that leave the claim untouched are not
-    /// re-checked (run-51 CJ-6). A paused mission still holds its claim
-    /// (`Paused` is not terminal). `exclude` skips the mission being updated
-    /// or resumed: it is its own owner, not a conflict.
+    /// mission on the path regardless of owner, so a non-terminal path may
+    /// only have one owner. Enforced at the transitions that create or
+    /// reactivate a claim — create, an update that switches to a Webhook
+    /// cadence from another cadence, changes the path, or adds a usable
+    /// secret to a dormant row, and resume (WI#352 AO-1, run-51 CJ-6,
+    /// WI#359 CO-2/CO-4); updates that leave the claim untouched are not
+    /// re-checked, and a same-path re-set is deliberately not checked. A
+    /// paused mission still holds its claim (`Paused` is not terminal),
+    /// and a dormant (secret-less or unusable-secret) non-terminal row
+    /// still blocks other users' claims on its path (WI#359 CO-3).
+    /// `exclude` skips the mission being updated or resumed: it is its own
+    /// owner, not a conflict.
     async fn ensure_webhook_path_unclaimed(
         &self,
         project_id: ProjectId,
@@ -1694,7 +1700,11 @@ impl MissionManager {
     /// constant time via `subtle::ConstantTimeEq` to avoid timing attacks.
     /// Missions without a configured `secret` are not triggerable — they
     /// are skipped so the public endpoint returns 404 rather than firing
-    /// on an unauthenticated request.
+    /// on an unauthenticated request. WI#359 (CO-1/CO-2): a mission whose
+    /// stored secret can never be presented on the wire (empty,
+    /// whitespace-padded, non-visible-ASCII) is dormant and equally not
+    /// triggerable — `ct_eq` treats two empty slices as equal, so the
+    /// empty-empty case needs the explicit usable-secret guard.
     pub async fn fire_webhook_mission(
         &self,
         path: &str,
@@ -7536,7 +7546,8 @@ mod tests {
     async fn create_mission_rejects_webhook_path_owned_by_another_user() {
         // MR !885 review: webhook firing matches all Active missions on a
         // path, so two users owning the same path would each receive every
-        // delivery. A create claiming another user's active path must fail.
+        // delivery. A create claiming another user's non-terminal path must
+        // fail.
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project = ProjectId::new();
