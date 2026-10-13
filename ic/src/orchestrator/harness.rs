@@ -1045,11 +1045,11 @@ fn push_mapped(folded: &mut String, map: &mut Vec<usize>, orig_idx: usize, ch: c
     folded.push(ch);
 }
 
-/// Test-only probe for the EE-1 needle-length guard in
-/// [`SecretValueRedactor::scrub_folded`]: bumped immediately before every
-/// `find` call so a test can prove the guard skipped the searcher setup
-/// entirely (a behavioral assertion on the output cannot — the guarded and
-/// unguarded paths produce identical text).
+// Test-only probe for the EE-1 needle-length guard in
+// `SecretValueRedactor::scrub_folded`: bumped immediately before every
+// `find` call so a test can prove the guard skipped the searcher setup
+// entirely (a behavioral assertion on the output cannot — the guarded and
+// unguarded paths produce identical text).
 #[cfg(test)]
 thread_local! {
     static FOLDED_FIND_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
