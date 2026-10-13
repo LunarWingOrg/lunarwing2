@@ -208,11 +208,14 @@ The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Bu
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
+**Known issue (WI#320 F4, re-reported as WI#374):** at the pinned v1.18.25 the `mode: "opencode"` lane is broken in the LunarWing worker shape — every task fails with `external worker 'opencode' failed: Unexpected server error. Check server logs for details.` because `opencode serve` crashes in `SystemPrompt.environment` (`undefined is not an object (evaluating 'a.name')`) while assembling the prompt, before any model call. No config remediation (base-URL override, MCP/plugin strip, git-init workspace) avoids it, and v1.18.29 is worse (see the pin note above), so the lane cannot be fixed from this repo until upstream ships a fix; the opencode2 lane below is the working one. Since WI#374 the worker captures the `opencode serve` log (`OPENCODE_SERVE_LOG`, default `/var/log/lunarwing/opencode-serve.log`) and attaches a bounded tail of it to these job errors, so the crash's real stack line reaches `list_jobs`/`job_status` instead of only the container's stdout. The v1 lane is slated for removal in v2.1.7.0.
+
 ## OpenCode 2 Worker (opencode2)
 
 The OpenCode **2** lane, run as a separate external worker per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
-keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
+keeps its v1.18.25 pin (last dispatch-verified release; see the known
+issue above); v2 is opt-in per tenant until upstream's
 2.0.x patch stack settles. Do not configure both lanes on the same
 tenant during the transition (agent routing confusion — plan §5).
 
