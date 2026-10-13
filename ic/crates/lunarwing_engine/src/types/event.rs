@@ -177,13 +177,11 @@ fn redact_header_pairs(headers: &mut serde_json::Value) {
         }
         serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
-                let credential = match (
-                    item.get("name").and_then(|n| n.as_str()),
-                    item.get("value"),
-                ) {
-                    (Some(name), Some(value)) => header_pair_is_credential(name, value),
-                    _ => false,
-                };
+                let credential =
+                    match (item.get("name").and_then(|n| n.as_str()), item.get("value")) {
+                        (Some(name), Some(value)) => header_pair_is_credential(name, value),
+                        _ => false,
+                    };
                 if credential
                     && let Some(value) = item.get_mut("value")
                     && is_present(value)
@@ -581,7 +579,10 @@ mod tests {
         });
         let redacted = redact_event_params("http", &params);
         let headers = redacted["headers"].as_str().expect("stays a string");
-        assert!(!headers.contains("raw-token"), "credential leaked: {headers}");
+        assert!(
+            !headers.contains("raw-token"),
+            "credential leaked: {headers}"
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(headers).expect("re-serialised headers stay valid JSON");
         assert_eq!(parsed[0]["value"], "[REDACTED]");

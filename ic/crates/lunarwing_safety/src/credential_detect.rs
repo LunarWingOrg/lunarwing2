@@ -629,7 +629,9 @@ mod tests {
         // recognize them even under an innocuous header name.
         assert!(header_value_carries_credentials("Bearer abc123"));
         assert!(header_value_carries_credentials("Basic dXNlcjpwYXNz"));
-        assert!(header_value_carries_credentials("AWS4-HMAC-SHA256 Credential=x"));
+        assert!(header_value_carries_credentials(
+            "AWS4-HMAC-SHA256 Credential=x"
+        ));
         assert!(!header_value_carries_credentials("application/json"));
         assert!(!header_value_carries_credentials(""));
     }
@@ -642,7 +644,10 @@ mod tests {
         let sanitized = sanitize_url_credentials("https://h.example/cb#access_token=X");
         assert_eq!(sanitized, "https://h.example/cb");
         let sanitized = sanitize_url_credentials("https://h.example/cb?token=X#frag?api_key=Y");
-        assert!(!sanitized.contains('Y'), "fragment query leaked: {sanitized}");
+        assert!(
+            !sanitized.contains('Y'),
+            "fragment query leaked: {sanitized}"
+        );
         assert!(!sanitized.contains('X'), "token value leaked: {sanitized}");
         assert!(!sanitized.contains('#'), "fragment kept: {sanitized}");
     }
@@ -660,7 +665,10 @@ mod tests {
                 "value {leaked} leaked: {sanitized}"
             );
         }
-        assert!(sanitized.contains("q=hello"), "safe param dropped: {sanitized}");
+        assert!(
+            sanitized.contains("q=hello"),
+            "safe param dropped: {sanitized}"
+        );
     }
 
     #[test]
@@ -668,17 +676,25 @@ mod tests {
         // FI-7: no re-encoding drift, the marker renders literally, an empty
         // credential value is left alone (redacting it would falsely claim
         // a credential was present), and flag params keep their bare form.
-        let sanitized = sanitize_url_credentials(
-            "https://api.example.com/d?q=a%20b&flag&api_key=&token=abc",
-        );
+        let sanitized =
+            sanitize_url_credentials("https://api.example.com/d?q=a%20b&flag&api_key=&token=abc");
         assert!(sanitized.contains("q=a%20b"), "encoding drift: {sanitized}");
-        assert!(sanitized.contains("&flag&"), "flag param grew '=': {sanitized}");
-        assert!(sanitized.contains("api_key=&"), "empty value redacted: {sanitized}");
+        assert!(
+            sanitized.contains("&flag&"),
+            "flag param grew '=': {sanitized}"
+        );
+        assert!(
+            sanitized.contains("api_key=&"),
+            "empty value redacted: {sanitized}"
+        );
         assert!(
             sanitized.contains("token=[REDACTED]"),
             "marker percent-encoded or missing: {sanitized}"
         );
-        assert!(!sanitized.contains("abc"), "token value leaked: {sanitized}");
+        assert!(
+            !sanitized.contains("abc"),
+            "token value leaked: {sanitized}"
+        );
     }
 
     /// Adversarial tests for credential detection with Unicode, control chars,

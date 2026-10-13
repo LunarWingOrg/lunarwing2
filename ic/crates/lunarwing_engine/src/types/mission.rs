@@ -134,7 +134,9 @@ impl MissionCadence {
 pub fn usable_webhook_secret(secret: &str) -> bool {
     !secret.is_empty()
         && secret.trim() == secret
-        && secret.bytes().all(|b| (0x20..=0x7e).contains(&b) || b == b'\t')
+        && secret
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) || b == b'\t')
 }
 
 /// A mission — a long-running goal that spawns threads over time.
