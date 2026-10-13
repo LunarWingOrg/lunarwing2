@@ -1259,8 +1259,13 @@ impl Workspace {
         // content (the incident that clobbered MEMORY.md). Keep a rolling
         // shadow copy so the previous version is recoverable in-place.
         if is_system_prompt_file(&path) && !doc.content.is_empty() && doc.content != content {
-            self.shadow_backup_prompt_file(&self.user_id, &path, &doc.content, fail_at_daily_log_cap)
-                .await?;
+            self.shadow_backup_prompt_file(
+                &self.user_id,
+                &path,
+                &doc.content,
+                fail_at_daily_log_cap,
+            )
+            .await?;
         }
 
         // Compute chunks + embeddings upfront (no DB connections held).
@@ -1323,7 +1328,9 @@ impl Workspace {
                 Ok(()) => {}
                 // The guarded tool lane refuses the replace at the cap: the
                 // caller's write must not proceed (WI#335).
-                Err(e @ WorkspaceError::DailyLogBackupCapReached { .. }) if fail_at_daily_log_cap => {
+                Err(e @ WorkspaceError::DailyLogBackupCapReached { .. })
+                    if fail_at_daily_log_cap =>
+                {
                     return Err(e);
                 }
                 Err(e) => {
@@ -4907,7 +4914,10 @@ mod runtime_index_tests {
         let (workspace, _temp_dir) = create_test_workspace().await;
         let day = "daily/2026-10-05.md";
 
-        workspace.write(day, "version 0").await.expect("initial write");
+        workspace
+            .write(day, "version 0")
+            .await
+            .expect("initial write");
         for version in 1..=3 {
             workspace
                 .write_with_daily_log_cap_guard(day, &format!("version {version}"))
