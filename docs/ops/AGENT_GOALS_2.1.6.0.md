@@ -92,8 +92,8 @@
     - **DQ-6:** the DN-4 anchor re-check belongs to WI#370's retention work; noted in WI#375.
     - **DR-2:** new `cron_tick_with_failing_job_persistence_never_dispatches` integration test sabotages only `agent_jobs` (settings store keeps working) and asserts the mock worker never receives a dispatch when the job-row write fails. The recording-decorator half is WI#375.
     - **DR-3:** all four worker images now gate on their bridge suites at build time — kimi `npm test` (already), opencode2 `bun path_expand_test.ts` (already), opencode v1 `bun path_expand_test.ts` (added, DS-4), pebble `cargo test --locked` (added). The between-builds host MR lane is WI#375.
-    - **DR-4:** `cron_gateway_owner_gate_precedes_manager_lookup` pins 403-before-any-lookup against a gateway with no manager (never 503).
-    - **DR-5/DR-6:** tracked in WI#375 (10 s bound, GET `?token=`, 404/503 mappings, `drive_tick` bias, closed-channel cancel, `load_last_tick_job` rejection branches).
+    - **DR-4:** `cron_gateway_owner_gate_precedes_manager_lookup` pins403-before-any-lookup against a gateway with no manager (never 503)
+    - **DR-5/DR-6:** tracked in WI#375 (10 s bound, GET `?token=`, 404/503 mappings, `drive_tick` bias, closed-channel cancel, `load_last_tick_job` rejection branches)
     - **DR-7:** stale "bridge cap" test comments corrected to the host 4h tick cap; the two unreachable-worker tests (gateway recovery, `cron_mission` tool) now use a Feb-29 schedule instead of relying on the daily 10:15 UTC schedule never firing mid-test; the 122-line test split and `// safety: test` markers are WI#375.
     - **DS-1:** the three `agent_comm_protocol.json` files and the design doc no longer overclaim "without following symlinks" — creation is symlink-safe (descriptor-relative, `O_NOFOLLOW`), the returned path is re-resolved and confined; the `fstat`-vs-`stat` dev/ino compare is WI#375.
     - **DS-2:** all four bridges classify bootstrap errnos — permanent (`Invalid workspace path for cron tick: …`: validation, ENOTDIR/ELOOP, EACCES/EPERM, containment) vs transient (`Transient workspace error for cron tick: …`: EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO, swap-race ENOENT/EINVAL) — and the host checks the transient marker *first* so wrapped OS text (e.g. pebble's "could not be resolved under WORKSPACE_ROOT") cannot misclassify. Classification tests on both sides.
@@ -283,7 +283,7 @@
     - **AO-7 (cadence_differs vs secrets):** `MissionCadence::schedule_differs` (`ic/crates/lunarwing_engine/src/types/mission.rs:117`) compares Webhook cadences by path only in create dedup; derived `PartialEq` unchanged elsewhere.
     - **Docs:** `docs/architecture/ENGINE-V2.md:1096-1136` records the corrected CJ-3 figures (aggregate over create/fire/resume/update, worst case bounded at 180/min) plus the deny-list and at-rest redaction rules.
     - **Verification on this tree (`taskset -c 0-17 -j18`):** targeted engine pins 8/8 pass (`summarize_params_never_surfaces_sensitive_values`, `redact_event_params_replaces_only_sensitive_values`, `webhook_dedup_compares_cadence_by_path_only`, `create_mission_rejects_webhook_path_owned_by_another_user`, `create_mission_reclaims_webhook_path_after_terminal_mission`, `update_mission_enforces_webhook_single_owner`, `resume_mission_enforces_webhook_single_owner`, `update_mission_rechecks_single_owner_only_on_new_claims`); `cargo test -p lunarwing --lib -- bridge::effect_adapter` 92/92 pass incl. `run_spawning_mission_calls_share_an_aggregate_rate_limit` and the CJ-7 `webhook_secret_applied` pins. Run-85 independently re-ran the effect_adapter suite 92/92 on this exact tree.
-    - Status note posted on WI#352; the WI stays open for a maintainer to close per the goals-branch convention (EX-3). Run-51 residuals CJ-4/CJ-5/CJ-10/CJ-11 are tracked separately as WI#359 (goals item 22, still `[ ]`).
+    - Status note posted on WI#352; the WI stays open for a maintainer to close per the goals-branch convention (EX-3). Run-51 residuals CJ-4/CJ-5/CJ-10/CJ-11 are tracked separately as WI#359 (goals item 22, still `[ ]`)
 20. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/356
 21. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/357 - last attempt was (see comments on MR and address any issues that may be blockers; also fix CI/CD cuz failed): https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1570
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/359 - last attempt was (see comments on MR and address any issues that may be blockers and address nits if possible): https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1574
@@ -310,7 +310,7 @@
 32. [x] (S) (H MR) release alpha of droid and desk repo projs LATER near end of dev cycle
 33. [x] (S) (H MR) come back to item 2 at some point after manual review is completed (NOTE FOR LATER)
 34. [x] (S) (H MR) prob rm opencode v1 in .1.7.0 and add lunardepth in .1.8.0
-35. [x] (S) RESERVED
+35. [x] (S) (H MR) Status of some of the bigger goals here check in on
 36. [x] (S) RESERVED
 37. [x] (S) RESERVED
 38. [x] (S) RESERVED
