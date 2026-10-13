@@ -279,3 +279,48 @@ test("an oversized request line is answered once with its recovered id", async (
     shim.kill()
   }
 })
+
+test("oversized requests never recover nested argument ids (FE-2)", async () => {
+  const shim = startShim({})
+  try {
+    const replies: Array<Record<string, unknown>> = []
+    let buffer = ""
+    shim.stdout.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8")
+      let newline = buffer.indexOf("\n")
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        if (line.trim()) replies.push(JSON.parse(line) as Record<string, unknown>)
+        newline = buffer.indexOf("\n")
+      }
+    })
+    const padding = "x".repeat(3 * 1024 * 1024)
+    // Both use SDK key order, with the real id at the line's end. A nested
+    // jsonrpc/id pair at the arguments' head must not beat that top-level id
+    // if the head regex loses its start anchor.
+    shim.stdin.write(JSON.stringify({
+      method: "tools/call",
+      params: { name: "memory_read", arguments: { jsonrpc: "2.0", id: 99, path: padding } },
+      jsonrpc: "2.0",
+      id: 42,
+    }) + "\n")
+    // A nested pair at the arguments' tail is still not the top-level id;
+    // removing the tail regex's end anchor would incorrectly recover 98.
+    shim.stdin.write(JSON.stringify({
+      method: "tools/call",
+      params: { name: "memory_read", arguments: { path: padding, jsonrpc: "2.0", id: 98 } },
+      jsonrpc: "2.0",
+      id: 43,
+    }) + "\n")
+    // The in-order ping is a barrier: inspect every preceding error, rather
+    // than waiting for an id a regressed shim may never answer.
+    const pong = await rpc(shim, { jsonrpc: "2.0", id: 7, method: "ping" })
+    assert.deepEqual(pong, { jsonrpc: "2.0", id: 7, result: {} })
+    const errors = replies.filter((reply) => reply.error !== undefined)
+    assert.deepEqual(errors.map((reply) => reply.id), [42, 43])
+    assert.deepEqual(errors.map((reply) => (reply.error as { code: number }).code), [-32600, -32600])
+  } finally {
+    shim.kill()
+  }
+})
