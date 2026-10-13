@@ -163,10 +163,14 @@ def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
             fail(f"{entrypoint} must export OPENCODE_PASSWORD before serve")
         # FB-1: implicit Service.ensure spawns the real binary, so argv checks
         # alone cannot stop it. Pin the boot-time default before mode dispatch.
+        # FB-7: the reset must honour OPENCODE_CONFIG_DIR like upstream;
+        # FB-6: it must remove an agent-planted FIFO/dir/symlink before the
+        # write (a bare redirect hangs, crashes, or follows the symlink).
         boot = code.split('case "$MODE" in', 1)[0]
         service_setup = (
-            'SERVICE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"',
+            'SERVICE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"',
             'mkdir -p "$SERVICE_CONFIG_DIR"',
+            'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"',
             "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\"",
         )
         if all(line in boot.splitlines() for line in service_setup):

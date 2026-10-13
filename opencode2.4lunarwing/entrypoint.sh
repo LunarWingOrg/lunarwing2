@@ -21,8 +21,15 @@ umask "$FILE_UMASK"
 # directly in service mode, bypassing the argv wrapper. Reset the shared
 # service default on every boot so they use private, command-scoped servers.
 # This is a naive-use guard: the agent can still edit its live service config.
-SERVICE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+# FB-7: upstream resolves the service config as $OPENCODE_CONFIG_DIR when set,
+# otherwise ${XDG_CONFIG_HOME:-~/.config}/opencode — honour the same order so
+# the reset always lands where upstream reads it.
+SERVICE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
 mkdir -p "$SERVICE_CONFIG_DIR"
+# FB-6: the agent can plant a FIFO, directory or symlink at the reset path; a
+# plain redirect would hang on the FIFO, crash on the directory, or overwrite
+# the symlink's target. Remove whatever sits there before writing.
+rm -rf -- "$SERVICE_CONFIG_DIR/service.json"
 printf '%s\n' '{"disabled": true}' > "$SERVICE_CONFIG_DIR/service.json"
 
 # ── git / SSH credential setup ────────────────────────────────────────────────

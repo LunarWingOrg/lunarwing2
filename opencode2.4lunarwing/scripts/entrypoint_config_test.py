@@ -111,6 +111,52 @@ class EntrypointConfigTests(unittest.TestCase):
         self.assertEqual(json.loads((xdg / "opencode/service.json").read_text()), {"disabled": True})
         self.assertFalse((self.home / ".config/opencode/service.json").exists())
 
+    def test_service_reset_honours_opencode_config_dir(self) -> None:
+        # FB-7: upstream reads the service config from $OPENCODE_CONFIG_DIR
+        # when set, so the reset must land there, not in ~/.config/opencode.
+        custom = self.root / "custom-config"
+        custom.mkdir()
+        if os.geteuid() == 0:
+            os.chown(custom, 10003, 10003)
+        self.boot(OPENCODE_CONFIG_DIR=str(custom))
+        self.assertEqual(json.loads((custom / "service.json").read_text()), {"disabled": True})
+        self.assertFalse((self.home / ".config/opencode/service.json").exists())
+
+    def test_service_reset_survives_plants_at_the_service_path(self) -> None:
+        # FB-6: a FIFO, directory, or symlink planted at the reset path must
+        # not hang the boot, crash it, or redirect the write through the
+        # symlink onto the agent's own file.
+        agent_file = self.home / "agent-file.json"
+        agent_file.write_text('{"agent": "kept"}')
+        service = self.home / ".config/opencode/service.json"
+
+        def own(path: Path) -> None:
+            if os.geteuid() == 0:
+                os.chown(path, 10003, 10003, follow_symlinks=False)
+
+        for plant in ("fifo", "dir", "symlink"):
+            with self.subTest(plant=plant):
+                service.unlink(missing_ok=True)
+                service.parent.mkdir(parents=True, exist_ok=True)
+                own(service.parent)
+                own(service.parent.parent)
+                if plant == "fifo":
+                    os.mkfifo(service)
+                    own(service)
+                elif plant == "dir":
+                    service.mkdir()
+                    (service / "planted").write_text("x")
+                    own(service)
+                else:
+                    os.symlink(agent_file, service)
+                    own(service)
+                self.boot()
+                self.assertFalse(service.is_symlink())
+                self.assertTrue(service.is_file())
+                self.assertEqual(json.loads(service.read_text()), {"disabled": True})
+                if plant == "symlink":
+                    self.assertEqual(agent_file.read_text(), '{"agent": "kept"}')
+
     def test_study_notes_only_can_materialize_config(self) -> None:
         study = self.root / "study-notes"
         (study / "agent-notes-by-agent").mkdir(parents=True)
