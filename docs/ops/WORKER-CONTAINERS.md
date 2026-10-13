@@ -8,11 +8,27 @@ See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 ## Hub-handshake credential boundary (WI#373)
 
 Every worker container receives `AGENT_AUTH_TOKEN` — the tenant-scoped
-`WORKER_AUTH_TOKEN` (WI#205; legacy tenants fall back to the gateway bearer)
-that authenticates the daemon→worker WebSocket handshake. Only the **bridge
-process** needs it. Task code is untrusted, so no task process may inherit it:
-a leaked token lets any job impersonate the daemon toward that worker (and,
-where the legacy fallback still applies, toward the whole gateway surface).
+`WORKER_AUTH_TOKEN` (WI#210: mt-admin mints and persists a scoped token on the
+first lifecycle pass; the gateway bearer is substituted only as a loudly warned
+last resort when the worker env file is unwritable) that authenticates the
+daemon→worker WebSocket handshake. Only the **bridge process** needs it. Task
+code is untrusted, so no task process may inherit it: one value is shared by
+all four worker lanes of the tenant, so a leaked token lets any job
+impersonate the daemon toward **every** worker WebSocket port of that tenant
+(and, where the last-resort fallback still applies, toward the whole gateway
+surface).
+
+What follows is **env hygiene, not a confidentiality boundary** (MR !1586
+run-98 FY-1): the token still lives in the environment of long-lived
+processes that run as the task's own uid — tini (PID 1), the entrypoint
+shell, `health_server.py`, and the bridge (pebble runs as root) — so task
+code can simply read `/proc/1/environ` (same-uid ptrace-read, which Yama
+does not block) and get it back. The strip blocks the *accidental* routes —
+env dumps into transcripts, logs, and LLM context, which is how WI#373 was
+observed — and is the same trust posture as the authority-domain rule below
+(one container = one uid = one authority domain). Real isolation (credential
+out of the container env; tasks under a separate uid from the bridge) is
+tracked as WI#400.
 
 Each lane enforces the strip at its task-process boundary:
 
@@ -34,9 +50,15 @@ Each lane enforces the strip at its task-process boundary:
   `PEBBLE_*` provider variables) and drops task-supplied re-injections.
   Pinned by a self-exec regression test that carries the token in the parent
   env and probes the real spawned environment through a stub. The one-shot
-  `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (harness-pinned).
+  `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (harness-pinned) — this is
+  the only mode today where the strip is total, because `exec env -u …`
+  replaces PID 1 and no long-lived carrier process remains.
 
-Residual, out of scope for WI#373: the OpenCode serve password
+Residual, deliberate (run-98 FY-1): the strip does **not** hide the token
+from task code that goes looking for it — `/proc/1/environ` and the bridge
+process's environ still contain it in every lane except pebble `cli` (see
+the env-hygiene paragraph above and the authority-domain section below;
+isolation is WI#400). The OpenCode serve password
 (`OPENCODE_SERVER_PASSWORD`) is necessarily present in the serve process env —
 the server enforces it itself, and task code already runs inside that trust
 boundary. The LLM provider keys (`KIMI_API_KEY`, `TENSORZERO_API_KEY`, …) are
