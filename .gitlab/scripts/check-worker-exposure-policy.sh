@@ -12,7 +12,9 @@
 # the image build gate (control 5) and the compile-out patch (control 8).
 set -euo pipefail
 
-repo_root=$(git rev-parse --show-toplevel)
+# No git: the ci-config job runs this in python:3.12-slim-bookworm, which has
+# none. The script sits at <repo root>/.gitlab/scripts/.
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 lane="$repo_root/opencode2.4lunarwing"
 v1_lane="$repo_root/opencode4lunarwing"
 

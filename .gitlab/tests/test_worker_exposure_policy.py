@@ -11,22 +11,12 @@ Dockerfile wiring. These tests run the real script against the real tree
 import os
 import pathlib
 import shutil
-import stat
 import subprocess
 import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".gitlab" / "scripts" / "check-worker-exposure-policy.sh"
-
-FAKE_GIT = """#!/usr/bin/env bash
-if [[ "$*" == "rev-parse --show-toplevel" ]]; then
-    echo "$FAKE_ROOT"
-    exit 0
-fi
-echo "fake git: unexpected args: $*" >&2
-exit 1
-"""
 
 EXECUTOR_RULESET = """
 function sessionPermissions() {
@@ -72,16 +62,25 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         (self.root / "opencode2.4lunarwing" / "scripts" / "opencode_task_executor.ts").write_text(
             EXECUTOR_RULESET, encoding="utf-8"
         )
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir()
-        shim = bin_dir / "git"
-        shim.write_text(FAKE_GIT, encoding="utf-8")
-        shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    def run_guard(self, root: pathlib.Path) -> subprocess.CompletedProcess:
+    def run_guard(self, root: pathlib.Path, *, without_git: bool = False) -> subprocess.CompletedProcess:
         env = dict(os.environ)
-        env["PATH"] = f"{root / 'bin'}{os.pathsep}{env['PATH']}"
-        env["FAKE_ROOT"] = str(root)
+        if without_git:
+            # The ci-config image (python:3.12-slim-bookworm) has no git; the
+            # guard must resolve the repo root without it (run-79 EI-1). Build
+            # a PATH of just the tools the guard needs, with no git in it.
+            minimal = self.root / "nogit-bin"
+            minimal.mkdir(exist_ok=True)
+            for tool in ("bash", "sh", "python3", "grep", "dirname"):
+                target = shutil.which(tool)
+                if target is None:
+                    raise AssertionError(f"required tool {tool!r} not found")
+                link = minimal / tool
+                if not link.exists():
+                    link.symlink_to(target)
+            if shutil.which("git", path=str(minimal)):
+                raise AssertionError("git reachable in the no-git lane")
+            env["PATH"] = str(minimal)
         return subprocess.run(
             ["bash", str(root / ".gitlab" / "scripts" / SCRIPT.name)],
             capture_output=True,
@@ -98,8 +97,17 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("worker exposure policy guard: ok", result.stdout)
 
+    def test_real_tree_passes_without_git(self):
+        result = self.run_guard(ROOT, without_git=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("worker exposure policy guard: ok", result.stdout)
+
     def test_fixture_passes(self):
         result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fixture_passes_without_git(self):
+        result = self.run_guard(self.root, without_git=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_share_pin_fails(self):
