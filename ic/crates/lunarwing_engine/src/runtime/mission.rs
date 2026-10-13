@@ -900,17 +900,8 @@ impl MissionManager {
 
         // Run-51 CJ-6: capture the current claim before applying updates so
         // the single-owner rule below can tell a new/changed claim from an
-        // untouched one. Secret-less legacy rows are dormant: adding a usable
-        // secret creates a claim even if the path itself does not change.
-        // WI#359 (CO-2): a stored secret that can never be presented on the
-        // wire (whitespace-padded, non-visible-ASCII) is dormant too.
-        let old_webhook_path = match &mission.cadence {
-            MissionCadence::Webhook {
-                path,
-                secret: Some(secret),
-            } if crate::types::mission::usable_webhook_secret(secret) => Some(path.clone()),
-            _ => None,
-        };
+        // untouched one (dormant rows hold no claim — see live_webhook_claim).
+        let old_webhook_path = live_webhook_claim(&mission.cadence).map(str::to_string);
         if let Some(name) = updates.name {
             mission.name = name;
         }
@@ -945,32 +936,25 @@ impl MissionManager {
         }
         validate_webhook_cadence(&mission.cadence)?;
         // WI#352 (AO-1): the webhook single-owner rule applies here too —
-        // but only to new claims (run-51 CJ-6): an update that sets a
-        // Webhook cadence or changes the path must not land on a path
-        // another user's non-terminal mission already claims. An update
-        // that leaves the claim untouched is not re-checked: under a legacy
-        // two-owner conflict either owner must still be able to rotate a
-        // leaked secret or lower a budget, and reactivation of a paused
-        // holder is checked by `resume_mission`.
-        let new_webhook_path = match &mission.cadence {
-            MissionCadence::Webhook { path, .. } => Some(path.as_str()),
-            _ => None,
-        };
+        // but only to new claims (run-51 CJ-6). An update that leaves the
+        // claim untouched is not re-checked: under a legacy two-owner
+        // conflict either owner must still be able to rotate a leaked
+        // secret or lower a budget, and reactivation of a paused holder is
+        // checked by `resume_mission`.
+        let makes_new_claim = webhook_claim_changed(old_webhook_path.as_deref(), &mission.cadence);
         // WI#359 (CJ-4): the check-then-save sequence must be atomic
         // against creates and other claim transitions — this mission's own
         // fire lock does not serialize against those. Hold the shared
         // create/claim lock from the check until the save below. Lock
         // order is fire lock → create lock; `create_mission_detailed`
         // never takes a fire lock, so no ABBA.
-        let makes_new_claim = new_webhook_path.is_some()
-            && new_webhook_path.as_deref() != old_webhook_path.as_deref();
         let _claim_guard = if makes_new_claim {
             Some(self.mission_create_lock.lock().await)
         } else {
             None
         };
-        if let Some(path) = new_webhook_path
-            && makes_new_claim
+        if makes_new_claim
+            && let MissionCadence::Webhook { path, .. } = &mission.cadence
         {
             self.ensure_webhook_path_unclaimed(
                 mission.project_id,
@@ -3859,6 +3843,33 @@ fn conflicting_webhook_claims(
         }
     }
     conflicts
+}
+
+/// The live webhook claim of a stored cadence: the path when the cadence
+/// is Webhook with a usable secret, else `None`. Secret-less legacy rows
+/// are dormant (adding a usable secret creates a claim even when the path
+/// itself does not change), and a stored secret that can never be
+/// presented on the wire (whitespace-padded, non-visible-ASCII) is dormant
+/// too (WI#359, CO-2).
+fn live_webhook_claim(cadence: &MissionCadence) -> Option<&str> {
+    match cadence {
+        MissionCadence::Webhook {
+            path,
+            secret: Some(secret),
+        } if crate::types::mission::usable_webhook_secret(secret) => Some(path.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether applying an update changes the mission's webhook path claim
+/// (WI#359, CL-5). `old_claim` is the [`live_webhook_claim`] captured
+/// before the update; the resulting cadence's own secret has already been
+/// validated usable, so a Webhook result always holds a claim.
+fn webhook_claim_changed(old_claim: Option<&str>, new_cadence: &MissionCadence) -> bool {
+    match new_cadence {
+        MissionCadence::Webhook { path, .. } => Some(path.as_str()) != old_claim,
+        _ => false,
+    }
 }
 
 fn validate_webhook_cadence(cadence: &MissionCadence) -> Result<(), EngineError> {
