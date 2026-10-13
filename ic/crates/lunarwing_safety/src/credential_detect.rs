@@ -78,6 +78,120 @@ fn header_name_is_credential(name: &str) -> bool {
     AUTH_HEADER_SUBSTRINGS.iter().any(|sub| lower.contains(sub))
 }
 
+/// WI#359 (CJ-11): public view of the header-name credential heuristic so
+/// the engine's event redaction can blank credential-like header values.
+pub fn header_name_carries_credentials(name: &str) -> bool {
+    header_name_is_credential(name)
+}
+
+/// WI#359 (CJ-11): public view of the query-parameter credential heuristic
+/// so URL sanitizers can redact credential-like query values.
+pub fn query_param_carries_credentials(name: &str) -> bool {
+    query_param_is_credential(name)
+}
+
+/// Substrings matched against the normalized parameter key (lowercase, `_`
+/// and `-` stripped, so `apiKey`/`api_key`/`api-key` all fold to `apikey`).
+/// WI#359 (CJ-10): one shared credential-key list for the engine's event
+/// redaction/summaries and the bridge's mission-hook redaction.
+/// Deliberately broad — this is a redaction path, where over-redaction
+/// costs display quality (e.g. an `author` key matches `auth`) and
+/// under-redaction leaks credentials into persisted events.
+const CREDENTIAL_KEY_SUBSTRINGS: &[&str] = &[
+    "secret",
+    "token",
+    "passw",
+    "apikey",
+    "auth",
+    "credential",
+    "privatekey",
+    "cookie",
+    "bearer",
+    "signature",
+];
+
+/// Whether a parameter key commonly carries credentials (WI#359, CJ-10).
+///
+/// Normalizes the key (lowercase, `_`/`-` stripped) and substring-matches
+/// against [`CREDENTIAL_KEY_SUBSTRINGS`], so `hmac_secret`, `access_token`,
+/// `client_secret`, `private_key`, `refresh_token`, and `apiKey` all match.
+pub fn is_credential_param_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    CREDENTIAL_KEY_SUBSTRINGS
+        .iter()
+        .any(|sub| normalized.contains(sub))
+}
+
+/// Return a display/storage copy of `params` with every credential-keyed
+/// value replaced by `"[REDACTED]"`, recursing into nested objects and
+/// arrays (WI#359, CJ-10 — a positional `mission_update({…})` payload hides
+/// keys under `_args[0]`, so a top-level-only pass misses them).
+///
+/// `null` and empty-string values are left untouched: redacting them would
+/// claim a credential was present where there is none (WI#359 info item).
+pub fn redact_credential_params(params: &serde_json::Value) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let redacted = if is_credential_param_key(key)
+                        && !value.is_null()
+                        && !matches!(value, serde_json::Value::String(s) if s.is_empty())
+                    {
+                        serde_json::Value::String("[REDACTED]".into())
+                    } else {
+                        redact_credential_params(value)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_credential_params).collect())
+        }
+        _ => params.clone(),
+    }
+}
+
+/// Return a copy of `url_str` with credential material removed (WI#359,
+/// CJ-11): userinfo stripped and credential-like query parameter values
+/// replaced by `[REDACTED]`. Unparseable URLs cannot be analyzed, so only
+/// the portion before any `?`/`#` is kept.
+pub fn sanitize_url_credentials(url_str: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url_str) else {
+        return url_str
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(url_str)
+            .to_string();
+    };
+    let _ = parsed.set_username("");
+    parsed.set_password(None);
+    let sanitized: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(name, value)| {
+            if query_param_is_credential(&name) {
+                (name.into_owned(), "[REDACTED]".to_string())
+            } else {
+                (name.into_owned(), value.into_owned())
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        parsed.set_query(None);
+    } else {
+        parsed
+            .query_pairs_mut()
+            .clear()
+            .extend_pairs(sanitized.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    }
+    parsed.to_string()
+}
+
 fn header_value_is_credential(value: &str) -> bool {
     let lower = value.to_lowercase();
     AUTH_VALUE_PREFIXES.iter().any(|pfx| lower.starts_with(pfx))
@@ -377,6 +491,83 @@ mod tests {
         assert!(!url_contains_userinfo(&serde_json::json!({
             "url": "https://api.example.com/data"
         })));
+    }
+
+    // ── WI#359 (CJ-10): shared credential-key predicate ────────────────
+
+    #[test]
+    fn credential_param_key_normalizes_and_substring_matches() {
+        for key in [
+            "api_key",
+            "apiKey",
+            "api-key",
+            "webhook_secret",
+            "hmac_secret",
+            "access_token",
+            "client_secret",
+            "private_key",
+            "refresh_token",
+            "Authorization",
+            "x_auth",
+            "session_cookie",
+            "user_password",
+            "bearer",
+            "request_signature",
+            "aws_credentials",
+        ] {
+            assert!(is_credential_param_key(key), "'{key}' must match");
+        }
+        for key in ["url", "name", "id", "goal", "query", "content", "path"] {
+            assert!(!is_credential_param_key(key), "'{key}' must not match");
+        }
+    }
+
+    #[test]
+    fn redact_credential_params_recurses_and_preserves_non_credentials() {
+        let params = serde_json::json!({
+            "id": "mission-1",
+            "hmac_secret": "s3cr3t",
+            "_args": [{"webhook_secret": "nested-secret", "name": "ok"}],
+            "headers": [{"name": "Authorization", "value": "Bearer raw"}],
+        });
+        let redacted = redact_credential_params(&params);
+        assert_eq!(redacted["hmac_secret"], "[REDACTED]");
+        assert_eq!(redacted["_args"][0]["webhook_secret"], "[REDACTED]");
+        assert_eq!(redacted["_args"][0]["name"], "ok");
+        assert_eq!(redacted["id"], "mission-1");
+        // Array-item "name" keys are not credential keys; the http-specific
+        // pass handles header values (redact_event_params).
+        assert_eq!(redacted["headers"][0]["value"], "Bearer raw");
+    }
+
+    #[test]
+    fn redact_credential_params_leaves_null_and_empty_values_alone() {
+        // WI#359 info item: redacting null/"" would falsely claim a
+        // credential was present.
+        let params = serde_json::json!({"webhook_secret": null, "api_key": ""});
+        let redacted = redact_credential_params(&params);
+        assert_eq!(redacted["webhook_secret"], serde_json::Value::Null);
+        assert_eq!(redacted["api_key"], "");
+    }
+
+    // ── WI#359 (CJ-11): URL credential sanitization ────────────────────
+
+    #[test]
+    fn sanitize_url_redacts_credential_query_values_and_userinfo() {
+        let sanitized = sanitize_url_credentials(
+            "https://user:pass@api.example.com/data?api_key=abc123&page=2&sig=deadbeef",
+        );
+        assert!(!sanitized.contains("abc123"), "api_key value leaked: {sanitized}");
+        assert!(!sanitized.contains("deadbeef"), "sig value leaked: {sanitized}");
+        assert!(!sanitized.contains("user:pass"), "userinfo leaked: {sanitized}");
+        assert!(sanitized.contains("page=2"), "safe param dropped: {sanitized}");
+        assert!(sanitized.starts_with("https://api.example.com/data"));
+    }
+
+    #[test]
+    fn sanitize_url_unparseable_drops_query_and_fragment() {
+        assert_eq!(sanitize_url_credentials("not a url?api_key=x"), "not a url");
+        assert_eq!(sanitize_url_credentials("plain"), "plain");
     }
 
     /// Adversarial tests for credential detection with Unicode, control chars,
