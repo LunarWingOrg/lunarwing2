@@ -386,14 +386,23 @@ INITEOF
 
 # ── OpenRC service units ─────────────────────────────────────────────────────
 
+# The post-WI#376 proxy unit contract: one fixed flag line carrying no tenant
+# data. Shared by the preflight guard and the renderer, which archives only
+# installed units that fail this check.
+openrc_proxy_unit_is_safe() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  grep -Eq \
+    '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"
+}
+
 # A dependency-cache rebuild can source every init script, even for a command
 # addressing a different tenant. Inspect files as data before invoking OpenRC.
 require_safe_openrc_proxy_units() {
   local path
   for path in "$OPENRC_INITD_DIR"/lunarwing-proxy-*; do
     [[ -e "$path" || -L "$path" ]] || continue
-    if [[ ! -f "$path" || -L "$path" ]] || ! grep -Eq \
-      '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"; then
+    if ! openrc_proxy_unit_is_safe "$path"; then
       say "refusing OpenRC operation: unsafe legacy proxy unit $path; run: $0 render-units --all-proxies" >&2
       return 125
     fi
@@ -460,22 +469,39 @@ render_all_openrc_proxy_units() {
 # Preserve the installed bytes before replacement, including suspicious URLs.
 # CLI writers require root; EUID also permits isolated non-root test fixtures.
 # The archive is private, outside init.d, non-executable, and never sourced.
+# Every refusal names the reason and LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR:
+# an unusable backup path otherwise blocks the migration with an opaque error.
 backup_openrc_proxy_unit() {
   local path="$1" dir init_dir backup
   [[ -e "$path" || -L "$path" ]] || return 0
-  [[ -f "$path" && ! -L "$path" ]] || return 1
-  darkirc_path_components_safe "$OPENRC_PROXY_BACKUP_DIR" || return 1
-  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" || return 1
-  init_dir="$(realpath -m -- "$OPENRC_INITD_DIR")" || return 1
-  [[ "$dir" != "$init_dir" && "$dir" != "$init_dir/"* ]] || return 1
-  if [[ ! -e "$dir" ]]; then
-    install -d -m 0700 -- "$dir" || return 1
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    say "cannot safely back up $path: not a regular file (symlink?); installed unit was not replaced" >&2
+    return 1
   fi
-  [[ -d "$dir" && ! -L "$dir" && "$(stat -c '%u:%a' -- "$dir")" == "$EUID:700" ]] \
-    || return 1
-  backup="$(mktemp "$dir/${path##*/}.XXXXXX")" || return 1
+  if ! darkirc_path_components_safe "$OPENRC_PROXY_BACKUP_DIR"; then
+    say "cannot safely back up $path: symlinked component in LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR; installed unit was not replaced" >&2
+    return 1
+  fi
+  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" \
+    || { say "cannot safely back up $path: cannot resolve LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR; installed unit was not replaced" >&2; return 1; }
+  init_dir="$(realpath -m -- "$OPENRC_INITD_DIR")" || return 1
+  if [[ "$dir" == "$init_dir" || "$dir" == "$init_dir/"* ]]; then
+    say "cannot safely back up $path: LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR must be outside $OPENRC_INITD_DIR; installed unit was not replaced" >&2
+    return 1
+  fi
+  if [[ ! -e "$dir" ]]; then
+    install -d -m 0700 -- "$dir" \
+      || { say "cannot safely back up $path: cannot create backup dir $dir; installed unit was not replaced" >&2; return 1; }
+  fi
+  if [[ ! -d "$dir" || -L "$dir" || "$(stat -c '%u:%a' -- "$dir")" != "$EUID:700" ]]; then
+    say "cannot safely back up $path: backup dir $dir (LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR) must be a non-symlink dir owned by EUID $EUID with mode 0700; installed unit was not replaced" >&2
+    return 1
+  fi
+  backup="$(mktemp "$dir/${path##*/}.XXXXXX")" \
+    || { say "cannot safely back up $path: mktemp failed in $dir; installed unit was not replaced" >&2; return 1; }
   if ! cat -- "$path" >"$backup" || ! chmod 0600 "$backup"; then
     rm -f -- "$backup"
+    say "cannot safely back up $path: copy to $dir failed; installed unit was not replaced" >&2
     return 1
   fi
   say "preserved installed proxy unit: $backup"
@@ -549,10 +575,15 @@ INITEOF
     rm -f -- "$tmp"
     return 1
   fi
-  if ! backup_openrc_proxy_unit "$path"; then
-    rm -f -- "$tmp"
-    say "cannot safely back up $path; installed unit was not replaced" >&2
-    return 1
+  # Archive only units that fail the safe-unit contract (legacy or damaged
+  # installs whose bytes may carry a payload). Re-rendering an already-safe
+  # unit must not grow the archive on every upgrade or --all-proxies sweep
+  # (EQ-4); safe bytes are reproducible from the renderer, so nothing is lost.
+  if [[ -e "$path" || -L "$path" ]] && ! openrc_proxy_unit_is_safe "$path"; then
+    backup_openrc_proxy_unit "$path" || {
+      rm -f -- "$tmp"
+      return 1
+    }
   fi
   if ! chmod 0755 "$tmp" || ! mv -T -- "$tmp" "$path"; then
     rm -f -- "$tmp"
