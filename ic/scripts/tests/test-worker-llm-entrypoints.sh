@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # WI#330: execute each worker's real startup configuration/guard in an isolated
-# filesystem. No container, CLI binary, network listener, or build is needed;
-# this runs in the MR shell-harnesses lane as well as on developer hosts.
+# filesystem. No container, CLI binary, or build is needed; the WI#373 phases
+# bind short-lived ephemeral 127.0.0.1 listeners for their stub servers. This
+# runs in the MR shell-harnesses lane as well as on developer hosts.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 python3 - "$SCRIPT_DIR/../../.." <<'PY'
@@ -87,26 +88,34 @@ def free_port():
 
 def execable_dir(root):
     """Temp dirs can be mounted noexec on dev VMs; probe for a directory
-    where the stub binaries can actually run, falling back to HOME."""
+    where the stub binaries can actually run. root/bin is probed first; the
+    HOME fallback is created only when that fails, and is rmtree'd at exit
+    so a run never leaves directories behind (MR !1586 run-98 FY-2)."""
+    import atexit
     import shutil
-    candidates = [root / "bin"]
+
+    def probe_executable(candidate):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".exec-probe.sh"
+            try:
+                probe.write_text("#!/bin/sh\nexit 0\n")
+                probe.chmod(0o755)
+                return subprocess.run([str(probe)], capture_output=True).returncode == 0
+            finally:
+                probe.unlink(missing_ok=True)
+        except OSError:
+            return False
+
+    if probe_executable(root / "bin"):
+        return root / "bin"
+
     home = os.environ.get("HOME")
     if home and Path(home).is_dir():
-        candidates.append(Path(tempfile.mkdtemp(prefix="worker-ws373-", dir=home)))
-    for candidate in candidates:
-        candidate.mkdir(parents=True, exist_ok=True)
-        try:
-            probe = candidate / ".exec-probe.sh"
-            probe.write_text("#!/bin/sh\nexit 0\n")
-            probe.chmod(0o755)
-            if subprocess.run([str(probe)], capture_output=True).returncode == 0:
-                probe.unlink()
-                return candidate
-            probe.unlink(missing_ok=True)
-        except OSError:
-            continue
-        if candidate != candidates[0]:
-            shutil.rmtree(candidate, ignore_errors=True)
+        fallback = Path(tempfile.mkdtemp(prefix="worker-ws373-", dir=home))
+        atexit.register(shutil.rmtree, fallback, ignore_errors=True)
+        if probe_executable(fallback):
+            return fallback
     raise AssertionError("no executable directory found for worker stubs")
 
 
