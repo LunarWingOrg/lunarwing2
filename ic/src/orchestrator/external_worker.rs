@@ -866,9 +866,9 @@ impl ExternalWorkerManager {
         }
         // DW-4: once a wrap-up (done=true) prompt is accepted the channel is
         // closed to further input. Without this gate a post-done prompt was
-        // queued and acked as accepted but never delivered (the worker closes
-        // its side when the done prompt lands), which the audit trail then
-        // misreported as accepted.
+        // queued and acked as accepted even though the worker refuses every
+        // post-done frame with accepted=false (its queue closed at accept
+        // time), which the audit trail then misreported as accepted.
         let done_at = handle.done_seq.load(Ordering::Relaxed);
         if done_at != 0 {
             return Err(not_active(&format!(
