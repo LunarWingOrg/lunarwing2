@@ -490,20 +490,24 @@ export async function executeTask(
     }
 
     const canonicalOutput = canonicalTurns.join("\n\n")
-    const resultOutput = [canonicalOutput || output.trim(), ...controlNotes]
-      .filter(Boolean).join("\n\n")
+    const completed = canonicalOutput || output.trim()
     const durationMs = Date.now() - startTime
 
-    if (!resultOutput) {
+    if (!completed) {
+      // Empty-output check runs on COMPLETED output only — control notes are
+      // accounting, not deliverables, and must not manufacture success (EZ-1,
+      // same class as EK-4/ES-1 on the normal terminal path).
       onResult({
         task_id: request.task_id,
         status: "error",
-        output: "",
+        output: controlNotes.filter(Boolean).join("\n\n"),
         error: emptyOutputError(deniedPermissions),
         duration_ms: durationMs,
       })
       return
     }
+
+    const resultOutput = [completed, ...controlNotes].filter(Boolean).join("\n\n")
 
     onResult({
       task_id: request.task_id,

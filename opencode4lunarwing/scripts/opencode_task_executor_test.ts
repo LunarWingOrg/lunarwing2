@@ -924,6 +924,39 @@ assert.ok(toolOnlyResults[0]!.output.includes("status: done"))
   assert.equal(queue.prompts.length, 0)
 }
 
+// !1566 EZ-1 (run-85 review): an empty main turn plus a remainder queued
+// behind a done prompt plus an empty FINAL turn must resolve error — control
+// notes are accounting, not completed output, and must not manufacture
+// success on the normal terminal path (same class as EK-4/ES-1).
+{
+  const sdk = makeSdk({
+    events: [
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+    partsPerCall: [[], []],
+  })
+  const queue: FollowupQueue = {
+    prompts: [
+      { task_id: "ez1", seq: 1, prompt: "wrap up", done: true },
+      { task_id: "ez1", seq: 2, prompt: "one more thing", done: false },
+    ],
+    closed: true,
+  }
+  const results: Array<{ status: string; output: string; error: string | null }> = []
+  await executeTask(
+    { task_id: "ez1", prompt: "build" },
+    () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+  )
+  assert.equal(results.length, 1)
+  assert.equal(sdk.promptArgs.length, 2, "nothing runs after the FINAL turn")
+  assert.equal(results[0]!.status, "error", "control notes must not manufacture success (EZ-1)")
+  assert.equal(results[0]!.error, "opencode completed without assistant text or tool output")
+  assert.match(results[0]!.output, /\[control\] follow-up seq=2 not run: wrap-up turn already requested/)
+  assert.equal(queue.prompts.length, 0)
+  assert.equal(queue.closed, true)
+}
+
 // !1552 ER-3: a no-follow-up main turn whose only "work" was denied
 // permissions reports the denial, not the generic empty-output message.
 {
