@@ -624,6 +624,12 @@ tenant down until its checkout is updated. Then restart through mt-admin.
 From deploying the patched mt-admin until `render-units --all-proxies`
 succeeds, every mt-admin command on OpenRC **except** `help`, the fleet
 migration and `upgrade-tenant` refuses up front with the migration command.
+Only a positively detected systemd host skips that file-only guard: when no
+init system can be detected at all (CI containers, chroots), the guard still
+inspects the installed unit files and refuses unsafe ones, and each command's
+own detection then reports the accurate "could not detect a supported service
+manager" error after its usage checks — a detection failure is never itself
+reported as "migration required".
 The service/update wrappers return exit code **125** for a refusal — never
 an OpenRC service state — so `remove-tenant`, `restore-tenant`,
 `migrate-owner-scope` and the writer-quiescence probes cannot misread a
