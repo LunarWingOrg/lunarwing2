@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""WI#357 worker exposure policy — static assertions for the opencode2 lane.
+
+Runs in two places with the same rules:
+
+- the image Dockerfile (control 5: every image build fails when the policy
+  regresses), additionally checking the built binary for OpenTunnel client
+  markers via --binary;
+- the repo CI guard .gitlab/scripts/check-worker-exposure-policy.sh
+  (control 4), which also runs the v1-lane checks.
+
+Assertions (opencode2 lane):
+  1. config/opencode2.json parses and pins "share": "disabled" (control 3).
+  2. config/opencode2.json pins "update": "disable".
+  3. config/opencode2.json carries the shell deny rules for the
+     self-exposure subcommands (control 2, config layer).
+  4. entrypoint.sh starts the server with a password and a loopback default
+     hostname, never invokes service mode, never passes --service, defaults
+     OPENCODE_BIN to the exposure-guard wrapper (not the real binary), and
+     disables implicit service startup and re-derives the runtime config
+     from /app/config at boot (controls 2+4; expected startup-shape checks).
+  5. scripts/opencode-exposure-guard.sh exists and scans every argv token:
+     service/pair subcommands, the --service flag, and every --hostname
+     occurrence (control 2, wrapper layer).
+  6. --binary PATH: the built opencode binary contains no OpenTunnel client
+     markers (controls 5 + 8).
+  7. --image-filesystem: the installed boot files, scripts and config are
+     root-owned and read-only (image builds only).
+
+v1 lane (--lane opencode4lunarwing): only the share-disabled and
+entrypoint-loopback checks apply (v1.18.25 has no service mode or
+tunnel; pairing is a v2 surface).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import sys
+
+LANE_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# Strings that prove the OpenTunnel client was compiled into the binary.
+# Checked case-sensitively against the raw bytes; the lane's own stub message
+# ("OpenTunnel remote access is compiled out ...") deliberately avoids them.
+OPENTUNNEL_MARKERS = (b"opentunnel.xyz", b"@opentunnel/client", b"@opentunnel/protocol")
+
+# Deny rules the lane config must carry (control 2, config layer). Kept in
+# sync with sessionPermissions() in scripts/opencode_task_executor.ts.
+REQUIRED_SHELL_DENIES = tuple(f"*opencode {sub} *" for sub in ("service", "pair", "serve"))
+
+failures: list[str] = []
+
+
+def fail(message: str) -> None:
+    failures.append(message)
+    print(f"FAIL: {message}", file=sys.stderr)
+
+
+def check(message: str) -> None:
+    print(f"ok: {message}")
+
+
+def check_config(lane: pathlib.Path, config_name: str, is_v2: bool) -> None:
+    config_path = lane / "config" / config_name
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"{config_path} does not parse: {error}")
+        return
+    if config.get("share") == "disabled":
+        check(f"{config_name} pins share=disabled")
+    else:
+        fail(f"{config_path} must pin \"share\": \"disabled\" (got {config.get('share')!r})")
+    if not is_v2:
+        return
+    if config.get("update") == "disable":
+        check("opencode2.json pins update=disable")
+    else:
+        fail(f"{config_path} must pin \"update\": \"disable\" (got {config.get('update')!r})")
+    denies = {
+        rule.get("resource")
+        for rule in config.get("permissions", [])
+        if isinstance(rule, dict)
+        and rule.get("action") == "shell"
+        and rule.get("effect") == "deny"
+    }
+    missing = [resource for resource in REQUIRED_SHELL_DENIES if resource not in denies]
+    if missing:
+        fail(f"{config_path} permissions must deny shell resources {missing}")
+    else:
+        check("opencode2.json carries the self-exposure shell deny rules")
+
+
+def serve_invocation_lines(code: str) -> list[str]:
+    r"""Lines of the '$OPENCODE_BIN" serve' invocation, joining continuations.
+
+    The serve command spans several shell lines (trailing backslashes), so a
+    plain '--hostname in code' check could be satisfied by an unrelated line
+    (run-79 EI-8). Returns [] when no serve invocation exists.
+    """
+    lines = code.splitlines()
+    for index, line in enumerate(lines):
+        if re.search(r'"?\$OPENCODE_BIN"?\s+serve\b', line):
+            block = [line.rstrip("\\").rstrip()]
+            cursor = index + 1
+            while cursor < len(lines) and lines[cursor - 1].rstrip().endswith("\\"):
+                block.append(lines[cursor].rstrip("\\").rstrip())
+                cursor += 1
+            return block
+    return []
+
+
+def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
+    entrypoint = lane / "entrypoint.sh"
+    try:
+        text = entrypoint.read_text(encoding="utf-8")
+    except OSError as error:
+        fail(f"{entrypoint} unreadable: {error}")
+        return
+    # Service mode / pairing must never appear as an invocation. Strip comment
+    # lines first: prose (like this policy's rationale) may name them.
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    for subcommand in ("service", "pair"):
+        if re.search(rf'(?:opencode|OPENCODE_BIN)"?\s+{subcommand}\b', code):
+            fail(f"{entrypoint} invokes 'opencode {subcommand}' — service mode is forbidden")
+            break
+    else:
+        check("entrypoint.sh never invokes service mode or pairing")
+    if "--service" in code:
+        # run-79 EI-3: serve --service is service mode via a flag.
+        fail(f"{entrypoint} passes --service — service mode is forbidden")
+    else:
+        check("entrypoint.sh never passes --service")
+    if 'OPENCODE_SERVE_HOST="${OPENCODE_SERVE_HOST:-127.0.0.1}"' in text:
+        check("entrypoint.sh defaults the server bind to loopback")
+    else:
+        fail(f"{entrypoint} lost its loopback OPENCODE_SERVE_HOST default")
+    serve_lines = serve_invocation_lines(code)
+    if serve_lines and any("--hostname" in line for line in serve_lines):
+        check("entrypoint.sh starts the server with an explicit --hostname")
+    else:
+        fail(f"{entrypoint} must start the server via serve with --hostname")
+    if is_v2:
+        # run-79 EI-3: OPENCODE_BIN must resolve to the wrapper, not the real
+        # binary at /usr/local/lib/opencode2/opencode.
+        if 'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"' in text:
+            check("entrypoint.sh runs opencode through the exposure-guard wrapper")
+        else:
+            fail(f"{entrypoint} must default OPENCODE_BIN to the wrapper at "
+                 "/usr/local/bin/opencode (not the real binary)")
+        # v2 mandates Basic auth on serve; v1.18.25's serve has no auth
+        # support, so the password invariant is v2-only. Structural: the
+        # export must be executable code, not prose naming the variable
+        # (run-79 EI-8 — a comment could satisfy a substring check).
+        if re.search(r'^\s*export OPENCODE_PASSWORD\b', code, re.MULTILINE):
+            check("entrypoint.sh sets a server password")
+        else:
+            fail(f"{entrypoint} must export OPENCODE_PASSWORD before serve")
+        # FB-1: implicit Service.ensure spawns the real binary, so argv checks
+        # alone cannot stop it. Pin the boot-time default before mode dispatch.
+        boot = code.split('case "$MODE" in', 1)[0]
+        service_setup = (
+            'SERVICE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"',
+            'mkdir -p "$SERVICE_CONFIG_DIR"',
+            "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\"",
+        )
+        if all(line in boot.splitlines() for line in service_setup):
+            check("entrypoint.sh disables implicit shared-service startup at boot")
+        else:
+            fail(f"{entrypoint} must write service.json with disabled=true before mode dispatch")
+        # run-79 EI-5: the workspace config copy is untrusted — it must be
+        # regenerated from the root-owned /app/config at every boot (copy or
+        # symlink). The live copy remains agent-writable within a session.
+        copies = 'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in code
+        links = 'ln -sfn /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in code
+        if copies or links:
+            check("entrypoint.sh re-derives the runtime config from /app/config at boot")
+        else:
+            fail(f"{entrypoint} must materialize the runtime config from "
+                 "/app/config/opencode2.json (copy or symlink) at every boot")
+
+
+def check_wrapper(lane: pathlib.Path) -> None:
+    wrapper = lane / "scripts" / "opencode-exposure-guard.sh"
+    try:
+        text = wrapper.read_text(encoding="utf-8")
+    except OSError:
+        fail(f"{wrapper} is missing — the binary wrapper is the control-2 layer that "
+             "permission rules cannot cover (bash -c, absolute paths)")
+        return
+    # run-79 EI-2/EI-3, run-84 EU-2: the wrapper must scan EVERY argv token —
+    # a \$1-only dispatch misses global flags before the subcommand and
+    # repeated --hostname values.
+    required_fragments = (
+        ('for arg in "$@"', "scan every argv token"),
+        ("service) refuse", "refuse the 'service' subcommand"),
+        ("pair) refuse", "refuse the 'pair' subcommand"),
+        ("--service | --service=*) refuse", "refuse the --service flag"),
+        ('--hostname=*) is_loopback', "check every --hostname=value occurrence"),
+        ('[ "$want_host" = 0 ]', "refuse a dangling --hostname"),
+    )
+    missing = [what for fragment, what in required_fragments if fragment not in text]
+    if missing:
+        fail(f"{wrapper} lost required guard shape: {missing} — the wrapper must "
+             "scan every argv token, not only $1")
+    else:
+        check("wrapper scans every argv token (service/pair/--service/--hostname)")
+
+
+def check_binary(binary: pathlib.Path) -> None:
+    try:
+        data = binary.read_bytes()
+    except OSError as error:
+        fail(f"{binary} unreadable: {error}")
+        return
+    for marker in OPENTUNNEL_MARKERS:
+        if marker in data:
+            fail(f"{binary} contains OpenTunnel client marker {marker.decode()!r} — "
+                 "compile the tunnel out (scripts/compile_out_remote_tunnel.py)")
+            return
+    check(f"{binary.name} contains no OpenTunnel client markers")
+
+
+def check_image_filesystem(lane: pathlib.Path) -> None:
+    """FB-4: check actual image metadata, not just Dockerfile text."""
+    paths = [lane, *(lane / name for name in (
+        "entrypoint.sh", "health_server.py", "agent_comm_protocol.json",
+    ))]
+    for name in ("scripts", "config"):
+        tree = lane / name
+        paths.extend((tree, *tree.rglob("*")))
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            fail(f"image policy file unreadable: {path}: {error}")
+            continue
+        # /app must prevent replacement of its children; its root-only write
+        # bit is fine. All protected children must have no write bits at all.
+        writable = metadata.st_mode & (0o022 if path == lane else 0o222)
+        if metadata.st_uid != 0 or writable or path.is_symlink():
+            fail(f"image policy path must be root-owned and read-only: {path}")
+    if not failures:
+        check("image boot files, scripts and config are root-owned and read-only")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--lane",
+        type=pathlib.Path,
+        default=LANE_ROOT,
+        help="worker lane root (default: this script's lane)",
+    )
+    parser.add_argument(
+        "--binary",
+        type=pathlib.Path,
+        default=None,
+        help="built opencode binary to scan for OpenTunnel markers (image builds)",
+    )
+    parser.add_argument(
+        "--image-filesystem",
+        action="store_true",
+        help="verify installed policy-file ownership/modes (image builds only)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="lane config filename (default: opencode2.json for the v2 lane, opencode.json otherwise)",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("opencode2", "opencode-v1"),
+        default=None,
+        help="lane profile (default: infer from the lane directory name; "
+        "required when the lane is unpacked under a generic name like /app)",
+    )
+    args = parser.parse_args()
+
+    lane = args.lane
+    if not lane.is_dir():
+        print(f"FAIL: lane root {lane} is not a directory", file=sys.stderr)
+        return 1
+
+    profile = args.profile or ("opencode2" if lane.name.startswith("opencode2") else "opencode-v1")
+    is_v2 = profile == "opencode2"
+
+    config_name = args.config or ("opencode2.json" if is_v2 else "opencode.json")
+    check_config(lane, config_name, is_v2)
+    check_entrypoint(lane, is_v2)
+    if is_v2:
+        check_wrapper(lane)
+    if args.binary is not None:
+        check_binary(args.binary)
+    if args.image_filesystem:
+        check_image_filesystem(lane)
+
+    if failures:
+        print(f"exposure policy: {len(failures)} check(s) FAILED for {lane}", file=sys.stderr)
+        return 1
+    print(f"exposure policy: all checks passed for {lane} (profile {profile})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

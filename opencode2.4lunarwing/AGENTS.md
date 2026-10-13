@@ -77,3 +77,36 @@ build with the default root HOME.
 - Remove the health server — orchestration depends on it
 - Configure opencode and opencode2 on the same tenant during the transition
   (agent routing confusion; see plan §5)
+- Let the worker self-expose (WI#357): never start service mode
+  (`opencode service …`, `serve --service`), pairing (`opencode pair …`),
+  or a non-loopback `serve`; never enable session sharing (`share` stays
+  `"disabled"`) or self-update (`update` stays `"disable"`). Keep the
+  guards in place: the every-token wrapper at `/usr/local/bin/opencode`,
+  the boot-time `service.json` reset (`disabled: true`, so server-backed
+  commands default to private servers), the session/config permission denies,
+  the root-owned read-only `entrypoint.sh`, `health_server.py`,
+  `agent_comm_protocol.json`, `scripts/`+`config/`, the image build assertions, and
+  `compile_out_remote_tunnel.py` fail-closed when bumping the pinned ref.
+  These are naive-use guards, not a boundary — the real binary stays
+  executable; only the egress allowlist (WI#357 control 1, deferred) holds
+  against a compromised agent. The wrapper rejects explicit service commands;
+  implicit startup is controlled by the agent-writable live `service.json`,
+  which the entrypoint resets at each boot.
+
+## Exposure Policy (WI#357)
+
+Workers must never self-expose; LunarWing owns every public path through the
+daemon's tunnel. See `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure
+policy" for the full control set, the !1490 gate record, and the bump
+checklist. This lane pins v2.0.24: v2.0.26 bundles OpenTunnel remote access
+(hosted relay, no self-host option). A bump past v2.0.24 is deliberate-only:
+the compile-out guard stubs `remote-tunnel.ts` at build time, and CI + the
+build assertions fail if the tunnel survives.
+
+## Key Files (this policy)
+
+- `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`--service`/non-loopback `--hostname` (naive-use guard).
+- `scripts/exposure_policy_assert.py` — shared static policy checker (image build + CI guard); `--image-filesystem` also checks installed ownership and modes.
+- `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots and HOME/XDG service defaults.
+- `scripts/compile_out_remote_tunnel.py` — fail-closed build patch that compiles the OpenTunnel client out; drift scan over `packages/{cli,server,schema,core}/src` (ts+tsx, any quoted `@opentunnel/*` specifier, all workspace manifests).
+- `scripts/opencode_task_executor.ts` — `sessionPermissions()` carries the shell deny rules (after the allow-all rule; ordering matters).
