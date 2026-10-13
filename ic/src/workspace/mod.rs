@@ -4955,6 +4955,106 @@ mod runtime_index_tests {
         );
     }
 
+    // WI#335 / !1572 FF-1: exercise real storage failures below the cap,
+    // independently of the classified cap refusal. SQLite triggers reach the
+    // same transactional writer used by both rolling and numbered backups.
+    async fn assert_daily_log_backup_storage_error_fails_closed(
+        rejected_path: &str,
+        operator_backup: &str,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(
+            LibSqlBackend::new_local(&temp_dir.path().join("backup-failure.db"))
+                .await
+                .expect("LibSqlBackend"),
+        );
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Workspace::new_with_db(
+            "backup-failure-user",
+            Arc::clone(&backend) as Arc<dyn Database>,
+        );
+        let day = "daily/2026-10-13.md";
+        let backup_path = "backups/daily/2026-10-13.md.bak";
+        workspace
+            .write(day, "original")
+            .await
+            .expect("seed day log");
+        workspace
+            .write(day, "current")
+            .await
+            .expect("seed rolling backup below the generation cap");
+
+        let conn = backend.connect().await.expect("connection");
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER reject_backup_write BEFORE UPDATE OF content ON memory_documents
+                 WHEN NEW.path LIKE '{rejected_path}'
+                 BEGIN SELECT RAISE(FAIL, 'injected backup storage failure'); END"
+            ),
+            (),
+        )
+        .await
+        .expect("install backup fault injection");
+
+        let error = workspace
+            .write_with_daily_log_cap_guard(day, "guarded replacement")
+            .await
+            .expect_err("a storage failure must abort the guarded replace");
+        assert!(
+            matches!(
+                &error,
+                WorkspaceError::SearchFailed { reason }
+                    if reason.contains("injected backup storage failure")
+            ),
+            "expected the injected storage error, not a cap refusal: {error:?}"
+        );
+        assert_eq!(
+            workspace.read(day).await.expect("live day log").content,
+            "current",
+            "the failed guarded replace must preserve the live log"
+        );
+        assert_eq!(
+            workspace
+                .read(backup_path)
+                .await
+                .expect("rolling backup")
+                .content,
+            "original",
+            "the failed guarded replace must preserve the rolling backup"
+        );
+
+        // Keep the trigger installed: the operator must still be able to
+        // replace this same log despite the same backup storage failure.
+        workspace
+            .write(day, "operator replacement")
+            .await
+            .expect("operator route remains warn-and-proceed on backup failure");
+        assert_eq!(
+            workspace.read(day).await.expect("operator day log").content,
+            "operator replacement"
+        );
+        assert_eq!(
+            workspace
+                .read(backup_path)
+                .await
+                .expect("operator backup")
+                .content,
+            operator_backup
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_log_guarded_replace_fails_closed_on_rolling_backup_storage_error() {
+        assert_daily_log_backup_storage_error_fails_closed("backups/daily/%.md.bak", "original")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn daily_log_guarded_replace_fails_closed_on_rotation_storage_error() {
+        assert_daily_log_backup_storage_error_fails_closed("backups/daily/%.md.bak.%", "current")
+            .await;
+    }
+
     /// WI#335: below the cap the guarded write behaves exactly like `write`
     /// (generations rotate normally), and non-daily prompt files are entirely
     /// unaffected by the guard.
