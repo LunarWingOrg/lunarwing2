@@ -214,7 +214,11 @@ case "$MODE" in
     log "Mode: WebSocket — starting opencode headless server"
 
     cd "$WORKSPACE_ROOT"
-    "$OPENCODE_BIN" serve \
+    # WI#373: the serve process runs all task code (every bash tool child
+    # inherits its env), so strip the bridge's hub-handshake credential from
+    # the server env. The bridge keeps its own copy for the WebSocket
+    # handshake; the server never needs it.
+    env -u AGENT_AUTH_TOKEN "$OPENCODE_BIN" serve \
       --port "$OPENCODE_SERVE_PORT" \
       --hostname "$OPENCODE_SERVE_HOST" &
     OPENCODE_PID=$!

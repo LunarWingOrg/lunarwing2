@@ -78,6 +78,119 @@ def expect_ready(worker, **kwargs):
     return config
 
 
+def free_port():
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def execable_dir(root):
+    """Temp dirs can be mounted noexec on dev VMs; probe for a directory
+    where the stub binaries can actually run, falling back to HOME."""
+    import shutil
+    candidates = [root / "bin"]
+    home = os.environ.get("HOME")
+    if home and Path(home).is_dir():
+        candidates.append(Path(tempfile.mkdtemp(prefix="worker-ws373-", dir=home)))
+    for candidate in candidates:
+        candidate.mkdir(parents=True, exist_ok=True)
+        try:
+            probe = candidate / ".exec-probe.sh"
+            probe.write_text("#!/bin/sh\nexit 0\n")
+            probe.chmod(0o755)
+            if subprocess.run([str(probe)], capture_output=True).returncode == 0:
+                probe.unlink()
+                return candidate
+            probe.unlink(missing_ok=True)
+        except OSError:
+            continue
+        if candidate != candidates[0]:
+            shutil.rmtree(candidate, ignore_errors=True)
+    raise AssertionError("no executable directory found for worker stubs")
+
+
+def run_websocket_startup(worker):
+    """WI#373: run the FULL entrypoint in websocket mode with stub binaries.
+    The opencode serve stub records whether the bridge's hub-handshake
+    credential (AGENT_AUTH_TOKEN) reached the server process env — the server
+    runs all task code, so it must NOT see it — and the bun stub records the
+    same for the bridge process, which MUST keep it for the handshake."""
+    directory, filename = workers[worker]
+    source = repo / directory
+    entrypoint = (source / "entrypoint.sh").read_text()
+    boundary = "# ── always start the health server"
+    assert boundary in entrypoint, f"{worker}: startup boundary changed"
+    with tempfile.TemporaryDirectory(prefix=f"{worker}-ws373-") as temp:
+        root = Path(temp)
+        home, app, workspace = root / "home", root / "app", root / "workspace"
+        bin_dir = execable_dir(root)
+        for path in (home, app / "config", workspace / ".opencode"):
+            path.mkdir(parents=True)
+        baked = (source / "config" / filename).read_text()
+        placeholder = f"http://set-{worker}-base-url.invalid/openai/v1"
+        if worker != "kimi":
+            placeholder += "/"
+        assert placeholder in baked, f"{worker}: expected baked placeholder"
+        (app / "config" / filename).write_text(baked.replace(placeholder, endpoint))
+        # Backgrounded by the entrypoint; exits immediately so nothing holds
+        # the temp directory open.
+        (app / "health_server.py").write_text("import time\ntime.sleep(0.2)\n")
+        serve_mark = root / "serve-env.txt"
+        bridge_mark = root / "bridge-env.txt"
+        serve_port, health_port = free_port(), free_port()
+        serve_stub = bin_dir / "opencode"
+        serve_stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+            f"with open({str(serve_mark)!r}, 'w') as fh:\n"
+            "    fh.write('PRESENT' if os.environ.get('AGENT_AUTH_TOKEN')"
+            " else 'ABSENT')\n"
+            "class Handler(BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        self.send_response(200)\n"
+            "        self.end_headers()\n"
+            "        self.wfile.write(b'ok')\n"
+            "    def log_message(self, *args):\n"
+            "        pass\n"
+            f"HTTPServer(('127.0.0.1', {serve_port}), Handler).handle_request()\n"
+        )
+        serve_stub.chmod(0o755)
+        bun_stub = bin_dir / "bun"
+        bun_stub.write_text(
+            "#!/bin/sh\n"
+            f"if [ -n \"$AGENT_AUTH_TOKEN\" ]; then echo PRESENT > {bridge_mark};"
+            f" else echo ABSENT > {bridge_mark}; fi\n"
+            "exit 0\n"
+        )
+        bun_stub.chmod(0o755)
+        script = entrypoint.replace("/app/", str(app) + "/")
+        for user in ("opencode", "kimi"):
+            script = script.replace(f"/home/{user}/", str(home) + "/")
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "HOME": str(home), "TMPDIR": temp,
+            "WORKSPACE_ROOT": str(workspace),
+            "OPENCODE_BIN": str(serve_stub),
+            f"{worker.upper()}_BASE_URL": endpoint,
+            "OPENCODE_SERVE_PORT": str(serve_port),
+            "OPENCODE_SERVE_HOST": "127.0.0.1",
+            "HEALTH_PORT": str(health_port),
+            "WS_STATE_FILE": str(root / "ws-state.json"),
+            "AGENT_AUTH_TOKEN": "bridge-secret-64hex",
+        }
+        result = subprocess.run(["bash"], input=script, text=True, env=env,
+                                capture_output=True, timeout=60)
+        assert result.returncode == 0, f"{worker}: entrypoint failed: {result.stderr}"
+        assert serve_mark.exists() and bridge_mark.exists(), \
+            f"{worker}: stubs did not run: {result.stderr}"
+        assert serve_mark.read_text().strip() == "ABSENT", \
+            f"{worker}: hub-handshake token reached the serve process env (WI#373)"
+        assert bridge_mark.read_text().strip() == "PRESENT", \
+            f"{worker}: bridge lost its handshake credential (WI#373)"
+
+
 for worker in workers:
     key = f"{worker.upper()}_BASE_URL"
     for label, overrides in (
@@ -108,4 +221,8 @@ assert config["default_model"] == "new-model"
 assert config["models"]["new-model"]["model"] == "new-model"
 assert config["providers"]["tensorzero"]["api_key"] == api_key
 print("PASS: Kimi normalizes model/URL consistently while preserving API-key bytes")
+
+for worker in ("opencode", "opencode2"):
+    run_websocket_startup(worker)
+    print(f"PASS: {worker} serve process runs without the hub-handshake token (WI#373)")
 PY
