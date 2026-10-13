@@ -3808,15 +3808,17 @@ fn is_settled_host_stop(thread: &crate::types::thread::Thread) -> bool {
         .unwrap_or(false)
 }
 
+/// One conflicting webhook path claim: `(project_id, path, holders)` with
+/// each holder as `(mission_id, owner)`.
+type WebhookClaimConflict = (ProjectId, String, Vec<(MissionId, String)>);
+
 /// WI#359 (info item): find webhook paths claimed by more than one owner's
 /// non-terminal mission within a project. A fire matches every Active
 /// mission on the path, so legacy two-owner duplicates keep firing for each
 /// owner. Rows with an unusable (dormant) secret do not count as live
 /// claims. Returns `(project_id, path, [(mission_id, owner)])` per
 /// conflicting path.
-fn conflicting_webhook_claims(
-    missions: &[Mission],
-) -> Vec<(ProjectId, String, Vec<(MissionId, String)>)> {
+fn conflicting_webhook_claims(missions: &[Mission]) -> Vec<WebhookClaimConflict> {
     let mut claims: std::collections::HashMap<(ProjectId, &str), Vec<&Mission>> =
         std::collections::HashMap::new();
     for mission in missions {
