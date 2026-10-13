@@ -366,10 +366,10 @@
     - **EM-5 (secret scrub):** only `level=Error` lines are eligible, and known secret values (bridge credential envs: `OPENCODE_SERVER_PASSWORD`, `TENSORZERO_API_KEY`, `OPENAI_API_KEY`, `AGENT_AUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `PASEO_TOKEN`, plus this task's injected `context.environment` values; ≥8 chars, ≤64 values) are replaced with `[redacted]` before the tail is returned into the job record.
     - **EM-6 (writability/false-capture):** with the tee gone there is no entrypoint capture to probe and no stale-file attach: `OPENCODE_SERVE_LOG` is a path override whose explicit empty value disables enrichment outright (no default-path fallback); unset resolves the xdg structured-log default. The structured log itself is serve-owned (append, no rotation) in the compose `opencode-data` volume — documented for operators.
     - **EM-7 (mutations, path freeze, entrypoint):** the path is resolved once at module load (`SERVE_LOG_PATH`), so a per-task credential grant named `OPENCODE_SERVE_LOG` cannot retarget or disable enrichment (`resolveServeLogPath` exported and unit-pinned; a subprocess pin proves a post-load env mutation has no effect). The test suite kills all four previously-surviving mutations (`.slice(-TAIL_LINES)` dropped, whole-file read, `TAIL_LINES=1000`, `TAIL_BYTES=1 MiB` — each bound now pinned independently) plus the EM-2 surrogate cap, the EM-3 O_NOFOLLOW, the EM-4 offset and ref filter, the EM-5 level filter, and the EM-7 per-call-env read (10 of 11 mutations dead; the isFile-gate drop is documented-unreachable, see EM-3). There is no entrypoint change anymore (the tee was the only one), so the "entrypoint change has no repo test" gap is moot; `bash -n` + shellcheck clean (only pre-existing SC2016 infos in the untouched git-credential block).
-    - **!1552 conflict note:** !1552 (WI#328) is closed-unmerged, so no textual conflict existed on that tree; superseded — its successor !1573 landed before this re-attempt and the conflicts were resolved per the run-92 merge analysis above.
-    - **Verification (host, bun 1.3.1 + node 24):** `bun scripts/opencode_result_test.ts` passes (and under `node --experimental-strip-types` — the module no longer uses Bun.file); `bun scripts/opencode_task_executor_test.ts` passes, including a new end-to-end subprocess pin (real SDK-shaped 500 error → enriched with the ref'd crash line, pre-task line excluded by the task-start offset, `TENSORZERO_API_KEY` scrubbed); `path_expand_test.ts`, `task_prompt_test.ts`, `study_notes_config_test.py` green; mutation-tested 11 runs (10 killed, 1 documented); `bash -n`/shellcheck clean on the reverted entrypoint. The Dockerfile build gate (line 233) runs `opencode_result_test.ts` at image build, so the suite is CI-enforced on the next worker-image build (protected pipeline). The image rebuild itself remains protected-pipeline-gated, unchanged from !1554.
+    - **!1552 conflict note:** !1552 (WI#328) is closed-unmerged, so no textual conflict existed on that tree; superseded — its successor !1573 landed before this re-attempt and the conflicts were resolved per the run-92 merge analysis above
+    - **Verification (host, bun 1.3.1 + node 24):** `bun scripts/opencode_result_test.ts` passes (and under `node --experimental-strip-types` — the module no longer uses Bun.file); `bun scripts/opencode_task_executor_test.ts` passes, including a new end-to-end subprocess pin (real SDK-shaped 500 error → enriched with the ref'd crash line, pre-task line excluded by the task-start offset, `TENSORZERO_API_KEY` scrubbed); `path_expand_test.ts`, `task_prompt_test.ts`, `study_notes_config_test.py` green; mutation-tested 11 runs (10 killed, 1 documented); `bash -n`/shellcheck clean on the reverted entrypoint. The Dockerfile build gate (line 233) runs `opencode_result_test.ts` at image build, so the suite is CI-enforced on the next worker-image build (protected pipeline). The image rebuild itself remains protected-pipeline-gated, unchanged from !1554
     - **WI#374 disposition:** closed as a duplicate of **WI#333** with a pointer note (the review's ask); WI#333 keeps the lane decision (bump past v1.18.25 or retire the v1 lane per its own ask), and goals item 34 tracks the v2.1.7.0 retirement.
-28. [ ] fix issues in CI/CD (if any) - See Pipeline Number 5587 for latest master pipeline run and see if anything is not GREEN
+28. [ ] fix issues in CI/CD (if any) - See Pipeline Number 5609 for latest master pipeline run and see if anything is not GREEN
 29. [x] (S) (H) MASCOT ANIMS
 30. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/373
 31. [ ] review all currently open work items - create audit document for 2.1.6.0 in docs/ops - there are similar docs in docs/ops for 2.1.5.0 and 2.1.4.0 and earlier releases so you can use those as references - you can sort doc by label of release ( i.e. 2.1.5.0, 2.1.6.0 )
@@ -377,9 +377,9 @@
 33. [x] (S) (H MR) come back to item 2 at some point after manual review is completed (NOTE FOR LATER)
 34. [x] (S) (H MR) prob rm opencode v1 in .1.7.0 and add lunardepth in .1.8.0
 35. [x] (S) (H MR) Status of some of the bigger goals here check in on
-36. [x] (S) RESERVED
-37. [x] (S) RESERVED
-38. [x] (S) RESERVED
+36. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/395
+37. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/393
+38. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/392
 
 ## Phase 5 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
@@ -387,5 +387,7 @@
 40. [ ] Create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for references)
 41. [x] (S) RESERVED
 42. [ ] update all docs in docs/guides
+43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/390
+44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/380 and increase handle_message_timeout to higher value between 600-630 
 
 ---
