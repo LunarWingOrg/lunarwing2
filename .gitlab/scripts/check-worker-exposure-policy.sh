@@ -39,13 +39,17 @@ dockerfile="$lane/Dockerfile"
 dockerfile_code=""
 _join=""
 while IFS= read -r _raw || [[ -n "$_raw" ]]; do
+    # Run-103 GD-1: Docker strips a UTF-8 BOM before the first line; without
+    # this a BOM-prefixed directive is not even recognized as a comment.
+    _raw="${_raw#$'\xef\xbb\xbf'}"
     _line="${_raw#"${_raw%%[![:space:]]*}"}"
     if [[ "$_line" == \#* ]]; then
         # Run-97 FQ-3: a parser directive changes how Docker itself parses the
         # file (escape=` makes every backslash a literal, so this script's
         # continuation joining no longer matches Docker's instruction split).
         # Refuse the directives outright instead of parsing Docker's grammar.
-        if [[ "${_line,,}" =~ ^#[[:space:]]*(escape|syntax|check)= ]]; then
+        # Run-103 GD-1: the grammar allows whitespace around the '='.
+        if [[ "${_line,,}" =~ ^#[[:space:]]*(escape|syntax|check)[[:space:]]*= ]]; then
             fail "Dockerfile parser directives (# escape=/# syntax=/# check=) are not allowed (run-97 FQ-3): ${_line}"
         fi
         continue

@@ -463,11 +463,20 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         # literal, so a LABEL line ending in "\" followed by RUN after the
         # final assertion passes the guard's continuation joining while Docker
         # executes the RUN. Refuse the directives instead of emulating the
-        # parser grammar.
+        # parser grammar. Run-103 GD-1: the refusal must also cover the
+        # grammar's whitespace-around-'=' spellings and a UTF-8 BOM prefix
+        # (Docker strips the BOM before parsing, so both hide a directive the
+        # old regex never matched).
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         original = dockerfile.read_text()
         tail = "LABEL hidden=yes \\\nRUN chown -R opencode2:opencode2 /app\n"
-        for directive in ("# escape=`\n", "# SyNtAx=docker/dockerfile:1\n", "  # check=true\n"):
+        for directive in (
+            "# escape=`\n",
+            "# SyNtAx=docker/dockerfile:1\n",
+            "  # check=true\n",
+            "# escape = `\n",
+            "\ufeff# escape=`\n",
+        ):
             with self.subTest(directive=directive.strip()):
                 dockerfile.write_text(directive + original + tail, encoding="utf-8")
                 result = self.run_guard(self.root)
