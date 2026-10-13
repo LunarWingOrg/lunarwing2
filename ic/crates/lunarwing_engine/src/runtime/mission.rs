@@ -84,7 +84,7 @@ const SHUTDOWN_STOP_GRACE: Duration = Duration::from_secs(3);
 /// retry marker, so an abort between the two saves leaves a mission row
 /// without a marker (the key already released) and an abort before the
 /// mission save leaves no trace with the key still recorded on the old row
-/// (the stuck-key residual, WI#341) — never a marker whose dedup release
+/// (the stuck-key residual, WI#394) — never a marker whose dedup release
 /// never saved. Markers written in the opposite order by older builds are
 /// healed by the next boot's retry recovery.
 const SHUTDOWN_SETTLE_BUDGET: Duration = Duration::from_secs(8);
@@ -4173,7 +4173,7 @@ async fn process_mission_outcome_and_notify(
     // dedup key already released for redelivery — while an abort before the
     // mission save leaves no trace with the key still recorded on the old
     // row (the settled stop may already have persisted the thread row; the
-    // stuck-key residual, WI#341) — never a marker whose mission-side
+    // stuck-key residual, WI#394) — never a marker whose mission-side
     // release never saved. Markers written in the opposite order by older
     // builds are healed by the boot sweep.
     mission.updated_at = chrono::Utc::now();
@@ -12333,6 +12333,16 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             "the persisted terminal reason is the host stop: {:?}",
             settled.events
         );
+        // FK-5: the terminal row above can be the loop engine's save while
+        // the run's own final save is still inside its delay; wait the run
+        // task out so the "boot" marker write can never race that save.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while thread_manager.is_running(thread_id).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the run task finishes its final save");
 
         // "Boot": the resolution sweep turns the stamp into the retry the
         // watcher would have planned — marker, wake, and notice.
@@ -12346,6 +12356,12 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                 .unwrap(),
             vec![id]
         );
+        assert_eq!(
+            booted.task_handles.lock().await.len(),
+            1,
+            "the retry wake is armed"
+        );
+        assert!(booted.recovered_retries.lock().await.contains(&thread_id));
         let saved_thread = store.load_thread(thread_id).await.unwrap().unwrap();
         let marker = RetryState::from_metadata(&saved_thread.metadata)
             .expect("the settled stop earns the watcher's retry marker");

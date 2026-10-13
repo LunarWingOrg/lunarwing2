@@ -790,7 +790,7 @@ pre-WI#188 loss: the settled stop persists the thread row
 abort in that narrower span leaves the dedup key still recorded on the old
 mission row with no marker and no stamp — every boot sweep skips the fire,
 a silent loss with a stuck key that also suppresses an external redelivery
-of the same payload (the Q-4 residual, WI#341; the abort-window test
+of the same payload (the Q-4 residual, WI#394; the abort-window test
 `outcome_processing_writes_no_marker_when_the_mission_save_fails` pins the
 "old row still holds the key" state). Markers
 written in the opposite order by older builds can still pair a live marker
@@ -912,14 +912,22 @@ mission metadata for the shutdown-interruption stamps
 (`pending_shutdown_interruption`) and the owed outcome notices
 (`pending_outcome_notification`). Downgrading restores the older
 completion/recovery behavior and does not reconstruct interrupted work. An
-older build never clears the mission-side stamps: they sit unread until a
-re-upgrade, whose boot sweep resolves each interruption stamp younger than
-24 hours (`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) into the retry it names —
-record-only beyond that — and emits every owed outcome notice it finds,
-with no age bound on either emission beyond the stamp age check. The
-upgrade direction has its own wrinkle: every live pre-upgrade retry marker
-deserializes with `notified: false` (the field is newer than those
-markers), so the first boot after the upgrade emits "Mission fire
+older build does not resolve the newer stamps. A pre-WI#276 build ignores
+both keys. A v2.1.5.0 build ignores `pending_outcome_notification` and
+reads only its own single-slot interruption stamp (`{"thread_id",
+"recorded_at"}`), so the per-thread map a newer build writes sits unread —
+until that build's own next grace-expired shutdown of the same mission
+replaces the whole `pending_shutdown_interruption` value and drops the
+newer entries (those fires keep their `INTERRUPTED` entry and dedup
+release but are never retried). A re-upgrade's boot sweep resolves each
+surviving interruption stamp younger than 24 hours
+(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) through the usual ownership and
+parity guards — record-only beyond that — and emits every owed outcome
+notice it finds, with no age bound. The
+upgrade direction has its own wrinkle: every live retry marker written by
+a build before WI#276 (pre-v2.1.5.0) deserializes with `notified: false`
+(the field is newer than those markers), so the first boot after the
+upgrade emits "Mission fire
 interrupted; retry N of M re-armed after daemon restart" once per marker —
 including markers whose original notice was delivered before the upgrade,
 and markers of runs that genuinely failed inside the shutdown grace rather
