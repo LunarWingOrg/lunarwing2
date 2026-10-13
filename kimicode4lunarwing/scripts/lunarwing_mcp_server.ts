@@ -25,8 +25,36 @@ const SERVER_VERSION = "1.0.0"
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 // An inbound line larger than this can never fit the relay's 256 KiB IPC
 // budget with room to spare; cap the stdin buffer so a runaway peer cannot
-// grow it without bound (MR !1549 EF-9).
-const MAX_STDIN_LINE_BYTES = 1024 * 1024
+// grow it without bound (MR !1549 EF-9). Counted in UTF-16 code units
+// (string length), not bytes.
+const MAX_STDIN_LINE_CHARS = 1024 * 1024
+// MR !1561 EV-3: an over-long request line must still be answered (exactly
+// once, with its id) — otherwise the CLI waits out its own MCP timeout. The
+// middle of the line is discarded (the 1 MiB bound stands); the head and a
+// rolling tail are kept so the id can be recovered from the line's
+// top-level edges: id-first (`{"jsonrpc":"2.0","id":N,`) or SDK order
+// (`…,"jsonrpc":"2.0","id":N}`). A nested "id" is never used.
+const EDGE_KEEP_CHARS = 256
+
+function parseJsonRpcId(raw: string | undefined): string | number | null {
+  if (raw === undefined) return null
+  if (raw.startsWith('"')) {
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      return typeof parsed === "string" ? parsed : null
+    } catch {
+      return null
+    }
+  }
+  const num = Number(raw)
+  return Number.isSafeInteger(num) ? num : null
+}
+
+function recoverRequestIdFromEdges(head: string, tail: string): string | number | null {
+  const headMatch = /^\{"jsonrpc":"2\.0","id":("(?:[^"\\]|\\.)*"|-?\d+)[,}]/.exec(head.trimStart())
+  const tailMatch = /,"jsonrpc":"2\.0","id":("(?:[^"\\]|\\.)*"|-?\d+)\}\s*$/.exec(tail)
+  return parseJsonRpcId(headMatch?.[1] ?? tailMatch?.[1])
+}
 
 function requestTimeoutMs(): number {
   const raw = Number.parseInt(process.env.LUNARWING_TOOL_PROXY_TIMEOUT_MS ?? "", 10)
@@ -203,15 +231,41 @@ async function main(): Promise<void> {
     )
   }
   let buffer = ""
+  let oversizedHead: string | null = null
+  let oversizedTail = ""
   process.stdin.setEncoding("utf8")
   process.stdin.on("data", (chunk: string) => {
     buffer += chunk
+    // MR !1561 EV-3: while an oversized line is being discarded, drop
+    // everything up to its terminating newline (keeping a rolling tail for
+    // id recovery) instead of letting the tail parse as a line of its own.
+    if (oversizedHead !== null) {
+      const discardEnd = buffer.indexOf("\n")
+      if (discardEnd < 0) {
+        oversizedTail = (oversizedTail + buffer).slice(-EDGE_KEEP_CHARS)
+        buffer = ""
+        return
+      }
+      oversizedTail = (oversizedTail + buffer.slice(0, discardEnd)).slice(-EDGE_KEEP_CHARS)
+      writeError(
+        recoverRequestIdFromEdges(oversizedHead, oversizedTail),
+        -32600,
+        "request exceeds the 1 MiB line budget",
+      )
+      oversizedHead = null
+      oversizedTail = ""
+      buffer = buffer.slice(discardEnd + 1)
+    }
     let newline = buffer.indexOf("\n")
     while (newline >= 0) {
       const line = buffer.slice(0, newline).trim()
       buffer = buffer.slice(newline + 1)
-      if (line.length > MAX_STDIN_LINE_BYTES) {
-        writeError(null, -32600, "request exceeds the 1 MiB line budget")
+      if (line.length > MAX_STDIN_LINE_CHARS) {
+        writeError(
+          recoverRequestIdFromEdges(line, line),
+          -32600,
+          "request exceeds the 1 MiB line budget",
+        )
       } else if (line.length > 0) {
         let parsed: JsonRpcRequest
         try {
@@ -227,11 +281,14 @@ async function main(): Promise<void> {
       }
       newline = buffer.indexOf("\n")
     }
-    if (buffer.length > MAX_STDIN_LINE_BYTES) {
+    if (buffer.length > MAX_STDIN_LINE_CHARS) {
       // A line this long without a terminator can never succeed at the
-      // relay; drop it instead of growing the buffer without bound.
-      console.error(`[${SERVER_NAME}] dropping oversized unterminated stdin line (${buffer.length} bytes)`)
-      writeError(null, -32600, "request exceeds the 1 MiB line budget")
+      // relay; stop buffering it (the middle is discarded, the head and a
+      // rolling tail are kept) and answer it once, with its recovered id,
+      // when the terminating newline arrives (MR !1561 EV-3).
+      console.error(`[${SERVER_NAME}] dropping oversized unterminated stdin line (${buffer.length} chars)`)
+      oversizedHead = buffer.slice(0, EDGE_KEEP_CHARS)
+      oversizedTail = buffer.slice(-EDGE_KEEP_CHARS)
       buffer = ""
     }
   })

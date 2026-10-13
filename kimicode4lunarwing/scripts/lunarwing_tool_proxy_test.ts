@@ -273,21 +273,50 @@ test("dropHubSocket fails pending waiters and frees the socket's pending map (EF
   const handle = await relay.startTask("task-drop", hub)
   assert.ok(handle)
 
-  const responsePromise = ipcRequest(handle.socketPath, {
-    op: "call",
-    call_id: "call-drop",
-    name: "memory_read",
-    arguments: {},
-  })
-  await new Promise((resolve) => setTimeout(resolve, 100))
-  assert.equal(hub.sent.length, 1)
-  relay.dropHubSocket(hub)
-  const response = await responsePromise
-  assert.equal(response.ok, true)
-  assert.match(String(response.error), /hub connection closed/)
-  // A second drop is a no-op — the entry is gone, not lingering empty.
-  relay.dropHubSocket(hub)
-  handle.close()
+  try {
+    const responsePromise = ipcRequest(handle.socketPath, {
+      op: "call",
+      call_id: "call-drop",
+      name: "memory_read",
+      arguments: {},
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(hub.sent.length, 1)
+    relay.dropHubSocket(hub)
+    const response = await responsePromise
+    assert.equal(response.ok, true)
+    assert.match(String(response.error), /hub connection closed/)
+    // A second drop is a no-op — the entry is gone, not lingering empty.
+    relay.dropHubSocket(hub)
+  } finally {
+    handle.close()
+  }
+})
+
+test("a request after dropHubSocket fails at once and re-creates no pending state (EV-4)", async () => {
+  // MR !1561 EV-4: pre-fix, a request arriving on the still-open task IPC
+  // after dropHubSocket re-created the socket's pending map and sent into
+  // the closed socket, then waited out the full relay timeout (2 s here).
+  const hub = new FakeHubSocket()
+  const handle = await relay.startTask("task-drop-final", hub)
+  assert.ok(handle)
+  try {
+    relay.dropHubSocket(hub)
+    const started = Date.now()
+    const response = await ipcRequest(handle.socketPath, {
+      op: "call",
+      call_id: "call-after-drop",
+      name: "memory_read",
+      arguments: {},
+    })
+    const elapsed = Date.now() - started
+    assert.equal(response.ok, true)
+    assert.match(String(response.error), /hub connection closed/)
+    assert.ok(elapsed < 1000, `must fail at once, not wait out the relay timeout (${elapsed} ms)`)
+    assert.equal(hub.sent.length, 0, "nothing may be sent into the dropped socket")
+  } finally {
+    handle.close()
+  }
 })
 
 test("socket path is filesystem-safe and unique per task id", () => {

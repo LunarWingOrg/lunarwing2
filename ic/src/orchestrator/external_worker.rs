@@ -496,7 +496,10 @@ impl ExternalWorkerManager {
                 tracing::error!(
                     "External worker '{}' is mode=cron but sets a worker-level tool_allowlist; \
                      stripping it — a cron worker container holds only cron.tool_allowlist \
-                     authority (ordinary dispatches to it get no proxied tools)",
+                     authority (ordinary dispatches to it get no proxied tools). The strip is \
+                     applied per worker entry, but the authority domain is the container: never \
+                     point an entry that has a tool_allowlist at the same endpoint as a \
+                     mode=cron entry; give a cron mission its own container",
                     config.name
                 );
                 config.tool_allowlist = Vec::new();
@@ -507,6 +510,43 @@ impl ExternalWorkerManager {
                 LoadBalancer::new(endpoints, config.load_balance.clone()),
             );
             workers.insert(config.name.clone(), config);
+        }
+
+        // MR !1561 EV-1: the authority domain is the container, not the
+        // config entry. A task-mode entry whose endpoint URL matches a cron
+        // entry's endpoint points at the same container, so its worker-level
+        // list would be borrowable by that container's ticks through a
+        // concurrent task's relay socket — re-opening the cross-task
+        // grant-borrow path the per-entry strip above closed. Strip such a
+        // shared-endpoint entry's worker-level list too. This is an exact
+        // URL match only: aliases (localhost vs 127.0.0.1, /etc/hosts names)
+        // are the operator's responsibility — see WORKER-CONTAINERS.md.
+        let cron_endpoint_urls: std::collections::HashSet<String> = workers
+            .values()
+            .filter(|config| config.is_cron())
+            .flat_map(|config| config.endpoints().into_iter().map(|endpoint| endpoint.url))
+            .collect();
+        if !cron_endpoint_urls.is_empty() {
+            for config in workers.values_mut() {
+                if config.is_cron() || config.tool_allowlist.is_empty() {
+                    continue;
+                }
+                if config
+                    .endpoints()
+                    .iter()
+                    .any(|endpoint| cron_endpoint_urls.contains(&endpoint.url))
+                {
+                    tracing::error!(
+                        "External worker '{}' shares an endpoint with a mode=cron worker; \
+                         stripping its worker-level tool_allowlist — one container is one \
+                         authority domain, so a cron tick in that container could otherwise \
+                         borrow this entry's grants through a concurrent task's relay socket. \
+                         Give the cron mission its own container",
+                        config.name
+                    );
+                    config.tool_allowlist = Vec::new();
+                }
+            }
         }
 
         if !workers.is_empty() {
@@ -3260,7 +3300,8 @@ async fn build_tool_catalog(
                     // Advertise the granted spelling so a bridge can call
                     // the catalog entry even when the registry uses an alias.
                     name: name.clone(),
-                    description: tool.description().to_string(),
+                    description: proxied_catalog_description(&resolved, tool.description())
+                        .to_string(),
                     parameters: proxied_catalog_schema(&resolved, tool.parameters_schema()),
                 });
             }
@@ -3268,6 +3309,23 @@ async fn build_tool_catalog(
         tools.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     }
     Envelope::new("tool_catalog", serde_json::json!({ "tools": tools }))
+}
+
+/// MR !1561 EV-2: the catalog description must not advertise calls the
+/// proxy boundary always denies. The memory_write tool's own description
+/// names the 'memory'/'daily_log'/'heartbeat'/'bootstrap' layer shortcuts,
+/// which the DX-2 guard rejects on this surface — the proxied description
+/// names only explicit workspace paths.
+fn proxied_catalog_description<'a>(resolved_name: &str, original: &'a str) -> &'a str {
+    if resolved_name != "memory_write" {
+        return original;
+    }
+    "Write to persistent memory in the tenant workspace at an explicit path \
+     (target is REQUIRED on this surface, e.g. 'notes/today.md' or \
+     'projects/alpha/notes.md'). The named shortcuts ('memory', 'daily_log', \
+     'heartbeat', 'bootstrap'), identity/config files, lorebooks, daily logs \
+     and 'engine/**' paths are denied by the proxy boundary. \
+     Never pass absolute filesystem paths like '/Users/...' or 'C:\\...'."
 }
 
 /// MR !1549 EF-4: the catalog must advertise the schema the proxy boundary
@@ -3294,7 +3352,7 @@ fn proxied_catalog_schema(resolved_name: &str, original: serde_json::Value) -> s
             },
             "append": {
                 "type": "boolean",
-                "description": "If true, append to existing content; if false, replace it (the previous version is kept at backups/<path>.bak).",
+                "description": "If true, append to existing content; if false, replace it. Replacement is NOT recoverable on this surface: the backups/<path>.bak shadow copy is kept only for prompt-visible files, which the proxy boundary denies. Always use false for JSON documents — appending corrupts them.",
                 "default": true
             }
         },
@@ -3712,10 +3770,49 @@ mod tests {
         assert!(props.contains_key("content") && props.contains_key("target"));
         let required = schema["required"].as_array().expect("required");
         assert!(required.contains(&serde_json::json!("target")));
+        // MR !1561 EV-2: the append description must not promise a backup
+        // the proxy boundary can never produce (the backups/<path>.bak
+        // shadow copy is kept only for prompt-visible files, which the
+        // boundary denies).
+        let append_desc = props["append"]["description"]
+            .as_str()
+            .expect("append desc");
+        assert!(
+            !append_desc.contains("previous version is kept"),
+            "the proxied append text must not promise a backup: {append_desc}"
+        );
+        assert!(
+            append_desc.contains("NOT recoverable"),
+            "the proxied append text must state replace is not recoverable: {append_desc}"
+        );
         // Other tools keep their own schema untouched.
         assert_eq!(
             proxied_catalog_schema("memory_read", original.clone()),
             original
+        );
+    }
+
+    #[test]
+    fn proxied_memory_write_description_names_only_workspace_paths() {
+        // MR !1561 EV-2: the tool's own description advertises the
+        // 'memory'/'daily_log'/'heartbeat'/'bootstrap' layer shortcuts the
+        // DX-2 guard always denies on this surface — the catalog must send
+        // a proxied description naming only explicit workspace paths.
+        let desc = proxied_catalog_description("memory_write", "original");
+        for denied in ["'memory'", "'daily_log'", "'heartbeat'", "'bootstrap'"] {
+            assert!(
+                !desc.contains(denied) || desc.contains("denied"),
+                "proxied description may only name {denied} as denied: {desc}"
+            );
+        }
+        assert!(
+            desc.contains("notes/today.md"),
+            "proxied description must name explicit workspace paths: {desc}"
+        );
+        // Other tools keep their own description untouched.
+        assert_eq!(
+            proxied_catalog_description("memory_read", "original"),
+            "original"
         );
     }
 

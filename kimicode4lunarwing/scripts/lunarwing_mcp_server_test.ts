@@ -234,3 +234,93 @@ test("without the proxy env the shim advertises zero tools", async () => {
     shim.kill()
   }
 })
+
+test("an oversized request line is answered once with its recovered id", async () => {
+  // MR !1561 EV-3: pre-fix the 1 MiB stdin cap replied with `id: null` (and
+  // let the dropped line's tail parse as its own line, producing a second
+  // id-null error plus a -32700), so the CLI waited out its own MCP timeout
+  // for the dropped call. The shim must now discard up to the newline and
+  // answer exactly once with the id recovered from the line's top-level
+  // edges — id-first or SDK order.
+  const shim = startShim({})
+  try {
+    const replies: Array<Record<string, unknown>> = []
+    shim.stdout.on("data", (chunk: Buffer) => {
+      for (const line of chunk.toString("utf8").split("\n")) {
+        if (!line.trim()) continue
+        replies.push(JSON.parse(line) as Record<string, unknown>)
+      }
+    })
+    const padding = "x".repeat(3 * 1024 * 1024)
+    // id-first shape.
+    shim.stdin.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 42,
+        method: "tools/call",
+        params: { name: "memory_read", arguments: { path: padding } },
+      }) + "\n",
+    )
+    // SDK order: jsonrpc/id serialized last.
+    shim.stdin.write(
+      `{"method":"tools/call","params":{"name":"memory_read","arguments":{"path":"${padding}"}},"jsonrpc":"2.0","id":"sdk-9"}` +
+        "\n",
+    )
+    const pong = await rpc(shim, { jsonrpc: "2.0", id: 7, method: "ping" })
+    assert.deepEqual(pong, { jsonrpc: "2.0", id: 7, result: {} })
+    const errors = replies.filter((reply) => reply.error !== undefined)
+    assert.equal(errors.length, 2, `expected exactly one error per oversized line: ${JSON.stringify(errors)}`)
+    const byId = new Map(errors.map((reply) => [reply.id, reply.error as { code: number; message: string }]))
+    assert.equal(byId.get(42)?.code, -32600, "the id-first line must be answered with its id")
+    assert.equal(byId.get("sdk-9")?.code, -32600, "the SDK-order line must be answered with its id")
+    assert.match(byId.get(42)?.message ?? "", /1 MiB/)
+    assert.match(byId.get("sdk-9")?.message ?? "", /1 MiB/)
+  } finally {
+    shim.kill()
+  }
+})
+
+test("oversized requests never recover nested argument ids (FE-2)", async () => {
+  const shim = startShim({})
+  try {
+    const replies: Array<Record<string, unknown>> = []
+    let buffer = ""
+    shim.stdout.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8")
+      let newline = buffer.indexOf("\n")
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        if (line.trim()) replies.push(JSON.parse(line) as Record<string, unknown>)
+        newline = buffer.indexOf("\n")
+      }
+    })
+    const padding = "x".repeat(3 * 1024 * 1024)
+    // Both use SDK key order, with the real id at the line's end. A nested
+    // jsonrpc/id pair at the arguments' head must not beat that top-level id
+    // if the head regex loses its start anchor.
+    shim.stdin.write(JSON.stringify({
+      method: "tools/call",
+      params: { name: "memory_read", arguments: { jsonrpc: "2.0", id: 99, path: padding } },
+      jsonrpc: "2.0",
+      id: 42,
+    }) + "\n")
+    // A nested pair at the arguments' tail is still not the top-level id;
+    // removing the tail regex's end anchor would incorrectly recover 98.
+    shim.stdin.write(JSON.stringify({
+      method: "tools/call",
+      params: { name: "memory_read", arguments: { path: padding, jsonrpc: "2.0", id: 98 } },
+      jsonrpc: "2.0",
+      id: 43,
+    }) + "\n")
+    // The in-order ping is a barrier: inspect every preceding error, rather
+    // than waiting for an id a regressed shim may never answer.
+    const pong = await rpc(shim, { jsonrpc: "2.0", id: 7, method: "ping" })
+    assert.deepEqual(pong, { jsonrpc: "2.0", id: 7, result: {} })
+    const errors = replies.filter((reply) => reply.error !== undefined)
+    assert.deepEqual(errors.map((reply) => reply.id), [42, 43])
+    assert.deepEqual(errors.map((reply) => (reply.error as { code: number }).code), [-32600, -32600])
+  } finally {
+    shim.kill()
+  }
+})
