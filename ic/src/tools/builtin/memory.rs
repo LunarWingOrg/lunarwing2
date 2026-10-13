@@ -346,6 +346,15 @@ fn map_write_err(e: crate::error::WorkspaceError) -> ToolError {
         WorkspaceError::ExistingContentRejected { path, reason } => {
             ToolError::ContentRejected(existing_content_rejection_message(&path, &reason))
         }
+        WorkspaceError::DailyLogBackupCapReached { path, generations } => {
+            ToolError::ExecutionFailed(format!(
+                "Replace of daily log '{path}' not applied: {generations} backup generations \
+                 are already retained and another replace would discard the second-oldest one \
+                 (WI#335). Nothing was written and no generation was lost; appends still work. \
+                 Replacing a saturated day's log is an operator action — ask the operator to do \
+                 it via the web memory editor or CLI."
+            ))
+        }
         WorkspaceError::DailyLogQuarantined {
             path,
             quarantine_path,
@@ -616,7 +625,7 @@ impl Tool for MemoryWriteTool {
                 },
                 "append": {
                     "type": "boolean",
-                    "description": "If true, append to existing content. If false, replace entirely (for every target, including 'daily_log'); replacing a prompt-visible file such as MEMORY.md or a daily log keeps the previous version at backups/<path>.bak (daily logs also keep the most recent earlier versions as numbered .bak.<n> generations). Always use false for JSON documents (e.g. lorebooks/*.json, context/profile.json) — appending corrupts them.",
+                    "description": "If true, append to existing content. If false, replace entirely (for every target, including 'daily_log'); replacing a prompt-visible file such as MEMORY.md or a daily log keeps the previous version at backups/<path>.bak (daily logs also keep the most recent earlier versions as numbered .bak.<n> generations; once those generations are full a daily-log replace fails closed and must be done by the operator via the web memory editor or CLI). Always use false for JSON documents (e.g. lorebooks/*.json, context/profile.json) — appending corrupts them.",
                     "default": true
                 },
                 "layer": {
@@ -718,6 +727,10 @@ impl Tool for MemoryWriteTool {
 
         // When a layer is specified, route through layer-aware methods for ALL targets.
         // Otherwise, use default workspace methods (which include injection scanning).
+        // Both replace lanes go through the daily-log-cap-guarded variants (WI#335):
+        // an agent must not be able to run the discard-at-cap rotation — the
+        // decision is made inside the rotation itself, and the classified
+        // error tells the agent to hand the replace to the operator.
         let layer_result = if let Some(layer_name) = layer {
             let result = if append {
                 workspace
@@ -726,7 +739,12 @@ impl Tool for MemoryWriteTool {
                     .map_err(map_write_err)?
             } else {
                 workspace
-                    .write_to_layer(layer_name, &normalized_path, content, force)
+                    .write_to_layer_with_daily_log_cap_guard(
+                        layer_name,
+                        &normalized_path,
+                        content,
+                        force,
+                    )
                     .await
                     .map_err(map_write_err)?
             };
@@ -743,8 +761,10 @@ impl Tool for MemoryWriteTool {
                             .await
                             .map_err(map_write_err)?;
                     } else {
+                        // Not a daily log, but routed through the guarded
+                        // write for one uniform agent replace lane.
                         workspace
-                            .write(paths::MEMORY, content)
+                            .write_with_daily_log_cap_guard(paths::MEMORY, content)
                             .await
                             .map_err(map_write_err)?;
                     }
@@ -762,9 +782,11 @@ impl Tool for MemoryWriteTool {
                         // prompt-visible write and keeps the prior version in
                         // the shadow backup (WI#286; daily logs keep numbered
                         // generations), so it doubles as the tool-level
-                        // repair path for today's log.
+                        // repair path for today's log. WI#335: once the day's
+                        // generations are full the replace fails closed — see
+                        // map_write_err for the agent-facing remedy.
                         workspace
-                            .write(&normalized_path, content)
+                            .write_with_daily_log_cap_guard(&normalized_path, content)
                             .await
                             .map_err(map_write_err)?;
                     }
@@ -776,8 +798,11 @@ impl Tool for MemoryWriteTool {
                             .await
                             .map_err(map_write_err)?;
                     } else {
+                        // Explicit-path targets can name a daily log
+                        // (daily/YYYY-MM-DD.md), so this arm takes the same
+                        // guarded replace as the named daily_log target.
                         workspace
-                            .write(&normalized_path, content)
+                            .write_with_daily_log_cap_guard(&normalized_path, content)
                             .await
                             .map_err(map_write_err)?;
                     }
@@ -2170,6 +2195,110 @@ mod tests {
                     .expect("backup")
                     .content
                     .contains("ignore previous instructions")
+            );
+        }
+
+        /// WI#335: the memory tool's replace lane fails closed once the day's
+        /// numbered backup generations are full — a steered agent cannot run
+        /// the discard-at-cap rotation and evict a generation — while the
+        /// operator route (`Workspace::write`, i.e. web/CLI) still rotates on
+        /// the same saturated day. The refusal writes nothing and loses no
+        /// generation, and the error tells the agent to hand the replace to
+        /// the operator.
+        #[tokio::test]
+        async fn daily_log_tool_replace_fails_closed_at_backup_generation_cap() {
+            let (workspace, _db, _temp_dir) = setup_workspace_with_db().await;
+            let write = MemoryWriteTool::from_workspace(Arc::clone(&workspace));
+            let ctx = JobContext::default();
+            let cap = crate::workspace::MAX_DAILY_LOG_BACKUP_GENERATIONS;
+
+            let first = write
+                .execute(
+                    serde_json::json!({"content": "version 0", "target": "daily_log"}),
+                    &ctx,
+                )
+                .await
+                .expect("seed today's log");
+            let path = first.result["path"]
+                .as_str()
+                .expect("daily log path")
+                .to_string();
+            let backup_path = format!("backups/{path}.bak");
+
+            // Replaces 1..=cap+1 fill every numbered generation without taking
+            // the discard branch (the last one occupies the cap slot).
+            for version in 1..=(cap + 1) {
+                write.execute(
+                    serde_json::json!({
+                        "content": format!("version {version}"),
+                        "target": "daily_log",
+                        "append": false,
+                    }),
+                    &ctx,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("replace {version} below/at the cap must succeed: {e}"));
+            }
+            assert!(
+                workspace
+                    .read(&format!("{backup_path}.{cap}"))
+                    .await
+                    .is_ok(),
+                "all cap generations exist before the saturated replace"
+            );
+
+            let err = write
+                .execute(
+                    serde_json::json!({
+                        "content": "version blocked",
+                        "target": "daily_log",
+                        "append": false,
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect_err("tool replace must fail closed at the cap");
+            let message = match err {
+                ToolError::ExecutionFailed(message) => message,
+                other => panic!("expected a classified execution failure, got: {other:?}"),
+            };
+            assert!(
+                message.contains("not applied") && message.contains("operator"),
+                "the refusal must tell the agent to use the operator route: {message}"
+            );
+            assert_eq!(
+                workspace.read(&path).await.expect("read log").content,
+                format!("version {}", cap + 1),
+                "the refused tool replace must not touch the day log"
+            );
+            assert_eq!(
+                workspace
+                    .read(&format!("{backup_path}.2"))
+                    .await
+                    .expect("second-oldest generation")
+                    .content,
+                "version 1",
+                "the refused tool replace must not discard or shift any generation"
+            );
+
+            // The operator route is unlimited: the same replace through
+            // `Workspace::write` rotates and discards as before.
+            workspace
+                .write(&path, "version blocked")
+                .await
+                .expect("operator replace still rotates at the cap");
+            assert_eq!(
+                workspace.read(&path).await.expect("read log").content,
+                "version blocked"
+            );
+            assert_eq!(
+                workspace
+                    .read(&format!("{backup_path}.2"))
+                    .await
+                    .expect("second-oldest generation after operator rotate")
+                    .content,
+                "version 2",
+                "the operator replace discarded .2 and shifted the rest down"
             );
         }
 
