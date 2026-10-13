@@ -466,36 +466,47 @@ render_all_openrc_proxy_units() {
   say "OpenRC proxy units neutralized fleet-wide (file writes only; services not restarted)."
 }
 
+# Validate the configured archive location without writing anything. The
+# renderer calls this even when the installed unit needs no archive copy: an
+# archive dir inside init.d could hand OpenRC an unparseable copy at the next
+# dependency scan, so a misconfigured archive always fails the render. Every
+# refusal names the reason and LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR (EQ-5).
+openrc_proxy_backup_dir_validate() {
+  local dir init_dir
+  if ! darkirc_path_components_safe "$OPENRC_PROXY_BACKUP_DIR"; then
+    say "unsafe archive path: symlinked component in LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR" >&2
+    return 1
+  fi
+  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" \
+    || { say "unsafe archive path: cannot resolve LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR" >&2; return 1; }
+  init_dir="$(realpath -m -- "$OPENRC_INITD_DIR")" || return 1
+  if [[ "$dir" == "$init_dir" || "$dir" == "$init_dir/"* ]]; then
+    say "unsafe archive path: LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR must be outside $OPENRC_INITD_DIR" >&2
+    return 1
+  fi
+  if [[ -e "$dir" ]]; then
+    if [[ ! -d "$dir" || -L "$dir" || "$(stat -c '%u:%a' -- "$dir")" != "$EUID:700" ]]; then
+      say "unsafe archive dir $dir (LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR): must be a non-symlink dir owned by EUID $EUID with mode 0700" >&2
+      return 1
+    fi
+  fi
+}
+
 # Preserve the installed bytes before replacement, including suspicious URLs.
 # CLI writers require root; EUID also permits isolated non-root test fixtures.
 # The archive is private, outside init.d, non-executable, and never sourced.
-# Every refusal names the reason and LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR:
-# an unusable backup path otherwise blocks the migration with an opaque error.
 backup_openrc_proxy_unit() {
-  local path="$1" dir init_dir backup
+  local path="$1" dir backup
   [[ -e "$path" || -L "$path" ]] || return 0
   if [[ ! -f "$path" || -L "$path" ]]; then
     say "cannot safely back up $path: not a regular file (symlink?); installed unit was not replaced" >&2
     return 1
   fi
-  if ! darkirc_path_components_safe "$OPENRC_PROXY_BACKUP_DIR"; then
-    say "cannot safely back up $path: symlinked component in LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR; installed unit was not replaced" >&2
-    return 1
-  fi
-  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" \
-    || { say "cannot safely back up $path: cannot resolve LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR; installed unit was not replaced" >&2; return 1; }
-  init_dir="$(realpath -m -- "$OPENRC_INITD_DIR")" || return 1
-  if [[ "$dir" == "$init_dir" || "$dir" == "$init_dir/"* ]]; then
-    say "cannot safely back up $path: LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR must be outside $OPENRC_INITD_DIR; installed unit was not replaced" >&2
-    return 1
-  fi
+  openrc_proxy_backup_dir_validate || return 1
+  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" || return 1
   if [[ ! -e "$dir" ]]; then
     install -d -m 0700 -- "$dir" \
       || { say "cannot safely back up $path: cannot create backup dir $dir; installed unit was not replaced" >&2; return 1; }
-  fi
-  if [[ ! -d "$dir" || -L "$dir" || "$(stat -c '%u:%a' -- "$dir")" != "$EUID:700" ]]; then
-    say "cannot safely back up $path: backup dir $dir (LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR) must be a non-symlink dir owned by EUID $EUID with mode 0700; installed unit was not replaced" >&2
-    return 1
   fi
   backup="$(mktemp "$dir/${path##*/}.XXXXXX")" \
     || { say "cannot safely back up $path: mktemp failed in $dir; installed unit was not replaced" >&2; return 1; }
@@ -572,6 +583,13 @@ start_pre() {
 }
 INITEOF
   then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  # The archive location is validated on every render, even when this render
+  # writes no copy: an archive dir inside init.d could hand OpenRC an
+  # unparseable copy at the next dependency scan, so misconfiguration refuses.
+  if ! openrc_proxy_backup_dir_validate; then
     rm -f -- "$tmp"
     return 1
   fi
