@@ -127,9 +127,12 @@ const LOREBOOK_DIR_PREFIX: &str = "lorebooks/";
 /// the next free slot. At the cap the first generation stays pinned and the
 /// second-oldest generation is discarded instead (with a `lunarwing::safety`
 /// audit line carrying its byte count and blake3 fingerprint) while the rest
-/// shift down one slot. The pin is positional, not evidential: `.1` holds the
-/// content that preceded the day's first replace, which is the poison's
-/// predecessor only when the poison arrived in that first replace (WI#335).
+/// shift down one slot — unless the write came through a
+/// `*_with_daily_log_cap_guard` method, which refuses at the cap (WI#335).
+/// The pin is positional, not evidential: `.1` holds the content that
+/// preceded the day's first replace, which is the poison's predecessor only
+/// when the poison arrived in that first replace. `pub(crate)` so the memory
+/// tool tests can drive the exact cap boundary.
 pub(crate) const MAX_DAILY_LOG_BACKUP_GENERATIONS: u32 = 8;
 
 /// Returns true if `path` (already normalized) is a system-prompt-injected file.
@@ -149,6 +152,17 @@ pub(crate) fn is_system_prompt_file(path: &str) -> bool {
 pub(crate) fn is_daily_log_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.starts_with("daily/") && lower.ends_with(".md")
+}
+
+/// The daily-log path a `backups/<path>.bak` shadow-backup path was derived
+/// from, for error attribution in the rotation's cap branch. Falls back to
+/// the backup path itself if the shape does not match (call sites construct
+/// `backups/{path}.bak`, so the fallback is unreachable in practice).
+fn daily_log_path_of_backup(backup_path: &str) -> &str {
+    backup_path
+        .strip_prefix("backups/")
+        .and_then(|p| p.strip_suffix(".bak"))
+        .unwrap_or(backup_path)
 }
 
 /// Shadow-backup documents (`backups/<path>.bak` plus numbered daily-log
@@ -1207,6 +1221,33 @@ impl Workspace {
     /// workspace.write("projects/alpha/README.md", "# Project Alpha\n\nDescription here.").await?;
     /// ```
     pub async fn write(&self, path: &str, content: &str) -> Result<MemoryDocument, WorkspaceError> {
+        self.write_inner(path, content, false).await
+    }
+
+    /// Same as [`Workspace::write`], except a replace of a daily log whose
+    /// numbered backup generations are already at the cap fails closed with
+    /// [`WorkspaceError::DailyLogBackupCapReached`] instead of running the
+    /// discard-at-cap rotation (WI#335). Agent tool lanes use this so a
+    /// steered agent cannot evict a generation with ordinary replaces; the
+    /// decision lives inside the rotation itself, so a racing replace cannot
+    /// slip past a pre-check. Operator routes keep [`Workspace::write`]
+    /// (unlimited: an operator may always replace a saturated day's log).
+    /// Non-daily paths and daily logs below the cap behave identically to
+    /// [`Workspace::write`].
+    pub async fn write_with_daily_log_cap_guard(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Result<MemoryDocument, WorkspaceError> {
+        self.write_inner(path, content, true).await
+    }
+
+    async fn write_inner(
+        &self,
+        path: &str,
+        content: &str,
+        fail_at_daily_log_cap: bool,
+    ) -> Result<MemoryDocument, WorkspaceError> {
         let path = normalize_path(path);
         validate_prompt_write(&path, content)?;
         let doc = self
@@ -1218,8 +1259,8 @@ impl Workspace {
         // content (the incident that clobbered MEMORY.md). Keep a rolling
         // shadow copy so the previous version is recoverable in-place.
         if is_system_prompt_file(&path) && !doc.content.is_empty() && doc.content != content {
-            self.shadow_backup_prompt_file(&self.user_id, &path, &doc.content)
-                .await;
+            self.shadow_backup_prompt_file(&self.user_id, &path, &doc.content, fail_at_daily_log_cap)
+                .await?;
         }
 
         // Compute chunks + embeddings upfront (no DB connections held).
@@ -1251,7 +1292,7 @@ impl Workspace {
     /// replace, not necessarily the poisoned version, so the memory-write
     /// tool lane fails closed once the cap exists rather than letting a
     /// steered agent discard generations through the front door (WI#335;
-    /// [`Workspace::daily_log_backup_cap_reached`]). The backup is stored
+    /// [`Workspace::write_with_daily_log_cap_guard`]). The backup is stored
     /// with an empty chunk projection: retrievable by exact-path `read()`,
     /// visible in `list()`, but never search-indexed. Backup content is not
     /// rescanned
@@ -1261,21 +1302,40 @@ impl Workspace {
     /// and backup path. Backup and rotation failures are logged and never
     /// block the write; a rotation failure in particular still leaves the
     /// rolling-slot overwrite to proceed, since that slot holds the
-    /// immediately prior version the WI#288 repair path relies on.
-    async fn shadow_backup_prompt_file(&self, scope: &str, path: &str, prior_content: &str) {
+    /// immediately prior version the WI#288 repair path relies on. The one
+    /// exception is `fail_at_daily_log_cap`: with the flag set, the rotation
+    /// hitting the generation cap aborts the replace with
+    /// [`WorkspaceError::DailyLogBackupCapReached`] before anything is
+    /// overwritten (WI#335).
+    async fn shadow_backup_prompt_file(
+        &self,
+        scope: &str,
+        path: &str,
+        prior_content: &str,
+        fail_at_daily_log_cap: bool,
+    ) -> Result<(), WorkspaceError> {
         let backup_path = format!("backups/{path}.bak");
-        if is_daily_log_file(path)
-            && let Err(e) = self
-                .rotate_daily_log_backup(scope, &backup_path, prior_content)
+        if is_daily_log_file(path) {
+            match self
+                .rotate_daily_log_backup(scope, &backup_path, prior_content, fail_at_daily_log_cap)
                 .await
-        {
-            tracing::warn!(
-                target: "lunarwing::safety",
-                file = %path,
-                backup = %backup_path,
-                error = %e,
-                "daily-log backup rotation failed; overwriting the rolling slot"
-            );
+            {
+                Ok(()) => {}
+                // The guarded tool lane refuses the replace at the cap: the
+                // caller's write must not proceed (WI#335).
+                Err(e @ WorkspaceError::DailyLogBackupCapReached { .. }) if fail_at_daily_log_cap => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "lunarwing::safety",
+                        file = %path,
+                        backup = %backup_path,
+                        error = %e,
+                        "daily-log backup rotation failed; overwriting the rolling slot"
+                    );
+                }
+            }
         }
         let result: Result<(), WorkspaceError> = async {
             let backup_doc = self
@@ -1305,6 +1365,7 @@ impl Workspace {
                 "prompt-file shadow backup failed; proceeding with write"
             ),
         }
+        Ok(())
     }
 
     /// Roll an existing daily-log backup slot aside to a numbered
@@ -1320,6 +1381,7 @@ impl Workspace {
         scope: &str,
         backup_path: &str,
         incoming_prior: &str,
+        fail_at_cap: bool,
     ) -> Result<(), WorkspaceError> {
         let existing = match self
             .storage
@@ -1333,7 +1395,9 @@ impl Workspace {
         if existing.content.is_empty() || existing.content == incoming_prior {
             return Ok(());
         }
-        let slot_path = self.next_daily_log_backup_slot(scope, backup_path).await?;
+        let slot_path = self
+            .next_daily_log_backup_slot(scope, backup_path, fail_at_cap)
+            .await?;
         let slot_doc = self
             .storage
             .get_or_create_document_by_path(scope, self.agent_id, &slot_path)
@@ -1352,15 +1416,18 @@ impl Workspace {
     /// stay bounded. The pin is positional, not evidential: `.1` holds the
     /// content that preceded the day's first replace — the poison's
     /// predecessor only when the poison arrived in that first replace — so
-    /// discarding `.2+` can still lose the poisoned version (WI#335). The
-    /// memory-write tool lane therefore fails closed at the cap (see
-    /// [`Workspace::daily_log_backup_cap_reached`]); this rotation itself
-    /// stays unchanged so operator routes (web/CLI) keep working on a
-    /// saturated day.
+    /// discarding `.2+` can still lose the poisoned version (WI#335). With
+    /// `fail_at_cap` the cap branch refuses instead: the caller gets
+    /// [`WorkspaceError::DailyLogBackupCapReached`] and nothing is discarded
+    /// or shifted (the memory-write tool lane's fail-closed door); without it
+    /// the rotation discards as before so operator routes (web/CLI) keep
+    /// working on a saturated day. The decision lives here — inside the
+    /// rotation — so a racing replace cannot slip past a pre-check.
     async fn next_daily_log_backup_slot(
         &self,
         scope: &str,
         backup_path: &str,
+        fail_at_cap: bool,
     ) -> Result<String, WorkspaceError> {
         for n in 1..=MAX_DAILY_LOG_BACKUP_GENERATIONS {
             let candidate = format!("{backup_path}.{n}");
@@ -1374,7 +1441,15 @@ impl Workspace {
                 Err(e) => return Err(e),
             }
         }
-        // Cap reached: pin `.1` and discard `.2` instead. Evicting the oldest
+        // Cap reached. Guarded lanes (the memory-write tool) refuse here,
+        // before anything is discarded (WI#335).
+        if fail_at_cap {
+            return Err(WorkspaceError::DailyLogBackupCapReached {
+                path: daily_log_path_of_backup(backup_path).to_string(),
+                generations: MAX_DAILY_LOG_BACKUP_GENERATIONS,
+            });
+        }
+        // Pin `.1` and discard `.2` instead. Evicting the oldest
         // generation would let a steered agent rotate the day's first replaced
         // version — e.g. the quarantined poison's predecessor — out of the
         // only reserved store with a handful of ordinary replaces (WI#288
@@ -1406,38 +1481,6 @@ impl Workspace {
              discarded, first generation pinned (positional, not evidential)"
         );
         Ok(format!("{backup_path}.{MAX_DAILY_LOG_BACKUP_GENERATIONS}"))
-    }
-
-    /// Whether the daily-log backup generation cap is already reached for
-    /// `path` in this workspace's scope — i.e. `backups/<path>.bak.<cap>`
-    /// exists, so the next replace-triggered rotation would run the
-    /// discard-at-cap branch of [`Workspace::next_daily_log_backup_slot`]
-    /// (WI#335). The probe mirrors that branch's own existence test, so a
-    /// created-but-empty generation counts as occupied exactly as it does
-    /// there. Non-daily-log paths always return `Ok(false)`.
-    ///
-    /// Tool lanes use this to fail closed before such a replace: the pinned
-    /// `.1` holds the content that preceded the day's first replace
-    /// (positional, not evidential), and once the cap exists a steered agent
-    /// could otherwise discard the generation holding the poison with
-    /// ordinary replaces. Operator routes (web/CLI, direct [`Workspace::write`])
-    /// intentionally never call this, so an operator can always replace a
-    /// saturated day's log.
-    pub async fn daily_log_backup_cap_reached(&self, path: &str) -> Result<bool, WorkspaceError> {
-        let path = normalize_path(path);
-        if !is_daily_log_file(&path) {
-            return Ok(false);
-        }
-        let cap_slot = format!("backups/{path}.bak.{MAX_DAILY_LOG_BACKUP_GENERATIONS}");
-        match self
-            .storage
-            .get_document_by_path(&self.user_id, self.agent_id, &cap_slot)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(WorkspaceError::DocumentNotFound { .. }) => Ok(false),
-            Err(e) => Err(e),
-        }
     }
 
     /// Move a poisoned daily log aside to `daily/<date>.poisoned-<n>.md` and
@@ -1718,6 +1761,36 @@ impl Workspace {
         content: &str,
         force: bool,
     ) -> Result<WriteResult, WorkspaceError> {
+        self.write_to_layer_inner(layer_name, path, content, force, false)
+            .await
+    }
+
+    /// Same as [`Workspace::write_to_layer`], except a layer-scoped replace
+    /// of a daily log whose numbered backup generations (in that layer's
+    /// scope) are already at the cap fails closed with
+    /// [`WorkspaceError::DailyLogBackupCapReached`] instead of running the
+    /// discard-at-cap rotation — the layer-write sibling of
+    /// [`Workspace::write_with_daily_log_cap_guard`] (WI#335). Operator
+    /// routes keep [`Workspace::write_to_layer`].
+    pub async fn write_to_layer_with_daily_log_cap_guard(
+        &self,
+        layer_name: &str,
+        path: &str,
+        content: &str,
+        force: bool,
+    ) -> Result<WriteResult, WorkspaceError> {
+        self.write_to_layer_inner(layer_name, path, content, force, true)
+            .await
+    }
+
+    async fn write_to_layer_inner(
+        &self,
+        layer_name: &str,
+        path: &str,
+        content: &str,
+        force: bool,
+        fail_at_daily_log_cap: bool,
+    ) -> Result<WriteResult, WorkspaceError> {
         let (scope, actual_layer, redirected) =
             self.resolve_layer_target(layer_name, content, force)?;
         let path = normalize_path(path);
@@ -1731,8 +1804,8 @@ impl Workspace {
         // prompt-visible file destroys its prior content just the same, and
         // the memory_write schema promises the backup on every replace lane.
         if is_system_prompt_file(&path) && !doc.content.is_empty() && doc.content != content {
-            self.shadow_backup_prompt_file(&scope, &path, &doc.content)
-                .await;
+            self.shadow_backup_prompt_file(&scope, &path, &doc.content, fail_at_daily_log_cap)
+                .await?;
         }
 
         let prepared = self.prepare_chunks_for_path(&path, content).await;
