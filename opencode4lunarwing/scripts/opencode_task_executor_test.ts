@@ -891,6 +891,54 @@ assert.ok(toolOnlyResults[0]!.output.includes("status: done"))
   assert.match(results[0]!.output, /\[control\] follow-up seq=1 timed out before completing/)
 }
 
+// !1552 ER-2: nothing runs after the FINAL turn — a remainder queued behind
+// a done prompt becomes a "not run" note instead of a post-wrap-up turn.
+{
+  const sdk = makeSdk({
+    events: [
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+    partsPerCall: [
+      [{ type: "text", text: "MAIN DELIVERABLE" }],
+      [{ type: "text", text: "wrap-up done" }],
+    ],
+  })
+  const queue: FollowupQueue = {
+    prompts: [
+      { task_id: "er2", seq: 1, prompt: "wrap up", done: true },
+      { task_id: "er2", seq: 2, prompt: "one more thing", done: false },
+    ],
+    closed: true,
+  }
+  const results: Array<{ status: string; output: string }> = []
+  await executeTask(
+    { task_id: "er2", prompt: "build" },
+    () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+  )
+  assert.equal(results.length, 1)
+  assert.equal(results[0]!.status, "success")
+  assert.equal(sdk.promptArgs.length, 2, "nothing runs after the FINAL turn")
+  assert.match(results[0]!.output, /wrap-up done/)
+  assert.match(results[0]!.output, /\[control\] follow-up seq=2 not run: wrap-up turn already requested/)
+  assert.equal(queue.prompts.length, 0)
+}
+
+// !1552 ER-3: a no-follow-up main turn whose only "work" was denied
+// permissions reports the denial, not the generic empty-output message.
+{
+  const sdk = makeSdk({
+    events: [
+      { type: "permission.asked", properties: { id: "er3-perm", sessionID: "session-1" } },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ],
+    parts: [],
+  })
+  const result = await runTask(sdk.sdk, { task_id: "er3", prompt: "build" })
+  assert.equal(result.status, "error")
+  assert.match(result.error!, /1 permission request\(s\).*denied/)
+}
+
 // MR !1537 DW-10: a stale idle event published BEFORE the follow-up turn was
 // seen busy must not end that turn early — the turn must still answer its
 // permission ask and run to its real idle.

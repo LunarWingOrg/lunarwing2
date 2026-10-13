@@ -285,7 +285,8 @@ function handleTaskPrompt(payload: unknown, ws: BridgeSocket): void {
   const seen = queue.seenSeqs ?? new Set<number>()
   queue.seenSeqs = seen
   if (seen.has(prompt.seq)) {
-    // At-least-once redelivery: ack again without queueing a duplicate.
+    // Duplicate seq (a retransmitted frame): ack again without queueing a
+    // duplicate. The daemon itself never redelivers — delivery is at-most-once.
     const ack: TaskPromptAck = { task_id: prompt.task_id, seq: prompt.seq, accepted: true }
     ws.send(JSON.stringify(createEnvelope("task_prompt_ack", { ...ack })))
     return

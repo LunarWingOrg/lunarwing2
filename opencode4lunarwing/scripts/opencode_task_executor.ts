@@ -146,6 +146,9 @@ export async function executeTask(
   // function-scope so the catch path can still report banked turns (MR !1537
   // review DW-3).
   const canonicalTurns: string[] = []
+  // [control] notes owed to the final output (MR !1552 ER-2): accepted-but-
+  // unrun follow-ups are accounted for on BOTH the success and failure paths.
+  const controlNotes: string[] = []
   // Seq of the follow-up prompt whose turn is currently running, undefined
   // while the MAIN turn (or its retries) is in flight. Once any turn has
   // succeeded, a failure/timeout in a follow-up turn must not change the
@@ -431,10 +434,17 @@ export async function executeTask(
             `[control] Follow-up prompt received (seq=${followup.seq}${followup.done ? ", wrap-up requested" : ""})`,
           )
           if (followup.done) {
-            // done=true: this injected turn is the wrap-up turn. Close the
-            // queue so later prompts are acked accepted=false instead of
-            // silently extending the run (DI-4).
+            // done=true: this injected turn is the wrap-up turn. The bridge
+            // seals admission when it ACCEPTS a done prompt, so anything still
+            // queued behind it is unreachable through the shipped bridge —
+            // account for it explicitly instead of running it after the FINAL
+            // turn told the model no further prompts would come (ER-2).
             if (followups) followups.closed = true
+            for (const pending of followups?.prompts.splice(0) ?? []) {
+              const note = `[control] follow-up seq=${pending.seq} not run: wrap-up turn already requested`
+              controlNotes.push(note)
+              emitProgress(note)
+            }
             nextPrompt =
               `FOLLOW-UP INSTRUCTION (seq=${followup.seq}, FINAL) from the orchestrator:\n` +
               `${followup.prompt}\n\n${WRAP_UP_SUFFIX}`
@@ -480,7 +490,8 @@ export async function executeTask(
     }
 
     const canonicalOutput = canonicalTurns.join("\n\n")
-    const resultOutput = canonicalOutput || output.trim()
+    const resultOutput = [canonicalOutput || output.trim(), ...controlNotes]
+      .filter(Boolean).join("\n\n")
     const durationMs = Date.now() - startTime
 
     if (!resultOutput) {
@@ -509,18 +520,17 @@ export async function executeTask(
     const stopped = stopReason ?? (err instanceof TaskStoppedError ? err.reason : undefined)
     const errorMsg = opencodeErrorMessage(err)
     const banked = canonicalTurns.join("\n\n")
-    const notes: string[] = []
     if (currentFollowupSeq !== undefined) {
       const outcome = stopped === "timeout" ? "timed out before completing"
         : stopped === "cancelled" ? "cancelled before completing" : `failed: ${errorMsg}`
-      notes.push(`[control] follow-up seq=${currentFollowupSeq} ${outcome}`)
+      controlNotes.push(`[control] follow-up seq=${currentFollowupSeq} ${outcome}`)
     }
     // Accepted does not promise execution: explicitly account for every turn
     // still queued when any error/cancellation/timeout terminates this task.
     for (const pending of followups?.prompts.splice(0) ?? []) {
-      notes.push(`[control] follow-up seq=${pending.seq} not run: task ended before this turn`)
+      controlNotes.push(`[control] follow-up seq=${pending.seq} not run: task ended before this turn`)
     }
-    const resultOutput = [banked || output.trim(), ...notes].filter(Boolean).join("\n\n")
+    const resultOutput = [banked || output.trim(), ...controlNotes].filter(Boolean).join("\n\n")
     const preserveSuccess = currentFollowupSeq !== undefined && canonicalTurns.length > 0
     if (stopped) {
       closeEvents?.()
