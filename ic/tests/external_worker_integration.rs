@@ -3418,9 +3418,15 @@ async fn tool_catalog_advertises_the_proxied_memory_write_schema() {
     // must not promise a backup the proxy boundary can never produce.
     let desc = entries[0]["description"].as_str().expect("description");
     assert!(
-        desc.contains("notes/today.md") && !desc.contains("for curated long-term facts"),
-        "the proxied description must name explicit workspace paths, not the tool's own \
-         layer-shortcut text: {desc}"
+        desc.contains("notes/today.md"),
+        "the proxied description must name explicit workspace paths: {desc}"
+    );
+    // MR !1571 review FE-5: pin that the catalog entry is NOT the tool's own
+    // description — the `!contains("for curated long-term facts")` clause
+    // this replaces was vacuous against the probe's "gate probe" text.
+    assert_ne!(
+        desc, "gate probe",
+        "the catalog must carry the proxied description, not the tool's own: {desc}"
     );
     let append_desc = params["properties"]["append"]["description"]
         .as_str()

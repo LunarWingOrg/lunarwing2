@@ -4443,16 +4443,18 @@ mod tests {
         // 'memory'/'daily_log'/'heartbeat'/'bootstrap' layer shortcuts the
         // DX-2 guard always denies on this surface — the catalog must send
         // a proxied description naming only explicit workspace paths.
+        // MR !1571 review FE-5: pin the exact text — the previous contains
+        // loop passed vacuously for any description containing the word
+        // "denied" (which the real text does).
         let desc = proxied_catalog_description("memory_write", "original");
-        for denied in ["'memory'", "'daily_log'", "'heartbeat'", "'bootstrap'"] {
-            assert!(
-                !desc.contains(denied) || desc.contains("denied"),
-                "proxied description may only name {denied} as denied: {desc}"
-            );
-        }
-        assert!(
-            desc.contains("notes/today.md"),
-            "proxied description must name explicit workspace paths: {desc}"
+        assert_eq!(
+            desc,
+            "Write to persistent memory in the tenant workspace at an explicit path \
+             (target is REQUIRED on this surface, e.g. 'notes/today.md' or \
+             'projects/alpha/notes.md'). The named shortcuts ('memory', 'daily_log', \
+             'heartbeat', 'bootstrap'), identity/config files, lorebooks, daily logs \
+             and 'engine/**' paths are denied by the proxy boundary. \
+             Never pass absolute filesystem paths like '/Users/...' or 'C:\\...'."
         );
         // Other tools keep their own description untouched.
         assert_eq!(
