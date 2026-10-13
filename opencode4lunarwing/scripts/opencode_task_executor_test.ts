@@ -993,6 +993,72 @@ assert.ok(toolOnlyResults[0]!.output.includes("status: done"))
   assert.equal(queue.closed, true)
 }
 
+// !1573 FG-1: a retryable failure followed by a clean EMPTY retry must not
+// turn diagnostics or failed-attempt output into a successful deliverable.
+// Exercise the normal terminal path for main, follow-up, and FINAL turns.
+{
+  const savedDelay = process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+  process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = "0"
+  try {
+    for (const turn of ["main", "follow-up", "final"] as const) {
+      for (const diagnostic of ["retry-only", "tool-error", "partial-text"] as const) {
+        const taskId = `fg1-${turn}-${diagnostic}`
+        const idle = { type: "session.idle", properties: { sessionID: "session-1" } }
+        const events: unknown[] = turn === "main" ? [] : [idle]
+        if (diagnostic !== "retry-only") {
+          events.push({
+            type: "message.part.updated",
+            properties: {
+              part: diagnostic === "tool-error"
+                ? {
+                    sessionID: "session-1", type: "tool", tool: "bash",
+                    state: { status: "error", error: "permission denied" },
+                  }
+                : {
+                    sessionID: "session-1", type: "text",
+                    text: "Let me start by", time: { end: 1 },
+                  },
+            },
+          })
+        }
+        events.push(idle, idle)
+        const sdk = makeSdk({
+          events,
+          parts: [],
+          assistantErrors: [
+            ...(turn === "main" ? [] : [undefined]),
+            { message: "upstream provider timed out" }, undefined,
+          ],
+        })
+        const queue: FollowupQueue = {
+          prompts: turn === "main" ? [] : [
+            { task_id: taskId, seq: 1, prompt: "finish", done: turn === "final" },
+          ],
+          closed: turn === "final",
+        }
+        const results: Array<{ status: string; output: string; error: string | null }> = []
+        await executeTask(
+          { task_id: taskId, prompt: "build" },
+          () => {}, (result) => results.push(result), undefined, sdk.sdk, queue,
+        )
+        assert.equal(results.length, 1)
+        assert.equal(sdk.promptArgs.length, turn === "main" ? 2 : 3)
+        assert.equal(results[0]!.status, "error", `${taskId}: no turn produced completed output`)
+        assert.equal(results[0]!.error, "opencode completed without assistant text or tool output")
+        assert.match(results[0]!.output, /ERROR: upstream provider timed out/)
+        assert.match(results[0]!.output, /\[worker\] Transient provider failure; retrying/)
+        if (diagnostic === "tool-error") assert.match(results[0]!.output, /\[bash\] ERROR: permission denied/)
+        if (diagnostic === "partial-text") assert.match(results[0]!.output, /Let me start by/)
+        assert.equal(queue.prompts.length, 0)
+        assert.equal(queue.closed, true)
+      }
+    }
+  } finally {
+    if (savedDelay === undefined) delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+    else process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = savedDelay
+  }
+}
+
 // !1552 ER-3: a no-follow-up main turn whose only "work" was denied
 // permissions reports the denial, not the generic empty-output message.
 {

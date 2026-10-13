@@ -490,24 +490,23 @@ export async function executeTask(
     }
 
     const canonicalOutput = canonicalTurns.join("\n\n")
-    const completed = canonicalOutput || output.trim()
     const durationMs = Date.now() - startTime
 
-    if (!completed) {
-      // Empty-output check runs on COMPLETED output only — control notes are
-      // accounting, not deliverables, and must not manufacture success (EZ-1,
-      // same class as EK-4/ES-1 on the normal terminal path).
+    if (!canonicalOutput) {
+      // Only a cleanly finished turn can bank completed output. Retry
+      // diagnostics, failed-attempt output, and control notes must not
+      // manufacture success after an empty retry (FG-1/EZ-1).
       onResult({
         task_id: request.task_id,
         status: "error",
-        output: controlNotes.filter(Boolean).join("\n\n"),
+        output: [output.trim(), ...controlNotes].filter(Boolean).join("\n\n"),
         error: emptyOutputError(deniedPermissions),
         duration_ms: durationMs,
       })
       return
     }
 
-    const resultOutput = [completed, ...controlNotes].filter(Boolean).join("\n\n")
+    const resultOutput = [canonicalOutput, ...controlNotes].filter(Boolean).join("\n\n")
 
     onResult({
       task_id: request.task_id,

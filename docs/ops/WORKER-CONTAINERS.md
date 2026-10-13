@@ -799,14 +799,15 @@ assistant/tool output; control notes alone cannot turn empty or permission-denie
 work into success. Explicit cancellation remains `cancelled` and retains completed
 output. The 16 MiB daemon WebSocket limit rejects oversized results; it does not
 truncate accumulated output or guarantee delivery of an oversized deliverable.
-The normal terminal path delivers the banked canonical turns joined, or —
-failing that — the accumulated streamed output as the result text. Success is
+The normal terminal path delivers the banked canonical turns joined. When no
+turn was banked, the task resolves `error`; accumulated output is delivered as
+diagnostics only (FG-1). Success is
 preserved through a failed or timed-out follow-up only when a turn was banked
 (canonical text, streamed text, or completed-tool output of that turn),
 including tool output from a main attempt retried successfully with no text;
 a later failed follow-up preserves that main turn's success (ER-1). Raw
 accumulated output feeds the delivered text on the failure paths but never
-the preserve decision itself.
+the success decision itself.
 
 The daemon bounds prompts in UTF-8 bytes; the OpenCode bridge's additional
 length check uses 16,384 UTF-16 units. Its queue holds at most 64 pending prompts.
