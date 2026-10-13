@@ -33,7 +33,8 @@ Each lane enforces the strip at its task-process boundary:
   `strip_bridge_credentials` (everything else preserved: PATH, locale,
   `PEBBLE_*` provider variables) and drops task-supplied re-injections.
   Pinned by a self-exec regression test that carries the token in the parent
-  env and probes the real spawned environment through a stub.
+  env and probes the real spawned environment through a stub. The one-shot
+  `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (harness-pinned).
 
 Residual, out of scope for WI#373: the OpenCode serve password
 (`OPENCODE_SERVER_PASSWORD`) is necessarily present in the serve process env —
