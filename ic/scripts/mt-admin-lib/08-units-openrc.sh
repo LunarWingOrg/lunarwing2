@@ -416,8 +416,11 @@ openrc_dispatch_preflight() {
     help|--help|-h|upgrade-tenant) return 0 ;;
     render-units) [[ $# -eq 2 && "$2" == --all-proxies ]] && return 0 ;;
   esac
-  ensure_init_system || return 1
-  [[ "$INIT_SYSTEM" != openrc ]] || require_safe_openrc_proxy_units
+  # Detection failure must not become a false "migration required" refusal
+  # (FL-1): only a positively detected systemd host skips the file-only guard.
+  # On failure the command's own ensure_init_system reports the accurate error.
+  ensure_init_system 2>/dev/null || true
+  [[ "$INIT_SYSTEM" == systemd ]] || require_safe_openrc_proxy_units
 }
 
 _openrc_service() {

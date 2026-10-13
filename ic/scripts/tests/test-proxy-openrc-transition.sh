@@ -102,6 +102,35 @@ grep -Fq 'render-units --all-proxies' "$fixture/refused.log" \
   expect_refusal preflight-detects-openrc main status alice
 )
 
+# FL-1: an init-detection failure must not become a false "migration required"
+# refusal. With detect_init_system stubbed to die and no override, an unsafe
+# legacy unit still refuses (the file evidence is authoritative), while a
+# command on a host with no legacy units reaches its own usage checks.
+(
+  INIT_SYSTEM=""
+  unset LUNARWING_SERVICE_MANAGER
+  detect_init_system() { die "could not detect a supported service manager"; }
+  status_tenant() { printf 'status\n' >>"$fixture/destructive"; }
+  expect_refusal detection-failure-keeps-refusal main status alice
+)
+(
+  INIT_SYSTEM=""
+  unset LUNARWING_SERVICE_MANAGER
+  detect_init_system() { die "could not detect a supported service manager"; }
+  mv -- "$OPENRC_INITD_DIR/lunarwing-proxy-deadline" "$fixture/parked-unit"
+  # die() exits the shell, so main runs in an inner subshell whose status the
+  # || captures; a plain call would trip the harness errexit.
+  rc=0
+  ( main configure-weechat-relay ) >"$fixture/usage.log" 2>&1 || rc=$?
+  mv -- "$fixture/parked-unit" "$OPENRC_INITD_DIR/lunarwing-proxy-deadline"
+  [[ "$rc" != 0 ]] || fail 'configure-weechat-relay without a name succeeded'
+  grep -Fq 'usage:' "$fixture/usage.log" \
+    || fail 'configure-weechat-relay omitted its usage error'
+  if grep -Fq 'migration required' "$fixture/usage.log"; then
+    fail 'detection failure became a false migration refusal'
+  fi
+)
+
 # Help and both supported migration entrypoints remain available.
 main help >"$fixture/help.log"
 (
