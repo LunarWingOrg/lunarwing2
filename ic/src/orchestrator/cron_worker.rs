@@ -1552,14 +1552,12 @@ async fn persist_tick_record(
         started_at: Some(now),
         completed_at: None,
         credential_grants_json: "[]".to_string(),
+        job_mode: crate::orchestrator::job_manager::JobMode::External(worker.name.clone())
+            .db_value(),
     };
     if let Err(error) = store.save_sandbox_job(&record).await {
         tracing::warn!(%job_id, "Failed to persist cron tick job record: {error}");
         return false;
-    }
-    let mode = crate::orchestrator::job_manager::JobMode::External(worker.name.clone()).db_value();
-    if let Err(error) = store.update_sandbox_job_mode(job_id, &mode).await {
-        tracing::warn!(%job_id, "Failed to persist cron tick job mode: {error}");
     }
     true
 }
@@ -1839,6 +1837,7 @@ mod tests {
             allow_subminute_schedule: None,
             project_dir: None,
             timezone: None,
+            tool_allowlist: Vec::new(),
         }
     }
 

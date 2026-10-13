@@ -21,8 +21,9 @@ impl SandboxStore for LibSqlBackend {
             r#"
                 INSERT INTO agent_jobs (
                     id, title, description, status, source, user_id, project_dir,
-                    success, failure_reason, created_at, started_at, completed_at
-                ) VALUES (?1, ?2, ?3, ?4, 'sandbox', ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    success, failure_reason, created_at, started_at, completed_at,
+                    job_mode
+                ) VALUES (?1, ?2, ?3, ?4, 'sandbox', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT (id) DO UPDATE SET
                     status = excluded.status,
                     success = excluded.success,
@@ -42,6 +43,7 @@ impl SandboxStore for LibSqlBackend {
                 fmt_ts(&job.created_at),
                 fmt_opt_ts(&job.started_at),
                 fmt_opt_ts(&job.completed_at),
+                job.job_mode.as_str(),
             ],
         )
         .await
@@ -55,7 +57,8 @@ impl SandboxStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT id, title, description, status, user_id, project_dir,
-                       success, failure_reason, created_at, started_at, completed_at
+                       success, failure_reason, created_at, started_at, completed_at,
+                       job_mode
                 FROM agent_jobs WHERE id = ?1 AND source = 'sandbox'
                 "#,
                 params![id.to_string()],
@@ -80,6 +83,7 @@ impl SandboxStore for LibSqlBackend {
                 created_at: get_ts(&row, 8),
                 started_at: get_opt_ts(&row, 9),
                 completed_at: get_opt_ts(&row, 10),
+                job_mode: get_text(&row, 11),
             })),
             None => Ok(None),
         }
@@ -91,7 +95,8 @@ impl SandboxStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT id, title, description, status, user_id, project_dir,
-                       success, failure_reason, created_at, started_at, completed_at
+                       success, failure_reason, created_at, started_at, completed_at,
+                       job_mode
                 FROM agent_jobs WHERE source = 'sandbox'
                 ORDER BY created_at DESC
                 "#,
@@ -118,6 +123,7 @@ impl SandboxStore for LibSqlBackend {
                 created_at: get_ts(&row, 8),
                 started_at: get_opt_ts(&row, 9),
                 completed_at: get_opt_ts(&row, 10),
+                job_mode: get_text(&row, 11),
             });
         }
         Ok(jobs)
@@ -220,7 +226,8 @@ impl SandboxStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT id, title, description, status, user_id, project_dir,
-                       success, failure_reason, created_at, started_at, completed_at
+                       success, failure_reason, created_at, started_at, completed_at,
+                       job_mode
                 FROM agent_jobs WHERE source = 'sandbox' AND user_id = ?1
                 ORDER BY created_at DESC
                 "#,
@@ -247,6 +254,7 @@ impl SandboxStore for LibSqlBackend {
                 created_at: get_ts(&row, 8),
                 started_at: get_opt_ts(&row, 9),
                 completed_at: get_opt_ts(&row, 10),
+                job_mode: get_text(&row, 11),
             });
         }
         Ok(jobs)

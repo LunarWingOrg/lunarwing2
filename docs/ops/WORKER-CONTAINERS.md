@@ -19,6 +19,39 @@ Kimi's `WS_MAX_PAYLOAD_BYTES` defaults to 1,048,576 bytes and can be raised to
 accommodates that maximum. OpenCode and Pebble bridges do not currently cap
 their outgoing envelopes, so outputs above 16 MiB still exceed the transport
 contract. Results/progress between 1 and 16 MiB are accepted (MR !1540 DX-1/DX-3).
+Note the interplay with the WI#324 tool proxy (MR !1549 EF-9): raising the
+hub's tool-output safety cap (`SAFETY_MAX_OUTPUT_LENGTH`, default 100,000
+bytes) past the worker bridge's inbound `maxPayload` (Kimi default 1 MiB)
+means a large `tool_result` is dropped by the worker's own WS layer — keep
+the worker's `WS_MAX_PAYLOAD_BYTES` at or above the hub cap when tuning it.
+
+## Worker-side tool proxy bridge (WI#324)
+
+The kimi worker image ships the WI#324 worker-side bridge: a per-task unix
+socket relay in `lunarwing_bridge.ts` plus a thin stdio MCP server
+(`scripts/lunarwing_mcp_server.ts`) registered in `$KIMI_CODE_HOME/mcp.json`
+by the entrypoint (write-if-absent; set `"enabled": false` there to opt out).
+The kimi CLI spawns the shim per task session; the bridge injects
+`LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET` per task, and the shim
+translates MCP `tools/list` / `tools/call` into `tool_list` / `tool_call`
+frames on the existing hub WebSocket. Tools appear to the agent as
+`mcp__lunarwing__<name>`; the hub stays deny-by-default until the worker's
+`tool_allowlist` (or `cron.tool_allowlist` for tick jobs — MR !1506 CQ-10)
+grants phase-1 names. `LUNARWING_TOOL_PROXY_TIMEOUT_MS` bounds one proxied
+call (default 300000, capped 900000). The opencode/opencode2/pebble lanes do
+not have the bridge yet; see
+[`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md)
+for the wire contract.
+
+**One worker container is one authority domain** (MR !1549 EF-1): every
+concurrent and successive job in a container runs as the same uid, and any
+process in it can connect to another task's relay socket and act with that
+job's grant — including a detached leftover process waiting for later tasks.
+Per-user isolation therefore requires per-user workers. Because a tick job
+could borrow a concurrent interactive job's grant this way, a `mode = "cron"`
+worker's worker-level `tool_allowlist` is stripped at manager load (logged
+as an error): a cron worker container never holds more than its
+`cron.tool_allowlist`, and ordinary dispatches to it get no proxied tools.
 
 ## Generic shell sandbox network policy (WI#154/155)
 

@@ -14,7 +14,7 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 - [Documentation index](docs/README.md)
 - [Community guide](COMMUNITY.md) · [Project manifesto](MANIFESTO.md)
 - [Canonical source on GitLab](https://git.lunarwing.org/lunarwing/lunarwing2)
-- Companion application Repositories (PRE-ALPHA): [LunarWing Desktop](https://git.lunarwing.org/lunarwing/lunarwing2desktop) · [LunarWing Android](https://git.lunarwing.org/lunarwing/lunarwing2droid)
+- Companion application Repositories (PRE-ALPHA at time of writing): [LunarWing Desktop](https://git.lunarwing.org/lunarwing/lunarwing2desktop) · [LunarWing Android](https://git.lunarwing.org/lunarwing/lunarwing2droid)
 - [IRC: #lunarwing on Libera.Chat](https://web.libera.chat/?channel=#lunarwing)
 - [AGPL-3.0-or-later license](LICENSE)
 
@@ -52,7 +52,7 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 
 ## Getting started
 
-The browser-based onboarding console is the recommended setup path for beginners. It wraps the multi-tenant admin scripts and shows configuration, output, validation, and recovery guidance in one local interface. Run from the repository root:
+The browser-based onboarding console is the recommended setup path for beginners. It wraps the multi-tenant admin scripts and shows configuration, output, validation, and recovery guidance in one local interface. Run from the repository root. The demo needs no privileges; the doctor check and the real console need root/sudo
 
 ```bash
 # 1. Look around safely — no tenants, no host changes
@@ -74,7 +74,7 @@ Worth knowing before you provision:
 - The gateway binds to `127.0.0.1` by default.
 - New tenants enable Engine V2, SSH support, health checks, build, and start. DarkIRC, Gotify, external workers, and optional toolchains stay off until selected.
 - Blank XMPP fields assign `<tenant>@xmpp.localhost` and provision the bridge automatically.
-- The onboarding server is a privileged local console for one trusted operator: no user accounts, no TLS. Keep it on loopback with token auth (real mode refuses non-loopback binding), use an SSH tunnel for remote admin, and treat session URLs and audit files as credentials. Docker group membership is effectively root-equivalent.
+- The onboarding server is a privileged local console for one trusted operator: no user accounts, no TLS. Keep it on loopback with token auth (real mode refuses non-loopback binding), use an SSH tunnel for remote admin, and treat session URLs and audit files as credentials.
 
 Prefer the terminal? The [Python onboarding CLI](lunarwing_mt_onboard/README.md) and [direct mt-admin](docs/guides/MT-ADMIN-QUICKSTART.md) cover the same ground with exact flag-level control.
 
@@ -86,7 +86,7 @@ Moving a v1 tenant to v2 uses a staged Kawarimi export/import: rehearse on a sep
 
 ## Development and testing
 
-The Rust workspace lives under `ic/` (Rust 1.96.1, edition 2024). Its crates.io dependency closure is committed under `ic/vendor/` and source-replaced through Cargo; review the [vendoring rules](AGENTS.md#vendored-dependencies) before changing dependencies. On a resource-constrained host, cap Cargo at twelve CPUs/jobs and prefer `cargo check` over full debug builds:
+The Rust workspace lives under `ic/` (Rust 1.96.1, edition 2024). Its crates.io dependency closure is committed under `ic/vendor/` and source-replaced through Cargo; review the [vendoring rules](AGENTS.md#vendored-dependencies) before changing dependencies. On a resource-constrained host, cap Cargo at twelve CPUs/jobs and prefer `cargo check` over full debug builds (this is just an example and will entirely depend on your system):
 
 ```bash
 cd ic
@@ -113,4 +113,4 @@ LunarWing focuses on user freedom, self-hostable infrastructure, and open protoc
 
 [![Chat on IRC](https://img.shields.io/badge/IRC-%23lunarwing-00b0aa?style=for-the-badge&labelColor=000000)](https://web.libera.chat/?channel=#lunarwing)
 
-LunarWing is entirely self-funded and maintained by a thriving community of volunteers, ranging from individuals to small organizations. Everything is licensed under [AGPL-3.0-or-later](LICENSE).
+LunarWing is fully funded and maintained by a thriving community of volunteers, ranging from individuals to small organizations. The LunarWing organization ensures project governance. This repository is AGPL-3.0-or-later (see LICENSE.md) [AGPL-3.0-or-later](LICENSE). Vendored third-party crates under ic/vendor/ keep their own licenses. The companion apps are licensed separately.

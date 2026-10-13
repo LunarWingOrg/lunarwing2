@@ -119,3 +119,138 @@ console.log(JSON.stringify({ role: "assistant", content: "done" }))
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test("a sabotaged tool-proxy directory neither fails the task nor leaks its slot (EF-2)", async () => {
+  // MR !1549 EF-2: the proxy dir lives on a same-uid shared /tmp tree; another
+  // process can replace it with a plain file. startTask must degrade to
+  // "no tools", the task must still report a task_result, and the
+  // concurrency slot must be released for the next task.
+  const root = mkdtempSync(join(tmpdir(), "kimi-proxy-sabotage-"))
+  const bin = join(root, "mock-kimi")
+  writeFileSync(bin, `#!/usr/bin/env node
+const sock = process.env.LUNARWING_TOOL_PROXY_SOCKET
+console.log(JSON.stringify({ role: "assistant", content: sock ? "HAS_PROXY_ENV" : "NO_PROXY_ENV" }))
+`, { mode: 0o755 })
+  const proxyDirFile = join(root, "proxy-as-file")
+  writeFileSync(proxyDirFile, "not a directory")
+  const port = await freePort()
+  const child = startBridge(port, "sabotage-token", {
+    WORKSPACE_ROOT: root,
+    KIMI_BIN: bin,
+    LUNARWING_TOOL_PROXY_DIR: proxyDirFile,
+  })
+  let ws: WebSocket | undefined
+  try {
+    await waitForListening(child)
+    ws = await connect(port, "sabotage-token")
+    const runTask = (taskId: string) => new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`task ${taskId} never reported a result`)), 15000)
+      ws!.on("message", function onMessage(data) {
+        const message = JSON.parse(data.toString())
+        if (message.type === "task_result" && message.payload.task_id === taskId) {
+          clearTimeout(timer)
+          ws!.off("message", onMessage)
+          resolve(message.payload)
+        }
+      })
+      ws!.once("error", reject)
+      ws!.send(JSON.stringify({ type: "task_request", payload: {
+        task_id: taskId, prompt: "hi", timeout_ms: 10000,
+      }}))
+    })
+    const first = await runTask("sabotage-1")
+    assert.equal(first.status, "success")
+    assert.match(String(first.output), /NO_PROXY_ENV/,
+      "proxy setup failure must degrade to a tool-less task, not a throw")
+    // The slot was released: a second task on the same socket also completes.
+    const second = await runTask("sabotage-2")
+    assert.equal(second.status, "success")
+    assert.match(String(second.output), /NO_PROXY_ENV/)
+  } finally {
+    ws?.close()
+    child.kill("SIGTERM")
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("task MCP shim reaches hub tools through the bridge tool-proxy relay", async () => {
+  // WI#324 full worker-side path: hub task_request -> bridge starts a per-task
+  // proxy socket -> the task's CLI (mock kimi standing in for the MCP shim)
+  // issues a proxied call over the unix socket -> bridge emits tool_call on the
+  // hub WS -> hub tool_result routes back by call_id -> task output carries it.
+  const root = mkdtempSync(join(tmpdir(), "kimi-proxy-bridge-"))
+  const bin = join(root, "mock-kimi")
+  writeFileSync(bin, `#!/usr/bin/env node
+const net = require("node:net")
+const sock = process.env.LUNARWING_TOOL_PROXY_SOCKET
+const taskId = process.env.LUNARWING_TASK_ID
+if (!sock || !taskId) {
+  console.log(JSON.stringify({ role: "assistant", content: "NO_PROXY_ENV" }))
+  process.exit(0)
+}
+const conn = net.connect(sock)
+conn.on("connect", () => {
+  conn.write(JSON.stringify({
+    op: "call", call_id: "abc123", name: "memory_read",
+    arguments: { path: "notes/x.md" },
+  }) + "\\n")
+})
+let buf = ""
+conn.on("data", (d) => {
+  buf += d.toString()
+  const i = buf.indexOf("\\n")
+  if (i < 0) return
+  const resp = JSON.parse(buf.slice(0, i))
+  const text = resp.ok ? "tool:" + resp.output : "tool-error:" + resp.error
+  console.log(JSON.stringify({ role: "assistant", content: text }))
+  process.exit(0)
+})
+setTimeout(() => {
+  console.log(JSON.stringify({ role: "assistant", content: "PROXY_TIMEOUT" }))
+  process.exit(0)
+}, 8000)
+`, { mode: 0o755 })
+  const proxyDir = join(root, "proxy")
+  const port = await freePort()
+  const child = startBridge(port, "proxy-test-token", {
+    WORKSPACE_ROOT: root,
+    KIMI_BIN: bin,
+    LUNARWING_TOOL_PROXY_DIR: proxyDir,
+  })
+  let ws: WebSocket | undefined
+  try {
+    await waitForListening(child)
+    ws = await connect(port, "proxy-test-token")
+    const done = new Promise<Record<string, unknown>>((resolve, reject) => {
+      ws!.on("message", data => {
+        const message = JSON.parse(data.toString())
+        if (message.type === "tool_call") {
+          // The hub side: frame must be bound to the dispatched task id.
+          assert.equal(message.payload.task_id, "proxy-task")
+          assert.equal(message.payload.name, "memory_read")
+          assert.equal(message.payload.call_id, "abc123")
+          ws!.send(JSON.stringify({
+            id: "hub-reply", type: "tool_result",
+            timestamp: new Date().toISOString(),
+            payload: {
+              call_id: "abc123", status: "success",
+              output: "proxied-content", error: null,
+            },
+          }))
+        }
+        if (message.type === "task_result") resolve(message.payload)
+      })
+      ws!.once("error", reject)
+    })
+    ws.send(JSON.stringify({ type: "task_request", payload: {
+      task_id: "proxy-task", prompt: "read a note", timeout_ms: 30000,
+    }}))
+    const result = await done
+    assert.equal(result.status, "success")
+    assert.match(String(result.output), /tool:proxied-content/)
+  } finally {
+    ws?.close()
+    child.kill("SIGTERM")
+    rmSync(root, { recursive: true, force: true })
+  }
+})

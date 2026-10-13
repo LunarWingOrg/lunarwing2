@@ -150,10 +150,10 @@ pub(crate) fn is_daily_log_file(path: &str) -> bool {
     lower.starts_with("daily/") && lower.ends_with(".md")
 }
 
-/// Shadow-backup documents (`backups/<path>.bak` plus numbered daily-log
-/// generations) hold replaced prompt-file versions — which can include
-/// quarantined injection content — and are written only by the shadow-backup
-/// rotation itself. Agent-facing memory lanes and the web memory-write route
+/// Backup documents (prompt-file shadows, numbered daily-log generations, and
+/// harness rollback snapshots) hold replaced versions — which can include
+/// quarantined injection content — and are written by internal backup paths
+/// without search chunks. Agent-facing memory lanes and the web memory-write route
 /// reserve the prefix so the retained evidence cannot be overwritten or
 /// erased through them (WI#288 review); direct `Workspace` reads stay
 /// available for operator recovery.
@@ -1299,6 +1299,28 @@ impl Workspace {
                 "prompt-file shadow backup failed; proceeding with write"
             ),
         }
+    }
+
+    /// Store an internal rollback snapshot without chunking or embedding it.
+    /// Like prompt-file shadows, it is readable by exact path for recovery.
+    /// Only the reserved backup namespace may bypass normal write indexing.
+    pub(crate) async fn write_backup_snapshot(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Result<(), WorkspaceError> {
+        if normalize_path(path) != path || !path.starts_with("backups/") {
+            return Err(WorkspaceError::IoError {
+                reason: "snapshot target must be a canonical backups/ path".to_string(),
+            });
+        }
+        let doc = self
+            .storage
+            .get_or_create_document_by_path(&self.user_id, self.agent_id, path)
+            .await?;
+        self.storage
+            .update_document_and_replace_chunks(doc.id, content, &[])
+            .await
     }
 
     /// Roll an existing daily-log backup slot aside to a numbered
