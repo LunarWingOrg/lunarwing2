@@ -13,7 +13,13 @@ import {
   type TaskResult,
   DEFAULT_TIMEOUT_MS,
 } from "./lunarwing_runtime"
-import { extractAssistantText, opencodeErrorMessage, withServeLogDetail } from "./opencode_result"
+import {
+  extractAssistantText,
+  opencodeErrorRef,
+  opencodeErrorMessage,
+  serveLogStartSize,
+  withServeLogDetail,
+} from "./opencode_result"
 import { expandWorkspacePath } from "./workspace_path"
 
 const OPENCODE_HOST = process.env.OPENCODE_SERVE_HOST || "127.0.0.1"
@@ -68,6 +74,28 @@ function isRetryableProviderError(message: string): boolean {
   )
 }
 
+// Values that must never survive into a job record via the serve-log tail:
+// the bridge's own credential env plus everything this task injected.
+const SECRET_SCRUB_ENV_KEYS = [
+  "OPENCODE_SERVER_PASSWORD",
+  "TENSORZERO_API_KEY",
+  "OPENAI_API_KEY",
+  "AGENT_AUTH_TOKEN",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "PASEO_TOKEN",
+]
+
+function secretScrubValues(request: TaskRequest): string[] {
+  const values = SECRET_SCRUB_ENV_KEYS.map((key) => process.env[key]).filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  )
+  for (const value of Object.values(request.context?.environment ?? {})) {
+    if (typeof value === "string" && value.length > 0) values.push(value)
+  }
+  return values
+}
+
 function createSdk(directory?: string): OpencodeClient {
   const password = getPassword()
   const headers: Record<string, string> = {}
@@ -102,6 +130,10 @@ export async function executeTask(
   const workDir = request.context?.project_dir
     ? resolveWorkDir(request.context.project_dir)
     : WORKSPACE_ROOT
+  // Boundary for serve-log enrichment (WI#374): only log lines appended after
+  // the task started can belong to it — one serve process serves the whole
+  // tenant container.
+  const serveLogStart = serveLogStartSize()
 
   const injectedKeys: string[] = []
   const savedValues: Record<string, string | undefined> = {}
@@ -133,6 +165,7 @@ export async function executeTask(
 
   let stopReason: StopReason | undefined
   let resolveStop: (reason: StopReason) => void = () => {}
+  let serverErrorRef: string | undefined
   const stopPromise = new Promise<StopReason>((resolve) => {
     resolveStop = resolve
   })
@@ -289,7 +322,10 @@ export async function executeTask(
 
         if (event.type === "session.error") {
           if (event.properties.sessionID !== sessionID) continue
-          if (!sessionErrorMsg) sessionErrorMsg = opencodeErrorMessage(event.properties.error)
+          if (!sessionErrorMsg) {
+            sessionErrorMsg = opencodeErrorMessage(event.properties.error)
+            serverErrorRef ??= opencodeErrorRef(event.properties.error)
+          }
         }
 
         if (event.type === "permission.asked") {
@@ -336,10 +372,14 @@ export async function executeTask(
 
       const promptOutcome = await waitForStop(promptPromise)
       const promptData = "result" in promptOutcome ? promptOutcome.result.data : undefined
+      const promptErrorObject = "error" in promptOutcome ? promptOutcome.error : undefined
+      const infoError = promptData?.info.error
       const promptError =
-        ("error" in promptOutcome ? opencodeErrorMessage(promptOutcome.error) : "") ||
-        (promptData?.info.error ? opencodeErrorMessage(promptData.info.error) : "") ||
+        (promptErrorObject ? opencodeErrorMessage(promptErrorObject) : "") ||
+        (infoError ? opencodeErrorMessage(infoError) : "") ||
         sessionErrorMsg
+      serverErrorRef ??=
+        opencodeErrorRef(promptErrorObject) ?? (infoError ? opencodeErrorRef(infoError) : undefined)
 
       if (!promptError) {
         finalPromptData = promptData
@@ -421,11 +461,16 @@ export async function executeTask(
       return
     }
     const errorMsg = opencodeErrorMessage(err)
+    const error = await withServeLogDetail(errorMsg, {
+      ref: serverErrorRef ?? opencodeErrorRef(err),
+      startOffset: serveLogStart,
+      secrets: secretScrubValues(request),
+    })
     onResult({
       task_id: request.task_id,
       status: "error",
       output: output.trim(),
-      error: await withServeLogDetail(errorMsg),
+      error,
       duration_ms: durationMs,
     })
   } finally {

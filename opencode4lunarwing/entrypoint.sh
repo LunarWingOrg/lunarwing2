@@ -213,29 +213,10 @@ case "$MODE" in
   websocket)
     log "Mode: WebSocket — starting opencode headless server"
 
-    # WI#374: capture opencode serve's own stdout/stderr to a log file so the
-    # bridge can attach its tail to otherwise opaque "Unexpected server error"
-    # job failures. tee keeps everything on container stdout as before. When
-    # the path is not writable, serve runs without capture (previous behavior).
-    OPENCODE_SERVE_LOG="${OPENCODE_SERVE_LOG:-/var/log/lunarwing/opencode-serve.log}"
-    SERVE_LOG_CAPTURE=0
-    if touch "$OPENCODE_SERVE_LOG" 2>/dev/null; then
-      SERVE_LOG_CAPTURE=1
-    else
-      log "WARN: OPENCODE_SERVE_LOG ($OPENCODE_SERVE_LOG) is not writable; serve log capture disabled"
-    fi
-
     cd "$WORKSPACE_ROOT"
-    if [ "$SERVE_LOG_CAPTURE" = 1 ]; then
-      "$OPENCODE_BIN" serve \
-        --port "$OPENCODE_SERVE_PORT" \
-        --hostname "$OPENCODE_SERVE_HOST" \
-        > >(tee "$OPENCODE_SERVE_LOG") 2>&1 &
-    else
-      "$OPENCODE_BIN" serve \
-        --port "$OPENCODE_SERVE_PORT" \
-        --hostname "$OPENCODE_SERVE_HOST" &
-    fi
+    "$OPENCODE_BIN" serve \
+      --port "$OPENCODE_SERVE_PORT" \
+      --hostname "$OPENCODE_SERVE_HOST" &
     OPENCODE_PID=$!
 
     log "Waiting for opencode server on port $OPENCODE_SERVE_PORT..."
@@ -259,7 +240,6 @@ case "$MODE" in
     log "Starting LunarWing bridge — role: $WS_ROLE"
     export OPENCODE_SERVE_PORT
     export OPENCODE_SERVE_HOST
-    export OPENCODE_SERVE_LOG
     export WS_ROLE
     export WS_STATE_FILE
     export WORKSPACE_ROOT
