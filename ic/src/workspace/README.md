@@ -199,16 +199,17 @@ logged and never mask the rejection; the refused append is then relabelled
 so rephrase advice would blame the clean entry).
 
 For a deliberate repair, `memory_write(target: "daily_log", append: false)`
-replaces today's log through `write()`: only the new content is scanned, and
-the previous version (poisoned or not) is kept in the shadow backup
-`backups/daily/YYYY-MM-DD.md.bak` (earlier generations roll aside to numbered
-`.bak.<n>` slots, with the first generation of the day pinned as evidence —
-see the cap behavior below). The named `daily_log` target used to ignore `append: false`
+replaces today's log through the cap-guarded write: only the new content is
+scanned, and the previous version (poisoned or not) is kept in the shadow
+backup `backups/daily/YYYY-MM-DD.md.bak` (earlier generations roll aside to
+numbered `.bak.<n>` slots; the first generation of the day stays pinned — a
+positional pin, see the cap behavior below). The named `daily_log` target used to ignore `append: false`
 and append silently while reporting a replace (WI#288 residual); the
 explicit-path form (`target: "daily/YYYY-MM-DD.md"`) always honored it. When a
 `layer` is specified the write routes through the layer methods: replaces get
-the same shadow backup, but appends do not quarantine — a poisoned layer-scope
-day file rejects until it is replaced or repaired by an operator.
+the same shadow backup (and the same cap guard), but appends do not
+quarantine — a poisoned layer-scope day file rejects until it is replaced or
+repaired by an operator.
 
 ### Prompt-File Shadow Backups (WI#286)
 
@@ -231,24 +232,36 @@ prior byte count and the backup path. Most prompt-visible files keep a single
 rolling slot, overwritten on each replace; daily logs additionally retain up
 to eight earlier generations — before the slot is overwritten, its content
 rolls aside to the first free `backups/daily/<date>.md.bak.<n>`. At the cap
-the first generation of the day stays pinned (it is the repair path's
-retained evidence: evicting the oldest would let a steered agent rotate the
-poison's predecessor out of the reserved store with ordinary replaces) and
-the second-oldest generation is discarded instead, with an audit line
-carrying its byte count and blake3 fingerprint so forensics can say what was
-lost — so repeated same-day replaces (including the WI#288 repair
-path) never silently discard a recent version, and retained storage stays
-bounded. A replace retried after a crash between the backup and the replace
-commit grows no duplicate generation. Backups are retrievable by exact-path
-`read()` and visible in `list()`, but are stored with an empty chunk
-projection so they never enter the search index. Because they can hold
+the first generation of the day stays pinned and the second-oldest
+generation is discarded instead, with an audit line carrying its byte count
+and blake3 fingerprint so forensics can say what was lost. The pin is
+positional, not evidential (WI#335): `.1` holds the content that preceded
+the day's *first* replace, which is the poison's predecessor only when the
+poison arrived in that first replace — any earlier replace that day puts the
+poison in `.2+`. Letting the discard branch run from the agent lane would
+therefore let a steered agent evict the poisoned generation with a handful
+of ordinary replaces, so the memory tool's replace lanes (`daily_log`,
+explicit `daily/*.md` paths, and the layer route) fail closed once the cap
+exists: the replace is refused with a classified error before anything is
+discarded or shifted, telling the agent to hand the replace to the operator.
+The decision is made inside the rotation itself, so a racing replace cannot
+slip past a pre-check. Operator routes (`Workspace::write` /
+`Workspace::write_to_layer` via web/CLI) intentionally keep rotating and
+discarding at the cap — an operator may always replace a saturated day's
+log. Repeated same-day replaces through those routes never silently discard
+a recent version without the fingerprinted audit line, and retained storage
+stays bounded. A replace retried after a crash between the backup and the
+replace commit grows no duplicate generation. Backups are retrievable by
+exact-path `read()` and visible in `list()`, but are stored with an empty
+chunk projection so they never enter the search index. Because they can hold
 quarantined injection content and are the recovery evidence for replaced
 prompt files, the `backups/` prefix is reserved: the memory tools reject
 writes and reads under it and hide it from tree listings, and the web
 `POST /api/memory/write` route answers HTTP 403 for it (operator reads stay
 open). Quarantined daily logs (`daily/*.poisoned-*.md`) are reserved the
 same way on all three lanes. Backup and rotation failures are logged and
-never block the write itself.
+never block the write itself — except the guarded cap refusal above, which
+is the point.
 
 ## Operator Prompt Editing (WI#220)
 
