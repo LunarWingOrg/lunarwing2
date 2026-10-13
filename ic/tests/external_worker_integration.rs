@@ -2824,8 +2824,9 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
         tool_allowlist: vec!["knowledge_search".to_string()],
         ..Default::default()
     };
-    let mgr = ExternalWorkerManager::new(vec![cron_config, shared_config, alias_config, ctrl_config])
-        .with_tool_proxy(test_proxy(tools));
+    let mgr =
+        ExternalWorkerManager::new(vec![cron_config, shared_config, alias_config, ctrl_config])
+            .with_tool_proxy(test_proxy(tools));
 
     // The entry sharing the cron worker's endpoint is stripped: denied.
     let job_id = Uuid::new_v4();

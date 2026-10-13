@@ -708,11 +708,9 @@ impl ExternalWorkerManager {
                 if config.is_cron() || config.tool_allowlist.is_empty() {
                     continue;
                 }
-                if config
-                    .endpoints()
-                    .iter()
-                    .any(|endpoint| cron_endpoint_keys.contains(&endpoint_container_key(&endpoint.url)))
-                {
+                if config.endpoints().iter().any(|endpoint| {
+                    cron_endpoint_keys.contains(&endpoint_container_key(&endpoint.url))
+                }) {
                     tracing::error!(
                         "External worker '{}' shares an endpoint with a mode=cron worker; \
                          stripping its worker-level tool_allowlist — one container is one \
@@ -4476,7 +4474,10 @@ mod tests {
         assert_eq!(endpoint_container_key("ws://[::1]:9/ws/agent"), cron);
         assert_eq!(endpoint_container_key("ws://LOCALHOST:9/ws/agent"), cron);
         // Path and query are ignored.
-        assert_eq!(endpoint_container_key("ws://127.0.0.1:9/ws/agent?a=1"), cron);
+        assert_eq!(
+            endpoint_container_key("ws://127.0.0.1:9/ws/agent?a=1"),
+            cron
+        );
         assert_eq!(endpoint_container_key("ws://127.0.0.1:9/ws/agent/"), cron);
         // Host case and scheme-default port normalize.
         assert_eq!(
