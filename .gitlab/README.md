@@ -214,6 +214,16 @@ candidate job — the scan can only succeed after a candidate publishes
   publishes no shared cache, preserving the protected-cache-writer policy.
   Override `CI_BUN_IMAGE` with a mirror of the pinned digest to avoid
   Docker Hub quotas. Worker image rebuilds remain a separate protected gate.
+- `worker-kimi-ts`: the kimi worker Node/TS suites (bridge, executor, tool
+  proxy relay, MCP shim, runtime, entrypoint/hook policy) via the same
+  `npm ci --ignore-scripts` + `npx tsc` + `npm test` sequence the
+  kimicode4lunarwing Dockerfile builder stage runs. Runs on every MR/branch
+  push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
+  `validate_config.py` ties to the node FROM digest(s) in
+  `kimicode4lunarwing/Dockerfile` (fail-closed, like the bun tie). The
+  real-CLI contract lane (`kimi_cli_contract_test`) self-skips here — the
+  image carries no kimi binary — so the protected candidate image build
+  remains the only place that contract is asserted against the real CLI.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL
