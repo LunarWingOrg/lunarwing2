@@ -93,6 +93,14 @@ for backup in "${backups[@]}"; do
   fi
 done
 [[ "$found_suspicious" == 1 ]] || fail 'backup copy lost the suspicious installed bytes'
+
+# FL-4 (M4): re-rendering an already-safe unit must not grow the archive —
+# only units failing the safe-unit contract are preserved.
+before="$(find "$OPENRC_PROXY_BACKUP_DIR" -maxdepth 1 -name 'lunarwing-proxy-*' | wc -l)"
+render_proxy_openrc_unit alice
+after="$(find "$OPENRC_PROXY_BACKUP_DIR" -maxdepth 1 -name 'lunarwing-proxy-*' | wc -l)"
+[[ "$before" == "$after" ]] || fail 're-rendering a safe unit grew the backup archive'
+
 # A backup directory inside init.d must be refused rather than hand OpenRC an
 # unparseable copy where dependency scanning could pick it up.
 OPENRC_PROXY_BACKUP_DIR="$fixture/init.d/backups"
