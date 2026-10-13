@@ -922,13 +922,17 @@ pub struct ExternalWorkerSettings {
     /// are never worker-callable (MR !1533 DP-2). Tools must additionally
     /// pass the daemon's autonomous-execution gates, and secrets never cross
     /// the proxy — only sanitized results.
-    /// Cron split (WI#325/MR !1549 CQ-10): on a `mode = "cron"` worker this
-    /// worker-level list is stripped at load (logged as an error) — tick
-    /// jobs draw proxy authority from the separate `cron.tool_allowlist`
-    /// only, and ordinary dispatches to a cron-mode worker get no proxied
-    /// tools. The strip is per worker entry while the authority domain is
-    /// the container: never point an entry that has a `tool_allowlist` at
-    /// the same endpoint as a cron entry (MR !1561 EV-1).
+    /// Cron split (WI#325, MR !1506 CQ-10): tick jobs draw proxy authority
+    /// from the separate `cron.tool_allowlist`, never this worker-level
+    /// list. On a `mode = "cron"` worker this list is additionally stripped
+    /// at load (logged as an error, MR !1549 EF-1), and ordinary dispatches
+    /// to a cron-mode worker get no proxied tools. The strip is per worker
+    /// entry while the authority domain is the container: the manager also
+    /// strips this list on a non-cron entry whose endpoint shares a cron
+    /// entry's container (normalized endpoint key — loopback spellings
+    /// folded, host lowercased, scheme-default port applied, path/query
+    /// ignored; MR !1561 EV-1 / MR !1571 FE-1). Never point an entry that
+    /// has a `tool_allowlist` at the same endpoint as a cron entry.
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
     /// Operating mode: "task" (default, bounded dispatches) or "cron"
