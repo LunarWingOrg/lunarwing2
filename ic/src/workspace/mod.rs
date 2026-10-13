@@ -124,12 +124,13 @@ const LOREBOOK_DIR_PREFIX: &str = "lorebooks/";
 /// Number of numbered generations retained per daily log in addition to the
 /// rolling `.bak` slot (WI#288 review). Bounds per-day backup storage (each
 /// generation can be up to the 256 KiB write cap) and the cost of probing for
-/// the next free slot. At the cap the first generation stays pinned — it is
-/// the day's first replaced version, the retained evidence the WI#288 repair
-/// path exists to protect — and the second-oldest generation is discarded
-/// instead (with a `lunarwing::safety` audit line carrying its byte count and
-/// blake3 fingerprint) while the rest shift down one slot.
-const MAX_DAILY_LOG_BACKUP_GENERATIONS: u32 = 8;
+/// the next free slot. At the cap the first generation stays pinned and the
+/// second-oldest generation is discarded instead (with a `lunarwing::safety`
+/// audit line carrying its byte count and blake3 fingerprint) while the rest
+/// shift down one slot. The pin is positional, not evidential: `.1` holds the
+/// content that preceded the day's first replace, which is the poison's
+/// predecessor only when the poison arrived in that first replace (WI#335).
+pub(crate) const MAX_DAILY_LOG_BACKUP_GENERATIONS: u32 = 8;
 
 /// Returns true if `path` (already normalized) is a system-prompt-injected file.
 pub(crate) fn is_system_prompt_file(path: &str) -> bool {
@@ -1242,10 +1243,15 @@ impl Workspace {
     /// overwritten on each replace. Daily logs also keep older generations:
     /// before the slot is overwritten its content rolls aside to a numbered
     /// `backups/daily/<date>.md.bak.<n>`; at the generation cap the first
-    /// generation of the day stays pinned as evidence and the second-oldest
+    /// generation of the day stays pinned and the second-oldest
     /// is discarded with a fingerprinted audit line, so repeated same-day
     /// replaces (including the WI#288 repair path) never silently discard a
-    /// version an operator may still need to inspect. The backup is stored
+    /// version an operator may still need to inspect. The pin is positional,
+    /// not evidential: `.1` holds the content that preceded the day's first
+    /// replace, not necessarily the poisoned version, so the memory-write
+    /// tool lane fails closed once the cap exists rather than letting a
+    /// steered agent discard generations through the front door (WI#335;
+    /// [`Workspace::daily_log_backup_cap_reached`]). The backup is stored
     /// with an empty chunk projection: retrievable by exact-path `read()`,
     /// visible in `list()`, but never search-indexed. Backup content is not
     /// rescanned
@@ -1339,12 +1345,18 @@ impl Workspace {
 
     /// First free numbered daily-log backup generation slot. At the
     /// [`MAX_DAILY_LOG_BACKUP_GENERATIONS`] cap, the first generation stays
-    /// pinned — it is the day's first replaced version, the retained evidence
-    /// the WI#288 repair path exists to protect — the second-oldest
+    /// pinned and the second-oldest
     /// generation is discarded (audited with its byte count and blake3
     /// fingerprint), every newer generation shifts down one slot, and the
     /// freed top slot is returned, so both retained storage and this probe
-    /// stay bounded.
+    /// stay bounded. The pin is positional, not evidential: `.1` holds the
+    /// content that preceded the day's first replace — the poison's
+    /// predecessor only when the poison arrived in that first replace — so
+    /// discarding `.2+` can still lose the poisoned version (WI#335). The
+    /// memory-write tool lane therefore fails closed at the cap (see
+    /// [`Workspace::daily_log_backup_cap_reached`]); this rotation itself
+    /// stays unchanged so operator routes (web/CLI) keep working on a
+    /// saturated day.
     async fn next_daily_log_backup_slot(
         &self,
         scope: &str,
@@ -1391,9 +1403,41 @@ impl Workspace {
             discarded_bytes = discarded.content.len(),
             discarded_blake3 = %blake3::hash(discarded.content.as_bytes()).to_hex(),
             "daily-log backup generation cap reached; second-oldest generation \
-             discarded, first generation pinned as evidence"
+             discarded, first generation pinned (positional, not evidential)"
         );
         Ok(format!("{backup_path}.{MAX_DAILY_LOG_BACKUP_GENERATIONS}"))
+    }
+
+    /// Whether the daily-log backup generation cap is already reached for
+    /// `path` in this workspace's scope — i.e. `backups/<path>.bak.<cap>`
+    /// exists, so the next replace-triggered rotation would run the
+    /// discard-at-cap branch of [`Workspace::next_daily_log_backup_slot`]
+    /// (WI#335). The probe mirrors that branch's own existence test, so a
+    /// created-but-empty generation counts as occupied exactly as it does
+    /// there. Non-daily-log paths always return `Ok(false)`.
+    ///
+    /// Tool lanes use this to fail closed before such a replace: the pinned
+    /// `.1` holds the content that preceded the day's first replace
+    /// (positional, not evidential), and once the cap exists a steered agent
+    /// could otherwise discard the generation holding the poison with
+    /// ordinary replaces. Operator routes (web/CLI, direct [`Workspace::write`])
+    /// intentionally never call this, so an operator can always replace a
+    /// saturated day's log.
+    pub async fn daily_log_backup_cap_reached(&self, path: &str) -> Result<bool, WorkspaceError> {
+        let path = normalize_path(path);
+        if !is_daily_log_file(&path) {
+            return Ok(false);
+        }
+        let cap_slot = format!("backups/{path}.bak.{MAX_DAILY_LOG_BACKUP_GENERATIONS}");
+        match self
+            .storage
+            .get_document_by_path(&self.user_id, self.agent_id, &cap_slot)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(WorkspaceError::DocumentNotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Move a poisoned daily log aside to `daily/<date>.poisoned-<n>.md` and
@@ -4645,11 +4689,13 @@ mod runtime_index_tests {
     }
 
     /// WI#288 review (T-3/J-1): retained generations are capped — at the cap
-    /// the first generation of the day stays pinned (it is the repair path's
-    /// retained evidence), the second-oldest generation is discarded and the
-    /// rest shift down, so an injection-steered agent cannot rotate the
-    /// evidence out of the reserved store with ordinary replaces, and the
-    /// free-slot probe stays bounded.
+    /// the first generation of the day stays pinned, the second-oldest
+    /// generation is discarded and the rest shift down, so the free-slot probe
+    /// stays bounded. The pin is positional, not evidential (WI#335): `.1`
+    /// holds the content that preceded the day's first replace, and keeping a
+    /// steered agent from rotating later generations out of the reserved
+    /// store with ordinary replaces is the tool lane's job
+    /// (`memory_write` fails closed at the cap), not this rotation's.
     #[tokio::test]
     async fn daily_log_shadow_backup_generation_cap_pins_first_generation() {
         let (workspace, _temp_dir) = create_test_workspace().await;
@@ -4682,7 +4728,7 @@ mod runtime_index_tests {
                 .expect("first generation survives the cap")
                 .content,
             "version 0",
-            "the first generation of the day is pinned as evidence and never evicted"
+            "the first generation of the day (the pre-first-replace content) is pinned and never evicted"
         );
         for n in 2..=cap {
             let generation = workspace
