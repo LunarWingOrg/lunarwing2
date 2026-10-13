@@ -81,10 +81,12 @@ const SHUTDOWN_STOP_GRACE: Duration = Duration::from_secs(3);
 /// Upper bound [`MissionManager::shutdown`] waits for mission background
 /// work: the stop grace plus a margin for the watcher's post-stop database
 /// writes. The mission row (history + dedup release) is saved before the
-/// retry marker, so an abort in that window leaves either no trace (the
-/// clean pre-WI#188 loss) or a mission row without a marker — never a
-/// marker whose dedup release never saved. Markers written in the opposite
-/// order by older builds are healed by the next boot's retry recovery.
+/// retry marker, so an abort between the two saves leaves a mission row
+/// without a marker (the key already released) and an abort before the
+/// mission save leaves no trace with the key still recorded on the old row
+/// (the stuck-key residual, WI#394) — never a marker whose dedup release
+/// never saved. Markers written in the opposite order by older builds are
+/// healed by the next boot's retry recovery.
 const SHUTDOWN_SETTLE_BUDGET: Duration = Duration::from_secs(8);
 /// Oldest age a pending-shutdown-interruption stamp may reach and still be
 /// resolved into a retry (WI#337). The resolution is a next-boot affair: a
@@ -323,6 +325,11 @@ pub struct MissionManager {
     /// Startup retry admissions for this process. Durable markers remain until
     /// spawn, so repeated recovery calls must not create parallel sleep tasks.
     recovered_retries: Mutex<std::collections::HashSet<ThreadId>>,
+    /// Test-only override (milliseconds) of the outcome watcher's stop grace
+    /// (WI#341 AE-T-4): lets a test drive the grace-expired `Ok(None)` arm
+    /// end-to-end without sleeping out the production constant.
+    #[cfg(test)]
+    shutdown_stop_grace_override_ms: std::sync::atomic::AtomicU64,
 }
 
 fn normalize_cron_expression(expression: &str) -> String {
@@ -456,7 +463,39 @@ impl MissionManager {
             mission_create_lock: Mutex::new(()),
             weak_self: RwLock::new(None),
             recovered_retries: Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            shutdown_stop_grace_override_ms: std::sync::atomic::AtomicU64::new(
+                SHUTDOWN_STOP_GRACE.as_millis() as u64,
+            ),
         }
+    }
+
+    /// The outcome watcher's stop grace: the production constant outside
+    /// tests; the test override when one is installed (WI#341 AE-T-4).
+    #[cfg(not(test))]
+    fn shutdown_stop_grace(&self) -> Duration {
+        SHUTDOWN_STOP_GRACE
+    }
+
+    /// The outcome watcher's stop grace: the production constant outside
+    /// tests; the test override when one is installed (WI#341 AE-T-4).
+    #[cfg(test)]
+    fn shutdown_stop_grace(&self) -> Duration {
+        Duration::from_millis(
+            self.shutdown_stop_grace_override_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Shrink the outcome watcher's stop grace so a test can drive the
+    /// grace-expired arm without sleeping out the production constant
+    /// (WI#341 AE-T-4).
+    #[cfg(test)]
+    pub(crate) fn set_shutdown_stop_grace(&self, grace: Duration) {
+        self.shutdown_stop_grace_override_ms.store(
+            grace.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Install the weak self-handle once the manager lives behind an `Arc`.
@@ -2452,15 +2491,14 @@ impl MissionManager {
         // self-handle (installed once via `arm_retry_wake`, WI#188). Upgrading
         // a Weak never awaits, so the coroutine's opaque type stays flat.
         let retry_mgr = self.weak_self.read().await.clone();
+        let stop_grace = self.shutdown_stop_grace();
         let handle = tokio::spawn(async move {
             // WI#276: the thread stays registered while it runs, so on daemon
             // shutdown the stop actually lands and the run's real outcome is
             // processed below. The old watcher joined first — taking the
             // handle out of the running set — so its shutdown stop missed,
             // the run was dropped mid-await, and the fire was lost silently.
-            let outcome = tm
-                .wait_thread_or_stop(thread_id, &cancel, SHUTDOWN_STOP_GRACE)
-                .await;
+            let outcome = tm.wait_thread_or_stop(thread_id, &cancel, stop_grace).await;
             let shutting_down = cancel.is_cancelled();
             match outcome {
                 Ok(Some(outcome)) => {
@@ -4259,10 +4297,13 @@ async fn process_mission_outcome_and_notify(
     // Durable writes are ordered so every crash prefix is self-consistent
     // (WI#276 review): the mission row (approach history + dedup release)
     // lands first and the retry marker is the final commit write. An abort
-    // before the marker leaves no marker — the clean pre-WI#188 loss, with
-    // the dedup key already released for redelivery — never a marker whose
-    // mission-side release never saved. Markers written in the opposite
-    // order by older builds are healed by the boot sweep.
+    // between the two saves leaves a mission row without a marker — the
+    // dedup key already released for redelivery — while an abort before the
+    // mission save leaves no trace with the key still recorded on the old
+    // row (the settled stop may already have persisted the thread row; the
+    // stuck-key residual, WI#394) — never a marker whose mission-side
+    // release never saved. Markers written in the opposite order by older
+    // builds are healed by the boot sweep.
     mission.updated_at = chrono::Utc::now();
     store.save_mission(&mission).await?;
 
@@ -4991,11 +5032,23 @@ mod tests {
 
     // ── TestStore — in-memory Store that persists missions ───
 
+    /// One save attempt against [`TestStore`], recorded in call order
+    /// (WI#341 AE-T-3) so a test can pin the durable-write ORDER of outcome
+    /// processing — the mission row before the retry marker — which the
+    /// persisted end state alone cannot distinguish (a failed marker write
+    /// leaves the same state under either order).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestStoreWrite {
+        Mission(MissionId),
+        Thread(ThreadId),
+    }
+
     struct TestStore {
         threads: tokio::sync::RwLock<HashMap<ThreadId, Thread>>,
         missions: tokio::sync::RwLock<HashMap<MissionId, Mission>>,
         docs: tokio::sync::RwLock<Vec<MemoryDoc>>,
         mission_load_delay: Duration,
+        thread_save_delay: Duration,
         failing_mission_loads: tokio::sync::RwLock<Vec<MissionId>>,
         failing_mission_saves: tokio::sync::RwLock<Vec<MissionId>>,
         failing_thread_loads: tokio::sync::RwLock<Vec<ThreadId>>,
@@ -5005,6 +5058,7 @@ mod tests {
         /// webhook-claim checks can be forced to both complete before
         /// either save lands.
         list_all_missions_barrier: Option<Arc<tokio::sync::Barrier>>,
+        write_log: tokio::sync::RwLock<Vec<TestStoreWrite>>,
     }
 
     impl TestStore {
@@ -5014,11 +5068,13 @@ mod tests {
                 missions: tokio::sync::RwLock::new(HashMap::new()),
                 docs: tokio::sync::RwLock::new(Vec::new()),
                 mission_load_delay: Duration::ZERO,
+                thread_save_delay: Duration::ZERO,
                 failing_mission_loads: tokio::sync::RwLock::new(Vec::new()),
                 failing_mission_saves: tokio::sync::RwLock::new(Vec::new()),
                 failing_thread_loads: tokio::sync::RwLock::new(Vec::new()),
                 failing_thread_saves: tokio::sync::RwLock::new(Vec::new()),
                 list_all_missions_barrier: None,
+                write_log: tokio::sync::RwLock::new(Vec::new()),
             }
         }
 
@@ -5028,12 +5084,26 @@ mod tests {
                 ..Self::new()
             }
         }
+
+        /// A store whose `save_thread` waits `delay` before landing (WI#341
+        /// AE-T-4): the run task's final save then outlives the watcher's
+        /// stop grace, driving the grace-expired arm end-to-end.
+        fn with_thread_save_delay(delay: Duration) -> Self {
+            Self {
+                thread_save_delay: delay,
+                ..Self::new()
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl Store for TestStore {
         // ── Thread (minimal — save/load needed by ThreadManager) ──
         async fn save_thread(&self, thread: &Thread) -> Result<(), EngineError> {
+            self.write_log
+                .write()
+                .await
+                .push(TestStoreWrite::Thread(thread.id));
             let mut failing = self.failing_thread_saves.write().await;
             if let Some(index) = failing.iter().position(|id| *id == thread.id) {
                 failing.swap_remove(index);
@@ -5042,6 +5112,9 @@ mod tests {
                 });
             }
             drop(failing);
+            if !self.thread_save_delay.is_zero() {
+                tokio::time::sleep(self.thread_save_delay).await;
+            }
             self.threads.write().await.insert(thread.id, thread.clone());
             Ok(())
         }
@@ -5133,6 +5206,10 @@ mod tests {
 
         // ── Mission (fully implemented) ──
         async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
+            self.write_log
+                .write()
+                .await
+                .push(TestStoreWrite::Mission(mission.id));
             let mut failing = self.failing_mission_saves.write().await;
             if let Some(index) = failing.iter().position(|id| *id == mission.id) {
                 failing.swap_remove(index);
@@ -12197,7 +12274,10 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
     /// WI#276 review: the retry marker is the commit write of outcome
     /// processing. A store that fails the marker (thread) write must still
     /// leave a complete mission row — history and dedup release — with no
-    /// half-written marker beside it.
+    /// half-written marker beside it. The persisted end state alone cannot
+    /// prove that order (a failed marker write leaves the same state under
+    /// the reverse order), so the attempt-ordered `write_log` pins the
+    /// `save_mission`-before-`save_thread` sequence directly (WI#341 AE-T-3).
     #[tokio::test]
     async fn outcome_processing_persists_mission_row_before_the_retry_marker() {
         let store = Arc::new(TestStore::new());
@@ -12225,6 +12305,8 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         store.save_thread(&thread).await.unwrap();
         store.save_mission(&mission).await.unwrap();
         store.failing_thread_saves.write().await.push(thread.id);
+        // Drop the setup writes so the log holds only outcome processing.
+        store.write_log.write().await.clear();
 
         let failed = ThreadOutcome::Failed {
             kind: ThreadFailureKind::Unknown,
@@ -12235,6 +12317,18 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             .await
             .expect("a marker-write failure is best-effort, not a processing error");
         assert!(pending.is_some(), "the retry is still planned");
+
+        // The order the end state cannot show: the mission-row save attempt
+        // precedes the marker (thread) save attempt — even with the marker
+        // write failing, the log records both attempts in call order.
+        assert_eq!(
+            *store.write_log.read().await,
+            vec![
+                TestStoreWrite::Mission(mission.id),
+                TestStoreWrite::Thread(thread.id),
+            ],
+            "the mission row must save before the retry marker is attempted"
+        );
 
         let saved_mission = store.load_mission(mission.id).await.unwrap().unwrap();
         assert!(
@@ -12577,6 +12671,149 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             notif.response
         );
         mgr.shutdown().await;
+    }
+
+    /// WI#341 AE-T-4: the watcher's grace-expired (`Ok(None)`) arm, driven
+    /// end-to-end — the review's "stop that settles after the grace but
+    /// before teardown". The run's final save outlives the (test-shrunk)
+    /// grace, so the watcher records the unsettled fire on the mission row
+    /// only; the delayed save then lands `Failed("execution stopped")` during
+    /// "teardown", and the boot resolution re-arms the retry from the stamp.
+    #[tokio::test]
+    async fn shutdown_stop_settling_after_the_grace_is_stamped_and_resolved_at_boot() {
+        let store = Arc::new(TestStore::with_thread_save_delay(Duration::from_millis(
+            400,
+        )));
+        let opened = Arc::new(tokio::sync::Notify::new());
+        let thread_manager = Arc::new(ThreadManager::new(
+            Arc::new(HangingLlm {
+                opened: Arc::clone(&opened),
+            }),
+            Arc::new(MockEffects),
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let mgr = Arc::new(MissionManager::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::clone(&thread_manager),
+        ));
+        mgr.set_shutdown_stop_grace(Duration::from_millis(50));
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "nightly-digest",
+                "send the digest",
+                MissionCadence::Manual,
+                vec!["darkirc".to_string()],
+            )
+            .await
+            .unwrap();
+        let thread_id = mgr
+            .fire_mission(id, "test-user", None)
+            .await
+            .unwrap()
+            .expect("the fire spawns a thread");
+        opened.notified().await;
+
+        mgr.shutdown().await;
+
+        // The grace expired before the run's delayed final save, so the
+        // watcher recorded the interruption on the mission row only:
+        // approach entry + stamp, and never the thread row.
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission.approach_history.iter().any(|entry| entry
+                == &format!(
+                    "INTERRUPTED: shutdown while the thread was still stopping ({thread_id})"
+                )),
+            "{:?}",
+            mission.approach_history
+        );
+        assert_eq!(stamped_interrupted_threads(&mission), vec![thread_id]);
+        let unsettled = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert!(
+            RetryState::from_metadata(&unsettled.metadata).is_none(),
+            "the grace-expired arm never writes the thread row"
+        );
+
+        // The stop had landed; the run's delayed final save completes during
+        // "teardown" and persists the host-stop terminal state.
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let thread = store
+                    .load_thread(thread_id)
+                    .await
+                    .unwrap()
+                    .expect("the thread row exists");
+                if thread.state.is_terminal() {
+                    break thread;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the run's final save outlives the grace but lands");
+        assert_eq!(settled.state, ThreadState::Failed);
+        assert!(
+            is_settled_host_stop(&settled),
+            "the persisted terminal reason is the host stop: {:?}",
+            settled.events
+        );
+        // FK-5: the terminal row above can be the loop engine's save while
+        // the run's own final save is still inside its delay; wait the run
+        // task out so the "boot" marker write can never race that save.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while thread_manager.is_running(thread_id).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the run task finishes its final save");
+
+        // "Boot": the resolution sweep turns the stamp into the retry the
+        // watcher would have planned — marker, wake, and notice.
+        let booted = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        booted.arm_retry_wake().await;
+        let mut rx = booted.subscribe_notifications();
+        assert_eq!(
+            booted
+                .resolve_pending_shutdown_interruptions()
+                .await
+                .unwrap(),
+            vec![id]
+        );
+        assert_eq!(
+            booted.task_handles.lock().await.len(),
+            1,
+            "the retry wake is armed"
+        );
+        assert!(booted.recovered_retries.lock().await.contains(&thread_id));
+        let saved_thread = store.load_thread(thread_id).await.unwrap().unwrap();
+        let marker = RetryState::from_metadata(&saved_thread.metadata)
+            .expect("the settled stop earns the watcher's retry marker");
+        assert_eq!(marker.attempt, 1);
+        assert!(marker.notified, "the boot notice reached the subscriber");
+        let saved_mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            stamped_interrupted_threads(&saved_mission).is_empty(),
+            "the stamp is resolved"
+        );
+        let notif = rx
+            .try_recv()
+            .expect("the interruption notice is owed at boot");
+        assert!(notif.is_error);
+        assert!(
+            notif
+                .response
+                .as_deref()
+                .is_some_and(|r| r.contains("interrupted by daemon shutdown")),
+            "{:?}",
+            notif.response
+        );
+        booted.shutdown().await;
     }
 
     /// A stop arriving mid-stream persists the stream-stop reason; it is the
