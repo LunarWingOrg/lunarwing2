@@ -931,8 +931,12 @@ pub struct ExternalWorkerSettings {
     /// strips this list on a non-cron entry whose endpoint shares a cron
     /// entry's container (normalized endpoint key — loopback spellings
     /// folded, host lowercased, scheme-default port applied, path/query
-    /// ignored; MR !1561 EV-1 / MR !1571 FE-1). Never point an entry that
-    /// has a `tool_allowlist` at the same endpoint as a cron entry.
+    /// ignored; MR !1561 EV-1 / MR !1571 FE-1). The key names a host:port
+    /// listener, not the container itself (MR !1582 FT-2): the same
+    /// container on a second host port or behind a proxy on another port
+    /// is not caught — that remains the operator's responsibility. Never
+    /// point an entry that has a `tool_allowlist` at the same endpoint as
+    /// a cron entry.
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
     /// Operating mode: "task" (default, bounded dispatches) or "cron"

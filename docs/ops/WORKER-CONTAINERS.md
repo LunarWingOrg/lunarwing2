@@ -62,8 +62,13 @@ entry whose endpoint shares a cron entry's container. The comparison uses
 a normalized endpoint key — loopback spellings folded into one class,
 host lowercased, scheme-default port applied, path and query ignored —
 so one host:port that path-routes several containers strips all of them
-(fails closed); exotic aliases such as `/etc/hosts` names remain the
-operator's responsibility, and the rule stands on its own.) A borrowed
+(fails closed). The key names a host:port listener, not the container
+itself: a container that is also published on a second host port, or
+reached behind a proxy on another port, is not caught; a real host
+literally named `loopback` folds into the loopback class and can only
+over-strip, which fails closed. Those, and exotic aliases such as
+`/etc/hosts` names, remain the operator's responsibility — the rule
+stands on its own.) A borrowed
 call is recorded in the `job_events` — and counted against the
 100-frame budget — of the job whose relay socket was used, not of the
 job that issued it.

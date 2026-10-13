@@ -212,8 +212,13 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   class, the host is lowercased, the scheme-default port is applied, and
   the path/query are ignored — one host:port that path-routes several
   containers collapses to one key and strips all of them (fails closed).
-  Exotic aliases (`/etc/hosts` names) remain the operator's
-  responsibility, so the rule stands on its own. A borrowed call is
+  The key names a host:port listener, not the container itself (MR !1582
+  review FT-2): a container also published on a second host port, or
+  reached behind a proxy on another port, is not caught, and a real host
+  literally named `loopback` folds into the loopback class (over-strips,
+  fails closed). Those, and exotic aliases (`/etc/hosts` names), remain
+  the operator's responsibility, so the rule stands on its own. A
+  borrowed call is
   recorded in the `job_events` — and counted
   against the 100-frame budget — of the job whose relay socket was used,
   not of the job that issued it:
