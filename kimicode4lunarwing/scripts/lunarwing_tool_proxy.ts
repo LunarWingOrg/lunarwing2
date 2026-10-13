@@ -84,6 +84,10 @@ interface TaskProxy {
  */
 export class ToolProxyRelay {
   private readonly pendingBySocket = new Map<object, Map<string, PendingWaiter>>()
+  // MR !1561 EV-4: dropped hub sockets stay dropped — a request arriving on
+  // a task's still-open IPC server after the drop must fail at once instead
+  // of re-creating the pending map and sending into the closed socket.
+  private readonly droppedHubSockets = new WeakSet<object>()
   private readonly tasks = new Map<string, TaskProxy>()
 
   /** Start the per-task IPC server. Returns the socket path, or null when the
@@ -197,8 +201,12 @@ export class ToolProxyRelay {
 
   /** Hub socket closed: fail every waiter parked on it and drop the map, so
    * reconnects never accumulate stale pending state (MR !1549 EF-9). Tasks'
-   * IPC servers stay up; their next request just fails to reach the hub. */
+   * IPC servers stay up; their next request just fails to reach the hub.
+   * The socket is remembered as dropped (MR !1561 EV-4): a later request on
+   * the still-open task IPC resolves immediately with the same error instead
+   * of re-creating the pending map and waiting out the relay timeout. */
   dropHubSocket(hubSocket: object): void {
+    this.droppedHubSockets.add(hubSocket)
     const pending = this.pendingBySocket.get(hubSocket)
     if (!pending) return
     this.pendingBySocket.delete(hubSocket)
@@ -362,6 +370,12 @@ export class ToolProxyRelay {
     request: { key: string; kind: "call" | "catalog"; taskId: string; serialized: string },
   ): Promise<Record<string, unknown> | null> {
     return new Promise((resolve) => {
+      if (this.droppedHubSockets.has(hubSocket)) {
+        // The hub connection is already gone (EV-4): fail at once instead of
+        // re-creating the pending map and waiting out the relay timeout.
+        resolve({ error: "hub connection closed before the tool reply arrived" })
+        return
+      }
       let perSocket = this.pendingBySocket.get(hubSocket)
       if (!perSocket) {
         perSocket = new Map()

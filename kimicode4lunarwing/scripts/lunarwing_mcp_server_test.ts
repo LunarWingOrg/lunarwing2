@@ -234,3 +234,48 @@ test("without the proxy env the shim advertises zero tools", async () => {
     shim.kill()
   }
 })
+
+test("an oversized request line is answered once with its recovered id", async () => {
+  // MR !1561 EV-3: pre-fix the 1 MiB stdin cap replied with `id: null` (and
+  // let the dropped line's tail parse as its own line, producing a second
+  // id-null error plus a -32700), so the CLI waited out its own MCP timeout
+  // for the dropped call. The shim must now discard up to the newline and
+  // answer exactly once with the id recovered from the line's top-level
+  // edges — id-first or SDK order.
+  const shim = startShim({})
+  try {
+    const replies: Array<Record<string, unknown>> = []
+    shim.stdout.on("data", (chunk: Buffer) => {
+      for (const line of chunk.toString("utf8").split("\n")) {
+        if (!line.trim()) continue
+        replies.push(JSON.parse(line) as Record<string, unknown>)
+      }
+    })
+    const padding = "x".repeat(3 * 1024 * 1024)
+    // id-first shape.
+    shim.stdin.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 42,
+        method: "tools/call",
+        params: { name: "memory_read", arguments: { path: padding } },
+      }) + "\n",
+    )
+    // SDK order: jsonrpc/id serialized last.
+    shim.stdin.write(
+      `{"method":"tools/call","params":{"name":"memory_read","arguments":{"path":"${padding}"}},"jsonrpc":"2.0","id":"sdk-9"}` +
+        "\n",
+    )
+    const pong = await rpc(shim, { jsonrpc: "2.0", id: 7, method: "ping" })
+    assert.deepEqual(pong, { jsonrpc: "2.0", id: 7, result: {} })
+    const errors = replies.filter((reply) => reply.error !== undefined)
+    assert.equal(errors.length, 2, `expected exactly one error per oversized line: ${JSON.stringify(errors)}`)
+    const byId = new Map(errors.map((reply) => [reply.id, reply.error as { code: number; message: string }]))
+    assert.equal(byId.get(42)?.code, -32600, "the id-first line must be answered with its id")
+    assert.equal(byId.get("sdk-9")?.code, -32600, "the SDK-order line must be answered with its id")
+    assert.match(byId.get(42)?.message ?? "", /1 MiB/)
+    assert.match(byId.get("sdk-9")?.message ?? "", /1 MiB/)
+  } finally {
+    shim.kill()
+  }
+})

@@ -232,9 +232,13 @@ async function handleTaskRequest(
   // WI#324: give the task's CLI a local tool-proxy socket so its MCP shim can
   // reach the hub over this connection. A listen/fs failure never fails the
   // task — it just runs without LunarWing tools (hub stays deny-by-default).
-  // startTask runs INSIDE the try (MR !1549 EF-2): an unexpected throw must
-  // still hit the finally below so the concurrency slot and workspace lock
-  // are released and the hub is not left waiting on a task_result.
+  // startTask runs INSIDE the try (MR !1549 EF-2) so an unexpected throw still
+  // hits the finally below and the concurrency slot and workspace lock are
+  // released. The "hub not left waiting on a task_result" half rests on the
+  // relay's never-throw contract (MR !1561 EV-5): if startTask ever did throw,
+  // the slot would be released but no task_result would be sent — keep
+  // startTask/closeTask throw-free (pinned by the relay's EF-2 tests and the
+  // bridge sabotage test).
   let toolProxy: TaskProxyHandle | null = null
   try {
     toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
