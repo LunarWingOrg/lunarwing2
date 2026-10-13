@@ -814,7 +814,9 @@ def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
 
 
 def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors: list[str]) -> None:
-    trust_sensitive = ("CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE", "CI_BUN_IMAGE")
+    trust_sensitive = (
+        "CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE", "CI_BUN_IMAGE", "CI_NODE_IMAGE"
+    )
     for name in trust_sensitive:
         value = variables.get(name, "")
         if not value:
@@ -861,6 +863,46 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                 errors.append(
                     "CI_BUN_IMAGE digest must match the oven/bun digest(s) in "
                     "opencode4lunarwing/Dockerfile"
+                )
+
+    # The worker-kimi-ts lane must test with the same node content the worker
+    # image builds and runs with (MR !1590 review GB-2). Fail closed like the
+    # bun tie above: a missing Dockerfile, an unpinned/malformed node FROM, or
+    # no node FROM at all must not silently dissolve the tie.
+    node_match = DIGEST_PATTERN.search(variables.get("CI_NODE_IMAGE", ""))
+    if node_match:
+        if not KIMI_DOCKERFILE.is_file():
+            errors.append(
+                "kimicode4lunarwing/Dockerfile missing; cannot cross-check "
+                "CI_NODE_IMAGE against its node FROM digest(s)"
+            )
+        else:
+            dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
+            node_from_lines = [
+                line.strip()
+                for line in dockerfile_text.splitlines()
+                if re.match(r"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?\S*/node[:@]", line)
+            ]
+            if not node_from_lines:
+                errors.append(
+                    "kimicode4lunarwing/Dockerfile has no node FROM line; "
+                    "cannot cross-check CI_NODE_IMAGE"
+                )
+            dockerfile_node_digests = set()
+            for from_line in node_from_lines:
+                digest_match = re.search(r"@sha256:([0-9a-f]{64})(?![0-9a-fA-F])", from_line)
+                if digest_match:
+                    dockerfile_node_digests.add(digest_match.group(1))
+                else:
+                    errors.append(
+                        "kimicode4lunarwing/Dockerfile node FROM is not pinned "
+                        "to a 64-char lowercase sha256 digest: "
+                        f"{from_line!r}"
+                    )
+            if dockerfile_node_digests and dockerfile_node_digests != {node_match.group(1)}:
+                errors.append(
+                    "CI_NODE_IMAGE digest must match the node digest(s) in "
+                    "kimicode4lunarwing/Dockerfile"
                 )
 
     literal_images = {
