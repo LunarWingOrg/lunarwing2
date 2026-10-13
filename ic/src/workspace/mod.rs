@@ -4821,6 +4821,183 @@ mod runtime_index_tests {
         );
     }
 
+    /// WI#335: a guarded (agent tool lane) replace of a daily log whose
+    /// numbered generations are already at the cap fails closed with the
+    /// classified error before anything is discarded or shifted, while the
+    /// unguarded operator route keeps rotating on the same saturated day.
+    #[tokio::test]
+    async fn daily_log_guarded_replace_fails_closed_at_generation_cap() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let day = "daily/2026-10-04.md";
+        let backup_path = "backups/daily/2026-10-04.md.bak";
+        let cap = MAX_DAILY_LOG_BACKUP_GENERATIONS as usize;
+
+        // v0 plus replaces v1..=v(cap+1) saturate all cap slots without ever
+        // taking the discard branch: after write v(cap+1) every numbered
+        // generation exists and the next rotation would discard.
+        for version in 0..=(cap as u32 + 1) {
+            workspace
+                .write(day, &format!("version {version}"))
+                .await
+                .expect("write day log");
+        }
+
+        let err = workspace
+            .write_with_daily_log_cap_guard(day, "version blocked")
+            .await
+            .expect_err("guarded replace must fail closed at the cap");
+        assert!(
+            matches!(
+                &err,
+                WorkspaceError::DailyLogBackupCapReached { path, generations }
+                    if path == day && *generations == MAX_DAILY_LOG_BACKUP_GENERATIONS
+            ),
+            "classified cap error naming the day log, got: {err:?}"
+        );
+        assert_eq!(
+            workspace.read(day).await.expect("day log").content,
+            format!("version {}", cap + 1),
+            "the refused replace must not touch the day log"
+        );
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.2"))
+                .await
+                .expect("second-oldest generation")
+                .content,
+            "version 1",
+            "the refused replace must not discard or shift any generation"
+        );
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.{cap}"))
+                .await
+                .expect("top generation")
+                .content,
+            format!("version {}", cap - 1),
+            "the top generation is untouched by the refusal"
+        );
+
+        // The operator route (web/CLI) is intentionally unlimited: the same
+        // replace proceeds and runs the discard-at-cap rotation.
+        workspace
+            .write(day, "version blocked")
+            .await
+            .expect("operator replace still rotates at the cap");
+        assert_eq!(
+            workspace.read(day).await.expect("day log").content,
+            "version blocked"
+        );
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.2"))
+                .await
+                .expect("second-oldest generation after operator rotate")
+                .content,
+            "version 2",
+            "the operator replace discarded .2 and shifted the rest down"
+        );
+    }
+
+    /// WI#335: below the cap the guarded write behaves exactly like `write`
+    /// (generations rotate normally), and non-daily prompt files are entirely
+    /// unaffected by the guard.
+    #[tokio::test]
+    async fn daily_log_guarded_replace_rotates_normally_below_the_cap() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let day = "daily/2026-10-05.md";
+
+        workspace.write(day, "version 0").await.expect("initial write");
+        for version in 1..=3 {
+            workspace
+                .write_with_daily_log_cap_guard(day, &format!("version {version}"))
+                .await
+                .expect("guarded replace below the cap rotates like write");
+        }
+        assert_eq!(
+            workspace
+                .read("backups/daily/2026-10-05.md.bak.2")
+                .await
+                .expect("rotated generation")
+                .content,
+            "version 1",
+            "guarded replaces below the cap keep rotating generations"
+        );
+
+        // A guarded replace of a non-daily prompt file takes the ordinary
+        // single-slot shadow backup, never the cap decision.
+        workspace
+            .write(paths::MEMORY, "curated one")
+            .await
+            .expect("seed MEMORY.md");
+        workspace
+            .write_with_daily_log_cap_guard(paths::MEMORY, "curated two")
+            .await
+            .expect("guarded replace of a non-daily prompt file is unguarded in effect");
+        assert_eq!(
+            workspace
+                .read("backups/MEMORY.md.bak")
+                .await
+                .expect("shadow backup")
+                .content,
+            "curated one"
+        );
+    }
+
+    /// WI#335: the layer-scoped replace lane of the memory tool fails closed
+    /// at the cap in the layer's scope too, while the operator layer write
+    /// keeps rotating.
+    #[tokio::test]
+    async fn daily_log_guarded_layer_replace_fails_closed_at_generation_cap() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let day = "daily/2026-10-06.md";
+        let backup_path = "backups/daily/2026-10-06.md.bak";
+        let cap = MAX_DAILY_LOG_BACKUP_GENERATIONS as usize;
+
+        for version in 0..=(cap as u32 + 1) {
+            workspace
+                .write_to_layer("private", day, &format!("version {version}"), false)
+                .await
+                .expect("layer write day log");
+        }
+
+        let err = workspace
+            .write_to_layer_with_daily_log_cap_guard("private", day, "version blocked", false)
+            .await
+            .expect_err("guarded layer replace must fail closed at the cap");
+        assert!(
+            matches!(
+                &err,
+                WorkspaceError::DailyLogBackupCapReached { path, generations }
+                    if path == day && *generations == MAX_DAILY_LOG_BACKUP_GENERATIONS
+            ),
+            "classified cap error naming the layer-scope day log, got: {err:?}"
+        );
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.2"))
+                .await
+                .expect("second-oldest layer generation")
+                .content,
+            "version 1",
+            "the refused layer replace must not discard or shift any generation"
+        );
+
+        workspace
+            .write_to_layer("private", day, "version blocked", false)
+            .await
+            .expect("operator layer replace still rotates at the cap");
+        assert_eq!(
+            workspace
+                .read(&format!("{backup_path}.2"))
+                .await
+                .expect("second-oldest layer generation after operator rotate")
+                .content,
+            "version 2",
+            "the operator layer replace discarded .2 and shifted the rest down"
+        );
+    }
+
     // ==================== WI#288: daily-log quarantine ====================
 
     /// WI#288 acceptance flow: a daily log already holding unquoted poison
