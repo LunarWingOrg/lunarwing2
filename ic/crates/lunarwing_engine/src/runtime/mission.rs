@@ -1699,7 +1699,11 @@ impl MissionManager {
                 } => {
                     mission_path == path
                         && match (mission_secret.as_deref(), secret) {
-                            (Some(expected), Some(provided)) => {
+                            // WI#359 (CO-1): an empty configured secret must
+                            // never authenticate a fire — `ct_eq` treats two
+                            // empty slices as equal, and the gateway maps an
+                            // empty `X-Webhook-Secret:` header to `Some("")`.
+                            (Some(expected), Some(provided)) if !expected.is_empty() => {
                                 bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
                             }
                             // No configured secret => not triggerable (defense in depth).
@@ -6532,6 +6536,42 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_stored_webhook_secret_never_authenticates_a_fire() {
+        // WI#359 (CO-1): `subtle::ct_eq` treats two empty slices as equal,
+        // so a legacy mission stored with `secret: Some("")` could be fired
+        // by anyone presenting an empty `X-Webhook-Secret:` header. The
+        // stored-empty case must spawn zero threads, whatever is presented.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+        // validate_webhook_cadence rejects empty secrets on create/update,
+        // so stage the legacy row directly in the store.
+        let legacy = Mission::new(
+            project,
+            "test-user",
+            "legacy-hook",
+            "goal",
+            MissionCadence::Webhook {
+                path: "legacy".into(),
+                secret: Some(String::new()),
+            },
+        );
+        store.save_mission(&legacy).await.unwrap();
+        mgr.active.write().await.push(legacy.id);
+
+        for presented in [None, Some(""), Some("anything")] {
+            let fired = mgr
+                .fire_webhook_mission("legacy", presented, serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(
+                fired.is_empty(),
+                "an empty configured secret must never authenticate (presented: {presented:?})"
+            );
+        }
     }
 
     #[tokio::test]

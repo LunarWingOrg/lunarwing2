@@ -128,6 +128,19 @@ pub async fn webhook_trigger_handler(
     })))
 }
 
+/// Extract the `X-Webhook-Secret` header value for a mission webhook fire.
+///
+/// WI#359 (CO-1): an empty or whitespace-only value maps to `None` ("no
+/// secret provided") so a legacy mission stored with an empty secret can
+/// never be authenticated by presenting an empty header.
+fn mission_webhook_secret(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
 /// Handle incoming webhook POST to `/api/missions/webhook/{path}`.
 ///
 /// This endpoint routes payloads to Engine V2 `Webhook`-cadence missions.
@@ -146,10 +159,7 @@ pub async fn mission_webhook_handler(
         ));
     }
 
-    let secret = headers
-        .get("x-webhook-secret")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let secret = mission_webhook_secret(&headers);
 
     let payload = parse_mission_webhook_payload(&body)?;
 
@@ -178,6 +188,21 @@ mod tests {
     fn invalid_mission_webhook_json_maps_to_bad_request() {
         let result = parse_mission_webhook_payload(b"not-json");
         assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    /// WI#359 (CO-1): an empty or whitespace-only `X-Webhook-Secret` header
+    /// must map to `None` so it can never authenticate a legacy mission
+    /// stored with an empty secret.
+    #[test]
+    fn empty_mission_webhook_secret_header_maps_to_none() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(mission_webhook_secret(&headers), None);
+        headers.insert("x-webhook-secret", "".parse().unwrap());
+        assert_eq!(mission_webhook_secret(&headers), None);
+        headers.insert("x-webhook-secret", "   ".parse().unwrap());
+        assert_eq!(mission_webhook_secret(&headers), None);
+        headers.insert("x-webhook-secret", "real-secret".parse().unwrap());
+        assert_eq!(mission_webhook_secret(&headers).as_deref(), Some("real-secret"));
     }
 
     /// Routines with `secret: None` must be rejected with 403.
