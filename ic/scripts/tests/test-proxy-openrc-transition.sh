@@ -131,6 +131,25 @@ grep -Fq 'render-units --all-proxies' "$fixture/refused.log" \
   fi
 )
 
+# FV-2 (EQ-6 propagation): ensure_init_system's detection-failure return must
+# reach tenant_writers_active's '|| return 2'. With detection stubbed to die
+# and no override, the writer probe is unknown (2) — without the propagation
+# (mutant M6) INIT_SYSTEM stays empty yet the probe falls into the OpenRC
+# lane, where the stubbed 'started' status would read as an active writer (0).
+(
+  INIT_SYSTEM=""
+  unset LUNARWING_SERVICE_MANAGER
+  detect_init_system() { die "could not detect a supported service manager"; }
+  mv -- "$OPENRC_INITD_DIR/lunarwing-proxy-deadline" "$fixture/parked-unit"
+  rm -f -- "$fixture/service-calls"
+  rc=0
+  tenant_writers_active alice >"$fixture/writers.log" 2>&1 || rc=$?
+  mv -- "$fixture/parked-unit" "$OPENRC_INITD_DIR/lunarwing-proxy-deadline"
+  [[ "$rc" == 2 ]] || fail "detection failure classified writers as $rc, not unknown (2)"
+  [[ ! -e "$fixture/service-calls" ]] \
+    || fail 'detection failure reached rc-service in the writer probe'
+)
+
 # Help and both supported migration entrypoints remain available.
 main help >"$fixture/help.log"
 (
@@ -273,6 +292,25 @@ MATRIX
     || fail 'symlinked unit reached rc-service instead of being refused'
   grep -Fq 'not a regular init script' "$fixture/stop.log" \
     || fail 'symlinked unit refusal did not name the reason'
+)
+# FV-1: the symlink half of FL-3 needs a live target — the dangling-symlink
+# fixture above fails the -f test on its own, leaving the refusal's '-L' half
+# unpinned (mutant N3b). A symlink to an existing regular 0755 script must
+# refuse identically: rc 1, the named reason, and no rc-service call.
+(
+  OPENRC_INITD_DIR="$fixture/live-symlink-initd"
+  mkdir -p "$OPENRC_INITD_DIR"
+  printf '# real init script\n' >"$fixture/real-init-script"
+  chmod 0755 "$fixture/real-init-script"
+  ln -s "$fixture/real-init-script" "$OPENRC_INITD_DIR/lunarwing-alice"
+  rm -f -- "$fixture/service-calls"
+  rc=0
+  ( stop_tenant_openrc alice ) >"$fixture/stop.log" 2>&1 || rc=$?
+  [[ "$rc" == 1 ]] || fail 'a symlink to a real init script counted as already stopped'
+  [[ ! -e "$fixture/service-calls" ]] \
+    || fail 'symlink-to-script unit reached rc-service instead of being refused'
+  grep -Fq 'not a regular init script' "$fixture/stop.log" \
+    || fail 'symlink-to-script refusal did not name the reason'
 )
 
 # FL-4 (M3): enable-health-fleet sources mt-admin directly, bypassing main's
