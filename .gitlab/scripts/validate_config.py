@@ -814,13 +814,27 @@ def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
 
 
 def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors: list[str]) -> None:
-    trust_sensitive = ("CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE")
+    trust_sensitive = ("CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE", "CI_BUN_IMAGE")
     for name in trust_sensitive:
         value = variables.get(name, "")
         if not value:
             errors.append(f"defaults.yml must declare {name}")
         elif not IMAGE_PATTERN.search(value):
             errors.append(f"{name}={value!r} is not digest-pinned")
+
+    # The worker-opencode-ts lane must test with the same bun content the
+    # worker image builds and runs with (MR !1552 review ER-5).
+    bun_match = DIGEST_PATTERN.search(variables.get("CI_BUN_IMAGE", ""))
+    if bun_match and OPENCODE_DOCKERFILE.is_file():
+        dockerfile_text = OPENCODE_DOCKERFILE.read_text(encoding="utf-8")
+        dockerfile_bun_digests = set(
+            re.findall(r"FROM\s+\S*oven/bun\S*@sha256:([0-9a-f]{64})", dockerfile_text)
+        )
+        if dockerfile_bun_digests and dockerfile_bun_digests != {bun_match.group(1)}:
+            errors.append(
+                "CI_BUN_IMAGE digest must match the oven/bun digest(s) in "
+                "opencode4lunarwing/Dockerfile"
+            )
 
     literal_images = {
         ".worker-candidate": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51",
