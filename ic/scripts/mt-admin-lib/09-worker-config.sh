@@ -2091,9 +2091,10 @@ restart_worker() {
 # WI#357 control 9: audit listening sockets inside a tenant's running worker
 # containers against the worker exposure contract ("workers must never
 # self-expose"). In-container, non-loopback binds are expected only on the
-# bridge WS port (registry <lane>_wss) and the health port (8443), because
-# mt-admin publishes exactly those to HOST loopback; every published mapping
-# must also carry a loopback HostIp. Anything else is reported and fails the
+# bridge WS port (registry <lane>_wss) and the health port (8443), and only
+# as TCP LISTEN — those two are the ports mt-admin publishes to HOST loopback;
+# any UDP bind stays an exposure (FC-2). Every published mapping must also
+# carry a loopback HostIp. Anything else is reported and fails the
 # audit. Read-only: no container or unit state is changed.
 #
 # Run-79 EI-6 hardening:
@@ -2213,6 +2214,7 @@ worker_listeners() {  # <tenant>
         return n
       }
       $4 == "0A" || $4 == "07" {
+        proto = ($4 == "0A") ? "tcp" : "udp"
         split($2, parts, ":")
         hex = parts[1]
         port = hex2dec(parts[2])
@@ -2223,11 +2225,11 @@ worker_listeners() {  # <tenant>
           if (hex == "00000000000000000000000001000000") next  # ::1
           host = (hex == "00000000000000000000000000000000") ? "::" : "ipv6-specific"
         }
-        if (port == health || (wss != "" && port == wss)) {
-          printf "  expected non-loopback bind (published on host loopback): %s:%d\n", host, port
+        if ($4 == "0A" && (port == health || (wss != "" && port == wss))) {
+          printf "  expected non-loopback bind (published on host loopback): %s:%d/%s\n", host, port, proto
           next
         }
-        printf "  EXPOSURE: unexpected non-loopback listener: %s:%d\n", host, port
+        printf "  EXPOSURE: unexpected non-loopback listener: %s:%d/%s\n", host, port, proto
         bad++
       }
       END { exit (bad > 0 ? 1 : 0) }
