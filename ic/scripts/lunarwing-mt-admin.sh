@@ -603,8 +603,16 @@ main() {
   fi
   shift || true
 
-  openrc_dispatch_preflight "$command_name" "$@" \
-    || die "OpenRC proxy migration required; refusing $command_name"
+  if ! openrc_dispatch_preflight "$command_name" "$@"; then
+    # writers-active has a 0/1/2 state contract (active/stopped/unknown), and
+    # export-tenant/import-tenant read 1 as "stopped". A refusal is unknown —
+    # never a service state (EQ-1).
+    if [[ "$command_name" == writers-active ]]; then
+      say "OpenRC proxy migration required; writer state unknown — run: $0 render-units --all-proxies" >&2
+      exit 2
+    fi
+    die "OpenRC proxy migration required; refusing $command_name"
+  fi
 
   # An explicitly-chosen runtime persists no matter which command runs.
   # Without this, commands that never touch containers (list-tenants, tokens,
@@ -1554,7 +1562,11 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: migrate-owner-scope <name> [--from <old_scope>]"
       ports_registry_init
-      migrate_owner_scope "$name" "$old_scope"
+      # The explicit CLI arm dies on failure; migrate_owner_scope itself only
+      # returns nonzero so auto-callers (start/build/patch-env) keep their
+      # warn-and-continue contract (EQ-7).
+      migrate_owner_scope "$name" "$old_scope" \
+        || die "owner-scope migration failed for '$name'"
       ;;
 
     owner-scopes)

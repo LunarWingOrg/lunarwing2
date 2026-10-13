@@ -386,14 +386,23 @@ INITEOF
 
 # ── OpenRC service units ─────────────────────────────────────────────────────
 
+# The post-WI#376 proxy unit contract: one fixed flag line carrying no tenant
+# data. Shared by the preflight guard and the renderer, which archives only
+# installed units that fail this check.
+openrc_proxy_unit_is_safe() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  grep -Eq \
+    '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"
+}
+
 # A dependency-cache rebuild can source every init script, even for a command
 # addressing a different tenant. Inspect files as data before invoking OpenRC.
 require_safe_openrc_proxy_units() {
   local path
   for path in "$OPENRC_INITD_DIR"/lunarwing-proxy-*; do
     [[ -e "$path" || -L "$path" ]] || continue
-    if [[ ! -f "$path" || -L "$path" ]] || ! grep -Eq \
-      '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"; then
+    if ! openrc_proxy_unit_is_safe "$path"; then
       say "refusing OpenRC operation: unsafe legacy proxy unit $path; run: $0 render-units --all-proxies" >&2
       return 125
     fi
@@ -457,25 +466,53 @@ render_all_openrc_proxy_units() {
   say "OpenRC proxy units neutralized fleet-wide (file writes only; services not restarted)."
 }
 
+# Validate the configured archive location without writing anything. The
+# renderer calls this even when the installed unit needs no archive copy: an
+# archive dir inside init.d could hand OpenRC an unparseable copy at the next
+# dependency scan, so a misconfigured archive always fails the render. Every
+# refusal names the reason and LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR (EQ-5).
+openrc_proxy_backup_dir_validate() {
+  local dir init_dir
+  if ! darkirc_path_components_safe "$OPENRC_PROXY_BACKUP_DIR"; then
+    say "unsafe archive path: symlinked component in LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR" >&2
+    return 1
+  fi
+  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" \
+    || { say "unsafe archive path: cannot resolve LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR" >&2; return 1; }
+  init_dir="$(realpath -m -- "$OPENRC_INITD_DIR")" || return 1
+  if [[ "$dir" == "$init_dir" || "$dir" == "$init_dir/"* ]]; then
+    say "unsafe archive path: LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR=$OPENRC_PROXY_BACKUP_DIR must be outside $OPENRC_INITD_DIR" >&2
+    return 1
+  fi
+  if [[ -e "$dir" ]]; then
+    if [[ ! -d "$dir" || -L "$dir" || "$(stat -c '%u:%a' -- "$dir")" != "$EUID:700" ]]; then
+      say "unsafe archive dir $dir (LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR): must be a non-symlink dir owned by EUID $EUID with mode 0700" >&2
+      return 1
+    fi
+  fi
+}
+
 # Preserve the installed bytes before replacement, including suspicious URLs.
 # CLI writers require root; EUID also permits isolated non-root test fixtures.
 # The archive is private, outside init.d, non-executable, and never sourced.
 backup_openrc_proxy_unit() {
-  local path="$1" dir init_dir backup
+  local path="$1" dir backup
   [[ -e "$path" || -L "$path" ]] || return 0
-  [[ -f "$path" && ! -L "$path" ]] || return 1
-  darkirc_path_components_safe "$OPENRC_PROXY_BACKUP_DIR" || return 1
-  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" || return 1
-  init_dir="$(realpath -m -- "$OPENRC_INITD_DIR")" || return 1
-  [[ "$dir" != "$init_dir" && "$dir" != "$init_dir/"* ]] || return 1
-  if [[ ! -e "$dir" ]]; then
-    install -d -m 0700 -- "$dir" || return 1
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    say "cannot safely back up $path: not a regular file (symlink?); installed unit was not replaced" >&2
+    return 1
   fi
-  [[ -d "$dir" && ! -L "$dir" && "$(stat -c '%u:%a' -- "$dir")" == "$EUID:700" ]] \
-    || return 1
-  backup="$(mktemp "$dir/${path##*/}.XXXXXX")" || return 1
+  openrc_proxy_backup_dir_validate || return 1
+  dir="$(realpath -m -- "$OPENRC_PROXY_BACKUP_DIR")" || return 1
+  if [[ ! -e "$dir" ]]; then
+    install -d -m 0700 -- "$dir" \
+      || { say "cannot safely back up $path: cannot create backup dir $dir; installed unit was not replaced" >&2; return 1; }
+  fi
+  backup="$(mktemp "$dir/${path##*/}.XXXXXX")" \
+    || { say "cannot safely back up $path: mktemp failed in $dir; installed unit was not replaced" >&2; return 1; }
   if ! cat -- "$path" >"$backup" || ! chmod 0600 "$backup"; then
     rm -f -- "$backup"
+    say "cannot safely back up $path: copy to $dir failed; installed unit was not replaced" >&2
     return 1
   fi
   say "preserved installed proxy unit: $backup"
@@ -549,10 +586,22 @@ INITEOF
     rm -f -- "$tmp"
     return 1
   fi
-  if ! backup_openrc_proxy_unit "$path"; then
+  # The archive location is validated on every render, even when this render
+  # writes no copy: an archive dir inside init.d could hand OpenRC an
+  # unparseable copy at the next dependency scan, so misconfiguration refuses.
+  if ! openrc_proxy_backup_dir_validate; then
     rm -f -- "$tmp"
-    say "cannot safely back up $path; installed unit was not replaced" >&2
     return 1
+  fi
+  # Archive only units that fail the safe-unit contract (legacy or damaged
+  # installs whose bytes may carry a payload). Re-rendering an already-safe
+  # unit must not grow the archive on every upgrade or --all-proxies sweep
+  # (EQ-4); safe bytes are reproducible from the renderer, so nothing is lost.
+  if [[ -e "$path" || -L "$path" ]] && ! openrc_proxy_unit_is_safe "$path"; then
+    backup_openrc_proxy_unit "$path" || {
+      rm -f -- "$tmp"
+      return 1
+    }
   fi
   if ! chmod 0755 "$tmp" || ! mv -T -- "$tmp" "$path"; then
     rm -f -- "$tmp"
@@ -1479,14 +1528,18 @@ stop_tenant_openrc() {
   local name="$1"
   require_safe_openrc_proxy_units || return 1
   local stop_failed=false worker
-  _openrc_stop_service "lunarwing-${name}" || stop_failed=true
-  _openrc_stop_service "xmpp-bridge-${name}" || stop_failed=true
+  # Every unit is stopped only when its init script is installed: an absent
+  # unit is already stopped, so a partially provisioned or partially removed
+  # tenant never makes remove-tenant/upgrade-tenant permanently refuse (EQ-2).
+  # A refusal (125) or a failed stop of an installed unit still fails the stop.
+  _openrc_stop_service_if_installed "lunarwing-${name}" || stop_failed=true
+  _openrc_stop_service_if_installed "xmpp-bridge-${name}" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-proxy-${name}" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-weechat-adapter-${name}" || stop_failed=true
   _openrc_stop_service_if_installed "lunarwing-weechat-${name}" || stop_failed=true
   if tenant_darkirc_enabled "$name"; then
-    _openrc_stop_service "lunarwing-darkirc-adapter-${name}" || stop_failed=true
-    _openrc_stop_service "lunarwing-darkirc-${name}" || stop_failed=true
+    _openrc_stop_service_if_installed "lunarwing-darkirc-adapter-${name}" || stop_failed=true
+    _openrc_stop_service_if_installed "lunarwing-darkirc-${name}" || stop_failed=true
   fi
   # Container babysitters must stop before their containers or they immediately respawn them.
   for worker in nanocode pebble opencode kimi opencode2 vision voice; do
@@ -1496,7 +1549,7 @@ stop_tenant_openrc() {
   _openrc_stop_service_if_installed "lunarwing-voice-${name}" || stop_failed=true
   # Postgres last: the daemon depends on it, so it stops after its consumers.
   _openrc_stop_service_if_installed "lunarwing-pg-${name}-sup" || stop_failed=true
-  _openrc_stop_service "lunarwing-pg-${name}" || stop_failed=true
+  _openrc_stop_service_if_installed "lunarwing-pg-${name}" || stop_failed=true
   if [[ "$stop_failed" == true ]]; then
     say "OpenRC tenant shutdown completed with service stop errors for $name"
     return 1
@@ -1544,11 +1597,17 @@ cleanup_legacy_weechat_openrc() {
 }
 
 uninstall_tenant_openrc() {
-  local name="$1"
+  local name="$1" svc failed=false
   for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-opencode2-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-voice-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-opencode2-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}-sup"; do
     _openrc_update del "$svc" default 2>/dev/null || true
-    rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
+    # rm failures must reach the caller's '|| die': previously the trailing
+    # say always returned 0, making that guard dead code (EQ-8).
+    rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc" || failed=true
   done
+  if [[ "$failed" == true ]]; then
+    say "failed to remove one or more OpenRC unit files for $name" >&2
+    return 1
+  fi
   say "uninstalled OpenRC services for $name"
 }
 

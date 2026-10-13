@@ -45,7 +45,14 @@ detect_init_system() {
 
 INIT_SYSTEM=""
 ensure_init_system() {
-  [[ -n "$INIT_SYSTEM" ]] || INIT_SYSTEM="$(detect_init_system)"
+  # Propagate detection failure: detect_init_system die()s inside the command
+  # substitution, which only fails the subshell — the assignment still leaves
+  # INIT_SYSTEM empty and, without this check, the function returned 0, so
+  # guards like 'ensure_init_system || return 1' never fired (EQ-6).
+  if [[ -z "$INIT_SYSTEM" ]]; then
+    INIT_SYSTEM="$(detect_init_system)" || return 1
+    [[ -n "$INIT_SYSTEM" ]] || return 1
+  fi
   if [[ -z "$HEALTH_INTERVAL_MIN" ]]; then
     if [[ "$INIT_SYSTEM" == "openrc" ]]; then
       HEALTH_INTERVAL_MIN=5

@@ -83,6 +83,25 @@ rc=0
 tenant_writers_active alice >"$fixture/refused.log" 2>&1 || rc=$?
 [[ "$rc" == 2 ]] || fail 'refusal path containing dead was classified as stopped'
 
+# EQ-1: at the CLI boundary a dispatcher refusal is "unknown" (exit 2) for
+# writers-active — never 1, which export-tenant/import-tenant read as stopped.
+rc=0
+(main writers-active alice) >"$fixture/refused.log" 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "main writers-active refusal exited $rc, not 2"
+grep -Fq 'render-units --all-proxies' "$fixture/refused.log" \
+  || fail 'main writers-active refusal omitted the repair command'
+
+# EQ-6 Q3: production main() starts with INIT_SYSTEM empty (01-detect.sh), so
+# the preflight must detect the init system itself; with INIT_SYSTEM cleared
+# and the override selecting openrc, a legacy unit must still refuse before
+# the (stubbed) handler can run. Pins the preflight's ensure_init_system.
+(
+  INIT_SYSTEM=""
+  export LUNARWING_SERVICE_MANAGER=openrc
+  status_tenant() { printf 'status\n' >>"$fixture/destructive"; }
+  expect_refusal preflight-detects-openrc main status alice
+)
+
 # Help and both supported migration entrypoints remain available.
 main help >"$fixture/help.log"
 (
@@ -100,5 +119,36 @@ main help >"$fixture/help.log"
   main remove-tenant alice
 )
 [[ -f "$fixture/systemd" ]] || fail 'OpenRC preflight blocked systemd'
+
+# EQ-6: with no legacy unit present, restore's daemon probe classification is
+# fail-closed: indeterminate OpenRC status codes (1, 32) refuse; only a
+# positively-stopped daemon (rc 3) reaches pg_restore. The subshells sit in an
+# if-condition so die()'s subshell exit cannot trip the harness errexit.
+rm -f -- "$OPENRC_INITD_DIR/lunarwing-proxy-deadline"
+for probe_rc in 1 32; do
+  if (
+    rc-service() { return "$probe_rc"; }
+    restore_tenant_postgres alice "$fixture/backup.dump" true
+  ) >"$fixture/probe.log" 2>&1; then
+    fail "restore proceeded with indeterminate probe rc=$probe_rc"
+  fi
+  grep -Fq "cannot confirm" "$fixture/probe.log" \
+    || fail "restore rc=$probe_rc refused without the fail-closed reason"
+  [[ ! -e "$fixture/restore-ran" ]] || fail "restore rc=$probe_rc ran pg_restore"
+done
+if ! (
+  rc-service() { return 3; }
+  _ctr() {
+    if [[ "$*" == *pg_restore* ]]; then
+      printf 'restore\n' >>"$fixture/restore-ran"
+    else
+      printf 'true\n'
+    fi
+  }
+  restore_tenant_postgres alice "$fixture/backup.dump" true
+) >"$fixture/probe.log" 2>&1; then
+  fail 'restore with positively-stopped daemon (rc 3) was refused'
+fi
+[[ -e "$fixture/restore-ran" ]] || fail 'restore with rc 3 did not reach pg_restore'
 
 printf 'ALL TESTS PASSED\n'
