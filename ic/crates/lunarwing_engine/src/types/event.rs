@@ -127,24 +127,64 @@ fn redact_http_surface(redacted: &mut serde_json::Value) {
         let sanitized = lunarwing_safety::sanitize_url_credentials(url);
         redacted["url"] = serde_json::Value::String(sanitized);
     }
+    let Some(headers) = redacted.get_mut("headers") else {
+        return;
+    };
+    if let serde_json::Value::String(raw) = headers {
+        // Run-91 FI-1: the http tool also accepts `headers` as a JSON
+        // string, and the approval gate runs on the coerced copy — the
+        // persisted event would otherwise keep the exact credential that
+        // caused the gate. Parse, redact inside, and re-serialise;
+        // anything unparseable fails closed.
+        let raw = std::mem::take(raw);
+        *headers = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(mut parsed) => {
+                redact_header_pairs(&mut parsed);
+                serde_json::Value::String(parsed.to_string())
+            }
+            Err(_) => serde_json::Value::String("[REDACTED]".into()),
+        };
+    } else {
+        redact_header_pairs(headers);
+    }
+}
+
+/// Whether one header name/value pair carries a credential (run-91
+/// FI-2/FI-3): the name check unions the header heuristic with the shared
+/// credential-key list (so `X-Goog-Api-Key`, `apikey`, or `api_key` are
+/// caught), and a value starting with an auth-scheme prefix (`Bearer `,
+/// `Basic `, …) is redacted even under an innocuous name.
+fn header_pair_is_credential(name: &str, value: &serde_json::Value) -> bool {
+    lunarwing_safety::header_name_carries_credentials(name)
+        || lunarwing_safety::is_credential_param_key(name)
+        || value
+            .as_str()
+            .is_some_and(lunarwing_safety::header_value_carries_credentials)
+}
+
+/// Blank credential-carrying header values in object or array form.
+fn redact_header_pairs(headers: &mut serde_json::Value) {
     let is_present = |value: &serde_json::Value| {
         !value.is_null() && !matches!(value, serde_json::Value::String(s) if s.is_empty())
     };
-    match redacted.get_mut("headers") {
-        Some(serde_json::Value::Object(map)) => {
+    match headers {
+        serde_json::Value::Object(map) => {
             for (name, value) in map.iter_mut() {
-                if lunarwing_safety::header_name_carries_credentials(name) && is_present(value) {
+                if header_pair_is_credential(name, value) && is_present(value) {
                     *value = serde_json::Value::String("[REDACTED]".into());
                 }
             }
         }
-        Some(serde_json::Value::Array(items)) => {
+        serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
-                let credential_header = item
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(lunarwing_safety::header_name_carries_credentials);
-                if credential_header
+                let credential = match (
+                    item.get("name").and_then(|n| n.as_str()),
+                    item.get("value"),
+                ) {
+                    (Some(name), Some(value)) => header_pair_is_credential(name, value),
+                    _ => false,
+                };
+                if credential
                     && let Some(value) = item.get_mut("value")
                     && is_present(value)
                 {
@@ -528,6 +568,84 @@ mod tests {
         let redacted = redact_event_params("http", &params);
         assert_eq!(redacted["headers"]["X-Api-Key"], "[REDACTED]");
         assert_eq!(redacted["headers"]["Accept"], "text/html");
+    }
+
+    #[test]
+    fn redact_event_params_http_string_headers_are_redacted_fail_closed() {
+        // Run-91 FI-1: the http tool accepts `headers` as a JSON string and
+        // the approval gate runs on the coerced copy, so the persisted
+        // event must not keep the raw string either.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": "[{\"name\":\"Authorization\",\"value\":\"Bearer raw-token\"}]",
+        });
+        let redacted = redact_event_params("http", &params);
+        let headers = redacted["headers"].as_str().expect("stays a string");
+        assert!(!headers.contains("raw-token"), "credential leaked: {headers}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(headers).expect("re-serialised headers stay valid JSON");
+        assert_eq!(parsed[0]["value"], "[REDACTED]");
+        assert_eq!(parsed[0]["name"], "Authorization");
+
+        // Object form inside the string is covered too.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": "{\"X-Api-Key\":\"raw-key\"}",
+        });
+        let redacted = redact_event_params("http", &params);
+        let headers = redacted["headers"].as_str().expect("stays a string");
+        assert!(!headers.contains("raw-key"), "credential leaked: {headers}");
+
+        // An unparseable string fails closed.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": "Authorization: Bearer raw-token",
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"], "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_event_params_http_value_prefix_credential_is_redacted() {
+        // Run-91 FI-2: the approval gate reacts to auth-scheme value
+        // prefixes, so redaction must blank them even under an innocuous
+        // header name — in both array and object form.
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": [{"name": "X-Custom", "value": "Bearer raw-token"}],
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"][0]["value"], "[REDACTED]");
+
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": {"X-Custom": "Basic dXNlcjpwYXNz"},
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"]["X-Custom"], "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_event_params_http_uses_the_shared_credential_key_list() {
+        // Run-91 FI-3: header and query checks union the http heuristic
+        // with the shared credential-key list, so the documented schema
+        // shape (array form) and provider key styles are covered.
+        let params = serde_json::json!({
+            "url": "https://api.example.com/data?x-api-key=raw-key&q=hello",
+            "headers": [{"name": "X-Goog-Api-Key", "value": "raw-goog-key"}],
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"][0]["value"], "[REDACTED]");
+        let url = redacted["url"].as_str().expect("url stays a string");
+        assert!(!url.contains("raw-key"), "query credential leaked: {url}");
+        assert!(url.contains("q=hello"), "safe query param dropped: {url}");
+
+        let params = serde_json::json!({
+            "url": "https://api.example.com",
+            "headers": {"apikey": "raw-key"},
+        });
+        let redacted = redact_event_params("http", &params);
+        assert_eq!(redacted["headers"]["apikey"], "[REDACTED]");
     }
 
     #[test]
