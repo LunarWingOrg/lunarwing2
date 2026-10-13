@@ -128,12 +128,15 @@ migrate_owner_scope() {
   tables="$(owner_scope_tables)"
 
   # Stop the daemon first so it doesn't re-create 'default' rows mid-migration.
+  # Return, don't die: start/build/patch-env call this function automatically
+  # and expect a return code for their warn-and-continue contract (EQ-7); the
+  # explicit migrate-owner-scope CLI arm dies on the nonzero return.
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     _systemctl_user "$name" stop "lunarwing-${name}.service" 2>/dev/null || true
   else
     _openrc_service "lunarwing-${name}" stop \
-      || die "stop failed; refusing owner-scope migration for '$name'"
+      || { say "stop failed; refusing owner-scope migration for '$name'" >&2; return 1; }
   fi
 
   # Connect over the container's LOCAL SOCKET — psql runs INSIDE the pg container via
