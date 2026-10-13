@@ -59,23 +59,32 @@ or finish that task before dispatching another.
 
 When `opencode serve` fails a request with its bare HTTP 500 wrapper
 ("Unexpected server error. Check server logs for details."), the task error
-returned to LunarWing automatically includes a bounded tail (last 25 lines /
-8 KiB, long lines truncated) of the serve process log, where the real root
-cause is printed. The entrypoint captures that log to `OPENCODE_SERVE_LOG`
-(default `/var/log/lunarwing/opencode-serve.log`, host-visible at `./logs` in
-the compose layout) while keeping it on container stdout; set the variable to
-relocate it. If the path is not writable the worker starts without capture
-(warning logged) and errors arrive unenriched, as before.
+returned to LunarWing automatically includes the real root cause, read from
+serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/
+opencode.log`; at the pinned v1.18.25 that is where the server's error
+middleware logs the cause — container stdout does not carry it). Only
+`level=Error` lines appended after the task started are considered, and when
+the failing response carries its unique `ref=err_…` id only that request's
+line is attached, so a concurrent task's failure never leaks into another
+job's record. The tail is bounded (last 25 lines / 8 KiB, 400-character
+code-point line cap) and known secret values (bridge credentials and this
+task's injected environment) are redacted before anything is persisted. The
+read is symlink- and FIFO-safe. Set `OPENCODE_SERVE_LOG` to override the log
+path or to an explicit empty value (`OPENCODE_SERVE_LOG=`) to disable the
+enrichment entirely. The structured log lives in the container (persisted in
+the `opencode-data` volume in the compose layout); it is not rotated, so
+long-lived containers accumulate it — inspect or prune it via `podman exec`.
 
-> **Known issue (WI#320 F4 / WI#374):** at the pinned v1.18.25, every task
-> dispatch fails in the LunarWing worker shape — `opencode serve` crashes in
-> `SystemPrompt.environment` (`undefined is not an object (evaluating
-> 'a.name')`) while building the prompt, before any model call. v1.18.29 ships
-> two further regressions (see the Dockerfile pin note), so the lane stays at
-> v1.18.25 and is effectively unusable until upstream fixes land; the opencode2
-> worker (`mode: "opencode2"`) is the working lane. The log-tail enrichment
-> above is what surfaces this crash in the job error instead of the bare 500
-> wrapper.
+> **Known issue (WI#320 F4, tracked as WI#333):** at the pinned v1.18.25,
+> every task dispatch fails in the LunarWing worker shape — `opencode serve`
+> crashes in `SystemPrompt.environment` (`undefined is not an object
+> (evaluating 'a.name')`) while building the prompt, before any model call.
+> v1.18.29 ships two further regressions (see the Dockerfile pin note), so
+> the lane stays at v1.18.25 and is effectively unusable until upstream fixes
+> land; the opencode2 worker (`mode: "opencode2"`) is the working lane, and
+> the v1 lane is expected to be retired in v2.1.7.0 (goals item 34). The
+> enrichment above is what surfaces this crash in the job error instead of
+> the bare 500 wrapper.
 
 ## Usage
 
