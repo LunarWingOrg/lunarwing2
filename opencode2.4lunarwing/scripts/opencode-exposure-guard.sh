@@ -27,7 +27,10 @@
 #                             the worker's server must stay on loopback
 #                             (every --hostname occurrence is checked)
 #
-# Everything else execs the real binary unchanged.
+# Everything else execs the real binary unchanged. Server-backed commands can
+# spawn that binary without passing through this wrapper; entrypoint.sh resets
+# service.json to disabled=true at boot so they default to private servers.
+# The agent can rewrite that live config, so this is still a naive-use guard.
 set -eu
 
 REAL_OPENCODE="${LUNARWING_REAL_OPENCODE:-/usr/local/lib/opencode2/opencode}"
@@ -53,9 +56,9 @@ for arg in "$@"; do
     continue
   fi
   case "$arg" in
-    service) refuse "service" "service mode is disabled in LunarWing worker images" ;;
+    service) refuse "service" "explicit service commands are disabled by the worker wrapper" ;;
     pair) refuse "pair" "pairing links are disabled in LunarWing worker images" ;;
-    --service | --service=*) refuse "serve --service" "service mode is disabled in LunarWing worker images" ;;
+    --service | --service=*) refuse "serve --service" "explicit service commands are disabled by the worker wrapper" ;;
     --hostname) want_host=1 ;;
     --hostname=*) is_loopback "${arg#--hostname=}" || refuse "--hostname ${arg#--hostname=}" "the worker's opencode server must bind loopback only" ;;
   esac

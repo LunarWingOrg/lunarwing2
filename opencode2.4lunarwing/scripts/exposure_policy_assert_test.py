@@ -44,6 +44,9 @@ def write_lane(root: pathlib.Path, *, name: str = "opencode2.4lunarwing") -> pat
         "# comment naming opencode service mode is prose, not an invocation\n"
         'OPENCODE_SERVE_HOST="${OPENCODE_SERVE_HOST:-127.0.0.1}"\n'
         'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"\n'
+        'SERVICE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"\n'
+        'mkdir -p "$SERVICE_CONFIG_DIR"\n'
+        "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\"\n"
         'mkdir -p "$WORKSPACE_ROOT/.opencode"\n'
         'rm -f "$WORKSPACE_ROOT/.opencode/opencode2.json"\n'
         'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"\n'
@@ -130,6 +133,19 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         result = run_assert("--lane", str(self.lane))
         self.assertEqual(result.returncode, 1)
         self.assertIn("OPENCODE_BIN", result.stderr)
+
+    def test_implicit_service_disable_must_be_executable_before_dispatch(self) -> None:
+        entrypoint = self.lane / "entrypoint.sh"
+        original = entrypoint.read_text(encoding="utf-8")
+        write = "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\""
+        for replacement in ("", "# " + write, write.replace("true", "false"),
+                            'case "$MODE" in\n' + write,
+                            write.replace("service.json", "wrong.json")):
+            with self.subTest(replacement=replacement):
+                entrypoint.write_text(original.replace(write, replacement), encoding="utf-8")
+                result = run_assert("--lane", str(self.lane))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must write service.json with disabled=true", result.stderr)
 
     def test_password_mentioned_only_in_comment_fails(self) -> None:
         # run-79 EI-8: a substring check is satisfied by prose; the structural
@@ -267,7 +283,7 @@ class ExposureGuardWrapperTests(unittest.TestCase):
         ):
             result = self.run_wrapper(*form)
             self.assertEqual(result.returncode, 77, (form, result.stderr))
-            self.assertIn("service mode is disabled", result.stderr)
+            self.assertIn("explicit service commands are disabled", result.stderr)
 
     def test_every_hostname_occurrence_is_checked(self) -> None:
         # EU-2: last-value-wins parsing means a second --hostname 0.0.0.0

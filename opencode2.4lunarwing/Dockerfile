@@ -232,7 +232,7 @@ COPY --from=builder /build/opencode/packages/schema/package.json /app/node_modul
 COPY --from=builder /build/opencode/packages/protocol/src /app/node_modules/@opencode/protocol/src
 COPY --from=builder /build/opencode/packages/protocol/package.json /app/node_modules/@opencode/protocol/package.json
 
-COPY --chown=opencode2:opencode2 entrypoint.sh health_server.py agent_comm_protocol.json ./
+COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
 # WI#357 (run-79 EI-5): the exposure controls (wrapper, policy assert,
 # compile-out guard, lane config) must be root-owned and read-only — the
 # agent user gets edit/write on the workspace, so an agent-writable config
@@ -240,11 +240,13 @@ COPY --chown=opencode2:opencode2 entrypoint.sh health_server.py agent_comm_proto
 # would reload, and an agent-writable bridge ruleset would take effect at
 # the next bridge restart. The entrypoint re-derives the runtime config
 # from this read-only copy at every boot (workspace copy is untrusted).
+# The boot script, health server and protocol are protected too: a container
+# restart reuses its filesystem, so an agent edit there would otherwise persist.
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
 RUN chmod +x /app/entrypoint.sh /app/health_server.py \
-    && chmod -R a-w /app/scripts /app/config
+    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json
 
 # WI#357: install the exposure-guard wrapper as the only PATH-visible
 # opencode entrypoint, then fail the BUILD when the policy regresses:
@@ -313,6 +315,7 @@ RUN set -eu; \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
+    && python3 scripts/entrypoint_config_test.py \
     && python3 scripts/compile_out_remote_tunnel_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
            [ ! -e "$leaked" ] \
@@ -326,6 +329,9 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
              /var/log/lunarwing \
              /app/results \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
+
+# Check the final runtime filesystem, after all COPY/chown/chmod operations.
+RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem
 
 # ── ports ──────────────────────
 EXPOSE 8443

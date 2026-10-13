@@ -36,7 +36,9 @@ DOCKERFILE_LINES = (
     "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode\n",
     "COPY scripts/ ./scripts/\n",
     "COPY config/ ./config/\n",
-    "RUN chmod -R a-w /app/scripts /app/config\n",
+    "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./\n",
+    "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json\n",
+    "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem\n",
 )
 
 
@@ -74,7 +76,8 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             # a PATH of just the tools the guard needs, with no git in it.
             minimal = self.root / "nogit-bin"
             minimal.mkdir(exist_ok=True)
-            for tool in ("bash", "sh", "python3", "grep", "dirname"):
+            for tool in ("bash", "sh", "python3", "grep", "dirname", "cp", "mkdir",
+                         "chmod", "rm", "ln", "date"):
                 target = shutil.which(tool)
                 if target is None:
                     raise AssertionError(f"required tool {tool!r} not found")
@@ -185,6 +188,34 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         result = self.run_guard(self.root)
         self.assertEqual(result.returncode, 1)
         self.assertIn("read-only", result.stderr)
+
+    def test_dockerfile_agent_owned_boot_files_fails(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for owner in ("opencode2:opencode2", "10003:10003"):
+            for name in ("entrypoint.sh", "health_server.py", "agent_comm_protocol.json"):
+                with self.subTest(owner=owner, name=name):
+                    dockerfile.write_text(original + f"COPY --chown={owner} {name} ./\n")
+                    result = self.run_guard(self.root)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("boot files must be root-owned", result.stderr)
+
+    def test_dockerfile_writable_boot_file_fails(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for name in ("entrypoint.sh", "health_server.py", "agent_comm_protocol.json"):
+            with self.subTest(name=name):
+                dockerfile.write_text(original.replace(f" /app/{name}", ""))
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("read-only", result.stderr)
+
+    def test_dockerfile_missing_filesystem_assertion_fails(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        dockerfile.write_text(dockerfile.read_text().replace(" --image-filesystem", ""))
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("verify installed policy-file ownership", result.stderr)
 
     def test_executor_missing_deny_fails(self):
         executor = self.root / "opencode2.4lunarwing" / "scripts" / "opencode_task_executor.ts"

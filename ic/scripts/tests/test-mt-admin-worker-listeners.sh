@@ -60,13 +60,26 @@ _ctr() {  # <tenant> inspect -f <format> <container>  →  $1 $2 $3 $4 $5
   if [[ "$fmt" == *State.Running* ]]; then
     case "${FIXTURE_STATE[$lane]:-absent}" in
       absent) printf 'Error: no such container %s\n' "$container" >&2; return 1 ;;
+      absent-podman) printf 'Error: no such object: "%s"\n' "$container" >&2; return 125 ;;
+      absent-docker) printf 'Error: No such object: %s\n' "$container" >&2; return 1 ;;
+      absent-daemon) printf 'Error response from daemon: No such container: %s\n' "$container" >&2; return 1 ;;
+      wrong-container) printf 'Error: no such container %s-other\n' "$container" >&2; return 1 ;;
+      absence-success) printf 'Error: no such container %s\n' "$container" >&2; return 0 ;;
+      missing-user) printf "id: 'acorn': no such user\n" >&2; return 1 ;;
+      missing-runtime) printf 'Error: stat /run/user/1234: no such file or directory\n' >&2; return 1 ;;
       stopped) printf 'false %d\n' "$NEXT_PID" ;;
       inspect-error) printf 'sudo: connection refused\n' >&2; return 1 ;;
+      state-on-error) printf 'true %d\n' "$NEXT_PID"; return 1 ;;
+      warn-running:*) printf 'WARN[0000] runtime warning\n' >&2; printf 'true %s\n' "${FIXTURE_STATE[$lane]#warn-running:}" ;;
       running:*) printf 'true %s\n' "${FIXTURE_STATE[$lane]#running:}" ;;
     esac
     return 0
   fi
   if [[ "$fmt" == *PortBindings* ]]; then
+    if [[ "${FIXTURE_BINDINGS[$lane]:-}" == inspect-error ]]; then
+      printf 'runtime: connection refused\n' >&2
+      return 1
+    fi
     printf '%s' "${FIXTURE_BINDINGS[$lane]:-null}"
     return 0
   fi
@@ -243,6 +256,50 @@ mark_absent opencode2
 mark_absent kimi
 run_audit
 expect_finding "unreadable netns is a finding" "could not read /proc/"
+
+# FC-1: absence is a non-zero inspect with a runtime diagnostic naming this
+# exact container. Docker capitalisation and Podman quoting both occur live.
+for shape in absent-podman absent-docker absent-daemon; do
+  reset_fixtures
+  FIXTURE_STATE[pebble]="$shape"
+  run_audit
+  if [[ "$AUDIT_RC" -eq 0 && "$AUDIT_OUT" == *"pebble: not present"* ]]; then
+    pass "$shape is recognised as absent"
+  else
+    fail "$shape is recognised as absent (rc=$AUDIT_RC, output: $AUDIT_OUT)"
+  fi
+done
+
+for shape in missing-user missing-runtime wrong-container absence-success state-on-error; do
+  reset_fixtures
+  FIXTURE_STATE[pebble]="$shape"
+  run_audit
+  expect_finding "$shape cannot turn an inspect failure into clean" "INSPECT FAILED"
+done
+
+reset_fixtures
+assign_running pebble
+FIXTURE_STATE[pebble]="warn-${FIXTURE_STATE[pebble]}"
+run_audit
+if [[ "$AUDIT_RC" -eq 0 && "$AUDIT_OUT" == *"pebble: lunarwing-pebble-acorn pid"* ]]; then
+  pass "warning before valid state still audits running container"
+else
+  fail "warning before valid state (rc=$AUDIT_RC, output: $AUDIT_OUT)"
+fi
+# Prove the warning did not skip the running container's mapping audit.
+FIXTURE_BINDINGS[pebble]='{"9090/tcp":[{"HostIp":"0.0.0.0","HostPort":"9090"}]}'
+run_audit
+expect_finding "warning-prefixed state still checks mappings" "HostIp 0.0.0.0"
+
+reset_fixtures
+assign_running pebble
+FIXTURE_BINDINGS[pebble]=inspect-error
+run_audit
+expect_finding "PortBindings inspect failure is a finding" "INSPECT FAILED: could not read PortBindings"
+
+FIXTURE_BINDINGS[pebble]='invalid-json'
+run_audit
+expect_finding "PortBindings parse failure is a finding" "could not parse PortBindings"
 
 # 11. The REAL _worker_listeners_read (rootful branch) reads a live
 # process's /proc net tables host-side — the same read the audit performs

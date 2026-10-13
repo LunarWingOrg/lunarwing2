@@ -17,16 +17,18 @@ Assertions (opencode2 lane):
   4. entrypoint.sh starts the server with a password and a loopback default
      hostname, never invokes service mode, never passes --service, defaults
      OPENCODE_BIN to the exposure-guard wrapper (not the real binary), and
-     re-derives the runtime config from /app/config at boot (controls 2+4;
-     structural checks — comments cannot satisfy them).
+     disables implicit service startup and re-derives the runtime config
+     from /app/config at boot (controls 2+4; expected startup-shape checks).
   5. scripts/opencode-exposure-guard.sh exists and scans every argv token:
      service/pair subcommands, the --service flag, and every --hostname
      occurrence (control 2, wrapper layer).
   6. --binary PATH: the built opencode binary contains no OpenTunnel client
      markers (controls 5 + 8).
+  7. --image-filesystem: the installed boot files, scripts and config are
+     root-owned and read-only (image builds only).
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
-entrypoint-loopback/password checks apply (v1.18.25 has no service mode or
+entrypoint-loopback checks apply (v1.18.25 has no service mode or
 tunnel; pairing is a v2 surface).
 """
 
@@ -159,9 +161,21 @@ def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
             check("entrypoint.sh sets a server password")
         else:
             fail(f"{entrypoint} must export OPENCODE_PASSWORD before serve")
+        # FB-1: implicit Service.ensure spawns the real binary, so argv checks
+        # alone cannot stop it. Pin the boot-time default before mode dispatch.
+        boot = code.split('case "$MODE" in', 1)[0]
+        service_setup = (
+            'SERVICE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"',
+            'mkdir -p "$SERVICE_CONFIG_DIR"',
+            "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\"",
+        )
+        if all(line in boot.splitlines() for line in service_setup):
+            check("entrypoint.sh disables implicit shared-service startup at boot")
+        else:
+            fail(f"{entrypoint} must write service.json with disabled=true before mode dispatch")
         # run-79 EI-5: the workspace config copy is untrusted — it must be
         # regenerated from the root-owned /app/config at every boot (copy or
-        # symlink), so agent edits cannot persist across restarts.
+        # symlink). The live copy remains agent-writable within a session.
         copies = 'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in code
         links = 'ln -sfn /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in code
         if copies or links:
@@ -212,6 +226,29 @@ def check_binary(binary: pathlib.Path) -> None:
     check(f"{binary.name} contains no OpenTunnel client markers")
 
 
+def check_image_filesystem(lane: pathlib.Path) -> None:
+    """FB-4: check actual image metadata, not just Dockerfile text."""
+    paths = [lane, *(lane / name for name in (
+        "entrypoint.sh", "health_server.py", "agent_comm_protocol.json",
+    ))]
+    for name in ("scripts", "config"):
+        tree = lane / name
+        paths.extend((tree, *tree.rglob("*")))
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            fail(f"image policy file unreadable: {path}: {error}")
+            continue
+        # /app must prevent replacement of its children; its root-only write
+        # bit is fine. All protected children must have no write bits at all.
+        writable = metadata.st_mode & (0o022 if path == lane else 0o222)
+        if metadata.st_uid != 0 or writable or path.is_symlink():
+            fail(f"image policy path must be root-owned and read-only: {path}")
+    if not failures:
+        check("image boot files, scripts and config are root-owned and read-only")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -225,6 +262,11 @@ def main() -> int:
         type=pathlib.Path,
         default=None,
         help="built opencode binary to scan for OpenTunnel markers (image builds)",
+    )
+    parser.add_argument(
+        "--image-filesystem",
+        action="store_true",
+        help="verify installed policy-file ownership/modes (image builds only)",
     )
     parser.add_argument(
         "--config",
@@ -255,6 +297,8 @@ def main() -> int:
         check_wrapper(lane)
     if args.binary is not None:
         check_binary(args.binary)
+    if args.image_filesystem:
+        check_image_filesystem(lane)
 
     if failures:
         print(f"exposure policy: {len(failures)} check(s) FAILED for {lane}", file=sys.stderr)

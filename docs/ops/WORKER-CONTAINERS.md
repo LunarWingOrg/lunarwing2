@@ -132,30 +132,44 @@ Enforced controls (opencode2 lane unless noted):
    `/usr/local/bin/opencode` (real binary at `/usr/local/lib/opencode2/opencode`),
    scanning **every argv token**: `service`/`pair` subcommands, the
    `--service` flag, and every `--hostname` occurrence (loopback only).
-   Both layers are naive-use guards — they stop the routine command
-   surface, not a deliberately obfuscated invocation of the real binary.
+   Server-backed commands such as `run` and `session list` can spawn the real
+   binary directly via `Service.ensure`, bypassing the wrapper. At each boot
+   the entrypoint writes `{"disabled": true}` to
+   `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/service.json`, so those commands
+   default to private, command-scoped servers instead of a shared service.
+   This reset discards prior service settings; the bridge's explicit foreground
+   `serve` still uses its loopback hostname and per-boot password. These layers
+   are naive-use guards: the agent can rewrite its live service config or
+   invoke the real binary directly.
 3. **Session sharing pinned off.** `"share": "disabled"` in both
    `opencode2.4lunarwing/config/opencode2.json` and
    `opencode4lunarwing/config/opencode.json` (v1 schema supports it at
    v1.18.25), plus `"update": "disable"` in the v2 lane so an upstream
    default flip cannot re-enable publication or replace the pinned binary.
-   The config tree is root-owned and read-only in the image; the runtime
-   copy in the workspace is re-derived from it at every boot and is
-   untrusted (an agent edit holds only until restart, within a session it
-   is a naive-use guard like the others).
+   The config tree and boot files (`entrypoint.sh`, `health_server.py`,
+   `agent_comm_protocol.json`) are root-owned and read-only in the image,
+   including deployments that restart the same container filesystem. The
+   entrypoint re-derives the default runtime config from the baked source at
+   every boot. An override copy gets owner-write permission before the config
+   writers run; the baked source stays read-only. Live runtime/project configs
+   and operator-selected `OPENCODE_CONFIG` remain untrusted and mutable.
 4. **CI guard.** `.gitlab/scripts/check-worker-exposure-policy.sh` (job
    `worker-exposure-policy-guard`, security stage) asserts the pins, the
    ruleset ordering, the wrapper (every-token scan), the Dockerfile wiring
-   including the root-owned read-only `scripts/`+`config/`, and runs
+   including the root-owned read-only boot files + `scripts/`+`config/`, and runs
    git-free (the ci-config image ships no git);
    `.gitlab/tests/test_worker_exposure_policy.py` regression-covers it,
-   including no-git lanes.
+   including no-git lanes. The guard also runs the exposure/wrapper,
+   compile-out, and non-root boot configuration suites on merge requests.
 5. **Build-time assertion.** The opencode2 Dockerfile runs
    `scripts/exposure_policy_assert.py --binary …`: the image fails to build
    if the config lacks the pins, the entrypoint touches service mode or
    `--service`, `OPENCODE_BIN` bypasses the wrapper, the wrapper regressed
    to a first-token dispatch, the binary contains OpenTunnel client
-   markers, or `scripts/`+`config/` are not root-owned read-only.
+   markers. A final `--image-filesystem` assertion checks actual ownership
+   and modes of the boot files and `scripts/`+`config/` after all image steps;
+   the image fails if they are not root-owned read-only or `/app` permits
+   non-root replacement of its children.
 6. **Runtime smoke (DEFERRED to WI#345):** live `service.json`/`opentunnel`
    dir/listener assertions against a running container belong to the WI#345
    runtime-smoke suite, which does not exist yet. Control 9 covers the
@@ -187,10 +201,20 @@ Enforced controls (opencode2 lane unless noted):
    non-loopback bind beyond bridge-WS + health, on any published mapping
    off host loopback — an empty/missing `HostIp` counts as all-interfaces
    (Docker's shape; podman reports `0.0.0.0`) — and an inspect failure is a
-   finding, never a silent skip. Re-run against the `scootaloo` tenant on
+   finding, never a silent skip. Absence requires a failed inspect with a
+   Docker/Podman missing-object/container diagnostic naming that exact
+   container; account/runtime-directory errors are findings. Warning lines
+   before a valid state line are tolerated, and a failed PortBindings inspect
+   is also a finding. Re-run against the `scootaloo` tenant on
    2026-10-13 (rootless podman, after the run-79 EI-6 hardening):
    **clean** — all four lanes showed exactly the expected bridge-WS + 8443
    binds, all mappings host-loopback only.
+
+**!1570 deployment note:** rebuild the worker image and recreate existing
+opencode2 containers through mt-admin to receive the protected boot files.
+Restarting a container on an older image does not apply the new ownership or
+startup logic. !1490 remains gated at v2.0.24; the service-config reset is not
+an egress boundary.
 
 Control 11 audit of the other lanes (2026-10-12, against pinned sources;
 re-checked 2026-10-13):

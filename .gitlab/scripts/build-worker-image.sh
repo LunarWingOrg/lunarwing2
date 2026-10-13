@@ -52,6 +52,7 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # against the lane + built binary, and the compile-out patch runs
         # against the upstream checkout; their self-tests execute in-image.
         input_files='opencode2.4lunarwing/Dockerfile
+opencode2.4lunarwing/entrypoint.sh
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts
@@ -61,6 +62,7 @@ opencode2.4lunarwing/scripts/opencode_task_executor_test.ts
 opencode2.4lunarwing/scripts/opencode-exposure-guard.sh
 opencode2.4lunarwing/scripts/exposure_policy_assert.py
 opencode2.4lunarwing/scripts/exposure_policy_assert_test.py
+opencode2.4lunarwing/scripts/entrypoint_config_test.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
         source_ref=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69

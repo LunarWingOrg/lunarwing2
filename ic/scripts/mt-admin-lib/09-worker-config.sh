@@ -2120,6 +2120,17 @@ _worker_listeners_read() {  # <tenant> <container pid> — host-side netns read
   fi
 }
 
+_worker_inspect_absent() {  # <container> <failed inspect output>
+  local container="$1" line
+  local absent_re="^(error: |error response from daemon: )*no such (object|container):?[[:space:]]+[\"']?${container}[\"']?[[:space:]]*$"
+  while IFS= read -r line; do
+    # Match a runtime's missing-container diagnostic, not e.g. an id/sudo
+    # failure ('no such user') or a missing /run/user directory (FC-1).
+    [[ "${line,,}" =~ $absent_re ]] && return 0
+  done <<< "$2"
+  return 1
+}
+
 worker_listeners() {  # <tenant>
   local name="$1"
   name="$(sanitize_name "$name")"
@@ -2132,19 +2143,26 @@ worker_listeners() {  # <tenant>
   local -a lanes=(pebble opencode opencode2 kimi)
   for lane in "${lanes[@]}"; do
     container="lunarwing-${lane}-${name}"
-    inspect_out="$(_ctr "$name" inspect -f '{{.State.Running}} {{.State.Pid}}' "$container" 2>&1 || true)"
-    inspect_out="${inspect_out%%$'\n'*}"  # Go template emits one line + newline
-    if [[ "$inspect_out" =~ ^(true|false)\ [0-9]+$ ]]; then
-      state="${inspect_out%% *}"
-      pid="${inspect_out#* }"
-    elif [[ "$inspect_out" == *"no such"* || "$inspect_out" == *"not found"* ]]; then
-      say "$lane: not present ($container) — skipped"
-      continue
-    else
+    rc=0
+    inspect_out="$(_ctr "$name" inspect -f '{{.State.Running}} {{.State.Pid}}' "$container" 2>&1)" || rc=$?
+    if ((rc != 0)); then
+      if _worker_inspect_absent "$container" "$inspect_out"; then
+        say "$lane: not present ($container) — skipped"
+        continue
+      fi
       say "$lane: $container — INSPECT FAILED (counted as a finding, never a silent skip): ${inspect_out//$'\n'/ }"
       findings=$((findings + 1))
       continue
     fi
+    # Runtime warnings may precede the Go-template state line on stderr.
+    state="$(grep -m 1 -E '^(true|false) [0-9]+$' <<< "$inspect_out" || true)"
+    if [[ -z "$state" ]]; then
+      say "$lane: $container — INSPECT FAILED (missing state): ${inspect_out//$'\n'/ }"
+      findings=$((findings + 1))
+      continue
+    fi
+    pid="${state#* }"
+    state="${state%% *}"
     if [[ "$state" != "true" ]]; then
       say "$lane: not running ($container) — skipped"
       continue
@@ -2155,8 +2173,10 @@ worker_listeners() {  # <tenant>
     # Published mappings: every HostIp must be host loopback. Docker records
     # an all-interfaces publish as "HostIp":"" — treat empty/missing as
     # all-interfaces (run-79 EI-6), never as "nothing to check".
-    bindings="$(_ctr "$name" inspect -f '{{json .HostConfig.PortBindings}}' "$container" 2>/dev/null || true)"
-    if [[ -n "$bindings" && "$bindings" != "null" ]]; then
+    if ! bindings="$(_ctr "$name" inspect -f '{{json .HostConfig.PortBindings}}' "$container" 2>/dev/null)"; then
+      say "  INSPECT FAILED: could not read PortBindings for $container"
+      findings=$((findings + 1))
+    elif [[ -n "$bindings" && "$bindings" != "null" ]]; then
       bad="$(printf '%s' "$bindings" | jq -r '
         to_entries[] | .key as $port | .value[] |
         (.HostIp // "") as $ip |
