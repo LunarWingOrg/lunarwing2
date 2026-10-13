@@ -160,12 +160,13 @@ try {
   }
 
   // Per-task offset: only lines appended after the recorded size attach.
-  writeFileSync(logPath, `${errorLine("ref=err_01d0c0de")}\n`)
+  // FU-1: use the same ref so only the offset excludes the pre-task line.
+  writeFileSync(logPath, `${errorLine("ref=err_01d0c0de phase=PRETASK")}\n`)
   const startOffset = serveLogStartSizeOf(logPath)
-  writeFileSync(logPath, `${errorLine("ref=err_01d0c0de")}\n${errorLine("ref=err_02d0c0de")}\n`)
-  const scoped = await withServeLogDetail(GENERIC(), { logPath, startOffset, ref: "err_02d0c0de" })
-  assert.ok(scoped.includes("ref=err_02d0c0de"))
-  assert.ok(!scoped.includes("err_01d0c0de"), "pre-task line leaked past the start offset")
+  appendFileSync(logPath, `${errorLine("ref=err_01d0c0de phase=INTASK")}\n`)
+  const scoped = await withServeLogDetail(GENERIC(), { logPath, startOffset, ref: "err_01d0c0de" })
+  assert.ok(scoped.includes("phase=INTASK"))
+  assert.ok(!scoped.includes("phase=PRETASK"), "pre-task line leaked past the start offset")
 
   // Line-count bound: 40 short error lines (same request ref) all inside the
   // byte window — exactly the last 25 may attach.

@@ -1265,9 +1265,10 @@ assert.equal(errorCloseQueue.closed, true, "error path must close the queue")
   // Pattern-only name (no entry in the fixed key list): mt-admin injects
   // provider credentials like this via --env-file / EXTRA_ENV_FILE.
   const FIXTURE_PATTERN_SECRET = ["pattern", "only", "value", "0044"].join("-")
-  const PRE_REF = "err_01d0c0de"
   const CRASH_REF = "err_feedbeef"
-  const PRE = `timestamp=2026-10-12T00:00:00.000Z level=ERROR run=run01 message=failed ref=${PRE_REF} error=earlier tenant task failed`
+  // FU-1: matching refs make this pin the task-start offset, not ref filtering.
+  const PRE_REF = CRASH_REF
+  const PRE = `timestamp=2026-10-12T00:00:00.000Z level=ERROR run=run01 message=failed ref=${PRE_REF} error=earlier-tenant-task-failed`
   const CRASH =
     `timestamp=2026-10-12T00:00:01.000Z level=ERROR run=run01 message=failed ref=${CRASH_REF} ` +
     `error=TypeError: undefined is not an object (evaluating 'a.name') token=${FIXTURE_SECRET} ` +
@@ -1327,7 +1328,7 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
       assert.ok(errorMessage.includes("opencode serve log tail:"))
       assert.ok(errorMessage.includes(`ref=${CRASH_REF}`), "ref line missing from the enriched error")
       assert.ok(errorMessage.includes("TypeError: undefined is not an object"))
-      assert.ok(!errorMessage.includes(PRE_REF), "pre-task line leaked past the task-start offset")
+      assert.ok(!errorMessage.includes("earlier-tenant-task-failed"), "pre-task line leaked past the task-start offset")
       assert.ok(!errorMessage.includes(FIXTURE_SECRET), "boot secret survived the scrub")
       assert.ok(!errorMessage.includes(FIXTURE_TASK_SECRET), "task env secret survived the scrub")
       assert.ok(!errorMessage.includes(FIXTURE_PATTERN_SECRET), "pattern-named secret survived the scrub")
