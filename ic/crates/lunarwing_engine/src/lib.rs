@@ -54,7 +54,9 @@ pub use types::error::{CapabilityError, EngineError, ModelFailureKind, StepError
 pub use types::event::{EventId, EventKind, ThreadEvent};
 pub use types::memory::{DocId, DocType, MemoryDoc};
 pub use types::message::{MessageRole, ThreadMessage, TransientContentPart};
-pub use types::mission::{Mission, MissionCadence, MissionId, MissionRetryPolicy, MissionStatus};
+pub use types::mission::{
+    Mission, MissionCadence, MissionId, MissionRetryPolicy, MissionStatus, usable_webhook_secret,
+};
 pub use types::project::{Project, ProjectId};
 pub use types::provenance::Provenance;
 pub use types::step::{

@@ -1222,7 +1222,7 @@ async fn handle_execute_action(
                     EventKind::ApprovalRequested {
                         action_name: name.clone(),
                         call_id: call_id.clone(),
-                        parameters: Some(crate::types::event::redact_event_params(&params)),
+                        parameters: Some(crate::types::event::redact_event_params(&name, &params)),
                         description: None,
                         allow_always: None,
                         gate_name: None,
@@ -1327,7 +1327,7 @@ async fn handle_execute_action(
                 EventKind::ApprovalRequested {
                     action_name: name.clone(),
                     call_id: call_id.clone(),
-                    parameters: Some(crate::types::event::redact_event_params(&parameters)),
+                    parameters: Some(crate::types::event::redact_event_params(&name, &parameters)),
                     description: None,
                     allow_always: match resume_kind.as_ref() {
                         crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),
@@ -1583,7 +1583,9 @@ async fn handle_execute_actions_parallel(
                         EventKind::ApprovalRequested {
                             action_name: pc.name.clone(),
                             call_id: pc.call_id.clone(),
-                            parameters: Some(crate::types::event::redact_event_params(&pc.params)),
+                            parameters: Some(crate::types::event::redact_event_params(
+                                &pc.name, &pc.params,
+                            )),
                             description: None,
                             allow_always: None,
                             gate_name: None,
@@ -1870,7 +1872,7 @@ async fn execute_single_action(
                 // copy so ApprovalRequested.parameters no longer holds a
                 // webhook_secret (scoped so, run-51 CJ-9: message previews
                 // and thread transcripts are separate at-rest classes).
-                parameters: Some(crate::types::event::redact_event_params(&parameters)),
+                parameters: Some(crate::types::event::redact_event_params(name, &parameters)),
                 description: None,
                 allow_always: match resume_kind.as_ref() {
                     crate::gate::ResumeKind::Approval { allow_always } => Some(*allow_always),

@@ -459,10 +459,9 @@ async fn persist_and_notify_thread_gate(
         // first because dispatch routes these names to the mission handler
         // even when a dynamic MCP/WASM tool registers the same name (run-33
         // AQ-10): the display redaction must match the dispatch path.
-        crate::tools::redact_params(
-            &parameters,
-            crate::bridge::effect_adapter::MISSION_SENSITIVE_PARAMS,
-        )
+        // WI#359 (CJ-10): one shared credential-key predicate, recursive so
+        // a positional `_args[0]` payload is covered too.
+        lunarwing_safety::redact_credential_params(&parameters)
     } else if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
         crate::tools::redact_params(&parameters, tool.sensitive_params())
     } else {

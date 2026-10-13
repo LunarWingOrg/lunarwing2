@@ -659,6 +659,21 @@ impl MissionManager {
         missions: Vec<Mission>,
         self_improvement_on: bool,
     ) -> Result<usize, EngineError> {
+        // WI#359: startup does not re-check webhook ownership — legacy
+        // two-owner duplicates that are both non-terminal keep firing.
+        // Surface them like the parked-recurring report does.
+        for (project_id, path, holders) in conflicting_webhook_claims(&missions) {
+            warn!(
+                project_id = %project_id,
+                path = %path,
+                holders = %holders
+                    .iter()
+                    .map(|(id, owner)| format!("{id} (owner: {owner})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "webhook path has multiple non-terminal owners; every matching fire will deliver to each of them — rotate or pause the duplicates"
+            );
+        }
         let mut active_ids = Vec::new();
         for candidate in missions {
             let lock = mission_lock(&self.fire_locks, candidate.id).await;
@@ -717,8 +732,8 @@ impl MissionManager {
     /// Webhook paths are project-wide unique: firing matches every Active
     /// mission on the path, so two users owning the same path would each
     /// receive every delivery (MR !885 review). A create that would claim
-    /// another user's active path is rejected; a path held only by terminal
-    /// missions is free to reclaim.
+    /// another user's non-terminal path is rejected; a path held only by
+    /// terminal missions is free to reclaim.
     pub async fn create_mission(
         &self,
         project_id: ProjectId,
@@ -792,7 +807,8 @@ impl MissionManager {
             });
         }
         // Webhook path ownership: a fire matches every Active mission on the
-        // path regardless of owner, so an active path may only have one owner.
+        // path regardless of owner, so a non-terminal path may only have one
+        // owner.
         if let MissionCadence::Webhook { path, .. } = &cadence {
             self.ensure_webhook_path_unclaimed(project_id, path, &user_id, None)
                 .await?;
@@ -814,13 +830,18 @@ impl MissionManager {
     }
 
     /// Enforce the webhook single-owner rule: a fire matches every Active
-    /// mission on the path regardless of owner, so an active path may only
-    /// have one owner. Enforced at the transitions that create or reactivate
-    /// a claim — create, a cadence-setting or path-changing update, and
-    /// resume (WI#352, AO-1); updates that leave the claim untouched are not
-    /// re-checked (run-51 CJ-6). A paused mission still holds its claim
-    /// (`Paused` is not terminal). `exclude` skips the mission being updated
-    /// or resumed: it is its own owner, not a conflict.
+    /// mission on the path regardless of owner, so a non-terminal path may
+    /// only have one owner. Enforced at the transitions that create or
+    /// reactivate a claim — create, an update that switches to a Webhook
+    /// cadence from another cadence, changes the path, or adds a usable
+    /// secret to a dormant row, and resume (WI#352 AO-1, run-51 CJ-6,
+    /// WI#359 CO-2/CO-4); updates that leave the claim untouched are not
+    /// re-checked, and a same-path re-set is deliberately not checked. A
+    /// paused mission still holds its claim (`Paused` is not terminal),
+    /// and a dormant (secret-less or unusable-secret) non-terminal row
+    /// still blocks other users' claims on its path (WI#359 CO-3).
+    /// `exclude` skips the mission being updated or resumed: it is its own
+    /// owner, not a conflict.
     async fn ensure_webhook_path_unclaimed(
         &self,
         project_id: ProjectId,
@@ -885,15 +906,8 @@ impl MissionManager {
 
         // Run-51 CJ-6: capture the current claim before applying updates so
         // the single-owner rule below can tell a new/changed claim from an
-        // untouched one. Secret-less legacy rows are dormant: adding a usable
-        // secret creates a claim even if the path itself does not change.
-        let old_webhook_path = match &mission.cadence {
-            MissionCadence::Webhook {
-                path,
-                secret: Some(secret),
-            } if !secret.is_empty() => Some(path.clone()),
-            _ => None,
-        };
+        // untouched one (dormant rows hold no claim — see live_webhook_claim).
+        let old_webhook_path = live_webhook_claim(&mission.cadence).map(str::to_string);
         if let Some(name) = updates.name {
             mission.name = name;
         }
@@ -928,20 +942,24 @@ impl MissionManager {
         }
         validate_webhook_cadence(&mission.cadence)?;
         // WI#352 (AO-1): the webhook single-owner rule applies here too —
-        // but only to new claims (run-51 CJ-6): an update that sets a
-        // Webhook cadence or changes the path must not land on a path
-        // another user's non-terminal mission already claims. An update
-        // that leaves the claim untouched is not re-checked: under a legacy
-        // two-owner conflict either owner must still be able to rotate a
-        // leaked secret or lower a budget, and reactivation of a paused
-        // holder is checked by `resume_mission`.
-        let new_webhook_path = match &mission.cadence {
-            MissionCadence::Webhook { path, .. } => Some(path.as_str()),
-            _ => None,
+        // but only to new claims (run-51 CJ-6). An update that leaves the
+        // claim untouched is not re-checked: under a legacy two-owner
+        // conflict either owner must still be able to rotate a leaked
+        // secret or lower a budget, and reactivation of a paused holder is
+        // checked by `resume_mission`.
+        let makes_new_claim = webhook_claim_changed(old_webhook_path.as_deref(), &mission.cadence);
+        // WI#359 (CJ-4): the check-then-save sequence must be atomic
+        // against creates and other claim transitions — this mission's own
+        // fire lock does not serialize against those. Hold the shared
+        // create/claim lock from the check until the save below. Lock
+        // order is fire lock → create lock; `create_mission_detailed`
+        // never takes a fire lock, so no ABBA.
+        let _claim_guard = if makes_new_claim {
+            Some(self.mission_create_lock.lock().await)
+        } else {
+            None
         };
-        if let Some(path) = new_webhook_path
-            && Some(path) != old_webhook_path.as_deref()
-        {
+        if makes_new_claim && let MissionCadence::Webhook { path, .. } = &mission.cadence {
             self.ensure_webhook_path_unclaimed(
                 mission.project_id,
                 path,
@@ -1048,6 +1066,15 @@ impl MissionManager {
         // WI#352 (AO-1): re-check the webhook single-owner rule before
         // reactivating — legacy data or a pre-rule conflict could leave two
         // owners on the path, and a fire matches every Active mission on it.
+        // WI#359 (CJ-4): hold the shared create/claim lock across the check
+        // and the save so a concurrent create or claim-changing update
+        // cannot slip a second owner onto the path between them. Lock order
+        // is fire lock → create lock (see update_mission).
+        let _claim_guard = if matches!(mission.cadence, MissionCadence::Webhook { .. }) {
+            Some(self.mission_create_lock.lock().await)
+        } else {
+            None
+        };
         if let MissionCadence::Webhook { path, .. } = &mission.cadence {
             self.ensure_webhook_path_unclaimed(
                 mission.project_id,
@@ -1671,7 +1698,11 @@ impl MissionManager {
     /// constant time via `subtle::ConstantTimeEq` to avoid timing attacks.
     /// Missions without a configured `secret` are not triggerable — they
     /// are skipped so the public endpoint returns 404 rather than firing
-    /// on an unauthenticated request.
+    /// on an unauthenticated request. WI#359 (CO-1/CO-2): a mission whose
+    /// stored secret can never be presented on the wire (empty,
+    /// whitespace-padded, non-visible-ASCII) is dormant and equally not
+    /// triggerable — `ct_eq` treats two empty slices as equal, so the
+    /// empty-empty case needs the explicit usable-secret guard.
     pub async fn fire_webhook_mission(
         &self,
         path: &str,
@@ -1699,7 +1730,14 @@ impl MissionManager {
                 } => {
                     mission_path == path
                         && match (mission_secret.as_deref(), secret) {
-                            (Some(expected), Some(provided)) => {
+                            // WI#359 (CO-1/CO-2): a stored secret that can
+                            // never be presented on the wire (empty,
+                            // whitespace-padded, non-visible-ASCII) is
+                            // dormant — `ct_eq` treats two empty slices as
+                            // equal, and the gateway trims header values.
+                            (Some(expected), Some(provided))
+                                if crate::types::mission::usable_webhook_secret(expected) =>
+                            {
                                 bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
                             }
                             // No configured secret => not triggerable (defense in depth).
@@ -3770,12 +3808,88 @@ fn is_settled_host_stop(thread: &crate::types::thread::Thread) -> bool {
         .unwrap_or(false)
 }
 
+/// One conflicting webhook path claim: `(project_id, path, holders)` with
+/// each holder as `(mission_id, owner)`.
+type WebhookClaimConflict = (ProjectId, String, Vec<(MissionId, String)>);
+
+/// WI#359 (info item): find webhook paths claimed by more than one owner's
+/// non-terminal mission within a project. A fire matches every Active
+/// mission on the path, so legacy two-owner duplicates keep firing for each
+/// owner. Rows with an unusable (dormant) secret do not count as live
+/// claims. Returns `(project_id, path, [(mission_id, owner)])` per
+/// conflicting path.
+fn conflicting_webhook_claims(missions: &[Mission]) -> Vec<WebhookClaimConflict> {
+    let mut claims: std::collections::HashMap<(ProjectId, &str), Vec<&Mission>> =
+        std::collections::HashMap::new();
+    for mission in missions {
+        if mission.is_terminal() {
+            continue;
+        }
+        if let MissionCadence::Webhook {
+            path,
+            secret: Some(secret),
+        } = &mission.cadence
+            && crate::types::mission::usable_webhook_secret(secret)
+        {
+            claims
+                .entry((mission.project_id, path.as_str()))
+                .or_default()
+                .push(mission);
+        }
+    }
+    let mut conflicts = Vec::new();
+    for ((project_id, path), holders) in claims {
+        let distinct_owners: std::collections::HashSet<&str> =
+            holders.iter().map(|m| m.user_id.as_str()).collect();
+        if distinct_owners.len() > 1 {
+            conflicts.push((
+                project_id,
+                path.to_string(),
+                holders
+                    .iter()
+                    .map(|m| (m.id, m.user_id.clone()))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+    conflicts
+}
+
+/// The live webhook claim of a stored cadence: the path when the cadence
+/// is Webhook with a usable secret, else `None`. Secret-less legacy rows
+/// are dormant (adding a usable secret creates a claim even when the path
+/// itself does not change), and a stored secret that can never be
+/// presented on the wire (whitespace-padded, non-visible-ASCII) is dormant
+/// too (WI#359, CO-2).
+fn live_webhook_claim(cadence: &MissionCadence) -> Option<&str> {
+    match cadence {
+        MissionCadence::Webhook {
+            path,
+            secret: Some(secret),
+        } if crate::types::mission::usable_webhook_secret(secret) => Some(path.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether applying an update changes the mission's webhook path claim
+/// (WI#359, CL-5). `old_claim` is the [`live_webhook_claim`] captured
+/// before the update; the resulting cadence's own secret has already been
+/// validated usable, so a Webhook result always holds a claim.
+fn webhook_claim_changed(old_claim: Option<&str>, new_cadence: &MissionCadence) -> bool {
+    match new_cadence {
+        MissionCadence::Webhook { path, .. } => Some(path.as_str()) != old_claim,
+        _ => false,
+    }
+}
+
 fn validate_webhook_cadence(cadence: &MissionCadence) -> Result<(), EngineError> {
     if let MissionCadence::Webhook { secret, .. } = cadence
-        && secret.as_deref().is_none_or(str::is_empty)
+        && secret
+            .as_deref()
+            .is_none_or(|value| !crate::types::mission::usable_webhook_secret(value))
     {
         return Err(EngineError::Effect {
-            reason: "webhook cadence requires non-empty webhook_secret".into(),
+            reason: "webhook cadence requires a usable webhook_secret (non-empty, no leading/trailing whitespace, visible ASCII)".into(),
         });
     }
     Ok(())
@@ -4872,6 +4986,11 @@ mod tests {
         failing_mission_saves: tokio::sync::RwLock<Vec<MissionId>>,
         failing_thread_loads: tokio::sync::RwLock<Vec<ThreadId>>,
         failing_thread_saves: tokio::sync::RwLock<Vec<ThreadId>>,
+        /// CJ-4 test hook: when set, `list_all_missions` waits on this
+        /// barrier (bounded by a timeout) before answering, so two racing
+        /// webhook-claim checks can be forced to both complete before
+        /// either save lands.
+        list_all_missions_barrier: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl TestStore {
@@ -4885,6 +5004,7 @@ mod tests {
                 failing_mission_saves: tokio::sync::RwLock::new(Vec::new()),
                 failing_thread_loads: tokio::sync::RwLock::new(Vec::new()),
                 failing_thread_saves: tokio::sync::RwLock::new(Vec::new()),
+                list_all_missions_barrier: None,
             }
         }
 
@@ -5043,14 +5163,23 @@ mod tests {
             &self,
             project_id: ProjectId,
         ) -> Result<Vec<Mission>, EngineError> {
-            Ok(self
+            // CJ-4 hook: snapshot FIRST, then wait on the barrier — a race
+            // repro needs both contenders to check against state from before
+            // either save. Bounded: a serialized (post-fix) contender blocks
+            // on the claim lock instead of reaching this barrier, so an
+            // unbounded wait would deadlock the test.
+            let snapshot: Vec<Mission> = self
                 .missions
                 .read()
                 .await
                 .values()
                 .filter(|m| m.project_id == project_id)
                 .cloned()
-                .collect())
+                .collect();
+            if let Some(barrier) = &self.list_all_missions_barrier {
+                let _ = tokio::time::timeout(Duration::from_millis(500), barrier.wait()).await;
+            }
+            Ok(snapshot)
         }
         async fn list_all_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
             Ok(self.missions.read().await.values().cloned().collect())
@@ -6535,6 +6664,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_stored_webhook_secret_never_authenticates_a_fire() {
+        // WI#359 (CO-1): `subtle::ct_eq` treats two empty slices as equal,
+        // so a legacy mission stored with `secret: Some("")` could be fired
+        // by anyone presenting an empty `X-Webhook-Secret:` header. The
+        // stored-empty case must spawn zero threads, whatever is presented.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+        // validate_webhook_cadence rejects empty secrets on create/update,
+        // so stage the legacy row directly in the store.
+        let legacy = Mission::new(
+            project,
+            "test-user",
+            "legacy-hook",
+            "goal",
+            MissionCadence::Webhook {
+                path: "legacy".into(),
+                secret: Some(String::new()),
+            },
+        );
+        store.save_mission(&legacy).await.unwrap();
+        mgr.active.write().await.push(legacy.id);
+
+        for presented in [None, Some(""), Some("anything")] {
+            let fired = mgr
+                .fire_webhook_mission("legacy", presented, serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(
+                fired.is_empty(),
+                "an empty configured secret must never authenticate (presented: {presented:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn webhook_dispatch_isolates_broken_mission_loads() {
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
@@ -6855,6 +7020,16 @@ mod tests {
                     !entity.contains(&a_id.0.to_string()),
                     "must not leak the holding mission's UUID: {entity}"
                 );
+                // WI#359 (CL-3): the holder's owner and mission name are
+                // identifying too and must stay out of the error.
+                assert!(
+                    !entity.contains("user-a"),
+                    "must not leak the holding mission's owner: {entity}"
+                );
+                assert!(
+                    !entity.contains("a-hook"),
+                    "must not leak the holding mission's name: {entity}"
+                );
             }
             other => panic!("expected AccessDenied, got {other:?}"),
         }
@@ -7008,7 +7183,10 @@ mod tests {
             },
         );
         store.save_mission(&a).await.unwrap();
-        for secret in [None, Some(String::new())] {
+        // WI#359 (CO-2): whitespace-only secrets are dormant too — they can
+        // never be presented on the wire, so adding a usable secret is a new
+        // claim that must pass the single-owner check.
+        for secret in [None, Some(String::new()), Some("  ".to_string())] {
             let b = Mission::new(
                 project,
                 "user-b",
@@ -7048,7 +7226,163 @@ mod tests {
             )
             .await
             .unwrap();
+            // WI#359 (CO-5): the repaired row really moved onto the free
+            // path with the rotated secret.
+            assert!(
+                matches!(store.load_mission(b.id).await.unwrap().unwrap().cadence,
+                MissionCadence::Webhook { path, secret: stored }
+                    if path == "free" && stored.as_deref() == Some("new-secret"))
+            );
         }
+
+        // WI#359 (CO-5) positive case: a dormant row adding a usable secret
+        // on an UNCLAIMED path is a new claim with no conflict — it succeeds.
+        let quiet = Mission::new(
+            project,
+            "user-b",
+            "quiet-hook",
+            "goal",
+            MissionCadence::Webhook {
+                path: "quiet".into(),
+                secret: None,
+            },
+        );
+        store.save_mission(&quiet).await.unwrap();
+        mgr.update_mission(
+            quiet.id,
+            "user-b",
+            MissionUpdate {
+                webhook_secret: Some("quiet-secret".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(store.load_mission(quiet.id).await.unwrap().unwrap().cadence,
+            MissionCadence::Webhook { path, secret: stored }
+                if path == "quiet" && stored.as_deref() == Some("quiet-secret"))
+        );
+    }
+
+    #[test]
+    fn conflicting_webhook_claims_flags_only_live_multi_owner_paths() {
+        // WI#359 (info item): startup surfaces legacy two-owner duplicates.
+        let project = ProjectId::new();
+        let webhook = |path: &str, secret: &str| MissionCadence::Webhook {
+            path: path.into(),
+            secret: Some(secret.into()),
+        };
+        let a = Mission::new(project, "user-a", "a", "g", webhook("events", "sa"));
+        let b = Mission::new(project, "user-b", "b", "g", webhook("events", "sb"));
+        let mut terminal = Mission::new(project, "user-c", "c", "g", webhook("events", "sc"));
+        terminal.status = MissionStatus::Completed;
+        let dormant = Mission::new(project, "user-d", "d", "g", webhook("events", "  "));
+        let same_owner = Mission::new(project, "user-a", "a2", "g", webhook("events", "sa2"));
+        let other_path = Mission::new(project, "user-e", "e", "g", webhook("other", "se"));
+        let other_project = Mission::new(
+            ProjectId::new(),
+            "user-f",
+            "f",
+            "g",
+            webhook("events", "sf"),
+        );
+        let missions = [
+            a.clone(),
+            b.clone(),
+            terminal,
+            dormant,
+            same_owner,
+            other_path,
+            other_project,
+        ];
+        let conflicts = conflicting_webhook_claims(&missions);
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "only the live two-owner path conflicts: {conflicts:?}"
+        );
+        let (pid, path, holders) = &conflicts[0];
+        assert_eq!(*pid, project);
+        assert_eq!(path, "events");
+        // user-a holds two rows (a, a2); user-b holds one — three holders,
+        // two distinct owners.
+        assert_eq!(holders.len(), 3);
+        assert!(holders.contains(&(a.id, "user-a".to_string())));
+        assert!(holders.contains(&(b.id, "user-b".to_string())));
+    }
+
+    #[tokio::test]
+    async fn webhook_claim_check_and_save_are_serialized_against_create() {
+        // WI#359 (CJ-4): `create_mission_detailed` holds the shared claim
+        // lock across check+save, but update/resume used to hold only their
+        // own mission's fire lock — two transitions could both pass
+        // `ensure_webhook_path_unclaimed` and both save, leaving two owners
+        // on one path. The store barrier forces both checks to complete
+        // before either save; exactly one claim may land.
+        let mut raw_store = TestStore::new();
+        raw_store.list_all_missions_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
+        let store = Arc::new(raw_store);
+        let mgr = Arc::new(make_mission_manager(store.clone() as Arc<dyn Store>));
+        let project = ProjectId::new();
+        let existing = Mission::new(project, "user-b", "b-hook", "goal", MissionCadence::Manual);
+        store.save_mission(&existing).await.unwrap();
+
+        let create_mgr = Arc::clone(&mgr);
+        let create = tokio::spawn(async move {
+            create_mgr
+                .create_mission(
+                    project,
+                    "user-a",
+                    "a-hook",
+                    "goal",
+                    MissionCadence::Webhook {
+                        path: "events".into(),
+                        secret: Some("a-secret".into()),
+                    },
+                    Vec::new(),
+                )
+                .await
+        });
+        let update_mgr = Arc::clone(&mgr);
+        let update_id = existing.id;
+        let update = tokio::spawn(async move {
+            update_mgr
+                .update_mission(
+                    update_id,
+                    "user-b",
+                    MissionUpdate {
+                        cadence: Some(MissionCadence::Webhook {
+                            path: "events".into(),
+                            secret: Some("b-secret".into()),
+                        }),
+                        ..MissionUpdate::default()
+                    },
+                )
+                .await
+        });
+        let (created, updated) = tokio::join!(create, update);
+        let created = created.expect("create task panicked");
+        let updated = updated.expect("update task panicked");
+
+        let claims = store
+            .list_all_missions(project)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|mission| {
+                !mission.is_terminal()
+                    && matches!(&mission.cadence, MissionCadence::Webhook { path, .. } if path == "events")
+            })
+            .count();
+        assert_eq!(
+            claims, 1,
+            "exactly one mission may hold the webhook path claim (create: {created:?}, update: {updated:?})"
+        );
+        assert!(
+            created.is_ok() != updated.is_ok(),
+            "exactly one of the racing transitions may succeed (create: {created:?}, update: {updated:?})"
+        );
     }
 
     #[tokio::test]
@@ -7216,7 +7550,8 @@ mod tests {
     async fn create_mission_rejects_webhook_path_owned_by_another_user() {
         // MR !885 review: webhook firing matches all Active missions on a
         // path, so two users owning the same path would each receive every
-        // delivery. A create claiming another user's active path must fail.
+        // delivery. A create claiming another user's non-terminal path must
+        // fail.
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project = ProjectId::new();

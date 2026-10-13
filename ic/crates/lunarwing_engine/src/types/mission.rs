@@ -122,6 +122,19 @@ impl MissionCadence {
     }
 }
 
+/// WI#359 (CO-2): one shared predicate for a webhook secret that can
+/// actually be presented on a fire. HTTP/1.1 header values are trimmed
+/// (httparse) and `HeaderValue::to_str` rejects non-visible-ASCII, so a
+/// secret that is empty, carries leading/trailing whitespace, or contains
+/// bytes outside visible ASCII can never arrive on the wire. A row holding
+/// such a secret is dormant — it must not count as a live path claim, and
+/// unusable secrets are rejected on create and update.
+pub fn usable_webhook_secret(secret: &str) -> bool {
+    !secret.is_empty()
+        && secret.trim() == secret
+        && secret.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
 /// A mission — a long-running goal that spawns threads over time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
@@ -528,6 +541,21 @@ impl Mission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usable_webhook_secret_rejects_unpresentable_values() {
+        // WI#359 (CO-2): presentable on the wire means non-empty, no
+        // leading/trailing whitespace, visible ASCII only.
+        assert!(usable_webhook_secret("s3cret-token"));
+        assert!(usable_webhook_secret("with interior space"));
+        assert!(!usable_webhook_secret(""));
+        assert!(!usable_webhook_secret("  "));
+        assert!(!usable_webhook_secret(" padded"));
+        assert!(!usable_webhook_secret("padded "));
+        assert!(!usable_webhook_secret("tab\tinside"));
+        assert!(!usable_webhook_secret("newline\ninside"));
+        assert!(!usable_webhook_secret("non-ascii-sëcret"));
+    }
 
     #[test]
     fn new_mission_defaults_to_thirty_threads_per_day() {
