@@ -30,6 +30,12 @@ fi
 rc-service() {
   [[ "$1 $2" != "lunarwing-darkirc-adapter-fixture stop" ]]
 }
+# EQ-2: stops now target installed init scripts only, so the fixture must
+# install the DarkIRC units for the failing stop to be exercised at all.
+export OPENRC_INITD_DIR="$fixture/init.d"
+mkdir -p "$OPENRC_INITD_DIR"
+printf '# fixture\n' >"$OPENRC_INITD_DIR/lunarwing-darkirc-fixture"
+printf '# fixture\n' >"$OPENRC_INITD_DIR/lunarwing-darkirc-adapter-fixture"
 if (stop_tenant_openrc fixture) >/dev/null 2>&1; then
   fail "OpenRC DarkIRC stop failure was hidden"
 else
