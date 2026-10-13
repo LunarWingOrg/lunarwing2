@@ -187,6 +187,15 @@ Enforced controls (opencode2 lane unless noted):
    (case-insensitively). Later COPY/ADD/RUN steps or new stages are refused
    regardless of command spelling; earlier filesystem changes are checked
    by the image-build assertion (run-96 FP-1, closing the run-90 FC-4 gaps).
+   Run-97 FQ-1: the wrapper-install/binary-scan RUN must sit in the *same
+   stage* as the final `--image-filesystem` assertion — build engines skip
+   unused stages, so the exact line in a dead or builder stage satisfies
+   presence checks while the shipped image has neither wrapper nor scan.
+   Run-97 FQ-2/FQ-3: the last `USER` instruction must be exactly
+   `USER 10003:10003`, and Dockerfile parser directives
+   (`# escape=`, `# syntax=`, `# check=`) are refused outright, since a
+   custom escape character would invalidate the guard's continuation
+   joining.
    `.gitlab/tests/test_worker_exposure_policy.py` regression-covers it,
    including no-git lanes. The guard also runs the exposure/wrapper,
    compile-out, and non-root boot configuration suites on merge requests.
