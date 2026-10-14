@@ -221,12 +221,17 @@ async fn send_request(
     })
 }
 
-/// URL with query and fragment removed, for logging. Query-param credentials
-/// injected after validation must not reach host logs (FZ-1 / WI#395).
+/// URL with query, fragment, and userinfo removed, for logging. Query-param
+/// credentials injected after validation must not reach host logs (FZ-1 /
+/// WI#395), and neither may caller-supplied userinfo (`validate_url` does
+/// not reject `user:pass@`), so the credentials never ride a log line even
+/// when the upstream preserves the query across redirects (GN-5).
 fn redact_url_for_log(url: &reqwest::Url) -> String {
     let mut cleaned = url.clone();
     cleaned.set_query(None);
     cleaned.set_fragment(None);
+    let _ = cleaned.set_username("");
+    let _ = cleaned.set_password(None);
     cleaned.to_string()
 }
 
@@ -713,7 +718,7 @@ impl Tool for HttpTool {
 
                     redirects_remaining -= 1;
                     tracing::debug!(
-                        to = %parsed_url,
+                        to = %redact_url_for_log(&parsed_url),
                         hops_left = redirects_remaining,
                         "http tool following redirect"
                     );
@@ -909,7 +914,7 @@ mod tests {
     }
 
     /// FZ-1 / WI#395: log URLs never carry the query (where injected
-    /// credentials live) or the fragment.
+    /// credentials live), the fragment, or caller-supplied userinfo (GN-5).
     #[test]
     fn test_redact_url_for_log_strips_query_and_fragment() {
         let url = reqwest::Url::parse("https://api.example.com/v1/d?api_key=secret123#frag")
@@ -922,6 +927,14 @@ mod tests {
         // No query/fragment to begin with: unchanged.
         let bare = reqwest::Url::parse("https://api.example.com/v1/d").expect("valid URL");
         assert_eq!(redact_url_for_log(&bare), "https://api.example.com/v1/d");
+
+        // GN-5: caller-supplied userinfo is stripped too.
+        let userinfo =
+            reqwest::Url::parse("https://user:pass@api.example.com/v1/d?api_key=secret123")
+                .expect("valid URL");
+        let logged = redact_url_for_log(&userinfo);
+        assert_eq!(logged, "https://api.example.com/v1/d");
+        assert!(!logged.contains("user:pass"), "{logged}");
     }
 
     #[test]
