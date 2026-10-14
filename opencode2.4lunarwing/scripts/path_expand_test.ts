@@ -66,4 +66,18 @@ assert.equal(workspacePathsOverlap("/workspace/project", "/workspace/project/src
 assert.equal(workspacePathsOverlap("/workspace/project/src", "/workspace/project"), true)
 assert.equal(workspacePathsOverlap("/workspace/project-a", "/workspace/project-b"), false)
 
+// WI#375 DS-5: in-root names starting with ".." are not path escapes —
+// `relative()` yields "..foo" for such a child, and a startsWith("..")
+// predicate misclassifies it as an escape.
+{
+  const ds5Root = mkdtempSync(join(tmpdir(), "opencode2-workspace-"))
+  const dotdotPrefixed = join(ds5Root, "..foo")
+  mkdirSync(dotdotPrefixed)
+  assert.equal(resolveWorkspacePath("..foo", ds5Root), dotdotPrefixed)
+  rmSync(ds5Root, { recursive: true, force: true })
+}
+assert.equal(workspacePathsOverlap("/workspace", "/workspace/..foo"), true)
+assert.equal(workspacePathsOverlap("/workspace/..foo", "/workspace"), true)
+assert.equal(workspacePathsOverlap("/workspace/..foo", "/workspace/..bar"), false)
+
 console.log("workspace path expansion self-check passed")

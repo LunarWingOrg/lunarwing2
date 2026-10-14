@@ -8,20 +8,28 @@ export function expandWorkspacePath(path: string, workspaceRoot: string): string
   return `${workspaceRoot}/${path}`
 }
 
+// A relative() result escapes its base only when it is exactly ".." or
+// starts with "../" — an in-root component may itself start with ".." (e.g.
+// a directory named "..foo") and must not be misclassified as an escape
+// (WI#375 DS-5).
+function escapesRoot(fromBase: string): boolean {
+  return fromBase === ".." || fromBase.startsWith("../") || isAbsolute(fromBase)
+}
+
 export function resolveWorkspacePath(path: string, workspaceRoot: string): string {
   const canonicalRoot = realpathSync(resolve(workspaceRoot))
   const expanded = expandWorkspacePath(path, canonicalRoot)
   const candidate = realpathSync(resolve(isAbsolute(expanded) ? expanded : resolve(canonicalRoot, expanded)))
   const fromRoot = relative(canonicalRoot, candidate)
-  if (fromRoot === "" || (!fromRoot.startsWith("..") && !isAbsolute(fromRoot))) return candidate
+  if (fromRoot === "" || !escapesRoot(fromRoot)) return candidate
   throw new Error(`Workspace path escapes WORKSPACE_ROOT: ${path}`)
 }
 
 export function workspacePathsOverlap(left: string, right: string): boolean {
   const fromLeft = relative(left, right)
-  if (fromLeft === "" || (!fromLeft.startsWith("..") && !isAbsolute(fromLeft))) return true
+  if (fromLeft === "" || !escapesRoot(fromLeft)) return true
   const fromRight = relative(right, left)
-  return fromRight === "" || (!fromRight.startsWith("..") && !isAbsolute(fromRight))
+  return fromRight === "" || !escapesRoot(fromRight)
 }
 
 // Name the failing component (the raw error only names the /proc/self/fd

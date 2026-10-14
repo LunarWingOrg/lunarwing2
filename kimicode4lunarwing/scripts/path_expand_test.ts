@@ -45,6 +45,21 @@ test("resolveWorkspacePath: rejects traversal and escaping symlinks", () => {
   assert.throws(() => resolveWorkspacePath("escape", root), /escapes WORKSPACE_ROOT/)
 })
 
+test("resolveWorkspacePath: in-root '..' prefixed names are not escapes (WI#375 DS-5)", () => {
+  const root = mkdtempSync(join(tmpdir(), "kimi-workspace-"))
+  // `relative()` yields "..foo" for this in-root child; a startsWith("..")
+  // escape predicate misclassifies it and rejects a legitimate path.
+  const dotdotPrefixed = join(root, "..foo")
+  mkdirSync(dotdotPrefixed)
+  assert.equal(resolveWorkspacePath("..foo", root), dotdotPrefixed)
+})
+
+test("workspacePathsOverlap: in-root '..' prefixed names overlap (WI#375 DS-5)", () => {
+  assert.equal(workspacePathsOverlap("/workspace", "/workspace/..foo"), true)
+  assert.equal(workspacePathsOverlap("/workspace/..foo", "/workspace"), true)
+  assert.equal(workspacePathsOverlap("/workspace/..foo", "/workspace/..bar"), false)
+})
+
 test("workspacePathsOverlap: rejects equal and parent-child workspaces only", () => {
   assert.equal(workspacePathsOverlap("/workspace/project", "/workspace/project"), true)
   assert.equal(workspacePathsOverlap("/workspace/project", "/workspace/project/src"), true)
