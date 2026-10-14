@@ -5513,7 +5513,15 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         let mut background = foreground.clone();
         background.thread_type = lunarwing_engine::ThreadType::Mission;
         for verb in ["mission_pause", "mission_delete"] {
-            for ctx in [&background, &foreground] {
+            // WI#356: Mission threads are refused mission_delete at the
+            // dispatch gate, so only mission_pause can charge a Mission-class
+            // stop bucket; the Foreground class exercises both stop verbs.
+            let contexts: Vec<&ThreadExecutionContext> = if verb == "mission_delete" {
+                vec![&foreground]
+            } else {
+                vec![&background, &foreground]
+            };
+            for ctx in contexts {
                 for _ in 0..20 {
                     assert!(
                         adapter
@@ -5539,17 +5547,35 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         // caller-class keys carry the charges (20 Ok calls prove execute
         // ran past the gate), and the shared bare-verb key stays empty.
         let user = foreground.user_id.as_str();
+        for class in ["Mission", "Foreground"] {
+            assert_eq!(
+                adapter
+                    .rate_limiter
+                    .get_usage(user, &format!("mission_pause@{class}"))
+                    .await,
+                Some((20, 20)),
+                "mission_pause@{class} bucket must hold the 20 admitted calls"
+            );
+        }
+        assert_eq!(
+            adapter
+                .rate_limiter
+                .get_usage(user, "mission_delete@Foreground")
+                .await,
+            Some((20, 20)),
+            "mission_delete@Foreground bucket must hold the 20 admitted calls"
+        );
+        assert!(
+            matches!(
+                adapter
+                    .rate_limiter
+                    .get_usage(user, "mission_delete@Mission")
+                    .await,
+                None | Some((0, 0))
+            ),
+            "WI#356: Mission threads never reach the mission_delete bucket"
+        );
         for verb in ["mission_pause", "mission_delete"] {
-            for class in ["Mission", "Foreground"] {
-                assert_eq!(
-                    adapter
-                        .rate_limiter
-                        .get_usage(user, &format!("{verb}@{class}"))
-                        .await,
-                    Some((20, 20)),
-                    "{verb}@{class} bucket must hold the 20 admitted calls"
-                );
-            }
             assert!(
                 matches!(
                     adapter.rate_limiter.get_usage(user, verb).await,
@@ -5756,6 +5782,93 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 .expect("list missions")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn mission_threads_cannot_create_or_delete_missions() {
+        // WI#356 (run-33 AQ-3 / run-40 BF-1): a mission run's thread is
+        // unsupervised by construction and owner-scoped, so the gate refuses
+        // it the lifecycle verbs — creating further missions or deleting any
+        // of the owner's missions must come from the supervised foreground
+        // (v1 parity: routine_create/routine_delete sit on
+        // AUTONOMOUS_TOOL_DENYLIST).
+        let (adapter, mgr, store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.thread_type = lunarwing_engine::ThreadType::Mission;
+        let own = lunarwing_engine::Mission::new(
+            ctx.project_id,
+            &ctx.user_id,
+            "own",
+            "goal",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_mission(&own).await.expect("seed mission");
+
+        for verb in MISSION_LIFECYCLE_ACTION_NAMES {
+            let denied = adapter
+                .execute_action(
+                    verb,
+                    serde_json::json!({"name": "own", "goal": "never runs"}),
+                    &lease(),
+                    &ctx,
+                )
+                .await;
+            match denied {
+                Err(EngineError::LeaseDenied { reason }) => {
+                    assert!(
+                        reason.contains("Mission threads"),
+                        "unexpected refusal wording for {verb}: {reason}"
+                    );
+                }
+                other => panic!("expected LeaseDenied for Mission {verb}, got {other:?}"),
+            }
+        }
+
+        // The refusal precedes the supervision pause: no approval can grant
+        // the lifecycle verbs to a Mission thread.
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_mission_supervised".to_string());
+        let denied = adapter
+            .execute_action(
+                "mission_delete",
+                serde_json::json!({"name": "own"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(EngineError::LeaseDenied { .. })),
+            "Mission lifecycle refusal must precede the supervision pause, got {denied:?}"
+        );
+        ctx.supervised_mode = false;
+        ctx.current_call_id = None;
+
+        // The steering verbs still pass the gate: mission_update dispatches
+        // and mutates the seeded mission.
+        let updated = adapter
+            .execute_action(
+                "mission_update",
+                serde_json::json!({"name": "own", "current_focus": "steered"}),
+                &lease(),
+                &ctx,
+            )
+            .await
+            .expect("mission_update executes on a Mission thread");
+        assert!(
+            !updated.is_error,
+            "mission_update must succeed: {:?}",
+            updated.output
+        );
+
+        // Nothing dispatched behind the refusals: no new mission, and the
+        // seeded one was updated, not deleted.
+        let missions = mgr
+            .list_missions(ctx.project_id, &ctx.user_id)
+            .await
+            .expect("list missions");
+        assert_eq!(missions.len(), 1, "only the seeded mission exists");
+        assert_eq!(missions[0].current_focus.as_deref(), Some("steered"));
     }
 
     #[tokio::test]
