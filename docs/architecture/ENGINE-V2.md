@@ -45,7 +45,8 @@ denylist, the WI#309 resume-lease mission catalog, the WI#311 no-auto-complete
 rule for non-manual missions, the WI#319 pre-2026-07-26
 `Completed`-as-delete caveat in recovery guidance, and the WI#308 mission-verb
 dispatch gate subset (Research-thread refusal, WI#356 Mission lifecycle
-refusal, permission, supervision, rate limit, hooks) with its documented
+refusal plus the run-107 GM-1 update-field refusal, permission,
+supervision, rate limit, hooks) with its documented
 unsupervised-mission-run scope.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
@@ -1127,7 +1128,10 @@ Research threads — every `rlm_query` child included — are refused the six
 mutating verbs outright (create, fire, pause, resume, update, delete);
 Mission threads are refused the two lifecycle verbs (create, delete)
 outright (WI#356) — a mission thread may steer existing missions but never
-creates or deletes them; a
+creates or deletes them — and a Mission thread's `mission_update` may carry
+steering fields only (goal, current_focus, success_criteria, retry policy):
+cadence, webhook_secret, max_threads_per_day, new_name and notify_channels
+changes are refused (run-107 GM-1); a
 persisted `tool_permissions.<verb>` = disabled denies the call, and a
 settings-store read error fails closed for the mutating verbs (read-only
 verbs keep the registry path's deny-the-grant fallback); supervised mode
@@ -1143,8 +1147,7 @@ threads cannot spend Foreground stop tokens, while each class still has a
 20/minute, 200/hour cap for each stop verb. (After WI#356 a Mission thread
 never reaches the delete bucket — the gate refuses the verb first — so the
 Mission-class delete bucket is defensive keying.) Caller class comes from
-the host
-execution context, not tool parameters — and it is not a trust class
+the host execution context, not tool parameters — and it is not a trust class
 (WI#359 CN-3): all of one user's Mission-class threads share one
 `@Mission` stop bucket per stop verb (the mission prompt steers threads to
 `mission_pause`), and the list/history verbs and the run-spawning
@@ -1247,23 +1250,31 @@ webhook cadence) starts an autonomous, unsupervised agent whose own mission
 calls are limited by the rate limit, hooks, and the WI#356 lifecycle
 refusal. The approval description for the run-spawning verbs (create, fire,
 resume, update) says so and discloses the fan-out: the run may steer any of
-the owner's missions (update/re-target, fire, pause, resume) without
+the owner's missions (fire, pause, resume, goal/focus updates) without
 asking. `rlm_query` children, by contrast, inherit the parent's
 `supervised_mode`/`shared_conversation`/`supervised_timeout_secs` into
 their config, so a supervised parent's child gates fail closed. Second, the
 mission verbs are owner-scoped, not thread-scoped: any Foreground or
-Mission thread may steer (update/re-target — goal, cadence, notify
-channels, webhook secret — fire, pause, resume) *any* of the owner's
-missions by name or UUID (`resolve_mission_id` carries no thread scoping),
-and the planner grants the verbs to every thread type under the Stateful
-tier. The v1 equivalents (`routine_create`/`update`/`delete`/`fire`) sit on
+Mission thread may steer *any* of the owner's missions by name or UUID
+(`resolve_mission_id` carries no thread scoping), and the planner grants
+the verbs to every thread type under the Stateful tier. A Foreground
+thread's update may re-target (goal, cadence, notify channels, webhook
+secret, budget, rename); a Mission thread's update is limited to steering
+fields (goal, current_focus, success_criteria, retry policy) — cadence,
+webhook_secret, max_threads_per_day, new_name and notify_channels changes
+from a Mission thread are refused at the gate (WI#356, run-107 GM-1), so a
+mission run cannot turn any mission into a webhook-triggered one with a
+secret the model chose, nor lift its daily budget. The v1 equivalents
+(`routine_create`/`update`/`delete`/`fire`) sit on
 the autonomous-execution denylist; the v2 verbs do not — the bound placed
 on them (WI#356, run-33 AQ-3 / run-40 BF-1) is the dispatch gate's
 categorical refusal of `mission_create`/`mission_delete` to Mission threads
-alongside the Research-thread refusal, so creating or deleting a mission
-always goes through the supervised foreground, plus the fan-out disclosure
-on the run-spawning approval prompts. The owner-scoped steering reach that
-remains is deliberate and stays open. One related seam remains
+alongside the Research-thread refusal — partial v1 parity (create/delete
+only; v1 also denies update/fire, which v2 keeps as steering) — so creating
+or deleting a mission stays with the foreground conversation (supervised
+only when the tenant sets `AGENT_SUPERVISED_MODE`), plus the fan-out
+disclosure on the run-spawning approval prompts. The owner-scoped steering
+reach that remains is deliberate and stays open. One related seam remains
 by design: the structured-tier policy preflight
 (`executor/structured.rs`) evaluates policy from `available_actions`, which
 stays registry-only so the model-visible catalog does not duplicate the

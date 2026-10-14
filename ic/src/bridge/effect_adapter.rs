@@ -593,12 +593,22 @@ impl EffectBridgeAdapter {
         // refuses — a Research thread holding the missions lease is still
         // refused the mutating verbs (run-33 AQ-1). WI#356: a Mission
         // thread is likewise refused the lifecycle verbs (create, delete).
+        // Run-107 GM-3: name the categorical reason in the note instead of
+        // the misleading "no active lease".
+        let gate_refusal = if context.thread_type == lunarwing_engine::ThreadType::Research
+            && MISSION_MUTATING_ACTION_NAMES.contains(&action.name.as_str())
+        {
+            Some("the dispatch gate refuses it to Research threads")
+        } else if context.thread_type == lunarwing_engine::ThreadType::Mission
+            && MISSION_LIFECYCLE_ACTION_NAMES.contains(&action.name.as_str())
+        {
+            Some("the dispatch gate refuses it to Mission threads")
+        } else {
+            None
+        };
         let callable = thread_may_call(mission_manager.leases(), context.thread_id, &action.name)
             .await
-            && !(context.thread_type == lunarwing_engine::ThreadType::Research
-                && MISSION_MUTATING_ACTION_NAMES.contains(&action.name.as_str()))
-            && !(context.thread_type == lunarwing_engine::ThreadType::Mission
-                && MISSION_LIFECYCLE_ACTION_NAMES.contains(&action.name.as_str()));
+            && gate_refusal.is_none();
 
         let failed = |reason: String| -> crate::error::Error {
             crate::error::ToolError::ExecutionFailed {
@@ -613,6 +623,7 @@ impl EffectBridgeAdapter {
             action.parameters_schema,
             MISSIONS_CAPABILITY,
             callable,
+            gate_refusal,
             parameters,
         )
         .map_err(|error| failed(error.to_string()))
@@ -663,7 +674,11 @@ impl EffectBridgeAdapter {
     /// - Research threads — every `rlm_query` child included — are refused
     ///   the mutating verbs outright (see [`MISSION_MUTATING_ACTION_NAMES`]);
     /// - Mission threads are refused the lifecycle verbs outright (create,
-    ///   delete — see [`MISSION_LIFECYCLE_ACTION_NAMES`], WI#356);
+    ///   delete — see [`MISSION_LIFECYCLE_ACTION_NAMES`], WI#356), and their
+    ///   `mission_update` may carry steering fields only — cadence,
+    ///   webhook_secret, max_threads_per_day, new_name and notify_channels
+    ///   are refused (see [`MISSION_UPDATE_FOREGROUND_ONLY_PARAMS`],
+    ///   run-107 GM-1);
     /// - persisted `tool_permissions.<verb>` = disabled denies the call, and
     ///   a settings-store read error fails closed for the mutating verbs
     ///   (read-only verbs keep the registry path's deny-the-grant fallback);
@@ -690,7 +705,9 @@ impl EffectBridgeAdapter {
     /// (they hold no credential registrations). Note the scope this leaves
     /// open: any Foreground or Mission thread may steer (update, fire, pause,
     /// resume) *any* of the owner's missions by name or UUID, not just the
-    /// mission it belongs to; create/delete are Foreground-only after WI#356.
+    /// mission it belongs to — though a Mission thread's update is limited
+    /// to steering fields (run-107 GM-1); create/delete are Foreground-only
+    /// after WI#356.
     ///
     /// Returns `Some(error)` when a gate trips, `None` to proceed — including
     /// for non-mission calls and when no mission manager is wired (the call
@@ -717,17 +734,19 @@ impl EffectBridgeAdapter {
                 reason: format!(
                     "Tool '{action_name}' is not available on Research threads; \
                      mission changes must come from the foreground conversation \
-                     or the mission's own thread."
+                     (steering verbs also from the mission's own thread)."
                 ),
             });
         }
 
         // Categorical refusal (WI#356, run-33 AQ-3 / run-40 BF-1): Mission
         // threads are unsupervised by construction and owner-scoped, so they
-        // may steer existing missions but never create or delete them — the
-        // v1 parity bound (`routine_create`/`routine_delete` sit on
-        // AUTONOMOUS_TOOL_DENYLIST). Like the Research refusal this precedes
-        // the supervision pause; no approval can grant it.
+        // may steer existing missions but never create or delete them —
+        // partial v1 parity (`routine_create`/`routine_delete` sit on
+        // AUTONOMOUS_TOOL_DENYLIST; v1 also denies update/fire, which v2
+        // still grants to Mission threads as steering). Like the Research
+        // refusal this precedes the supervision pause; no approval can
+        // grant it.
         if context.thread_type == lunarwing_engine::ThreadType::Mission
             && MISSION_LIFECYCLE_ACTION_NAMES.contains(&action_name)
         {
@@ -736,6 +755,33 @@ impl EffectBridgeAdapter {
                     "Tool '{action_name}' is not available on Mission threads; \
                      mission creation and deletion must come from the foreground \
                      conversation."
+                ),
+            });
+        }
+
+        // WI#356 (run-107 GM-1): a Mission thread's `mission_update` may
+        // steer (goal, current_focus, success_criteria, retry policy) but
+        // must not reshape the mission's external reach or guardrails —
+        // cadence (a webhook/event cadence makes it externally
+        // triggerable), webhook_secret (the model would choose and know the
+        // secret), max_threads_per_day (0 lifts the daily budget), new_name
+        // (rename), notify_channels (redirects notifications). Those fields
+        // stay foreground-only. `name` doubles as the lookup key in
+        // `resolve_mission_id`, so the refusal keys on `new_name`, never
+        // `name`. Same ordering as the lifecycle refusal: before the
+        // supervision pause, so no approval can grant it.
+        if context.thread_type == lunarwing_engine::ThreadType::Mission
+            && action_name == "mission_update"
+            && MISSION_UPDATE_FOREGROUND_ONLY_PARAMS
+                .iter()
+                .any(|key| parameters.get(*key).is_some())
+        {
+            return Some(EngineError::LeaseDenied {
+                reason: format!(
+                    "Tool 'mission_update' on Mission threads accepts only steering fields \
+                     (goal, current_focus, success_criteria, retry policy); cadence, \
+                     webhook_secret, max_threads_per_day, new_name and notify_channels \
+                     changes must come from the foreground conversation."
                 ),
             });
         }
@@ -1904,6 +1950,23 @@ pub(crate) const MISSION_MUTATING_ACTION_NAMES: &[&str] = &[
 /// delete any — the same bound v1 places on `routine_create`/`routine_delete`
 /// via the autonomous-execution denylist.
 pub(crate) const MISSION_LIFECYCLE_ACTION_NAMES: &[&str] = &["mission_create", "mission_delete"];
+
+/// The `mission_update` parameter keys a Mission thread may not set (WI#356,
+/// run-107 GM-1): each reshapes the mission's external reach or guardrails.
+/// `cadence` can turn a mission into a persistent externally-triggerable
+/// webhook/event one; `webhook_secret` is a secret the model would choose
+/// and therefore know; `max_threads_per_day = 0` lifts the daily budget;
+/// `new_name` renames; `notify_channels` redirects where outcomes go. The
+/// steering fields (goal, current_focus, success_criteria, retry policy)
+/// stay available. `name` is deliberately absent: it doubles as the lookup
+/// key in `resolve_mission_id`, so only `new_name` is refused.
+pub(crate) const MISSION_UPDATE_FOREGROUND_ONLY_PARAMS: &[&str] = &[
+    "cadence",
+    "webhook_secret",
+    "max_threads_per_day",
+    "new_name",
+    "notify_channels",
+];
 
 /// The verbs whose approval starts or reshapes autonomous mission runs
 /// (WI#308, run-33 AQ-2). Mission-spawned threads are unsupervised by
@@ -5789,8 +5852,9 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         // unsupervised by construction and owner-scoped, so the gate refuses
         // it the lifecycle verbs — creating further missions or deleting any
         // of the owner's missions must come from the supervised foreground
-        // (v1 parity: routine_create/routine_delete sit on
-        // AUTONOMOUS_TOOL_DENYLIST).
+        // (partial v1 parity: routine_create/routine_delete sit on
+        // AUTONOMOUS_TOOL_DENYLIST; v1 also denies update/fire, which v2
+        // still grants to Mission threads as steering).
         let (adapter, mgr, store) = adapter_with_mission_manager_parts();
         adapter.set_mission_manager(mgr.clone()).await;
         let mut ctx = mission_create_ctx();
@@ -5804,7 +5868,14 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         );
         store.save_mission(&own).await.expect("seed mission");
 
-        for verb in MISSION_LIFECYCLE_ACTION_NAMES {
+        // Run-107 GM-2: iterate the literal verbs, not the constant under
+        // test — dropping a verb from MISSION_LIFECYCLE_ACTION_NAMES must
+        // fail here, not pass vacuously.
+        assert_eq!(
+            MISSION_LIFECYCLE_ACTION_NAMES,
+            &["mission_create", "mission_delete"]
+        );
+        for verb in ["mission_create", "mission_delete"] {
             let denied = adapter
                 .execute_action(
                     verb,
@@ -5823,6 +5894,22 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                 other => panic!("expected LeaseDenied for Mission {verb}, got {other:?}"),
             }
         }
+
+        // A Mission-thread mission_create under a *new* name is refused the
+        // same way — the refusal does not depend on the dedup path hitting
+        // the seeded mission.
+        let denied = adapter
+            .execute_action(
+                "mission_create",
+                serde_json::json!({"name": "brand-new", "goal": "never runs"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(EngineError::LeaseDenied { .. })),
+            "Mission mission_create with a new name must be refused, got {denied:?}"
+        );
 
         // The refusal precedes the supervision pause: no approval can grant
         // the lifecycle verbs to a Mission thread.
@@ -5868,6 +5955,114 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             .expect("list missions");
         assert_eq!(missions.len(), 1, "only the seeded mission exists");
         assert_eq!(missions[0].current_focus.as_deref(), Some("steered"));
+    }
+
+    #[tokio::test]
+    async fn mission_thread_updates_carry_steering_fields_only() {
+        // WI#356 (run-107 GM-1): a Mission thread's mission_update may steer
+        // (goal, current_focus, success_criteria, retry policy) but the
+        // fields that reshape external reach or guardrails — cadence,
+        // webhook_secret, max_threads_per_day, new_name, notify_channels —
+        // are foreground-only. `name` stays allowed: it is the lookup key.
+        let (adapter, mgr, store) = adapter_with_mission_manager_parts();
+        adapter.set_mission_manager(mgr.clone()).await;
+        let mut ctx = mission_create_ctx();
+        ctx.thread_type = lunarwing_engine::ThreadType::Mission;
+        let own = lunarwing_engine::Mission::new(
+            ctx.project_id,
+            &ctx.user_id,
+            "own",
+            "goal",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_mission(&own).await.expect("seed mission");
+
+        assert_eq!(
+            MISSION_UPDATE_FOREGROUND_ONLY_PARAMS,
+            &[
+                "cadence",
+                "webhook_secret",
+                "max_threads_per_day",
+                "new_name",
+                "notify_channels",
+            ]
+        );
+        for (key, value) in [
+            ("cadence", serde_json::json!("webhook:hooked")),
+            ("webhook_secret", serde_json::json!("whsec-chosen")),
+            ("max_threads_per_day", serde_json::json!(0)),
+            ("new_name", serde_json::json!("renamed")),
+            ("notify_channels", serde_json::json!(["elsewhere"])),
+        ] {
+            let denied = adapter
+                .execute_action(
+                    "mission_update",
+                    serde_json::json!({"name": "own", key: value}),
+                    &lease(),
+                    &ctx,
+                )
+                .await;
+            match denied {
+                Err(EngineError::LeaseDenied { reason }) => {
+                    assert!(
+                        reason.contains("steering fields"),
+                        "unexpected refusal wording for {key}: {reason}"
+                    );
+                }
+                other => panic!("expected LeaseDenied for Mission mission_update {key}, got {other:?}"),
+            }
+        }
+
+        // The refusal precedes the supervision pause: no approval grants the
+        // foreground-only fields to a Mission thread.
+        ctx.supervised_mode = true;
+        ctx.current_call_id = Some("call_mission_update_supervised".to_string());
+        let denied = adapter
+            .execute_action(
+                "mission_update",
+                serde_json::json!({"name": "own", "cadence": "webhook:hooked"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(EngineError::LeaseDenied { .. })),
+            "Mission update field refusal must precede the supervision pause, got {denied:?}"
+        );
+        ctx.supervised_mode = false;
+        ctx.current_call_id = None;
+
+        // A Foreground thread keeps the full update surface (the foreground
+        // is where cadence/secret/budget changes belong).
+        ctx.thread_type = lunarwing_engine::ThreadType::Foreground;
+        let updated = adapter
+            .execute_action(
+                "mission_update",
+                serde_json::json!({"name": "own", "max_threads_per_day": 3}),
+                &lease(),
+                &ctx,
+            )
+            .await
+            .expect("Foreground mission_update executes");
+        assert!(
+            !updated.is_error,
+            "Foreground mission_update must succeed: {:?}",
+            updated.output
+        );
+
+        // Nothing the gate refused was applied: cadence, budget, name and
+        // channels are untouched, and the foreground budget change landed.
+        let mission = mgr
+            .get_mission(own.id)
+            .await
+            .expect("load mission")
+            .expect("mission exists");
+        assert!(matches!(
+            mission.cadence,
+            lunarwing_engine::MissionCadence::Manual
+        ));
+        assert_eq!(mission.name, "own");
+        assert_eq!(mission.max_threads_per_day, 3);
     }
 
     #[tokio::test]
@@ -7383,6 +7578,70 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             "a thread the host holds no leases for is answered callable, not \
              refused: {:?}",
             result.output
+        );
+    }
+
+    /// WI#356 (run-107 GM-3): a Mission thread holding the full missions
+    /// lease is answered `callable: false` for the lifecycle verbs with the
+    /// gate refusal as the note's reason — never the misleading "no active
+    /// lease" — while the steering verbs stay callable.
+    #[tokio::test]
+    async fn tool_info_mission_thread_sees_lifecycle_refusal_as_not_callable() {
+        let adapter = adapter_with_tool_info().await;
+        let (mgr, leases, _store) = mission_manager_with_leases();
+        adapter.set_mission_manager(mgr).await;
+        let thread = lunarwing_engine::ThreadId::new();
+        grant(&leases, thread, "tools", &["tool_info"]).await;
+        let mission_names = all_mission_function_names();
+        let mission_names: Vec<&str> = mission_names.iter().map(String::as_str).collect();
+        grant(&leases, thread, MISSIONS_CAPABILITY, &mission_names).await;
+
+        for verb in ["mission_create", "mission_delete"] {
+            let result = adapter
+                .execute_action(
+                    "tool_info",
+                    serde_json::json!({"name": verb}),
+                    &lease(),
+                    &exec_ctx_for_type(
+                        thread,
+                        Some("call_tool_info"),
+                        lunarwing_engine::ThreadType::Mission,
+                    ),
+                )
+                .await
+                .expect("tool_info returns an action result");
+            assert!(!result.is_error, "{verb}: {:?}", result.output);
+            assert_eq!(
+                result.output["callable"], false,
+                "{verb} is refused to Mission threads at the gate: {:?}",
+                result.output
+            );
+            let note = result.output["note"].as_str().expect("note");
+            assert!(
+                note.contains("the dispatch gate refuses it to Mission threads"),
+                "{verb} note must name the gate refusal, not a missing lease: {note}"
+            );
+            assert!(!note.contains("no active lease"), "{note}");
+        }
+
+        let steering = adapter
+            .execute_action(
+                "tool_info",
+                serde_json::json!({"name": "mission_update"}),
+                &lease(),
+                &exec_ctx_for_type(
+                    thread,
+                    Some("call_tool_info"),
+                    lunarwing_engine::ThreadType::Mission,
+                ),
+            )
+            .await
+            .expect("tool_info returns an action result");
+        assert!(!steering.is_error, "{:?}", steering.output);
+        assert_eq!(
+            steering.output["callable"], true,
+            "the steering verbs stay callable for Mission threads: {:?}",
+            steering.output
         );
     }
 }

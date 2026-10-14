@@ -473,11 +473,15 @@ async fn persist_and_notify_thread_gate(
     // what the human is really authorizing. WI#356 (run-40 BF-1): the
     // prompt must also disclose the fan-out — the spawned thread may steer
     // any of the owner's missions, not just the one that spawned it.
+    // Run-107 GM-1: the steering a Mission thread's update may do is
+    // narrowed to goal/focus/criteria/retry fields — cadence, webhook
+    // secret, budget, rename and notification-channel changes stay
+    // foreground-only — so the disclosure names the remaining reach.
     let description = if crate::bridge::effect_adapter::MISSION_RUN_SPAWNING_ACTION_NAMES
         .contains(&action_name.as_str())
     {
         format!(
-            "Tool '{}' requires {} (gate: {gate_name}). Approved mission runs execute unsupervised: the spawned mission threads do not pause for approval and may steer any of your missions (update/re-target, fire, pause, resume) without asking.",
+            "Tool '{}' requires {} (gate: {gate_name}). Approved mission runs execute unsupervised: the spawned mission threads do not pause for approval and may steer any of your missions (fire, pause, resume, goal/focus updates) without asking.",
             action_name,
             resume_kind.kind_name()
         )

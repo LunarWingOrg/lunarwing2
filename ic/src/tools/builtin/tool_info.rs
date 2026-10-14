@@ -136,13 +136,17 @@ fn render_info(
 /// manager's leases (the set the executor's preflight consults) and passes
 /// in. The bridge calls this only where the function dispatches — engine
 /// threads with a mission manager wired; the note tells a thread without the
-/// lease that a call from it is refused.
+/// lease that a call from it is refused. When the dispatch gate refuses the
+/// call categorically (a Research or Mission thread and a verb that thread
+/// type may never call), the bridge passes `refusal_reason` so the note names
+/// the real reason instead of "no active lease" (run-107 GM-3).
 pub(crate) fn engine_action_info(
     name: &str,
     description: &str,
     schema: serde_json::Value,
     capability: &str,
     callable: bool,
+    refusal_reason: Option<&str>,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, ToolError> {
     let detail = ToolInfoDetail::parse(params)?;
@@ -156,6 +160,12 @@ pub(crate) fn engine_action_info(
             "'{name}' is not a registry tool, so the tool registry and tool_list do not show \
              it. It is an Engine V2 '{capability}' capability function, directly callable \
              from this thread's CodeAct code, e.g. `await {name}(...)`."
+        )
+    } else if let Some(reason) = refusal_reason {
+        format!(
+            "'{name}' is not a registry tool, so the tool registry and tool_list do not show \
+             it. It is an Engine V2 '{capability}' capability function, but {reason}, so a \
+             call from this thread is refused."
         )
     } else {
         format!(
@@ -444,6 +454,7 @@ mod tests {
             schema.clone(),
             "missions",
             true,
+            None,
             &serde_json::json!({"name": "mission_create"}),
         )
         .expect("names detail");
@@ -465,6 +476,7 @@ mod tests {
             schema.clone(),
             "missions",
             true,
+            None,
             &serde_json::json!({"name": "mission_create", "detail": "summary"}),
         )
         .expect("summary detail");
@@ -479,6 +491,7 @@ mod tests {
             schema.clone(),
             "missions",
             true,
+            None,
             &serde_json::json!({"name": "mission_create", "detail": "schema"}),
         )
         .expect("schema detail");
@@ -491,6 +504,7 @@ mod tests {
                 schema,
                 "missions",
                 true,
+                None,
                 &serde_json::json!({"name": "mission_create", "detail": "verbose"}),
             ),
             Err(ToolError::InvalidParameters(_))
@@ -512,6 +526,7 @@ mod tests {
             schema,
             "missions",
             false,
+            None,
             &serde_json::json!({"name": "mission_delete"}),
         )
         .expect("names detail");
@@ -524,6 +539,35 @@ mod tests {
         let note = info["note"].as_str().expect("note");
         assert!(note.contains("not a registry tool"), "{note}");
         assert!(note.contains("no active lease"), "{note}");
+        assert!(!note.contains("directly callable"), "{note}");
+    }
+
+    /// Run-107 GM-3: when the dispatch gate refuses the call categorically,
+    /// the note names that reason instead of the misleading "no active
+    /// lease".
+    #[test]
+    fn test_engine_action_info_note_names_a_categorical_refusal() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+        });
+        let info = engine_action_info(
+            "mission_create",
+            "Create a mission",
+            schema,
+            "missions",
+            false,
+            Some("the dispatch gate refuses it to Mission threads"),
+            &serde_json::json!({"name": "mission_create"}),
+        )
+        .expect("names detail");
+        assert_eq!(info["callable"], false);
+        let note = info["note"].as_str().expect("note");
+        assert!(
+            note.contains("the dispatch gate refuses it to Mission threads"),
+            "{note}"
+        );
+        assert!(!note.contains("no active lease"), "{note}");
         assert!(!note.contains("directly callable"), "{note}");
     }
 
