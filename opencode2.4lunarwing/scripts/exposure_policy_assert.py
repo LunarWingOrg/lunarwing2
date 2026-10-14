@@ -27,9 +27,10 @@ Assertions (opencode2 lane):
   7. --image-filesystem: the installed boot files, scripts and config are
      root-owned and read-only (image builds only). For the v2 profile the
      installed wrapper is verified too: /usr/local/bin/opencode must be the
-     byte-identical root-owned read-only exposure guard, PATH must resolve
-     'opencode' to it, and the real binary is re-scanned for OpenTunnel
-     markers (run-103 GD-2).
+     byte-identical root-owned read-only executable exposure guard, PATH must
+     resolve 'opencode' to it, the real binary is re-scanned for OpenTunnel
+     markers (run-103 GD-2), and LUNARWING_REAL_OPENCODE may not retarget the
+     wrapper at build time (run-106 GJ-3).
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1.18.25 has no service mode or
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -276,9 +278,11 @@ def check_installed_wrapper(
     A RUN in the final stage between the wrapper-install scan and the
     --image-filesystem assertion can replace the wrapper (or the real
     binary) after every text check passed; only the installed filesystem
-    cannot lie. The wrapper must be the byte-identical, owner-only-writable
-    exposure guard, PATH must resolve 'opencode' to it, and the real binary
-    is re-scanned for OpenTunnel markers. Image builds only (v2 profile).
+    cannot lie. The wrapper must be the byte-identical, owner-only-writable,
+    executable exposure guard, PATH must resolve 'opencode' to it, the real
+    binary is re-scanned for OpenTunnel markers, and LUNARWING_REAL_OPENCODE
+    may not retarget the wrapper at build time (run-106 GJ-3b/c). Image
+    builds only (v2 profile).
     """
     try:
         metadata = wrapper_path.lstat()
@@ -294,6 +298,13 @@ def check_installed_wrapper(
     if metadata.st_mode & 0o022:
         fail(f"installed wrapper {wrapper_path} must not be group- or other-writable")
         return
+    # Run-106 GJ-3(c): a non-executable wrapper is skipped by PATH lookup, so
+    # 'opencode' resolves elsewhere — refuse it with its own reason instead
+    # of the misleading "earlier PATH dir shadows" text.
+    if not metadata.st_mode & stat.S_IXUSR:
+        fail(f"installed wrapper {wrapper_path} must be executable "
+             f"(mode {stat.S_IMODE(metadata.st_mode):o})")
+        return
     source = lane / "scripts" / "opencode-exposure-guard.sh"
     try:
         installed = wrapper_path.read_bytes()
@@ -305,6 +316,16 @@ def check_installed_wrapper(
         fail(f"installed wrapper {wrapper_path} is not byte-identical to {source} — "
              "replaced after the scan (run-103 GD-2)")
         return
+    # Run-106 GJ-3(b): the wrapper honours LUNARWING_REAL_OPENCODE over the
+    # default binary path, so an ENV pointing it elsewhere would exec that
+    # path at runtime while this check scans only binary_path. Only the
+    # default passes at build time; a foreign value fails AND is scanned so
+    # the report says what sits at the override target.
+    real_override = os.environ.get("LUNARWING_REAL_OPENCODE", "")
+    if real_override and pathlib.Path(real_override) != binary_path:
+        fail(f"LUNARWING_REAL_OPENCODE={real_override!r} is set at build time — the "
+             f"wrapper would exec that instead of {binary_path} (run-106 GJ-3b)")
+        check_binary(pathlib.Path(real_override))
     resolved = shutil.which("opencode")
     if resolved is None or pathlib.Path(resolved) != wrapper_path:
         fail(f"'opencode' on PATH must resolve to the wrapper {wrapper_path} "

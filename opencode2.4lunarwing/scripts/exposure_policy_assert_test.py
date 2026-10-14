@@ -388,9 +388,12 @@ class InstalledWrapperTests(unittest.TestCase):
         self.assert_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.assert_module)
 
-    def check(self, *path: pathlib.Path) -> list[str]:
+    def check(self, *path: pathlib.Path, env: dict[str, str] | None = None) -> list[str]:
         self.assert_module.failures.clear()
-        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join(str(p) for p in path)}):
+        environ = {"PATH": os.pathsep.join(str(p) for p in path)}
+        if env:
+            environ.update(env)
+        with mock.patch.dict(os.environ, environ):
             self.assert_module.check_installed_wrapper(
                 self.lane,
                 self.wrapper_path,
@@ -444,6 +447,32 @@ class InstalledWrapperTests(unittest.TestCase):
         failures = self.check(self.bin_dir)
         self.assertEqual(len(failures), 1, failures)
         self.assertIn("missing or unreadable", failures[0])
+
+    def test_non_executable_wrapper_fails_with_its_own_reason(self) -> None:
+        # Run-106 GJ-3(c): a root-owned 0644 wrapper used to be refused with
+        # the misleading "earlier PATH dir shadows" text (which skips
+        # non-executables); the executable bit now has its own failure.
+        self.wrapper_path.chmod(0o644)
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("must be executable", failures[0])
+
+    def test_real_opencode_env_override_fails_and_scans_the_target(self) -> None:
+        # Run-106 GJ-3(b): the wrapper honours LUNARWING_REAL_OPENCODE, so an
+        # ENV retargeting it at a marker-bearing binary used to pass while
+        # check_binary scanned only the fixed default path.
+        alt = self.root / "alt" / "opencode.real"
+        alt.parent.mkdir()
+        alt.write_bytes(b"\x7fELF tampered build embedding https://opentunnel.xyz relay")
+        failures = self.check(self.bin_dir, env={"LUNARWING_REAL_OPENCODE": str(alt)})
+        self.assertTrue(any("LUNARWING_REAL_OPENCODE" in f for f in failures), failures)
+        self.assertTrue(any("opentunnel" in f for f in failures), failures)
+
+    def test_real_opencode_env_override_at_the_default_path_passes(self) -> None:
+        failures = self.check(
+            self.bin_dir, env={"LUNARWING_REAL_OPENCODE": str(self.binary_path)}
+        )
+        self.assertEqual(failures, [])
 
     def test_image_filesystem_path_wires_the_check_in(self) -> None:
         # The scenarios above call the function directly (GD-3: the image
