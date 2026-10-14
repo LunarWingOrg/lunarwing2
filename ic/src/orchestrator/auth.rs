@@ -237,6 +237,12 @@ impl TokenStore {
     /// be followed by a re-insert — nothing would ever remove that entry.
     /// Lock order secrets → redactors matches the clear path, so the
     /// re-check and the insert are atomic against a concurrent clear.
+    ///
+    /// The re-check covers PRESENCE, not generation: a build racing a
+    /// re-store of different values would cache the older generation. That
+    /// is unreachable today because the only production store runs once at
+    /// dispatch and job ids are fresh UUIDs (a web restart creates a new
+    /// id), so a build can never race a re-store for the same id.
     async fn cache_redactor_if_held(
         &self,
         job_id: Uuid,
@@ -631,8 +637,13 @@ mod tests {
         );
         assert!(store.harness_redactors.read().await.get(&job_id).is_some());
 
-        // Quiescent-state invariant under racing builds and clears: once
-        // everything settles, the cache never outlives the held secrets.
+        // Quiescent-state sweep: once everything settles, the cache never
+        // outlives the held secrets. This is an invariant check, NOT a race
+        // pin: `#[tokio::test]` runs current-thread and `clear_harness_secrets`
+        // holds no guard across an await, so the spawned builder always runs
+        // atomically between the clear's statements — the loop cannot fail on
+        // a pre-EE-4 direct insert. The race closure rests on the lock-order
+        // argument in `cache_redactor_if_held` and the two direct calls above.
         for _ in 0..64 {
             let store = Arc::new(TokenStore::new());
             let job_id = Uuid::new_v4();
