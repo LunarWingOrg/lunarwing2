@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-cache"
-version = "36.0.17"
+version = "36.0.18"
 dependencies = [
  "anyhow",
  "base64",

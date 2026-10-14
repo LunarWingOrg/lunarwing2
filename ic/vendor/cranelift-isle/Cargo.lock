@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.123.17"
+version = "0.123.18"
 dependencies = [
  "codespan-reporting",
  "log",
