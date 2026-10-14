@@ -231,10 +231,13 @@ every backup emits a `lunarwing::safety` warn audit line naming the path, the
 prior byte count and the backup path. Most prompt-visible files keep a single
 rolling slot, overwritten on each replace; daily logs additionally retain up
 to eight earlier generations — before the slot is overwritten, its content
-rolls aside to the first free `backups/daily/<date>.md.bak.<n>`. At the cap
+rolls aside to the first free `backups/daily/<date>.md.bak.<n>`, and a
+successful roll-aside emits its own audit line naming the numbered slot and
+the rolled byte count (WI#336). At the cap
 the first generation of the day stays pinned and the second-oldest
 generation is discarded instead, with an audit line carrying its byte count
-and blake3 fingerprint so forensics can say what was lost. The pin is
+and blake3 fingerprint — emitted before the destructive shift begins, so a
+mid-shift failure still records what was lost (WI#336). The pin is
 positional, not evidential (WI#335): `.1` holds the content that preceded
 the day's first *backed-up* replace in that scope — the first backup is
 taken only when the prior content is non-empty and differs, and layer writes
