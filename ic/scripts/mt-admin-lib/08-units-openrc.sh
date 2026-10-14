@@ -392,6 +392,15 @@ INITEOF
 openrc_proxy_unit_is_safe() {
   local path="$1"
   [[ -f "$path" && ! -L "$path" ]] || return 1
+  # FL-6 (WI#393): presence of the contract line is not equality — a unit
+  # carrying the safe line PLUS extra content would classify as safe and be
+  # neither archived nor refused, leaving the extra content for OpenRC to
+  # source. Reject any line carrying the legacy inline-upstream flag
+  # (--tensorzero, as opposed to --tensorzero-env), command substitution, or
+  # a backtick before accepting the contract line.
+  if grep -Eq -- '--tensorzero |[$][(]|`' "$path"; then
+    return 1
+  fi
   grep -Eq \
     '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"
 }
