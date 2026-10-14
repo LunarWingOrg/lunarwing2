@@ -442,20 +442,74 @@ impl StoreData {
     ///
     /// Called once at the trait boundary so early validator errors — which run
     /// on the injected URL and can quote injected values in deny reasons
-    /// (GN-6) — and response headers — which can echo the urlencoded
-    /// query-param credential through a redirect `Location` (GN-7) — are
-    /// covered alongside send errors.
+    /// (GN-6), response headers — which can echo the urlencoded query-param
+    /// credential through a redirect `Location` (GN-7) — and response
+    /// bodies — which echo the redirect target URL on common 3xx edges
+    /// (run-111 HA-3) — are covered alongside send errors. Headers are
+    /// redacted per field before serialization so JSON-escaping cannot hide
+    /// a secret containing `"` or `\` (run-111 HA-8).
     fn redact_http_outcome_for_guest(
         &self,
         outcome: Result<lunarwing::agent::host::HttpResponse, String>,
     ) -> Result<lunarwing::agent::host::HttpResponse, String> {
         match outcome {
             Ok(mut resp) => {
-                resp.headers_json = self.redact_credentials(&resp.headers_json);
+                resp.body = self.redact_credential_bytes(std::mem::take(&mut resp.body));
+                resp.headers_json = self.redact_headers_json(&resp.headers_json);
                 Ok(resp)
             }
             Err(e) => Err(self.redact_credentials(&e)),
         }
+    }
+
+    /// Redact credentials from a serialized headers map at the field level
+    /// (WI#395 run-111 HA-8): a secret containing `"` or `\` is JSON-escaped
+    /// in the serialized form, so string-level replacement can miss it, and a
+    /// blind string replace could even produce invalid JSON. Parsing first
+    /// and redacting each name and value keeps the output valid for any
+    /// secret bytes.
+    fn redact_headers_json(&self, headers_json: &str) -> String {
+        let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+            return self.redact_credentials(headers_json);
+        };
+        let redacted: HashMap<String, String> = map
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    self.redact_credentials(&name),
+                    self.redact_credentials(&value),
+                )
+            })
+            .collect();
+        serde_json::to_string(&redacted).unwrap_or_else(|_| self.redact_credentials(headers_json))
+    }
+
+    /// Byte-level credential scrub for response bodies (WI#395 run-111
+    /// HA-3): bodies are not guaranteed UTF-8, so the raw and urlencoded
+    /// spellings are replaced at the byte level rather than through lossy
+    /// string conversion.
+    fn redact_credential_bytes(&self, mut bytes: Vec<u8>) -> Vec<u8> {
+        for (name, value) in &self.credentials {
+            if !value.is_empty() {
+                let marker = format!("[REDACTED:{name}]").into_bytes();
+                replace_all_bytes(&mut bytes, value.as_bytes(), &marker);
+                let encoded = urlencoding::encode(value).to_string();
+                if encoded != *value {
+                    replace_all_bytes(&mut bytes, encoded.as_bytes(), &marker);
+                }
+            }
+        }
+        for cred in &self.host_credentials {
+            if !cred.secret_value.is_empty() {
+                const MARKER: &[u8] = b"[REDACTED:host_credential]";
+                replace_all_bytes(&mut bytes, cred.secret_value.as_bytes(), MARKER);
+                let encoded = urlencoding::encode(&cred.secret_value).to_string();
+                if encoded != cred.secret_value {
+                    replace_all_bytes(&mut bytes, encoded.as_bytes(), MARKER);
+                }
+            }
+        }
+        bytes
     }
 
     /// Unredacted HTTP exchange implementation; the trait method applies
@@ -802,6 +856,24 @@ fn replace_encoded_secret(result: &mut String, value: &str, replacement: &str) {
     let encoded = urlencoding::encode(value).to_string();
     if encoded != value {
         *result = result.replace(encoded.as_str(), replacement);
+    }
+}
+
+/// Replace every occurrence of `needle` in `haystack` with `marker`, at the
+/// byte level (WI#395 run-111 HA-3 — response bodies are not guaranteed
+/// UTF-8, so string-level replacement cannot be used on them).
+fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
+    if needle.is_empty() {
+        return;
+    }
+    let mut search_from = 0;
+    while let Some(offset) = haystack[search_from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let at = search_from + offset;
+        haystack.splice(at..at + needle.len(), marker.iter().copied());
+        search_from = at + marker.len();
     }
 }
 
@@ -3478,6 +3550,140 @@ mod tests {
             redacted.headers_json.contains("[REDACTED:host_credential]"),
             "{}",
             redacted.headers_json
+        );
+    }
+
+    /// WI#395 (run-111 HA-4): the trait-boundary redaction call itself is
+    /// pinned — the GN-6/GN-7 tests call the helper directly, so removing
+    /// the `redact_http_outcome_for_guest` call from `Host::http_request`
+    /// would pass them. A placeholder injected into the URL *path* is quoted
+    /// verbatim in the allowlist deny reason (`PathNotAllowed` carries the
+    /// normalized path), so a real denied request must come back redacted.
+    #[test]
+    fn guest_http_request_redacts_validator_error_at_trait_boundary() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::tools::wasm::capabilities::{Capabilities, EndpointPattern, HttpCapability};
+        use crate::tools::wasm::wrapper::StoreData;
+        use std::collections::HashMap;
+
+        const SECRET: &str = "pathsecret4k3l2m";
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), SECRET.to_string());
+        let capabilities = Capabilities::default().with_http(HttpCapability::new(vec![
+            EndpointPattern::host("api.example.com").with_path_prefix("/allowed/"),
+        ]));
+        let mut store_data = StoreData::new(1024 * 1024, capabilities, credentials, Vec::new());
+
+        // The placeholder lands in the path; the deny reason quotes it.
+        let url = format!("https://api.example.com/{{API_TOKEN}}/d");
+        let err = store_data
+            .http_request("GET".to_string(), url, "{}".to_string(), None, None)
+            .unwrap_err();
+        assert!(
+            err.contains("HTTP not allowed"),
+            "expected an allowlist denial: {err}"
+        );
+        assert!(!err.contains(SECRET), "{err}");
+        assert!(err.contains("[REDACTED:API_TOKEN]"), "{err}");
+    }
+
+    /// WI#395 (run-111 HA-3/HA-8): the response BODY reaches the guest and
+    /// can echo the injected credential — a 3xx body echoes the redirect
+    /// target URL on common edges (Go, Apache, Express). An
+    /// interceptor-driven 302 with the echo in both `Location` and the body
+    /// must come back with both scrubbed, byte-level for the body. The
+    /// secret also contains a double quote: serialized into `headers_json`
+    /// it is JSON-escaped, so only per-field header redaction catches the
+    /// raw echo (HA-8). The URL targets a public IP literal so the
+    /// private-IP guard passes without DNS.
+    #[test]
+    fn guest_http_request_redacts_echoed_credential_in_headers_and_body() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
+        use crate::tools::wasm::capabilities::{Capabilities, EndpointPattern, HttpCapability};
+        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        const SECRET: &str = "guestbody\"7c8d9e+/==";
+        const SECRET_STEM: &str = "guestbody";
+
+        #[derive(Debug)]
+        struct RedirectEcho;
+        #[async_trait::async_trait]
+        impl HttpInterceptor for RedirectEcho {
+            async fn before_request(
+                &self,
+                _request: &HttpExchangeRequest,
+            ) -> Option<HttpExchangeResponse> {
+                let encoded = urlencoding::encode(SECRET).to_string();
+                let location = format!("https://example.test/mapped?api_key={encoded}");
+                Some(HttpExchangeResponse {
+                    status: 302,
+                    headers: vec![
+                        ("location".to_string(), location.clone()),
+                        ("x-auth-echo".to_string(), format!("Bearer {SECRET}")),
+                        ("content-type".to_string(), "text/html".to_string()),
+                    ],
+                    body: format!("<a href=\"{location}\">Found</a>.\n"),
+                })
+            }
+
+            async fn after_response(
+                &self,
+                _request: &HttpExchangeRequest,
+                _response: &HttpExchangeResponse,
+            ) {
+            }
+        }
+
+        let mut query_params = HashMap::new();
+        query_params.insert("api_key".to_string(), SECRET.to_string());
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["93.184.216.34".to_string()],
+            headers: HashMap::new(),
+            query_params,
+            secret_value: SECRET.to_string(),
+            url_prefix: None,
+        }];
+        let capabilities =
+            Capabilities::default().with_http(HttpCapability::new(vec![EndpointPattern::host(
+                "93.184.216.34",
+            )]));
+        let mut store_data =
+            StoreData::new(1024 * 1024, capabilities, HashMap::new(), host_credentials);
+        store_data.http_interceptor = Some(Arc::new(RedirectEcho));
+
+        let resp = store_data
+            .http_request(
+                "GET".to_string(),
+                "https://93.184.216.34/mapped".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(resp.status, 302);
+
+        let encoded = urlencoding::encode(SECRET).to_string();
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(
+            !body.contains(SECRET_STEM) && !body.contains(&encoded),
+            "echoed credential leaked into the guest body: {body}"
+        );
+        assert!(
+            body.contains("[REDACTED:host_credential]"),
+            "scrub marker missing from the guest body: {body}"
+        );
+        assert!(
+            !resp.headers_json.contains(SECRET_STEM) && !resp.headers_json.contains(&encoded),
+            "echoed credential leaked into the guest headers: {}",
+            resp.headers_json
+        );
+        assert!(
+            resp.headers_json.contains("[REDACTED:host_credential]"),
+            "{}",
+            resp.headers_json
         );
     }
 
