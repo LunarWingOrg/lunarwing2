@@ -156,7 +156,9 @@ sudo ic/scripts/export-tenant.sh <tenant>            # prompts before stopping s
 ```
 The tenant is now stopped on the old host (PostgreSQL remains up for the dump;
 you may stop it too). Use `--no-quiesce` only if `mt-admin writers-active
-<tenant>` already reports stopped. DarkIRC export refuses pending, candidate,
+<tenant>` exits 1 and prints `stopped` — export requires both, so a
+precondition error (which also exits 1) can never masquerade as a quiesced
+tenant (WI#393 FL-5). DarkIRC export refuses pending, candidate,
 journal, rollback, interrupted-manifest, or unresolved ledger state before any
 lifecycle mutation.
 
