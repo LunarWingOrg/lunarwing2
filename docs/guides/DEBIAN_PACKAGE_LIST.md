@@ -4,11 +4,12 @@ Packages needed to run a live LunarWing multi-tenant deployment on **Debian 12 (
 13 (trixie) + systemd** via `ic/scripts/lunarwing-mt-admin.sh`, including the infra
 health-check + self-heal pipeline.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** Package set re-checked against the
+**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Package set re-checked against the
 current mt-admin prerequisite probes; no changes were needed (the v2.1.2.0
-sandbox rework added no new host packages — podman was already required, and
-the v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` reuse existing
-tooling inside the tenant containers).
+sandbox rework added no new host packages — podman was already required, the
+v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` reuse existing
+tooling inside the tenant containers, and the v2.1.6.0 OpenRC proxy-unit
+migration and worker-credential work add no new host commands).
 
 This is the Debian equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the
 operational notes there (port registry, per-tenant rustup, doctor output, etc.) apply
