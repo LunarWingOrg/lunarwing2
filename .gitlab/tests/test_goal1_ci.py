@@ -543,6 +543,13 @@ class WorkerTsLaneTests(unittest.TestCase):
         merged["worker-kimi-ts"]["rules"].insert(0, {"when": "never"})
         self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
 
+    def test_main_runs_the_lane_validator(self):
+        # MR !1618 review GV-2: every unit test above calls the validator
+        # directly, so deleting the main() call passed the whole suite.
+        with mock.patch.object(config, "validate_worker_ts_lanes") as lane_check:
+            config.main()
+        lane_check.assert_called_once()
+
     def test_wrong_image_variable_is_caught(self):
         merged = self.merged()
         merged["worker-kimi-ts"]["image"]["name"] = "$CI_BUN_IMAGE"
