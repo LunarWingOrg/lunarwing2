@@ -480,7 +480,7 @@
     - **WI#409 / !1629 HG-1 release-note handoff (2026-10-14):** include the rustls 0.23.46 security upgrade for RUSTSEC-2026-0346/0347/0348/0349 in Crate Security Re-Audit, Dependency Sweep, and Accepted Advisories. The reviewed Pebble upstream lock is now upgraded too, with its Dockerfile digest refreshed; rebuild/promotion is required to deploy it. Replace the old nine-ID totals with eleven (eight vulnerabilities, one unsound, two unmaintained); only 0346/0349 remain accepted on the opt-in 0.22.4 libSQL chain, owned by WI#409 under WI#331's gate. Keep the MR/protected-image verification pending until there is new pipeline evidence; !1629's draft is on its separate branch, not this tree. Full wording/evidence: `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md` (October 14 update).
 41. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/377
 42. [ ] update all docs in docs/guides - last attempt was at https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1613 please see comments of MR for blockers etc
-43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/390
+43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/390 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1630 - please address HH-1 and HH-2 and HH-3 and the Pebble workspace fix in the next try
 44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/380 and increase handle_message_timeout to higher value between 600-630 
 
 ---
