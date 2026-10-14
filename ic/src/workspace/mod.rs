@@ -1441,30 +1441,67 @@ impl Workspace {
         if existing.content.is_empty() || existing.content == incoming_prior {
             return Ok(());
         }
-        let slot_path = self
-            .next_daily_log_backup_slot(scope, backup_path, fail_closed)
-            .await?;
-        let slot_doc = self
-            .storage
-            .get_or_create_document_by_path(scope, self.agent_id, &slot_path)
-            .await?;
-        let rolled = self
-            .storage
-            .update_document_and_replace_chunks(slot_doc.id, &existing.content, &[])
-            .await;
-        // WI#336 AB-3: audit a successful roll-aside with the slot it moved
-        // to — the `.bak` "preserved" line alone never records where the
-        // previous version went.
-        if rolled.is_ok() {
-            tracing::warn!(
-                target: "lunarwing::safety",
-                file = %backup_path,
-                slot = %slot_path,
-                bytes = existing.content.len(),
-                "daily-log backup slot rolled aside into a numbered generation"
-            );
+        // WI#336 GP-1/GP-2: one probe→create→update block whose result is
+        // matched below, so a failure at any step can be fingerprinted with
+        // the un-rotated `.bak` content (`existing` stays in scope).
+        let rolled: Result<String, WorkspaceError> = async {
+            let slot_path = self
+                .next_daily_log_backup_slot(scope, backup_path, fail_closed)
+                .await?;
+            let slot_doc = self
+                .storage
+                .get_or_create_document_by_path(scope, self.agent_id, &slot_path)
+                .await?;
+            self.storage
+                .update_document_and_replace_chunks(slot_doc.id, &existing.content, &[])
+                .await?;
+            Ok(slot_path)
         }
-        rolled
+        .await;
+        match rolled {
+            // WI#336 AB-3: audit a successful roll-aside with the slot it
+            // moved to — the `.bak` "preserved" line alone never records
+            // where the previous version went. `file` names the day log so a
+            // consumer correlating on it sees every line of the rotation
+            // (GP-2).
+            Ok(slot_path) => {
+                tracing::warn!(
+                    target: "lunarwing::safety",
+                    file = %daily_log_path_of_backup(backup_path),
+                    backup = %backup_path,
+                    scope = %scope,
+                    slot = %slot_path,
+                    bytes = existing.content.len(),
+                    "daily-log backup slot rolled aside into a numbered generation"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // The fail-closed cap refusal already emitted its own audit
+                // line (run-85 EY-3); a second line would double-report one
+                // event. Any other failure leaves the un-rolled `.bak`
+                // content unfingerprinted: on the warn-and-proceed lane the
+                // caller overwrites that slot next, losing a second version
+                // whose only record was the earlier "preserved" line's byte
+                // count (WI#336 GP-1). On the fail-closed lane the replace
+                // aborts and the fingerprinted content survives.
+                if !matches!(e, WorkspaceError::DailyLogBackupCapReached { .. }) {
+                    tracing::warn!(
+                        target: "lunarwing::safety",
+                        file = %daily_log_path_of_backup(backup_path),
+                        backup = %backup_path,
+                        scope = %scope,
+                        bytes = existing.content.len(),
+                        blake3 = %blake3::hash(existing.content.as_bytes()).to_hex(),
+                        fail_closed = fail_closed,
+                        error = %e,
+                        "daily-log backup rotation failed; fingerprint of the \
+                         un-rotated rolling-slot content"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// First free numbered daily-log backup generation slot. At the
@@ -1514,7 +1551,8 @@ impl Workspace {
         if fail_closed {
             tracing::warn!(
                 target: "lunarwing::safety",
-                file = %backup_path,
+                file = %daily_log_path_of_backup(backup_path),
+                backup = %backup_path,
                 scope = %scope,
                 generations = MAX_DAILY_LOG_BACKUP_GENERATIONS,
                 "daily-log backup cap reached; fail-closed replace refused, \
@@ -1541,7 +1579,9 @@ impl Workspace {
         // overwrite of the rolling slot then lost a second version.
         tracing::warn!(
             target: "lunarwing::safety",
-            file = %backup_path,
+            file = %daily_log_path_of_backup(backup_path),
+            backup = %backup_path,
+            scope = %scope,
             generations = MAX_DAILY_LOG_BACKUP_GENERATIONS,
             discarded_bytes = discarded.content.len(),
             discarded_blake3 = %blake3::hash(discarded.content.as_bytes()).to_hex(),
