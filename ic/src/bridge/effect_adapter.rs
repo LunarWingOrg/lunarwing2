@@ -777,12 +777,11 @@ impl EffectBridgeAdapter {
                 .any(|key| parameters.get(*key).is_some())
         {
             return Some(EngineError::LeaseDenied {
-                reason: format!(
-                    "Tool 'mission_update' on Mission threads accepts only steering fields \
-                     (goal, current_focus, success_criteria, retry policy); cadence, \
-                     webhook_secret, max_threads_per_day, new_name and notify_channels \
-                     changes must come from the foreground conversation."
-                ),
+                reason: "Tool 'mission_update' on Mission threads accepts only steering fields \
+                         (goal, current_focus, success_criteria, retry policy); cadence, \
+                         webhook_secret, max_threads_per_day, new_name and notify_channels \
+                         changes must come from the foreground conversation."
+                    .to_string(),
             });
         }
 
