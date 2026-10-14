@@ -6,7 +6,7 @@ LunarWing controls local filesystem and shell tools through three separate layer
 2. **Sandbox policy** limits filesystem and network access.
 3. **Tool permission** decides whether an invocation runs, asks for approval, or is disabled.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19, 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** `ALLOW_LOCAL_TOOLS`,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19, 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** `ALLOW_LOCAL_TOOLS`,
 `AGENT_AUTO_APPROVE_TOOLS`, and the `full_access` double opt-in
 (`SANDBOX_ALLOW_FULL_ACCESS`) were re-checked against the config resolver and
 sandbox manager. Updated for the v2.1.2.0 generic podman-first sandbox: new
@@ -19,6 +19,9 @@ The 2026-09-27 repass added the v2.1.3.0 mt-admin sandbox-image defaults
 `SANDBOX_RUNTIME=podman` for new tenants) and the env-generation note that
 mt-admin now writes only the canonical `AGENT_AUTO_APPROVE_TOOLS` key for new
 tenants, migrating a legacy-only `AUTO_APPROVE_TOOLS` value on re-render.
+The 2026-10-14 repass found the layer unchanged (the `SANDBOX_*` knob set
+still resolves in `ic/src/config/sandbox.rs`; the v2.1.6.0 worker-credential
+strips touch worker containers, not this tenant sandbox layer).
 
 Use the narrowest access that satisfies the task. `full_access` combined with automatic approval lets model output execute directly on the host with the LunarWing service account's privileges.
 
