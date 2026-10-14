@@ -601,12 +601,19 @@ archive (`$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`, default
 `/var/lib/lunarwing/openrc-proxy-backups`, directory mode 0700, files mode
 0600, never executable, never sourced); already-safe units are replaced
 without archiving, so repeated sweeps and upgrades do not grow the
-archive. The contract is equality, not presence (WI#393 FL-6): a unit is
-safe only as a regular non-symlink file carrying the fixed
-`--tensorzero-env` flag line, with no line anywhere in it carrying the
-legacy inline `--tensorzero <url>` flag, command substitution, or a
-backtick — a unit with the safe line plus extra content fails the
-contract and is archived and replaced like any other unsafe unit. The
+archive. The contract is equality, not presence (WI#393 FL-6/GR-1): a unit
+is safe only as a regular non-symlink file whose bytes reproduce the
+renderer template for its filename's tenant exactly — the same lines in
+the same order and count, the fixed `--tensorzero-env` flag line, the
+tenant name identical in the description/user/group/`before` slots, the
+canonical renderer paths (python interpreter, tenant proxy script,
+run/log/env dirs, env-exec launcher), a numeric port, no NUL/CR bytes,
+and a final newline. Renderer and contract share one template source in
+`mt-admin-lib/08-units-openrc.sh`, so the two cannot drift apart. Any
+extra, missing, reordered, or payload-carrying line — a legacy inline
+`--tensorzero <url>` flag, command substitution, a backtick, a prepended
+override, a replaced `proxy_command` — fails the contract, and the unit
+is archived and replaced like any other unsafe unit. The
 archive is retained indefinitely for investigation —
 legacy units may carry payload URLs with query-string tokens — and is
 deliberately left behind by `remove-tenant --purge`; prune it manually
