@@ -1903,8 +1903,7 @@ pub(crate) const MISSION_MUTATING_ACTION_NAMES: &[&str] = &[
 /// missions (update, fire, pause, resume) but must not create new ones or
 /// delete any — the same bound v1 places on `routine_create`/`routine_delete`
 /// via the autonomous-execution denylist.
-pub(crate) const MISSION_LIFECYCLE_ACTION_NAMES: &[&str] =
-    &["mission_create", "mission_delete"];
+pub(crate) const MISSION_LIFECYCLE_ACTION_NAMES: &[&str] = &["mission_create", "mission_delete"];
 
 /// The verbs whose approval starts or reshapes autonomous mission runs
 /// (WI#308, run-33 AQ-2). Mission-spawned threads are unsupervised by
