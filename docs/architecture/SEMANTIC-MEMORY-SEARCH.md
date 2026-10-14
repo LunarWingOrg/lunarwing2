@@ -265,7 +265,7 @@ Four tools in `ic/src/tools/builtin/memory.rs`:
 | Tool | Purpose |
 |------|---------|
 | `memory_search` | Hybrid FTS + vector search, returns bounded scored results (limit 1-20) |
-| `memory_write` | Write to user memory paths; internal Engine runtime paths are rejected. Since v2.1.6.0 (WI#335) a replace of a previously backed-up file shadows the current content to `backups/<path>.bak` (daily logs keep numbered generations under `backups/daily/`, capped at `MAX_DAILY_LOG_BACKUP_GENERATIONS` = 8); at the cap the replace is refused fail-closed with `WorkspaceError::DailyLogBackupCapReached`, which the tool surfaces as `ToolError::NotAuthorized` — an operator replace on the same lane is the unblock |
+| `memory_write` | Write to user memory paths; internal Engine runtime paths are rejected. A replace of a prompt-visible file whose prior content is non-empty and differing first shadows that content to `backups/<path>.bak` (WI#286), and daily logs keep numbered generations under `backups/daily/` capped at `MAX_DAILY_LOG_BACKUP_GENERATIONS` = 8 (WI#288). Since v2.1.6.0 (WI#335) the agent tool lane refuses a replace at that cap fail-closed with `WorkspaceError::DailyLogBackupCapReached`, surfaced as `ToolError::NotAuthorized`; on that lane any shadow-backup failure also aborts the replace. The unblock is an operator replace through the web memory editor or CLI — a different, unguarded lane (`Workspace::write`/`write_to_layer`) that still rotates and discards at the cap |
 | `memory_read` | Read a bounded page by path and continue with `next_offset` |
 | `memory_tree` | View a bounded directory tree with truncation metadata |
 
