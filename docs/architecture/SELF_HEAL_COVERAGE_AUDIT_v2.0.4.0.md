@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-28, again 2026-10-01 for v2.1.4.0, and again 2026-10-06 for v2.1.5.0)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-28, again 2026-10-01 for v2.1.4.0, again 2026-10-06 for v2.1.5.0, and again 2026-10-14 for v2.1.6.0)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -158,4 +158,13 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > `retry_reasons.empty` counter, and the metrics exporter picks the numeric
 > field up dynamically). The audit's detection/remedy table still describes
 > the self-heal pipeline itself.
+>
+> **Update (2026-10-14, v2.1.6.0):** the `ORDER` list is unchanged in the
+> 2.1.6.0 cycle (`bash tests/run-all.sh --list` still registers the same 19
+> suites, verified live). No self-heal pipeline script changed this cycle;
+> the release's WI#376 mt-admin hardening (init detection, OpenRC stop/units,
+> restore probe) lives in `ic/scripts/mt-admin-lib/`, not the host health
+> pipeline, and is documented in `SELF_HEAL_DEPLOYMENT_WIRING.md`. The
+> audit's detection/remedy table still describes the self-heal pipeline
+> itself.
 
