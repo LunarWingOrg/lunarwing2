@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-09-28, v2.1.3.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics; revalidated 2026-10-01, v2.1.4.0 — pipeline wiring, scheduling ownership, and role mappings unchanged this cycle; revalidated 2026-10-06, v2.1.5.0 — `ensure_health_pipeline()` still lives in `mt-admin-lib/12-health-pipeline.sh` and is still invoked from `add_tenant()`; writer-quiescence stop path and watchdog installer ownership unchanged; the only pipeline-script change this cycle is the `health-llm-streams.sh` `retry_reason_empty_total` export (WI#297), which does not touch this wiring)
+**Date:** 2026-06-13 (revalidated 2026-09-28, v2.1.3.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics; revalidated 2026-10-01, v2.1.4.0 — pipeline wiring, scheduling ownership, and role mappings unchanged this cycle; revalidated 2026-10-06, v2.1.5.0 — `ensure_health_pipeline()` still lives in `mt-admin-lib/12-health-pipeline.sh` and is still invoked from `add_tenant()`; writer-quiescence stop path and watchdog installer ownership unchanged; the only pipeline-script change this cycle is the `health-llm-streams.sh` `retry_reason_empty_total` export (WI#297), which does not touch this wiring; revalidated 2026-10-14, v2.1.6.0 — no change under `ic-infrastructure-health-check/` in the cycle; `ensure_health_pipeline()` still at `mt-admin-lib/12-health-pipeline.sh` and still invoked from `add_tenant()` in `mt-admin-lib/04-tenant-lifecycle.sh`; the WI#376 mt-admin hardening (FL-1 init-detection preflight, FL-2 restore probe rc+state classification, FL-3 symlinked/non-regular OpenRC units never "already stopped") lives in the mt-admin modules this doc already names and does not change the pipeline structure, scheduling ownership, or the two-watchdog split; the WI#180 suite-count sentence is corrected to 19, matching the audit's canonical correction)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
@@ -232,8 +232,9 @@ changing the pipeline structure documented above:
   `KNOWLEDGE_SYNC_ENABLED` / `KNOWLEDGE_SWEEP_ENABLED` and cadences from the
   tenant env file; disabled features ignore stale/failed/malformed state.
 
-The canonical aggregate suite list grew from 14 to 20 registered suites; see
-`SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md` for the updated `ORDER` list.
+The canonical aggregate suite list grew from 14 to 19 registered suites (the
+WI#180 note initially overcounted at 20; the corrected count is recorded in
+`SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md`); see that audit for the `ORDER` list.
 
 `ic/scripts/setup-instance.sh` (the deprecated single-instance helper) does not
 reference the health pipeline — it predates the MT integration.
