@@ -3,7 +3,7 @@
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
 **Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
-(v2.1.5.0).** Pipeline structure,
+(v2.1.5.0); re-checked 2026-10-14 (v2.1.6.0).** Pipeline structure,
 limits, tools, schema/migrations, and env
 vars were re-checked; no search/indexing changes were made in the 2.1.4.0
 cycle. The 2.1.5.0 cycle added migration V28
@@ -19,7 +19,11 @@ in Step 1. The 2.1.4.0 cycle added operator-facing system-prompt editing
 (WI#220, gateway Settings → System Prompt) which flows through the same
 `Workspace::write()` ingestion, write guard, and indexing path described
 below — no pipeline change; see `ic/src/workspace/README.md` (Operator
-Prompt Editing) and `docs/guides/TENANT-SYSTEM-PROMPTS.md`.
+Prompt Editing) and `docs/guides/TENANT-SYSTEM-PROMPTS.md`. The 2.1.6.0
+cycle added no new migration (V28 remains the latest) and left chunking,
+search, and the knowledge layer untouched; the WI#335 daily-log backup
+guard (item 24) changed `memory_write` replace behavior and is documented
+in Step 5.
 
 The system lives in `ic/src/workspace/`. General memory is exposed through
 `memory_search`, `memory_write`, `memory_read`, and `memory_tree` in
@@ -261,7 +265,7 @@ Four tools in `ic/src/tools/builtin/memory.rs`:
 | Tool | Purpose |
 |------|---------|
 | `memory_search` | Hybrid FTS + vector search, returns bounded scored results (limit 1-20) |
-| `memory_write` | Write to user memory paths; internal Engine runtime paths are rejected |
+| `memory_write` | Write to user memory paths; internal Engine runtime paths are rejected. Since v2.1.6.0 (WI#335) a replace of a previously backed-up file shadows the current content to `backups/<path>.bak` (daily logs keep numbered generations under `backups/daily/`, capped at `MAX_DAILY_LOG_BACKUP_GENERATIONS` = 8); at the cap the replace is refused fail-closed with `WorkspaceError::DailyLogBackupCapReached`, which the tool surfaces as `ToolError::NotAuthorized` — an operator replace on the same lane is the unblock |
 | `memory_read` | Read a bounded page by path and continue with `next_offset` |
 | `memory_tree` | View a bounded directory tree with truncation metadata |
 
