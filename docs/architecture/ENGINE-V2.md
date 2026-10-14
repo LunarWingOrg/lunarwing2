@@ -3,7 +3,7 @@
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
 **Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
-(v2.1.5.0).** Module map, gate types,
+(v2.1.5.0); re-checked 2026-10-14 (v2.1.6.0).** Module map, gate types,
 mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
 re-checked against the current tree, including the landed WI#227 sealed step
 records; updates for 2.1.1.0 include the
@@ -45,7 +45,22 @@ denylist, the WI#309 resume-lease mission catalog, the WI#311 no-auto-complete
 rule for non-manual missions, the WI#319 pre-2026-07-26
 `Completed`-as-delete caveat in recovery guidance, and the WI#308 mission-verb
 dispatch gate subset (Research-thread refusal, permission, supervision, rate
-limit, hooks) with its documented unsupervised-mission-run scope.
+limit, hooks) with its documented unsupervised-mission-run scope. Updates
+for 2.1.6.0 include the WI#332 pending-gate liveness rules (listing and the
+60s sweep drop gates whose thread vanished/left Waiting/changed owner, with
+the authentication-fallback exemption, request-id-checked sweep discards
+protecting replacement gates, and the resolve-time liveness re-check that
+fails closed), the WI#337/WI#339/WI#341 shutdown-interruption resolution
+work (parity-checked stamp resolution, the per-thread interruption-stamp
+map, per-mission/per-stamp sweep isolation, marker-persists-before-notice
+ordering with acknowledged notices, the 24h stamp-age bound, and the
+WI#394 stuck-key residual), the WI#338 scan-time parity checks as defense
+in depth (full `mission.json` forges remain out of scope until WI#322),
+and the WI#359 webhook/rate-limit hardening (the usable-secret predicate
+so an empty/whitespace stored secret never authenticates a fire, the
+serialized webhook claim check-then-save across create/update/resume, the
+shared recursive credential-key redaction over summaries/events/http
+surfaces, and the corrected aggregate/stop-bucket limiter wording).
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
