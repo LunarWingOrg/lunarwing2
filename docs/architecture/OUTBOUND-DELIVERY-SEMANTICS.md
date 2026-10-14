@@ -13,8 +13,10 @@ ack wording, the XMPP enqueue gate / spool / drain / retry rules, and the
 still hold. Revalidated 2026-10-14 (v2.1.6.0): the acceptance-not-delivery
 ack wording, the XMPP enqueue gate / spool / drain / retry rules, and the
 2s drain-timeout anchor were re-checked against the same files and still
-hold; the mission-run ledger paragraph matches the WI#276/WI#341 wording
-in ENGINE-V2.md.** Defines what a
+hold; the mission-run ledger paragraph is consistent with the model, and
+ENGINE-V2.md carries the full exception list beyond its two named
+exceptions (the 24 h stamp-age bound, already-owned/superseded stamps
+cleared without retry, and the accepted save→marker crash window).** Defines what a
 successful `message`-tool send means, and what the XMPP channel guarantees
 about outbound stanzas. Rooted in the PR Digest #59 incident: a scheduled
 mission recorded "Delivered via XMPP … Goal achieved" in its memory because
