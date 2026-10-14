@@ -406,6 +406,21 @@ class NodeImageTieTests(unittest.TestCase):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
         return errors
 
+    def test_tag_only_ci_node_image_is_caught(self):
+        # MR !1618 review GV-3: the trust-sensitive entry is the only check
+        # that rejects a tag-only CI_NODE_IMAGE — the node tie above runs
+        # only when a digest is present, so a tag silently skips it.
+        self.variables["CI_NODE_IMAGE"] = "docker.io/library/node:22-bookworm-slim"
+        self.write_dockerfile(
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n"
+        )
+        self.assertTrue(
+            any(
+                "CI_NODE_IMAGE" in error and "digest-pinned" in error
+                for error in self.errors()
+            )
+        )
+
     def test_matching_digests_pass(self):
         # The real Dockerfile has two node stages (builder + runtime).
         self.write_dockerfile(
