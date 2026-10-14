@@ -5218,6 +5218,7 @@ mod runtime_index_tests {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        use tracing_subscriber::Layer as _;
         use tracing_subscriber::layer::SubscriberExt;
         let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let layer = tracing_subscriber::fmt::layer()
