@@ -517,6 +517,32 @@ class WorkerTsLaneTests(unittest.TestCase):
         merged["worker-kimi-ts"]["rules"] = [{"when": "never"}]
         self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
 
+    def test_mr_rule_when_never_is_caught(self):
+        # MR !1618 review GV-1: the MR rule exists but disables the lane.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["when"] = "never"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_mr_rule_when_manual_is_caught(self):
+        # GV-1: a manual MR rule runs the lane only on demand — it cannot gate.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["when"] = "manual"
+        merged["worker-kimi-ts"]["rules"][0]["allow_failure"] = False
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_job_level_allow_failure_is_caught(self):
+        # GV-1: an allowed-to-fail lane runs on MRs but cannot gate.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["allow_failure"] = True
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_shadowing_unconditional_never_is_caught(self):
+        # GV-1: first match wins — an unconditional rule before the MR rule
+        # shadows it, so the lane never runs on MRs.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"].insert(0, {"when": "never"})
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
     def test_wrong_image_variable_is_caught(self):
         merged = self.merged()
         merged["worker-kimi-ts"]["image"]["name"] = "$CI_BUN_IMAGE"
