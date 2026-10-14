@@ -563,6 +563,40 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
         dockerfile.write_bytes(original)
 
+    def test_glued_continuation_splitting_a_token_is_refused(self):
+        # Run-111 GZ-1: BuildKit keeps the character before a continuation
+        # backslash and appends the next line with no separator, while the
+        # guard joins with a space. `SHEL\` + `L [...]` therefore reached the
+        # guard as the word SHEL (never matching the SHELL refusal) and
+        # `ARG LUNARWING_WRAPPER_\` + `SHA256=…` hid a protected name from
+        # the literal checks, while BuildKit parsed each pair as one
+        # instruction; a lone backslash before SHELL behaves the same way.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for snippet in (
+            'SHEL\\\nL ["/bin/sh", "-c"]\n',
+            '\\\nSHELL ["/bin/sh", "-c"]\n',
+            'ARG LUNARWING_WRAPPER_\\\nSHA256=evil\n',
+        ):
+            with self.subTest(snippet=snippet):
+                dockerfile.write_text(original.replace(
+                    FILESYSTEM_ASSERTION, snippet + FILESYSTEM_ASSERTION
+                ), encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(
+                    "continuation backslash must be preceded by whitespace", result.stderr
+                )
+        # Control: whitespace before the backslash is a legitimate multi-line
+        # instruction and must keep passing.
+        dockerfile.write_text(original.replace(
+            FILESYSTEM_ASSERTION,
+            "RUN echo one \\\n && echo two \\\n && echo three\n" + FILESYSTEM_ASSERTION,
+        ), encoding="utf-8")
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dockerfile.write_text(original, encoding="utf-8")
+
     def test_dockerfile_heredocs_cannot_swallow_assertion(self):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         original = dockerfile.read_text()

@@ -100,6 +100,15 @@ while IFS= read -r _raw || [[ -n "$_raw" ]]; do
     fi
     if [[ "$_line" == *\\ ]]; then
         _part="${_line%\\}"
+        # Run-111 GZ-1: BuildKit keeps the character before the backslash and
+        # appends the next line with no separator, while this loop joins with
+        # a space — so `SHEL\` + `L [...]` is one SHELL instruction for the
+        # builder but the word SHEL here, and `ARG LUNARWING_WRAPPER_\` +
+        # `SHA256=…` hides a protected name from the checks below. Require
+        # whitespace (or nothing) before the continuation backslash.
+        if [[ -z "$_part" || "${_part: -1}" != [[:space:]] ]]; then
+            fail "Dockerfile continuation backslash must be preceded by whitespace (run-111 GZ-1): ${_raw}"
+        fi
         _join+="${_part%"${_part##*[![:space:]]}"} "
         continue
     fi
