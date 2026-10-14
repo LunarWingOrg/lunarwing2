@@ -438,7 +438,11 @@
 ## Phase 5 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
 39. [ ] update all documentation under docs/architecture
-40. [ ] Create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for references)
+40. [x] Create release notes draft at the root of the repo (as we usually do with each release; see previous release notes in docs/releases for references)
+    - DONE 2026-10-14 (Rarity, item-40, branch `rarity/kimi-40-20261014-0301`): `RELEASE-v2.1.6.0.md` drafted at the repo root, following the RELEASE-v2.1.5.0.md shape (codename header, Overview, Highlights, Compatibility table, per-WI Changes sections, Upgrade Notes, Security/Deployment/Release Limitations) and marked DRAFT with release date TBD
+    - Content sourced from this goals file's landed items (1, 3, 5–19, 22, 24, 25, 27, 30): external-worker tool proxy (WI#324), cron missions (WI#325), harness redaction (WI#326), opencode control channel (WI#328), opencode2 SDK surface (WI#329), worker LLM endpoints (WI#330), pending-gate lifecycle (WI#332), pebble anchors/smoke (WI#334), backup-cap fail-closed (WI#335), shutdown stamps + outcome notices (WI#337/338/339/341), webhook/rate-limit/redaction hardening (WI#352/359), v1 crash enrichment (WI#374), OpenRC transition (WI#376), credential env hygiene (WI#373), dependency sweep + audit
+    - Compatibility table re-verified against the tree: owned packages 2.1.6, MSRV 1.96.1, V28 still latest migration, port registry v17, Wasmtime 36.0.17, channel/tool registry bumps per item 1, external worker pins unchanged (opencode2 held per WI#357)
+    - The WI#331 breaking-change upgrade note (Turso sync requires `--features libsql-remote-replica`; do not simply unset `LIBSQL_URL`) is carried from `docs/ops/v2.1.6.0_WI331_ADVISORY_CLEARING.md`'s "for the item-40 release-notes draft" section, and the risk-acceptance audit posture links `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
 41. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/377
 42. [ ] update all docs in docs/guides
 43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/390
