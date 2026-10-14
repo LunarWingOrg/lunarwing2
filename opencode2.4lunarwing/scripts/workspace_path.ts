@@ -1,4 +1,4 @@
-import { closeSync, constants, existsSync, mkdirSync, openSync, realpathSync } from "node:fs"
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs"
 import { isAbsolute, relative, resolve } from "node:path"
 
 export function expandWorkspacePath(path: string, workspaceRoot: string): string {
@@ -86,7 +86,17 @@ export function resolveTaskWorkspace(
       closeSync(fd)
       fd = next
     }
-    return resolveWorkspacePath(path, root)
+    const resolved = resolveWorkspacePath(path, root)
+    // DS-1: the descriptor walk and the re-resolved path must name the same
+    // directory — a dev/ino mismatch means an in-root redirect raced the
+    // walk. Thrown without an errno so the caller reports it under the
+    // transient wording and the supervisor re-walks on the retry.
+    const walked = fstatSync(fd)
+    const landed = statSync(resolved)
+    if (walked.dev !== landed.dev || walked.ino !== landed.ino) {
+      throw new Error(`resolved path changed during bootstrap: ${path}`)
+    }
+    return resolved
   } catch (error) {
     const message = String(error)
     const code = (error as NodeJS.ErrnoException).code
