@@ -186,7 +186,9 @@ mod tests {
         let thread_id = harness.create_thread().await;
         harness.send_chat(&thread_id, "create cron routine").await;
         harness
-            .wait_for_turns(&thread_id, 1, Duration::from_secs(10))
+            // Match the 30s budget of the other turn waits in this suite:
+            // 10s is not enough headroom on low-end CI runners.
+            .wait_for_turns(&thread_id, 1, Duration::from_secs(30))
             .await;
 
         let routine = harness

@@ -66,8 +66,22 @@ use lunarwing::tools::builtin::{MemoryReadTool, MemoryWriteTool};
 use lunarwing::workspace::Workspace;
 
 /// How long we wait for any single test assertion before declaring the test
-/// hung. The protocol path under test should resolve in well under this.
-const TEST_BOUND: Duration = Duration::from_secs(15);
+/// hung. Must comfortably exceed [`MOCK_TASK_TIMEOUT_MS`] so a slow runner's
+/// task timeout fires (and is asserted) before this outer bound does.
+const TEST_BOUND: Duration = Duration::from_secs(90);
+
+/// Per-task timeout handed to `execute_task` for tests that expect the task to
+/// complete. 10s proved too tight on low-end CI runners (the libsql lane
+/// serializes rustc and test threads): the 103-frame flood in
+/// `tool_call_cap_bounds_frames_and_marker_rows` exceeded it and failed
+/// `ExternalWorkerTimeout` in pipeline 5636. Tests that exercise timeout
+/// *behavior* use their own short deadlines instead of this constant.
+const MOCK_TASK_TIMEOUT_MS: u64 = 60_000;
+
+/// Negative-wait bound for assertions that no further dispatch arrives. Kept
+/// small on purpose: these tests pass by waiting the full window, so they must
+/// not pay the generous [`TEST_BOUND`].
+const NO_DISPATCH_BOUND: Duration = Duration::from_secs(15);
 
 // ── Mock worker ─────────────────────────────────────────────────────
 
@@ -1167,7 +1181,7 @@ async fn cancel_ack_is_awaited_before_socket_teardown() {
             job_id,
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext::default(),
         ),
@@ -1221,7 +1235,7 @@ async fn cancel_ack_timeout_falls_back_to_daemon_result() {
             job_id,
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext::default(),
         ),
@@ -2098,7 +2112,7 @@ async fn cancel_in_flight_task() {
             job_id,
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext::default(),
         ),
@@ -2138,7 +2152,7 @@ async fn cancellation_before_dispatch_is_preserved() {
             job_id,
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext::default(),
         ),
@@ -2550,7 +2564,7 @@ async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
     };
     let res = timeout(
         TEST_BOUND,
-        mgr.execute_task(job_id, "mock", "task", Some(10_000), true, context),
+        mgr.execute_task(job_id, "mock", "task", Some(MOCK_TASK_TIMEOUT_MS), true, context),
     )
     .await
     .expect("test timed out")
@@ -2634,7 +2648,7 @@ async fn cron_tick_tool_calls_use_cron_allowlist_not_worker_allowlist() {
             Uuid::new_v4(),
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             cron_tick_context(),
         ),
@@ -2680,7 +2694,7 @@ async fn cron_tick_tool_calls_use_cron_allowlist_not_worker_allowlist() {
             job_id2,
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             cron_tick_context(),
         ),
@@ -2736,7 +2750,7 @@ async fn cron_worker_worker_level_allowlist_is_stripped_at_load() {
             job_id,
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext {
                 user_id: "tenant-user".to_string(),
@@ -2836,7 +2850,7 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
             job_id,
             "mock-interactive",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext {
                 user_id: "tenant-user".to_string(),
@@ -2864,7 +2878,7 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
             alias_job_id,
             "mock-alias",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext {
                 user_id: "tenant-user".to_string(),
@@ -2892,7 +2906,7 @@ async fn shared_endpoint_with_a_cron_worker_is_stripped_at_load() {
             ctrl_job_id,
             "mock-standalone",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext {
                 user_id: "tenant-user".to_string(),
@@ -2960,7 +2974,7 @@ async fn cron_allowlist_is_sanitized_at_manager_load() {
             Uuid::new_v4(),
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             cron_tick_context(),
         ),
@@ -3005,7 +3019,7 @@ async fn cron_allowlist_is_sanitized_at_manager_load() {
             Uuid::new_v4(),
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             cron_tick_context(),
         ),
@@ -3060,7 +3074,7 @@ async fn tool_call_denied_when_allowlist_empty() {
             Uuid::new_v4(),
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext::default(),
         ),
@@ -3105,7 +3119,7 @@ async fn tool_call_unknown_allowlisted_tool_is_an_error_not_a_hang() {
             Uuid::new_v4(),
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext::default(),
         ),
@@ -3146,7 +3160,7 @@ async fn tool_call_without_wired_proxy_replies_error() {
             Uuid::new_v4(),
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext::default(),
         ),
@@ -3234,7 +3248,7 @@ async fn run_proxy_task(
             job_id,
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext {
                 user_id: "tenant-user".to_string(),
@@ -3927,7 +3941,7 @@ async fn tool_call_giant_frame_is_capped_at_the_socket() {
             Uuid::new_v4(),
             "mock",
             "task",
-            Some(10_000),
+            Some(MOCK_TASK_TIMEOUT_MS),
             true,
             TaskContext::default(),
         ),
@@ -4443,7 +4457,9 @@ async fn cron_user_cancel_ends_tick_without_reentry() {
     assert!(mgr.cancel_task(job_id).await, "cancel must find the job");
 
     assert!(
-        timeout(TEST_BOUND, request_rx.recv()).await.is_err(),
+        timeout(NO_DISPATCH_BOUND, request_rx.recv())
+            .await
+            .is_err(),
         "a user-cancelled tick must not be re-dispatched"
     );
 }
@@ -4477,7 +4493,9 @@ async fn cron_tick_abandoned_after_max_reentries() {
         );
     }
     assert!(
-        timeout(TEST_BOUND, request_rx.recv()).await.is_err(),
+        timeout(NO_DISPATCH_BOUND, request_rx.recv())
+            .await
+            .is_err(),
         "a tick past its re-entry budget must not dispatch again"
     );
     assert_eq!(
@@ -4536,7 +4554,9 @@ async fn cron_busy_rejection_retries_without_spending_reentry_budget() {
     // The retry wedges too, lapses, and the tick is then abandoned at the
     // re-entry cap: no third link is dispatched.
     assert!(
-        timeout(TEST_BOUND, request_rx.recv()).await.is_err(),
+        timeout(NO_DISPATCH_BOUND, request_rx.recv())
+            .await
+            .is_err(),
         "a tick at its re-entry cap must not dispatch again"
     );
     assert_eq!(
@@ -4761,7 +4781,9 @@ async fn cron_pause_stops_pending_reentries() {
     // Without the boundary check the chain would re-dispatch after the lapse
     // (~2s) + terminal wait + backoff (~4s). Allow generous slack.
     assert!(
-        timeout(TEST_BOUND * 2, request_rx.recv()).await.is_err(),
+        timeout(NO_DISPATCH_BOUND * 2, request_rx.recv())
+            .await
+            .is_err(),
         "a paused mission must not re-dispatch its tick chain"
     );
     let status = mgr
@@ -5386,7 +5408,7 @@ async fn control_channel_delivers_prompt_and_records_ack() {
                 job_id,
                 "mock",
                 "do the thing",
-                Some(10_000),
+                Some(MOCK_TASK_TIMEOUT_MS),
                 true,
                 TaskContext::default(),
             )
@@ -5472,7 +5494,7 @@ async fn control_channel_rejects_prompt_when_worker_lacks_capability() {
                 job_id,
                 "mock",
                 "task",
-                Some(10_000),
+                Some(MOCK_TASK_TIMEOUT_MS),
                 true,
                 TaskContext::default(),
             )
@@ -5625,7 +5647,7 @@ async fn control_channel_persists_delivery_and_ack_rows() {
                 job_id,
                 "mock",
                 "do the thing",
-                Some(10_000),
+                Some(MOCK_TASK_TIMEOUT_MS),
                 true,
                 TaskContext::default(),
             )
@@ -5708,7 +5730,7 @@ async fn control_channel_persists_refused_and_legacy_acks_once() {
                     job_id,
                     "mock",
                     "build",
-                    Some(10_000),
+                    Some(MOCK_TASK_TIMEOUT_MS),
                     true,
                     TaskContext::default(),
                 )
@@ -5771,7 +5793,7 @@ async fn control_channel_ignores_forged_ack() {
                 job_id,
                 "mock",
                 "do the thing",
-                Some(10_000),
+                Some(MOCK_TASK_TIMEOUT_MS),
                 true,
                 TaskContext::default(),
             )
@@ -5850,7 +5872,7 @@ async fn control_channel_cancel_closes_queue_immediately() {
                 job_id,
                 "mock",
                 "do the thing",
-                Some(10_000),
+                Some(MOCK_TASK_TIMEOUT_MS),
                 true,
                 TaskContext::default(),
             )
@@ -5951,7 +5973,7 @@ async fn control_channel_records_unacked_delivered_seq() {
                 job_id,
                 "mock",
                 "do the thing",
-                Some(10_000),
+                Some(MOCK_TASK_TIMEOUT_MS),
                 true,
                 TaskContext::default(),
             )
