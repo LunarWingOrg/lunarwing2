@@ -396,6 +396,12 @@ Policy denials returned by the proxy carry the stable body prefix
 `sandbox-proxy denied: <reason>` so a sandboxed agent reading command output
 can attribute the failure to the proxy rather than the remote service.
 
+Forwarding failures (502) never echo the outbound request URL in the body or
+the host-side log: injected query-param credentials live in that URL, so
+reqwest errors are stripped with `without_url()` before either use (WI#395).
+The same rule applies to WASM-tool send errors and to http-tool log lines,
+which log the URL without query and fragment.
+
 ### Bind Address
 
 Always binds to **`127.0.0.1`** (localhost only). Port is OS-assigned (port `0`, ephemeral). Falls back to `[::1]` (IPv6 loopback) if IPv4 is unavailable.
