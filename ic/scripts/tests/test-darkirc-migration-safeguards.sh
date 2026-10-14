@@ -318,7 +318,13 @@ case "${1:-}" in
     ;;
   validate-migration-export-boundary) validate_boundary "$2"; exit 0 ;;
   stop-writers) exit 0 ;;
-  writers-active) [[ -e "${STRUCTURED_TEST_WORK:?}/writers-active" ]] && exit 0 || exit 1 ;;
+  writers-active)
+    # This export fixture has no active-writers scenario: answer the contract
+    # word for "stopped" (rc 1 + stdout) so the FL-5 rc+stdout caller check
+    # passes; precondition-error coverage lives in the kawarimi harness.
+    printf 'stopped\n'
+    exit 1
+    ;;
   *) exit 0 ;;
 esac
 MT
@@ -597,7 +603,20 @@ case "${1:-}" in
   darkirc-scope-id) ;;
   stage-migration) ;;
   import-migration) ;;
-  writers-active) [[ -e "${STRUCTURED_TEST_WORK:?}/writers-active" ]] && exit 0 || exit 1 ;;
+  writers-active)
+    # FL-5: a precondition-failure mode that exits 1 exactly like "stopped"
+    # but carries no stdout state word (the real arm's die() shape).
+    if [[ "${STRUCTURED_WRITERS_ERROR:-}" == 1 ]]; then
+      printf 'error: must be root\n' >&2
+      exit 1
+    fi
+    if [[ -e "${STRUCTURED_TEST_WORK:?}/writers-active" ]]; then
+      printf 'active\n'
+      exit 0
+    fi
+    printf 'stopped\n'
+    exit 1
+    ;;
   add-tenant) exit 97 ;;
 esac
 printf '%s\n' "$*" >> "${STRUCTURED_TEST_WORK:?}/mt.log"
@@ -825,6 +844,23 @@ else
   pass "resume rejects partial tenant with active writers"
 fi
 rm -f "$structured_tmp/writers-active"
+
+# FL-5 (WI#393): a writers-active precondition failure exits 1 exactly like
+# "stopped" but carries no stdout state word. --resume must refuse it as
+# unverifiable — never read the shared exit code as a quiesced tenant.
+if PATH="$structured_tmp/bin:$PATH" \
+   LUNARWING_PORTS_REGISTRY="$structured_tmp/ports.json" \
+   STRUCTURED_TEST_WORK="$structured_tmp" \
+   STRUCTURED_WRITERS_ERROR=1 \
+   bash "$structured_tmp/scripts/import-tenant.sh" "$structured_tmp/structured.tar" \
+     --dry-run --yes --old-stopped --resume >"$structured_tmp/error-resume.out" 2>&1; then
+  fail "resume reads a writers-active precondition error as stopped (FL-5)"
+  cat "$structured_tmp/error-resume.out"
+else
+  pass "resume refuses a writers-active precondition error (FL-5)"
+fi
+assert_contains "resume names the unverifiable writer state (FL-5)" \
+  "$(cat "$structured_tmp/error-resume.out")" "cannot verify stopped writers"
 
 : >"$structured_tmp/mt.log"
 if PATH="$structured_tmp/bin:$PATH" \
