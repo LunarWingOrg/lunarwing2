@@ -5994,10 +5994,13 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             ("new_name", serde_json::json!("renamed")),
             ("notify_channels", serde_json::json!(["elsewhere"])),
         ] {
+            let mut params = serde_json::Map::new();
+            params.insert("name".to_string(), serde_json::json!("own"));
+            params.insert(key.to_string(), value);
             let denied = adapter
                 .execute_action(
                     "mission_update",
-                    serde_json::json!({"name": "own", key: value}),
+                    serde_json::Value::Object(params),
                     &lease(),
                     &ctx,
                 )
@@ -6009,7 +6012,9 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
                         "unexpected refusal wording for {key}: {reason}"
                     );
                 }
-                other => panic!("expected LeaseDenied for Mission mission_update {key}, got {other:?}"),
+                other => {
+                    panic!("expected LeaseDenied for Mission mission_update {key}, got {other:?}")
+                }
             }
         }
 
