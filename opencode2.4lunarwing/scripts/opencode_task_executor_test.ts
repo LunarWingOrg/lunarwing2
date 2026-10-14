@@ -36,6 +36,7 @@ function makeSdk(options: MockOptions = {}) {
   let messageListCalls = 0
   const messageListArgs: unknown[] = []
   const promptArgs: unknown[] = []
+  const createArgs: unknown[] = []
   const signals: AbortSignal[] = []
   const captureSignal = (args: unknown[]) => {
     const requestOptions = args[1] as { signal?: AbortSignal } | undefined
@@ -61,6 +62,7 @@ function makeSdk(options: MockOptions = {}) {
     session: {
       create: async (...args: unknown[]) => {
         captureSignal(args)
+        createArgs.push(args)
         if (options.pendingCreate) await new Promise(() => {})
         return { id: "session-1" }
       },
@@ -150,6 +152,7 @@ function makeSdk(options: MockOptions = {}) {
     messageListArgs,
     signals,
     promptArgs,
+    createArgs,
   }
 }
 
@@ -561,5 +564,35 @@ AUTHORITATIVE TASK
 fix it`,
 })
 assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
+
+// WI#357 exposure policy: the session ruleset handed to session.create must
+// deny the self-exposure command surface, and those denies must come AFTER
+// the allow-all shell rule (the server evaluates with findLast, so order is
+// what makes them win). The in-image opencode wrapper is the second layer;
+// these rules are what the worker's own permission plane enforces.
+{
+  const rulesetSdk = makeSdk({})
+  await runTask(rulesetSdk.sdk)
+  const createInput = rulesetSdk.createArgs[0] as [
+    { permissions?: Array<{ action: string; resource: string; effect: string }> },
+  ]
+  const permissions = createInput[0].permissions ?? []
+  const shellAllowIndex = permissions.findIndex(
+    (rule) => rule.action === "shell" && rule.resource === "*" && rule.effect === "allow",
+  )
+  assert.ok(shellAllowIndex >= 0, "session ruleset lost its allow-all shell rule")
+  for (const subcommand of ["service", "pair", "serve"]) {
+    const denyIndex = permissions.findIndex(
+      (rule) =>
+        rule.action === "shell" &&
+        rule.resource === `*opencode ${subcommand} *` &&
+        rule.effect === "deny",
+    )
+    assert.ok(
+      denyIndex > shellAllowIndex,
+      `session ruleset must deny shell "*opencode ${subcommand} *" after the allow rule`,
+    )
+  }
+}
 
 console.log("opencode2 task executor self-check passed")

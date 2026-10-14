@@ -168,6 +168,201 @@ sandbox user onto the tenant's uid: docker, podman 5+ (keep-id pinned to
 get no mount. The raw `<tenant root>/logs` directory stays protected: it is
 neither a valid `workdir` nor visible through a tenant-root mount.
 
+## Worker exposure policy (WI#357)
+
+**LunarWing owns every public exposure path** through `ic/src/tunnel/`
+(providers `none` (default) / `netbird` / `custom`; `TUNNEL_URL` or
+`TUNNEL_PROVIDER`). **External workers must never self-expose**: no tunnels,
+relays, pairing links, or public listeners of their own, and no publishing
+session content to third-party share services. A worker that needs a public
+path routes it through the daemon's tunnel. The only legitimate instruction
+channel into a worker is the daemon's job dispatch → the in-container bridge
+→ the worker's agent API on loopback.
+
+This policy is why the opencode2 lane is pinned at **v2.0.24**: v2.0.26
+bundles OpenTunnel remote access (`packages/cli/src/services/remote-tunnel.ts`,
+`@opentunnel/client` → hosted relay `opentunnel.xyz`, no self-host option,
+anonymous device identity in the agent-writable `$XDG_DATA_HOME/opentunnel`),
+plus `opencode service set remote true` and `opencode pair` surfaces. !1490
+(v2.0.26 bump) must not merge while the guards below are the only thing
+between a prompt-injected task and a public remote-control channel.
+
+**Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
+wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
+— all of them miss whitespace/quote-obfuscated command text, the real
+binary stays directly executable by the agent uid, and with egress open a
+compromised agent can fetch an upstream opencode (tunnel included) or run
+`@opentunnel/client` under bun against the loopback server, whatever the
+pin. **Only control 1 (the egress allowlist) holds against a compromised
+agent**; until it lands, a bump past v2.0.24 crosses on compile-out plus
+config alone.
+
+Enforced controls (opencode2 lane unless noted):
+
+1. **Egress allowlist (DEFERRED, maintainer's call per WI#357):** mt-admin
+   restricting worker egress to the configured LLM endpoint + git hosts.
+   Not yet implemented; it is the only control that also covers future
+   phone-home features and `webfetch`/shell exfiltration, and the only one
+   that holds against a compromised agent (see the gate record above).
+2. **No self-exposure commands (naive-use guard).** The bridge session
+   ruleset (`opencode2.4lunarwing/scripts/opencode_task_executor.ts`,
+   `sessionPermissions()`) denies `shell` on `*opencode service *`,
+   `*opencode pair *`, `*opencode serve *` — after the allow-all rule,
+   because upstream evaluates with findLast. The lane config
+   (`config/opencode2.json` `permissions`) carries the same denies for
+   cli/acp sessions the bridge did not create. And
+   `scripts/opencode-exposure-guard.sh` is installed as
+   `/usr/local/bin/opencode` (real binary at `/usr/local/lib/opencode2/opencode`),
+   scanning **every argv token**: `service`/`pair` subcommands, the
+   `--service` flag, and every `--hostname` occurrence (loopback only).
+   Server-backed commands such as `run` and `session list` can spawn the real
+   binary directly via `Service.ensure`, bypassing the wrapper. At each boot
+   the entrypoint removes whatever sits at
+   `${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/service.json`
+   (upstream's resolution order, run-90 FB-6/FB-7) and writes
+   `{"disabled": true}` there, so those commands default to private,
+   command-scoped servers instead of a shared service. The removal also
+   defeats an agent-planted FIFO/directory/symlink at the reset path, which
+   would otherwise hang the boot, crash it, or redirect the write. This reset
+   discards prior service settings; the bridge's explicit foreground
+   `serve` still uses its loopback hostname and per-boot password. These layers
+   are naive-use guards: the agent can rewrite its live service config or
+   invoke the real binary directly.
+3. **Session sharing pinned off.** `"share": "disabled"` in both
+   `opencode2.4lunarwing/config/opencode2.json` and
+   `opencode4lunarwing/config/opencode.json` (v1 schema supports it at
+   v1.18.25), plus `"update": "disable"` in the v2 lane so an upstream
+   default flip cannot re-enable publication or replace the pinned binary.
+   The config tree and boot files (`entrypoint.sh`, `health_server.py`,
+   `agent_comm_protocol.json`) are root-owned and read-only in the image,
+   including deployments that restart the same container filesystem. The
+   entrypoint re-derives the default runtime config from the baked source at
+   every boot. An override copy gets owner-write permission before the config
+   writers run; the baked source stays read-only. Live runtime/project configs
+   and operator-selected `OPENCODE_CONFIG` remain untrusted and mutable.
+4. **CI guard.** `.gitlab/scripts/check-worker-exposure-policy.sh` (job
+   `worker-exposure-policy-guard`, security stage) asserts the pins, the
+   ruleset ordering, the wrapper (every-token scan), the Dockerfile wiring
+   including the root-owned read-only boot files + `scripts/`+`config/`, and runs
+   git-free (the ci-config image ships no git). The Dockerfile checks are
+   anchored over comment-stripped, continuation-joined lines. The exact
+   compile-out source COPY and RUN must occur in `AS builder`, in that order,
+   before the native build RUN. The wrapper-install/binary-scan RUN and the
+   read-only chmod RUN (with optional exec-bit prefix) must each match a whole
+   instruction, so a suffix such as `|| true` cannot hide a failed scan.
+   After the final `--image-filesystem` RUN, only `EXPOSE`, `HEALTHCHECK`,
+   `USER`, `ENTRYPOINT`, `CMD`, `LABEL` and `STOPSIGNAL` are allowed
+   (case-insensitively). Later COPY/ADD/RUN steps or new stages are refused
+   regardless of command spelling; earlier filesystem changes are checked
+   by the image-build assertion (run-96 FP-1, closing the run-90 FC-4 gaps).
+   Run-97 FQ-1: the wrapper-install/binary-scan RUN must sit in the *same
+   stage* as the final `--image-filesystem` assertion — build engines skip
+   unused stages, so the exact line in a dead or builder stage satisfies
+   presence checks while the shipped image has neither wrapper nor scan.
+   Run-97 FQ-2/FQ-3: the last `USER` instruction must be exactly
+   `USER 10003:10003`, and Dockerfile parser directives
+   (`# escape=`, `# syntax=`, `# check=`) are refused outright, since a
+   custom escape character would invalidate the guard's continuation
+   joining. Run-103 GD-1: the directive refusal also covers the grammar's
+   whitespace-around-`=` spellings (`# escape = \``) and a UTF-8 BOM prefix
+   (Docker strips a leading BOM before parsing) — either hid a directive
+   the old regex never matched.
+   `.gitlab/tests/test_worker_exposure_policy.py` regression-covers it,
+   including no-git lanes. The guard also runs the exposure/wrapper,
+   compile-out, and non-root boot configuration suites on merge requests.
+5. **Build-time assertion.** The opencode2 Dockerfile runs
+   `scripts/exposure_policy_assert.py --binary …`: the image fails to build
+   if the config lacks the pins, the entrypoint touches service mode or
+   `--service`, `OPENCODE_BIN` bypasses the wrapper, the wrapper regressed
+   to a first-token dispatch, the binary contains OpenTunnel client
+   markers. A final `--image-filesystem` assertion checks actual ownership
+   and modes of the boot files and `scripts/`+`config/` after all image steps;
+   the image fails if they are not root-owned read-only or `/app` permits
+   non-root replacement of its children. Run-103 GD-2: the v2
+   `--image-filesystem` path additionally verifies the *installed wrapper*:
+   `/usr/local/bin/opencode` must be a regular non-symlink, root-owned file
+   with no group/other write bit, byte-identical to
+   `scripts/opencode-exposure-guard.sh`, and `shutil.which("opencode")`
+   must resolve to it (no earlier `PATH` dir shadows it); the real binary
+   at `/usr/local/lib/opencode2/opencode` is re-scanned for tunnel markers.
+   A same-stage `RUN` between the wrapper-install scan and the final
+   assertion therefore cannot swap the wrapper (or the binary) in
+   unnoticed — pinned by unit tests with injected paths, since the image
+   build itself is a protected-pipeline gate.
+6. **Runtime smoke (DEFERRED to WI#345):** live `service.json`/`opentunnel`
+   dir/listener assertions against a running container belong to the WI#345
+   runtime-smoke suite, which does not exist yet. Control 9 covers the
+   listener half on live tenants.
+7. **Bump checklist (REQUIRED for every worker version bump).** The bump
+   entry in this file must record the upstream features that add network
+   exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
+   auto-update — with the decision for each, not only the bridge call
+   surface. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
+   these guards cover the *shipped binary*; against a compromised agent
+   only control 1 makes the crossing safe (see the gate record above).
+8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
+   in the builder stage: at v2.0.24 it verifies there is no tunnel surface;
+   at v2.0.26+ it replaces `remote-tunnel.ts` with a fail-closed stub
+   (verified against the real v2.0.26 tree: importers use exactly
+   `run`/`ensure`/`hostname`). Drift detection scans
+   `packages/{cli,server,schema,core}/src` (`*.ts` and `*.tsx`), matches
+   any quoted `@opentunnel/*` specifier (static, dynamic `import()`,
+   `require`), and collects `@opentunnel` deps from every
+   `packages/*/package.json`; if upstream moves/renames the module or
+   extends its surface, the build fails instead of silently shipping the
+   tunnel. The runtime-stage binary marker scan is the backstop beyond
+   even that.
+9. **Live listener audit.** `mt-admin worker-listeners <tenant>` lists
+   listening sockets inside each running worker container, read **host-side
+   from `/proc/<container pid>/net/{tcp,tcp6,udp,udp6}`** (running `cat`
+   inside the untrusted container would let a root-in-container agent forge
+   the audit), TCP LISTEN (0A) and UDP UNCONN (07) alike. It fails on any
+   non-loopback bind beyond bridge-WS + health — and the expected-port
+   exemption is TCP LISTEN only: those are the ports mt-admin publishes, so a
+   UDP bind on 8443 or the WS port is unpublished and still a finding, with
+   the protocol labelled on every reported line (run-90 FC-2). It fails on
+   any published mapping
+   off host loopback — an empty/missing `HostIp` counts as all-interfaces
+   (Docker's shape; podman reports `0.0.0.0`) — and an inspect failure is a
+   finding, never a silent skip. Absence requires a failed inspect with a
+   Docker/Podman missing-object/container diagnostic naming that exact
+   container; account/runtime-directory errors are findings. Warning lines
+   before a valid state line are tolerated, and a failed PortBindings inspect
+   is also a finding. Re-run against the `scootaloo` tenant on
+   2026-10-13 (rootless podman, after the run-79 EI-6 hardening):
+   **clean** — all four lanes showed exactly the expected bridge-WS + 8443
+   binds, all mappings host-loopback only.
+
+**!1570 deployment note:** rebuild the worker image and recreate existing
+opencode2 containers through mt-admin to receive the protected boot files.
+Restarting a container on an older image does not apply the new ownership or
+startup logic. !1490 remains gated at v2.0.24; the service-config reset is not
+an egress boundary.
+
+Control 11 audit of the other lanes (2026-10-12, against pinned sources;
+re-checked 2026-10-13):
+
+- **opencode v1 (v1.18.25):** no service mode, no pairing, no tunnel (all
+  v2-era surfaces). Session sharing existed and is now pinned
+  `"share": "disabled"`. v1.18.25's `serve` has **no auth support at all**
+  (no password — the containment is the loopback bind plus host-loopback
+  publishing, verified live under control 9).
+- **kimi (2.1.1):** no server mode, pairing, sharing, or tunnel in the lane;
+  `kimi -p` is spawned per task. `telemetry = false` is pinned in
+  `config/config.toml`; the WI#206 fail-closed command guard is the only
+  in-CLI enforcement point and stays mandatory.
+- **pebble:** no listeners, pairing, or sharing in upstream
+  (nanogpt-community/pebble) — the only `TcpListener` is test code.
+  **Finding (widened per run-79 EI-10):** the image has no `USER`
+  directive, so the agent runs as **root in the container**. That exposes
+  more than `pebble self-update` (fetches GitHub releases, replaces the
+  binary): a root-in-container agent can replace the bridge binary itself
+  and forge audit/bridge output (why control 9 reads `/proc` host-side).
+  Rootless podman maps it to the tenant uid on the host, but within the
+  container the pinned-build contract is not enforced. Mitigation is
+  control 1 (egress allowlist) or a lane hardening pass (non-root user +
+  root-owned bridge binary); recorded here per the bump-checklist rule.
+
 ## LunarWing Worker
 
 The main sandbox worker. Its runtime image includes Git, build-essential, Node.js/npm, Python 3, Rust, and GitHub CLI; it does not install a Claude Code executable. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.
