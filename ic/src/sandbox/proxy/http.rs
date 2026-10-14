@@ -614,7 +614,7 @@ fn scrub_header_value(value: &[u8], spellings: &[String]) -> HeaderScrub {
     let Some(raw) = spellings.first() else {
         return HeaderScrub::Unchanged;
     };
-    if raw.as_bytes().len() < MIN_HEADER_SCRUB_LEN {
+    if raw.len() < MIN_HEADER_SCRUB_LEN {
         return HeaderScrub::Unchanged;
     }
     if let Some(scrubbed) = scrub_credential_echoes(value, spellings) {

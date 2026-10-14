@@ -3575,7 +3575,7 @@ mod tests {
         let mut store_data = StoreData::new(1024 * 1024, capabilities, credentials, Vec::new());
 
         // The placeholder lands in the path; the deny reason quotes it.
-        let url = format!("https://api.example.com/{{API_TOKEN}}/d");
+        let url = "https://api.example.com/{API_TOKEN}/d".to_string();
         let err = store_data
             .http_request("GET".to_string(), url, "{}".to_string(), None, None)
             .unwrap_err();
