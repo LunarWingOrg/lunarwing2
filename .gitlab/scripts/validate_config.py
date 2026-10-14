@@ -813,8 +813,64 @@ def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
         )
 
 
+def cross_check_image_digest(
+    variables: dict[str, str],
+    name: str,
+    dockerfile: pathlib.Path,
+    from_package: str,
+    display: str,
+    errors: list[str],
+) -> None:
+    """A CI lane image must test with the same content the worker image
+    builds and runs with (MR !1552 review ER-5). Fail closed: a missing
+    Dockerfile, an unpinned/malformed FROM, or no matching FROM at all must
+    not silently dissolve the tie this check exists to enforce (MR !1566
+    review EZ-3)."""
+    match = DIGEST_PATTERN.search(variables.get(name, ""))
+    if not match:
+        return
+    if not dockerfile.is_file():
+        errors.append(
+            f"{display} missing; cannot cross-check {name} against its "
+            f"{from_package} FROM digest(s)"
+        )
+        return
+    dockerfile_text = dockerfile.read_text(encoding="utf-8")
+    from_lines = [
+        line.strip()
+        for line in dockerfile_text.splitlines()
+        if re.match(
+            rf"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?\S*{re.escape(from_package)}", line
+        )
+    ]
+    if not from_lines:
+        errors.append(
+            f"{display} has no {from_package} FROM line; cannot cross-check {name}"
+        )
+    dockerfile_digests = set()
+    for from_line in from_lines:
+        digest_match = re.search(r"@sha256:([0-9a-f]{64})(?![0-9a-fA-F])", from_line)
+        if digest_match:
+            dockerfile_digests.add(digest_match.group(1))
+        else:
+            errors.append(
+                f"{display} {from_package} FROM is not pinned "
+                f"to a 64-char lowercase sha256 digest: {from_line!r}"
+            )
+    if dockerfile_digests and dockerfile_digests != {match.group(1)}:
+        errors.append(
+            f"{name} digest must match the {from_package} digest(s) in {display}"
+        )
+
+
 def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors: list[str]) -> None:
-    trust_sensitive = ("CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE", "CI_BUN_IMAGE")
+    trust_sensitive = (
+        "CI_LINT_IMAGE",
+        "CI_RUST_IMAGE",
+        "CI_GITLEAKS_IMAGE",
+        "CI_BUN_IMAGE",
+        "CI_NODE_IMAGE",
+    )
     for name in trust_sensitive:
         value = variables.get(name, "")
         if not value:
@@ -823,45 +879,17 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
             errors.append(f"{name}={value!r} is not digest-pinned")
 
     # The worker-opencode-ts lane must test with the same bun content the
-    # worker image builds and runs with (MR !1552 review ER-5). Fail closed:
-    # a missing Dockerfile, an unpinned/malformed oven/bun FROM, or no
-    # oven/bun FROM at all must not silently dissolve the tie this check
-    # exists to enforce (MR !1566 review EZ-3).
-    bun_match = DIGEST_PATTERN.search(variables.get("CI_BUN_IMAGE", ""))
-    if bun_match:
-        if not OPENCODE_DOCKERFILE.is_file():
-            errors.append(
-                "opencode4lunarwing/Dockerfile missing; cannot cross-check "
-                "CI_BUN_IMAGE against its oven/bun FROM digest(s)"
-            )
-        else:
-            dockerfile_text = OPENCODE_DOCKERFILE.read_text(encoding="utf-8")
-            bun_from_lines = [
-                line.strip()
-                for line in dockerfile_text.splitlines()
-                if re.match(r"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?\S*oven/bun", line)
-            ]
-            if not bun_from_lines:
-                errors.append(
-                    "opencode4lunarwing/Dockerfile has no oven/bun FROM line; "
-                    "cannot cross-check CI_BUN_IMAGE"
-                )
-            dockerfile_bun_digests = set()
-            for from_line in bun_from_lines:
-                digest_match = re.search(r"@sha256:([0-9a-f]{64})(?![0-9a-fA-F])", from_line)
-                if digest_match:
-                    dockerfile_bun_digests.add(digest_match.group(1))
-                else:
-                    errors.append(
-                        "opencode4lunarwing/Dockerfile oven/bun FROM is not pinned "
-                        "to a 64-char lowercase sha256 digest: "
-                        f"{from_line!r}"
-                    )
-            if dockerfile_bun_digests and dockerfile_bun_digests != {bun_match.group(1)}:
-                errors.append(
-                    "CI_BUN_IMAGE digest must match the oven/bun digest(s) in "
-                    "opencode4lunarwing/Dockerfile"
-                )
+    # worker image builds and runs with (MR !1552 review ER-5).
+    cross_check_image_digest(
+        variables, "CI_BUN_IMAGE", OPENCODE_DOCKERFILE, "oven/bun",
+        "opencode4lunarwing/Dockerfile", errors,
+    )
+    # The worker-kimi-ts lane must test with the same node content the kimi
+    # worker image builds and runs with (WI#375 DR-3).
+    cross_check_image_digest(
+        variables, "CI_NODE_IMAGE", KIMI_DOCKERFILE, "library/node",
+        "kimicode4lunarwing/Dockerfile", errors,
+    )
 
     literal_images = {
         ".worker-candidate": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51",
