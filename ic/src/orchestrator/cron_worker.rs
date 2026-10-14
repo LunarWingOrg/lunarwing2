@@ -2256,9 +2256,8 @@ mod tests {
         let cm = Arc::new(crate::context::ContextManager::new(4));
         let (events, _) = broadcast::channel(8);
         let worker = ExternalWorkerConfig::default();
-        let manager = Arc::new(
-            ExternalWorkerManager::new(vec![worker.clone()]).with_event_deps(events, cm),
-        );
+        let manager =
+            Arc::new(ExternalWorkerManager::new(vec![worker.clone()]).with_event_deps(events, cm));
         let cron = test_cron();
         // Stand in for the in-flight chain link the closed channel must
         // cancel: a reserved (never started) task on the same worker.
@@ -2296,20 +2295,32 @@ mod tests {
         let key = "cron-mission:pr-digest:last-job";
 
         // No pointer recorded yet.
-        assert!(load_last_tick_job(Some(&db), "owner", "pr-digest").await.is_none());
+        assert!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest")
+                .await
+                .is_none()
+        );
 
         // A garbage pointer cannot parse as a job id.
         db.set_setting("owner", key, &serde_json::json!("not-a-uuid"))
             .await
             .unwrap(); // safety: test
-        assert!(load_last_tick_job(Some(&db), "owner", "pr-digest").await.is_none());
+        assert!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest")
+                .await
+                .is_none()
+        );
 
         // A well-formed id whose row was deleted (or never existed).
         let missing = Uuid::new_v4();
         db.set_setting("owner", key, &serde_json::json!(missing))
             .await
             .unwrap(); // safety: test
-        assert!(load_last_tick_job(Some(&db), "owner", "pr-digest").await.is_none());
+        assert!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest")
+                .await
+                .is_none()
+        );
 
         // A real job row owned by someone else.
         let foreign = Uuid::new_v4();
@@ -2319,7 +2330,11 @@ mod tests {
         db.set_setting("owner", key, &serde_json::json!(foreign))
             .await
             .unwrap(); // safety: test
-        assert!(load_last_tick_job(Some(&db), "owner", "pr-digest").await.is_none());
+        assert!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest")
+                .await
+                .is_none()
+        );
 
         // A real job row owned by the mission owner anchors again.
         let owned = Uuid::new_v4();

@@ -475,7 +475,10 @@ mod tests {
         }
         attacker.kill().ok();
         attacker.wait().ok();
-        assert!(succeeded > 0, "harness never completed a bootstrap — vacuous");
+        assert!(
+            succeeded > 0,
+            "harness never completed a bootstrap — vacuous"
+        );
         assert!(
             std::fs::read_dir(&outside)
                 .expect("read outside dir")

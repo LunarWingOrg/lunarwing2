@@ -4992,7 +4992,10 @@ async fn run_two_ticks_then_pause_and_shutdown(
 fn restart_cron_manager(
     db: &Arc<dyn Database>,
     url: &str,
-) -> (Arc<ExternalWorkerManager>, tokio::sync::broadcast::Sender<()>) {
+) -> (
+    Arc<ExternalWorkerManager>,
+    tokio::sync::broadcast::Sender<()>,
+) {
     let context_manager = Arc::new(ContextManager::new(16));
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
     let mgr = Arc::new(
@@ -5080,8 +5083,7 @@ async fn cron_resume_after_restart_anchors_events_to_last_job() {
         .await
         .unwrap();
     assert!(
-        !mgr
-            .cron_mission_status("mock", "owner-1")
+        !mgr.cron_mission_status("mock", "owner-1")
             .await
             .unwrap()
             .paused
@@ -5121,6 +5123,10 @@ async fn cron_tick_with_failing_job_persistence_never_dispatches() {
         .await
         .expect("sabotage agent_jobs");
     let db: Arc<dyn Database> = Arc::new(backend);
+    // WI#375 DR-2: the job_events FK would mask orphan-event writes, so count
+    // attempts through the recording decorator instead of reading rows.
+    let recording = Arc::new(lunarwing::db::recording::RecordingDb::new(db));
+    let db: Arc<dyn Database> = recording.clone();
 
     let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
     let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
@@ -5159,6 +5165,13 @@ async fn cron_tick_with_failing_job_persistence_never_dispatches() {
     assert!(
         leak.is_err(),
         "worker received a dispatch despite the failed job-row persist: {leak:?}"
+    );
+    // DN-6's no-orphan-event half: no save_job_event attempt may be made for
+    // a job whose row was never persisted (the FK would mask the write).
+    assert!(
+        recording.job_event_attempts().is_empty(),
+        "save_job_event attempted for an unpersisted job: {:?}",
+        recording.job_event_attempts()
     );
     let _ = shutdown.send(());
 }
