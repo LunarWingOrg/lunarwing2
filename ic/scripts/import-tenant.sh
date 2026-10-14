@@ -973,11 +973,15 @@ if jq -e ".tenants[\"$TENANT\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
     # anything else is unverifiable and must refuse the resume.
     resume_writers_rc=0
     resume_writers_out=""
-    resume_writers_out="$("$MT" writers-active "$TENANT" 2>/dev/null)" || resume_writers_rc=$?
+    resume_writers_err=""
+    resume_writers_out="$("$MT" writers-active "$TENANT" 2>"$WORK/writers-active-resume.stderr")" || resume_writers_rc=$?
+    # WI#393 GR-2: the refusal must carry the arm's stderr cause (the EQ-1
+    # refusal text names the render-units repair command), not a bare refusal.
+    resume_writers_err="$(head -c 1000 "$WORK/writers-active-resume.stderr" 2>/dev/null || true)"
     case "$resume_writers_rc:$resume_writers_out" in
       1:stopped) ;;
       0:active) die "cannot resume while tenant '$TENANT' has active writers" ;;
-      *) die "cannot verify stopped writers for resumable tenant '$TENANT'" ;;
+      *) die "cannot verify stopped writers for resumable tenant '$TENANT' (rc=$resume_writers_rc${resume_writers_err:+: $resume_writers_err})" ;;
     esac
     say "resuming interrupted DarkIRC import for matching tenant '$TENANT'"
   else

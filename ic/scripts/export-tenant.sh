@@ -563,17 +563,28 @@ banner "1/6  Quiesce tenant writers"
 # AND the stdout state word together so an error is never misread as a
 # quiesced tenant (which would let a snapshot race live writers).
 writers_active() {
-  local rc=0 out=""
-  out="$("$MT" writers-active "$TENANT" 2>/dev/null)" || rc=$?
+  local rc=0 out="" err="" errf="$WORK/writers-active.stderr"
+  : >"$errf"
+  out="$("$MT" writers-active "$TENANT" 2>"$errf")" || rc=$?
+  # The refusal must carry the arm's stderr cause (root/usage/registry errors,
+  # the EQ-1 refusal with its render-units repair text) — otherwise operators
+  # stall on a bare rc (WI#393 GR-2). Bounded so a pathological subprocess
+  # cannot flood the terminal; multi-line stdout stays refused by the *) arm.
+  err="$(head -c 1000 "$errf" 2>/dev/null || true)"
   case "$rc:$out" in
     0:active) return 0 ;;
     1:stopped) return 1 ;;
-    *) die "mt-admin writers-active could not confirm writer state for '$TENANT' (rc=$rc)" ;;
+    *) die "mt-admin writers-active could not confirm writer state for '$TENANT' (rc=$rc${err:+: $err})" ;;
   esac
 }
 if $NO_QUIESCE; then
-  if ! $DRY_RUN && writers_active; then die "--no-quiesce given but '$TENANT' still has active writers — stop them first for a consistent snapshot"; fi
-  note "--no-quiesce: verified tenant writers are already stopped"
+  if $DRY_RUN; then
+    note "--no-quiesce: [dry-run] would verify tenant writers are already stopped"
+  elif writers_active; then
+    die "--no-quiesce given but '$TENANT' still has active writers — stop them first for a consistent snapshot"
+  else
+    note "--no-quiesce: verified tenant writers are already stopped"
+  fi
 else
   run "$MT" stop-writers "$TENANT"
   if ! $DRY_RUN && writers_active; then
