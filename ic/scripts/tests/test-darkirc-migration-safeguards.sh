@@ -861,6 +861,9 @@ else
 fi
 assert_contains "resume names the unverifiable writer state (FL-5)" \
   "$(cat "$structured_tmp/error-resume.out")" "cannot verify stopped writers"
+# GR-2: the refusal must carry the arm's stderr cause, not a bare rc.
+assert_contains "resume refusal carries the writers-active stderr cause (GR-2)" \
+  "$(cat "$structured_tmp/error-resume.out")" "must be root"
 
 : >"$structured_tmp/mt.log"
 if PATH="$structured_tmp/bin:$PATH" \

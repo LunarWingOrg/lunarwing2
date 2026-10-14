@@ -706,6 +706,12 @@ for fl5_mode in quiesce no-quiesce; do
   else
     pass "writers-active error produced no migration bundle ($fl5_mode, FL-5)"
   fi
+  # GR-2: the refusal must carry the arm's stderr cause, not a bare rc.
+  if [[ "$fl5_output" == *"must run as root"* ]]; then
+    pass "export refusal carries the writers-active stderr cause ($fl5_mode, GR-2)"
+  else
+    fail "export refusal carries the writers-active stderr cause ($fl5_mode, GR-2)"
+  fi
 done
 
 # Equivalent credentials with different env quoting must compare by value.
