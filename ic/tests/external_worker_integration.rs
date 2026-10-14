@@ -2564,7 +2564,14 @@ async fn tool_call_roundtrip_allowlist_and_deny_by_default() {
     };
     let res = timeout(
         TEST_BOUND,
-        mgr.execute_task(job_id, "mock", "task", Some(MOCK_TASK_TIMEOUT_MS), true, context),
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(MOCK_TASK_TIMEOUT_MS),
+            true,
+            context,
+        ),
     )
     .await
     .expect("test timed out")
@@ -4457,9 +4464,7 @@ async fn cron_user_cancel_ends_tick_without_reentry() {
     assert!(mgr.cancel_task(job_id).await, "cancel must find the job");
 
     assert!(
-        timeout(NO_DISPATCH_BOUND, request_rx.recv())
-            .await
-            .is_err(),
+        timeout(NO_DISPATCH_BOUND, request_rx.recv()).await.is_err(),
         "a user-cancelled tick must not be re-dispatched"
     );
 }
@@ -4493,9 +4498,7 @@ async fn cron_tick_abandoned_after_max_reentries() {
         );
     }
     assert!(
-        timeout(NO_DISPATCH_BOUND, request_rx.recv())
-            .await
-            .is_err(),
+        timeout(NO_DISPATCH_BOUND, request_rx.recv()).await.is_err(),
         "a tick past its re-entry budget must not dispatch again"
     );
     assert_eq!(
@@ -4554,9 +4557,7 @@ async fn cron_busy_rejection_retries_without_spending_reentry_budget() {
     // The retry wedges too, lapses, and the tick is then abandoned at the
     // re-entry cap: no third link is dispatched.
     assert!(
-        timeout(NO_DISPATCH_BOUND, request_rx.recv())
-            .await
-            .is_err(),
+        timeout(NO_DISPATCH_BOUND, request_rx.recv()).await.is_err(),
         "a tick at its re-entry cap must not dispatch again"
     );
     assert_eq!(
