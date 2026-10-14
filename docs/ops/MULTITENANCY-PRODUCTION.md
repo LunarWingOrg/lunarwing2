@@ -601,7 +601,13 @@ archive (`$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`, default
 `/var/lib/lunarwing/openrc-proxy-backups`, directory mode 0700, files mode
 0600, never executable, never sourced); already-safe units are replaced
 without archiving, so repeated sweeps and upgrades do not grow the
-archive. The archive is retained indefinitely for investigation —
+archive. The contract is equality, not presence (WI#393 FL-6): a unit is
+safe only as a regular non-symlink file carrying the fixed
+`--tensorzero-env` flag line, with no line anywhere in it carrying the
+legacy inline `--tensorzero <url>` flag, command substitution, or a
+backtick — a unit with the safe line plus extra content fails the
+contract and is archived and replaced like any other unsafe unit. The
+archive is retained indefinitely for investigation —
 legacy units may carry payload URLs with query-string tokens — and is
 deliberately left behind by `remove-tenant --purge`; prune it manually
 with `rm` once the preserved bytes are no longer needed. The render aborts
@@ -635,7 +641,13 @@ an OpenRC service state — so `remove-tenant`, `restore-tenant`,
 `migrate-owner-scope` and the writer-quiescence probes cannot misread a
 refused or refused-looking status as "stopped". At the CLI boundary,
 `writers-active` maps a dispatcher refusal to exit **2** (unknown), never
-1 (stopped), matching its 0/1/2 state contract.
+1 (stopped), matching its 0/1/2 state contract. The arm's own precondition
+failures (root, usage, registry, name and lock-dir checks) also exit 1, so
+the exit code alone still cannot say "stopped": callers must accept the
+stopped state only as exit **1** with stdout `stopped` (and the active state
+only as exit **0** with stdout `active`). `export-tenant.sh` and
+`import-tenant.sh --resume` enforce exactly that pairing and refuse anything
+else as unverifiable (WI#393 FL-5).
 
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips
