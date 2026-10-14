@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Guard for the WI#331 mitigation: the libsql 0.6.0 legacy chain
-# (rustls-webpki 0.102.8, h2 0.3.27) must stay OUT of the default-feature
-# production graph now that libsql's remote/replication/tls surface lives
+# (rustls 0.22.4, rustls-webpki 0.102.8, h2 0.3.27) must stay OUT of the
+# default-feature production graph now that libsql's remote/replication/tls surface lives
 # behind the non-default `libsql-remote-replica` cargo feature.
 #
 # Why a separate guard (MR !1513 review CZ-1): both cargo-deny gates
@@ -37,6 +37,7 @@ fi
 # crate|version|advisories|explanation — keep alphabetized by crate name.
 guarded=(
     "h2|0.3.27|RUSTSEC-2026-0258|libsql 0.6.0 -> tonic 0.11 -> hyper 0.14 legacy chain; only opt-in libsql-remote-replica builds may compile it"
+    "rustls|0.22.4|RUSTSEC-2026-0346/0349|libsql 0.6.0 -> hyper-rustls 0.25 legacy chain; only opt-in libsql-remote-replica builds may compile it"
     "rustls-webpki|0.102.8|RUSTSEC-2026-0049/0098/0099/0104|libsql 0.6.0 -> hyper-rustls 0.25 -> rustls 0.22 legacy chain; only opt-in libsql-remote-replica builds may compile it"
 )
 

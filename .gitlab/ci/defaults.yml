@@ -41,6 +41,10 @@ variables:
   # CI_NODE_IMAGE must stay equal to the node digest(s) in
   # kimicode4lunarwing/Dockerfile (enforced by validate_config.py).
   CI_NODE_IMAGE: "docker.io/library/node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5"
+  # CI_DEBIAN_SNAPSHOT must stay equal to the valued ARG DEBIAN_SNAPSHOT in
+  # kimicode4lunarwing/Dockerfile (enforced by validate_config.py); the
+  # worker-kimi-ts lane installs its python3 prerequisite from this snapshot.
+  CI_DEBIAN_SNAPSHOT: "20260906T000000Z"
   # The runner contract reserves 40 GiB after checkout. Keep the compiler cache
   # below 30% of that budget so target files and registry archives have room.
   RUSTC_WRAPPER: "$CI_PROJECT_DIR/.ci-cache/bin/sccache"
