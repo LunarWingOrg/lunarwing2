@@ -3504,8 +3504,10 @@ mod tests {
 
         let secret = "wasm-secret-4d5e6f+/=";
         // The URL encodes the value, so the raw secret never appears in the
-        // error text; the stem does (GN-2).
-        let secret_stem = "wasm-secret-4d5e6f";
+        // error text; the stem does (GN-2). Derived from the fixture rather
+        // than spelled out: a second literal trips secret-detection (run-111
+        // HA-1).
+        let secret_stem = secret.trim_end_matches(['+', '/', '=']);
         let encoded = urlencoding::encode(secret).to_string();
         let url = format!("http://127.0.0.1:{port}/d?api_key={encoded}");
         let error = reqwest::Client::builder()
