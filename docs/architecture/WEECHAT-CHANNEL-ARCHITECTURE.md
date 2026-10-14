@@ -5,7 +5,7 @@ flow, the ingestion/latency model, the configuration-precedence rules (and the t
 create), and the known issues with their fix status.
 
 **Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
-(v2.1.5.0).** All component paths,
+(v2.1.5.0); re-checked 2026-10-14 (v2.1.6.0).** All component paths,
 limits, and fix statuses below were re-checked against the current tree; the only change
 is the `dm_policy` default note in §4 (see below). The 2.1.2.0 release bumped the
 channel crate and its registry entry (`ic/registry/channels/weechat.json`) to
@@ -21,7 +21,13 @@ workspace version 2.1.5; no component paths, limits, or fix statuses
 changed (re-verified: `MIN_POLL_INTERVAL_MS` still 30_000 at
 `capabilities.rs:14`, guest still requests 3s, `default_dm_policy()` still
 `pairing`, `max_chunk_length` still 420, `tags_allow_ingest` still the
-shared choke point).
+shared choke point). The 2.1.6.0 release again only bumped the registry
+entry to 0.2.13 and the channel crates to workspace version 2.1.6; no
+component paths, limits, or fix statuses changed (re-verified:
+`MIN_POLL_INTERVAL_MS` still 30_000 at `capabilities.rs:14`,
+`default_dm_policy()` still `pairing`, `max_chunk_length` still 420,
+`tags_allow_ingest` unchanged; `ws_adapter.py` and `ic/src/channels/wasm/`
+untouched in the cycle).
 
 > **Why this doc exists.** A multi-hour debugging session upgrading the `sunburst` tenant
 > showed that message delivery through this channel has several independent, *invisible*
