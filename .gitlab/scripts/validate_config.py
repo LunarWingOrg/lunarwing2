@@ -457,6 +457,52 @@ def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
             errors.append(f"check-satellite-advisories.sh lost its {fragment} guard")
 
 
+def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
+    """Both worker TS lanes must exist and keep their MR-pipeline wiring.
+
+    MR !1601 review GH-2: neither TS lane was pinned by the validator, so
+    deleting the whole block or replacing its rules with `when: never`
+    passed every gate silently — exactly the regression class GB-2 was
+    about. Require each lane to exist, to run on merge_request_event, to use
+    its digest-tied image variable, and to keep its core script fragments
+    (including the kimi lane's python3 provisioning, GH-1).
+    """
+    expected = {
+        "worker-kimi-ts": (
+            "$CI_NODE_IMAGE",
+            (
+                "apt-get install -y --no-install-recommends python3",
+                "cd kimicode4lunarwing/scripts",
+                "npm ci --ignore-scripts",
+                "npx tsc -p tsconfig.json",
+                "npm test",
+            ),
+        ),
+        "worker-opencode-ts": (
+            "$CI_BUN_IMAGE",
+            (
+                "cd opencode4lunarwing",
+                "bun install --frozen-lockfile",
+                "tsc --noEmit -p scripts/tsconfig.json",
+            ),
+        ),
+    }
+    for job_name, (image_variable, fragments) in expected.items():
+        job = merged.get(job_name)
+        if not isinstance(job, dict):
+            errors.append(f"{job_name} job missing")
+            continue
+        if image_name(job.get("image")) != image_variable:
+            errors.append(f"{job_name} must use the {image_variable} image")
+        if not any("merge_request_event" in condition for condition in rule_conditions(job)):
+            errors.append(f"{job_name} must run on merge_request_event")
+        script = job.get("script", [])
+        commands = "\n".join(script if isinstance(script, list) else [str(script)])
+        for fragment in fragments:
+            if fragment not in commands:
+                errors.append(f"{job_name} lost its required script fragment: {fragment}")
+
+
 def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
     """Catch release metadata drift before the expensive WASM/host test job."""
     expected = merged.get("cavepony-wasm", {}).get("variables", {}).get("CAVEPONY_EXPECTED_VERSION")
@@ -1039,6 +1085,7 @@ def main() -> int:
     validate_cavepony_version(merged_config, errors)
     validate_cargo_deny_gate(merged_config, errors)
     validate_satellite_advisory_sweep(merged_config, errors)
+    validate_worker_ts_lanes(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
     validate_worker_versions(errors)
     validate_deliverables_manifest(merged_config, errors)

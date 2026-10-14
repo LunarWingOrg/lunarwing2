@@ -454,5 +454,99 @@ class NodeImageTieTests(unittest.TestCase):
         self.assertTrue(any("not pinned" in error for error in self.errors()))
 
 
+class WorkerTsLaneTests(unittest.TestCase):
+    """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
+    the merge_request_event rule, the tied image variable, and the core
+    script fragments (including the kimi python3 provisioning, GH-1)."""
+
+    def lane(self, image_variable: str, commands: list[str]) -> dict:
+        return {
+            "stage": "validate",
+            "image": {"name": image_variable, "entrypoint": [""]},
+            "rules": [
+                {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+                {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'},
+                {"when": "never"},
+            ],
+            "script": commands,
+        }
+
+    def merged(self) -> dict:
+        return {
+            "worker-kimi-ts": self.lane(
+                "$CI_NODE_IMAGE",
+                [
+                    "apt-get update && apt-get install -y --no-install-recommends python3",
+                    "cd kimicode4lunarwing/scripts",
+                    "npm ci --ignore-scripts",
+                    "npx tsc -p tsconfig.json",
+                    "npm test",
+                ],
+            ),
+            "worker-opencode-ts": self.lane(
+                "$CI_BUN_IMAGE",
+                [
+                    "cd opencode4lunarwing",
+                    "bun install --frozen-lockfile",
+                    "bun scripts/path_expand_test.ts",
+                    "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
+                ],
+            ),
+        }
+
+    def errors(self, merged: dict) -> list[str]:
+        errors: list[str] = []
+        config.validate_worker_ts_lanes(merged, errors)
+        return errors
+
+    def test_valid_shape_passes(self):
+        self.assertEqual(self.errors(self.merged()), [])
+
+    def test_missing_kimi_lane_is_caught(self):
+        merged = self.merged()
+        del merged["worker-kimi-ts"]
+        self.assertTrue(any("worker-kimi-ts job missing" in error for error in self.errors(merged)))
+
+    def test_missing_opencode_lane_is_caught(self):
+        merged = self.merged()
+        del merged["worker-opencode-ts"]
+        self.assertTrue(any("worker-opencode-ts job missing" in error for error in self.errors(merged)))
+
+    def test_never_rules_are_caught(self):
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"] = [{"when": "never"}]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_wrong_image_variable_is_caught(self):
+        merged = self.merged()
+        merged["worker-kimi-ts"]["image"]["name"] = "$CI_BUN_IMAGE"
+        self.assertTrue(any("CI_NODE_IMAGE" in error for error in self.errors(merged)))
+
+    def test_missing_python3_provisioning_is_caught(self):
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command
+            for command in merged["worker-kimi-ts"]["script"]
+            if "python3" not in command
+        ]
+        self.assertTrue(any("python3" in error for error in self.errors(merged)))
+
+    def test_missing_npm_test_fragment_is_caught(self):
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command for command in merged["worker-kimi-ts"]["script"] if command != "npm test"
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_missing_bun_install_fragment_is_caught(self):
+        merged = self.merged()
+        merged["worker-opencode-ts"]["script"] = [
+            command
+            for command in merged["worker-opencode-ts"]["script"]
+            if "bun install" not in command
+        ]
+        self.assertTrue(any("bun install" in error for error in self.errors(merged)))
+
+
 if __name__ == "__main__":
     unittest.main()
