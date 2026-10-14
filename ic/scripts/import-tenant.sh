@@ -967,11 +967,16 @@ if jq -e ".tenants[\"$TENANT\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
     BRIDGE_ENVF="$LWROOT/env/xmpp-bridge.env"
     VISION_ENVF="$LWROOT/env/vision.env"
     validate_import_target_roots
+    # FL-5 (WI#393): rc 1 alone is not "stopped" — the writers-active arm's
+    # precondition failures (root, usage, registry, name, lock dir) share that
+    # exit code. Only rc 1 carrying the stdout state word confirms quiescence;
+    # anything else is unverifiable and must refuse the resume.
     resume_writers_rc=0
-    "$MT" writers-active "$TENANT" >/dev/null 2>&1 || resume_writers_rc=$?
-    case "$resume_writers_rc" in
-      1) ;;
-      0) die "cannot resume while tenant '$TENANT' has active writers" ;;
+    resume_writers_out=""
+    resume_writers_out="$("$MT" writers-active "$TENANT" 2>/dev/null)" || resume_writers_rc=$?
+    case "$resume_writers_rc:$resume_writers_out" in
+      1:stopped) ;;
+      0:active) die "cannot resume while tenant '$TENANT' has active writers" ;;
       *) die "cannot verify stopped writers for resumable tenant '$TENANT'" ;;
     esac
     say "resuming interrupted DarkIRC import for matching tenant '$TENANT'"
