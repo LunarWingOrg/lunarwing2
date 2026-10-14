@@ -4920,6 +4920,91 @@ async fn cron_owner_gate_is_uniform_for_non_owners() {
         .expect("owner fire on cron worker succeeds");
 }
 
+/// WI#375 DR-7: shared first-incarnation flow for the restart-persistence
+/// tests. Runs a per-second mission over `db` until two ticks have fired
+/// (draining both captured worker requests), pauses it, waits until the
+/// pause is applied, then shuts the supervisor down. The caller restarts a
+/// second manager over the same store and makes its own assertions.
+#[cfg(feature = "libsql")]
+async fn run_two_ticks_then_pause_and_shutdown(
+    db: &Arc<dyn Database>,
+    url: &str,
+    request_rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+) {
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_with_schedule(url, "* * * * * *", 30, 0)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+
+    timeout(TEST_BOUND * 2, async {
+        loop {
+            let status = mgr
+                .cron_mission_status("mock", "owner-1")
+                .await
+                .expect("status");
+            if status.tick_index >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("two scheduled ticks never fired");
+    for _ in 0..2 {
+        timeout(TEST_BOUND, request_rx.recv())
+            .await
+            .unwrap()
+            .expect("persisted tick reached worker");
+    }
+    mgr.pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
+        .await
+        .expect("pause");
+    // pause_cron_mission returns when the command is queued, not applied:
+    // wait until status reflects the pause (which is ordered after the
+    // persisted write in the supervisor's command handling) before teardown,
+    // so the shutdown broadcast cannot win the select race against it.
+    timeout(TEST_BOUND, async {
+        loop {
+            let status = mgr
+                .cron_mission_status("mock", "owner-1")
+                .await
+                .expect("status");
+            if status.paused {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("pause was never applied");
+    let _ = shutdown.send(());
+    drop(mgr);
+}
+
+/// WI#375 DR-7: restart a mission supervisor over an existing store (the
+/// shared "second incarnation" of the restart-persistence tests).
+#[cfg(feature = "libsql")]
+fn restart_cron_manager(
+    db: &Arc<dyn Database>,
+    url: &str,
+) -> (Arc<ExternalWorkerManager>, tokio::sync::broadcast::Sender<()>) {
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_with_schedule(url, "* * * * * *", 30, 0)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+    (mgr, shutdown)
+}
+
 /// MR !1522 DE-6: the persisted pause flag and tick counter survive a
 /// supervisor restart — the mission resumes paused with its tick index
 /// intact instead of silently resuming from zero.
@@ -4941,75 +5026,11 @@ async fn cron_pause_and_tick_counter_survive_restart() {
         requests: request_tx,
     })
     .await;
-
-    // First incarnation: per-second schedule; let two ticks fire, then pause.
-    let context_manager = Arc::new(ContextManager::new(16));
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
-    let mgr_a = Arc::new(
-        ExternalWorkerManager::new(vec![cron_config_with_schedule(&url, "* * * * * *", 30, 0)])
-            .with_event_deps(event_tx, Arc::clone(&context_manager))
-            .with_store(db.clone()),
-    );
-    let (shutdown_a, shutdown_rx_a) = tokio::sync::broadcast::channel(1);
-    mgr_a.spawn_cron_supervisors("owner-1", shutdown_rx_a);
-
-    timeout(TEST_BOUND * 2, async {
-        loop {
-            let status = mgr_a
-                .cron_mission_status("mock", "owner-1")
-                .await
-                .expect("status");
-            if status.tick_index >= 2 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("two scheduled ticks never fired");
-    for _ in 0..2 {
-        timeout(TEST_BOUND, request_rx.recv())
-            .await
-            .unwrap()
-            .expect("persisted tick reached worker");
-    }
-    mgr_a
-        .pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
-        .await
-        .expect("pause");
-    // pause_cron_mission returns when the command is queued, not applied:
-    // wait until status reflects the pause (which is ordered after the
-    // persisted write in the supervisor's command handling) before teardown,
-    // so the shutdown broadcast cannot win the select race against it.
-    timeout(TEST_BOUND, async {
-        loop {
-            let status = mgr_a
-                .cron_mission_status("mock", "owner-1")
-                .await
-                .expect("status");
-            if status.paused {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("pause was never applied");
-    let _ = shutdown_a.send(());
-    drop(mgr_a);
+    run_two_ticks_then_pause_and_shutdown(&db, &url, &mut request_rx).await;
 
     // Second incarnation over the same store: paused and tick_index persist.
-    let context_manager_b = Arc::new(ContextManager::new(16));
-    let (event_tx_b, _event_rx_b) = tokio::sync::broadcast::channel(16);
-    let mgr_b = Arc::new(
-        ExternalWorkerManager::new(vec![cron_config_with_schedule(&url, "* * * * * *", 30, 0)])
-            .with_event_deps(event_tx_b, Arc::clone(&context_manager_b))
-            .with_store(db.clone()),
-    );
-    let (shutdown_b, shutdown_rx_b) = tokio::sync::broadcast::channel(1);
-    mgr_b.spawn_cron_supervisors("owner-1", shutdown_rx_b);
-
-    let status = mgr_b
+    let (mgr, shutdown) = restart_cron_manager(&db, &url);
+    let status = mgr
         .cron_mission_status("mock", "owner-1")
         .await
         .expect("status after restart");
@@ -5019,8 +5040,35 @@ async fn cron_pause_and_tick_counter_survive_restart() {
         "persisted tick counter must survive the restart, got {}",
         status.tick_index
     );
-    // DN-4 / DO-4: after restart, resume still uses the last real job row as
-    // its audit anchor. Status drains the command before reading the store.
+    let _ = shutdown.send(());
+}
+
+/// MR !1531 DN-4 / DO-4: after a restart, resume still uses the last real
+/// job row as its audit anchor — the persisted lifecycle events land on the
+/// pre-shutdown tick job. Status drains the command before reading the
+/// store. Split out of `cron_pause_and_tick_counter_survive_restart`
+/// (WI#375 DR-7).
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_resume_after_restart_anchors_events_to_last_job() {
+    use lunarwing::db::Database;
+    use lunarwing::db::libsql::LibSqlBackend;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join("cron-restart-anchor.db"))
+        .await
+        .expect("test db");
+    backend.run_migrations().await.expect("migrations");
+    let db: Arc<dyn Database> = Arc::new(backend);
+
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+    run_two_ticks_then_pause_and_shutdown(&db, &url, &mut request_rx).await;
+
+    let (mgr, shutdown) = restart_cron_manager(&db, &url);
     let job_id: Uuid = serde_json::from_value(
         db.get_setting("owner-1", "cron-mission:test-mission:last-job")
             .await
@@ -5028,12 +5076,11 @@ async fn cron_pause_and_tick_counter_survive_restart() {
             .unwrap(),
     )
     .unwrap();
-    mgr_b
-        .resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
+    mgr.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
         .await
         .unwrap();
     assert!(
-        !mgr_b
+        !mgr
             .cron_mission_status("mock", "owner-1")
             .await
             .unwrap()
@@ -5048,7 +5095,7 @@ async fn cron_pause_and_tick_counter_survive_restart() {
             "missing persisted {kind} lifecycle event"
         );
     }
-    let _ = shutdown_b.send(());
+    let _ = shutdown.send(());
 }
 
 /// MR !1531 DR-2 / DN-6: when the job-row write fails, the tick must end
@@ -5321,6 +5368,134 @@ async fn cron_gateway_owner_gate_precedes_manager_lookup() {
         .status();
     assert_eq!(get_status, 403);
     assert_eq!(post_status, 403);
+}
+
+/// WI#375 DR-5: owner-facing error mappings on the cron recovery route —
+/// 503 when the gateway has no external worker manager at all, 404 for a
+/// task-mode worker, 503 for a cron-configured worker whose supervisor is
+/// not running — and GET with a `?token=` query bearer is rejected with 401
+/// (query tokens are limited to SSE/WS endpoints; this route must not
+/// accept them).
+#[tokio::test]
+async fn cron_gateway_maps_owner_errors_and_rejects_query_token() {
+    use std::collections::HashMap;
+
+    use lunarwing::channels::web::{
+        auth::{MultiAuthState, UserIdentity},
+        test_helpers::TestGatewayBuilder,
+    };
+
+    let owner_auth = || {
+        MultiAuthState::multi(HashMap::from([(
+            "owner-test-token".to_string(),
+            UserIdentity {
+                user_id: "owner-1".to_string(),
+                workspace_read_scopes: vec![],
+            },
+        )]))
+    };
+    let client = reqwest::Client::builder()
+        .timeout(TEST_BOUND)
+        .build()
+        .unwrap();
+
+    // No external worker manager at all: 503 (never a misleading 404).
+    let (addr, _state) = TestGatewayBuilder::new()
+        .user_id("owner-1")
+        .start_multi(owner_auth())
+        .await
+        .unwrap();
+    let url = format!("http://{addr}/api/workers/mock/cron");
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth("owner-test-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("owner-test-token")
+            .json(&serde_json::json!({"action":"pause"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    // GET with a query-string bearer is not accepted on this route (401).
+    assert_eq!(
+        client
+            .get(format!("{url}?token=owner-test-token"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+
+    // The worker exists but is task-mode: 404 on both methods.
+    let plain_manager = Arc::new(ExternalWorkerManager::new(vec![config_for(
+        "ws://127.0.0.1:9",
+    )]));
+    let (addr, _state) = TestGatewayBuilder::new()
+        .user_id("owner-1")
+        .external_worker_manager(plain_manager)
+        .start_multi(owner_auth())
+        .await
+        .unwrap();
+    let url = format!("http://{addr}/api/workers/mock/cron");
+    for method in ["get", "post"] {
+        let request = if method == "get" {
+            client.get(&url).bearer_auth("owner-test-token")
+        } else {
+            client
+                .post(&url)
+                .bearer_auth("owner-test-token")
+                .json(&serde_json::json!({"action":"pause"}))
+        };
+        assert_eq!(request.send().await.unwrap().status(), 404, "{method}");
+    }
+
+    // A cron-configured worker whose supervisor was never spawned: 503.
+    let cron_manager = Arc::new(ExternalWorkerManager::new(vec![cron_config_with_schedule(
+        "ws://127.0.0.1:9",
+        "0 0 0 29 2 *",
+        30,
+        0,
+    )]));
+    let (addr, _state) = TestGatewayBuilder::new()
+        .user_id("owner-1")
+        .external_worker_manager(cron_manager)
+        .start_multi(owner_auth())
+        .await
+        .unwrap();
+    let url = format!("http://{addr}/api/workers/mock/cron");
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth("owner-test-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("owner-test-token")
+            .json(&serde_json::json!({"action":"pause"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
 }
 
 #[tokio::test]

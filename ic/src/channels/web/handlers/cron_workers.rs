@@ -145,3 +145,77 @@ async fn control(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channels::web::test_helpers::TestGatewayBuilder;
+    use crate::orchestrator::external_worker::{CronCommand, CronMissionControl};
+
+    /// Park a control channel whose receiver is never polled: the channel
+    /// accepts sends until full but no supervisor ever drains or answers —
+    /// the stalled-supervisor fixture for the 10 s bound pins (WI#375 DR-5).
+    fn stalled_control(owner: &str) -> (CronMissionControl, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let parked = tokio::spawn(async move {
+            let _rx = rx;
+            std::future::pending::<()>().await;
+        });
+        (
+            CronMissionControl {
+                owner_id: owner.to_string(),
+                tx,
+            },
+            parked,
+        )
+    }
+
+    fn insert_control(manager: &ExternalWorkerManager, worker: &str, control: CronMissionControl) {
+        manager
+            .cron_controls
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(worker.to_string(), control);
+    }
+
+    /// WI#375 DR-5: a mutation the stalled supervisor never confirms within
+    /// the 10 s budget is `202 Accepted` (queued), not a misleading 504 —
+    /// pause/resume are idempotent, so the owner may re-query and retry.
+    #[tokio::test]
+    async fn stalled_supervisor_unconfirmed_mutation_is_accepted_not_timed_out() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let (registration, _parked) = stalled_control("owner-1");
+        insert_control(&manager, "mock", registration);
+        let state = TestGatewayBuilder::new()
+            .user_id("owner-1")
+            .external_worker_manager(manager)
+            .build();
+        let (status, body) = control(&state, "owner-1", "mock", CronAction::Pause)
+            .await
+            .expect("accepted"); // safety: test
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["queued"], true);
+    }
+
+    /// WI#375 DR-5: when the stalled supervisor's queue never accepts the
+    /// command inside the 10 s budget, nothing was enqueued — a plain 504.
+    #[tokio::test]
+    async fn stalled_supervisor_full_queue_is_a_plain_timeout() {
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]));
+        let (registration, _parked) = stalled_control("owner-1");
+        // Fill the bounded supervisor queue so the enqueue itself blocks.
+        for _ in 0..16 {
+            registration.tx.try_send(CronCommand::FireNow).unwrap(); // safety: test
+        }
+        insert_control(&manager, "mock", registration);
+        let state = TestGatewayBuilder::new()
+            .user_id("owner-1")
+            .external_worker_manager(manager)
+            .build();
+        let (status, message) = control(&state, "owner-1", "mock", CronAction::Pause)
+            .await
+            .expect_err("timeout"); // safety: test
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(message.contains("nothing was enqueued"));
+    }
+}
