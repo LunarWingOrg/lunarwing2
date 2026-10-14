@@ -280,10 +280,12 @@ class BunImageTieTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = pathlib.Path(temporary.name)
         self.dockerfile = self.root / "Dockerfile"
-        # Sibling fixture: the CI_NODE_IMAGE tie also runs here, so pin a
-        # matching kimi Dockerfile to keep the bun cases hermetic.
+        # Sibling fixture: the CI_NODE_IMAGE and CI_DEBIAN_SNAPSHOT ties also
+        # run here, so pin a matching kimi Dockerfile to keep the bun cases
+        # hermetic.
         self.kimi_dockerfile = self.root / "Dockerfile.kimi"
         self.kimi_dockerfile.write_text(
+            "ARG DEBIAN_SNAPSHOT=20260906T000000Z\n"
             f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS builder\n",
             encoding="utf-8",
         )
@@ -294,6 +296,7 @@ class BunImageTieTests(unittest.TestCase):
             "CI_GITLEAKS_IMAGE": f"docker.io/zricethezav/gitleaks:v8.30.1@sha256:{self.OTHER_DIGEST}",
             "CI_BUN_IMAGE": pin,
             "CI_NODE_IMAGE": f"docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST}",
+            "CI_DEBIAN_SNAPSHOT": "20260906T000000Z",
         }
         self.merged = {
             ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
@@ -364,6 +367,7 @@ class NodeImageTieTests(unittest.TestCase):
     NODE_DIGEST = "83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5"
     BUN_DIGEST = "9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895"
     OTHER_DIGEST = "0" * 64
+    SNAPSHOT = "20260906T000000Z"
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -383,6 +387,7 @@ class NodeImageTieTests(unittest.TestCase):
             "CI_GITLEAKS_IMAGE": f"docker.io/zricethezav/gitleaks:v8.30.1@sha256:{self.OTHER_DIGEST}",
             "CI_BUN_IMAGE": f"docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST}",
             "CI_NODE_IMAGE": f"docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST}",
+            "CI_DEBIAN_SNAPSHOT": self.SNAPSHOT,
         }
         self.merged = {
             ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
@@ -394,7 +399,9 @@ class NodeImageTieTests(unittest.TestCase):
         }
 
     def write_dockerfile(self, text: str) -> None:
-        self.dockerfile.write_text(text, encoding="utf-8")
+        # The CI_DEBIAN_SNAPSHOT tie also runs here; every fixture carries a
+        # matching valued ARG so only the node assertions vary.
+        self.dockerfile.write_text(f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + text, encoding="utf-8")
 
     def errors(self):
         errors = []
@@ -405,6 +412,21 @@ class NodeImageTieTests(unittest.TestCase):
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
         return errors
+
+    def test_tag_only_ci_node_image_is_caught(self):
+        # MR !1618 review GV-3: the trust-sensitive entry is the only check
+        # that rejects a tag-only CI_NODE_IMAGE — the node tie above runs
+        # only when a digest is present, so a tag silently skips it.
+        self.variables["CI_NODE_IMAGE"] = "docker.io/library/node:22-bookworm-slim"
+        self.write_dockerfile(
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n"
+        )
+        self.assertTrue(
+            any(
+                "CI_NODE_IMAGE" in error and "digest-pinned" in error
+                for error in self.errors()
+            )
+        )
 
     def test_matching_digests_pass(self):
         # The real Dockerfile has two node stages (builder + runtime).
@@ -454,6 +476,96 @@ class NodeImageTieTests(unittest.TestCase):
         self.assertTrue(any("not pinned" in error for error in self.errors()))
 
 
+class DebianSnapshotTieTests(unittest.TestCase):
+    """MR !1618 review GV-4 ties CI_DEBIAN_SNAPSHOT to the valued
+    ARG DEBIAN_SNAPSHOT in the kimi worker Dockerfile, so the worker-kimi-ts
+    lane's python3 comes from the same pinned snapshot the image builds
+    with — failing closed like the image ties."""
+
+    NODE_DIGEST = "83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5"
+    BUN_DIGEST = "9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895"
+    OTHER_DIGEST = "0" * 64
+    SNAPSHOT = "20260906T000000Z"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.dockerfile = self.root / "Dockerfile"
+        # Sibling fixture: the CI_BUN_IMAGE tie also runs here, so pin a
+        # matching opencode Dockerfile to keep the snapshot cases hermetic.
+        self.opencode_dockerfile = self.root / "Dockerfile.opencode"
+        self.opencode_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
+        self.variables = {
+            "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
+            "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
+            "CI_GITLEAKS_IMAGE": f"docker.io/zricethezav/gitleaks:v8.30.1@sha256:{self.OTHER_DIGEST}",
+            "CI_BUN_IMAGE": f"docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST}",
+            "CI_NODE_IMAGE": f"docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST}",
+            "CI_DEBIAN_SNAPSHOT": self.SNAPSHOT,
+        }
+        self.merged = {
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
+            ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
+            "rust-test-postgres-integration": {
+                "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
+            },
+        }
+
+    def write_dockerfile(self, text: str) -> None:
+        self.dockerfile.write_text(text, encoding="utf-8")
+
+    def node_from(self) -> str:
+        return f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n"
+
+    def errors(self):
+        errors = []
+        with mock.patch.multiple(
+            config,
+            OPENCODE_DOCKERFILE=self.opencode_dockerfile,
+            KIMI_DOCKERFILE=self.dockerfile,
+        ):
+            config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
+        return errors
+
+    def test_matching_snapshot_passes(self):
+        self.write_dockerfile(f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from())
+        self.assertEqual(self.errors(), [])
+
+    def test_snapshot_mismatch_is_caught(self):
+        self.write_dockerfile("ARG DEBIAN_SNAPSHOT=20261001T000000Z\n" + self.node_from())
+        self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+
+    def test_malformed_snapshot_is_caught(self):
+        self.variables["CI_DEBIAN_SNAPSHOT"] = "latest"
+        self.write_dockerfile(f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from())
+        self.assertTrue(
+            any(
+                "CI_DEBIAN_SNAPSHOT" in error and "timestamp" in error
+                for error in self.errors()
+            )
+        )
+
+    def test_missing_arg_is_caught(self):
+        self.write_dockerfile(self.node_from())
+        self.assertTrue(any("no valued ARG DEBIAN_SNAPSHOT" in error for error in self.errors()))
+
+    def test_two_stage_drift_is_caught(self):
+        # A second stage pinning a different snapshot must fail the tie even
+        # when the first valued ARG matches (same set-equality hole as GH-3).
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "ARG DEBIAN_SNAPSHOT=20261001T000000Z\n"
+            + self.node_from()
+        )
+        self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+
+
 class WorkerTsLaneTests(unittest.TestCase):
     """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
     the merge_request_event rule, the tied image variable, and the core
@@ -476,7 +588,9 @@ class WorkerTsLaneTests(unittest.TestCase):
             "worker-kimi-ts": self.lane(
                 "$CI_NODE_IMAGE",
                 [
-                    "apt-get update && apt-get install -y --no-install-recommends python3",
+                    "rm -f /etc/apt/sources.list.d/debian.sources",
+                    'printf \'%s\\n\' "deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main" > /etc/apt/sources.list',
+                    "apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends python3",
                     "cd kimicode4lunarwing/scripts",
                     "npm ci --ignore-scripts",
                     "npx tsc -p tsconfig.json",
@@ -517,6 +631,39 @@ class WorkerTsLaneTests(unittest.TestCase):
         merged["worker-kimi-ts"]["rules"] = [{"when": "never"}]
         self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
 
+    def test_mr_rule_when_never_is_caught(self):
+        # MR !1618 review GV-1: the MR rule exists but disables the lane.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["when"] = "never"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_mr_rule_when_manual_is_caught(self):
+        # GV-1: a manual MR rule runs the lane only on demand — it cannot gate.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["when"] = "manual"
+        merged["worker-kimi-ts"]["rules"][0]["allow_failure"] = False
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_job_level_allow_failure_is_caught(self):
+        # GV-1: an allowed-to-fail lane runs on MRs but cannot gate.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["allow_failure"] = True
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_shadowing_unconditional_never_is_caught(self):
+        # GV-1: first match wins — an unconditional rule before the MR rule
+        # shadows it, so the lane never runs on MRs.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"].insert(0, {"when": "never"})
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_main_runs_the_lane_validator(self):
+        # MR !1618 review GV-2: every unit test above calls the validator
+        # directly, so deleting the main() call passed the whole suite.
+        with mock.patch.object(config, "validate_worker_ts_lanes") as lane_check:
+            config.main()
+        lane_check.assert_called_once()
+
     def test_wrong_image_variable_is_caught(self):
         merged = self.merged()
         merged["worker-kimi-ts"]["image"]["name"] = "$CI_BUN_IMAGE"
@@ -530,6 +677,17 @@ class WorkerTsLaneTests(unittest.TestCase):
             if "python3" not in command
         ]
         self.assertTrue(any("python3" in error for error in self.errors(merged)))
+
+    def test_missing_snapshot_provisioning_is_caught(self):
+        # MR !1618 review GV-4: reverting the lane's python3 source to the
+        # live deb.debian.org mirror must fail the fragment check.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command
+            for command in merged["worker-kimi-ts"]["script"]
+            if "snapshot.debian.org" not in command
+        ]
+        self.assertTrue(any("snapshot.debian.org" in error for error in self.errors(merged)))
 
     def test_missing_npm_test_fragment_is_caught(self):
         merged = self.merged()

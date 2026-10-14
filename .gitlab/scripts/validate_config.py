@@ -457,20 +457,57 @@ def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
             errors.append(f"check-satellite-advisories.sh lost its {fragment} guard")
 
 
+def lane_runs_on_merge_requests(job: object) -> bool:
+    """First-match-wins rules walk for the MR pipeline case (MR !1618 GV-1).
+
+    GitLab evaluates rules in order and the first match decides; a matching
+    rule's `when` decides the outcome. So merely containing an
+    `if: merge_request_event` rule is not proof the lane runs on MRs: the MR
+    rule can carry `when: never`/`when: manual`, the job can set
+    `allow_failure: true` (the lane runs but cannot gate), or an
+    unconditional rule placed before the MR rule shadows it. Walk the rules
+    in order: the MR rule must be the first deciding rule, must not disable
+    or manual the lane, and must not allow failure.
+    """
+    if not isinstance(job, dict):
+        return False
+    if job.get("allow_failure"):
+        return False
+    rules = job.get("rules")
+    if not isinstance(rules, list):
+        return False
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        condition = str(rule.get("if", ""))
+        if "merge_request_event" in condition:
+            if rule.get("when") not in (None, "on_success", "always"):
+                return False
+            return not rule.get("allow_failure")
+        if not any(rule.get(key) for key in ("if", "changes", "exists")):
+            # An unconditional rule shadows every rule below it.
+            return False
+    return False
+
+
 def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
     """Both worker TS lanes must exist and keep their MR-pipeline wiring.
 
     MR !1601 review GH-2: neither TS lane was pinned by the validator, so
     deleting the whole block or replacing its rules with `when: never`
     passed every gate silently — exactly the regression class GB-2 was
-    about. Require each lane to exist, to run on merge_request_event, to use
-    its digest-tied image variable, and to keep its core script fragments
-    (including the kimi lane's python3 provisioning, GH-1).
+    about. Require each lane to exist, to run on merge_request_event (per
+    the GV-1 first-match rules walk), to use its digest-tied image variable,
+    and to keep its core script fragments (including the kimi lane's
+    python3 provisioning, GH-1, from the pinned Debian snapshot, GV-4).
+    Accepted limit: the fragment check guards against accidental deletion,
+    not an adversarial edit — a `true ||` prefix would still pass it.
     """
     expected = {
         "worker-kimi-ts": (
             "$CI_NODE_IMAGE",
             (
+                "snapshot.debian.org",
                 "apt-get install -y --no-install-recommends python3",
                 "cd kimicode4lunarwing/scripts",
                 "npm ci --ignore-scripts",
@@ -494,7 +531,7 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
             continue
         if image_name(job.get("image")) != image_variable:
             errors.append(f"{job_name} must use the {image_variable} image")
-        if not any("merge_request_event" in condition for condition in rule_conditions(job)):
+        if not lane_runs_on_merge_requests(job):
             errors.append(f"{job_name} must run on merge_request_event")
         script = job.get("script", [])
         commands = "\n".join(script if isinstance(script, list) else [str(script)])
@@ -950,6 +987,37 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                     "CI_NODE_IMAGE digest must match the node digest(s) in "
                     "kimicode4lunarwing/Dockerfile"
                 )
+
+    # The worker-kimi-ts lane installs its python3 apt prerequisite inside
+    # the bare node image; it must come from the same pinned Debian snapshot
+    # the image builds with, not the live deb.debian.org mirror (MR !1618
+    # review GV-4). Fail closed like the image ties: a missing/malformed
+    # variable, a missing Dockerfile, or a missing/divergent valued
+    # ARG DEBIAN_SNAPSHOT must not silently dissolve the tie.
+    snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
+    if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
+        errors.append(
+            "defaults.yml CI_DEBIAN_SNAPSHOT must be a snapshot timestamp "
+            f"(YYYYMMDDTHHMMSSZ), got {snapshot!r}"
+        )
+    elif not KIMI_DOCKERFILE.is_file():
+        errors.append(
+            "kimicode4lunarwing/Dockerfile missing; cannot cross-check "
+            "CI_DEBIAN_SNAPSHOT against its ARG DEBIAN_SNAPSHOT"
+        )
+    else:
+        dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
+        snapshot_args = re.findall(r"(?m)^ARG\s+DEBIAN_SNAPSHOT=(\S+)$", dockerfile_text)
+        if not snapshot_args:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile has no valued ARG DEBIAN_SNAPSHOT; "
+                "cannot cross-check CI_DEBIAN_SNAPSHOT"
+            )
+        elif set(snapshot_args) != {snapshot}:
+            errors.append(
+                "CI_DEBIAN_SNAPSHOT must match the ARG DEBIAN_SNAPSHOT value(s) in "
+                "kimicode4lunarwing/Dockerfile"
+            )
 
     literal_images = {
         ".worker-candidate": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51",

@@ -90,7 +90,10 @@ worker-opencode-ts:
 # node:22-bookworm-slim image has no python3, so the lane first installs the
 # builder stage's python3 apt prerequisite (Dockerfile: the entrypoint config
 # tests run the entrypoint with bash and it embeds python3 heredocs; without
-# it five entrypoint tests fail with exit 127 — MR !1601 review GH-1). The
+# it five entrypoint tests fail with exit 127 — MR !1601 review GH-1) from
+# the same pinned Debian snapshot the image builds with (CI_DEBIAN_SNAPSHOT,
+# tied to the Dockerfile ARG by validate_config.py — MR !1618 review GV-4),
+# not the live deb.debian.org mirror. The
 # real-CLI contract lane (kimi_cli_contract_test) self-skips here — no kimi
 # binary — and the protected image build remains the only place it executes
 # against the real CLI.
@@ -111,7 +114,12 @@ worker-kimi-ts:
     # Builder-stage prerequisite (kimicode4lunarwing/Dockerfile): the
     # entrypoint_config_test.js cases bash-run entrypoint.sh, whose config
     # section embeds python3 heredocs; the bare node image lacks python3.
-    - apt-get update && apt-get install -y --no-install-recommends python3
+    # Install it from the pinned CI_DEBIAN_SNAPSHOT archive (tied to the
+    # Dockerfile ARG DEBIAN_SNAPSHOT), mirroring the builder stage's apt
+    # source setup — not from the live deb.debian.org mirror (GV-4).
+    - rm -f /etc/apt/sources.list.d/debian.sources
+    - printf '%s\n' "deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main" "deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main" "deb http://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main" > /etc/apt/sources.list
+    - apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends python3
     - cd kimicode4lunarwing/scripts
     - npm ci --ignore-scripts
     - npx tsc -p tsconfig.json
