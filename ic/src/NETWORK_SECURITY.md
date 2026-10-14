@@ -400,7 +400,17 @@ Forwarding failures (502) never echo the outbound request URL in the body or
 the host-side log: injected query-param credentials live in that URL, so
 reqwest errors are stripped with `without_url()` before either use (WI#395).
 The same rule applies to WASM-tool send errors and to http-tool log lines,
-which log the URL without query and fragment.
+which log the URL without query, fragment, or userinfo (the http tool's
+redirect-hop debug lines included).
+
+Forwarded response headers are also scrubbed: an upstream can echo the
+injected credential back to the container (an always-HTTPS edge answering a
+plain-HTTP request with `301 Location: https://host/path?name=<form-encoded
+secret>`), so every spelling of the injected credential — raw and
+form-encoded — is replaced with `[REDACTED]` in header values before they
+reach the container, with a host-side warn naming the header only (WI#395).
+Response *bodies* that echo the request URL (e.g. error pages) are not
+scrubbed; that residual is tracked on WI#395.
 
 ### Bind Address
 
@@ -442,7 +452,7 @@ For plain HTTP requests to allowed hosts, the proxy can inject credentials:
 - Credentials are resolved at request time from the encrypted secrets store
 - Credentials never enter the container's environment or filesystem
 
-**Reference:** `src/sandbox/proxy/http.rs` — credential injection block in `handle_request()`
+**Reference:** `src/sandbox/proxy/http.rs` — credential injection block in `forward_request()`
 
 ### Hop-by-Hop Header Filtering
 
