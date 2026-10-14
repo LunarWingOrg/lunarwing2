@@ -18,6 +18,14 @@ at workspace version 2.1.5); no transfer limits or protocol behavior
 changed (re-verified: `MAX_OOB_ATTACHMENTS` 10,
 `MAX_CONCURRENT_OOB_DOWNLOADS` 4, `OOB_MAX_FILE_SIZE` 20 MB,
 `OOB_DNS_TIMEOUT_SECS` 5, `OOB_EXTRACTION_TIMEOUT_SECS` 60,
+`MAX_SEND_BODY_BYTES` 70 MiB send-route-only). The 2.1.6.0 release bumped
+the xmpp-bridge crate to 2.1.6 and the xmpp channel registry version to
+0.1.18 (crate now at workspace version 2.1.6; the WI#331 re-resolve and
+item-1 lock refreshes touched manifests/lockfiles only — no channel,
+daemon-xmpp, or bridge source change); no transfer limits or protocol
+behavior changed (re-verified 2026-10-14: `MAX_OOB_ATTACHMENTS` 10,
+`MAX_CONCURRENT_OOB_DOWNLOADS` 4, `OOB_MAX_FILE_SIZE` 20 MB,
+`OOB_DNS_TIMEOUT_SECS` 5, `OOB_EXTRACTION_TIMEOUT_SECS` 60,
 `MAX_SEND_BODY_BYTES` 70 MiB send-route-only).
 
 ## Overview
