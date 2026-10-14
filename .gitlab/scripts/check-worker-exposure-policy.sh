@@ -65,6 +65,18 @@ while IFS= read -r _raw || [[ -n "$_raw" ]]; do
     if ! ( export LC_ALL=C; [[ "${_line:0:1}" == [[:print:]] ]] ); then
         fail "Dockerfile line does not start with printable ASCII (run-106 GJ-1): ${_raw}"
     fi
+    # Run-106 GJ-2: BuildKit does not continue a line ending in an escaped
+    # escape token (two backslashes — its lineContinuationRegex requires a
+    # single trailing token), while this script joins any backslash-final
+    # line and buildah/podman joins this one too. A LABEL ending in two
+    # backslashes would therefore hide the next instruction (e.g. a
+    # post-assert root RUN) from the continuation joining. Refuse the
+    # spelling outright; trailing whitespace after a single backslash stays
+    # over-refused today, which is the safe direction.
+    _trimmed="${_line%"${_line##*[![:space:]]}"}"
+    if [[ "$_trimmed" == *\\\\ ]]; then
+        fail "Dockerfile line ends in an escaped backslash (\\\\) — not a continuation for BuildKit (run-106 GJ-2): ${_raw}"
+    fi
     if [[ "$_line" == *\\ ]]; then
         _part="${_line%\\}"
         _join+="${_part%"${_part##*[![:space:]]}"} "

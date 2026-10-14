@@ -498,6 +498,29 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 self.assertIn("printable ASCII", result.stderr)
         dockerfile.write_text(original, encoding="utf-8")
 
+    def test_dockerfile_escaped_trailing_backslash_fails(self):
+        # Run-106 GJ-2: BuildKit does not continue a line ending in two
+        # backslashes (an escaped escape token), but the guard joined any
+        # backslash-final line — so `LABEL hidden=yes \\` followed by a
+        # post-assert root RUN looked like one harmless LABEL here while
+        # BuildKit executed the RUN (buildah/podman joins the line, so the
+        # guard matched local podman builds but not the CI builder).
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for name, tail in {
+            "two-backslashes": "LABEL hidden=yes \\\\\nRUN chown -R opencode2:opencode2 /app\n",
+            "trailing-space": "LABEL hidden=yes \\\\ \nRUN chown -R opencode2:opencode2 /app\n",
+        }.items():
+            with self.subTest(name=name):
+                dockerfile.write_text(
+                    original.replace(FILESYSTEM_ASSERTION, FILESYSTEM_ASSERTION + tail),
+                    encoding="utf-8",
+                )
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("escaped backslash", result.stderr)
+        dockerfile.write_text(original, encoding="utf-8")
+
     def test_executor_missing_deny_fails(self):
         executor = self.root / "opencode2.4lunarwing" / "scripts" / "opencode_task_executor.ts"
         executor.write_text(
