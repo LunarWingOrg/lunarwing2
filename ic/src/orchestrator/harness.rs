@@ -1045,6 +1045,16 @@ fn push_mapped(folded: &mut String, map: &mut Vec<usize>, orig_idx: usize, ch: c
     folded.push(ch);
 }
 
+// Test-only probe for the EE-1 needle-length guard in
+// `SecretValueRedactor::scrub_folded`: bumped immediately before every
+// `find` call so a test can prove the guard skipped the searcher setup
+// entirely (a behavioral assertion on the output cannot — the guarded and
+// unguarded paths produce identical text).
+#[cfg(test)]
+thread_local! {
+    static FOLDED_FIND_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl SecretValueRedactor {
     pub fn new(values: &[SecretString]) -> Self {
         use secrecy::ExposeSecret;
@@ -1159,6 +1169,8 @@ impl SecretValueRedactor {
                 if needle.len() > folded.text.len().saturating_sub(from) {
                     break;
                 }
+                #[cfg(test)]
+                FOLDED_FIND_CALLS.with(|c| c.set(c.get() + 1));
                 let Some(pos) = folded.text[from..].find(needle) else {
                     break;
                 };
@@ -2521,11 +2533,17 @@ mod tests {
             let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
             // Offset 0 with a suffix (`base64 -w64` of S+":"), and the value
             // embedded at byte offsets 1 and 2 inside a larger encoded blob.
+            // The offset-1/2 blobs carry a trailing byte (`Z`) so the blob's
+            // final quantum mixes suffix bytes and only the stream-stable
+            // CORE of raw[2..]/raw[1..] can match — without it the padded
+            // full encoding matches even when the core was deduplicated out
+            // of the fold list (the old EE-3 shape), and the test passes
+            // vacuously for those cells.
             let blobs = [
                 base64::engine::general_purpose::STANDARD.encode(format!("{value}:")),
                 base64::engine::general_purpose::URL_SAFE.encode(format!("{value}ZZ")),
-                base64::engine::general_purpose::STANDARD.encode(format!("x{value}")),
-                base64::engine::general_purpose::STANDARD.encode(format!("xy{value}")),
+                base64::engine::general_purpose::STANDARD.encode(format!("x{value}Z")),
+                base64::engine::general_purpose::STANDARD.encode(format!("xy{value}Z")),
             ];
             for blob in blobs {
                 let wrapped = blob
@@ -2578,12 +2596,29 @@ mod tests {
     fn redactor_folded_path_skips_oversized_needles() {
         // EE-1: a folded variant longer than the text can never match; the
         // length guard must leave such text untouched while skipping the
-        // searcher setup whose cost grows with the variant length.
+        // searcher setup whose cost grows with the variant length. The
+        // FOLDED_FIND_CALLS probe pins the skip itself: with the guard
+        // removed the output is unchanged, so only the counter can fail.
+        FOLDED_FIND_CALLS.with(|c| c.set(0));
         let value = "V".repeat(MAX_SECRET_BYTES);
         let redactor = SecretValueRedactor::new([SecretString::from(value)].as_slice());
         let text = "tiny leaf with a newline\nand a backslash \\ inside";
         assert_eq!(redactor.scrub(text), text);
         assert!(!redactor.contains_secret(text));
+        FOLDED_FIND_CALLS.with(|c| {
+            assert_eq!(
+                c.get(),
+                0,
+                "every folded variant is longer than the text, so find must never run"
+            )
+        });
+        // Positive control, so the probe itself cannot pass vacuously: a
+        // folded variant shorter than the text DOES reach the find.
+        let redactor = SecretValueRedactor::new(
+            [SecretString::from("control-value-long-enough".to_string())].as_slice(),
+        );
+        let _ = redactor.scrub("newline\nto force the folded path");
+        FOLDED_FIND_CALLS.with(|c| assert!(c.get() > 0, "probe must count real finds"));
     }
 
     #[test]
@@ -2611,6 +2646,39 @@ mod tests {
             let scrubbed = redactor.scrub(&serialized);
             let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
             assert_eq!(cleaned["output"], "[redacted-secret]");
+        }
+    }
+
+    #[test]
+    fn redactor_contains_secret_folds_compact_json_escapes() {
+        // CW-10 promotion scanning relies on `contains_secret` catching
+        // encoded variants. The fixture is 45 bytes, so its base64 is one
+        // 60-char line: too short for direct wrap pieces (armed only past 76
+        // columns), meaning ONLY the folded path can match once the encoding
+        // is wrapped at 32 columns inside compact JSON. Kills two surviving
+        // mutations at once: dropping the backslash byte from the fast-path
+        // check (compact JSON has no real line breaks to trigger folding),
+        // and not folding the escaped `\r` pair (the CRLF case).
+        use base64::Engine;
+        let value = "harness-fixture-short-enough-for-one-b64-line";
+        assert_eq!(value.len(), 45);
+        let redactor = SecretValueRedactor::new([SecretString::from(value.to_string())].as_slice());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(value);
+        assert_eq!(b64.len(), 60);
+        for separator in ["\n", "\r\n"] {
+            let wrapped = b64
+                .as_bytes()
+                .chunks(32)
+                .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
+                .collect::<Vec<_>>()
+                .join(separator);
+            let serialized =
+                serde_json::to_string(&serde_json::json!({ "output": wrapped })).unwrap(); // safety: test
+            assert!(!serialized.contains('\n'));
+            assert!(
+                redactor.contains_secret(&serialized),
+                "wrapped base64 inside compact JSON must be detected ({separator:?} separator)"
+            );
         }
     }
 

@@ -712,7 +712,9 @@ mod test_rig_tests {
 
         rig.send_message("Hello test rig").await;
 
-        let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
+        // Generous completion wait: this drives a full agent loop over a real
+        // libSQL store, which needs more than 10s on low-end CI runners.
+        let responses = rig.wait_for_responses(1, Duration::from_secs(60)).await;
 
         assert!(
             !responses.is_empty(),

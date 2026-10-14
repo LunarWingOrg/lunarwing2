@@ -656,18 +656,34 @@ mod tests {
                 .output()
                 .expect("re-exec test binary");
             let text = String::from_utf8_lossy(&out.stdout);
+            let stderr_text = String::from_utf8_lossy(&out.stderr);
             assert!(
                 out.status.success(),
-                "child phase failed:\nstdout: {text}\nstderr: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "child phase failed:\nstdout: {text}\nstderr: {stderr_text}"
             );
             // FY-3: a drifted TEST_PATH makes the child run zero tests and
             // libtest still exits 0 — require the child's own result line so
             // this pin cannot pass vacuously.
             assert!(
                 text.contains("test result: ok. 1 passed"),
-                "child phase ran no tests (drifted TEST_PATH?):\nstdout: {text}\nstderr: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "child phase ran no tests (drifted TEST_PATH?):\nstdout: {text}\nstderr: {stderr_text}"
+            );
+            // GF-1: the child phase runs the real spawn_pebble with a forged
+            // task-supplied AGENT_AUTH_TOKEN, so the FY-5 drop warning must
+            // have been logged (task id, never the value) — the child runs
+            // with --nocapture, so its eprintln lands in the captured stderr.
+            assert!(
+                stderr_text.contains("dropped task-supplied env entry AGENT_AUTH_TOKEN"),
+                "child phase never logged the FY-5 drop warning:\nstdout: {text}\nstderr: {stderr_text}"
+            );
+            assert!(
+                stderr_text.contains("[exec] task-1:"),
+                "drop warning must name the task id:\nstderr: {stderr_text}"
+            );
+            let captured = format!("{text}{stderr_text}");
+            assert!(
+                !captured.contains("forged-by-task") && !captured.contains("bridge-secret-64hex"),
+                "a credential value appeared in the captured output:\nstdout: {text}\nstderr: {stderr_text}"
             );
             return;
         }

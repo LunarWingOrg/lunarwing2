@@ -68,16 +68,22 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   individual wrap lines at the canonical widths are armed as well (a tool
   returning one line at a time); larger secrets rely on whole-blob fold
   matching so the variant count stays bounded.
-  - Size limit, stated plainly (EE-2): above the 4096-char encoding cap —
-    base64 of raw values over ~3 KiB, hex over ~2 KiB, and a 4096-byte RSA
-    PEM's base64 is already past it — ONLY the whole contiguous encoding is
-    matched. A partial or truncated print of such an encoding (`base64
-    secret | head -5`, or the 64 KiB shell-capture cut on a ≥48 KiB secret)
-    leaks almost everything printed; measured with real CLI output: 285
-    bytes for a 5-line head of a >3 KiB secret, 48,513 bytes for base64 of
-    a 48-64 KiB secret, 32,231 bytes for `xxd -p` of a ≥32 KiB secret.
-    Restoring partial coverage for large encodings needs aligned-chunk
-    variants in a per-job automaton — tracked in WI#383.
+  - Size limit, stated plainly (EE-2): partial coverage of a truncated
+    print exists ONLY at the canonical wrap widths — 76-column base64 and
+    60-column hex, whose individual lines are the ones armed — and only up
+    to the 4096-char encoding cap (base64 of raw values over ~3 KiB, hex
+    over ~2 KiB; a 4096-byte RSA PEM's base64 is already past it). At any
+    other width (`base64 -w64`, `openssl base64`, hex at 48) even a
+    below-cap `| head -5` leaks everything printed (measured: 320 of 320
+    chars for raw 500-3072 B). Above the cap only the whole contiguous
+    encoding is matched at all, so a partial or truncated print of such an
+    encoding (`base64 secret | head -5`, or the 64 KiB shell-capture cut
+    on a ≥48 KiB secret) leaks almost everything printed; measured with
+    real CLI output: 285 bytes for a 5-line head of a >3 KiB secret,
+    48,513 bytes for base64 of a 48-64 KiB secret, 32,231 bytes for
+    `xxd -p` of a ≥32 KiB secret. Restoring partial coverage for large
+    encodings needs aligned-chunk variants in a per-job automaton —
+    tracked in WI#383.
   Variants are sorted longest-first across all mounted values. JSON object
   keys are also scrubbed. The daemon re-scrubs event ingest and `/complete` before
   persistence and broadcast, using a redactor built **once per job and
@@ -89,14 +95,22 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     `rev`-style reorderings. Fold matching can over-redact when unrelated
     base64/hex-looking text spans a folded line break (safe direction).
     Line-prefixed views defeat folding (EE-7): `read_file`'s `NNNNNN│ `
-    gutters and `cat -n` break the folded stream at every line, so wrapped
-    encodings of 57-4096-byte secrets leak in that presentation. The raw
-    value itself is matched only directly, never fold-matched (EE-8):
-    `fold -w N` of an unencoded token leaks from 16 bytes up to fully. Two
-    mounted values sharing a substring: the folded sweep merges overlapping
-    matches, but the direct pass replaces sequentially — in fold-free text
-    the non-overlapping tail of the second value can survive when only the
-    overlapping form is printed (EE-9 residual, WI#383).
+    gutters and `cat -n` break the folded stream at every line, so a
+    wrapped encoding in that presentation can only be caught by the armed
+    per-line pieces — which exist solely at the canonical widths and only
+    up to the 4096-char cap. At the canonical 76-column base64 / 60-column
+    hex that covers secrets up to 3072 / 2048 raw bytes and leaks above;
+    at any other width (`openssl base64` at 64, `base64 -w 32`) the whole
+    encoding leaks for every secret from about 56 bytes up, with no upper
+    bound. The raw value itself is matched only directly, never
+    fold-matched (EE-8): `fold -w N` of an unencoded token leaks from 16
+    bytes up to fully. Two mounted values sharing a substring: on the
+    folding slow path the sweep merges overlapping matches, but both
+    fold-free passes — the `scrub_folded` fast path (encoded forms) and
+    the direct pass (raw values) — still replace sequentially, so in
+    fold-free text the non-overlapping tail of the second value can
+    survive when only the overlapping form is printed (EE-9 residual,
+    WI#383).
   - Tools can truncate **before** this boundary: shell capture is capped at
     64 KiB and then reduced to a 32 KiB head/tail result. Fragments at those
     internal cuts may survive. The partial-prefix check only protects the
@@ -163,8 +177,8 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   is persisted, broadcast, and reflected in the parent's context BEFORE
   promotion lands (EE-5): the parent agent is told the job finished while
   promotion may still be running, and the promotion outcome reaches the
-  record only as the `harness_write_back` audit event — it is never
-  delivered to the parent.
+  record only as the `harness_write_back` audit event — never pushed to
+  the parent, which can still pull it with the `job_events` tool.
   Stop and the exit watcher claim a terminal result under the same write
   lock used by completion; cleanup checks and removes atomically (EA-3):
   - **Allowlist is operator-fixed to `projects/**`** (CW-1). Callers may

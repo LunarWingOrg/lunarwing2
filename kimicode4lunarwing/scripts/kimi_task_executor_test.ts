@@ -266,17 +266,42 @@ test("executeTask: hub-handshake token never reaches the task env (WI#373)", asy
   // process.env (server-role bridge requires it) and must not be inherited.
   const prev = process.env.AGENT_AUTH_TOKEN
   process.env.AGENT_AUTH_TOKEN = "bridge-secret-64hex"
+  // GF-1: the FY-5 drop must be logged (key and task id, never the value),
+  // so capture console.warn for the duration of the run.
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "))
+  }
   try {
     const { result } = await runExecutor(request, bin)
     assert.ok(result, "result was not emitted")
     assert.equal(result!.status, "success")
     assert.equal(result!.output, "token=<unset>")
   } finally {
+    console.warn = originalWarn
     if (prev === undefined) delete process.env.AGENT_AUTH_TOKEN
     else process.env.AGENT_AUTH_TOKEN = prev
   }
   // The bridge's own credential is untouched by the task run.
   assert.equal(process.env.AGENT_AUTH_TOKEN, prev)
+  const dropWarnings = warnings.filter((w) => w.includes("dropped task-supplied env entry"))
+  assert.equal(
+    dropWarnings.length,
+    1,
+    `expected exactly one FY-5 drop warning, got ${JSON.stringify(warnings)}`,
+  )
+  assert.ok(
+    dropWarnings[0]!.includes("AGENT_AUTH_TOKEN"),
+    `drop warning must name the dropped key: ${dropWarnings[0]}`,
+  )
+  assert.ok(
+    dropWarnings[0]!.includes("auth-token-env-test"),
+    `drop warning must name the task id: ${dropWarnings[0]}`,
+  )
+  const logged = warnings.join("\n")
+  assert.ok(!logged.includes("forged-by-task"), "the forged credential value must never be logged")
+  assert.ok(!logged.includes("bridge-secret-64hex"), "the bridge credential value must never be logged")
 })
 
 test("executeTask: pre-aborted signal returns cancelled without spawning", async () => {

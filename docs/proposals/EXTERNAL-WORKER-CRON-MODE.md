@@ -1,9 +1,28 @@
 # External Worker Cron Mode (WI#325)
 
 Status: implemented in v2.1.6.0; revised after the MR !1509 (CU-1..CU-10),
-!1522 (DE-1..DE-10), and !1531 (DN/DO) reviews. WI#325 remains open:
-audio capture and its proposed scope-out still require the WI owner's decision.
+!1522 (DE-1..DE-10), and !1531 (DN/DO) reviews. WI#325 was closed out
+2026-10-13 under the owner's general
+[close-out instruction (#8039)](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325#note_8039).
+Audio capture was scoped out by the implementer in the
+[close-out note (#8451)](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325#note_8451);
+cmc's [question (#7755)](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325#note_7755)
+was answered there, and the scope-out remains open to the owner's decision.
+No audio path exists in external workers today; ask 4's text logs use
+`job_events` + workspace state files, with the log-only cases documented below.
+Residual review nits stay tracked by WI#375 (child of #325), plus WI#370/WI#371.
 Work item: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/325
+
+- **Dependency disposition (GG-2):** the merged WI#324 hub/Kimi proxy supplies
+  cron ticks with the proxied tool path under `cron.tool_allowlist`, covered by
+  `cron_tick_tool_calls_use_cron_allowlist_not_worker_allowlist`; WI#324 remains
+  open/partial pending AC1 real-worker memory round-trip evidence and AC2 real
+  `knowledge_search` hits. Hub-mediated KV + advisory locks remain deferred to
+  WI#324 phase 2; true multi-threaded mission coordination is not implemented.
+  The long/infinite-deadline dependency is met by `cron.tick_timeout_ms`
+  (1s..4h, default 4h) replacing the ordinary worker deadline for each link,
+  while the supervised mission has no deadline across scheduled ticks and
+  re-entries; each link still has its timeout and heartbeat watchdog.
 
 ## Problem
 
@@ -316,8 +335,10 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
   lifecycle machine — it is never an engine `Mission` at all.
 - [~] Session audio/log capture — text session logs are covered by
   `job_events` + workspace state files; **audio capture is not implemented**
-   (no audio path exists in external workers today). Deferring it needs the
-   WI owner's acceptance; this branch does not claim that acceptance.
+  (no audio path exists in external workers today). It was scoped out by the
+  implementer in close-out note #8451 under the owner's general instruction
+  #8039; question #7755 was answered there, and the scope-out remains open to
+  the owner's decision.
 
 ## Owner recovery API (MR !1531 DN-3)
 
@@ -416,7 +437,10 @@ curl --fail -H "Authorization: Bearer $GATEWAY_AUTH_TOKEN" \
 - Migrating existing engine missions wholesale (additive; see WI#324 for the
   proxied tool path that lets workers call `memory_*`/`knowledge_*`).
 - Hub-mediated cross-thread coordination (KV + advisory locks) — WI#324 phase 2.
-- Audio session capture (no audio path exists in external workers today).
+- Audio session capture (no audio path exists in external workers today);
+  scoped out by the implementer in close-out note #8451 under the owner's
+  general instruction #8039; question #7755 was answered there, and the
+  scope-out remains open to the owner's decision.
 - Per-tick credential grants: `create_job` can inject named tenant secrets
   per job; tick jobs currently dispatch with an empty environment and
   `credential_grants_json = "[]"`. Follow-up if missions need tenant secrets.
