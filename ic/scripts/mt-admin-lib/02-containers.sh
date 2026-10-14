@@ -421,25 +421,24 @@ write_tenant_vision_env() {
   local vl_url
   vl_url="${LUNARWING_MT_VL_URL:-$DEFAULT_VL_URL}"
   mkdir -p "$env_dir"
-  (
-    umask 077
-    if [[ -n "$vl_url" ]]; then
-      cat >"$env_path" <<ENVEOF
+  # WI#390: write as the tenant through the atomic writer — root never opens
+  # vision.env inside the tenant-writable env dir, so a pre-placed or raced
+  # symlink there cannot redirect the write onto an attacker-chosen path.
+  if [[ -n "$vl_url" ]]; then
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600
 LUNARWING_AUTH_TOKEN=$token
 OCR_PORT=$VISION_SIDECAR_INTERNAL_PORT
 OCR_HEALTH_PORT=$VISION_SIDECAR_HEALTH_PORT
 VL_URL=$vl_url
 VL_MODEL=qwen3-vl
 ENVEOF
-    else
-      cat >"$env_path" <<ENVEOF
+  else
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600
 LUNARWING_AUTH_TOKEN=$token
 OCR_PORT=$VISION_SIDECAR_INTERNAL_PORT
 OCR_HEALTH_PORT=$VISION_SIDECAR_HEALTH_PORT
 ENVEOF
-    fi
-  )
-  chown "$name:$name" "$env_path"
+  fi
   printf '%s' "$token"
 }
 
@@ -453,10 +452,15 @@ write_tenant_voice_env() {
   env_dir="$(tenant_env_dir "$name")"
   env_path="$env_dir/voice.env"
   mkdir -p "$env_dir"
-  if [[ ! -e "$env_path" ]]; then
-    (umask 077; : >"$env_path")
-  elif [[ ! -f "$env_path" || -L "$env_path" ]]; then
-    die "unsafe LunarVoice environment file: $env_path"
+  # WI#390: create as the tenant through the atomic writer; a raced or
+  # pre-placed symlink (including a dangling one, which -e alone misses) can no
+  # longer make root truncate or create an attacker-chosen path.
+  if [[ -e "$env_path" || -L "$env_path" ]]; then
+    [[ -f "$env_path" && ! -L "$env_path" ]] \
+      || die "unsafe LunarVoice environment file: $env_path"
+  else
+    write_tenant_file_atomic "$name" "$env_path" 600 </dev/null \
+      || die "could not create LunarVoice environment file: $env_path"
   fi
 
   token="$(_env_existing "$env_path" VOICE_AUTH_TOKEN)"
@@ -496,8 +500,10 @@ write_tenant_voice_env() {
     value="${setting#*|}"
     _voice_env_set_default "$env_path" "$key" "$value"
   done
-  chmod 0600 "$env_path"
-  chown "$name:$name" "$env_path"
+  # WI#390: no trailing root chmod/chown — every _env_set commit above already
+  # lands voice.env tenant-owned at mode 600 through the tenant-side atomic
+  # writer, and root chmod/chown on the tenant path would follow a symlink
+  # swapped into place.
   printf '%s' "$token"
 }
 
