@@ -233,11 +233,13 @@ rolling slot, overwritten on each replace; daily logs additionally retain up
 to eight earlier generations — before the slot is overwritten, its content
 rolls aside to the first free `backups/daily/<date>.md.bak.<n>`, and a
 successful roll-aside emits its own audit line naming the numbered slot and
-the rolled byte count (WI#336). At the cap
-the first generation of the day stays pinned and the second-oldest
+the rolled byte count (WI#336). At the cap the
+first generation of the day stays pinned and the second-oldest
 generation is discarded instead, with an audit line carrying its byte count
-and blake3 fingerprint — emitted before the destructive shift begins, so a
-mid-shift failure still records what was lost (WI#336). The pin is
+and blake3 fingerprint — emitted before the destructive shift begins, so the
+line records the generation marked for discard even when the shift then
+fails (a failure before the first slot write leaves it intact) (WI#336).
+The pin is
 positional, not evidential (WI#335): `.1` holds the content that preceded
 the day's first *backed-up* replace in that scope — the first backup is
 taken only when the prior content is non-empty and differs, and layer writes
@@ -260,7 +262,10 @@ silently discard a recent version without the fingerprinted audit line, and
 retained storage stays bounded. A replace retried after a crash between the
 backup and the replace commit grows no duplicate generation. On operator
 lanes backup and rotation failures are logged and never block the write
-itself. The fail-closed agent lanes are the exception, and not only at the
+itself; a failed daily-log rotation additionally fingerprints (byte count +
+blake3) the un-rotated rolling-slot content before the overwrite destroys
+it (WI#336 GP-1). The fail-closed agent lanes are the exception, and not
+only at the
 cap: with the guard armed, *any* rotation or `.bak`-write failure aborts the
 replace, because proceeding would overwrite the rolling slot — exactly where
 the poison sits right after it lands — without a proven backup (the cap

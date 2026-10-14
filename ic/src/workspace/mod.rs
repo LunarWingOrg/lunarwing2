@@ -5311,7 +5311,10 @@ mod runtime_index_tests {
     /// WI#336 AB-2: the discard audit line is emitted before the destructive
     /// shift, so a mid-shift storage failure cannot erase the forensic
     /// record of what was lost (previously the line came after the shift
-    /// loop and a mid-loop error returned without it).
+    /// loop and a mid-loop error returned without it). The post-state pins
+    /// the exact failure point (run-107 GP-3): the trigger fires on the `.4`
+    /// write after `.2` and `.3` are already shifted, so `.4` keeps its old
+    /// content and now duplicates `.3`.
     #[test]
     fn daily_log_discard_audit_line_precedes_a_failing_shift() {
         let captured = capture_safety_lines(|| async {
@@ -5327,6 +5330,7 @@ mod runtime_index_tests {
                 std::sync::Arc::clone(&backend) as Arc<dyn Database>,
             );
             let day = "daily/2026-10-08.md";
+            let backup_path = "backups/daily/2026-10-08.md.bak";
             // v0 plus replaces v1..=v(cap+1) saturate every numbered
             // generation without ever taking the discard branch.
             for version in 0..=(MAX_DAILY_LOG_BACKUP_GENERATIONS + 1) {
@@ -5356,9 +5360,31 @@ mod runtime_index_tests {
                 workspace.read(day).await.expect("day log").content,
                 "version operator"
             );
+            // Post-state: `.1` stays pinned, `.2`/`.3` shifted down before
+            // the failure, the untouched `.4` now duplicates `.3`, `.5` kept
+            // its content, and the warn-and-proceed overwrite destroyed the
+            // un-rotated `.bak` ("version 8").
+            for (suffix, expected) in [
+                (".1", "version 0"),
+                (".2", "version 2"),
+                (".3", "version 3"),
+                (".4", "version 3"),
+                (".5", "version 4"),
+                ("", "version 9"),
+            ] {
+                let path = format!("{backup_path}{suffix}");
+                assert_eq!(
+                    workspace.read(&path).await.expect("generation").content,
+                    expected,
+                    "post-state of {path}"
+                );
+            }
         });
+        let discard = "discarding the second-oldest generation";
+        let fingerprint = "fingerprint of the un-rotated rolling-slot content";
+        let rotation_failed = "daily-log backup rotation failed; overwriting the rolling slot";
         assert!(
-            captured.contains("discarding the second-oldest generation"),
+            captured.contains(discard),
             "the discard line must be emitted before the failing shift: {captured}"
         );
         let expected_blake3 = blake3::hash(b"version 1").to_hex();
@@ -5367,9 +5393,99 @@ mod runtime_index_tests {
             "the line must fingerprint the lost `.2` content (\"version 1\"): {captured}"
         );
         assert!(captured.contains("discarded_bytes=9"), "{captured}");
+        // GP-1: the un-rotated `.bak` ("version 8") the caller then
+        // overwrote is fingerprinted before its destruction.
+        let unrotated_blake3 = blake3::hash(b"version 8").to_hex();
+        assert!(
+            captured.contains(fingerprint)
+                && captured.contains(&format!(" blake3={unrotated_blake3}"))
+                && captured.contains("fail_closed=false"),
+            "the failed rotation must fingerprint the un-rotated rolling slot: {captured}"
+        );
+        assert!(
+            captured.contains(rotation_failed),
+            "the caller's warn-and-proceed line still fires on the shift error: {captured}"
+        );
+        // Ordering: the discard line precedes the failure reporting, which
+        // precedes the warn-and-proceed overwrite notice.
+        let find = |needle: &str| {
+            captured
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing audit line: {needle}\n{captured}"))
+        };
+        assert!(
+            find(discard) < find(fingerprint) && find(fingerprint) < find(rotation_failed),
+            "audit lines out of order: {captured}"
+        );
+    }
+
+    /// WI#336 GP-4/GP-1: a FAILED roll-aside emits no "rolled aside" line
+    /// (the success line is gated on the update's result), and the
+    /// un-rotated `.bak` content the warn-and-proceed caller is about to
+    /// overwrite is fingerprinted before it is destroyed.
+    #[test]
+    fn daily_log_failed_roll_aside_emits_no_roll_aside_line() {
+        let captured = capture_safety_lines(|| async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let backend = std::sync::Arc::new(
+                LibSqlBackend::new_local(&temp_dir.path().join("roll-aside-failure.db"))
+                    .await
+                    .expect("LibSqlBackend"),
+            );
+            backend.run_migrations().await.expect("migrations");
+            let workspace = Workspace::new_with_db(
+                "roll-aside-failure-user",
+                std::sync::Arc::clone(&backend) as Arc<dyn Database>,
+            );
+            let day = "daily/2026-10-09.md";
+            workspace.write(day, "one").await.expect("seed day log");
+            workspace
+                .write(day, "two")
+                .await
+                .expect("seed the rolling backup");
+            // Fail the roll-aside update into the first numbered slot.
+            let conn = backend.connect().await.expect("connection");
+            conn.execute(
+                "CREATE TRIGGER reject_roll_aside BEFORE UPDATE OF content ON memory_documents
+                 WHEN NEW.path LIKE 'backups/daily/%.md.bak.1'
+                 BEGIN SELECT RAISE(FAIL, 'injected roll-aside failure'); END",
+                (),
+            )
+            .await
+            .expect("install roll-aside fault injection");
+            workspace
+                .write(day, "three")
+                .await
+                .expect("operator replace proceeds past the failed rotation");
+            assert_eq!(
+                workspace.read(day).await.expect("day log").content,
+                "three"
+            );
+            assert_eq!(
+                workspace
+                    .read("backups/daily/2026-10-09.md.bak")
+                    .await
+                    .expect("rolling backup")
+                    .content,
+                "two",
+                "the warn-and-proceed overwrite destroyed the un-rotated \"one\" \
+                 the fingerprint line records"
+            );
+        });
+        assert!(
+            !captured.contains("rolled aside into a numbered generation"),
+            "a failed roll-aside must not emit the success line: {captured}"
+        );
         assert!(
             captured.contains("daily-log backup rotation failed; overwriting the rolling slot"),
-            "the caller's warn-and-proceed line still fires on the shift error: {captured}"
+            "the caller's warn-and-proceed line fires on the rotation error: {captured}"
+        );
+        let unrotated_blake3 = blake3::hash(b"one").to_hex();
+        assert!(
+            captured.contains("fingerprint of the un-rotated rolling-slot content")
+                && captured.contains(&format!(" blake3={unrotated_blake3}"))
+                && captured.contains(" bytes=3"),
+            "the lost un-rotated content (\"one\") must be fingerprinted: {captured}"
         );
     }
 
