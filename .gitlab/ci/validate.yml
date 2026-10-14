@@ -85,11 +85,15 @@ worker-opencode-ts:
 # WI#324 (MR !1590 review GB-2): the kimi worker TS suites previously ran only
 # in the manual protected candidate image build, so bridge/tool-proxy
 # regressions reached main without any MR-pipeline execution. This lane runs
-# the same npm ci + tsc + npm test sequence as the Dockerfile builder stage on
-# each MR/push, on the same digest-pinned node image. The real-CLI contract
-# lane (kimi_cli_contract_test) self-skips here — no kimi binary — and the
-# protected image build remains the only place it executes against the real
-# CLI.
+# the Dockerfile builder stage's npm ci + tsc + npm test sequence on each
+# MR/push, on the same digest-pinned node image. The bare
+# node:22-bookworm-slim image has no python3, so the lane first installs the
+# builder stage's python3 apt prerequisite (Dockerfile: the entrypoint config
+# tests run the entrypoint with bash and it embeds python3 heredocs; without
+# it five entrypoint tests fail with exit 127 — MR !1601 review GH-1). The
+# real-CLI contract lane (kimi_cli_contract_test) self-skips here — no kimi
+# binary — and the protected image build remains the only place it executes
+# against the real CLI.
 worker-kimi-ts:
   stage: validate
   needs: []
@@ -104,6 +108,10 @@ worker-kimi-ts:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
   script:
+    # Builder-stage prerequisite (kimicode4lunarwing/Dockerfile): the
+    # entrypoint_config_test.js cases bash-run entrypoint.sh, whose config
+    # section embeds python3 heredocs; the bare node image lacks python3.
+    - apt-get update && apt-get install -y --no-install-recommends python3
     - cd kimicode4lunarwing/scripts
     - npm ci --ignore-scripts
     - npx tsc -p tsconfig.json
