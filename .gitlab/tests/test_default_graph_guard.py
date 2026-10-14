@@ -3,7 +3,7 @@
 
 The guard pins the WI#331 mitigation: libsql's remote/replication/tls surface
 lives behind the non-default `libsql-remote-replica` feature, so the legacy
-chain (rustls-webpki 0.102.8, h2 0.3.27) must never resolve in a
+chain (rustls 0.22.4, rustls-webpki 0.102.8, h2 0.3.27) must never resolve in a
 default-feature production graph. The ID-keyed cargo-deny ignores cannot see
 that regression because every deny gate queries --workspace --all-features
 (MR !1513 review CZ-1).
@@ -59,6 +59,7 @@ if [[ -n "$FAKE_ERROR" ]]; then
 fi
 echo "fixture v0.1.0 ($PWD)"
 echo "h2 v0.4.20"
+echo "rustls v0.23.46"
 echo "rustls-webpki v0.103.15"
 if [[ -z "$FAKE_REACHABLE_ROOT" || "$PWD" == "$FAKE_ROOT/$FAKE_REACHABLE_ROOT" ]]; then
     IFS=, read -ra pins <<< "$FAKE_REACHABLE"
@@ -110,10 +111,12 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
         )
 
     def real_ic_lock_pins(self):
-        """Match the real tree: both legacy pins live in ic/Cargo.lock."""
+        """Match the real tree: all three legacy pins live in ic/Cargo.lock."""
         self.write_ic_lock(
             '[[package]]\nname = "h2"\nversion = "0.3.27"\n'
             '[[package]]\nname = "h2"\nversion = "0.4.20"\n'
+            '[[package]]\nname = "rustls"\nversion = "0.22.4"\n'
+            '[[package]]\nname = "rustls"\nversion = "0.23.46"\n'
             '[[package]]\nname = "rustls-webpki"\nversion = "0.102.8"\n'
             '[[package]]\nname = "rustls-webpki"\nversion = "0.103.15"\n'
         )
@@ -156,6 +159,29 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("h2@0.3.27 is reachable", result.stderr)
         self.assertIn("RUSTSEC-2026-0258", result.stderr)
+
+    def test_rustls_legacy_in_either_default_graph_fails(self):
+        self.real_ic_lock_pins()
+        for root in ("ic", "ic/bridges/xmpp-bridge"):
+            with self.subTest(root=root):
+                result = self.run_guard(reachable=("rustls@0.22.4",), reachable_root=root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("rustls@0.22.4 is reachable", result.stderr)
+                self.assertIn("RUSTSEC-2026-0346/0349", result.stderr)
+                self.assertIn(f"{root}'s DEFAULT-feature", result.stderr)
+
+    def test_rustls_legacy_pin_missing_from_lock_is_stale_failure(self):
+        self.real_ic_lock_pins()
+        lock = self.root / "ic" / "Cargo.lock"
+        lock.write_text(
+            lock.read_text(encoding="utf-8").replace(
+                '[[package]]\nname = "rustls"\nversion = "0.22.4"\n', ""
+            ),
+            encoding="utf-8",
+        )
+        result = self.run_guard()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("rustls@0.22.4' is stale", result.stderr)
 
     def test_pin_missing_from_lock_is_stale_failure(self):
         # If the chain is ever really cleared from ic/Cargo.lock, the guard

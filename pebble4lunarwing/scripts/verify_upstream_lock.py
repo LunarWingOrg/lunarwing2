@@ -11,6 +11,10 @@ import tomllib
 
 # rustls/rustls-webpki: RUSTSEC-2026-0285 (TLS 1.3 handshake accepted across
 # encryption-level boundaries; patched >= 0.23.45 / webpki 0.103.15).
+# WI#409 additionally raises rustls to 0.23.46 for RUSTSEC-2026-0346/0347/
+# 0348/0349 (session-secret Debug, ECH rejection, Brotli allocation, and
+# unauthenticated key-exchange hints). The reviewed package allowlist stays
+# the same; Dockerfile's digest pins the exact upgraded lock.
 # chacha20: 0.10.1 is yanked on crates.io (upstream's own pin); 0.10.2 is the
 # identical-semver replacement, no advisory either way.
 ALLOWED_PACKAGES = {"rustls", "rustls-webpki", "chacha20"}
