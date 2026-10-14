@@ -482,6 +482,20 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 result = self.run_guard(self.root)
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn("parser directive", result.stderr)
+        # Run-106 GJ-1: BuildKit trims leading Unicode whitespace (Go
+        # unicode.IsSpace) before directive detection, but the guard's
+        # [[:space:]] trim is ASCII-only — the directive behind such a
+        # character is invisible here while the builder honours it. The
+        # guard now refuses any non-empty line whose first byte is not
+        # printable ASCII.
+        for prefix in ("\u00a0", "\u0085", "\u202f"):
+            with self.subTest(unicode_prefix=hex(ord(prefix))):
+                dockerfile.write_text(
+                    prefix + "# escape=`\n" + original + tail, encoding="utf-8"
+                )
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("printable ASCII", result.stderr)
         dockerfile.write_text(original, encoding="utf-8")
 
     def test_executor_missing_deny_fails(self):

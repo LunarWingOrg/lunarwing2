@@ -55,6 +55,16 @@ while IFS= read -r _raw || [[ -n "$_raw" ]]; do
         continue
     fi
     [[ -n "$_line" ]] || continue
+    # Run-106 GJ-1: BuildKit trims leading Unicode whitespace (Go
+    # unicode.IsSpace — U+00A0, U+0085, U+202F, …) before directive
+    # detection, but the [[:space:]] trim above is ASCII-only, so a parser
+    # directive behind such a character is neither comment nor instruction
+    # here while the builder honours it. In the C locale every byte of a
+    # valid instruction, continuation or comment line is printable ASCII;
+    # refuse anything else, fail-closed.
+    if ! ( export LC_ALL=C; [[ "${_line:0:1}" == [[:print:]] ]] ); then
+        fail "Dockerfile line does not start with printable ASCII (run-106 GJ-1): ${_raw}"
+    fi
     if [[ "$_line" == *\\ ]]; then
         _part="${_line%\\}"
         _join+="${_part%"${_part##*[![:space:]]}"} "
