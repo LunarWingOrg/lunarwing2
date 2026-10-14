@@ -51,9 +51,16 @@ RUN bun run build || echo "WARNING: @opencode/client build reported errors (impo
 
 WORKDIR /build/opencode/packages/cli
 COPY scripts/prepare_reproducible_build.py /build/prepare_reproducible_build.py
+COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py
 # Single-bundle source compilation avoids per-build chunk IDs/bytecode in the
 # executable. Fail closed if the pinned upstream build options have drifted.
 RUN python3 /build/prepare_reproducible_build.py script/build.ts
+# WI#357 control 8: compile the OpenTunnel remote-access client out, fail
+# closed. v2.0.24 has no tunnel (guard passes with nothing to stub); when a
+# future bump lands v2.0.26+'s remote-tunnel.ts the guard replaces it with a
+# refusing stub, and if upstream moves/renames the module or extends its
+# export surface the build fails instead of silently shipping the tunnel.
+RUN python3 /build/compile_out_remote_tunnel.py /build/opencode
 # Build only the native platform target (mirrors the v1 worker's --single
 # rationale; the image is distributed same-host via podman save|load).
 # Inject the pinned release version (sans leading v) into the build env:
@@ -91,6 +98,16 @@ ARG WITH_TOOLCHAINS=false
 ARG OPENCODE_VERSION
 ARG OPENCODE_REF
 ENV OPENCODE_IMAGE_REF="${OPENCODE_VERSION}@${OPENCODE_REF}"
+
+# WI#357 run-106 GJ-3(a): sha256 of the checkout's
+# scripts/opencode-exposure-guard.sh, passed by build-worker-image.sh and
+# mt-admin's build_opencode2_worker. The final --image-filesystem assert
+# compares it against the installed wrapper's digest: the byte-identity
+# reference (/app/scripts) ships inside the image, so a root RUN could
+# rewrite both files identically. This detects accidental drift; an adversarial
+# Dockerfile edit can still defeat it by replacing the environment or checker
+# (run-109 GW-3). Absent or mismatched fails the build with the checker intact.
+ARG LUNARWING_WRAPPER_SHA256=
 
 LABEL org.opencontainers.image.title="LunarWing OpenCode 2 Worker" \
       org.opencontainers.image.description="Persistent OpenCode 2 worker with WebSocket agent communication" \
@@ -212,7 +229,11 @@ RUN groupadd --gid 10003 opencode2 \
 # ── app layout ─────────────────────────
 WORKDIR /app
 
-COPY --from=builder /out/bin/opencode /usr/local/bin/opencode
+# WI#357: the pinned binary moves aside so the exposure-guard wrapper can own
+# /usr/local/bin/opencode. The wrapper refuses the self-exposure command
+# surface (service/pair, non-loopback serve) even when invoked through layers
+# the session permission ruleset cannot see (bash -c, absolute paths).
+COPY --from=builder /out/bin/opencode /usr/local/lib/opencode2/opencode
 COPY --from=builder /out/client /app/node_modules/@opencode/client
 # @opencode/client's generated types import from @opencode/schema and
 # @opencode/protocol; both resolve as source via their exports maps.
@@ -221,11 +242,33 @@ COPY --from=builder /build/opencode/packages/schema/package.json /app/node_modul
 COPY --from=builder /build/opencode/packages/protocol/src /app/node_modules/@opencode/protocol/src
 COPY --from=builder /build/opencode/packages/protocol/package.json /app/node_modules/@opencode/protocol/package.json
 
-COPY --chown=opencode2:opencode2 entrypoint.sh health_server.py agent_comm_protocol.json ./
-COPY --chown=opencode2:opencode2 scripts/ ./scripts/
-COPY --chown=opencode2:opencode2 config/ ./config/
+COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
+# WI#357 (run-79 EI-5): the exposure controls (wrapper, policy assert,
+# compile-out guard, lane config) must be root-owned and read-only — the
+# agent user gets edit/write on the workspace, so an agent-writable config
+# could append an allow rule or "share":"auto" that the v2 config watcher
+# would reload, and an agent-writable bridge ruleset would take effect at
+# the next bridge restart. The entrypoint re-derives the runtime config
+# from this read-only copy at every boot (workspace copy is untrusted).
+# The boot script, health server and protocol are protected too: a container
+# restart reuses its filesystem, so an agent edit there would otherwise persist.
+COPY scripts/ ./scripts/
+COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/health_server.py
+RUN chmod +x /app/entrypoint.sh /app/health_server.py \
+    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json
+
+# WI#357: install the exposure-guard wrapper as the only PATH-visible
+# opencode entrypoint, then fail the BUILD when the policy regresses:
+# lane config must pin share/update off, the entrypoint must not invoke
+# service mode, the wrapper must refuse service/pair, and the built binary
+# must contain no OpenTunnel client markers (the compile-out guard in
+# scripts/compile_out_remote_tunnel.py keeps that true on version bumps).
+RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode \
+    && python3 /app/scripts/exposure_policy_assert.py \
+        --lane /app \
+        --profile opencode2 \
+        --binary /usr/local/lib/opencode2/opencode
 
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
 # resolve — the client build above is best-effort, so verify the exact import
@@ -281,6 +324,9 @@ RUN set -eu; \
     && bun scripts/opencode_task_executor_test.ts \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
+    && python3 scripts/exposure_policy_assert_test.py \
+    && python3 scripts/entrypoint_config_test.py \
+    && python3 scripts/compile_out_remote_tunnel_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
            [ ! -e "$leaked" ] \
            || { echo "FATAL: build-time self-tests leaked per-build state at $leaked — refusing to bake a non-reproducible layer" >&2; exit 1; }; \
@@ -293,6 +339,9 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
              /var/log/lunarwing \
              /app/results \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
+
+# Check the final runtime filesystem, after all COPY/chown/chmod operations.
+RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem
 
 # ── ports ──────────────────────
 EXPOSE 8443
