@@ -2,8 +2,9 @@
 unmaintained = "workspace"
 yanked = "deny"
 ignore = [
-    # Accepted advisories — each entry re-verified against upstream 2026-10-10
-    # for v2.1.6.0. Clearing decisions are owned by work item WI#331
+    # Baseline accepted advisories re-verified against upstream 2026-10-10
+    # for v2.1.6.0; WI#409's rustls additions are dated 2026-10-14 below.
+    # Baseline clearing decisions are owned by work item WI#331
     # (https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331);
     # WI#304 was closed without a migration, so do not reference it as a
     # clearing owner. Clearing work that outlives WI#331 is split into open
@@ -41,6 +42,20 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name-constraint bypass; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 CRL parsing panic; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
+
+    # WI#409 (2026-10-14): the modern rustls line is upgraded to 0.23.46,
+    # fixing RUSTSEC-2026-0346/0347/0348/0349. No patched 0.22 release exists.
+    # rustls 0.22.4 remains only via libsql 0.6.0 -> hyper-rustls 0.25.0 ->
+    # tokio-rustls 0.25.0, behind WI#331's opt-in libsql-remote-replica gate.
+    # EXPOSURE: remote-replica TLS only; default/postgres-only builds exclude
+    # it. No custom ClientSessionStore logs session values in our sources
+    # (0346); 0349 concerns unauthenticated key-exchange hints in the session
+    # store, not certificate authentication. Accept the legacy chain only.
+    # Decision/clearing owner: WI#409, extending the WI#331 mitigation.
+    # The default-graph guard pins 0.22.4 out of shipped builds; the rustls
+    # version floor below prevents ID-keyed ignores masking a 0.23 downgrade.
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.22.4 session-value Debug exposes TLS secrets; libsql 0.6.0 legacy chain, no 0.22-line patch; no custom ClientSessionStore in LunarWing sources; exposure accepted only for opt-in libsql-remote-replica builds under WI#331 feature gate; modern line fixed at 0.23.46; decision/clearing owner WI#409 (verified 2026-10-14)" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.22.4 unauthenticated ServerHello key-exchange hint caching; same libsql 0.6.0 legacy chain, no 0.22-line patch; exposure accepted only for opt-in libsql-remote-replica builds under WI#331 feature gate, default/postgres-only builds exclude it; modern line fixed at 0.23.46; decision/clearing owner WI#409 (verified 2026-10-14)" },
 
     # failure crate — vendored libsignal-protocol path dep only.
     # failure 0.1.8 is the final release (EOL); clearing requires porting
@@ -126,9 +141,10 @@ deny = [
     # against silent downgrade (MR !1371 review A3): the advisory ignores
     # above are keyed by ID, which would not fire if a future lockfile
     # regressed the PATCHED line below the fixed release. The legacy copies
-    # (h2 0.3.27, rustls-webpki 0.102.8) sit outside these ranges and remain
-    # governed by the accepted advisories.
+    # (h2 0.3.27, rustls 0.22.4, rustls-webpki 0.102.8) sit outside these
+    # ranges and remain governed by the accepted advisories.
     { name = "h2", version = ">=0.4.0, <0.4.19" },
+    { name = "rustls", version = ">=0.23.0, <0.23.46" },
     { name = "rustls-webpki", version = ">=0.103.0, <0.103.15" },
 ]
 
