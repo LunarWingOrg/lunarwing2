@@ -280,15 +280,16 @@ def check_installed_wrapper(
 
     A RUN in the final stage between the wrapper-install scan and the
     --image-filesystem assertion can replace the wrapper (or the real
-    binary) after every text check passed; only the installed filesystem
-    cannot lie. The wrapper must be the byte-identical, owner-only-writable,
+    binary) after the earlier scan, so inspect the installed files here.
+    The wrapper must be the byte-identical, owner-only-writable,
     executable exposure guard, PATH must resolve 'opencode' to it, the real
     binary is re-scanned for OpenTunnel markers, and LUNARWING_REAL_OPENCODE
     may not retarget the wrapper at build time (run-106 GJ-3b/c). The
     installed digest must also match the LUNARWING_WRAPPER_SHA256 build-arg
-    anchor (run-106 GJ-3a) — the byte-identity source ships inside the
-    image, so only the anchor is unforgeable from the build context. Image
-    builds only (v2 profile).
+    anchor (run-106 GJ-3a). This detects accidental drift; an adversarial
+    Dockerfile edit can still defeat it by replacing the environment or
+    checker (run-109 GW-3). Image builds only (v2 profile); independent
+    checkout-side image verification remains a WI#357 follow-up.
     """
     try:
         metadata = wrapper_path.lstat()
@@ -328,6 +329,7 @@ def check_installed_wrapper(
     # (LUNARWING_WRAPPER_SHA256); compare the installed digest against that
     # anchor, and fail closed when it is absent — a dropped ARG or a builder
     # that does not forward the arg must fail the image build, not pass.
+    # The Dockerfile still controls this environment and checker (GW-3).
     anchor = wrapper_sha256 if wrapper_sha256 is not None else os.environ.get(
         "LUNARWING_WRAPPER_SHA256", ""
     )

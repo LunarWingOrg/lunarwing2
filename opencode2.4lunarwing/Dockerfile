@@ -104,8 +104,9 @@ ENV OPENCODE_IMAGE_REF="${OPENCODE_VERSION}@${OPENCODE_REF}"
 # mt-admin's build_opencode2_worker. The final --image-filesystem assert
 # compares it against the installed wrapper's digest: the byte-identity
 # reference (/app/scripts) ships inside the image, so a root RUN could
-# rewrite both files identically — the build-arg anchor cannot be rewritten
-# from inside the build context. Absent or mismatched fails the build.
+# rewrite both files identically. This detects accidental drift; an adversarial
+# Dockerfile edit can still defeat it by replacing the environment or checker
+# (run-109 GW-3). Absent or mismatched fails the build with the checker intact.
 ARG LUNARWING_WRAPPER_SHA256=
 
 LABEL org.opencontainers.image.title="LunarWing OpenCode 2 Worker" \

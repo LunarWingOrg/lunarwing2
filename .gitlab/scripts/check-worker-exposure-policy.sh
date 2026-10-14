@@ -71,11 +71,20 @@ while IFS= read -r _raw || [[ -n "$_raw" ]]; do
     # line and buildah/podman joins this one too. A LABEL ending in two
     # backslashes would therefore hide the next instruction (e.g. a
     # post-assert root RUN) from the continuation joining. Refuse the
-    # spelling outright; trailing whitespace after a single backslash stays
-    # over-refused today, which is the safe direction.
+    # spelling outright. Run-109 GW-2: trailing whitespace after a single
+    # backslash is also unsafe: BuildKit joins it, hiding a required assert
+    # inside the previous instruction while this guard counts a separate RUN.
     _trimmed="${_line%"${_line##*[![:space:]]}"}"
     if [[ "$_trimmed" == *\\\\ ]]; then
         fail "Dockerfile line ends in an escaped backslash (\\\\) — not a continuation for BuildKit (run-106 GJ-2): ${_raw}"
+    fi
+    if [[ "$_trimmed" == *\\ && "$_trimmed" != "$_line" ]]; then
+        fail "Dockerfile continuation backslash must not have trailing whitespace (run-109 GW-2): ${_raw}"
+    fi
+    # Heredoc bodies can swallow required instructions too. Refuse both the
+    # literal token and a token split across continued physical lines.
+    if [[ "$_line" == *'<<'* || "$_trimmed" == *'<\' ]]; then
+        fail "Dockerfile heredocs are not allowed (run-109 GW-2): ${_raw}"
     fi
     if [[ "$_line" == *\\ ]]; then
         _part="${_line%\\}"
@@ -113,6 +122,7 @@ filesystem_checked=0
 stage_index=0
 scan_stage=""
 assert_stage=""
+anchor_stage=""
 # Run-97 FQ-2: a USER root tail would void the root-owned read-only controls
 # outside mt-admin-managed deployments (mt-admin itself checks the image user).
 last_user=""
@@ -136,6 +146,19 @@ while IFS= read -r docker_line; do
     fi
     if [[ "$instruction" == USER ]]; then
         last_user="$docker_line"
+    fi
+    # Run-109 GW-3: an ENV overrides the build ARG, and SHELL can hide or
+    # replace it for every RUN. These are cheap drift guards; a root RUN can
+    # still rewrite the checker itself. Out-of-band verification is deferred.
+    if [[ "$instruction" == SHELL ]]; then
+        fail "Dockerfile SHELL overrides are not allowed (run-109 GW-3)"
+    fi
+    if [[ "$docker_line" == 'ARG LUNARWING_WRAPPER_SHA256=' ]]; then
+        anchor_stage=$stage_index
+    elif [[ "$docker_line" == *LUNARWING_WRAPPER_SHA256* \
+         || "$docker_line" == *LUNARWING_REAL_OPENCODE* \
+         || "$docker_line" == *OPENCODE_BIN* ]]; then
+        fail "Dockerfile must not override exposure-policy variables (run-109 GW-3): ${docker_line}"
     fi
     # Match the Dockerfile's variable reference literally, without expansion.
     # shellcheck disable=SC2016
@@ -168,8 +191,38 @@ done <<<"$dockerfile_code"
     || fail "Dockerfile must verify installed policy-file ownership and modes (FB-4)"
 [[ -n "$scan_stage" && "$scan_stage" == "$assert_stage" ]] \
     || fail "Dockerfile wrapper install + binary marker scan must run in the same stage as the final --image-filesystem assertion (run-97 FQ-1: unused stages are skipped at build time)"
+[[ -n "$anchor_stage" && "$anchor_stage" == "$assert_stage" ]] \
+    || fail "Dockerfile must declare ARG LUNARWING_WRAPPER_SHA256= in the final assertion stage (run-109 GW-3)"
 [[ -n "$last_user" && "$last_user" == "USER 10003:10003" ]] \
     || fail "Dockerfile's last USER instruction must be exactly 'USER 10003:10003' (run-97 FQ-2)"
+
+# ENV keys are expanded by BuildKit, so a split protected name such as
+# ${PREFIX}SHA256 escapes the literal checks above. Accept only literal
+# identifier=value assignments; shlex keeps quoted/expanded values intact.
+python3 -c '
+import re
+import shlex
+import sys
+
+protected = {"LUNARWING_WRAPPER_SHA256", "LUNARWING_REAL_OPENCODE", "OPENCODE_BIN"}
+failed = False
+for line in sys.stdin:
+    if line.split(None, 1)[:1] != ["ENV"]:
+        continue
+    try:
+        assignments = shlex.split(line)[1:]
+    except ValueError:
+        assignments = []
+    if not assignments or any(
+        not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", assignment)
+        or assignment.split("=", 1)[0] in protected
+        for assignment in assignments
+    ):
+        print("ERROR: Dockerfile ENV requires literal, unprotected key=value assignments "
+              "(no expanded or legacy keys; run-109 GW-3): " + line.strip(), file=sys.stderr)
+        failed = True
+sys.exit(1 if failed else 0)
+' <<<"$dockerfile_code" || failed=1
 
 # WI#357 (run-79 EI-5): the exposure controls must be root-owned and
 # read-only in the image; agent-writable scripts/config would let the agent

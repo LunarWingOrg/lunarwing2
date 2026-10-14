@@ -248,12 +248,15 @@ else
 fi
 
 # ── builder contract ────────────────────────────────────────────────────────
-mkdir -p "$fixture/target/opencode2.4lunarwing"
+mkdir -p "$fixture/target/opencode2.4lunarwing/scripts"
+wrapper_file="$fixture/target/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
+printf '#!/bin/sh\n# fixture wrapper\n' > "$wrapper_file"
 # Override consumed by the sourced container helpers.
 # shellcheck disable=SC2034
 CONTAINER_RT=docker
 ensure_container_runtime() { :; }
-docker() { BUILD_CALL="$*"; }
+docker() { BUILD_CALL="$*"; printf '%s\n' "$*" >> "$fixture/build-calls"; }
+podman() { docker "$@"; }
 BUILD_CALL=''
 build_opencode2_worker false true "$fixture/target" >/dev/null
 if [[ "$BUILD_CALL" == *'--build-arg WITH_TOOLCHAINS=true'* \
@@ -270,6 +273,67 @@ if [[ "$BUILD_CALL" == *'--no-cache'* ]]; then
   pass 'opencode2 builder honors --no-cache'
 else
   fail 'opencode2 builder ignored --no-cache'
+fi
+
+# GW-1: bind both runtime lanes to the selected checkout's wrapper bytes.
+for CONTAINER_RT in docker podman; do
+  for revision in first second; do
+    printf '#!/bin/sh\n# %s wrapper\n' "$revision" > "$wrapper_file"
+    expected_anchor=$(sha256sum < "$wrapper_file")
+    expected_anchor=${expected_anchor%% *}
+    BUILD_CALL=''
+    build_opencode2_worker false false "$fixture/target" >/dev/null
+    if [[ "$BUILD_CALL" == *"--build-arg LUNARWING_WRAPPER_SHA256=$expected_anchor"* ]]; then
+      pass "$CONTAINER_RT builder forwards the $revision checkout wrapper digest"
+    else
+      fail "$CONTAINER_RT builder lost the $revision wrapper digest: $BUILD_CALL"
+    fi
+  done
+
+  mv "$wrapper_file" "$wrapper_file.saved"
+  : > "$fixture/build-calls"
+  if (build_opencode2_worker false false "$fixture/target") >"$fixture/missing-wrapper.log" 2>&1; then
+    fail "$CONTAINER_RT builder accepted a missing wrapper"
+  else
+    assert_contains "$fixture/missing-wrapper.log" 'cannot hash' \
+      "$CONTAINER_RT builder explains a missing wrapper"
+  fi
+  if [[ ! -s "$fixture/build-calls" ]]; then
+    pass "$CONTAINER_RT builder refuses a missing wrapper before invoking the runtime"
+  else
+    fail "$CONTAINER_RT builder invoked the runtime without a wrapper digest"
+  fi
+  mv "$wrapper_file.saved" "$wrapper_file"
+done
+
+for bad_digest in '' short "$(printf '%064d' 0)g" "$(printf '%064d' 0 | tr 0 g)"; do
+  : > "$fixture/build-calls"
+  if (
+    sha256sum() { printf '%s  -\n' "$bad_digest"; }
+    build_opencode2_worker false false "$fixture/target"
+  ) >"$fixture/invalid-digest.log" 2>&1; then
+    fail 'opencode2 builder accepted an invalid wrapper digest'
+  else
+    assert_contains "$fixture/invalid-digest.log" 'invalid wrapper sha256' \
+      'opencode2 builder rejects an invalid wrapper digest'
+  fi
+  if [[ -s "$fixture/build-calls" ]]; then
+    fail 'opencode2 builder invoked the runtime with an invalid wrapper digest'
+  fi
+done
+
+: > "$fixture/build-calls"
+if (
+  sha256sum() { printf '%064d  -\n' 0; return 1; }
+  build_opencode2_worker false false "$fixture/target"
+) >"$fixture/hash-failure.log" 2>&1; then
+  fail 'opencode2 builder accepted a failed hash command'
+else
+  assert_contains "$fixture/hash-failure.log" 'cannot hash' \
+    'opencode2 builder explains a failed hash command even with valid-looking output'
+fi
+if [[ -s "$fixture/build-calls" ]]; then
+  fail 'opencode2 builder invoked the runtime after a failed hash command'
 fi
 
 # Missing worker dir dies instead of building from the wrong context.

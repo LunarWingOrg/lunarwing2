@@ -34,6 +34,7 @@ COMPILE_OUT_RUN = "RUN python3 /build/compile_out_remote_tunnel.py /build/openco
 BUILD_RUN = 'RUN OPENCODE_VERSION="${OPENCODE_VERSION#v}" bun run build -- --single\n'
 READONLY_RUN = "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json\n"
 FILESYSTEM_ASSERTION = "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem\n"
+WRAPPER_ANCHOR_ARG = "ARG LUNARWING_WRAPPER_SHA256=\n"
 BINARY_SCAN_RUN = (
     "RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode \\\n"
     "    && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 "
@@ -52,6 +53,7 @@ DOCKERFILE_LINES = (
     "COPY config/ ./config/\n",
     "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./\n",
     READONLY_RUN,
+    WRAPPER_ANCHOR_ARG,
     FILESYSTEM_ASSERTION,
     "USER 10003:10003\n",
 )
@@ -520,6 +522,123 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn("escaped backslash", result.stderr)
         dockerfile.write_text(original, encoding="utf-8")
+
+    def test_dockerfile_whitespace_after_continuation_fails(self):
+        # GW-2: BuildKit joins backslash + space/tab/CRLF, swallowing the
+        # required assert RUN into the preceding instruction. The old guard
+        # counted the physical RUN anyway, so this was a false pass.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for prefix in (
+            "ENV LUNARWING_STAGE=final \\\u0020\n",
+            "ENV LUNARWING_STAGE=final \\\r\n",
+            "RUN echo prepared \\\t\n",
+        ):
+            with self.subTest(prefix=prefix):
+                dockerfile.write_text(original.replace(
+                    FILESYSTEM_ASSERTION, prefix + FILESYSTEM_ASSERTION
+                ), encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("continuation backslash must not have trailing whitespace", result.stderr)
+
+    def test_dockerfile_heredocs_cannot_swallow_assertion(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for prefix, terminator in (
+            ("RUN cat >/dev/null <<LABEL\n", "LABEL\n"),
+            ("RUN cat >/dev/null <<USER\n", "USER\n"),
+            ("RUN cat >/dev/null <<-'LABEL'\n", "LABEL\n"),
+            ("COPY <<LABEL /ignored\n", "LABEL\n"),
+            ("ADD <<LABEL /ignored\n", "LABEL\n"),
+            ("RUN cat >/dev/null <\\\n<LABEL\n", "LABEL\n"),
+        ):
+            with self.subTest(prefix=prefix):
+                dockerfile.write_text(original.replace(
+                    FILESYSTEM_ASSERTION, prefix + FILESYSTEM_ASSERTION + terminator
+                ), encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("heredocs are not allowed", result.stderr)
+
+    def test_dockerfile_shell_override_fails(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for shell in (
+            'SHELL ["/bin/sh", "-c"]\n',
+            'sHeLl ["/usr/bin/env", "-u", "LUNARWING_REAL_OPENCODE", "/bin/sh", "-c"]\n',
+        ):
+            with self.subTest(shell=shell):
+                dockerfile.write_text(original.replace(
+                    FILESYSTEM_ASSERTION, shell + FILESYSTEM_ASSERTION
+                ), encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("SHELL overrides are not allowed", result.stderr)
+
+    def test_dockerfile_policy_variable_overrides_fail(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for name, value in (
+            ("LUNARWING_WRAPPER_SHA256", "0" * 64),
+            ("LUNARWING_REAL_OPENCODE", "/tmp/other-opencode"),
+            ("OPENCODE_BIN", "/usr/local/lib/opencode2/opencode"),
+        ):
+            for prefix in ("ENV", "ARG", "RUN export"):
+                with self.subTest(name=name, prefix=prefix):
+                    dockerfile.write_text(original.replace(
+                        FILESYSTEM_ASSERTION,
+                        f"{prefix} {name}={value}\n" + FILESYSTEM_ASSERTION,
+                    ), encoding="utf-8")
+                    result = self.run_guard(self.root)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("must not override exposure-policy variables", result.stderr)
+
+    def test_dockerfile_expanded_and_legacy_env_keys_fail(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        for env in (
+            "ARG P=LUNARWING_WRAPPER_\nENV ${P}SHA256=tampered\n",
+            "ARG P=LUNARWING_REAL_\nENV SAFE=value ${P}OPENCODE=/tmp/other\n",
+            "ARG P=OPENCODE_\nENV ${P}BIN=/tmp/other\n",
+            'ARG P=OPENCODE_\nENV "${P}BIN"=/tmp/other\n',
+            'ENV OPENCODE_"BIN"=/tmp/other\n',
+            "ENV STAGE final\n",
+            "ENV STAGE final=other\n",
+        ):
+            with self.subTest(env=env):
+                dockerfile.write_text(original.replace(
+                    FILESYSTEM_ASSERTION, env + FILESYSTEM_ASSERTION
+                ), encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("ENV requires literal, unprotected key=value assignments", result.stderr)
+
+    def test_dockerfile_literal_env_keys_allow_expanded_and_quoted_values(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        dockerfile.write_text(dockerfile.read_text().replace(
+            FILESYSTEM_ASSERTION,
+            'ENV PATH=/opt/bin:$PATH NOTE="two words" OTHER="${BASE:-default}"\n'
+            + FILESYSTEM_ASSERTION,
+        ), encoding="utf-8")
+        result = self.run_guard(self.root, without_git=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dockerfile_wrapper_anchor_arg_must_be_in_assertion_stage(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_text()
+        without_anchor = original.replace(WRAPPER_ANCHOR_ARG, "")
+        for name, mutated in {
+            "missing": without_anchor,
+            "commented": original.replace(WRAPPER_ANCHOR_ARG, "# " + WRAPPER_ANCHOR_ARG),
+            "global": WRAPPER_ANCHOR_ARG + without_anchor,
+            "builder-only": without_anchor.replace(COMPILE_OUT_COPY, WRAPPER_ANCHOR_ARG + COMPILE_OUT_COPY),
+        }.items():
+            with self.subTest(name=name):
+                dockerfile.write_text(mutated, encoding="utf-8")
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("must declare ARG LUNARWING_WRAPPER_SHA256=", result.stderr)
 
     def test_executor_missing_deny_fails(self):
         executor = self.root / "opencode2.4lunarwing" / "scripts" / "opencode_task_executor.ts"

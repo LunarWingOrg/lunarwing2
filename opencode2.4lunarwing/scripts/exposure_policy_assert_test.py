@@ -485,8 +485,9 @@ class InstalledWrapperTests(unittest.TestCase):
         # Run-106 GJ-3(a): the byte-identity reference ships inside the
         # image, so a root RUN rewriting both /usr/local/bin/opencode AND
         # /app/scripts/opencode-exposure-guard.sh identically passed GD-2's
-        # byte-identity check; the build-arg anchor (the checkout's digest)
-        # cannot be rewritten from inside the build context.
+        # byte-identity check. The checkout digest catches this drift while
+        # the anchor and checker stay intact; an adversarial Dockerfile can
+        # still replace either (run-109 GW-3).
         tampered = WRAPPER.read_bytes() + b"\n# rewritten in-image\n"
         self.wrapper_path.write_bytes(tampered)
         self.wrapper_path.chmod(0o755)

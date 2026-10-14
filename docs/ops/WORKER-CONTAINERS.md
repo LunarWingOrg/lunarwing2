@@ -254,7 +254,8 @@ Enforced controls (opencode2 lane unless noted):
    `USER`, `ENTRYPOINT`, `CMD`, `LABEL` and `STOPSIGNAL` are allowed
    (case-insensitively). Later COPY/ADD/RUN steps or new stages are refused
    regardless of command spelling; earlier filesystem changes are checked
-   by the image-build assertion (run-96 FP-1, closing the run-90 FC-4 gaps).
+   by the in-image assertion, subject to the trust limitation in control 5
+   (run-96 FP-1, closing the run-90 FC-4 gaps).
    Run-97 FQ-1: the wrapper-install/binary-scan RUN must sit in the *same
    stage* as the final `--image-filesystem` assertion — build engines skip
    unused stages, so the exact line in a dead or builder stage satisfies
@@ -266,14 +267,25 @@ Enforced controls (opencode2 lane unless noted):
    joining. Run-103 GD-1: the directive refusal also covers the grammar's
    whitespace-around-`=` spellings (`# escape = \``) and a UTF-8 BOM prefix
    (Docker strips a leading BOM before parsing) — either hid a directive
-   the old regex never matched. Run-106 GJ-1/GJ-2 close the two remaining
+   the old regex never matched. Run-106 GJ-1/GJ-2 close two additional
    parser-divergence spellings: any non-empty line whose first byte is not
    printable ASCII is refused (BuildKit trims Unicode whitespace such as
    U+00A0/U+0085/U+202F before directive detection; the guard's
    `[[:space:]]` trim is ASCII-only), and any line whose right-trimmed form
    ends in two backslashes is refused (an escaped escape token is not a
    continuation for BuildKit, but the guard — like buildah/podman — used to
-   join it, hiding the next instruction).
+   join it, hiding the next instruction). Run-109 GW-2 also refuses trailing
+   whitespace (space/tab/CR) after a single continuation backslash and
+   heredocs (`<<`, including a token split across continued lines). Before
+   the assertion, those spellings can hide its RUN inside a previous
+   instruction or heredoc body; the earlier "safe over-refusal" claim was
+   incorrect. GW-3 refuses `SHELL`, any instruction naming
+   `LUNARWING_WRAPPER_SHA256`, `LUNARWING_REAL_OPENCODE` or `OPENCODE_BIN`
+   except the exact `ARG LUNARWING_WRAPPER_SHA256=`, and ENV keys that are
+   expanded or use legacy space-separated assignment syntax. Literal
+   `key=value` assignments may still have quoted or expanded values. The
+   anchor ARG must be in the final assertion's stage. These are drift
+   checks: an adversarial Dockerfile can still rewrite the in-image checker.
    `.gitlab/tests/test_worker_exposure_policy.py` regression-covers it,
    including no-git lanes. The guard also runs the exposure/wrapper,
    compile-out, and non-root boot configuration suites on merge requests.
@@ -292,10 +304,10 @@ Enforced controls (opencode2 lane unless noted):
    to `scripts/opencode-exposure-guard.sh`, and `shutil.which("opencode")`
    must resolve to it (no earlier `PATH` dir shadows it); the real binary
    at `/usr/local/lib/opencode2/opencode` is re-scanned for tunnel markers.
-   A same-stage `RUN` between the wrapper-install scan and the final
-   assertion therefore cannot swap the wrapper (or the binary) in
-   unnoticed — pinned by unit tests with injected paths, since the image
-   build itself is a protected-pipeline gate. Run-106 GJ-3 hardens the
+   These checks detect accidental drift after the wrapper-install scan,
+   provided the checker and its environment remain intact — pinned by unit
+   tests with injected paths, since the image build itself is a
+   protected-pipeline gate. Run-106 GJ-3 hardens the
    same check: `LUNARWING_REAL_OPENCODE` may not retarget the wrapper at
    build time (only the default binary path passes, and any other value is
    also marker-scanned), a non-executable wrapper is refused with its own
@@ -304,7 +316,17 @@ Enforced controls (opencode2 lane unless noted):
    byte-identity source ships inside the image, so a root `RUN` could
    rewrite both files identically; the anchor is computed from the checkout
    by `build-worker-image.sh` and mt-admin's `build_opencode2_worker`, and
-   a missing or mismatched anchor fails the build fail-closed. Note the
+   a missing or mismatched anchor fails the build fail-closed. The anchor is
+   **not unforgeable**: an adversarial Dockerfile edit can still defeat the
+   check by replacing its environment or the checker itself (run-109 GW-3).
+   The CI guard's ENV/SHELL refusals are an additional drift check.
+   **WI#357 follow-up:** verify the built image out of band with the
+   checkout's checker and wrapper bytes, including image-config `Env` and
+   `Shell`: export the BuildKit filesystem via a local/tar output in CI,
+   and use `podman create`/`podman cp` (or the Docker equivalents) plus
+   checkout-side comparison in mt-admin. This durable check is deferred;
+   it would also avoid relying on the partial Dockerfile parser for GW-2
+   and the remaining binary/boot-path checks in GW-4. Note the
    `PATH` resolution is a *build-time* property: at runtime the agent-owned
    `~/.cargo/bin` and `~/go/bin` (five PATH entries — the four toolchain
    dirs plus an empty `/usr/local/sbin` — precede `/usr/local/bin`), so a

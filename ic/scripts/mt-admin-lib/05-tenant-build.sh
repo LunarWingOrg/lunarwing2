@@ -1213,13 +1213,13 @@ build_opencode2_worker() {
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
   # WI#357 run-106 GJ-3(a): pass the checkout's exposure-guard wrapper digest
-  # so the in-image --image-filesystem assert can anchor the installed
-  # wrapper against something a root RUN inside the build cannot rewrite
-  # (the in-image byte-identity reference is rewritable; this is not). A
-  # missing or mismatched anchor fails the image build, fail-closed.
-  local wrapper_anchor
-  wrapper_anchor=$(sha256sum "$opencode2_dir/scripts/opencode-exposure-guard.sh" | cut -d ' ' -f 1)
-  [[ -n "$wrapper_anchor" ]] || die "cannot hash $opencode2_dir/scripts/opencode-exposure-guard.sh"
+  # for the in-image --image-filesystem comparison. This detects accidental
+  # drift; an adversarial Dockerfile can still replace the environment or
+  # checker. Out-of-band image verification remains a WI#357 follow-up (GW-3).
+  local wrapper_file="$opencode2_dir/scripts/opencode-exposure-guard.sh" wrapper_anchor
+  wrapper_anchor=$(sha256sum < "$wrapper_file") || die "cannot hash $wrapper_file"
+  wrapper_anchor=${wrapper_anchor%% *}
+  [[ "$wrapper_anchor" =~ ^[0-9a-f]{64}$ ]] || die "invalid wrapper sha256 for $wrapper_file"
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()

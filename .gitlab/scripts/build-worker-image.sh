@@ -67,10 +67,20 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
         source_ref=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
-        # the in-image --image-filesystem assert against the installed
-        # wrapper (the in-image byte-identity reference is rewritable by a
-        # root RUN; this anchor is not).
-        wrapper_anchor=$(sha256sum "$CI_PROJECT_DIR/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" | cut -d ' ' -f 1)
+        # the in-image --image-filesystem assert against the installed wrapper.
+        # Detects accidental drift; an adversarial Dockerfile can still defeat
+        # it. Out-of-band image verification remains a WI#357 follow-up (GW-3).
+        wrapper_file="$CI_PROJECT_DIR/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
+        wrapper_anchor=$(sha256sum < "$wrapper_file") || {
+            echo "cannot hash $wrapper_file" >&2; exit 1;
+        }
+        wrapper_anchor=${wrapper_anchor%% *}
+        case "$wrapper_anchor" in
+            *[!0-9a-f]*) echo "invalid wrapper sha256 for $wrapper_file" >&2; exit 1 ;;
+        esac
+        [ "${#wrapper_anchor}" -eq 64 ] || {
+            echo "invalid wrapper sha256 for $wrapper_file" >&2; exit 1;
+        }
         build_args="OPENCODE_VERSION=v2.0.24
 OPENCODE_REF=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
 WITH_TOOLCHAINS=false
