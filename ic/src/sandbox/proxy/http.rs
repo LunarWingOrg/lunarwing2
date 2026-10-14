@@ -463,7 +463,10 @@ async fn forward_request(
                     Ok(make_response_from_builder(resp_builder, full_body(body)))
                 }
                 Err(e) => {
-                    tracing::error!("Proxy: failed to read response body: {}", e);
+                    // Body-read errors can carry the request URL in their
+                    // Display; strip it before logging (WI#395). The body
+                    // returned to the container stays a fixed generic message.
+                    tracing::error!("Proxy: failed to read response body: {}", e.without_url());
                     Ok(error_response(
                         StatusCode::BAD_GATEWAY,
                         "Failed to read response".to_string(),
@@ -472,6 +475,11 @@ async fn forward_request(
             }
         }
         Err(e) => {
+            // reqwest's Display appends the full request URL; with a QueryParam
+            // injection that URL carries the secret, and both this log line and
+            // the container-visible 502 body would hand it back to untrusted
+            // code (WI#395). Strip the URL before either use.
+            let e = e.without_url();
             tracing::error!("Proxy: request failed: {}", e);
             Ok(error_response(
                 StatusCode::BAD_GATEWAY,
@@ -595,6 +603,26 @@ mod tests {
     use super::*;
     use crate::sandbox::proxy::allowlist::DomainAllowlist;
     use crate::sandbox::proxy::policy::DefaultPolicyDecider;
+    use crate::secrets::{CredentialLocation, CredentialMapping};
+    use tracing_test::traced_test;
+
+    /// Resolves every secret name to a fixed value (for testing).
+    struct FixedCredentialResolver(String);
+
+    #[async_trait::async_trait]
+    impl CredentialResolver for FixedCredentialResolver {
+        async fn resolve(&self, _name: &str) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// Bind an ephemeral loopback port and release it so nothing listens there.
+    async fn closed_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
 
     #[tokio::test]
     async fn test_proxy_starts_and_stops() {
@@ -682,5 +710,68 @@ mod tests {
             forwarding_client(&uri, true).await.is_err(),
             "non-public targets never reach a forwarding client"
         );
+    }
+
+    /// WI#395: a container allowed to reach a host with a query-param
+    /// credential mapping can force a send failure (here: a closed port on the
+    /// mapped host) and read the 502 body. Neither the 502 body nor the
+    /// host-side error log may carry the injected secret or its `?<name>=`
+    /// pair (reqwest's Display would otherwise echo the full request URL).
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_send_error_502_omits_injected_query_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-secret-1a2b3c+/==";
+        let closed = closed_loopback_port().await;
+
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping {
+            secret_name: "QP_TOKEN".to_string(),
+            location: CredentialLocation::QueryParam {
+                name: "api_key".to_string(),
+            },
+            host_patterns: vec!["127.0.0.1".to_string()],
+            path_patterns: Vec::new(),
+            optional: false,
+        }];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+
+        let proxy = HttpProxy::new(decider, resolver);
+        let addr = proxy.start(0).await.unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{closed}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(
+            !response.contains(SECRET),
+            "injected secret leaked into the 502 body: {response}"
+        );
+        assert!(
+            !response.contains("api_key="),
+            "credential pair leaked into the 502 body: {response}"
+        );
+
+        // The same failure must not leak through the host-side error log.
+        assert!(logs_contain("Proxy: request failed"));
+        assert!(
+            !logs_contain(SECRET) && !logs_contain("api_key="),
+            "injected secret leaked into the proxy error log"
+        );
+
+        proxy.stop().await;
     }
 }
