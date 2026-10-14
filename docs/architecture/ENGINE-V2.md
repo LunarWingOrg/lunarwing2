@@ -938,8 +938,12 @@ replaces the whole `pending_shutdown_interruption` value and drops the
 newer entries (those fires keep their `INTERRUPTED` entry and dedup
 release but are never retried). A re-upgrade's boot sweep resolves each
 surviving interruption stamp younger than 24 hours
-(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) through the usual ownership and
-parity guards — record-only beyond that — and emits every owed outcome
+(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) through the WI#338 scan-time
+parity checks — the stamped thread must be a Mission-type thread of the
+mission's own project and owner (unless the mission is shared) and listed
+in the mission's `thread_history`; a mismatch clears the stamp
+record-only, and the same checks guard the retry-marker sweep and the
+recoverable-thread resume — record-only beyond that — and emits every owed outcome
 notice it finds, with no age bound. The
 upgrade direction has its own wrinkle: every live retry marker written by
 a build before WI#276 (pre-v2.1.5.0) deserializes with `notified: false`
@@ -1236,12 +1240,19 @@ create, on an
 update that switches to a Webhook cadence from another cadence, changes
 the path, or adds a usable
 secret to a dormant claim, and on resume
-(AO-1); updates that leave the claim untouched are not re-checked (a
+(AO-1); the claim check and the save are serialized by the shared
+mission create lock (`_claim_guard`) on every claim-making transition —
+create, update, and resume alike — so two racing transitions cannot both
+pass the check and both save (CJ-4); updates that leave the claim untouched are not re-checked (a
 same-path re-set is deliberately not checked), so
 under a legacy two-owner conflict either owner can still rotate a leaked
 secret — but a dormant row's owner cannot lower a budget or make any other
 update without first supplying a usable secret, because validation rejects
-the row otherwise (WI#359 CO-3). Dormant (secret-less or unpresentable
+the row otherwise (WI#359 CO-3) — "usable" here and everywhere above is
+the shared `usable_webhook_secret` predicate in
+`lunarwing_engine::types::mission` (non-empty, no leading/trailing
+whitespace, visible ASCII with an interior HTAB allowed — values httparse
+trims or `HeaderValue` rejects can never arrive on the wire). Dormant (secret-less or unpresentable
 whitespace/non-visible-ASCII secret) non-terminal rows still block other
 users' claims on their path (WI#359 CO-3); startup logs a warning for
 every legacy multi-owner path it re-activates (WI#359); two conflicting
