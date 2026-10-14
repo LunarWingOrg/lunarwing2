@@ -1,6 +1,10 @@
 # Harness Worker Capabilities (WI#326)
 
 Status: implemented in v2.1.6.0. Owner: `ic/src/orchestrator/harness.rs`.
+Re-checked 2026-10-14 for the v2.1.6.0 docs pass: the only harness.rs change
+after the EE-doc update (`f084624a1`) was a `cargo fmt` normalization — no
+behavior change; the capability contract, redaction coverage, write-back
+pipeline, and WI#383 residual list below are current.
 
 The conventional LunarWing Docker worker can run in **harness mode**
 (`create_job` with `mode: "harness"`), adding three optional capability
