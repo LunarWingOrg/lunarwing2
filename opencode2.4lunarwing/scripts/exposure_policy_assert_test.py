@@ -9,6 +9,7 @@ argument contract is asserted without needing the pinned image.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -390,7 +391,13 @@ class InstalledWrapperTests(unittest.TestCase):
 
     def check(self, *path: pathlib.Path, env: dict[str, str] | None = None) -> list[str]:
         self.assert_module.failures.clear()
-        environ = {"PATH": os.pathsep.join(str(p) for p in path)}
+        # Run-106 GJ-3(a): the build passes the checkout's wrapper digest as
+        # the LUNARWING_WRAPPER_SHA256 build arg; the fixture stands in for
+        # the checkout with the lane's committed wrapper bytes.
+        environ = {
+            "PATH": os.pathsep.join(str(p) for p in path),
+            "LUNARWING_WRAPPER_SHA256": hashlib.sha256(WRAPPER.read_bytes()).hexdigest(),
+        }
         if env:
             environ.update(env)
         with mock.patch.dict(os.environ, environ):
@@ -473,6 +480,27 @@ class InstalledWrapperTests(unittest.TestCase):
             self.bin_dir, env={"LUNARWING_REAL_OPENCODE": str(self.binary_path)}
         )
         self.assertEqual(failures, [])
+
+    def test_wrapper_and_source_rewritten_identically_fails(self) -> None:
+        # Run-106 GJ-3(a): the byte-identity reference ships inside the
+        # image, so a root RUN rewriting both /usr/local/bin/opencode AND
+        # /app/scripts/opencode-exposure-guard.sh identically passed GD-2's
+        # byte-identity check; the build-arg anchor (the checkout's digest)
+        # cannot be rewritten from inside the build context.
+        tampered = WRAPPER.read_bytes() + b"\n# rewritten in-image\n"
+        self.wrapper_path.write_bytes(tampered)
+        self.wrapper_path.chmod(0o755)
+        (self.lane / "scripts" / "opencode-exposure-guard.sh").write_bytes(tampered)
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("LUNARWING_WRAPPER_SHA256", failures[0])
+
+    def test_missing_anchor_fails(self) -> None:
+        # A dropped ARG declaration or a builder that does not forward the
+        # build arg must fail the image build, not silently skip the anchor.
+        failures = self.check(self.bin_dir, env={"LUNARWING_WRAPPER_SHA256": ""})
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("missing", failures[0])
 
     def test_image_filesystem_path_wires_the_check_in(self) -> None:
         # The scenarios above call the function directly (GD-3: the image

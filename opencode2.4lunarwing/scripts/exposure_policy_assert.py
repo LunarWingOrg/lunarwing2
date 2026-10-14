@@ -29,8 +29,9 @@ Assertions (opencode2 lane):
      installed wrapper is verified too: /usr/local/bin/opencode must be the
      byte-identical root-owned read-only executable exposure guard, PATH must
      resolve 'opencode' to it, the real binary is re-scanned for OpenTunnel
-     markers (run-103 GD-2), and LUNARWING_REAL_OPENCODE may not retarget the
-     wrapper at build time (run-106 GJ-3).
+     markers (run-103 GD-2), LUNARWING_REAL_OPENCODE may not retarget the
+     wrapper at build time, and the installed digest must match the
+     LUNARWING_WRAPPER_SHA256 build-arg anchor (run-106 GJ-3).
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1.18.25 has no service mode or
@@ -40,6 +41,7 @@ tunnel; pairing is a v2 surface).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -272,6 +274,7 @@ def check_installed_wrapper(
     binary_path: pathlib.Path = pathlib.Path("/usr/local/lib/opencode2/opencode"),
     *,
     owner_uid: int = 0,
+    wrapper_sha256: str | None = None,
 ) -> None:
     """Run-103 GD-2: verify the shipped wrapper, not the Dockerfile's claim.
 
@@ -281,7 +284,10 @@ def check_installed_wrapper(
     cannot lie. The wrapper must be the byte-identical, owner-only-writable,
     executable exposure guard, PATH must resolve 'opencode' to it, the real
     binary is re-scanned for OpenTunnel markers, and LUNARWING_REAL_OPENCODE
-    may not retarget the wrapper at build time (run-106 GJ-3b/c). Image
+    may not retarget the wrapper at build time (run-106 GJ-3b/c). The
+    installed digest must also match the LUNARWING_WRAPPER_SHA256 build-arg
+    anchor (run-106 GJ-3a) — the byte-identity source ships inside the
+    image, so only the anchor is unforgeable from the build context. Image
     builds only (v2 profile).
     """
     try:
@@ -315,6 +321,25 @@ def check_installed_wrapper(
     if installed != expected:
         fail(f"installed wrapper {wrapper_path} is not byte-identical to {source} — "
              "replaced after the scan (run-103 GD-2)")
+        return
+    # Run-106 GJ-3(a): {source} ships inside the image, so the same root RUN
+    # can rewrite both files identically and pass the byte-identity check.
+    # The build passes the checkout's wrapper sha256 as a build argument
+    # (LUNARWING_WRAPPER_SHA256); compare the installed digest against that
+    # anchor, and fail closed when it is absent — a dropped ARG or a builder
+    # that does not forward the arg must fail the image build, not pass.
+    anchor = wrapper_sha256 if wrapper_sha256 is not None else os.environ.get(
+        "LUNARWING_WRAPPER_SHA256", ""
+    )
+    installed_digest = hashlib.sha256(installed).hexdigest()
+    if not anchor:
+        fail("LUNARWING_WRAPPER_SHA256 (the checkout's wrapper digest) is missing — "
+             "the installed wrapper cannot be anchored (run-106 GJ-3a)")
+        return
+    if anchor != installed_digest:
+        fail(f"installed wrapper {wrapper_path} digest {installed_digest} does not "
+             f"match the LUNARWING_WRAPPER_SHA256 build-arg anchor — rewritten "
+             "together with the in-image reference (run-106 GJ-3a)")
         return
     # Run-106 GJ-3(b): the wrapper honours LUNARWING_REAL_OPENCODE over the
     # default binary path, so an ENV pointing it elsewhere would exec that

@@ -66,9 +66,15 @@ opencode2.4lunarwing/scripts/entrypoint_config_test.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
         source_ref=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
+        # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
+        # the in-image --image-filesystem assert against the installed
+        # wrapper (the in-image byte-identity reference is rewritable by a
+        # root RUN; this anchor is not).
+        wrapper_anchor=$(sha256sum "$CI_PROJECT_DIR/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" | cut -d ' ' -f 1)
         build_args="OPENCODE_VERSION=v2.0.24
 OPENCODE_REF=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
 WITH_TOOLCHAINS=false
+LUNARWING_WRAPPER_SHA256=$wrapper_anchor
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
     kimi)

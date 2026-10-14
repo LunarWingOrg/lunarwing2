@@ -1212,6 +1212,15 @@ build_opencode2_worker() {
   local -a toolchain_args=()
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
+  # WI#357 run-106 GJ-3(a): pass the checkout's exposure-guard wrapper digest
+  # so the in-image --image-filesystem assert can anchor the installed
+  # wrapper against something a root RUN inside the build cannot rewrite
+  # (the in-image byte-identity reference is rewritable; this is not). A
+  # missing or mismatched anchor fails the image build, fail-closed.
+  local wrapper_anchor
+  wrapper_anchor=$(sha256sum "$opencode2_dir/scripts/opencode-exposure-guard.sh" | cut -d ' ' -f 1)
+  [[ -n "$wrapper_anchor" ]] || die "cannot hash $opencode2_dir/scripts/opencode-exposure-guard.sh"
+
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()
     if [[ "$no_cache" == "true" ]]; then
@@ -1223,10 +1232,10 @@ build_opencode2_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" --network=host --format docker -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
       || die "opencode2 worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
       || die "opencode2 worker image build failed"
   fi
 

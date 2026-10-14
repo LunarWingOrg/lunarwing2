@@ -99,6 +99,15 @@ ARG OPENCODE_VERSION
 ARG OPENCODE_REF
 ENV OPENCODE_IMAGE_REF="${OPENCODE_VERSION}@${OPENCODE_REF}"
 
+# WI#357 run-106 GJ-3(a): sha256 of the checkout's
+# scripts/opencode-exposure-guard.sh, passed by build-worker-image.sh and
+# mt-admin's build_opencode2_worker. The final --image-filesystem assert
+# compares it against the installed wrapper's digest: the byte-identity
+# reference (/app/scripts) ships inside the image, so a root RUN could
+# rewrite both files identically — the build-arg anchor cannot be rewritten
+# from inside the build context. Absent or mismatched fails the build.
+ARG LUNARWING_WRAPPER_SHA256=
+
 LABEL org.opencontainers.image.title="LunarWing OpenCode 2 Worker" \
       org.opencontainers.image.description="Persistent OpenCode 2 worker with WebSocket agent communication" \
       org.opencontainers.image.version="1.0.0" \
