@@ -552,7 +552,11 @@ else
 fi
 DARKIRC_PIN_DIR=""
 PARTIAL_BUNDLE=""
-trap 'rm -rf "$WORK" "${DARKIRC_PIN_DIR:-}"; [[ -z "${PARTIAL_BUNDLE:-}" ]] || rm -f -- "$PARTIAL_BUNDLE"' EXIT
+# FL-5/GR-2 stderr capture must live OUTSIDE $WORK: in a real export $WORK is
+# the bundle staging directory, so a scratch file there would leak into the
+# bundle and fail the importer's top-level-entry validation.
+WRITERS_ERRF="$(mktemp)"
+trap 'rm -rf "$WORK" "${DARKIRC_PIN_DIR:-}"; [[ -z "${PARTIAL_BUNDLE:-}" ]] || rm -f -- "$PARTIAL_BUNDLE"; rm -f -- "$WRITERS_ERRF"' EXIT
 chmod 0700 "$WORK"
 
 # ---- 1. quiesce the writers (consistent + final snapshot) --------------------
@@ -563,14 +567,14 @@ banner "1/6  Quiesce tenant writers"
 # AND the stdout state word together so an error is never misread as a
 # quiesced tenant (which would let a snapshot race live writers).
 writers_active() {
-  local rc=0 out="" err="" errf="$WORK/writers-active.stderr"
-  : >"$errf"
-  out="$("$MT" writers-active "$TENANT" 2>"$errf")" || rc=$?
+  local rc=0 out="" err=""
+  : >"$WRITERS_ERRF"
+  out="$("$MT" writers-active "$TENANT" 2>"$WRITERS_ERRF")" || rc=$?
   # The refusal must carry the arm's stderr cause (root/usage/registry errors,
   # the EQ-1 refusal with its render-units repair text) — otherwise operators
   # stall on a bare rc (WI#393 GR-2). Bounded so a pathological subprocess
   # cannot flood the terminal; multi-line stdout stays refused by the *) arm.
-  err="$(head -c 1000 "$errf" 2>/dev/null || true)"
+  err="$(head -c 1000 "$WRITERS_ERRF" 2>/dev/null || true)"
   case "$rc:$out" in
     0:active) return 0 ;;
     1:stopped) return 1 ;;

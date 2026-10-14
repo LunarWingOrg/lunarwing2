@@ -779,7 +779,7 @@ grep -qE '^\s*owner-scopes)' "$MT" || die "mt-admin at $MT predates owner-scopes
 prepare_import_stage_root
 WORK="$(mktemp -d "$IMPORT_STAGE_ROOT/import.XXXXXX")"
 chmod 0700 "$WORK"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; [[ -z "${WRITERS_ERRF:-}" ]] || rm -f -- "$WRITERS_ERRF"' EXIT
 # Pin the caller-supplied credential bundle before any validation. Validation
 # and every later extraction then operate on the same owner-only non-/tmp copy,
 # so a writable source directory cannot swap archive contents between checks.
@@ -974,10 +974,12 @@ if jq -e ".tenants[\"$TENANT\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
     resume_writers_rc=0
     resume_writers_out=""
     resume_writers_err=""
-    resume_writers_out="$("$MT" writers-active "$TENANT" 2>"$WORK/writers-active-resume.stderr")" || resume_writers_rc=$?
+    # The capture file lives outside $WORK, which is the import staging dir.
+    WRITERS_ERRF="$(mktemp)"
+    resume_writers_out="$("$MT" writers-active "$TENANT" 2>"$WRITERS_ERRF")" || resume_writers_rc=$?
     # WI#393 GR-2: the refusal must carry the arm's stderr cause (the EQ-1
     # refusal text names the render-units repair command), not a bare refusal.
-    resume_writers_err="$(head -c 1000 "$WORK/writers-active-resume.stderr" 2>/dev/null || true)"
+    resume_writers_err="$(head -c 1000 "$WRITERS_ERRF" 2>/dev/null || true)"
     case "$resume_writers_rc:$resume_writers_out" in
       1:stopped) ;;
       0:active) die "cannot resume while tenant '$TENANT' has active writers" ;;
