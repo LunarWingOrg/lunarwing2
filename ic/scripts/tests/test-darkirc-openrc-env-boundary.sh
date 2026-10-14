@@ -155,6 +155,9 @@ fi
 source "$ADMIN_SCRIPT"
 render_body="$(declare -f render_tenant_openrc_units)"
 render_body+="$(declare -f render_proxy_openrc_unit)"
+# WI#393 GR-1: the proxy unit body now lives in the single template source
+# shared with the safe-unit contract; pin its text the same way.
+render_body+="$(declare -f _openrc_proxy_unit_template)"
 weechat_render_body="$(declare -f _render_weechat_openrc_unit)"
 writer_body="$(declare -f write_tenant_darkirc_adapter_env)"
 grep -Fq 'write_tenant_file_atomic "$name" "$path" 600' <<<"$writer_body" || {
@@ -204,10 +207,13 @@ for fragment in \
   }
 done
 
+# The proxy unit's text lives in the quoted-heredoc template (WI#393 GR-1),
+# so its source shows the unescaped form; the other renderers still use
+# unquoted heredocs with escaped ${...} in their source.
 for svc_pattern in \
   'lunarwing:required_files="\${lunarwing_openrc_env_exec} \${lunarwing_command} \${lunarwing_env_file}"' \
   'xmpp-bridge:required_files="\${xmpp_bridge_openrc_env_exec} \${xmpp_bridge_command} \${xmpp_bridge_env_file}"' \
-  'proxy:required_files="\${proxy_openrc_env_exec} \${proxy_command} \${proxy_env_file}"' \
+  'proxy:required_files="${proxy_openrc_env_exec} ${proxy_command} ${proxy_env_file}"' \
   'adapter:required_files="\${adapter_openrc_env_exec} \${adapter_command} \${adapter_env_file}"' \
   'darkirc-adapter:required_files="\${darkirc_adapter_openrc_env_exec} \${darkirc_adapter_command} \${darkirc_adapter_env_file}"'; do
   var="${svc_pattern%%:*}"
