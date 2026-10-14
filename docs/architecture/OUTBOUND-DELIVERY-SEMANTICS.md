@@ -10,7 +10,11 @@ record-only wording. Revalidated 2026-10-06 (v2.1.5.0): the `message`-tool
 ack wording, the XMPP enqueue gate / spool / drain / retry rules, and the
 `OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT` (2s) anchor were re-checked against
 `ic/src/tools/builtin/message.rs` and `ic/src/channels/xmpp/mod.rs` and
-still hold.** Defines what a
+still hold. Revalidated 2026-10-14 (v2.1.6.0): the acceptance-not-delivery
+ack wording, the XMPP enqueue gate / spool / drain / retry rules, and the
+2s drain-timeout anchor were re-checked against the same files and still
+hold; the mission-run ledger paragraph matches the WI#276/WI#341 wording
+in ENGINE-V2.md.** Defines what a
 successful `message`-tool send means, and what the XMPP channel guarantees
 about outbound stanzas. Rooted in the PR Digest #59 incident: a scheduled
 mission recorded "Delivered via XMPP … Goal achieved" in its memory because
