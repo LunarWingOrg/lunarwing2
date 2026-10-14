@@ -5,7 +5,7 @@ custom tunnel commands. Managed Cloudflare Tunnel, ngrok, and Tailscale provider
 externally managed service from any vendor remains supported through a static
 HTTPS `TUNNEL_URL`.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** `TUNNEL_URL` precedence,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** `TUNNEL_URL` precedence,
 `TUNNEL_CUSTOM_COMMAND`, and the V24 settings scrub were re-checked against
 `ic/src/config/tunnel.rs` and `ic/migrations/V24__remove_legacy_tunnel_settings.sql`;
 no changes were needed.
