@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "cranelift-srcgen"
-version = "0.123.17"
+version = "0.123.18"

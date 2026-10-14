@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "pulley-interpreter"
-version = "36.0.17"
+version = "36.0.18"
 authors = ["The Pulley Project Developers"]
 build = false
 autolib = false
@@ -74,17 +74,17 @@ version = "1.4.0"
 optional = true
 
 [dependencies.cranelift-bitset]
-version = "0.123.17"
+version = "0.123.18"
 
 [dependencies.log]
 version = "0.4.27"
 default-features = false
 
 [dependencies.pulley-macros]
-version = "=36.0.17"
+version = "=36.0.18"
 
 [dependencies.wasmtime-math]
-version = "=36.0.17"
+version = "=36.0.18"
 optional = true
 package = "wasmtime-internal-math"
 
