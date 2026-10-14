@@ -127,9 +127,10 @@ const LOREBOOK_DIR_PREFIX: &str = "lorebooks/";
 /// the next free slot. At the cap the first generation stays pinned and the
 /// second-oldest generation is discarded instead (with a `lunarwing::safety`
 /// audit line carrying its byte count and blake3 fingerprint, emitted before
-/// the destructive shift so a mid-shift failure still records the loss —
-/// WI#336 AB-2) while the rest
-/// shift down one slot — unless the write came through a
+/// the destructive shift so the generation marked for discard is recorded
+/// even when the shift then fails — a failure before the first slot write
+/// leaves it intact; WI#336 AB-2) while the rest shift down one slot —
+/// unless the write came through a
 /// `*_with_daily_log_cap_guard` method, which refuses at the cap (WI#335).
 /// The pin is positional, not evidential: `.1` holds the content that
 /// preceded the day's first backed-up replace in that scope (the first
@@ -1307,13 +1308,13 @@ impl Workspace {
     /// backup is stored
     /// with an empty chunk projection: retrievable by exact-path `read()`,
     /// visible in `list()`, but never search-indexed. Backup content is not
-    /// rescanned
-    /// (the `backups/` prefix is not prompt-visible), so even a previously
-    /// poisoned file can still be replaced. Every backup emits a
+    /// rescanned (the `backups/` prefix is not prompt-visible), so even a
+    /// previously poisoned file can still be replaced. Every backup emits a
     /// `lunarwing::safety` warn audit line with the path, prior byte count
     /// and backup path; a daily-log roll-aside additionally emits one naming
-    /// the numbered slot the previous version moved to (WI#336 AB-3). On
-    /// operator lanes (WI#286) backup and rotation
+    /// the numbered slot the previous version moved to (WI#336 AB-3), and a
+    /// failed rotation emits one fingerprinting the un-rotated rolling-slot
+    /// content (WI#336 GP-1). On operator lanes (WI#286) backup and rotation
     /// failures are logged and never block the write; a rotation failure in
     /// particular still leaves the rolling-slot overwrite to proceed, since
     /// that slot holds the immediately prior version the WI#288 repair path
@@ -1421,7 +1422,10 @@ impl Workspace {
     /// attempt crashed after the backup committed but before the replace did,
     /// and re-rotating would grow a duplicate generation per retry. A
     /// successful roll-aside emits a `lunarwing::safety` warn line naming the
-    /// numbered slot the previous version moved to (WI#336 AB-3).
+    /// numbered slot the previous version moved to (WI#336 AB-3). A failed
+    /// rotation — other than the fail-closed cap refusal, which has its own
+    /// line — emits one fingerprinting the un-rotated `.bak` content (WI#336
+    /// GP-1).
     async fn rotate_daily_log_backup(
         &self,
         scope: &str,
@@ -1506,13 +1510,14 @@ impl Workspace {
 
     /// First free numbered daily-log backup generation slot. At the
     /// [`MAX_DAILY_LOG_BACKUP_GENERATIONS`] cap, the first generation stays
-    /// pinned and the second-oldest
-    /// generation is discarded (audited with its byte count and blake3
-    /// fingerprint, the audit line emitted before the destructive shift so a
-    /// mid-shift failure still records what was lost — WI#336 AB-2), every
-    /// newer generation shifts down one slot, and the
-    /// freed top slot is returned, so both retained storage and this probe
-    /// stay bounded. The pin is positional, not evidential: `.1` holds the
+    /// pinned and the second-oldest generation is discarded (audited with its
+    /// byte count and blake3 fingerprint; the audit line is emitted before
+    /// the destructive shift, so the generation marked for discard is
+    /// recorded even when the shift then fails — a failure before the first
+    /// slot write leaves it intact; WI#336 AB-2), every newer generation
+    /// shifts down one slot, and the freed top slot is returned, so both
+    /// retained storage and this probe stay bounded. The pin is positional,
+    /// not evidential: `.1` holds the
     /// content that preceded the day's first backed-up replace in that scope
     /// (the first backup is taken only when the prior content is non-empty
     /// and differs; layer writes keep their own chain) — the poison's
@@ -5457,10 +5462,7 @@ mod runtime_index_tests {
                 .write(day, "three")
                 .await
                 .expect("operator replace proceeds past the failed rotation");
-            assert_eq!(
-                workspace.read(day).await.expect("day log").content,
-                "three"
-            );
+            assert_eq!(workspace.read(day).await.expect("day log").content, "three");
             assert_eq!(
                 workspace
                     .read("backups/daily/2026-10-09.md.bak")
