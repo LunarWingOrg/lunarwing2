@@ -10,7 +10,7 @@ checksum = "dde20b3d026af13f561bdd0f15edf01fc734f0dafcedbaf42bba506a9517f223"
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.123.17"
+version = "0.123.18"
 dependencies = [
  "arbitrary",
  "serde",
