@@ -756,12 +756,11 @@ fn value_contains_reencoded_secret(value: &[u8], secret: &[u8]) -> bool {
 
 /// Build the forwarding HTTP client for one proxied request.
 ///
-/// Advisory mode keeps the historical shared-client semantics (host redirects
-/// are followed transparently). Enforced mode constructs a client that never
-/// follows redirects (they are returned to the container, whose follow-up
-/// request re-enters the allowlist check), ignores environment proxy settings
-/// (so they cannot bypass DNS pinning), and pins every outbound connection to
-/// the previously resolved public addresses.
+/// Both modes use per-request clients that never follow redirects on the
+/// host (a 3xx is returned to the container, whose follow-up request
+/// re-enters the allowlist check) and ignore environment proxy settings
+/// (so they cannot bypass DNS pinning). Enforced mode additionally pins
+/// every outbound connection to the previously resolved public addresses.
 async fn forwarding_client(
     uri: &hyper::Uri,
     public_only: bool,

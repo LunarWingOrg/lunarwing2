@@ -409,8 +409,19 @@ plain-HTTP request with `301 Location: https://host/path?name=<form-encoded
 secret>`), so every spelling of the injected credential — raw and
 form-encoded — is replaced with `[REDACTED]` in header values before they
 reach the container, with a host-side warn naming the header only (WI#395).
-Response *bodies* that echo the request URL (e.g. error pages) are not
-scrubbed; that residual is tracked on WI#395.
+Re-encoded echoes that evade exact two-spelling matching (lowercase hex,
+double percent-encoding, `+` read as a space) are detected by
+percent-decoding up to two rounds and replace the whole header value;
+spellings shorter than 4 bytes are never spliced into header values (a
+1-3 byte "secret" corrupts unrelated headers for no security gain), and
+`Content-Length` is dropped rather than rewritten.
+
+Response *bodies* are scrubbed too (WI#395): 3xx bodies echo the redirect
+target URL on common edges (Go `net/http`, Apache, Express), so a
+credential-injected exchange requests `Accept-Encoding: identity`,
+byte-scrubs the body with the same spellings, drops the stale upstream
+`Content-Length` (hyper re-frames), and refuses — with 502 — a body that
+arrives `Content-Encoding`-compressed, because it cannot be inspected.
 
 ### Bind Address
 
@@ -530,6 +541,19 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    - Runs at two points: before sending and after receiving
    - Uses Aho-Corasick for fast multi-pattern matching
    - **Reference:** `crates/lunarwing_safety/src/leak_detector.rs`
+
+4. **Guest-facing redaction (WI#395)** — everything the WASM tool sees from
+   one HTTP exchange is redacted once at the trait boundary
+   (`Host::http_request`): send errors (URL stripped via `without_url()`),
+   early validator errors that quote the injected URL (allowlist deny
+   reasons), response headers (a redirect `Location` can echo the
+   urlencoded query credential), and response bodies (3xx bodies echo the
+   redirect target URL on common edges). Headers are redacted per field
+   before serialization — a secret containing `"` or `\` is JSON-escaped in
+   the serialized form and would slip past string-level replacement — and
+   bodies are scrubbed at the byte level (bodies are not guaranteed UTF-8).
+   **Reference:** `src/tools/wasm/wrapper.rs` —
+   `StoreData::redact_http_outcome_for_guest`
 
 ### Daemon Log Scrubbing and `/tenant-logs` (WI#287)
 
