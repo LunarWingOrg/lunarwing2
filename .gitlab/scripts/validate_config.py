@@ -507,6 +507,7 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
         "worker-kimi-ts": (
             "$CI_NODE_IMAGE",
             (
+                "snapshot.debian.org",
                 "apt-get install -y --no-install-recommends python3",
                 "cd kimicode4lunarwing/scripts",
                 "npm ci --ignore-scripts",
@@ -986,6 +987,37 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                     "CI_NODE_IMAGE digest must match the node digest(s) in "
                     "kimicode4lunarwing/Dockerfile"
                 )
+
+    # The worker-kimi-ts lane installs its python3 apt prerequisite inside
+    # the bare node image; it must come from the same pinned Debian snapshot
+    # the image builds with, not the live deb.debian.org mirror (MR !1618
+    # review GV-4). Fail closed like the image ties: a missing/malformed
+    # variable, a missing Dockerfile, or a missing/divergent valued
+    # ARG DEBIAN_SNAPSHOT must not silently dissolve the tie.
+    snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
+    if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
+        errors.append(
+            "defaults.yml CI_DEBIAN_SNAPSHOT must be a snapshot timestamp "
+            f"(YYYYMMDDTHHMMSSZ), got {snapshot!r}"
+        )
+    elif not KIMI_DOCKERFILE.is_file():
+        errors.append(
+            "kimicode4lunarwing/Dockerfile missing; cannot cross-check "
+            "CI_DEBIAN_SNAPSHOT against its ARG DEBIAN_SNAPSHOT"
+        )
+    else:
+        dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
+        snapshot_args = re.findall(r"(?m)^ARG\s+DEBIAN_SNAPSHOT=(\S+)$", dockerfile_text)
+        if not snapshot_args:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile has no valued ARG DEBIAN_SNAPSHOT; "
+                "cannot cross-check CI_DEBIAN_SNAPSHOT"
+            )
+        elif set(snapshot_args) != {snapshot}:
+            errors.append(
+                "CI_DEBIAN_SNAPSHOT must match the ARG DEBIAN_SNAPSHOT value(s) in "
+                "kimicode4lunarwing/Dockerfile"
+            )
 
     literal_images = {
         ".worker-candidate": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51",

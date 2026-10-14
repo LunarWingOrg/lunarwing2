@@ -64,6 +64,11 @@ both Rust jobs to use same digest-pinned image and keeps README digest in sync.
 Job images are declared through the `CI_LINT_IMAGE`, `CI_RUST_IMAGE`,
 `CI_GITLEAKS_IMAGE`, `CI_BUN_IMAGE`, and `CI_NODE_IMAGE` variables in `defaults.yml`; `ci-config` expands those
 variables before checking pins, so overrides must stay digest-pinned too.
+`CI_DEBIAN_SNAPSHOT` (same file) is not an image but is tied the same way:
+it must equal the valued `ARG DEBIAN_SNAPSHOT` in
+`kimicode4lunarwing/Dockerfile`, and the `worker-kimi-ts` lane installs its
+python3 prerequisite from that snapshot archive instead of the live
+deb.debian.org mirror.
 
 ### Rustup component downloads and runner DNS
 
@@ -220,7 +225,9 @@ candidate job — the scan can only succeed after a candidate publishes
   `npx tsc` + `npm test` sequence. The lane first installs the builder
   stage's python3 apt prerequisite — the bare `CI_NODE_IMAGE` node image
   lacks python3 and the entrypoint config tests bash-run `entrypoint.sh`,
-  whose config section embeds python3 heredocs. Runs on every MR/branch
+  whose config section embeds python3 heredocs — from the pinned
+  `CI_DEBIAN_SNAPSHOT` archive (tied to the Dockerfile `ARG DEBIAN_SNAPSHOT`
+  by `validate_config.py`), not the live deb.debian.org mirror. Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
   `validate_config.py` ties to the node FROM digest(s) in
   `kimicode4lunarwing/Dockerfile` (fail-closed, like the bun tie). The
