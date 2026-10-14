@@ -330,6 +330,15 @@ class BunImageTieTests(unittest.TestCase):
         )
         self.assertTrue(any("CI_BUN_IMAGE digest must match" in error for error in self.errors()))
 
+    def test_two_stage_drift_is_caught(self):
+        # Builder matches the variable but the runtime stage drifts: only a
+        # set-equality comparison catches this; an any-match check would not.
+        self.write_dockerfile(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n"
+            f"FROM docker.io/oven/bun:debian@sha256:{self.OTHER_DIGEST} AS runtime\n"
+        )
+        self.assertTrue(any("CI_BUN_IMAGE digest must match" in error for error in self.errors()))
+
     def test_missing_dockerfile_is_caught(self):
         self.assertTrue(any("Dockerfile missing" in error for error in self.errors()))
 
@@ -408,6 +417,16 @@ class NodeImageTieTests(unittest.TestCase):
     def test_digest_mismatch_is_caught(self):
         self.write_dockerfile(
             f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST[:-1]}0 AS builder\n"
+        )
+        self.assertTrue(any("CI_NODE_IMAGE digest must match" in error for error in self.errors()))
+
+    def test_two_stage_drift_is_caught(self):
+        # MR !1601 review GH-3: builder matches the variable but the runtime
+        # stage drifts — only set equality catches this; an any-match
+        # comparison (`var_digest in dockerfile_digests`) would accept it.
+        self.write_dockerfile(
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n"
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS runtime\n"
         )
         self.assertTrue(any("CI_NODE_IMAGE digest must match" in error for error in self.errors()))
 
