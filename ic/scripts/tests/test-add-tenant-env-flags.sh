@@ -114,6 +114,26 @@ generate_token()          { echo "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 say()                     { :; }          # silence
 chown()                   { :; }          # no-op (running as non-root in tests)
 
+# WI#390: the env writers commit through the tenant-side atomic writer, which
+# drops privileges with sudo -u <tenant>. This harness's tenant does not exist
+# as an account, so map the fixture tenant onto the invoking user (the fixture
+# env dir is owned by that user at mode 700, satisfying every tenant-side
+# ownership/privacy check) and let sudo -u invocations run directly.
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
+tenant_cat() { cat -- "$2"; }
+original_writer="$(declare -f write_tenant_file_atomic)"
+eval "${original_writer/write_tenant_file_atomic ()/original_write_tenant_file_atomic ()}"
+write_tenant_file_atomic() {
+  local name="$1"
+  shift
+  [[ "$name" != fixture-tenant ]] || name="$(id -un)"
+  original_write_tenant_file_atomic "$name" "$@"
+}
+
 run_writer() {  # <args...> — invokes write_tenant_lunarwing_env, prints the file
   rm -f "$MT_FIXTURE/env/lunarwing.env"
   write_tenant_lunarwing_env "$@"
@@ -766,6 +786,72 @@ assert_eq "resolver: stored wins over default" \
   "$(resolve_tenant_xmpp_jid fixture-tenant "")" "stored@xmpp.sobe.world"
 assert_eq "resolver: explicit wins over stored" \
   "$(resolve_tenant_xmpp_jid fixture-tenant "cli@xmpp.example.net")" "cli@xmpp.example.net"
+
+echo "=== WI#390: env writers refuse symlinked/foreign targets ==="
+
+# A pre-placed symlink at the destination must never be followed: the write
+# fails closed and the attacker-chosen target keeps its content.
+sensitive="$MT_FIXTURE/sensitive-target"
+printf 'DO-NOT-TRUNCATE\n' >"$sensitive"
+
+ln -s "$sensitive" "$MT_FIXTURE/env/proxy.env"
+if ( write_tenant_proxy_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: proxy env writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "proxy.env symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+assert_eq "proxy.env symlink left in place" \
+  "$(if [[ -L "$MT_FIXTURE/env/proxy.env" ]]; then echo symlink; else echo replaced; fi)" "symlink"
+
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/lunarwing.env"
+if ( write_tenant_lunarwing_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: lunarwing env writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "lunarwing.env symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+
+rm -f "$MT_FIXTURE/env/xmpp-bridge.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/xmpp-bridge.env"
+if ( write_tenant_bridge_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: bridge env writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "xmpp-bridge.env symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+
+# A dangling symlink (target absent) must not be created/truncated either.
+rm -f "$MT_FIXTURE/env/proxy.env"
+ln -s "$MT_FIXTURE/env/.dangling-target" "$MT_FIXTURE/env/proxy.env"
+if ( write_tenant_proxy_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: proxy env writer created a dangling symlink's target"; failures=$((failures + 1))
+else
+  echo "  PASS: proxy env writer refuses a dangling symlink"
+fi
+if [[ -e "$MT_FIXTURE/env/.dangling-target" ]]; then
+  echo "  FAIL: dangling symlink target was created"; failures=$((failures + 1))
+fi
+
+# The append helper fails closed on a symlinked target too, and round-trips a
+# clean one through the tenant-side atomic writer.
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+printf 'LLM_BASE_URL=http://direct:9000/v1\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+if ( _tenant_env_append fixture-tenant "$MT_FIXTURE/env/lunarwing.env" <<< 'PIN_OK=1' ); then
+  assert_eq "_tenant_env_append round-trips through the atomic writer" "$(envval PIN_OK)" "1"
+else
+  echo "  FAIL: _tenant_env_append refused a clean target"; failures=$((failures + 1))
+fi
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/lunarwing.env"
+if ( printf 'EVIL=1\n' | _tenant_env_append fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) >/dev/null 2>&1; then
+  echo "  FAIL: _tenant_env_append followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "_tenant_env_append symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+
+# Leave no symlinks behind: later sections rewrite these fixtures with plain
+# redirects, which would follow them.
+rm -f "$MT_FIXTURE/env/lunarwing.env" "$MT_FIXTURE/env/xmpp-bridge.env" "$MT_FIXTURE/env/proxy.env"
 
 echo "=== write_tenant_bridge_env fixture tests ==="
 

@@ -1643,8 +1643,9 @@ write_tenant_bridge_env() {
   fi
 
   # WI#390: write as the tenant through the atomic writer — root never opens
-  # xmpp-bridge.env inside the tenant-writable env dir (see proxy.env).
-  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600
+  # xmpp-bridge.env inside the tenant-writable env dir (see proxy.env). The
+  # explicit || die keeps the refusal fatal even when errexit is suppressed.
+  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600 || die "could not safely write $path"
 LUNARWING_BASE_DIR=$state_dir
 IRONCLAW_BASE_DIR=$state_dir
 XMPP_BRIDGE_BIND=127.0.0.1:${bridge_port}
@@ -1678,7 +1679,9 @@ write_tenant_proxy_env() {
   # WI#390: write as the tenant through the atomic writer — root never opens
   # proxy.env inside the tenant-writable env dir, so a pre-placed or raced
   # symlink there cannot redirect the write onto an attacker-chosen path.
-  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600
+  # The explicit || die keeps the refusal fatal even when errexit is suppressed
+  # (e.g. the whole call sits inside an if-condition).
+  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600 || die "could not safely write $path"
 PROXY_PORT=$proxy_port
 PROXY_BIND=127.0.0.1
 TENSORZERO_URL=$tensorzero_url
@@ -2906,13 +2909,16 @@ write_tenant_gotify_config() {
   gotify_url="$(printf '%s' "$gotify_url" | sed 's|/$||')"
   # WI#390: commit through the tenant-side atomic writer — root never opens
   # gotify.json inside the tenant-writable state tree. The writer's mode 600
-  # also hardens the previous umask-dependent 0644.
+  # also hardens the previous umask-dependent 0644. The explicit returns keep
+  # the refusal fatal even when errexit is suppressed by the caller's context.
   if [[ -n "$gotify_title" ]]; then
     printf '{"url": "%s", "title": "%s"}\n' "$gotify_url" "$gotify_title" \
-      | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent
+      | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent \
+      || return 1
   else
     printf '{"url": "%s"}\n' "$gotify_url" \
-      | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent
+      | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent \
+      || return 1
   fi
   say "wrote: $config_path"
 }
