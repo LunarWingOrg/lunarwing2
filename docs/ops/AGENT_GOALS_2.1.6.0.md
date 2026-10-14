@@ -482,6 +482,7 @@
 41. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/377
 42. [ ] update all docs in docs/guides - last attempt was at https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1613 please see comments of MR for blockers etc
 43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/390 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1630 - please address HH-1 and HH-2 and HH-3 and the Pebble workspace fix in the next try
-44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/380 and increase handle_message_timeout to higher value between 600-630 
+44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/380 and increase handle_message_timeout to higher value between 600-630
+45. [x] (S) (H) (MR) Read notes from goals doc and catch up
 
 ---
