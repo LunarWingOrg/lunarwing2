@@ -557,13 +557,18 @@ chmod 0700 "$WORK"
 
 # ---- 1. quiesce the writers (consistent + final snapshot) --------------------
 banner "1/6  Quiesce tenant writers"
+# FL-5 (WI#393): the writers-active arm's contract is 0:active / 1:stopped /
+# 2:unknown, but its precondition failures (root, usage, registry, name, lock
+# dir) also exit 1 — the exit code alone cannot say "stopped". Require the rc
+# AND the stdout state word together so an error is never misread as a
+# quiesced tenant (which would let a snapshot race live writers).
 writers_active() {
-  local rc=0
-  "$MT" writers-active "$TENANT" >/dev/null 2>&1 || rc=$?
-  case "$rc" in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) die "mt-admin writers-active failed for '$TENANT' (rc=$rc)" ;;
+  local rc=0 out=""
+  out="$("$MT" writers-active "$TENANT" 2>/dev/null)" || rc=$?
+  case "$rc:$out" in
+    0:active) return 0 ;;
+    1:stopped) return 1 ;;
+    *) die "mt-admin writers-active could not confirm writer state for '$TENANT' (rc=$rc)" ;;
   esac
 }
 if $NO_QUIESCE; then
