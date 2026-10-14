@@ -2,7 +2,7 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-05 (v2.1.5.0 item-23 tiers).**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), 2026-10-05 (v2.1.5.0 item-23 tiers), and 2026-10-14 (v2.1.6.0).**
 Referenced ops runbook,
 `ic/scripts/release-test.sh`, and the channel/worker/multi-tenant tiers were
 re-checked against the current tree. Added the v2.1.2.0 durable cross-channel
@@ -18,7 +18,10 @@ editor (WI#220), opt-in tool runtime-estimate hints (WI#191),
 `routine_history` over Engine V2 missions (WI#265), and the mt-admin
 read-only diagnostics verbs (WI#268). The 2026-10-05 repass added v2.1.5.0
 tiers: the lightweight routine tool-round budget (WI#291) and the
-pending-gates corrupt-file quarantine (WI#299).
+pending-gates corrupt-file quarantine (WI#299). The 2026-10-14 repass added
+v2.1.6.0 tiers: the daily-log backup generation cap (WI#335), the required
+tenant LLM endpoint at provisioning (WI#330), and the external-worker
+proxied tool surface (WI#324).
 
 Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
@@ -80,6 +83,7 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] Sandbox policy behavior matches the active runtime (`SANDBOX_RUNTIME` auto/podman/docker) and network mode (`SANDBOX_NETWORK` none/proxy-enforced/proxy). Default is `none` (no egress); `proxy-enforced` keeps `--network none` and reaches only the validating allowlist proxy through a per-execution Unix-socket relay; `proxy` is the legacy advisory mode.
 - [ ] HTTP requests obey URL validation, private-address policy, redirects, and capability allowlists.
 - [ ] Memory read, write, tree, and hybrid search preserve workspace semantics.
+- [ ] **Daily-log backup generation cap** (v2.1.6.0, WI#335) — against one day log, drive nine agent `memory_write` replaces (cap is `MAX_DAILY_LOG_BACKUP_GENERATIONS = 8` plus the rolling `.bak`): the ninth fails closed as a `NotAuthorized` refusal naming the retained generations, nothing is written, no generation is lost, and appends still work; an operator replace through the web memory editor or CLI still succeeds on the same saturated day (see `ic/src/workspace/README.md`).
 - [ ] Secret list/delete operations never return secret values.
 - [ ] Install, authenticate, activate, deactivate, update, and remove a disposable tool.
 - [ ] Install and invoke a WASM tool with host-injected credentials.
@@ -108,6 +112,7 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Worker disconnect: verify connection-level failover and clear terminal state.
 - [ ] Container boundary: verify secrets are not copied into worker output or environment diagnostics.
 - [ ] Job list, status, events, prompt, and cancel operations agree across CLI/web/tool surfaces.
+- [ ] **External-worker proxied tools** (v2.1.6.0, WI#324) — on a worker with a `tool_allowlist` grant (kimi lane ships the `lunarwing` MCP shim), confirm a permitted proxied call (e.g. `memory_read` of an allowed workspace path) round-trips through the hub, an unlisted tool is absent from the worker's tool catalog, and a denied call returns the hub's sanitized reason; a cron-mode worker gets no worker-level grants on ordinary dispatches (see `../ops/WORKER-CONTAINERS.md`).
 
 ## Multi-Tenant and Init Coverage
 
@@ -117,6 +122,7 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Verify systemd user-manager behavior on systemd hosts.
 - [ ] Verify OpenRC service rendering and lifecycle on a Gentoo/OpenRC host, or record the tier as deferred.
 - [ ] Start, stop, restart, build, and remove the disposable tenant through MT admin.
+- [ ] **Required tenant LLM endpoint** (v2.1.6.0, WI#330) — `add-tenant` without `--tensorzero-url`/`LUNARWING_MT_TENSORZERO_URL`/`--llm-base-url` aborts before creating tenant state; `--enable-proxy` without an upstream aborts; worker envs carry a real endpoint or the baked `.invalid` placeholder, and a worker container refuses to start on the placeholder naming the variable to fix; `upgrade-tenant` backfills an inheritable endpoint for enabled workers before rebuilding (see `MT-ADMIN-QUICKSTART.md` §3).
 - [ ] Confirm host health discovery uses the tenant port registry rather than a hardcoded single-node port.
 
 ## Security and Recovery
