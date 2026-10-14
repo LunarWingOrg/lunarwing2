@@ -62,7 +62,7 @@ Pinned images:
 `ic/rust-toolchain.toml`, and both primary/MSRV image tags. It also requires
 both Rust jobs to use same digest-pinned image and keeps README digest in sync.
 Job images are declared through the `CI_LINT_IMAGE`, `CI_RUST_IMAGE`,
-`CI_GITLEAKS_IMAGE`, and `CI_BUN_IMAGE` variables in `defaults.yml`; `ci-config` expands those
+`CI_GITLEAKS_IMAGE`, `CI_BUN_IMAGE`, and `CI_NODE_IMAGE` variables in `defaults.yml`; `ci-config` expands those
 variables before checking pins, so overrides must stay digest-pinned too.
 
 ### Rustup component downloads and runner DNS
@@ -214,6 +214,19 @@ candidate job — the scan can only succeed after a candidate publishes
   publishes no shared cache, preserving the protected-cache-writer policy.
   Override `CI_BUN_IMAGE` with a mirror of the pinned digest to avoid
   Docker Hub quotas. Worker image rebuilds remain a separate protected gate.
+- `worker-kimi-ts`: the kimi worker Node/TS suites (bridge, executor, tool
+  proxy relay, MCP shim, runtime, entrypoint/hook policy) via the
+  kimicode4lunarwing Dockerfile builder stage's `npm ci --ignore-scripts` +
+  `npx tsc` + `npm test` sequence. The lane first installs the builder
+  stage's python3 apt prerequisite — the bare `CI_NODE_IMAGE` node image
+  lacks python3 and the entrypoint config tests bash-run `entrypoint.sh`,
+  whose config section embeds python3 heredocs. Runs on every MR/branch
+  push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
+  `validate_config.py` ties to the node FROM digest(s) in
+  `kimicode4lunarwing/Dockerfile` (fail-closed, like the bun tie). The
+  real-CLI contract lane (`kimi_cli_contract_test`) self-skips here — the
+  image carries no kimi binary — so the protected candidate image build
+  remains the only place that contract is asserted against the real CLI.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL

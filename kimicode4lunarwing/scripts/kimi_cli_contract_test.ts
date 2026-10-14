@@ -44,8 +44,8 @@ import { test } from "node:test"
  * provider was contacted — everything the contract needs, in a few seconds
  * instead of the full ~60s+ retry exhaustion.
  *
- * Self-skip: when no real kimi binary is on PATH (host dev machines) both
- * tests skip. In the worker image build (`npm test` in the Dockerfile) the
+ * Self-skip: when no real kimi binary is on PATH (host dev machines) all
+ * four tests skip. In the worker image build (`npm test` in the Dockerfile) the
  * gate asserts the contract for real — `bin/kimi` is on PATH there; if the
  * build layout ever changes, KIMI_BIN can point at the installed CLI
  * explicitly.

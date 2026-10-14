@@ -457,6 +457,52 @@ def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
             errors.append(f"check-satellite-advisories.sh lost its {fragment} guard")
 
 
+def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
+    """Both worker TS lanes must exist and keep their MR-pipeline wiring.
+
+    MR !1601 review GH-2: neither TS lane was pinned by the validator, so
+    deleting the whole block or replacing its rules with `when: never`
+    passed every gate silently — exactly the regression class GB-2 was
+    about. Require each lane to exist, to run on merge_request_event, to use
+    its digest-tied image variable, and to keep its core script fragments
+    (including the kimi lane's python3 provisioning, GH-1).
+    """
+    expected = {
+        "worker-kimi-ts": (
+            "$CI_NODE_IMAGE",
+            (
+                "apt-get install -y --no-install-recommends python3",
+                "cd kimicode4lunarwing/scripts",
+                "npm ci --ignore-scripts",
+                "npx tsc -p tsconfig.json",
+                "npm test",
+            ),
+        ),
+        "worker-opencode-ts": (
+            "$CI_BUN_IMAGE",
+            (
+                "cd opencode4lunarwing",
+                "bun install --frozen-lockfile",
+                "tsc --noEmit -p scripts/tsconfig.json",
+            ),
+        ),
+    }
+    for job_name, (image_variable, fragments) in expected.items():
+        job = merged.get(job_name)
+        if not isinstance(job, dict):
+            errors.append(f"{job_name} job missing")
+            continue
+        if image_name(job.get("image")) != image_variable:
+            errors.append(f"{job_name} must use the {image_variable} image")
+        if not any("merge_request_event" in condition for condition in rule_conditions(job)):
+            errors.append(f"{job_name} must run on merge_request_event")
+        script = job.get("script", [])
+        commands = "\n".join(script if isinstance(script, list) else [str(script)])
+        for fragment in fragments:
+            if fragment not in commands:
+                errors.append(f"{job_name} lost its required script fragment: {fragment}")
+
+
 def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
     """Catch release metadata drift before the expensive WASM/host test job."""
     expected = merged.get("cavepony-wasm", {}).get("variables", {}).get("CAVEPONY_EXPECTED_VERSION")
@@ -814,7 +860,9 @@ def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
 
 
 def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors: list[str]) -> None:
-    trust_sensitive = ("CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE", "CI_BUN_IMAGE")
+    trust_sensitive = (
+        "CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE", "CI_BUN_IMAGE", "CI_NODE_IMAGE"
+    )
     for name in trust_sensitive:
         value = variables.get(name, "")
         if not value:
@@ -861,6 +909,46 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                 errors.append(
                     "CI_BUN_IMAGE digest must match the oven/bun digest(s) in "
                     "opencode4lunarwing/Dockerfile"
+                )
+
+    # The worker-kimi-ts lane must test with the same node content the worker
+    # image builds and runs with (MR !1590 review GB-2). Fail closed like the
+    # bun tie above: a missing Dockerfile, an unpinned/malformed node FROM, or
+    # no node FROM at all must not silently dissolve the tie.
+    node_match = DIGEST_PATTERN.search(variables.get("CI_NODE_IMAGE", ""))
+    if node_match:
+        if not KIMI_DOCKERFILE.is_file():
+            errors.append(
+                "kimicode4lunarwing/Dockerfile missing; cannot cross-check "
+                "CI_NODE_IMAGE against its node FROM digest(s)"
+            )
+        else:
+            dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
+            node_from_lines = [
+                line.strip()
+                for line in dockerfile_text.splitlines()
+                if re.match(r"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?\S*/node[:@]", line)
+            ]
+            if not node_from_lines:
+                errors.append(
+                    "kimicode4lunarwing/Dockerfile has no node FROM line; "
+                    "cannot cross-check CI_NODE_IMAGE"
+                )
+            dockerfile_node_digests = set()
+            for from_line in node_from_lines:
+                digest_match = re.search(r"@sha256:([0-9a-f]{64})(?![0-9a-fA-F])", from_line)
+                if digest_match:
+                    dockerfile_node_digests.add(digest_match.group(1))
+                else:
+                    errors.append(
+                        "kimicode4lunarwing/Dockerfile node FROM is not pinned "
+                        "to a 64-char lowercase sha256 digest: "
+                        f"{from_line!r}"
+                    )
+            if dockerfile_node_digests and dockerfile_node_digests != {node_match.group(1)}:
+                errors.append(
+                    "CI_NODE_IMAGE digest must match the node digest(s) in "
+                    "kimicode4lunarwing/Dockerfile"
                 )
 
     literal_images = {
@@ -997,6 +1085,7 @@ def main() -> int:
     validate_cavepony_version(merged_config, errors)
     validate_cargo_deny_gate(merged_config, errors)
     validate_satellite_advisory_sweep(merged_config, errors)
+    validate_worker_ts_lanes(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
     validate_worker_versions(errors)
     validate_deliverables_manifest(merged_config, errors)
