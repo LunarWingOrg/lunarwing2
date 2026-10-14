@@ -279,7 +279,11 @@ Enforced controls (opencode2 lane unless noted):
    heredocs (`<<`, including a token split across continued lines). Before
    the assertion, those spellings can hide its RUN inside a previous
    instruction or heredoc body; the earlier "safe over-refusal" claim was
-   incorrect. GW-3 refuses `SHELL`, any instruction naming
+   incorrect. Run-110 GX-1: the BOM is stripped from the first line only, as
+   BuildKit does, so a BOM on a later line reaches the printable-ASCII
+   refusal, and NUL bytes are refused outright (bash `read` drops them,
+   BuildKit keeps them). Either one used to make the guard join the next
+   instruction into a `LABEL` while BuildKit ran it on its own. GW-3 refuses `SHELL`, any instruction naming
    `LUNARWING_WRAPPER_SHA256`, `LUNARWING_REAL_OPENCODE` or `OPENCODE_BIN`
    except the exact `ARG LUNARWING_WRAPPER_SHA256=`, and ENV keys that are
    expanded or use legacy space-separated assignment syntax. Literal

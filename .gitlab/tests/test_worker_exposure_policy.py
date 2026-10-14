@@ -542,6 +542,27 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn("continuation backslash must not have trailing whitespace", result.stderr)
 
+    def test_dockerfile_late_bom_and_nul_bytes_fail(self):
+        # Run-110 GX-1: BuildKit strips a BOM before the first line only and
+        # keeps NUL bytes, while bash's read drops them. Either spelling ended
+        # a LABEL for BuildKit while the guard joined the next RUN into it.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_bytes()
+        assertion = FILESYSTEM_ASSERTION.encode()
+        hidden = b"RUN cp /usr/local/lib/opencode2/opencode /usr/local/bin/opencode\n"
+        for name, inserted, reason in (
+            ("bom-line", b"LABEL poc=1\\\n\xef\xbb\xbf\n", "does not start with printable ASCII"),
+            ("bom-comment", b"LABEL poc=1 \\\n\xef\xbb\xbf#=hidden\n", "does not start with printable ASCII"),
+            ("nul-after-backslash", b"LABEL poc=1\\\x00\n", "NUL bytes"),
+            ("nul-comment", b"LABEL poc=1 \\\n\x00#=hidden\n", "NUL bytes"),
+        ):
+            with self.subTest(name=name):
+                dockerfile.write_bytes(original.replace(assertion, assertion + inserted + hidden, 1))
+                result = self.run_guard(self.root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(reason, result.stderr)
+        dockerfile.write_bytes(original)
+
     def test_dockerfile_heredocs_cannot_swallow_assertion(self):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         original = dockerfile.read_text()

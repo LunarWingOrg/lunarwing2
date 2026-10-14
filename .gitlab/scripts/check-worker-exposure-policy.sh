@@ -38,10 +38,22 @@ python3 "$lane/scripts/entrypoint_config_test.py" || failed=1
 dockerfile="$lane/Dockerfile"
 dockerfile_code=""
 _join=""
+# Run-110 GX-1: bash's read drops NUL bytes that BuildKit keeps, so a NUL
+# after a trailing backslash, or a NUL-prefixed line inside a continuation,
+# ends an instruction for BuildKit while this loop joins the next one.
+if ! python3 -c 'import sys; sys.exit(b"\0" in open(sys.argv[1], "rb").read())' "$dockerfile"; then
+    fail "Dockerfile contains NUL bytes (run-110 GX-1)"
+fi
+_first_line=1
 while IFS= read -r _raw || [[ -n "$_raw" ]]; do
     # Run-103 GD-1: Docker strips a UTF-8 BOM before the first line; without
     # this a BOM-prefixed directive is not even recognized as a comment.
-    _raw="${_raw#$'\xef\xbb\xbf'}"
+    # Run-110 GX-1: only before the first line. A BOM on a later line is
+    # content for BuildKit, so it must reach the GJ-1 refusal below.
+    if ((_first_line)); then
+        _raw="${_raw#$'\xef\xbb\xbf'}"
+        _first_line=0
+    fi
     _line="${_raw#"${_raw%%[![:space:]]*}"}"
     if [[ "$_line" == \#* ]]; then
         # Run-97 FQ-3: a parser directive changes how Docker itself parses the
