@@ -395,9 +395,11 @@ write_tenant_vision_env() {
   mkdir -p "$env_dir"
   # WI#390: write as the tenant through the atomic writer — root never opens
   # vision.env inside the tenant-writable env dir, so a pre-placed or raced
-  # symlink there cannot redirect the write onto an attacker-chosen path.
+  # symlink there cannot redirect the write onto an attacker-chosen path. The
+  # explicit returns keep the refusal fatal even when errexit is suppressed
+  # (e.g. a caller's || fallback list).
   if [[ -n "$vl_url" ]]; then
-    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600 || return 1
 LUNARWING_AUTH_TOKEN=$token
 OCR_PORT=$VISION_SIDECAR_INTERNAL_PORT
 OCR_HEALTH_PORT=$VISION_SIDECAR_HEALTH_PORT
@@ -405,7 +407,7 @@ VL_URL=$vl_url
 VL_MODEL=qwen3-vl
 ENVEOF
   else
-    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600 || return 1
 LUNARWING_AUTH_TOKEN=$token
 OCR_PORT=$VISION_SIDECAR_INTERNAL_PORT
 OCR_HEALTH_PORT=$VISION_SIDECAR_HEALTH_PORT
