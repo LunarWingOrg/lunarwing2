@@ -4,18 +4,19 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).**
 Every referenced mt-admin
 subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 `patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,
 `tokens`, WeeChat bootstrap recovery) was re-checked against
-`ic/scripts/lunarwing-mt-admin.sh`; no changes were needed beyond adding the
-v2.1.2.0 `fix-podman-userns` repair command below. The 2026-09-19 repass added
+`ic/scripts/lunarwing-mt-admin.sh`. The 2026-09-19 repass added
 the `opencode2` worker to the single-worker restart example. The 2026-09-27
 repass added the v2.1.3.0 (WI#223) `build-sandbox-image` command and the
 new-tenant `SANDBOX_IMAGE`/`SANDBOX_AUTO_PULL=false` defaults. The 2026-10-01
 repass added the v2.1.4.0 (WI#268) read-only diagnostics verbs `psql` and
-`daemon-pid` (see §8). **Migration note
+`daemon-pid` (see §8). The 2026-10-14 repass records the v2.1.6.0 (WI#330)
+required tenant LLM endpoint in §3 and the (WI#376) OpenRC
+`render-units --all-proxies` fleet migration command in §8. **Migration note
 (WI#154/155):** `SANDBOX_NETWORK` defaults to `none` everywhere. Existing
 explicit `proxy` settings are preserved (mt-admin renders `none` only when
 unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
@@ -80,8 +81,9 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group
 Useful opt-ins and opt-outs include:
 
 ```bash
-# Enable the per-tenant TensorZero proxy
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-proxy
+# Enable the per-tenant TensorZero proxy (upstream is REQUIRED — see below)
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-proxy \
+  --tensorzero-url https://tensorzero.internal.example:7070
 
 # Enable the per-tenant DarkIRC daemon and adapter
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-darkirc
@@ -93,6 +95,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-study-mcp
 # Skip automatic WeeChat relay bootstrap
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap
 ```
+
+Since v2.1.6.0 (WI#330) `add-tenant` requires an explicit tenant LLM endpoint
+and there is **no built-in default**: pass `--tensorzero-url <url>` (or set the
+fleet `LUNARWING_MT_TENSORZERO_URL`) for the proxy path, or
+`--llm-base-url <url>` for a direct non-proxy endpoint. A missing endpoint
+aborts provisioning before any tenant state exists; host-loopback and overlay
+MagicDNS addresses are rejected for workers (they are unreachable from worker
+containers), and worker images refuse to start on the baked `.invalid`
+placeholder, naming the environment variable to fix. `upgrade-tenant` backfills
+an inheritable endpoint for every enabled worker before rebuilding, so managed
+tenants do not need per-worker `configure-*` calls.
 
 For knowledge-store seeding details (what is imported, the one-shot safety
 invariants, opt-outs, and verification), see
@@ -217,6 +230,14 @@ sudo ic/scripts/lunarwing-mt-admin.sh patch-env ruffles
 ```
 
 `render-units` reconciles generated systemd-user/OpenRC definitions after source updates. `patch-env` fills current managed values without licensing manual secret inspection.
+
+On OpenRC hosts carrying legacy per-worker proxy indirection units, migrate the whole fleet at once (v2.1.6.0, WI#376):
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies
+```
+
+The migration refuses to run beside a still-installed legacy proxy unit and names the command to use per tenant; only a positively detected systemd host skips the legacy-unit guard.
 
 Use the worker lifecycle commands for one worker rather than restarting the entire tenant when possible:
 
