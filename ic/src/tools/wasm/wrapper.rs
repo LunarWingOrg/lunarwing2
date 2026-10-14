@@ -355,17 +355,25 @@ impl StoreData {
     /// Prevents credentials from leaking through error messages or logs.
     /// reqwest::Error includes the full URL in its Display output, so any
     /// error from an injected-URL request will contain the raw credential
-    /// unless we scrub it.
+    /// unless we scrub it. Query-param injection URL-encodes the value, so
+    /// the encoded form is scrubbed alongside the raw one (WI#395).
     fn redact_credentials(&self, text: &str) -> String {
         let mut result = text.to_string();
         for (name, value) in &self.credentials {
             if !value.is_empty() {
-                result = result.replace(value, &format!("[REDACTED:{}]", name));
+                let replacement = format!("[REDACTED:{}]", name);
+                result = result.replace(value.as_str(), &replacement);
+                replace_encoded_secret(&mut result, value, &replacement);
             }
         }
         for cred in &self.host_credentials {
             if !cred.secret_value.is_empty() {
-                result = result.replace(&cred.secret_value, "[REDACTED:host_credential]");
+                result = result.replace(cred.secret_value.as_str(), "[REDACTED:host_credential]");
+                replace_encoded_secret(
+                    &mut result,
+                    &cred.secret_value,
+                    "[REDACTED:host_credential]",
+                );
             }
         }
         result
@@ -474,6 +482,35 @@ where
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Also scrub the URL-encoded form of a secret. Query-param injection
+/// percent-encodes characters like `+`, `/` and `=` (typical of base64
+/// tokens), so a raw-value replace alone leaves the encoded copy intact
+/// (WI#395).
+fn replace_encoded_secret(result: &mut String, value: &str, replacement: &str) {
+    let encoded = urlencoding::encode(value).to_string();
+    if encoded != value {
+        *result = result.replace(encoded.as_str(), replacement);
+    }
+}
+
+/// Format a reqwest send error without exposing the request URL.
+///
+/// reqwest's Display appends the full URL (`... for url (...)`); for a
+/// query-param credential injection that URL carries the encoded secret, so
+/// it is stripped before walking the error chain (WI#395).
+/// [`StoreData::redact_credentials`] remains a second layer over whatever
+/// text is produced.
+fn format_send_error(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut chain = format!("HTTP request failed: {e}");
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        chain.push_str(&format!(" -> {cause}"));
+        source = cause.source();
+    }
+    chain
 }
 
 // Implement the generated Host trait from bindgen.
@@ -695,16 +732,7 @@ impl lunarwing::agent::host::Host for StoreData {
             // Caller-specified timeout (default 30s, max 5min)
             let timeout_ms = timeout_ms.unwrap_or(30_000).min(300_000) as u64;
             let timeout = Duration::from_millis(timeout_ms);
-            let response = request.timeout(timeout).send().await.map_err(|e| {
-                // Walk the full error chain for the actual root cause
-                let mut chain = format!("HTTP request failed: {}", e);
-                let mut source = std::error::Error::source(&e);
-                while let Some(cause) = source {
-                    chain.push_str(&format!(" -> {}", cause));
-                    source = cause.source();
-                }
-                chain
-            })?;
+            let response = request.timeout(timeout).send().await.map_err(format_send_error)?;
 
             let status = response.status().as_u16();
             let response_headers: HashMap<String, String> = response
@@ -3286,6 +3314,77 @@ mod tests {
         let redacted = store_data.redact_credentials(text);
         assert!(!redacted.contains("super-secret-token"));
         assert!(redacted.contains("[REDACTED:host_credential]"));
+    }
+
+    /// WI#395: a `+/=`-bearing secret survives a raw-value scrub once it has
+    /// been URL-encoded by query-param injection; both forms must be redacted.
+    #[test]
+    fn test_redact_credentials_scrubs_url_encoded_secrets() {
+        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
+        use std::collections::HashMap;
+
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["api.example.com".to_string()],
+            headers: HashMap::new(),
+            query_params: HashMap::new(),
+            secret_value: "ab+/c=999".to_string(),
+            url_prefix: None,
+        }];
+
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            HashMap::new(),
+            host_credentials,
+        );
+
+        let encoded = urlencoding::encode("ab+/c=999").to_string();
+        assert_ne!(encoded, "ab+/c=999", "precondition: value gets encoded");
+        let text = format!("failed for url (https://api.example.com/d?k={encoded})");
+        let redacted = store_data.redact_credentials(&text);
+        assert!(!redacted.contains("ab+/c=999"), "{redacted}");
+        assert!(!redacted.contains(&encoded), "{redacted}");
+        assert!(redacted.contains("[REDACTED:host_credential]"));
+    }
+
+    /// WI#395: a send failure must not echo the request URL (which carries an
+    /// injected query-param credential) back to the WASM tool. The raw error
+    /// Display would append `for url (...)`; `format_send_error` strips it.
+    #[tokio::test]
+    async fn send_error_chain_omits_credential_bearing_url() {
+        use crate::tools::wasm::wrapper::format_send_error;
+
+        // Ephemeral loopback port with nothing listening: the send fails
+        // immediately with connection refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let secret = "wasm-secret-4d5e6f+/=";
+        let encoded = urlencoding::encode(secret).to_string();
+        let url = format!("http://127.0.0.1:{port}/d?api_key={encoded}");
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap_err();
+
+        // Precondition: the unfixed Display output carries the URL.
+        assert!(
+            error.to_string().contains("for url"),
+            "precondition failed: {}",
+            error
+        );
+
+        let formatted = format_send_error(error);
+        assert!(formatted.starts_with("HTTP request failed:"), "{formatted}");
+        assert!(!formatted.contains(secret), "{formatted}");
+        assert!(!formatted.contains(&encoded), "{formatted}");
+        assert!(!formatted.contains("api_key="), "{formatted}");
     }
 
     #[tokio::test]
