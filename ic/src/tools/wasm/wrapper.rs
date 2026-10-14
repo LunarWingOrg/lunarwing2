@@ -732,7 +732,11 @@ impl lunarwing::agent::host::Host for StoreData {
             // Caller-specified timeout (default 30s, max 5min)
             let timeout_ms = timeout_ms.unwrap_or(30_000).min(300_000) as u64;
             let timeout = Duration::from_millis(timeout_ms);
-            let response = request.timeout(timeout).send().await.map_err(format_send_error)?;
+            let response = request
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(format_send_error)?;
 
             let status = response.status().as_u16();
             let response_headers: HashMap<String, String> = response
