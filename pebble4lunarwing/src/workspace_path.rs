@@ -96,11 +96,27 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
         match create_dir(&child) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(annotate_component(part, error)),
         }
-        parent = open_dir(&child)?;
+        parent = open_dir(&child).map_err(|error| annotate_component(part, error))?;
     }
-    resolve_workspace_path(path, &root)
+    let resolved = resolve_workspace_path(path, &root)?;
+    // WI#375 DS-1: the descriptor walk and the re-resolved path must name
+    // the same directory — a dev/ino mismatch means an in-root redirect
+    // raced the walk. Reported as NotFound so the host classifies the swap
+    // race as transient (retry re-walks), like a swap-race ENOENT.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let walked = parent.metadata()?;
+        let landed = resolved.metadata()?;
+        if walked.dev() != landed.dev() || walked.ino() != landed.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("resolved path changed during bootstrap for '{path}'"),
+            ));
+        }
+    }
+    Ok(resolved)
 }
 
 /// DS-2: only validation, a non-directory component (ENOTDIR), a symlink loop
@@ -113,7 +129,47 @@ fn is_non_retryable_bootstrap(error: &io::Error) -> bool {
     if matches!(error.kind(), InvalidInput | PermissionDenied | Unsupported) {
         return true;
     }
-    matches!(error.raw_os_error(), Some(code) if code == libc::ENOTDIR || code == libc::ELOOP)
+    // The component annotation (WI#375 DS-7) boxes the original error, so the
+    // raw errno is reachable through the payload, not on the wrapper itself.
+    let raw = error.raw_os_error().or_else(|| {
+        error
+            .get_ref()
+            .and_then(|payload| payload.downcast_ref::<AnnotatedComponent>())
+            .and_then(|annotated| annotated.inner.raw_os_error())
+    });
+    matches!(raw, Some(code) if code == libc::ENOTDIR || code == libc::ELOOP)
+}
+
+/// Bootstrap failure payload naming the path component that failed (WI#375
+/// DS-7): std `io::Error` cannot carry both a custom message and the raw
+/// errno, so the original error is boxed as the payload — `kind()` is set at
+/// construction and the raw errno stays reachable through `inner` for retry
+/// classification.
+#[derive(Debug)]
+struct AnnotatedComponent {
+    part: String,
+    inner: io::Error,
+}
+
+impl std::fmt::Display for AnnotatedComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "component '{}': {}", self.part, self.inner)
+    }
+}
+
+impl std::error::Error for AnnotatedComponent {}
+
+/// Name the failing component (the raw error only names the /proc/self/fd
+/// magic path) while preserving the error kind and raw errno. Mirrors the TS
+/// bridges' `annotateComponent` wording.
+fn annotate_component(part: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        AnnotatedComponent {
+            part: part.to_string(),
+            inner: error,
+        },
+    )
 }
 
 pub(crate) fn resolve_task_workspace(
@@ -300,6 +356,8 @@ mod tests {
 
     /// DS-3: a FIFO component must fail fast with ENOTDIR (permanent) —
     /// without `O_DIRECTORY` the blocking FIFO open would hang the bridge.
+    /// WI#375 DS-7: the error names the failing component, and the ENOTDIR
+    /// errno must survive the annotation (still classified permanent).
     #[test]
     fn cron_bootstrap_rejects_fifo_component_fast() {
         let root = temp_root("cron-fifo");
@@ -318,6 +376,45 @@ mod tests {
         assert!(
             error.to_string().contains("Invalid workspace path"),
             "FIFO component must be a permanent failure, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("component 'missions'"),
+            "error names the failing component, got: {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// WI#375 DS-7: the component annotation names the failing component in
+    /// the message while the boxed inner error keeps its raw errno for
+    /// retry classification.
+    #[test]
+    fn annotated_component_preserves_errno_classification() {
+        let permanent = annotate_component("missions", io::Error::from_raw_os_error(libc::ENOTDIR));
+        assert!(is_non_retryable_bootstrap(&permanent));
+        assert!(permanent.to_string().contains("component 'missions'"));
+        let symlink_loop = annotate_component("x", io::Error::from_raw_os_error(libc::ELOOP));
+        assert!(is_non_retryable_bootstrap(&symlink_loop));
+        // Transient errnos stay transient through the same annotation.
+        let transient = annotate_component("missions", io::Error::from_raw_os_error(libc::EMFILE));
+        assert!(!is_non_retryable_bootstrap(&transient));
+        let swap_race = annotate_component("x", io::Error::from_raw_os_error(libc::ENOENT));
+        assert!(!is_non_retryable_bootstrap(&swap_race));
+    }
+
+    /// WI#375 DS-1: the walked descriptor and the re-resolved path must be
+    /// the same directory; the happy path keeps them equal.
+    #[test]
+    fn cron_bootstrap_walked_fd_matches_resolved_path() {
+        let root = temp_root("cron-ds1");
+        let context = crate::protocol::TaskContext {
+            project_dir: Some("missions/pr-digest".to_string()),
+            cron_tick: Some(serde_json::json!({"event":"cron.tick"})),
+            ..Default::default()
+        };
+        let mission = resolve_task_workspace(&context, &root).expect("bootstrap");
+        assert_eq!(
+            mission,
+            root.join("missions/pr-digest").canonicalize().unwrap()
         );
         std::fs::remove_dir_all(root).ok();
     }
