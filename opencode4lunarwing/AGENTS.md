@@ -27,3 +27,8 @@ The Dockerfile fetches anomalyco/opencode at the full SHA in `OPENCODE_REF` and 
 - Expose the internal opencode serve port (4096) externally
 - Store secrets in config files (use env vars with `{env:VAR}` syntax)
 - Remove the health server — orchestration depends on it
+- Let the worker self-expose (WI#357): v1.18.25 has no service mode, pairing,
+  or tunnel (those are v2 surfaces), but session sharing exists and stays
+  pinned `"share": "disabled"` in `config/opencode.json`. Workers must never
+  open their own inbound path or publish sessions; see
+  `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure policy".
