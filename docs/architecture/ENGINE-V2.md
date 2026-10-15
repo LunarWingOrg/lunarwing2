@@ -1089,7 +1089,7 @@ the function in `MissionManager::leases()`, the thread manager's lease set
 that preflight consults. WI#308 intersects the dispatch gate's categorical
 refusal: a Research thread holding the lease is still answered
 `callable: false` for the six mutating verbs, and a Mission thread for the
-two lifecycle verbs (create, delete — WI#356), because the gate would refuse
+three lifecycle verbs (create, delete, resume — WI#356), because the gate would refuse
 the call (and an executor-time refusal fails the whole code step). A thread
 without one gets the same definition with
 `callable: false` and a note saying a call from it would be refused, including
@@ -1126,12 +1126,16 @@ Dispatch of the eight verbs carries its own gate subset at the adapter
 gate stack that a registry tool handle keys. In the registry stack's order:
 Research threads — every `rlm_query` child included — are refused the six
 mutating verbs outright (create, fire, pause, resume, update, delete);
-Mission threads are refused the two lifecycle verbs (create, delete)
-outright (WI#356) — a mission thread may steer existing missions but never
-creates or deletes them — and a Mission thread's `mission_update` may carry
-steering fields only (goal, current_focus, success_criteria, retry policy):
-cadence, webhook_secret, max_threads_per_day, new_name and notify_channels
-changes are refused (run-107 GM-1); a
+Mission threads are refused the three lifecycle verbs (create, delete,
+resume) outright (WI#356) — a mission thread may steer existing missions but
+never creates, deletes or resumes them (run-111 HB-2: resume un-deletes the
+conversation-insights opt-out tombstone and clears gate-pause markers) — and
+a Mission thread's `mission_update` may carry the lookup keys and steering
+fields only (`id`/`_args`, or `name` on its own, plus goal, current_focus,
+success_criteria and the retry-policy scalars): every other field — cadence,
+webhook_secret, max_threads_per_day, new_name, notify_channels — is refused
+by an allowlist, and `name` together with `id`/`_args` is refused as a
+rename (run-107 GM-1, run-111 HB-1); a
 persisted `tool_permissions.<verb>` = disabled denies the call, and a
 settings-store read error fails closed for the mutating verbs (read-only
 verbs keep the registry path's deny-the-grant fallback); supervised mode
@@ -1250,7 +1254,8 @@ webhook cadence) starts an autonomous, unsupervised agent whose own mission
 calls are limited by the rate limit, hooks, and the WI#356 lifecycle
 refusal. The approval description for the run-spawning verbs (create, fire,
 resume, update) says so and discloses the fan-out: the run may steer any of
-the owner's missions (fire, pause, resume, goal/focus updates) without
+the owner's missions (fire, pause, and goal, focus, success-criteria or
+retry-policy updates) without
 asking. `rlm_query` children, by contrast, inherit the parent's
 `supervised_mode`/`shared_conversation`/`supervised_timeout_secs` into
 their config, so a supervised parent's child gates fail closed. Second, the
@@ -1259,19 +1264,21 @@ Mission thread may steer *any* of the owner's missions by name or UUID
 (`resolve_mission_id` carries no thread scoping), and the planner grants
 the verbs to every thread type under the Stateful tier. A Foreground
 thread's update may re-target (goal, cadence, notify channels, webhook
-secret, budget, rename); a Mission thread's update is limited to steering
-fields (goal, current_focus, success_criteria, retry policy) — cadence,
-webhook_secret, max_threads_per_day, new_name and notify_channels changes
-from a Mission thread are refused at the gate (WI#356, run-107 GM-1), so a
+secret, budget, rename); a Mission thread's update is limited to the lookup
+keys and steering fields (goal, current_focus, success_criteria, retry
+policy) — every other field, and `name` together with `id`/`_args` (a
+rename), is refused at the gate by an allowlist (WI#356, run-107 GM-1,
+run-111 HB-1), so a
 mission run cannot turn any mission into a webhook-triggered one with a
-secret the model chose, nor lift its daily budget. The v1 equivalents
+secret the model chose, nor lift its daily budget, nor rename it. The v1 equivalents
 (`routine_create`/`update`/`delete`/`fire`) sit on
 the autonomous-execution denylist; the v2 verbs do not — the bound placed
 on them (WI#356, run-33 AQ-3 / run-40 BF-1) is the dispatch gate's
-categorical refusal of `mission_create`/`mission_delete` to Mission threads
+categorical refusal of `mission_create`/`mission_delete`/`mission_resume`
+to Mission threads
 alongside the Research-thread refusal — partial v1 parity (create/delete
-only; v1 also denies update/fire, which v2 keeps as steering) — so creating
-or deleting a mission stays with the foreground conversation (supervised
+only; v1 also denies update/fire, which v2 keeps as steering) — so creating,
+deleting or resuming a mission stays with the foreground conversation (supervised
 only when the tenant sets `AGENT_SUPERVISED_MODE`), plus the fan-out
 disclosure on the run-spawning approval prompts. The owner-scoped steering
 reach that remains is deliberate and stays open. One related seam remains
