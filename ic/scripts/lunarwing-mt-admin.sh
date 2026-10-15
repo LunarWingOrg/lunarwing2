@@ -537,6 +537,10 @@ Commands:
 
   list-tenants                     Show all tenants with ports and status
   status <name>                    Detailed status for one tenant
+  worker-listeners <name>          WI#357 exposure audit: list listening
+                                   sockets inside the tenant's running worker
+                                   containers; fail on any bind or published
+                                   mapping outside the loopback contract
   tokens [name]                    Print gateway auth tokens (all or one)
   doctor                           System dependency and health checks
   coord-doctor <name>              Read-only coordination knowledge-share
@@ -1243,6 +1247,11 @@ main() {
     status)
       [[ -n "${1:-}" ]] || die "usage: status <name>"
       status_tenant "$1"
+      ;;
+
+    worker-listeners)
+      [[ -n "${1:-}" ]] || die "usage: worker-listeners <name>"
+      worker_listeners "$1"
       ;;
 
     darkirc-contact)

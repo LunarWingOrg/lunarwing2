@@ -17,6 +17,21 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
 
 umask "$FILE_UMASK"
 
+# WI#357 / FB-1: server-backed CLI commands otherwise spawn the real binary
+# directly in service mode, bypassing the argv wrapper. Reset the shared
+# service default on every boot so they use private, command-scoped servers.
+# This is a naive-use guard: the agent can still edit its live service config.
+# FB-7: upstream resolves the service config as $OPENCODE_CONFIG_DIR when set,
+# otherwise ${XDG_CONFIG_HOME:-~/.config}/opencode — honour the same order so
+# the reset always lands where upstream reads it.
+SERVICE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
+mkdir -p "$SERVICE_CONFIG_DIR"
+# FB-6: the agent can plant a FIFO, directory or symlink at the reset path; a
+# plain redirect would hang on the FIFO, crash on the directory, or overwrite
+# the symlink's target. Remove whatever sits there before writing.
+rm -rf -- "$SERVICE_CONFIG_DIR/service.json"
+printf '%s\n' '{"disabled": true}' > "$SERVICE_CONFIG_DIR/service.json"
+
 # ── git / SSH credential setup ────────────────────────────────────────────────
 if [ -n "${GIT_AUTHOR_NAME:-}" ] && ! git config --global user.name >/dev/null 2>&1; then
   git config --global user.name "$GIT_AUTHOR_NAME"
@@ -89,6 +104,8 @@ if [ -f /app/config/opencode2.json ]; then
       || [ -n "${LW2STUDYMCP_STATE_HOME:-}" ]; then
     rm -f "$WORKSPACE_ROOT/.opencode/opencode2.json"
     cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"
+    # cp preserves the baked 0444 mode; only the runtime copy must be writable.
+    chmod u+w "$WORKSPACE_ROOT/.opencode/opencode2.json"
     config_materialized=true
   else
     ln -sfn /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"
