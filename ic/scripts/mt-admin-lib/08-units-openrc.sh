@@ -388,7 +388,9 @@ INITEOF
 
 # The post-WI#376 proxy unit contract: one fixed flag line carrying no tenant
 # data. Shared by the preflight guard and the renderer, which archives only
-# installed units that fail this check.
+# installed units that fail this check. Byte-identical copies of this contract
+# run inside the root health cron (WI#410): ic-infrastructure-health-check/
+# health-openrc.sh and lunarwing-self-heal.sh. Keep the three in sync.
 openrc_proxy_unit_is_safe() {
   local path="$1"
   [[ -f "$path" && ! -L "$path" ]] || return 1
