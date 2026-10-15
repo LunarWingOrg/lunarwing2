@@ -395,6 +395,25 @@ JSON
   if openrc_proxy_unit_is_safe "$neg_unit"; then
     fail 'a truncated unit classified safe'
   fi
+  # HU-3: the two load-bearing refusals pinned directly. A symlink at a real
+  # unit name pointing at genuine safe bytes must be refused — cmp follows
+  # symlinks, so without the `! -L` guard a link to a safe unit would pass.
+  rm -f -- "$neg_unit"
+  ln -s "$safe_unit" "$neg_unit"
+  if openrc_proxy_unit_is_safe "$neg_unit"; then
+    fail 'a symlink to genuine bytes classified safe'
+  fi
+  rm -f -- "$neg_unit"
+  # A correctly rendered body for an upper-case name must be refused: the
+  # filename's tenant must survive sanitize_name unchanged, so a unit whose
+  # name case-folds onto another tenant never reaches the byte comparison.
+  upper_unit="$neg_dir/lunarwing-proxy-Alice"
+  _openrc_proxy_unit_body Alice 23104 >"$upper_unit" \
+    || fail 'could not render the upper-case fixture body'
+  if openrc_proxy_unit_is_safe "$upper_unit"; then
+    fail 'an upper-case-name unit classified safe'
+  fi
+  rm -f -- "$upper_unit"
   # HF-1: renderer and checker resolve the interpreter through one
   # PATH-independent helper. A render made while the caller's PATH shadows
   # python3 (a venv, /usr/local/bin, pyenv) must still satisfy the guard —
