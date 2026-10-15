@@ -28,7 +28,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-10-14, target release 2.1.6.0):**
+**Current state (updated 2026-10-15, target release 2.1.6.0):**
 
 - v2.1.5.0 (Bungei Fukkō) shipped 2026-10-10: recovery paths and honest
   failure messages, the workspace daily-log backup gate, the routine/mission
@@ -38,15 +38,18 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   still Tier 3 by default (§3).
 - The v2.1.6.0 pre-release checklist is being worked through
   (`docs/ops/AGENT_GOALS_2.1.6.0.md`). The crate/pin state already moved
-  (all LunarWing crates at 2.1.6 per checklist item #1; kimi worker 2.1.1;
-  opencode2 stays v2.0.24 — the v2.0.26 bump is gated off per checklist
-  item #2, WI#357). Areas still under active change include the
-  external-worker tool proxy and control channel (WI#324/WI#328),
-  external-worker cron mode (WI#325), worker LLM endpoint handling
-  (WI#330), the libSQL remote-replica feature gate (WI#331), mission
-  credential redaction (WI#359), worker-container credential hygiene
-  (WI#373), and the OpenRC proxy-unit migration (WI#376). Check the
-  checklist before opening MRs there.
+  (all LunarWing crates at 2.1.6 per checklist item #1; kimi worker 2.2.0
+  per item #4; opencode2 stays v2.0.24 — the v2.0.26 bump is gated off per
+  checklist item #2, WI#357). Landed this cycle: the external-worker
+  control channel (WI#328), external-worker cron mode (WI#325), worker LLM
+  endpoint handling (WI#330), the libSQL remote-replica feature gate
+  (WI#331), mission credential redaction (WI#359), worker-container
+  credential hygiene (WI#373), the OpenRC proxy-unit migration (WI#376),
+  and the opencode2 exposure-policy controls (WI#357, item #21). Still
+  open — check the checklist before opening MRs there: the external-worker
+  tool proxy (WI#324), WI#336, WI#375, WI#377, WI#390, WI#380, WI#392,
+  WI#393, WI#402, WI#408, WI#410–#412, and the opencode2 exposure-policy
+  follow-ups (WI#357) plus WI#326/WI#395 pending maintainer acceptance.
 - **Kawarimi export testing under OpenRC** is being re-worked due to an open-write detection
   difference vs systemd. OpenRC contributors *with kawarimi export expertise* are welcome →
   ask in `#lunarwing`.
@@ -142,4 +145,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-10-14 (v2.1.6.0 freeze status). Update §2 whenever freeze status changes.*
+*Last updated: 2026-10-15 (v2.1.6.0 freeze status). Update §2 whenever freeze status changes.*
