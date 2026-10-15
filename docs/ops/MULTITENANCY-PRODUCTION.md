@@ -480,7 +480,13 @@ manager. `loginctl enable-linger` keeps them running after logout.
 LunarVision publishes the registry `vision_service` and `vision_health` ports to
 its internal `8088` API and `8089` operational listeners. `start-tenant` requires
 the internal `/health` probe to pass and force-recreates a stale container when
-its image, environment, ports, runtime, or init contract changes.
+its image, environment, ports, runtime, or init contract changes. Worker
+containers (`pebble`, `opencode`, `opencode2`, `kimi`) follow the same rule:
+their container contract carries the tenant-store image ID, so a rebuilt worker
+image is force-recreated by the next `start-tenant`/`restart-tenant` on both
+systemd and OpenRC hosts (first start after this change recreates each worker
+once). mt-admin-built worker images carry the source commit in
+`org.opencontainers.image.revision`.
 
 The main unit pulls in only sidecars that are enabled. Admin tooling always
 addresses tenant units through that user's bus:

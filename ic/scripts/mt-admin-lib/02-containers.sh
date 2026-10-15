@@ -150,6 +150,34 @@ _ensure_tenant_image() {
   return 1
 }
 
+# Worker launch contract with the tenant-store image ID appended.
+#
+# _ensure_tenant_image refreshes a tenant's copy of a rebuilt worker image, but
+# an existing container stays bound to the image ID it was created from: the
+# OpenRC unit and the non-Quadlet fallback only `podman start` it, and an
+# already-active Quadlet unit is not restarted by start-tenant. So after
+# build-<worker>-worker the OLD image kept serving until an operator removed
+# the container by hand (the kimi 2.2.0 rollout behind WI#411/WI#412 ran that
+# way). Hashing the image ID into the container contract makes start-tenant
+# force-recreate after every rebuild, as the vision/voice sidecar contracts
+# (_vision_launch_contract / _voice_launch_contract) already do. The base
+# contract is returned unchanged when the image cannot be inspected, so an
+# inspect failure alone never forces a recreate.
+# Usage: _worker_launch_contract <tenant> <image-ref> [<base-contract>]
+_worker_launch_contract() {
+  local name="$1" image="$2" base="${3:-}" image_id
+  image_id="$(_ctr "$name" image inspect -f '{{.Id}}' "$image" 2>/dev/null)" || image_id=""
+  if [[ -z "$image_id" ]]; then
+    printf '%s' "$base"
+    return 0
+  fi
+  if [[ -n "$base" ]]; then
+    printf '%s;image=%s' "$base" "$image_id"
+  else
+    printf 'image=%s' "$image_id"
+  fi
+}
+
 # Install (or refresh) the babysitter helper binary from this repo to /usr/local/sbin.
 # Idempotent: skips if the on-disk copy is byte-identical (mtime/perm-check), so
 # `start_tenant` is safe to call repeatedly without churning the file. This

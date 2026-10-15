@@ -1169,9 +1169,26 @@ acks; invalid identifiers themselves cannot be correlated.
 
 Interop: pre-WI#328 workers that never send `task_prompt_ack` still function — the daemon tolerates missing acks and ignores unknown message types, and newer workers must likewise ignore `task_prompt` if they do not implement prompting (they simply omit the capability, and the daemon never sends them the frame).
 
+### Rebuilt image rollout (image-ID contract)
+
+A worker container is bound to the image ID it was created from. `start-tenant` refreshes the tenant's rootless store with a rebuilt image (`_ensure_tenant_image`), but on OpenRC and the non-Quadlet fallback it then only `podman start`s an existing container, and an already-active Quadlet unit is not restarted, so a rebuilt image did not reach a running worker: the old container kept serving the old image until an operator removed it by hand (`restart-tenant` helped only on Quadlet hosts, where the unit re-runs `podman run`). This is how the kimi 2.2.0 image stayed in service without the WI#411/WI#412 fixes. Every worker lane (`pebble`, `opencode`, `opencode2`, `kimi`) now hashes the tenant-store image ID into its container contract (`_worker_launch_contract`, the same mechanism as the LunarVision/LunarVoice sidecar contracts), so `start-tenant` and `restart-tenant` force-recreate the container whenever the image ID differs from the one it was created from, on both init systems. The procedure after any worker change is therefore:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker        # or build-<worker>-worker / build-tenant --with-<worker>
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>  # logs "config changed for lunarwing-kimi-<tenant>; force-recreating"
+```
+
+Rollout note: the first `start-tenant` after upgrading mt-admin to this version recreates every worker container once, because the stored contract hash gains the image segment. The replaced image stays in the tenant store until the next rebuild's prune. `ic/scripts/tests/test-mt-admin-worker-image-contract.sh` pins the behaviour for all four lanes on both paths.
+
+mt-admin builds also stamp `org.opencontainers.image.revision` with the source checkout's commit (the `SOURCE_REVISION` build-arg every worker Dockerfile declares and CI already passed; mt-admin builds left it `unknown`). `-dirty` is appended when the worker directory has uncommitted or untracked changes and `unknown` is kept outside a git checkout, so a deployed image can be traced to a target commit:
+
+```bash
+podman image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' lunarwing-worker-kimi:latest
+```
+
 ### Upgrade ordering
 
-Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers only `lunarwing-agent-v1` and cannot connect to a worker container that still only accepts the legacy name — every dispatch to such a worker fails the WebSocket upgrade (HTTP 400, no echoed subprotocol) and surfaces as an external-worker connection failure whose reason includes the `lunarwing-agent-v1` / `ironclaw-agent-v1` hint. Workers are protocol-compatible in the other direction (2.1.1 workers accept the primary name only, which pre-2.1.1 daemons also offer), so the safe upgrade order is **workers first, then the daemon**, or — simplest — recreate worker containers in the same maintenance window as the daemon. mt-admin managed upgrades (`build-tenant`, `build-pebble-worker`, `build-opencode-worker`, `build-kimi-worker`) already rebuild and recreate worker containers as part of a tenant upgrade; only manual deployments can strand a legacy-only worker.
+Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers only `lunarwing-agent-v1` and cannot connect to a worker container that still only accepts the legacy name — every dispatch to such a worker fails the WebSocket upgrade (HTTP 400, no echoed subprotocol) and surfaces as an external-worker connection failure whose reason includes the `lunarwing-agent-v1` / `ironclaw-agent-v1` hint. Workers are protocol-compatible in the other direction (2.1.1 workers accept the primary name only, which pre-2.1.1 daemons also offer), so the safe upgrade order is **workers first, then the daemon**, or — simplest — recreate worker containers in the same maintenance window as the daemon. mt-admin managed upgrades (`build-tenant`, `build-pebble-worker`, `build-opencode-worker`, `build-opencode2-worker`, `build-kimi-worker`, each followed by `restart-tenant`) rebuild the image and, through the image-ID contract above, recreate the worker containers; only manual deployments can strand a legacy-only worker.
 
 ## Proxy Note
 
