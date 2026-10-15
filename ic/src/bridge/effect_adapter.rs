@@ -6185,22 +6185,47 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         ctx.supervised_mode = false;
         ctx.current_call_id = None;
 
-        // `name` on its own only resolves to itself: a steering update keyed
-        // by name still dispatches.
-        let updated = adapter
-            .execute_action(
-                "mission_update",
+        // HV-1: each lookup form must still steer without a rename. Use a
+        // distinct focus per call and reload it so a skipped update fails.
+        for (mut params, target, focus) in [
+            (
+                serde_json::json!({"id": other.id.to_string()}),
+                other.id,
+                "id-uuid",
+            ),
+            (serde_json::json!({"id": "other"}), other.id, "id-name"),
+            (
+                serde_json::json!({"_args": ["other"]}),
+                other.id,
+                "positional",
+            ),
+            (
                 serde_json::json!({"name": "own", "goal": "steered"}),
-                &lease(),
-                &ctx,
-            )
-            .await
-            .expect("name-only steering update executes on a Mission thread");
-        assert!(
-            !updated.is_error,
-            "name-only steering update must succeed: {:?}",
-            updated.output
-        );
+                own.id,
+                "name-only",
+            ),
+        ] {
+            params["current_focus"] = serde_json::json!(focus);
+            let updated = adapter
+                .execute_action("mission_update", params, &lease(), &ctx)
+                .await
+                .expect("lookup-keyed steering update executes on a Mission thread");
+            assert!(
+                !updated.is_error,
+                "{focus} steering update failed: {:?}",
+                updated.output
+            );
+            let mission = mgr
+                .get_mission(target)
+                .await
+                .expect("load steered mission")
+                .expect("steered mission exists");
+            assert_eq!(
+                mission.current_focus.as_deref(),
+                Some(focus),
+                "{focus} update must land"
+            );
+        }
 
         // No rename landed: both missions keep their names.
         let mut names: Vec<String> = mgr
@@ -6259,6 +6284,15 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
             }
             other => panic!("expected LeaseDenied for Mission mission_resume, got {other:?}"),
         }
+        assert_eq!(
+            mgr.get_mission(paused.id)
+                .await
+                .expect("load mission after refused resume")
+                .expect("paused mission exists")
+                .status,
+            lunarwing_engine::MissionStatus::Paused,
+            "a refused Mission-thread resume must leave the mission paused"
+        );
 
         // The refusal precedes the supervision pause: no approval can grant
         // a resume to a Mission thread.
@@ -6275,6 +6309,15 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert!(
             matches!(denied, Err(EngineError::LeaseDenied { .. })),
             "the resume refusal must precede the supervision pause, got {denied:?}"
+        );
+        assert_eq!(
+            mgr.get_mission(paused.id)
+                .await
+                .expect("load mission after refused supervised resume")
+                .expect("paused mission exists")
+                .status,
+            lunarwing_engine::MissionStatus::Paused,
+            "a refused supervised resume must leave the mission paused"
         );
         ctx.supervised_mode = false;
         ctx.current_call_id = None;
