@@ -313,6 +313,155 @@ MATRIX
     || fail 'symlink-to-script refusal did not name the reason'
 )
 
+# FL-6 (WI#393, run-107 GR-1/GR-3, run-113 HF-1/HF-3/HF-6):
+# openrc_proxy_unit_is_safe is byte-for-byte equality with a fresh render from
+# the shared template — the installed unit must reproduce
+# _openrc_proxy_unit_body for the filename's tenant exactly, with no extra,
+# missing, reordered, or payload-carrying bytes. The fixture is rendered by
+# the REAL renderer (rollout-style registry/home/exec stubs) so the pins bind
+# the contract itself, and renderer/template drift fails here instead of
+# passing a hand-written excerpt. Every negative lives at a REAL
+# lunarwing-proxy-<name> filename (HF-3): a name the filename check refuses
+# first would make the content-equality pin vacuous.
+(
+  export PORTS_REGISTRY="$fixture/ports.json"
+  export OPENRC_PROXY_BACKUP_DIR="$fixture/backup-units"
+  cat >"$PORTS_REGISTRY" <<'JSON'
+{"tenants":{"alice":{"enable_proxy":true,"ports":{"proxy":23104}}}}
+JSON
+  tenant_home() { printf '%s/%s' "$fixture" "$1"; }
+  install_openrc_env_exec() { :; }
+  render_proxy_openrc_unit alice || fail 'could not render the fixture unit'
+  safe_unit="$OPENRC_INITD_DIR/lunarwing-proxy-alice"
+  openrc_proxy_unit_is_safe "$safe_unit" \
+    || fail 'a genuine renderer output failed the safe-unit contract'
+  # EQ-4 under equality: re-rendering a conformant unit must not archive it.
+  render_proxy_openrc_unit alice || fail 're-render of a safe unit failed'
+  [[ ! -e "$OPENRC_PROXY_BACKUP_DIR" ]] \
+    || fail 're-rendering a safe unit grew the backup archive'
+  # Negatives — none of these trip the old three-pattern denylist; the
+  # equality contract must catch every one (GR-1 matrix classes). rm before
+  # each write so the verdict cache can never mask a negative behind a
+  # same-inode truncate.
+  neg_dir="$fixture/neg"
+  mkdir -p "$neg_dir"
+  neg_unit="$neg_dir/lunarwing-proxy-alice"
+  # Control: genuine bytes at the negative path are ACCEPTED, so each refusal
+  # below is attributable to the content, not the location (HF-3).
+  cp "$safe_unit" "$neg_unit"
+  openrc_proxy_unit_is_safe "$neg_unit" \
+    || fail 'genuine bytes at the negative path were refused'
+  for payload in \
+    'proxy_command=/tmp/evil' \
+    ': "${proxy_command:=/tmp/evil}"' \
+    'command_user="root:root"' \
+    ': "${proxy_args:=/tmp/evil.py --tensorzero=http://fixture.invalid/x}"' \
+    'start_pre() { /tmp/evil; }' \
+    'proxy_note="$(id)"' \
+    'proxy_note=`id`'
+  do
+    rm -f -- "$neg_unit"
+    cp "$safe_unit" "$neg_unit"
+    printf '%s\n' "$payload" >>"$neg_unit"
+    if openrc_proxy_unit_is_safe "$neg_unit"; then
+      fail "safe-template-plus-extra-content unit classified safe: $payload"
+    fi
+  done
+  # NUL byte: bash line readers stop at NUL while /bin/sh skips it and
+  # executes what follows, so a NUL-hidden payload must fail the byte
+  # comparison outright (HF-3).
+  rm -f -- "$neg_unit"
+  cp "$safe_unit" "$neg_unit"
+  printf 'proxy_note="ok"\0; echo PWNED\n' >>"$neg_unit"
+  if openrc_proxy_unit_is_safe "$neg_unit"; then
+    fail 'a NUL-hidden payload line classified safe'
+  fi
+  # A same-line-count substitution naming a foreign tenant, an over-long port
+  # (HF-6), and a truncated unit all fail equality without tripping any
+  # denylist pattern.
+  rm -f -- "$neg_unit"
+  sed 's/before lunarwing-alice/before lunarwing-other/' "$safe_unit" \
+    >"$neg_unit"
+  if openrc_proxy_unit_is_safe "$neg_unit"; then
+    fail 'a unit pointing at a foreign tenant classified safe'
+  fi
+  rm -f -- "$neg_unit"
+  sed 's/--port 23104/--port 231041/' "$safe_unit" >"$neg_unit"
+  if openrc_proxy_unit_is_safe "$neg_unit"; then
+    fail 'a unit with an over-long port classified safe'
+  fi
+  rm -f -- "$neg_unit"
+  head -n -3 "$safe_unit" >"$neg_unit"
+  if openrc_proxy_unit_is_safe "$neg_unit"; then
+    fail 'a truncated unit classified safe'
+  fi
+  # HF-1: renderer and checker resolve the interpreter through one
+  # PATH-independent helper. A render made while the caller's PATH shadows
+  # python3 (a venv, /usr/local/bin, pyenv) must still satisfy the guard —
+  # and must not grow the archive (no ping-pong repair loop).
+  mkdir -p "$fixture/pyshadow"
+  ln -s "$(command -v python3)" "$fixture/pyshadow/python3"
+  ( _OPENRC_PROXY_PYTHON3_RESOLVED=""
+    _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+    PATH="$fixture/pyshadow:$PATH"
+    render_proxy_openrc_unit alice ) \
+    || fail 'render under a python3-shadowing PATH failed'
+  openrc_proxy_unit_is_safe "$safe_unit" \
+    || fail 'unit rendered under a shadowing PATH failed the guard'
+  [[ ! -e "$OPENRC_PROXY_BACKUP_DIR" ]] \
+    || fail 'a PATH flip grew the backup archive (ping-pong repair loop)'
+  # HF-1 override: LUNARWING_MT_PROXY_PYTHON3 pins the interpreter for both
+  # sides. A unit rendered under the override is accepted while the override
+  # is set and refused once it is unset (the documented one-time refusal);
+  # re-rendering then repairs it. Each replacement archives exactly the unit
+  # that fails the contract under the resolution in force at that render.
+  LUNARWING_MT_PROXY_PYTHON3=/opt/py3/bin/python3 render_proxy_openrc_unit alice \
+    || fail 'render under LUNARWING_MT_PROXY_PYTHON3 failed'
+  grep -Fq ': "${proxy_command:=/opt/py3/bin/python3}"' "$safe_unit" \
+    || fail 'override interpreter did not reach the rendered unit'
+  [[ "$(find "$OPENRC_PROXY_BACKUP_DIR" -maxdepth 1 -name 'lunarwing-proxy-*' | wc -l)" == 1 ]] \
+    || fail 'override render did not archive exactly the previous unit'
+  LUNARWING_MT_PROXY_PYTHON3=/opt/py3/bin/python3 openrc_proxy_unit_is_safe "$safe_unit" \
+    || fail 'override-rendered unit refused under the same override'
+  if openrc_proxy_unit_is_safe "$safe_unit"; then
+    fail 'override-rendered unit accepted after the override was unset'
+  fi
+  render_proxy_openrc_unit alice || fail 'repair render after the override failed'
+  openrc_proxy_unit_is_safe "$safe_unit" \
+    || fail 'repaired unit failed the guard'
+  [[ "$(find "$OPENRC_PROXY_BACKUP_DIR" -maxdepth 1 -name 'lunarwing-proxy-*' | wc -l)" == 2 ]] \
+    || fail 'the one-time refusal repair did not archive exactly the mismatched unit'
+  rm -rf -- "$OPENRC_PROXY_BACKUP_DIR"
+  # HF-4: the interpreter allowlist rejects shell syntax before any
+  # substitution happens (an & would otherwise expand under bash 5.2+
+  # patsub_replacement), and the refusal leaves the installed unit untouched.
+  if ( LUNARWING_MT_PROXY_PYTHON3='/tmp/ev&il/python3' render_proxy_openrc_unit alice ) \
+    >"$fixture/ampersand.log" 2>&1; then
+    fail 'an & in LUNARWING_MT_PROXY_PYTHON3 rendered a unit'
+  fi
+  openrc_proxy_unit_is_safe "$safe_unit" \
+    || fail 'a refused override render still touched the installed unit'
+  # HF-6: the renderer accepts only a 1-5 ASCII-digit port from the registry.
+  if ( ports_get() { printf '231041\n'; }
+       render_proxy_openrc_unit alice ) >"$fixture/port.log" 2>&1; then
+    fail 'a 6-digit registry port rendered a unit'
+  fi
+  openrc_proxy_unit_is_safe "$safe_unit" \
+    || fail 'a refused port render still touched the installed unit'
+  # The preflight guard is the boundary that keeps OpenRC from sourcing an
+  # installed unit: it must accept the genuine render and refuse the same
+  # unit once extra content rides along (it is the only proxy unit here).
+  require_safe_openrc_proxy_units \
+    || fail 'a genuine renderer output failed the preflight guard'
+  printf '%s\n' 'proxy_note=`id`' >>"$safe_unit"
+  rc=0
+  ( require_safe_openrc_proxy_units ) >"$fixture/refused.log" 2>&1 || rc=$?
+  [[ "$rc" == 125 ]] || fail 'safe-render-plus-payload unit passed the preflight guard'
+  grep -Fq 'render-units --all-proxies' "$fixture/refused.log" \
+    || fail 'preflight refusal omitted the repair command'
+  rm -f -- "$safe_unit"
+)
+
 # FL-4 (M3): enable-health-fleet sources mt-admin directly, bypassing main's
 # preflight, so it carries its own proxy-unit guard — a legacy unit must
 # refuse before the root health cron is armed in the migration window. The id
