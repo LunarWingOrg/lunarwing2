@@ -779,7 +779,11 @@ grep -qE '^\s*owner-scopes)' "$MT" || die "mt-admin at $MT predates owner-scopes
 prepare_import_stage_root
 WORK="$(mktemp -d "$IMPORT_STAGE_ROOT/import.XXXXXX")"
 chmod 0700 "$WORK"
-trap 'rm -rf "$WORK"' EXIT
+# Cleared BEFORE the trap (WI#393 HF-5): WRITERS_ERRF is assigned only on the
+# --resume path, so an inherited value (e.g. via sudo -E) must never be
+# deleted as root on an early exit.
+WRITERS_ERRF=""
+trap 'rm -rf "$WORK"; [[ -z "$WRITERS_ERRF" ]] || rm -f -- "$WRITERS_ERRF"' EXIT
 # Pin the caller-supplied credential bundle before any validation. Validation
 # and every later extraction then operate on the same owner-only non-/tmp copy,
 # so a writable source directory cannot swap archive contents between checks.
@@ -967,12 +971,23 @@ if jq -e ".tenants[\"$TENANT\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
     BRIDGE_ENVF="$LWROOT/env/xmpp-bridge.env"
     VISION_ENVF="$LWROOT/env/vision.env"
     validate_import_target_roots
+    # FL-5 (WI#393): rc 1 alone is not "stopped" — the writers-active arm's
+    # precondition failures (root, usage, registry, name, lock dir) share that
+    # exit code. Only rc 1 carrying the stdout state word confirms quiescence;
+    # anything else is unverifiable and must refuse the resume.
     resume_writers_rc=0
-    "$MT" writers-active "$TENANT" >/dev/null 2>&1 || resume_writers_rc=$?
-    case "$resume_writers_rc" in
-      1) ;;
-      0) die "cannot resume while tenant '$TENANT' has active writers" ;;
-      *) die "cannot verify stopped writers for resumable tenant '$TENANT'" ;;
+    resume_writers_out=""
+    resume_writers_err=""
+    # The capture file lives outside $WORK, which is the import staging dir.
+    WRITERS_ERRF="$(mktemp)"
+    resume_writers_out="$("$MT" writers-active "$TENANT" 2>"$WRITERS_ERRF")" || resume_writers_rc=$?
+    # WI#393 GR-2: the refusal must carry the arm's stderr cause (the EQ-1
+    # refusal text names the render-units repair command), not a bare refusal.
+    resume_writers_err="$(head -c 1000 "$WRITERS_ERRF" 2>/dev/null || true)"
+    case "$resume_writers_rc:$resume_writers_out" in
+      1:stopped) ;;
+      0:active) die "cannot resume while tenant '$TENANT' has active writers" ;;
+      *) die "cannot verify stopped writers for resumable tenant '$TENANT' (rc=$resume_writers_rc${resume_writers_err:+: $resume_writers_err})" ;;
     esac
     say "resuming interrupted DarkIRC import for matching tenant '$TENANT'"
   else
