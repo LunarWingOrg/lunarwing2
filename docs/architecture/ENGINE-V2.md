@@ -295,8 +295,8 @@ Follow-ups that still
 cut head-only: `shrink_context_for_model_recovery`'s per-message cut after a
 context_overflow recovery (the model again sees `{items: [...` with no
 cursor), the stored-result preview in `ic/src/agent/thread_ops.rs:999-1009`,
-the Engine v2 500-byte preview in `ic/src/bridge/router.rs:3751-3772` built
-from the 1000-byte event preview in `lunarwing_engine/src/types/event.rs:74-87`,
+the Engine v2 500-byte preview in `ic/src/bridge/router.rs:3975-3994` built
+from the 1000-byte event preview in `lunarwing_engine/src/types/event.rs:226-241`,
 shell capture (64 KiB), SSH capture (1 MiB), and sandbox stdout/stderr caps.
 Also follow up the v1 earlier-turn 1000-byte tool-result cut in
 `ic/src/agent/session.rs:533-545` ([WI#351](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351): a later
