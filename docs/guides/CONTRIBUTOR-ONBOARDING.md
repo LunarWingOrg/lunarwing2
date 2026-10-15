@@ -41,15 +41,17 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   (all LunarWing crates at 2.1.6 per checklist item #1; kimi worker 2.2.0
   per item #4; opencode2 stays v2.0.24 — the v2.0.26 bump is gated off per
   checklist item #2, WI#357). Landed this cycle: the external-worker
-  control channel (WI#328), external-worker cron mode (WI#325), worker LLM
-  endpoint handling (WI#330), the libSQL remote-replica feature gate
-  (WI#331), mission credential redaction (WI#359), worker-container
-  credential hygiene (WI#373), the OpenRC proxy-unit migration (WI#376),
-  and the opencode2 exposure-policy controls (WI#357, item #21). Still
-  open — check the checklist before opening MRs there: the external-worker
-  tool proxy (WI#324), WI#336, WI#375, WI#377, WI#390, WI#380, WI#392,
-  WI#393, WI#402, WI#408, WI#410–#412, and the opencode2 exposure-policy
-  follow-ups (WI#357) plus WI#326/WI#395 pending maintainer acceptance.
+  control channel (WI#328), external-worker cron mode (WI#325), the
+  harness as an optional external worker (WI#326), worker LLM endpoint
+  handling (WI#330), the libSQL remote-replica feature gate (WI#331),
+  mission credential redaction (WI#359), worker-container credential
+  hygiene (WI#373), the OpenRC proxy-unit migration (WI#376), and the
+  opencode2 exposure-policy controls (WI#357, item #21). Still open —
+  check the checklist before opening MRs there: the external-worker tool
+  proxy (WI#324), WI#336, WI#375, WI#377, WI#390, WI#380, WI#392, WI#393,
+  WI#402, WI#408, WI#410–#412, and the opencode2 exposure-policy
+  follow-ups (WI#357); WI#356 and WI#395 are merged but still open pending
+  maintainer acceptance.
 - **Kawarimi export testing under OpenRC** is being re-worked due to an open-write detection
   difference vs systemd. OpenRC contributors *with kawarimi export expertise* are welcome →
   ask in `#lunarwing`.

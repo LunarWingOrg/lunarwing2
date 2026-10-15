@@ -7,8 +7,9 @@ mt-admin ownership commands, adapter env contract, and the 3000 ms polling
 floor were re-checked against the current tree; no changes were needed.
 (The v2.1.6.0 WI#376 `render-units --all-proxies` sweep rewrites
 `lunarwing-proxy-*` units only, not DarkIRC ones — but until it succeeds on a
-legacy-carrying OpenRC host, DarkIRC OpenRC lifecycle calls are refused with
-exit 125 like every other mt-admin operation; see
+legacy-carrying OpenRC host, mt-admin refuses DarkIRC OpenRC lifecycle calls
+up front (exit 1) like every other mt-admin operation except `help` and
+`upgrade-tenant`; see
 [`MT-ADMIN-QUICKSTART.md` §8](../MT-ADMIN-QUICKSTART.md).)
 
 This document describes the adapter boundary. Operational contact-key exchange and recovery procedures are in [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md); build and installation steps are in [`DARKIRC_BUILD_GUIDE.md`](DARKIRC_BUILD_GUIDE.md).
