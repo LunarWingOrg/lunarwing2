@@ -547,8 +547,11 @@ _openrc_proxy_unit_extract_port() {
 # Only safe verdicts are cached, for the life of the process, keyed by path
 # with the unit's dev:inode:mtime(ns):size signature plus the resolved
 # interpreter — any replacement, edit or interpreter-resolution change forces
-# a full re-check, so a cached "safe" can never outlive the bytes and
-# resolution it verified.
+# a full re-check. The key is a stat signature, not a content hash: a
+# same-size in-place rewrite that preserved dev:inode AND nanosecond mtime
+# would keep the stale verdict (200 such rewrites produced no stale hit on
+# ext4 or tmpfs, and only root writes init.d, so there is no tenant
+# escalation either way).
 declare -gA _OPENRC_PROXY_UNIT_SAFE_CACHE=()
 openrc_proxy_unit_is_safe() {
   local path="$1" name sig port
@@ -566,11 +569,11 @@ openrc_proxy_unit_is_safe() {
      || "${LUNARWING_MT_PROXY_PYTHON3:-}" != "$_OPENRC_PROXY_PYTHON3_RESOLVED_FROM" ]]; then
     _openrc_proxy_python3 >/dev/null || return 1
   fi
-  # Fast path: a cache hit costs one stat and no subshells. The fork-heavy
-  # validations (name sanitize, body render, cmp) run only on a miss, and only
-  # a fully verified unit is ever cached, so a hit can only repeat a verdict
-  # this process already proved for these exact bytes under this exact
-  # interpreter resolution.
+  # Fast path: a cache hit costs the one `$(stat …)` fork above — the
+  # fork-heavy validations (name sanitize, body render, cmp) run only on a
+  # miss, and only a fully verified unit is ever cached, so a hit can only
+  # repeat a verdict this process already proved for this exact stat
+  # signature under this exact interpreter resolution.
   if [[ "${_OPENRC_PROXY_UNIT_SAFE_CACHE[$path]:-}" == "$sig|$_OPENRC_PROXY_PYTHON3_RESOLVED" ]]; then
     return 0
   fi
