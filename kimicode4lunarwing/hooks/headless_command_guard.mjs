@@ -3,7 +3,7 @@
 // (WI#206).
 //
 // The worker runs `kimi -p --output-format stream-json` headless. Verified
-// against 2.0.2 (live-verified; 2.1.1 contract gate pending): print mode
+// against 2.0.2 (live-verified; 2.2.0 contract gate pending): print mode
 // forces the auto permission policy, and the upstream dangerous-command guard
 // is skipped in auto mode. [[permission.rules]] never load from config, so a PreToolUse
 // hook (which fires BEFORE permission checks in every mode and blocks with

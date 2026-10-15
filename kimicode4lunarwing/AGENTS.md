@@ -13,7 +13,7 @@ Persistent container worker for upstream Kimi Code CLI (MoonshotAI/kimi-code). T
 - `scripts/lunarwing_mcp_server.ts` — WI#324 thin stdio MCP server the CLI spawns per task (registered in `$KIMI_CODE_HOME/mcp.json` by entrypoint.sh). Advertises zero tools without the per-task proxy env; the hub stays deny-by-default without a `tool_allowlist` grant.
 - `entrypoint.sh` — Startup orchestration. Two modes: websocket, cli.
 - `config/config.toml` — Kimi Code CLI default config (model, provider, thinking, fail-closed permission policy). Baked into the image. Default provider is the TensorZero gateway (function `tensorzero::function_name::FrontierCODEK`), not the managed api.kimi.com service — see README. Since WI#330 the baked `base_url` is an `.invalid` placeholder that `entrypoint.sh` refuses to run; mt-admin renders `KIMI_BASE_URL` per tenant (default: the tenant's own LLM endpoint).
-- `hooks/headless_command_guard.mjs` — WI#206 fail-closed PreToolUse guard. The 2.0.2 behavior was live-verified; the 2.1.1 CLI contract gate still needs a protected worker image build. Print mode forces the auto policy, the upstream dangerous-command guard is skipped in auto mode, and `[[permission.rules]]` never load from config — this hook is the only in-CLI enforcement point for the headless lane.
+- `hooks/headless_command_guard.mjs` — WI#206 fail-closed PreToolUse guard. The 2.0.2 behavior was live-verified; the 2.2.0 CLI contract gate still needs a protected worker image build. Print mode forces the auto policy, the upstream dangerous-command guard is skipped in auto mode, and `[[permission.rules]]` never load from config — this hook is the only in-CLI enforcement point for the headless lane.
 
 ## Protocol Compatibility
 
