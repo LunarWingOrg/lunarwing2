@@ -118,4 +118,48 @@ I3="$(sb)"; mk_mockbin "$I3"; svc_down "$I3" lunarwing; svc_stuck "$I3" lunarwin
 run_chaos "$I3" systemd SELF_HEAL_GRACE_CHECKS=1 -- --verify-health false >/dev/null
 assert_eq "$(state_of "$I3" '.lunarwing.retries')" "1" "I3: --verify-health false skips health-check (is-active only)"
 
+# ── J: WI#410 runtime safe-unit guard (OpenRC migration window) ──────────────
+# An unsafe legacy proxy unit must refuse the WHOLE root-cron tick — no probe,
+# no restart, no state mutation — while a rendered (safe) unit keeps normal
+# remediation and the guard never fires under systemd.
+J="$(sb)"; mkdir -p "$J/initd"
+printf ': "${proxy_args:=/opt/x/lunarwing-proxy.py --port 21001 --tensorzero http://tz.example/tz?tok=abc}"\n' \
+  > "$J/initd/lunarwing-proxy-acme"; chmod +x "$J/initd/lunarwing-proxy-acme"
+report "$J" '{components:[{component:"openrc",status:"degraded",metrics:{services:[{name:"lunarwing-summer",status:"critical"}]}}]}'
+oJ="$(run_raw "$J" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$J/initd" \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$J/report.json" --backoff 0)"; RC=$?
+assert_contains "$oJ" "unsafe legacy proxy unit"          "J1: legacy proxy unit refuses the tick"
+assert_contains "$oJ" "render-units --all-proxies"        "J1: refusal names the remediation"
+assert_absent   "$oJ" "rc-service"                        "J1: no rc-service probe or restart runs"
+assert_absent   "$oJ" "RESTART"                           "J1: tick aborted before any remediation"
+assert_eq "$RC" 1 "J1: exit 1 (fail closed)"
+assert_eq "$(state_of "$J")" "" "J1: no state written"
+
+J2="$(sb)"; mkdir -p "$J2/initd"
+printf ': "${proxy_args:=/opt/lunarwing/tensorzero-proxy-configurations/lunarwing-proxy.py --port 21001 --bind 127.0.0.1 --tensorzero-env}"\n' \
+  > "$J2/initd/lunarwing-proxy-acme"; chmod +x "$J2/initd/lunarwing-proxy-acme"
+report "$J2" '{components:[{component:"openrc",status:"degraded",metrics:{services:[{name:"lunarwing-summer",status:"critical"}]}}]}'
+oJ2="$(run_dry "$J2" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$J2/initd" \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oJ2" "rc-service lunarwing-summer restart" "J2: safe rendered proxy unit keeps normal remediation"
+
+J3="$(sb)"; mkdir -p "$J3/initd"
+printf ': "${proxy_args:=/opt/x/lunarwing-proxy.py --port 21001 --tensorzero http://tz.example/tz?tok=abc}"\n' \
+  > "$J3/initd/lunarwing-proxy-acme"; chmod +x "$J3/initd/lunarwing-proxy-acme"
+report "$J3" "$GW"
+oJ3="$(run_dry "$J3" LUNARWING_SERVICE_MANAGER=systemd LUNARWING_MT_OPENRC_INITD_DIR="$J3/initd" \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oJ3" "would run: systemctl restart lunarwing" "J3: guard is OpenRC-only (systemd tick unaffected)"
+
+# Unit level (src_fn): the helper reports the first offender — a symlinked
+# proxy unit fails the contract even when its target is a safe rendered unit.
+J4="$(sb)"; mkdir -p "$J4/initd"
+printf ': "${proxy_args:=/opt/lunarwing/tensorzero-proxy-configurations/lunarwing-proxy.py --port 21001 --bind 127.0.0.1 --tensorzero-env}"\n' \
+  > "$J4/initd/lunarwing-proxy-ok"; chmod +x "$J4/initd/lunarwing-proxy-ok"
+assert_eq "$(src_fn LUNARWING_MT_OPENRC_INITD_DIR="$J4/initd" -- first_unsafe_openrc_proxy_unit)" "" \
+  "J4: rendered safe units pass the guard"
+ln -s "$J4/initd/lunarwing-proxy-ok" "$J4/initd/lunarwing-proxy-link"
+assert_eq "$(src_fn LUNARWING_MT_OPENRC_INITD_DIR="$J4/initd" -- first_unsafe_openrc_proxy_unit)" \
+  "$J4/initd/lunarwing-proxy-link" "J5: symlinked proxy unit is the first offender"
+
 finish
