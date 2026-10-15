@@ -199,17 +199,24 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 # npm ci verifies every bridge and CLI dependency against committed integrity
 # hashes. An override that disagrees with the lock fails instead of re-resolving.
 ARG KIMI_CODE_VERSION
+ARG SOURCE_DATE_EPOCH=0
 ENV KIMI_CODE_IMAGE_VERSION="${KIMI_CODE_VERSION}"
 COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
 # The stock npm bundled in the node base ships node-tar < 7.5.19
 # (CVE-2026-59873); upgrade npm to a pinned release that bundles the fix.
+# The trailing touch pins the /usr/local directory mtime: this step does not
+# always modify the directory itself, so depending on the run the layer tar
+# records either the base image mtime or SOURCE_DATE_EPOCH (clamped by
+# rewrite-timestamp) — flaking the candidate vs clean-rebuild digest gate
+# (worker-kimi-candidate in pipelines 5158, 5263, 5390, 5481, 5734).
 RUN test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonshot-ai/kimi-code']")" = "${KIMI_CODE_VERSION}" && \
     npm install -g npm@12.0.2 && \
     npm ci --omit=dev --prefix /opt/kimi-cli && \
     ln -s /opt/kimi-cli/node_modules/.bin/kimi /usr/local/bin/kimi && \
     kimi --version && \
     npm cache clean --force && \
-    rm -rf /root/.npm/_logs /tmp/node-compile-cache
+    rm -rf /root/.npm/_logs /tmp/node-compile-cache && \
+    touch -d "@${SOURCE_DATE_EPOCH}" /usr/local
 
 # ── XDG directories for kimi state ────────────────────────────────────────────
 RUN mkdir -p /home/kimi/.kimi-code \
