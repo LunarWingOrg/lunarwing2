@@ -4,6 +4,7 @@
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
@@ -266,6 +267,20 @@ class WorkerVersionPinTests(unittest.TestCase):
         end = text.index("        ;;\n", start) + len("        ;;\n")
         self.build_script.write_text(text[:start] + text[end:], encoding="utf-8")
         self.assertTrue(any("kimi" in error for error in self.errors()))
+
+    def test_kimi_block_must_not_pass_debian_snapshot(self):
+        # MR !1627 review HE-7: a DEBIAN_SNAPSHOT build-arg would override
+        # the Dockerfile default at build time and silently detach the
+        # CI_DEBIAN_SNAPSHOT tie from what the image really builds with.
+        text = self.build_script.read_text(encoding="utf-8")
+        self.build_script.write_text(
+            text.replace(
+                '        build_args="KIMI_CODE_VERSION=2.1.1\n',
+                '        build_args="KIMI_CODE_VERSION=2.1.1\nDEBIAN_SNAPSHOT=20260906T000000Z\n',
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(any("DEBIAN_SNAPSHOT" in error for error in self.errors()))
 
 
 class BunImageTieTests(unittest.TestCase):
@@ -533,7 +548,17 @@ class DebianSnapshotTieTests(unittest.TestCase):
         return errors
 
     def test_matching_snapshot_passes(self):
-        self.write_dockerfile(f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from())
+        # The realistic builder-stage shape: valued ARG, bare redeclaration,
+        # and RUN lines referencing ${DEBIAN_SNAPSHOT} (HE-3 pass-side pin).
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "ARG DEBIAN_SNAPSHOT\n"
+            + "RUN printf '%s\\n' \\\n"
+            + '      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" \\\n'
+            + '      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bookworm-security main" \\\n'
+            + "      > /etc/apt/sources.list\n"
+        )
         self.assertEqual(self.errors(), [])
 
     def test_snapshot_mismatch_is_caught(self):
@@ -565,47 +590,90 @@ class DebianSnapshotTieTests(unittest.TestCase):
         )
         self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
 
+    def test_lowercase_arg_instruction_is_caught(self):
+        # MR !1627 review HE-3: Dockerfile instructions are case-insensitive,
+        # so a lowercase stage-level `arg` still steers the build.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "arg DEBIAN_SNAPSHOT=20270101T000000Z\n"
+        )
+        self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+        # …while a lowercase ARG carrying the correct value must pass.
+        self.write_dockerfile(f"arg DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from())
+        self.assertEqual(self.errors(), [])
+
+    def test_indented_arg_is_caught(self):
+        # HE-3: an indented divergent ARG was invisible to the column-0 match.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "  ARG DEBIAN_SNAPSHOT=20270101T000000Z\n"
+        )
+        self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+
+    def test_quoted_arg_value_passes(self):
+        # HE-3: a quoted correct value must not false-error as a mismatch.
+        self.write_dockerfile(
+            f'ARG DEBIAN_SNAPSHOT="{self.SNAPSHOT}"\n' + self.node_from()
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_hardcoded_snapshot_url_is_caught(self):
+        # HE-3: the tie checked the ARG value but not its use — a RUN that
+        # hardcodes a snapshot timestamp builds from it regardless of the
+        # ARG, even when the hardcoded timestamp equals the pinned value.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + f'"deb http://snapshot.debian.org/archive/debian/{self.SNAPSHOT}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
+        )
+
+    def test_renamed_snapshot_variable_is_caught(self):
+        # HE-3: a URL referencing a different variable is equally detached.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOTS}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
+        )
+
 
 class WorkerTsLaneTests(unittest.TestCase):
     """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
-    the merge_request_event rule, the tied image variable, and the core
-    script fragments (including the kimi python3 provisioning, GH-1)."""
+    the merge_request_event rule, the tied image variable, and (MR !1644
+    review HN-5) the exact script, taken from config.WORKER_TS_LANE_SCRIPTS
+    so the fixtures always match the pinned tuple; the real-tree binding is
+    main() running this validator over the checked-in validate.yml."""
 
-    def lane(self, image_variable: str, commands: list[str]) -> dict:
+    def lane(self, job_name: str) -> dict:
+        image_variable, script = config.WORKER_TS_LANE_SCRIPTS[job_name]
         return {
             "stage": "validate",
+            "needs": [],
             "image": {"name": image_variable, "entrypoint": [""]},
+            "tags": ["$CI_LINT_RUNNER_TAG"],
             "rules": [
                 {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
                 {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'},
                 {"when": "never"},
             ],
-            "script": commands,
+            "script": list(script),
         }
 
     def merged(self) -> dict:
         return {
-            "worker-kimi-ts": self.lane(
-                "$CI_NODE_IMAGE",
-                [
-                    "rm -f /etc/apt/sources.list.d/debian.sources",
-                    'printf \'%s\\n\' "deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main" > /etc/apt/sources.list',
-                    "apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends python3",
-                    "cd kimicode4lunarwing/scripts",
-                    "npm ci --ignore-scripts",
-                    "npx tsc -p tsconfig.json",
-                    "npm test",
-                ],
-            ),
-            "worker-opencode-ts": self.lane(
-                "$CI_BUN_IMAGE",
-                [
-                    "cd opencode4lunarwing",
-                    "bun install --frozen-lockfile",
-                    "bun scripts/path_expand_test.ts",
-                    "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
-                ],
-            ),
+            "worker-kimi-ts": self.lane("worker-kimi-ts"),
+            "worker-opencode-ts": self.lane("worker-opencode-ts"),
         }
 
     def errors(self, merged: dict) -> list[str]:
@@ -615,6 +683,103 @@ class WorkerTsLaneTests(unittest.TestCase):
 
     def test_valid_shape_passes(self):
         self.assertEqual(self.errors(self.merged()), [])
+
+    def test_job_level_execution_overrides_are_caught(self):
+        # HP-1: the script can remain byte-identical while its environment
+        # skips tests, exits Node immediately, or replaces npm's shell.
+        overrides = (
+            ("variables", {"NODE_OPTIONS": "--test-skip-pattern=."}),
+            ("variables", {"NODE_OPTIONS": "--import=data:text/javascript,process.exit(0)"}),
+            ("variables", {"npm_config_script_shell": "/bin/true"}),
+            ("parallel", {"matrix": [{"NODE_OPTIONS": ["--test-only"]}]}),
+            ("hooks", {"pre_get_sources_script": ["git config --global core.hooksPath /tmp/hooks"]}),
+        )
+        for job_name in self.merged():
+            for key, value in overrides:
+                for inherited in (False, True):
+                    with self.subTest(job=job_name, key=key, value=value, inherited=inherited):
+                        merged = self.merged()
+                        override = {key: copy.deepcopy(value)}
+                        if inherited:
+                            merged[".execution-parent"] = override
+                            merged[job_name]["extends"] = ".execution-parent"
+                        else:
+                            merged[job_name].update(override)
+                        self.assertTrue(any(
+                            f"{job_name} must not set job keys ['{key}']" in error
+                            for error in self.errors(merged)
+                        ))
+
+    def test_other_job_keywords_require_review(self):
+        # The allowlist deliberately requires review even for currently
+        # harmless values; it is not a blacklist of known variable names.
+        for job_name in self.merged():
+            for key, value in (
+                ("variables", {}), ("variables", None), ("hooks", {}),
+                ("after_script", ["true"]), ("timeout", "1m"),
+                ("retry", 1), ("inherit", {"variables": False}),
+            ):
+                with self.subTest(job=job_name, key=key, value=value):
+                    merged = self.merged()
+                    merged[job_name][key] = value
+                    self.assertTrue(any(
+                        f"{job_name} must not set job keys ['{key}']" in error
+                        for error in self.errors(merged)
+                    ))
+
+    def test_runner_tags_must_match_in_both_lanes(self):
+        for job_name in self.merged():
+            for override in (
+                {}, {"tags": None}, {"tags": []},
+                {"tags": ["unavailable-runner"]},
+                {"tags": ["$CI_LINT_RUNNER_TAG", "extra-runner-tag"]},
+                {"tags": "$CI_LINT_RUNNER_TAG"},
+            ):
+                for inherited in (False, True):
+                    with self.subTest(job=job_name, override=override, inherited=inherited):
+                        merged = self.merged()
+                        del merged[job_name]["tags"]
+                        if inherited:
+                            merged[".runner-parent"] = copy.deepcopy(override)
+                            merged[job_name]["extends"] = ".runner-parent"
+                        else:
+                            merged[job_name].update(override)
+                        self.assertTrue(any(
+                            f"{job_name} tags must be exactly ['$CI_LINT_RUNNER_TAG']" in error
+                            for error in self.errors(merged)
+                        ))
+
+    def test_allowed_job_keys_can_be_inherited(self):
+        # Inspect the resolved job, not the raw `extends` keyword; allowed
+        # defaults and the canonical runner tag remain valid in a parent.
+        for job_name in self.merged():
+            with self.subTest(job=job_name):
+                merged = self.merged()
+                merged[".worker-template"] = merged[job_name]
+                merged[".worker-template"].update({
+                    "before_script": [], "allow_failure": False, "when": "on_success",
+                })
+                merged[job_name] = {"extends": ".worker-template"}
+                self.assertEqual(self.errors(merged), [])
+
+    def test_main_rejects_job_level_execution_override(self):
+        original_load_yaml = config.load_yaml
+        for job_name in self.merged():
+            with self.subTest(job=job_name):
+                def load_with_override(path):
+                    loaded = original_load_yaml(path)
+                    if path == ROOT / ".gitlab/ci/validate.yml":
+                        loaded[job_name]["variables"] = {"NODE_OPTIONS": "--test-only"}
+                    return loaded
+
+                with (
+                    mock.patch.object(config, "load_yaml", side_effect=load_with_override),
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    self.assertEqual(config.main(), 1)
+                self.assertIn(
+                    f"{job_name} must not set job keys ['variables']", stderr.getvalue()
+                )
 
     def test_missing_kimi_lane_is_caught(self):
         merged = self.merged()
@@ -657,11 +822,324 @@ class WorkerTsLaneTests(unittest.TestCase):
         merged["worker-kimi-ts"]["rules"].insert(0, {"when": "never"})
         self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
 
+    def test_job_level_when_manual_is_caught(self):
+        # MR !1627 review HE-1 (R1): the MR rule carries no `when`, so a
+        # job-level `when: manual` inherits into it — the lane never runs
+        # unless clicked, even with allow_failure: false.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["when"] = "manual"
+        merged["worker-kimi-ts"]["allow_failure"] = False
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_job_level_when_never_is_caught(self):
+        merged = self.merged()
+        merged["worker-kimi-ts"]["when"] = "never"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_catch_all_shadow_rule_is_caught(self):
+        # HE-1 (R2): an always-true `if` rule placed first shadows the MR
+        # rule; the substring check could not see it.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"].insert(
+            0, {"if": "$CI_PIPELINE_SOURCE", "when": "never"}
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_exists_shadow_rule_is_caught(self):
+        # HE-1 (R2): same shadow via exists: — .gitlab-ci.yml always exists.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"].insert(
+            0, {"exists": [".gitlab-ci.yml"], "when": "never"}
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_changes_shadow_rule_is_caught(self):
+        # HE-1 (R2): same shadow via changes: — **/* matches every push/MR.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"].insert(
+            0, {"changes": ["**/*"], "when": "never"}
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_inverted_mr_predicate_is_caught(self):
+        # HE-1 (R3): the substring "merge_request_event" is still present,
+        # but the lane then runs on everything EXCEPT merge requests.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE != "merge_request_event"'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_narrowed_mr_predicate_is_caught(self):
+        # HE-1 (R3): an &&-narrowed predicate no longer matches every MR.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE == "merge_request_event" '
+            '&& $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "no-such"'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_mr_rule_extra_keys_are_caught(self):
+        # HE-1: the first rule must be the plain MR predicate; an extra
+        # changes:/exists: key can narrow or shadow it.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["changes"] = ["kimicode4lunarwing/**"]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_mr_predicate_spacing_and_quotes_normalised(self):
+        # Formatting variants of the canonical predicate still pass.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            "$CI_PIPELINE_SOURCE=='merge_request_event'"
+        )
+        self.assertEqual(self.errors(merged), [])
+
+    def test_trailing_space_inside_mr_predicate_quotes_is_caught(self):
+        # MR !1644 review HN-1: the squash-and-compare check deleted
+        # whitespace inside the quoted literal, so `"merge_request_event "`
+        # passed while GitLab compares the literal exactly — the rule then
+        # never matches an MR pipeline and the lane silently drops out.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE == "merge_request_event "'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_space_inside_mr_predicate_literal_is_caught(self):
+        # HN-1: same hole, whitespace in the middle of the literal.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE == "merge_request _event"'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_nbsp_inside_mr_predicate_quotes_is_caught(self):
+        # HN-1: a non-breaking space inside the quotes is literal too.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE == "merge_request_event "'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_only_except_are_caught(self):
+        # HE-1: only/except bypass the rules walk entirely.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["only"] = ["merge_requests"]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_extends_observational_job_is_caught(self):
+        # HE-1 (R4): extending .observational-job (defaults.yml) inherits
+        # allow_failure: true — the lane runs on MRs but cannot gate.
+        merged = self.merged()
+        merged[".observational-job"] = {
+            "allow_failure": True,
+            "rules": [{"if": '$CI_PIPELINE_SOURCE == "schedule"'}, {"when": "never"}],
+        }
+        merged["worker-kimi-ts"]["extends"] = ".observational-job"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_extends_inherited_when_manual_is_caught(self):
+        merged = self.merged()
+        merged[".manual-parent"] = {"when": "manual"}
+        merged["worker-kimi-ts"]["extends"] = ".manual-parent"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_extends_job_keys_win(self):
+        # GitLab merge semantics: the job's own keys override the parent's,
+        # so an explicit allow_failure: false undoes the inherited one.
+        merged = self.merged()
+        merged[".observational-job"] = {"allow_failure": True}
+        merged["worker-kimi-ts"]["extends"] = ".observational-job"
+        merged["worker-kimi-ts"]["allow_failure"] = False
+        self.assertEqual(self.errors(merged), [])
+
+    def test_last_listed_parent_wins(self):
+        # GitLab multi-parent merge is a reverse deep merge: keys from the
+        # last listed parent override earlier parents.
+        merged = self.merged()
+        merged[".gating"] = {"allow_failure": False}
+        merged[".observational"] = {"allow_failure": True}
+        merged["worker-kimi-ts"]["extends"] = [".gating", ".observational"]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+        merged["worker-kimi-ts"]["extends"] = [".observational", ".gating"]
+        self.assertEqual(self.errors(merged), [])
+
+    def test_extends_self_cycle_still_applies_parent_keys(self):
+        # A cyclic extends chain must terminate (depth-bounded), surface
+        # the parent's gating keys, and — since HP-2/HN-3 — carry the
+        # truncation sentinel so the lane fails closed.
+        merged = self.merged()
+        merged[".loopy"] = {"extends": ".loopy", "allow_failure": True}
+        merged["worker-kimi-ts"]["extends"] = ".loopy"
+        errors = self.errors(merged)
+        self.assertTrue(any("merge_request_event" in error for error in errors))
+        self.assertTrue(any("depth budget" in error for error in errors))
+
+    def test_needs_dependency_is_caught(self):
+        # HE-1/HE-2: a non-empty needs can hold the lane behind a manual or
+        # absent job; the lanes must keep needs: [].
+        merged = self.merged()
+        merged["worker-kimi-ts"]["needs"] = [{"job": "ci-config", "artifacts": False}]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_before_script_is_caught(self):
+        # HE-2: a before_script can neutralise anything before the pinned
+        # commands run (e.g. before_script: [exit 0]).
+        merged = self.merged()
+        merged["worker-kimi-ts"]["before_script"] = ["exit 0"]
+        self.assertTrue(any("before_script" in error for error in self.errors(merged)))
+
+    def test_image_entrypoint_override_is_caught(self):
+        # HE-2: image.entrypoint: ["/bin/true"] would run nothing at all;
+        # [""] (the real tree's value) stays accepted.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["image"]["entrypoint"] = ["/bin/true"]
+        self.assertTrue(any("entrypoint" in error for error in self.errors(merged)))
+
+    def test_commented_out_fragment_is_caught(self):
+        # HE-2: the substring check accepted a fragment inside a comment.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "# npm test" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_true_or_prefixed_fragment_is_caught(self):
+        # HE-2: `true || npm test` contains the fragment but never runs it.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "true || npm test" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_or_true_suffixed_fragment_is_caught(self):
+        # HE-2: `npm test || true` runs the suite but cannot fail the lane.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "npm test || true" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_echoed_fragment_is_caught(self):
+        # HE-2: `echo npm test` contains the fragment but runs nothing.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "echo npm test" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_trailing_args_change_the_pinned_script(self):
+        # MR !1644 review HN-5 (inverts the HE-2 acceptance): the fragment
+        # pin accepted `npm test -- --test-name-pattern=NO_SUCH_TEST`, which
+        # runs nothing. The script must equal the pinned tuple line for
+        # line, so trailing args now fail.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "npm test -- --grep worker" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_folded_multi_line_command_is_caught(self):
+        # HN-5 (inverts the HE-2 acceptance): folding `npm test` into the
+        # previous line's YAML string changes the effective script.
+        merged = self.merged()
+        script = merged["worker-kimi-ts"]["script"]
+        index = script.index("npm test")
+        script[index - 1] = script[index - 1] + "\nnpm test"
+        del script[index]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_prepended_exit_0_is_caught(self):
+        # HN-5: `- exit 0` as the first script line has the same effect as
+        # the banned before_script — the pinned commands never run.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"].insert(0, "exit 0")
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_backgrounded_npm_test_is_caught(self):
+        # HN-5: `npm test &` runs the suite concurrently and cannot gate.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "npm test &" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_set_plus_e_and_trailing_true_is_caught(self):
+        # HN-5: `set +e` up front and a trailing `true` neutralise failures.
+        merged = self.merged()
+        script = merged["worker-kimi-ts"]["script"]
+        script.insert(0, "set +e")
+        script.append("true")
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_dropped_sources_removal_line_is_caught(self):
+        # HN-5: deleting the debian.sources removal lets the live mirror's
+        # newer python3 win, silently undoing the GV-4 snapshot pin.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command
+            for command in merged["worker-kimi-ts"]["script"]
+            if "debian.sources" not in command
+        ]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_extra_live_mirror_deb_entry_is_caught(self):
+        # HN-5: an extra live-mirror deb entry in the printf re-adds the
+        # live mirror alongside the snapshot pins.
+        merged = self.merged()
+        script = merged["worker-kimi-ts"]["script"]
+        index = next(
+            i for i, command in enumerate(script) if command.startswith("printf")
+        )
+        script[index] = script[index].replace(
+            " > /etc/apt/sources.list",
+            ' "deb http://deb.debian.org/debian bookworm main" > /etc/apt/sources.list',
+        )
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_dropped_opencode_bun_test_lines_are_caught(self):
+        # HN-5 (pre-existing gap): the opencode lane's five bun self-test
+        # lines could be deleted without tripping the fragment pins.
+        merged = self.merged()
+        merged["worker-opencode-ts"]["script"] = [
+            command
+            for command in merged["worker-opencode-ts"]["script"]
+            if not command.startswith("bun scripts/")
+        ]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_real_lanes_match_the_pinned_scripts(self):
+        # HN-5: the pinned tuples must equal the checked-in validate.yml
+        # lanes, so a lane edit without a tuple update fails here (and in
+        # ci-config via main()).
+        merged = {}
+        for include in config.EXPECTED_INCLUDES:
+            merged.update(config.load_yaml(ROOT / include.lstrip("/")))
+        self.assertEqual(self.errors(merged), [])
+
+    def test_missing_apt_retries_are_caught(self):
+        # HE-4: reverting the snapshot fetch to a retry-less apt-get update
+        # drops the pinned provisioning fragment.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command.replace(" -o Acquire::Retries=5 -o Acquire::http::Timeout=60", "")
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("Acquire::Retries" in error for error in self.errors(merged)))
+
     def test_main_runs_the_lane_validator(self):
         # MR !1618 review GV-2: every unit test above calls the validator
         # directly, so deleting the main() call passed the whole suite.
+        # MR !1627 review HE-7: also assert main()'s return value so an
+        # erroring validator cannot pass this pin unnoticed.
         with mock.patch.object(config, "validate_worker_ts_lanes") as lane_check:
-            config.main()
+            self.assertEqual(config.main(), 0)
         lane_check.assert_called_once()
 
     def test_wrong_image_variable_is_caught(self):
@@ -680,7 +1158,7 @@ class WorkerTsLaneTests(unittest.TestCase):
 
     def test_missing_snapshot_provisioning_is_caught(self):
         # MR !1618 review GV-4: reverting the lane's python3 source to the
-        # live deb.debian.org mirror must fail the fragment check.
+        # live deb.debian.org mirror must fail the (now exact-script) pin.
         merged = self.merged()
         merged["worker-kimi-ts"]["script"] = [
             command
@@ -704,6 +1182,364 @@ class WorkerTsLaneTests(unittest.TestCase):
             if "bun install" not in command
         ]
         self.assertTrue(any("bun install" in error for error in self.errors(merged)))
+
+    def test_reordered_script_lines_are_caught(self):
+        # HP-3: an order-insensitive comparison would accept a reorder, but
+        # the snapshot sources must be rewritten BEFORE apt-get update runs.
+        for job_name in self.merged():
+            with self.subTest(job=job_name):
+                merged = self.merged()
+                script = merged[job_name]["script"]
+                script[0], script[1] = script[1], script[0]
+                self.assertTrue(
+                    any("exactly the pinned commands" in error for error in self.errors(merged))
+                )
+
+    def test_script_as_a_single_string_is_caught(self):
+        # HP-3: GitLab also accepts a string script; dropping the
+        # isinstance(script, list) guard would compare it against the
+        # list. A non-iterable script (e.g. `script: 5`) must fail with a
+        # validator error, not crash the guard-less comparison.
+        for job_name in self.merged():
+            for script in ("\n".join(self.lane(job_name)["script"]), 5):
+                with self.subTest(job=job_name, script=script):
+                    merged = self.merged()
+                    merged[job_name]["script"] = script
+                    self.assertTrue(
+                        any(
+                            "exactly the pinned commands" in error
+                            for error in self.errors(merged)
+                        )
+                    )
+
+    def test_other_variable_in_mr_predicate_is_caught(self):
+        # HP-3: only $CI_PIPELINE_SOURCE is the MR predicate's left
+        # operand; dropping that check accepts any variable compared
+        # against the "merge_request_event" literal.
+        for job_name in self.merged():
+            with self.subTest(job=job_name):
+                merged = self.merged()
+                merged[job_name]["rules"][0] = {
+                    "if": '$CI_MERGE_REQUEST_IID == "merge_request_event"'
+                }
+                self.assertTrue(
+                    any("must run on merge_request_event" in error for error in self.errors(merged))
+                )
+
+    def test_root_file_job_override_is_merged_last(self):
+        # HP-2: GitLab merges the root file OVER the includes, so a root
+        # worker-kimi-ts entry is the effective job. Root-first merging
+        # hid the override behind validate.yml's pinned block.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_override(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded["worker-kimi-ts"] = {"script": ["exit 0"]}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_override),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("worker-kimi-ts script must be exactly the pinned commands", stderr.getvalue())
+
+    def test_root_file_variables_override_is_caught(self):
+        # HP-2: the root file's top-level variables win over the includes
+        # in GitLab; collect_variables must apply the same precedence so a
+        # root-file CI_NODE_IMAGE override fails the digest pin instead of
+        # passing unseen.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_variables(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded.setdefault("variables", {})["CI_NODE_IMAGE"] = (
+                    "docker.io/library/node:22-bookworm-slim"
+                )
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_variables),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("CI_NODE_IMAGE", stderr.getvalue())
+
+    def test_default_before_script_is_caught(self):
+        # HP-2: a default before_script/hooks is inherited by every job —
+        # including both lanes — and shares the pinned script's shell.
+        for key, value in (
+            ("before_script", ["export NODE_OPTIONS=--test-only"]),
+            ("hooks", {"pre_get_sources_script": ["true"]}),
+        ):
+            with self.subTest(key=key):
+                merged = self.merged()
+                merged["default"] = {key: value}
+                self.assertTrue(any(f"default.{key}" in error for error in self.errors(merged)))
+
+    def test_global_lane_bypass_variables_are_caught(self):
+        # Run-121 HP-2 reminder: a top-level NODE_OPTIONS or npm_config_*
+        # reaches every job, including both lanes; npm reads the prefix
+        # case-insensitively.
+        merged = self.merged()
+        merged["variables"] = {"GIT_STRATEGY": "fetch"}
+        self.assertEqual(self.errors(merged), [])
+        for name in ("NODE_OPTIONS", "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL"):
+            with self.subTest(name=name):
+                merged = self.merged()
+                merged["variables"] = {name: "--test-only"}
+                self.assertTrue(
+                    any("top-level variables" in error for error in self.errors(merged))
+                )
+
+    def test_nine_level_extends_chain_is_resolved(self):
+        # HP-2/HN-3: the budget must cover chains deeper than 8; a gating
+        # key on the ninth parent was silently invisible at depth 8.
+        merged = self.merged()
+        merged[".p9"] = {"allow_failure": True}
+        for index in range(8, 0, -1):
+            merged[f".p{index}"] = {"extends": f".p{index + 1}"}
+        merged["worker-kimi-ts"]["extends"] = ".p1"
+        errors = self.errors(merged)
+        self.assertTrue(any("merge_request_event" in error for error in errors))
+        self.assertFalse(any("depth budget" in error for error in errors))
+
+    def test_extends_chain_beyond_budget_fails_closed(self):
+        # HP-2/HN-3: a chain longer than the budget cannot be certified —
+        # the truncation sentinel must fail the lane even though the
+        # dropped parent's gating key is never seen.
+        merged = self.merged()
+        depth = config.EXTENDS_DEPTH_BUDGET + 1
+        merged[f".p{depth}"] = {"allow_failure": True}
+        for index in range(depth - 1, 0, -1):
+            merged[f".p{index}"] = {"extends": f".p{index + 1}"}
+        merged["worker-kimi-ts"]["extends"] = ".p1"
+        self.assertTrue(any("depth budget" in error for error in self.errors(merged)))
+
+    def test_global_variables_outside_allowlist_are_caught(self):
+        # MR !1658 review IA-5: a name denylist cannot enumerate every
+        # variable that hollows a lane out (BUN_OPTIONS preloads a file
+        # before bun's main script; PATH and GIT_CHECKOUT need one more
+        # artifact), so every global variable must be allowlisted.
+        merged = self.merged()
+        merged["variables"] = {name: "x" for name in config.GLOBAL_VARIABLE_ALLOWLIST}
+        self.assertEqual(self.errors(merged), [])
+        for name in ("BUN_OPTIONS", "PATH", "GIT_CHECKOUT", "SOME_NEW_VARIABLE"):
+            with self.subTest(name=name):
+                merged = self.merged()
+                merged["variables"] = {name: "x"}
+                self.assertTrue(
+                    any("GLOBAL_VARIABLE_ALLOWLIST" in error for error in self.errors(merged))
+                )
+
+    def test_workflow_rule_variables_are_caught(self):
+        # IA-1: workflow:rules:variables become pipeline-wide variables on
+        # the pipelines the rule matches, overriding same-named globals, so
+        # a NODE_OPTIONS or an unpinned CI_NODE_IMAGE there reaches both
+        # lanes while their scripts and the global variables stay pinned.
+        for variables in (
+            {"NODE_OPTIONS": "--import=data:text/javascript,process.exit(0)"},
+            {"CI_NODE_IMAGE": "docker.io/library/node:22-bookworm-slim"},
+        ):
+            with self.subTest(variables=variables):
+                merged = self.merged()
+                merged["workflow"] = {
+                    "rules": [
+                        {
+                            "if": '$CI_PIPELINE_SOURCE == "merge_request_event"',
+                            "variables": variables,
+                        },
+                    ]
+                }
+                self.assertTrue(
+                    any(
+                        "workflow:rules must not set variables" in error
+                        for error in self.errors(merged)
+                    )
+                )
+
+    def test_deprecated_global_before_script_is_caught(self):
+        # IA-3: the deprecated top-level before_script is still honoured by
+        # GitLab (equivalent to default:before_script) and inherited by
+        # both lanes, which define none.
+        merged = self.merged()
+        merged["before_script"] = ["exit 0"]
+        self.assertTrue(
+            any("top-level before_script" in error for error in self.errors(merged))
+        )
+
+    def test_lane_rule_variables_are_caught(self):
+        # IA-6: rules:variables on any lane rule reach the pinned script on
+        # the pipelines that rule matches (push and tag pipelines too, not
+        # only the first, MR rule).
+        for job_name in self.merged():
+            for index in (0, 1):
+                with self.subTest(job=job_name, rule=index):
+                    merged = self.merged()
+                    merged[job_name]["rules"][index]["variables"] = {
+                        "NODE_OPTIONS": "--test-only"
+                    }
+                    self.assertTrue(
+                        any(
+                            f"{job_name} rules must not set variables" in error
+                            for error in self.errors(merged)
+                        )
+                    )
+
+    def test_hash_form_root_image_variable_is_caught(self):
+        # IA-2: GitLab's `value:`/`description:` hash form defines the same
+        # variable; the root file is merged last, so a hash-form override
+        # of a pinned image variable must fail the digest pin exactly like
+        # the string form in test_root_file_variables_override_is_caught.
+        self.assertEqual(
+            config.collect_variables(
+                [
+                    (
+                        ROOT / "x.yml",
+                        {
+                            "variables": {
+                                "A": {"value": "v", "description": "d"},
+                                "B": "w",
+                                "C": {"description": "no value"},
+                            }
+                        },
+                    )
+                ]
+            ),
+            {"A": "v", "B": "w"},
+        )
+        original_load_yaml = config.load_yaml
+
+        def load_with_hash_form(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded.setdefault("variables", {})["CI_NODE_IMAGE"] = {
+                    "value": "docker.io/library/node:22-bookworm-slim",
+                    "description": "unpinned",
+                }
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_hash_form),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("CI_NODE_IMAGE", stderr.getvalue())
+
+    def test_nested_and_conditional_includes_are_caught(self):
+        # IA-4/IA-7: GitLab merges includes declared inside included files
+        # and honours include:rules on root entries; the validator reads
+        # exactly the seven root entries, so both shapes are refused.
+        original_load_yaml = config.load_yaml
+
+        def load_with_nested_include(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab" / "ci" / "containers.yml":
+                loaded = {"include": [{"local": "/.gitlab/ci/evil.yml"}], **loaded}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_nested_include),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("containers.yml must not include further files", stderr.getvalue())
+
+        def load_with_conditional_include(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                for item in loaded["include"]:
+                    if item.get("local") == "/.gitlab/ci/validate.yml":
+                        item["rules"] = [{"if": '$CI_PIPELINE_SOURCE == "push"'}]
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_conditional_include),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("root include entries must be plain local includes", stderr.getvalue())
+
+    def test_root_workflow_override_is_checked(self):
+        # IA-1: a root-file `workflow:` replaces the include's rules array
+        # in GitLab; the workflow check must read the merged view, not
+        # workflow.yml alone.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_workflow(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded["workflow"] = {"rules": [{"if": "$CI_COMMIT_BRANCH"}]}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_workflow),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("workflow must enable MR pipelines", stderr.getvalue())
+
+    def test_root_default_is_deep_merged_over_include_default(self):
+        # Pins the deep merge (IA-8 mutant M2): a harmless root `default:`
+        # key must not hide an include-level default.before_script by
+        # replacing the whole block.
+        original_load_yaml = config.load_yaml
+
+        def load_with_split_default(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab" / "ci" / "defaults.yml":
+                loaded.setdefault("default", {})["before_script"] = ["exit 0"]
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded["default"] = {"interruptible": True}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_split_default),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("default.before_script", stderr.getvalue())
+
+    def test_later_include_overrides_earlier_include(self):
+        # Pins the include order (IA-8 mutant M4): containers.yml comes
+        # after validate.yml, so its worker-kimi-ts entry is the effective
+        # job; merging in reverse would certify validate.yml's pinned block.
+        original_load_yaml = config.load_yaml
+
+        def load_with_later_override(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab" / "ci" / "containers.yml":
+                loaded["worker-kimi-ts"] = {"script": ["exit 0"]}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_later_override),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn(
+            "worker-kimi-ts script must be exactly the pinned commands", stderr.getvalue()
+        )
+
+    def test_extends_parent_image_keys_are_deep_merged(self):
+        # Pins the recursive merge (IA-8 mutant M18): nested hashes merge
+        # key-wise at every level, so a job's partial `image:` hash keeps
+        # the parent's name while overriding the entrypoint.
+        self.assertEqual(
+            config.merge_ci_hashes({"a": {"b": {"c": 1}}}, {"a": {"b": {"d": 2}}}),
+            {"a": {"b": {"c": 1, "d": 2}}},
+        )
+        merged = self.merged()
+        merged[".base"] = {"image": {"name": "$CI_NODE_IMAGE", "entrypoint": [""]}}
+        merged["worker-kimi-ts"]["extends"] = ".base"
+        merged["worker-kimi-ts"]["image"] = {"entrypoint": ["/bin/sh"]}
+        effective = config.resolve_extends(merged["worker-kimi-ts"], merged)
+        self.assertEqual(
+            effective["image"], {"name": "$CI_NODE_IMAGE", "entrypoint": ["/bin/sh"]}
+        )
+        self.assertTrue(any("entrypoint" in error for error in self.errors(merged)))
 
 
 if __name__ == "__main__":
