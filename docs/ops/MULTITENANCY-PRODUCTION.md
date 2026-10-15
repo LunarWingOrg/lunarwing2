@@ -608,8 +608,18 @@ the same order and count, the fixed `--tensorzero-env` flag line, the
 tenant name identical in the description/user/group/`before` slots, the
 canonical renderer paths (python interpreter, tenant proxy script,
 run/log/env dirs, env-exec launcher), a numeric port, no NUL/CR bytes,
-and a final newline. Renderer and contract share one template source in
-`mt-admin-lib/08-units-openrc.sh`, so the two cannot drift apart. Any
+and a final newline. Renderer and contract render from one shared body
+source in `mt-admin-lib/08-units-openrc.sh` and resolve the python
+interpreter through one PATH-independent helper — the
+`LUNARWING_MT_PROXY_PYTHON3` override when set, otherwise the first
+`python3` under `/usr/local/bin:/usr/bin:/bin`, allowlisted to plain path
+characters — so the two cannot drift apart and the calling process's PATH
+(a venv, sudo's `secure_path`, a pyenv shim) cannot flip a verdict or
+ping-pong the units between spellings. Units rendered before this pinning
+carried the caller's python3 spelling; on the first guarded operation they
+are **refused once** — run `render-units --all-proxies` to re-render them
+under the canonical interpreter (or set `LUNARWING_MT_PROXY_PYTHON3` to
+the existing spelling). Any
 extra, missing, reordered, or payload-carrying line — a legacy inline
 `--tensorzero <url>` flag, command substitution, a backtick, a prepended
 override, a replaced `proxy_command` — fails the contract, and the unit

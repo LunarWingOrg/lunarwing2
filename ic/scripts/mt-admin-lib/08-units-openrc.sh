@@ -507,8 +507,9 @@ _openrc_proxy_unit_extract_port() {
   # locale's [0-9] range can match non-ASCII digits that Python's int() would
   # also accept, smuggling a different value past a shape check.
   local LC_ALL=C
-  local prefix=': "${proxy_args:='"$(tenant_lw_root "$name")"'/tensorzero-proxy-configurations/lunarwing-proxy.py --port '
-  local port_re='^([0123456789]{1,5}) --bind 127[.]0[.]0[.]1 --tensorzero-env[}]"$'
+  local prefix port_re
+  prefix=': "${proxy_args:='"$(tenant_lw_root "$name")"'/tensorzero-proxy-configurations/lunarwing-proxy.py --port '
+  port_re='^([0123456789]{1,5}) --bind 127[.]0[.]0[.]1 --tensorzero-env[}]"$'
   local -a lines=()
   mapfile -t lines <"$path" || return 1
   for line in "${lines[@]}"; do
