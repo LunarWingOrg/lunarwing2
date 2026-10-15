@@ -570,29 +570,41 @@ def lane_runs_on_merge_requests(job: object, merged: dict) -> bool:
     return not first.get("allow_failure")
 
 
-def script_runs_command(script: object, fragment: str) -> bool:
-    """True when `fragment` starts a command or an &&/; segment of a script
-    line (MR !1627 review HE-2). A substring anywhere in the line is not
-    enough: `'# npm test'`, `echo npm test`, and `true || npm test` all
-    contain the fragment without the lane running it unconditionally.
-    Segments containing `||` do not count either — `npm test || true`
-    cannot fail the lane. Accepted residual limits: shell-variable
-    indirection (`$RUN_TESTS`) and here-doc/multi-line constructs are not
-    followed; the fragment check guards against accidental deletion and
-    casual bypass, not a fully adversarial shell rewrite.
-    """
-    commands = script if isinstance(script, list) else [script]
-    for command in commands:
-        for line in str(command).splitlines():
-            for segment in re.split(r"&&|;", line):
-                stripped = segment.strip()
-                if "||" in stripped:
-                    continue
-                if stripped.startswith(fragment) and (
-                    len(stripped) == len(fragment) or stripped[len(fragment)] in " \t"
-                ):
-                    return True
-    return False
+# MR !1644 review HN-5: the effective script of each worker TS lane must
+# equal these lines exactly (compared after extends resolution) — the
+# earlier "fragment starts a segment" pins let the lane be hollowed out
+# with a prepended `exit 0`, a dropped provisioning line, backgrounded or
+# neutralised test commands, or deleted bun test lines. Any deliberate edit
+# to a lane's script in .gitlab/ci/validate.yml must update the tuple in
+# the same commit, which is the point. Each entry pairs the lane's
+# digest-tied image variable with its pinned script lines.
+WORKER_TS_LANE_SCRIPTS = {
+    "worker-kimi-ts": (
+        "$CI_NODE_IMAGE",
+        (
+            "rm -f /etc/apt/sources.list.d/debian.sources",
+            "printf '%s\\n' \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb http://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
+            "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get install -y --no-install-recommends python3",
+            "cd kimicode4lunarwing/scripts",
+            "npm ci --ignore-scripts",
+            "npx tsc -p tsconfig.json",
+            "npm test",
+        ),
+    ),
+    "worker-opencode-ts": (
+        "$CI_BUN_IMAGE",
+        (
+            "cd opencode4lunarwing",
+            "bun install --frozen-lockfile",
+            "bun scripts/path_expand_test.ts",
+            "bun scripts/opencode_result_test.ts",
+            "bun scripts/task_prompt_test.ts",
+            "bun scripts/lunarwing_bridge_test.ts",
+            "bun scripts/opencode_task_executor_test.ts",
+            "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
+        ),
+    ),
+}
 
 
 def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
@@ -603,40 +615,17 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
     passed every gate silently — exactly the regression class GB-2 was
     about. Require each lane to exist, to run on merge_request_event (per
     the HE-1 exact-predicate first-rule gate on the extends-resolved job),
-    to use its digest-tied image variable, and to keep its core script
-    commands — each pinned fragment must start a command or an &&/;
-    segment (HE-2), so commenting a command out or neutralising it with
-    `true ||`/`|| true` fails here. A `before_script`, an image entrypoint
-    override, or a non-empty `needs` could hollow out the lane just as
-    well, so those are pinned too (HE-2). The kimi lane's pinned commands
-    include the python3 provisioning (GH-1) from the pinned Debian
-    snapshot (GV-4) with its apt retry options (HE-4).
+    to use its digest-tied image variable, and to run exactly its pinned
+    script (MR !1644 review HN-5: the extends-resolved script must equal
+    WORKER_TS_LANE_SCRIPTS line for line, so a prepended `exit 0`, a
+    dropped provisioning line, or a deleted test command fails here). A
+    `before_script`, an image entrypoint override, or a non-empty `needs`
+    could hollow out the lane just as well, so those stay pinned too
+    (HE-2). The kimi lane's pinned commands include the python3
+    provisioning (GH-1) from the pinned Debian snapshot (GV-4) with its apt
+    retry options (HE-4).
     """
-    expected = {
-        "worker-kimi-ts": (
-            "$CI_NODE_IMAGE",
-            (
-                "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 "
-                "-o Acquire::http::Timeout=60 update",
-                "apt-get install -y --no-install-recommends python3",
-                "printf '%s\\n' \"deb http://snapshot.debian.org/archive/debian/"
-                "${CI_DEBIAN_SNAPSHOT}/ bookworm main\"",
-                "cd kimicode4lunarwing/scripts",
-                "npm ci --ignore-scripts",
-                "npx tsc -p tsconfig.json",
-                "npm test",
-            ),
-        ),
-        "worker-opencode-ts": (
-            "$CI_BUN_IMAGE",
-            (
-                "cd opencode4lunarwing",
-                "bun install --frozen-lockfile",
-                "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
-            ),
-        ),
-    }
-    for job_name, (image_variable, fragments) in expected.items():
+    for job_name, (image_variable, expected_script) in WORKER_TS_LANE_SCRIPTS.items():
         job = merged.get(job_name)
         if not isinstance(job, dict):
             errors.append(f"{job_name} job missing")
@@ -652,10 +641,12 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
             errors.append(f"{job_name} must not set a before_script")
         if not lane_runs_on_merge_requests(job, merged):
             errors.append(f"{job_name} must run on merge_request_event")
-        script = effective.get("script", [])
-        for fragment in fragments:
-            if not script_runs_command(script, fragment):
-                errors.append(f"{job_name} lost its required script fragment: {fragment}")
+        script = effective.get("script")
+        if not isinstance(script, list) or [str(line) for line in script] != list(expected_script):
+            errors.append(
+                f"{job_name} script must be exactly the pinned commands "
+                f"{list(expected_script)!r} (got {script!r})"
+            )
 
 
 def validate_cavepony_version(merged: dict, errors: list[str]) -> None:

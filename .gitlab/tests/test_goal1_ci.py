@@ -649,10 +649,13 @@ class DebianSnapshotTieTests(unittest.TestCase):
 
 class WorkerTsLaneTests(unittest.TestCase):
     """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
-    the merge_request_event rule, the tied image variable, and the core
-    script fragments (including the kimi python3 provisioning, GH-1)."""
+    the merge_request_event rule, the tied image variable, and (MR !1644
+    review HN-5) the exact script, taken from config.WORKER_TS_LANE_SCRIPTS
+    so the fixtures always match the pinned tuple; the real-tree binding is
+    main() running this validator over the checked-in validate.yml."""
 
-    def lane(self, image_variable: str, commands: list[str]) -> dict:
+    def lane(self, job_name: str) -> dict:
+        image_variable, script = config.WORKER_TS_LANE_SCRIPTS[job_name]
         return {
             "stage": "validate",
             "image": {"name": image_variable, "entrypoint": [""]},
@@ -661,32 +664,13 @@ class WorkerTsLaneTests(unittest.TestCase):
                 {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'},
                 {"when": "never"},
             ],
-            "script": commands,
+            "script": list(script),
         }
 
     def merged(self) -> dict:
         return {
-            "worker-kimi-ts": self.lane(
-                "$CI_NODE_IMAGE",
-                [
-                    "rm -f /etc/apt/sources.list.d/debian.sources",
-                    'printf \'%s\\n\' "deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main" > /etc/apt/sources.list',
-                    "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get install -y --no-install-recommends python3",
-                    "cd kimicode4lunarwing/scripts",
-                    "npm ci --ignore-scripts",
-                    "npx tsc -p tsconfig.json",
-                    "npm test",
-                ],
-            ),
-            "worker-opencode-ts": self.lane(
-                "$CI_BUN_IMAGE",
-                [
-                    "cd opencode4lunarwing",
-                    "bun install --frozen-lockfile",
-                    "bun scripts/path_expand_test.ts",
-                    "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
-                ],
-            ),
+            "worker-kimi-ts": self.lane("worker-kimi-ts"),
+            "worker-opencode-ts": self.lane("worker-opencode-ts"),
         }
 
     def errors(self, merged: dict) -> list[str]:
@@ -945,23 +929,95 @@ class WorkerTsLaneTests(unittest.TestCase):
         ]
         self.assertTrue(any("npm test" in error for error in self.errors(merged)))
 
-    def test_fragment_with_trailing_args_counts(self):
-        # `npm test -- --grep x` still starts with the pinned command.
+    def test_trailing_args_change_the_pinned_script(self):
+        # MR !1644 review HN-5 (inverts the HE-2 acceptance): the fragment
+        # pin accepted `npm test -- --test-name-pattern=NO_SUCH_TEST`, which
+        # runs nothing. The script must equal the pinned tuple line for
+        # line, so trailing args now fail.
         merged = self.merged()
         merged["worker-kimi-ts"]["script"] = [
             "npm test -- --grep worker" if command == "npm test" else command
             for command in merged["worker-kimi-ts"]["script"]
         ]
-        self.assertEqual(self.errors(merged), [])
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
 
-    def test_fragment_on_later_line_of_one_command_counts(self):
-        # A fragment at the start of a later physical line inside one
-        # multi-line YAML string still counts as a command start.
+    def test_folded_multi_line_command_is_caught(self):
+        # HN-5 (inverts the HE-2 acceptance): folding `npm test` into the
+        # previous line's YAML string changes the effective script.
         merged = self.merged()
         script = merged["worker-kimi-ts"]["script"]
         index = script.index("npm test")
         script[index - 1] = script[index - 1] + "\nnpm test"
         del script[index]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_prepended_exit_0_is_caught(self):
+        # HN-5: `- exit 0` as the first script line has the same effect as
+        # the banned before_script — the pinned commands never run.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"].insert(0, "exit 0")
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_backgrounded_npm_test_is_caught(self):
+        # HN-5: `npm test &` runs the suite concurrently and cannot gate.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "npm test &" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_set_plus_e_and_trailing_true_is_caught(self):
+        # HN-5: `set +e` up front and a trailing `true` neutralise failures.
+        merged = self.merged()
+        script = merged["worker-kimi-ts"]["script"]
+        script.insert(0, "set +e")
+        script.append("true")
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_dropped_sources_removal_line_is_caught(self):
+        # HN-5: deleting the debian.sources removal lets the live mirror's
+        # newer python3 win, silently undoing the GV-4 snapshot pin.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command
+            for command in merged["worker-kimi-ts"]["script"]
+            if "debian.sources" not in command
+        ]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_extra_live_mirror_deb_entry_is_caught(self):
+        # HN-5: an extra live-mirror deb entry in the printf re-adds the
+        # live mirror alongside the snapshot pins.
+        merged = self.merged()
+        script = merged["worker-kimi-ts"]["script"]
+        index = next(
+            i for i, command in enumerate(script) if command.startswith("printf")
+        )
+        script[index] = script[index].replace(
+            " > /etc/apt/sources.list",
+            ' "deb http://deb.debian.org/debian bookworm main" > /etc/apt/sources.list',
+        )
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_dropped_opencode_bun_test_lines_are_caught(self):
+        # HN-5 (pre-existing gap): the opencode lane's five bun self-test
+        # lines could be deleted without tripping the fragment pins.
+        merged = self.merged()
+        merged["worker-opencode-ts"]["script"] = [
+            command
+            for command in merged["worker-opencode-ts"]["script"]
+            if not command.startswith("bun scripts/")
+        ]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_real_lanes_match_the_pinned_scripts(self):
+        # HN-5: the pinned tuples must equal the checked-in validate.yml
+        # lanes, so a lane edit without a tuple update fails here (and in
+        # ci-config via main()).
+        merged = {}
+        for include in config.EXPECTED_INCLUDES:
+            merged.update(config.load_yaml(ROOT / include.lstrip("/")))
         self.assertEqual(self.errors(merged), [])
 
     def test_missing_apt_retries_are_caught(self):
@@ -999,7 +1055,7 @@ class WorkerTsLaneTests(unittest.TestCase):
 
     def test_missing_snapshot_provisioning_is_caught(self):
         # MR !1618 review GV-4: reverting the lane's python3 source to the
-        # live deb.debian.org mirror must fail the fragment check.
+        # live deb.debian.org mirror must fail the (now exact-script) pin.
         merged = self.merged()
         merged["worker-kimi-ts"]["script"] = [
             command
