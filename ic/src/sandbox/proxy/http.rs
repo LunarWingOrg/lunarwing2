@@ -1005,6 +1005,14 @@ mod tests {
             scrub_header_value(b"charset=utf-8; q=0.9", &short),
             HeaderScrub::Unchanged
         ));
+
+        // HQ-3: four raw bytes must still scrub, including the encoded
+        // spelling. Raising the floor to five would silently skip this echo.
+        let at_floor = credential_echo_spellings("ab+c");
+        assert!(matches!(
+            scrub_header_value(b"x=ab%2Bc", &at_floor),
+            HeaderScrub::Spliced(value) if value == b"x=[REDACTED]"
+        ));
     }
 
     #[tokio::test]

@@ -464,14 +464,14 @@ impl StoreData {
     /// a secret containing `"` or `\` (run-111 HA-8).
     ///
     /// A credential-injected exchange additionally refuses a
-    /// content-encoded response body (run-114 HJ-1): the wrapper's reqwest
-    /// build has no decompression features, so an encoded body reaches the
+    /// content- or transfer-encoded response body (run-114 HJ-1, run-120 HQ-2).
+    /// The reqwest build has no decompression features, so it reaches the
     /// byte-level scrub as opaque bytes the scrub cannot inspect — and the
     /// guest, which chose `Accept-Encoding`, could decode an echo itself.
-    /// The wrapper forces `accept-encoding: identity` on those requests;
-    /// a non-identity `Content-Encoding` in the answer is refused rather
-    /// than forwarded blind. The refusal lives here so the interceptor
-    /// test path pins it end to end.
+    /// The wrapper forces `accept-encoding: identity` and removes `TE` on
+    /// those requests. Non-identity content codings and non-chunked transfer
+    /// codings are refused for non-empty bodies; hyper removes chunk framing.
+    /// The refusal lives here so the interceptor test path pins it end to end.
     fn redact_http_outcome_for_guest(
         &self,
         outcome: Result<lunarwing::agent::host::HttpResponse, String>,
@@ -480,13 +480,13 @@ impl StoreData {
             Ok(mut resp) => {
                 if self.last_http_exchange_had_credentials
                     && !resp.body.is_empty()
-                    && guest_content_encoding_is_opaque(&resp.headers_json)
+                    && guest_body_encoding_is_opaque(&resp.headers_json)
                 {
                     tracing::warn!(
-                        "WASM http_request: refused content-encoded response body that cannot be scrubbed for echoed credentials"
+                        "WASM http_request: refused encoded response body that cannot be scrubbed for echoed credentials"
                     );
                     return Err(
-                        "HTTP response refused: content-encoded body cannot be inspected for echoed credentials"
+                        "HTTP response refused: encoded body cannot be inspected for echoed credentials"
                             .to_string(),
                     );
                 }
@@ -625,11 +625,13 @@ impl StoreData {
         // echo itself. Credential-injected exchanges therefore ask for
         // identity only, replacing every guest spelling of the header
         // (a naive insert would leave both spellings and reqwest sends
-        // both). Ordinary requests keep the guest's value. The answer's
-        // `Content-Encoding` is refused in `redact_http_outcome_for_guest`
-        // if it is not identity.
+        // both). Also remove TE offers of transfer compression (HQ-2).
+        // Ordinary requests keep the guest's values. Non-empty opaque
+        // answers are refused in `redact_http_outcome_for_guest`.
         if self.last_http_exchange_had_credentials {
-            headers.retain(|k, _| !k.eq_ignore_ascii_case("accept-encoding"));
+            headers.retain(|k, _| {
+                !k.eq_ignore_ascii_case("accept-encoding") && !k.eq_ignore_ascii_case("te")
+            });
             headers.insert("accept-encoding".to_string(), "identity".to_string());
         }
         let bypass_proxy = url::Url::parse(&url).is_ok_and(|parsed| {
@@ -700,11 +702,10 @@ impl StoreData {
             if let Some(resp) = intercepted {
                 let resp_body = resp.body.into_bytes();
                 enforce_response_size(resp_body.len() as u64, max_response_bytes)?;
-                let resp_headers: HashMap<String, String> = resp
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let mut resp_headers = HashMap::new();
+                for (name, value) in &resp.headers {
+                    append_guest_response_header(&mut resp_headers, name, value);
+                }
                 let resp_headers_json =
                     serde_json::to_string(&resp_headers).unwrap_or_else(|_| "{}".to_string());
                 return Ok(lunarwing::agent::host::HttpResponse {
@@ -770,15 +771,7 @@ impl StoreData {
                 .map_err(format_send_error)?;
 
             let status = response.status().as_u16();
-            let response_headers: HashMap<String, String> = response
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.to_str()
-                        .ok()
-                        .map(|v| (k.as_str().to_string(), v.to_string()))
-                })
-                .collect();
+            let response_headers = guest_response_headers(response.headers());
             let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
 
             // Stream body so absent or inaccurate Content-Length cannot bypass the cap.
@@ -931,20 +924,57 @@ fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
     }
 }
 
-/// True when the serialized response header map declares a body encoding the
-/// wrapper cannot byte-scrub (WI#395 run-114 HJ-1). Missing, empty and
-/// `identity` encodings are inspectable. Every `Content-Encoding` field is
-/// considered (case-insensitive name), values are split on commas, and a
-/// token that is not `identity` makes the body opaque.
-fn guest_content_encoding_is_opaque(headers_json: &str) -> bool {
+/// Preserve every list-valued response field in the guest's string-map ABI.
+/// Set-Cookie cannot be comma-joined; keep its existing last-value behavior.
+fn append_guest_response_header(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    let name = name.to_ascii_lowercase();
+    if name == "set-cookie" {
+        headers.insert(name, value.to_string());
+        return;
+    }
+    headers
+        .entry(name)
+        .and_modify(|previous| {
+            previous.push_str(", ");
+            previous.push_str(value);
+        })
+        .or_insert_with(|| value.to_string());
+}
+
+/// HQ-1/HQ-2: duplicate coding fields must survive collection, and unreadable
+/// coding values must remain opaque instead of disappearing before the check.
+fn guest_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    let mut collected = HashMap::new();
+    for (name, value) in headers {
+        let value = match value.to_str() {
+            Ok(value) => value,
+            Err(_) if name == "content-encoding" || name == "transfer-encoding" => "opaque-invalid",
+            Err(_) => continue,
+        };
+        append_guest_response_header(&mut collected, name.as_str(), value);
+    }
+    collected
+}
+
+/// True when response headers are unreadable or declare an opaque body coding.
+/// Content-Encoding allows only identity; Transfer-Encoding allows only chunked
+/// (hyper removes that framing). Empty tokens are ignored. Both field names and
+/// coding names are case-insensitive, and every comma-separated token is checked.
+fn guest_body_encoding_is_opaque(headers_json: &str) -> bool {
     let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
-        return false;
+        return true;
     };
     map.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("content-encoding")
-            && value.split(',').any(|token| {
-                !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case("identity")
-            })
+        let allowed = if name.eq_ignore_ascii_case("content-encoding") {
+            "identity"
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            "chunked"
+        } else {
+            return false;
+        };
+        value
+            .split(',')
+            .any(|token| !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case(allowed))
     })
 }
 
@@ -2515,7 +2545,7 @@ fn build_tool_usage_hint(tool_name: &str, schema: &serde_json::Value) -> String 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
@@ -2530,6 +2560,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::context::JobContext;
+    use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
     use crate::secrets::{
         CreateSecretParams, DecryptedSecret, InMemorySecretsStore, Secret, SecretError, SecretRef,
         SecretsStore,
@@ -3758,67 +3789,62 @@ mod tests {
         );
     }
 
-    /// WI#395 (run-114 HJ-1): the guest chooses `Accept-Encoding` and the
-    /// wrapper's reqwest build has no decompression features, so a
-    /// compressed response body reaches the byte-level scrub as opaque
-    /// bytes it cannot inspect — while the guest, which asked for the
-    /// encoding, can decode an echoed credential itself. A
-    /// credential-injected exchange must send exactly one
-    /// `accept-encoding: identity` (replacing every guest spelling) and
-    /// refuse a non-identity `Content-Encoding` answer; an ordinary
-    /// exchange keeps the guest's own header and answer untouched.
-    #[test]
-    fn guest_http_request_forces_identity_and_refuses_compressed_body() {
-        use super::lunarwing::agent::host::Host as _;
-        use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
-        use crate::tools::wasm::capabilities::{Capabilities, EndpointPattern, HttpCapability};
-        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
+    #[derive(Debug)]
+    struct EncodingStub {
+        seen: Mutex<Vec<Vec<(String, String)>>>,
+        responses: Mutex<VecDeque<HttpExchangeResponse>>,
+    }
+
+    #[async_trait]
+    impl HttpInterceptor for EncodingStub {
+        async fn before_request(
+            &self,
+            request: &HttpExchangeRequest,
+        ) -> Option<HttpExchangeResponse> {
+            self.seen.lock().unwrap().push(request.headers.clone());
+            Some(
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("canned response"),
+            )
+        }
+
+        async fn after_response(
+            &self,
+            _request: &HttpExchangeRequest,
+            _response: &HttpExchangeResponse,
+        ) {
+        }
+    }
+
+    fn encoded_response(headers: &[(&str, &str)], body: &str) -> HttpExchangeResponse {
+        HttpExchangeResponse {
+            status: 200,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: body.to_string(),
+        }
+    }
+
+    fn encoding_test_store(
+        responses: Vec<HttpExchangeResponse>,
+    ) -> (super::StoreData, Arc<EncodingStub>) {
+        use super::{ResolvedHostCredential, StoreData};
+        use crate::tools::wasm::capabilities::{EndpointPattern, HttpCapability};
 
         const SECRET: &str = "gzipguestsecret6j7k8l+/==";
-
-        #[derive(Debug)]
-        struct GzipStub {
-            seen: Mutex<Vec<Vec<(String, String)>>>,
-        }
-        #[async_trait::async_trait]
-        impl HttpInterceptor for GzipStub {
-            async fn before_request(
-                &self,
-                request: &HttpExchangeRequest,
-            ) -> Option<HttpExchangeResponse> {
-                self.seen.lock().unwrap().push(request.headers.clone());
-                // Gzip magic + opaque payload: what a stubborn upstream
-                // answers regardless of the Accept-Encoding it received.
-                Some(HttpExchangeResponse {
-                    status: 200,
-                    headers: vec![
-                        ("content-encoding".to_string(), "gzip".to_string()),
-                        ("content-type".to_string(), "application/json".to_string()),
-                    ],
-                    body: "\u{1f}\u{8b}opaque-gzip-bytes".to_string(),
-                })
-            }
-
-            async fn after_response(
-                &self,
-                _request: &HttpExchangeRequest,
-                _response: &HttpExchangeResponse,
-            ) {
-            }
-        }
-
-        let stub = Arc::new(GzipStub {
+        let stub = Arc::new(EncodingStub {
             seen: Mutex::new(Vec::new()),
+            responses: Mutex::new(responses.into()),
         });
-        let capabilities =
-            Capabilities::default().with_http(HttpCapability::new(vec![EndpointPattern::host(
-                "93.184.216.34",
-            )]));
-
-        // Credential-injected exchange: the host credential forces identity
-        // and the gzip answer is refused at the trait boundary.
+        let capabilities = Capabilities::default().with_http(HttpCapability::new(vec![
+            EndpointPattern::host("93.184.216.34"),
+            EndpointPattern::host("93.184.216.35"),
+        ]));
         let mut query_params = HashMap::new();
         query_params.insert("api_key".to_string(), SECRET.to_string());
         let host_credentials = vec![ResolvedHostCredential {
@@ -3828,25 +3854,32 @@ mod tests {
             secret_value: SECRET.to_string(),
             url_prefix: None,
         }];
-        let mut credentialed = StoreData::new(
-            1024 * 1024,
-            capabilities.clone(),
-            HashMap::new(),
-            host_credentials,
-        );
-        credentialed.http_interceptor = Some(Arc::clone(&stub) as Arc<dyn HttpInterceptor>);
+        let mut store = StoreData::new(1024 * 1024, capabilities, HashMap::new(), host_credentials);
+        store.http_interceptor = Some(Arc::clone(&stub) as Arc<dyn HttpInterceptor>);
+        (store, stub)
+    }
 
-        let err = credentialed
+    /// HJ-1/HQ-2/HQ-3: credentialed exchanges force identity and remove TE;
+    /// the next uncredentialed exchange in the SAME StoreData resets the flag.
+    #[test]
+    fn guest_http_request_forces_identity_and_refuses_compressed_body() {
+        use super::lunarwing::agent::host::Host as _;
+
+        let gzip = encoded_response(&[("content-encoding", "gzip")], "opaque-gzip-bytes");
+        let (mut store, stub) = encoding_test_store(vec![gzip.clone(), gzip.clone()]);
+        let request_headers = r#"{"Accept-Encoding":"gzip, deflate","aCcEpT-EnCoDiNg":"br","TE":"gzip","tE":"deflate","X-Custom":"keep"}"#;
+
+        let err = store
             .http_request(
                 "GET".to_string(),
                 "https://93.184.216.34/mapped".to_string(),
-                "{\"Accept-Encoding\":\"gzip, deflate\",\"X-Custom\":\"keep\"}".to_string(),
+                request_headers.to_string(),
                 None,
                 None,
             )
             .expect_err("compressed body on a credential-injected exchange must be refused");
         assert!(
-            err.contains("content-encoded body cannot be inspected"),
+            err.contains("encoded body cannot be inspected"),
             "unexpected refusal reason: {err}"
         );
 
@@ -3862,22 +3895,21 @@ mod tests {
         );
         assert_eq!(accept_encoding[0].1, "identity", "{seen:?}");
         assert!(
+            !seen.iter().any(|(k, _)| k.eq_ignore_ascii_case("te")),
+            "{seen:?}"
+        );
+        assert!(
             seen.iter().any(|(k, v)| k == "X-Custom" && v == "keep"),
             "forcing identity must not drop unrelated headers: {seen:?}"
         );
 
-        // Ordinary exchange (no credential configured for this host): the
-        // guest's own Accept-Encoding is forwarded and its compressed
-        // answer delivered — the refusal is scoped to credential-injected
-        // exchanges.
-        let mut ordinary = StoreData::new(1024 * 1024, capabilities, HashMap::new(), Vec::new());
-        ordinary.http_interceptor = Some(Arc::clone(&stub) as Arc<dyn HttpInterceptor>);
-
-        let resp = ordinary
+        // A different allowlisted host has no credential, but this store has
+        // just handled a credentialed exchange. A sticky |= reset must fail.
+        let resp = store
             .http_request(
                 "GET".to_string(),
-                "https://93.184.216.34/mapped".to_string(),
-                "{\"Accept-Encoding\":\"gzip, deflate\"}".to_string(),
+                "https://93.184.216.35/mapped".to_string(),
+                request_headers.to_string(),
                 None,
                 None,
             )
@@ -3888,7 +3920,7 @@ mod tests {
             "ordinary exchange keeps its content-encoding: {}",
             resp.headers_json
         );
-        assert!(!resp.body.is_empty());
+        assert_eq!(resp.body, gzip.body.as_bytes());
 
         let seen = stub.seen.lock().unwrap().pop().unwrap();
         assert!(
@@ -3896,6 +3928,202 @@ mod tests {
                 .any(|(k, v)| k.eq_ignore_ascii_case("accept-encoding") && v == "gzip, deflate"),
             "ordinary exchange must forward the guest's accept-encoding: {seen:?}"
         );
+        assert!(
+            seen.iter().any(|(k, v)| k == "TE" && v == "gzip"),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(k, v)| k == "tE" && v == "deflate"),
+            "{seen:?}"
+        );
+        assert!(stub.responses.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn guest_http_request_checks_all_codings_and_allows_empty_bodies() {
+        use super::lunarwing::agent::host::Host as _;
+
+        let cases = [
+            (encoded_response(&[("content-encoding", "gzip")], ""), false),
+            (
+                encoded_response(&[("Content-Encoding", " Identity, ")], "plain"),
+                false,
+            ),
+            (
+                encoded_response(&[("content-encoding", "identity, gzip")], "opaque"),
+                true,
+            ),
+            (
+                encoded_response(
+                    &[
+                        ("Content-Encoding", "gzip"),
+                        ("content-encoding", "identity"),
+                    ],
+                    "opaque",
+                ),
+                true,
+            ),
+            (
+                encoded_response(&[("Transfer-Encoding", "Chunked, ")], "plain"),
+                false,
+            ),
+            (
+                encoded_response(&[("transfer-encoding", "chunked, gzip")], "opaque"),
+                true,
+            ),
+            (
+                encoded_response(&[("transfer-encoding", "gzip, chunked")], "opaque"),
+                true,
+            ),
+            (
+                encoded_response(
+                    &[
+                        ("Transfer-Encoding", "gzip"),
+                        ("transfer-encoding", "chunked"),
+                    ],
+                    "opaque",
+                ),
+                true,
+            ),
+            (
+                encoded_response(&[("transfer-encoding", "identity")], "plain"),
+                true,
+            ),
+        ];
+        let (mut store, stub) = encoding_test_store(cases.iter().map(|(r, _)| r.clone()).collect());
+        for (response, opaque) in cases {
+            let outcome = store.http_request(
+                "GET".to_string(),
+                "https://93.184.216.34/mapped".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            );
+            if opaque {
+                assert!(
+                    outcome
+                        .unwrap_err()
+                        .contains("encoded body cannot be inspected")
+                );
+            } else {
+                assert_eq!(outcome.unwrap().body, response.body.as_bytes());
+            }
+        }
+        assert!(stub.responses.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn guest_response_headers_preserve_duplicate_and_unreadable_codings() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        for (name, allowed) in [
+            ("content-encoding", "identity"),
+            ("transfer-encoding", "chunked"),
+        ] {
+            for first in [b"gzip".as_slice(), b"\xff".as_slice()] {
+                let mut headers = HeaderMap::new();
+                headers.append(name, HeaderValue::from_bytes(first).unwrap());
+                headers.append(name, HeaderValue::from_static(allowed));
+                let collected = super::guest_response_headers(&headers);
+                assert_eq!(collected[name].split(", ").count(), 2);
+                assert!(super::guest_body_encoding_is_opaque(
+                    &serde_json::to_string(&collected).unwrap()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn guest_response_headers_do_not_comma_join_cookies() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.append("set-cookie", HeaderValue::from_static("first=1; Path=/"));
+        let last_cookie = "last=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT";
+        headers.append("set-cookie", HeaderValue::from_static(last_cookie));
+        headers.append("vary", HeaderValue::from_static("Accept"));
+        headers.append("vary", HeaderValue::from_static("Origin"));
+        headers.append("x-opaque", HeaderValue::from_bytes(b"\xff").unwrap());
+        let collected = super::guest_response_headers(&headers);
+        assert_eq!(collected["set-cookie"], last_cookie);
+        assert_eq!(collected["vary"], "Accept, Origin");
+        assert!(!collected.contains_key("x-opaque"));
+        assert!(!super::guest_body_encoding_is_opaque(
+            &serde_json::to_string(&collected).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn reqwest_response_codings_survive_collection_and_are_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Real reqwest/hyper parsing: duplicate fields and obs-text must
+        // reach the same collector as live wrapper responses. No DNS/TLS.
+        for (headers, wire_body) in [
+            (
+                b"Content-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: 6\r\n"
+                    .as_slice(),
+                b"opaque".as_slice(),
+            ),
+            (
+                b"Content-Encoding: \xff\r\nContent-Encoding: identity\r\nContent-Length: 6\r\n"
+                    .as_slice(),
+                b"opaque".as_slice(),
+            ),
+            (
+                b"Transfer-Encoding: gzip, chunked\r\n".as_slice(),
+                b"6\r\nopaque\r\n0\r\n\r\n".as_slice(),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n")
+                    .await
+                    .unwrap();
+                socket.write_all(headers).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+                socket.write_all(wire_body).await.unwrap();
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/"))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .unwrap();
+            let headers_json =
+                serde_json::to_string(&super::guest_response_headers(response.headers())).unwrap();
+            let body = response.bytes().await.unwrap().to_vec();
+            server.await.unwrap();
+            assert_eq!(body, b"opaque", "hyper only removes chunk framing");
+            let (mut store, _) = encoding_test_store(Vec::new());
+            store.last_http_exchange_had_credentials = true;
+            let err = store
+                .redact_http_outcome_for_guest(Ok(super::lunarwing::agent::host::HttpResponse {
+                    status: 200,
+                    headers_json,
+                    body,
+                }))
+                .unwrap_err();
+            assert!(err.contains("encoded body cannot be inspected"), "{err}");
+        }
+    }
+
+    #[test]
+    fn guest_body_encoding_fails_closed_on_invalid_headers_json() {
+        for invalid in ["not json", "null", "[]", r#"{"content-encoding":42}"#] {
+            assert!(super::guest_body_encoding_is_opaque(invalid), "{invalid}");
+        }
+        assert!(!super::guest_body_encoding_is_opaque("{}"));
     }
 
     /// WI#395: a send failure must not echo the request URL (which carries an

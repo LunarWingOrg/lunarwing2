@@ -562,15 +562,27 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    bodies are scrubbed at the byte level (bodies are not guaranteed UTF-8).
    Because the guest chooses `Accept-Encoding` and this build cannot
    decompress, a credential-injected exchange sends exactly one
-   `accept-encoding: identity` (replacing every guest spelling) and a
-   non-identity `Content-Encoding` answer is refused instead of forwarded —
-   the guest asked for the encoding and could decode an echoed credential
-   itself; ordinary exchanges keep the guest's own header and answer.
+   `accept-encoding: identity` (replacing every guest spelling) and removes
+   every `TE` offer. A **non-empty** response with any non-identity
+   `Content-Encoding` or non-chunked `Transfer-Encoding` token is refused —
+   the guest could otherwise decode an echoed credential itself. Hyper
+   removes chunk framing, so `chunked` alone is inspectable. Empty bodies
+   (including HEAD/204/304 responses) are exempt from this encoding refusal;
+   ordinary exchanges keep the guest's own headers and answer.
+   Duplicate response fields are comma-joined before the encoding check,
+   including on the interceptor path; `Set-Cookie` retains its existing
+   last-value behavior because the guest string-map ABI cannot represent
+   separate cookies and comma-joining would corrupt them. Unreadable coding
+   header values become an opaque sentinel, and malformed `headers_json`
+   fails the encoding check closed.
+   This also applies to host-managed scoped-service Bearer credentials
+   (for example the OCR sidecar): a local service that gzips unconditionally
+   must honor the identity request or its non-empty answer will be refused.
    Residuals, recorded on WI#395: re-encoded echo spellings beyond the
-   exact raw/urlencoded pair are not detected in wrapper bodies (headers
-   get the two-round percent-decode check; bodies and wrapper-side
-   re-encodings do not), and the response leak detector skips bodies that
-   are not valid UTF-8.
+   exact raw/`urlencoding::encode` pair are not detected in wrapper headers
+   or bodies. Only **proxy headers** get the two-round percent-decode
+   detector; proxy bodies and wrapper headers/bodies do not. The wrapper's
+   response leak detector also skips bodies that are not valid UTF-8.
    **Reference:** `src/tools/wasm/wrapper.rs` —
    `StoreData::redact_http_outcome_for_guest`
 
