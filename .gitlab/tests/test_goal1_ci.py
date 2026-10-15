@@ -267,6 +267,20 @@ class WorkerVersionPinTests(unittest.TestCase):
         self.build_script.write_text(text[:start] + text[end:], encoding="utf-8")
         self.assertTrue(any("kimi" in error for error in self.errors()))
 
+    def test_kimi_block_must_not_pass_debian_snapshot(self):
+        # MR !1627 review HE-7: a DEBIAN_SNAPSHOT build-arg would override
+        # the Dockerfile default at build time and silently detach the
+        # CI_DEBIAN_SNAPSHOT tie from what the image really builds with.
+        text = self.build_script.read_text(encoding="utf-8")
+        self.build_script.write_text(
+            text.replace(
+                '        build_args="KIMI_CODE_VERSION=2.1.1\n',
+                '        build_args="KIMI_CODE_VERSION=2.1.1\nDEBIAN_SNAPSHOT=20260906T000000Z\n',
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(any("DEBIAN_SNAPSHOT" in error for error in self.errors()))
+
 
 class BunImageTieTests(unittest.TestCase):
     """MR !1552 ER-5 ties CI_BUN_IMAGE to the worker Dockerfile's oven/bun
@@ -533,7 +547,17 @@ class DebianSnapshotTieTests(unittest.TestCase):
         return errors
 
     def test_matching_snapshot_passes(self):
-        self.write_dockerfile(f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from())
+        # The realistic builder-stage shape: valued ARG, bare redeclaration,
+        # and RUN lines referencing ${DEBIAN_SNAPSHOT} (HE-3 pass-side pin).
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "ARG DEBIAN_SNAPSHOT\n"
+            + "RUN printf '%s\\n' \\\n"
+            + '      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" \\\n'
+            + '      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bookworm-security main" \\\n'
+            + "      > /etc/apt/sources.list\n"
+        )
         self.assertEqual(self.errors(), [])
 
     def test_snapshot_mismatch_is_caught(self):
@@ -565,6 +589,63 @@ class DebianSnapshotTieTests(unittest.TestCase):
         )
         self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
 
+    def test_lowercase_arg_instruction_is_caught(self):
+        # MR !1627 review HE-3: Dockerfile instructions are case-insensitive,
+        # so a lowercase stage-level `arg` still steers the build.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "arg DEBIAN_SNAPSHOT=20270101T000000Z\n"
+        )
+        self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+        # …while a lowercase ARG carrying the correct value must pass.
+        self.write_dockerfile(f"arg DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from())
+        self.assertEqual(self.errors(), [])
+
+    def test_indented_arg_is_caught(self):
+        # HE-3: an indented divergent ARG was invisible to the column-0 match.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "  ARG DEBIAN_SNAPSHOT=20270101T000000Z\n"
+        )
+        self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+
+    def test_quoted_arg_value_passes(self):
+        # HE-3: a quoted correct value must not false-error as a mismatch.
+        self.write_dockerfile(
+            f'ARG DEBIAN_SNAPSHOT="{self.SNAPSHOT}"\n' + self.node_from()
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_hardcoded_snapshot_url_is_caught(self):
+        # HE-3: the tie checked the ARG value but not its use — a RUN that
+        # hardcodes a snapshot timestamp builds from it regardless of the
+        # ARG, even when the hardcoded timestamp equals the pinned value.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + f'"deb http://snapshot.debian.org/archive/debian/{self.SNAPSHOT}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
+        )
+
+    def test_renamed_snapshot_variable_is_caught(self):
+        # HE-3: a URL referencing a different variable is equally detached.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOTS}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
+        )
+
 
 class WorkerTsLaneTests(unittest.TestCase):
     """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
@@ -590,7 +671,7 @@ class WorkerTsLaneTests(unittest.TestCase):
                 [
                     "rm -f /etc/apt/sources.list.d/debian.sources",
                     'printf \'%s\\n\' "deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main" > /etc/apt/sources.list',
-                    "apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends python3",
+                    "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get install -y --no-install-recommends python3",
                     "cd kimicode4lunarwing/scripts",
                     "npm ci --ignore-scripts",
                     "npx tsc -p tsconfig.json",
@@ -657,11 +738,222 @@ class WorkerTsLaneTests(unittest.TestCase):
         merged["worker-kimi-ts"]["rules"].insert(0, {"when": "never"})
         self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
 
+    def test_job_level_when_manual_is_caught(self):
+        # MR !1627 review HE-1 (R1): the MR rule carries no `when`, so a
+        # job-level `when: manual` inherits into it — the lane never runs
+        # unless clicked, even with allow_failure: false.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["when"] = "manual"
+        merged["worker-kimi-ts"]["allow_failure"] = False
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_job_level_when_never_is_caught(self):
+        merged = self.merged()
+        merged["worker-kimi-ts"]["when"] = "never"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_catch_all_shadow_rule_is_caught(self):
+        # HE-1 (R2): an always-true `if` rule placed first shadows the MR
+        # rule; the substring check could not see it.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"].insert(
+            0, {"if": "$CI_PIPELINE_SOURCE", "when": "never"}
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_exists_shadow_rule_is_caught(self):
+        # HE-1 (R2): same shadow via exists: — .gitlab-ci.yml always exists.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"].insert(
+            0, {"exists": [".gitlab-ci.yml"], "when": "never"}
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_changes_shadow_rule_is_caught(self):
+        # HE-1 (R2): same shadow via changes: — **/* matches every push/MR.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"].insert(
+            0, {"changes": ["**/*"], "when": "never"}
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_inverted_mr_predicate_is_caught(self):
+        # HE-1 (R3): the substring "merge_request_event" is still present,
+        # but the lane then runs on everything EXCEPT merge requests.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE != "merge_request_event"'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_narrowed_mr_predicate_is_caught(self):
+        # HE-1 (R3): an &&-narrowed predicate no longer matches every MR.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE == "merge_request_event" '
+            '&& $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "no-such"'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_mr_rule_extra_keys_are_caught(self):
+        # HE-1: the first rule must be the plain MR predicate; an extra
+        # changes:/exists: key can narrow or shadow it.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["changes"] = ["kimicode4lunarwing/**"]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_mr_predicate_spacing_and_quotes_normalised(self):
+        # Formatting variants of the canonical predicate still pass.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            "$CI_PIPELINE_SOURCE=='merge_request_event'"
+        )
+        self.assertEqual(self.errors(merged), [])
+
+    def test_only_except_are_caught(self):
+        # HE-1: only/except bypass the rules walk entirely.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["only"] = ["merge_requests"]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_extends_observational_job_is_caught(self):
+        # HE-1 (R4): extending .observational-job (defaults.yml) inherits
+        # allow_failure: true — the lane runs on MRs but cannot gate.
+        merged = self.merged()
+        merged[".observational-job"] = {
+            "allow_failure": True,
+            "rules": [{"if": '$CI_PIPELINE_SOURCE == "schedule"'}, {"when": "never"}],
+        }
+        merged["worker-kimi-ts"]["extends"] = ".observational-job"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_extends_inherited_when_manual_is_caught(self):
+        merged = self.merged()
+        merged[".manual-parent"] = {"when": "manual"}
+        merged["worker-kimi-ts"]["extends"] = ".manual-parent"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_extends_job_keys_win(self):
+        # GitLab merge semantics: the job's own keys override the parent's,
+        # so an explicit allow_failure: false undoes the inherited one.
+        merged = self.merged()
+        merged[".observational-job"] = {"allow_failure": True}
+        merged["worker-kimi-ts"]["extends"] = ".observational-job"
+        merged["worker-kimi-ts"]["allow_failure"] = False
+        self.assertEqual(self.errors(merged), [])
+
+    def test_last_listed_parent_wins(self):
+        # GitLab multi-parent merge is a reverse deep merge: keys from the
+        # last listed parent override earlier parents.
+        merged = self.merged()
+        merged[".gating"] = {"allow_failure": False}
+        merged[".observational"] = {"allow_failure": True}
+        merged["worker-kimi-ts"]["extends"] = [".gating", ".observational"]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+        merged["worker-kimi-ts"]["extends"] = [".observational", ".gating"]
+        self.assertEqual(self.errors(merged), [])
+
+    def test_extends_self_cycle_still_applies_parent_keys(self):
+        # A cyclic extends chain must terminate (depth-bounded) and still
+        # surface the parent's gating keys.
+        merged = self.merged()
+        merged[".loopy"] = {"extends": ".loopy", "allow_failure": True}
+        merged["worker-kimi-ts"]["extends"] = ".loopy"
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_needs_dependency_is_caught(self):
+        # HE-1/HE-2: a non-empty needs can hold the lane behind a manual or
+        # absent job; the lanes must keep needs: [].
+        merged = self.merged()
+        merged["worker-kimi-ts"]["needs"] = [{"job": "ci-config", "artifacts": False}]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_before_script_is_caught(self):
+        # HE-2: a before_script can neutralise anything before the pinned
+        # commands run (e.g. before_script: [exit 0]).
+        merged = self.merged()
+        merged["worker-kimi-ts"]["before_script"] = ["exit 0"]
+        self.assertTrue(any("before_script" in error for error in self.errors(merged)))
+
+    def test_image_entrypoint_override_is_caught(self):
+        # HE-2: image.entrypoint: ["/bin/true"] would run nothing at all;
+        # [""] (the real tree's value) stays accepted.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["image"]["entrypoint"] = ["/bin/true"]
+        self.assertTrue(any("entrypoint" in error for error in self.errors(merged)))
+
+    def test_commented_out_fragment_is_caught(self):
+        # HE-2: the substring check accepted a fragment inside a comment.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "# npm test" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_true_or_prefixed_fragment_is_caught(self):
+        # HE-2: `true || npm test` contains the fragment but never runs it.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "true || npm test" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_or_true_suffixed_fragment_is_caught(self):
+        # HE-2: `npm test || true` runs the suite but cannot fail the lane.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "npm test || true" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_echoed_fragment_is_caught(self):
+        # HE-2: `echo npm test` contains the fragment but runs nothing.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "echo npm test" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("npm test" in error for error in self.errors(merged)))
+
+    def test_fragment_with_trailing_args_counts(self):
+        # `npm test -- --grep x` still starts with the pinned command.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            "npm test -- --grep worker" if command == "npm test" else command
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertEqual(self.errors(merged), [])
+
+    def test_fragment_on_later_line_of_one_command_counts(self):
+        # A fragment at the start of a later physical line inside one
+        # multi-line YAML string still counts as a command start.
+        merged = self.merged()
+        script = merged["worker-kimi-ts"]["script"]
+        index = script.index("npm test")
+        script[index - 1] = script[index - 1] + "\nnpm test"
+        del script[index]
+        self.assertEqual(self.errors(merged), [])
+
+    def test_missing_apt_retries_are_caught(self):
+        # HE-4: reverting the snapshot fetch to a retry-less apt-get update
+        # drops the pinned provisioning fragment.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command.replace(" -o Acquire::Retries=5 -o Acquire::http::Timeout=60", "")
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("Acquire::Retries" in error for error in self.errors(merged)))
+
     def test_main_runs_the_lane_validator(self):
         # MR !1618 review GV-2: every unit test above calls the validator
         # directly, so deleting the main() call passed the whole suite.
+        # MR !1627 review HE-7: also assert main()'s return value so an
+        # erroring validator cannot pass this pin unnoticed.
         with mock.patch.object(config, "validate_worker_ts_lanes") as lane_check:
-            config.main()
+            self.assertEqual(config.main(), 0)
         lane_check.assert_called_once()
 
     def test_wrong_image_variable_is_caught(self):
