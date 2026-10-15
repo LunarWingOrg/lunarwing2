@@ -637,6 +637,22 @@ refused or refused-looking status as "stopped". At the CLI boundary,
 `writers-active` maps a dispatcher refusal to exit **2** (unknown), never
 1 (stopped), matching its 0/1/2 state contract.
 
+**Runtime re-check in the root health cron (WI#410):** the arming-time
+refusal in `ic/scripts/enable-health-fleet.sh` covers only the moment the
+cron is installed — a legacy proxy unit that reappears afterwards (or an
+interrupted `render-units` that leaves one behind) would otherwise be
+driven by the next root-cron tick with no gate. Both root-executed health
+scripts therefore re-check the same safe-unit contract at the top of every
+tick, before any `rc-service` invocation:
+`ic-infrastructure-health-check/health-openrc.sh` fails closed with a
+critical JSON report (empty `.metrics.services`, so self-heal gains no
+restart target — only the escalation signal) naming the offending unit and
+the fleet migration, and `ic-infrastructure-health-check/lunarwing-self-heal.sh`
+(OpenRC hosts only) aborts before any probe, restart, or state mutation
+with the same `render-units --all-proxies` remediation. The contract is a
+byte-identical copy of mt-admin's `openrc_proxy_unit_is_safe`; the sync
+note on that function names all three sites.
+
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips
 ordinary rendering, **not** the migration), validates the target tenant's
