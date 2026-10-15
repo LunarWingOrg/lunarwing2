@@ -606,6 +606,15 @@ WORKER_TS_LANE_SCRIPTS = {
     ),
 }
 
+# MR !1647 review HP-1: environment variables (including parallel matrices)
+# and pre-clone hooks can bypass an unchanged pinned script. Additional job
+# keywords require an explicit allowlist update alongside the lane change.
+WORKER_TS_LANE_KEYS = frozenset({
+    "stage", "needs", "image", "tags", "rules", "script", "allow_failure",
+    "when", "before_script",
+})
+WORKER_TS_LANE_TAGS = ["$CI_LINT_RUNNER_TAG"]
+
 
 def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
     """Both worker TS lanes must exist and keep their MR-pipeline wiring.
@@ -623,7 +632,9 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
     could hollow out the lane just as well, so those stay pinned too
     (HE-2). The kimi lane's pinned commands include the python3
     provisioning (GH-1) from the pinned Debian snapshot (GV-4) with its apt
-    retry options (HE-4).
+    retry options (HE-4). Only allowlisted job keys may survive extends
+    resolution, and tags must select the lint runner (HP-1); job-level
+    variables, parallel matrices and hooks cannot bypass the script pin.
     """
     for job_name, (image_variable, expected_script) in WORKER_TS_LANE_SCRIPTS.items():
         job = merged.get(job_name)
@@ -631,6 +642,14 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
             errors.append(f"{job_name} job missing")
             continue
         effective = resolve_extends(job, merged)
+        unexpected = sorted(set(effective) - WORKER_TS_LANE_KEYS)
+        if unexpected:
+            errors.append(
+                f"{job_name} must not set job keys {unexpected}; job-level "
+                "variables, parallel matrices or hooks can bypass the pinned script"
+            )
+        if effective.get("tags") != WORKER_TS_LANE_TAGS:
+            errors.append(f"{job_name} tags must be exactly {WORKER_TS_LANE_TAGS}")
         image = effective.get("image")
         if image_name(image) != image_variable:
             errors.append(f"{job_name} must use the {image_variable} image")

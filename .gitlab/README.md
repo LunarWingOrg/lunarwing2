@@ -244,6 +244,13 @@ candidate job — the scan can only succeed after a candidate publishes
   Like the opencode lane, the script is pinned line-for-line by
   `validate_config.py` (`WORKER_TS_LANE_SCRIPTS`, MR !1644 review HN-5):
   any script edit must update the tuple in the same commit.
+  Both worker TS lanes also have an allowlist of job keywords after
+  `extends` resolution (`WORKER_TS_LANE_KEYS`, MR !1647 review HP-1) and
+  require exactly `tags: ["$CI_LINT_RUNNER_TAG"]`. Job-level `variables`,
+  `parallel` matrices and `hooks` are refused, including inherited entries:
+  they can bypass the pinned script without editing a command. Adding any
+  other keyword (including `timeout`, `retry`, `inherit` or `after_script`)
+  requires reviewing and updating the allowlist in the same commit.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL

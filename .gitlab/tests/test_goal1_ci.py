@@ -4,6 +4,7 @@
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
@@ -658,7 +659,9 @@ class WorkerTsLaneTests(unittest.TestCase):
         image_variable, script = config.WORKER_TS_LANE_SCRIPTS[job_name]
         return {
             "stage": "validate",
+            "needs": [],
             "image": {"name": image_variable, "entrypoint": [""]},
+            "tags": ["$CI_LINT_RUNNER_TAG"],
             "rules": [
                 {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
                 {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'},
@@ -680,6 +683,103 @@ class WorkerTsLaneTests(unittest.TestCase):
 
     def test_valid_shape_passes(self):
         self.assertEqual(self.errors(self.merged()), [])
+
+    def test_job_level_execution_overrides_are_caught(self):
+        # HP-1: the script can remain byte-identical while its environment
+        # skips tests, exits Node immediately, or replaces npm's shell.
+        overrides = (
+            ("variables", {"NODE_OPTIONS": "--test-skip-pattern=."}),
+            ("variables", {"NODE_OPTIONS": "--import=data:text/javascript,process.exit(0)"}),
+            ("variables", {"npm_config_script_shell": "/bin/true"}),
+            ("parallel", {"matrix": [{"NODE_OPTIONS": ["--test-only"]}]}),
+            ("hooks", {"pre_get_sources_script": ["git config --global core.hooksPath /tmp/hooks"]}),
+        )
+        for job_name in self.merged():
+            for key, value in overrides:
+                for inherited in (False, True):
+                    with self.subTest(job=job_name, key=key, value=value, inherited=inherited):
+                        merged = self.merged()
+                        override = {key: copy.deepcopy(value)}
+                        if inherited:
+                            merged[".execution-parent"] = override
+                            merged[job_name]["extends"] = ".execution-parent"
+                        else:
+                            merged[job_name].update(override)
+                        self.assertTrue(any(
+                            f"{job_name} must not set job keys ['{key}']" in error
+                            for error in self.errors(merged)
+                        ))
+
+    def test_other_job_keywords_require_review(self):
+        # The allowlist deliberately requires review even for currently
+        # harmless values; it is not a blacklist of known variable names.
+        for job_name in self.merged():
+            for key, value in (
+                ("variables", {}), ("variables", None), ("hooks", {}),
+                ("after_script", ["true"]), ("timeout", "1m"),
+                ("retry", 1), ("inherit", {"variables": False}),
+            ):
+                with self.subTest(job=job_name, key=key, value=value):
+                    merged = self.merged()
+                    merged[job_name][key] = value
+                    self.assertTrue(any(
+                        f"{job_name} must not set job keys ['{key}']" in error
+                        for error in self.errors(merged)
+                    ))
+
+    def test_runner_tags_must_match_in_both_lanes(self):
+        for job_name in self.merged():
+            for override in (
+                {}, {"tags": None}, {"tags": []},
+                {"tags": ["unavailable-runner"]},
+                {"tags": ["$CI_LINT_RUNNER_TAG", "extra-runner-tag"]},
+                {"tags": "$CI_LINT_RUNNER_TAG"},
+            ):
+                for inherited in (False, True):
+                    with self.subTest(job=job_name, override=override, inherited=inherited):
+                        merged = self.merged()
+                        del merged[job_name]["tags"]
+                        if inherited:
+                            merged[".runner-parent"] = copy.deepcopy(override)
+                            merged[job_name]["extends"] = ".runner-parent"
+                        else:
+                            merged[job_name].update(override)
+                        self.assertTrue(any(
+                            f"{job_name} tags must be exactly ['$CI_LINT_RUNNER_TAG']" in error
+                            for error in self.errors(merged)
+                        ))
+
+    def test_allowed_job_keys_can_be_inherited(self):
+        # Inspect the resolved job, not the raw `extends` keyword; allowed
+        # defaults and the canonical runner tag remain valid in a parent.
+        for job_name in self.merged():
+            with self.subTest(job=job_name):
+                merged = self.merged()
+                merged[".worker-template"] = merged[job_name]
+                merged[".worker-template"].update({
+                    "before_script": [], "allow_failure": False, "when": "on_success",
+                })
+                merged[job_name] = {"extends": ".worker-template"}
+                self.assertEqual(self.errors(merged), [])
+
+    def test_main_rejects_job_level_execution_override(self):
+        original_load_yaml = config.load_yaml
+        for job_name in self.merged():
+            with self.subTest(job=job_name):
+                def load_with_override(path):
+                    loaded = original_load_yaml(path)
+                    if path == ROOT / ".gitlab/ci/validate.yml":
+                        loaded[job_name]["variables"] = {"NODE_OPTIONS": "--test-only"}
+                    return loaded
+
+                with (
+                    mock.patch.object(config, "load_yaml", side_effect=load_with_override),
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    self.assertEqual(config.main(), 1)
+                self.assertIn(
+                    f"{job_name} must not set job keys ['variables']", stderr.getvalue()
+                )
 
     def test_missing_kimi_lane_is_caught(self):
         merged = self.merged()
