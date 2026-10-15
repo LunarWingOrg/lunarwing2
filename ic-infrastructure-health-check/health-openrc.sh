@@ -16,6 +16,49 @@ INITD_DIR="${INITD_DIR:-/etc/init.d}"
 # script) and blank remediation for EVERY tenant. 0 disables the wrapper.
 STATUS_TIMEOUT="${HEALTH_OPENRC_STATUS_TIMEOUT:-8}"
 
+# WI#410: runtime re-check of the WI#376 EQ-3 migration-window guard.
+# ic/scripts/enable-health-fleet.sh refuses to ARM this root cron while an
+# unsafe legacy proxy unit is installed, but that check is arming-time only:
+# a pre-migration unit can reappear (or an interrupted render-units can leave
+# one behind) after the cron is armed, and the next root tick would then drive
+# `rc-service` against it with no gate. Inspect the installed units as data
+# BEFORE any rc-service invocation and fail closed with the same remediation.
+# The contract mirrors mt-admin's openrc_proxy_unit_is_safe
+# (ic/scripts/mt-admin-lib/08-units-openrc.sh) — keep the two in sync. Cheap by
+# construction: one glob plus one grep per installed proxy unit, once per tick.
+openrc_proxy_unit_is_safe() {
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  grep -Eq \
+    '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$1"
+}
+
+# Echo the first installed lunarwing-proxy-* unit that fails the safe-unit
+# contract, exiting 1; rc 0 with empty output means the fleet is safe to drive.
+first_unsafe_openrc_proxy_unit() {
+  local path
+  for path in "$INITD_DIR"/lunarwing-proxy-*; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    openrc_proxy_unit_is_safe "$path" || { printf '%s' "$path"; return 1; }
+  done
+  return 0
+}
+
+UNSAFE_PROXY_UNIT="$(first_unsafe_openrc_proxy_unit)" || true
+if [ -n "$UNSAFE_PROXY_UNIT" ]; then
+  # Fail closed without touching OpenRC: emit a valid critical report that
+  # names the fleet migration. No services are probed and none are remediated
+  # (the report carries an empty .metrics.services), so self-heal has no
+  # restart target from this refusal — only the escalation signal.
+  jq -n --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" --arg unit "$UNSAFE_PROXY_UNIT" '{
+    component: "openrc",
+    status: "critical",
+    timestamp: $ts,
+    metrics: { services: [] },
+    issues: ["unsafe legacy proxy unit " + $unit + " installed; refusing to invoke rc-service as root (WI#410); run: ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies"]
+  }'
+  exit 2
+fi
+
 # Services to check (override via env: SERVICES="xmpp-bridge lunarwing").
 # Auto-discovers multi-tenant services from $INITD_DIR when no override is set.
 discover_services() {
