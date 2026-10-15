@@ -554,9 +554,12 @@ DARKIRC_PIN_DIR=""
 PARTIAL_BUNDLE=""
 # FL-5/GR-2 stderr capture must live OUTSIDE $WORK: in a real export $WORK is
 # the bundle staging directory, so a scratch file there would leak into the
-# bundle and fail the importer's top-level-entry validation.
+# bundle and fail the importer's top-level-entry validation. Cleared before
+# the trap (WI#393 HF-5/HF-7): an inherited value is never deleted, and a
+# failing mktemp below still leaves the trap to clean up $WORK.
+WRITERS_ERRF=""
+trap 'rm -rf "$WORK" "${DARKIRC_PIN_DIR:-}"; [[ -z "${PARTIAL_BUNDLE:-}" ]] || rm -f -- "$PARTIAL_BUNDLE"; [[ -z "$WRITERS_ERRF" ]] || rm -f -- "$WRITERS_ERRF"' EXIT
 WRITERS_ERRF="$(mktemp)"
-trap 'rm -rf "$WORK" "${DARKIRC_PIN_DIR:-}"; [[ -z "${PARTIAL_BUNDLE:-}" ]] || rm -f -- "$PARTIAL_BUNDLE"; rm -f -- "$WRITERS_ERRF"' EXIT
 chmod 0700 "$WORK"
 
 # ---- 1. quiesce the writers (consistent + final snapshot) --------------------

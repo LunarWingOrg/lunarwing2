@@ -779,7 +779,11 @@ grep -qE '^\s*owner-scopes)' "$MT" || die "mt-admin at $MT predates owner-scopes
 prepare_import_stage_root
 WORK="$(mktemp -d "$IMPORT_STAGE_ROOT/import.XXXXXX")"
 chmod 0700 "$WORK"
-trap 'rm -rf "$WORK"; [[ -z "${WRITERS_ERRF:-}" ]] || rm -f -- "$WRITERS_ERRF"' EXIT
+# Cleared BEFORE the trap (WI#393 HF-5): WRITERS_ERRF is assigned only on the
+# --resume path, so an inherited value (e.g. via sudo -E) must never be
+# deleted as root on an early exit.
+WRITERS_ERRF=""
+trap 'rm -rf "$WORK"; [[ -z "$WRITERS_ERRF" ]] || rm -f -- "$WRITERS_ERRF"' EXIT
 # Pin the caller-supplied credential bundle before any validation. Validation
 # and every later extraction then operate on the same owner-only non-/tmp copy,
 # so a writable source directory cannot swap archive contents between checks.

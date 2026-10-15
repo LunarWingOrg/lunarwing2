@@ -398,6 +398,28 @@ else
   fail "import rejects unsupported manifest keys"
 fi
 
+echo "=== import's EXIT trap never deletes an inherited WRITERS_ERRF (HF-5) ==="
+# import-tenant.sh assigns WRITERS_ERRF only on the --resume path, but its
+# EXIT trap rm -f's it on every exit: an inherited value (e.g. via sudo -E)
+# would be deleted as root on any early failure. The unsafe-manifest bundle
+# dies after the trap is installed, so the victim file must survive.
+hf5_victim="$tmp/hf5-victim-file"
+printf 'do not delete\n' >"$hf5_victim"
+set +e
+WRITERS_ERRF="$hf5_victim" \
+  PATH="$tmp/bin:$PATH" \
+  LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
+  KAWARIMI_TEST_WORK="$tmp" \
+  bash "$tmp/scripts/import-tenant.sh" "$tmp/unsafe-manifest.tar" --dry-run --yes \
+  >/dev/null 2>&1
+hf5_status=$?
+set -e
+if [[ "$hf5_status" -ne 0 && -f "$hf5_victim" && "$(cat "$hf5_victim")" == "do not delete" ]]; then
+  pass "import EXIT trap leaves an inherited WRITERS_ERRF untouched (HF-5)"
+else
+  fail "import EXIT trap leaves an inherited WRITERS_ERRF untouched (HF-5)"
+fi
+
 mkdir -p "$tmp/unsafe-link"
 cp "$tmp/bundle-src/meta.txt" "$tmp/bundle-src/manifest-lunarwing.env" "$tmp/unsafe-link/"
 ln -s /etc/passwd "$tmp/unsafe-link/db.dump"
