@@ -205,6 +205,32 @@ free space on that host (prune dangling images/build cache), then re-run the
 candidate job — the scan can only succeed after a candidate publishes
 `worker-image.env`.
 
+## worker-kimi digest mismatch (directory mtime flake)
+
+Symptom — `worker-kimi-candidate` fails with:
+
+```
+clean rebuild digest mismatch: sha256:... != sha256:...
+```
+
+and the layer-level diagnosis shows a single differing layer (the npm CLI
+install layer), e.g. pipelines 5158, 5263, 5390, 5481, 5734. Retrying the job
+usually goes green, which masks the defect.
+
+Root cause: the CLI install `RUN` does not deterministically modify the
+`/usr/local` directory itself, so `rewrite-timestamp=true` records either the
+base image mtime (untouched run) or the clamped `SOURCE_DATE_EPOCH` (touched
+run) for that one tar entry. All file contents are identical — only the
+directory mtime races. Since 2026-10-15 the Dockerfile pins the directory
+mtime explicitly (`touch -d "@${SOURCE_DATE_EPOCH}" /usr/local` at the end of
+the `RUN`), so both builds record the same value.
+
+If a new single-layer mismatch appears, fetch the two blobs named by the
+diagnosis from the registry and diff their contents/metadata the same way
+before assuming real nondeterminism; directory mtimes of install prefixes are
+the prime suspect, and the fix is the same normalization in the offending
+`RUN`.
+
 ## Required jobs
 
 - CI composition, shell syntax, shellcheck, Python syntax, registry JSON, version
