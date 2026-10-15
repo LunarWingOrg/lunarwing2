@@ -231,13 +231,13 @@ sudo ic/scripts/lunarwing-mt-admin.sh patch-env ruffles
 
 `render-units` reconciles generated systemd-user/OpenRC definitions after source updates. `patch-env` fills current managed values without licensing manual secret inspection.
 
-On OpenRC hosts carrying legacy per-worker proxy indirection units, migrate the whole fleet at once (v2.1.6.0, WI#376):
+On OpenRC hosts still carrying legacy per-tenant TensorZero proxy units (`/etc/init.d/lunarwing-proxy-<tenant>` rendered before WI#376), neutralize the whole fleet at once (v2.1.6.0, WI#376):
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies
 ```
 
-The migration refuses to run beside a still-installed legacy proxy unit and names the command to use per tenant; only a positively detected systemd host skips the legacy-unit guard.
+Until that sweep succeeds, every other mt-admin command on OpenRC except `help` and `upgrade-tenant` refuses up front (exit 125; `writers-active` exits 2 = unknown) and names this command; only a positively detected systemd host skips the file-only legacy-unit guard. The sweep is file-only (legacy units are archived under `$LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR`; services are not restarted) and stops on an unregistered or symlinked proxy unit — move that file outside `init.d` by hand and retry. In the same maintenance window update `tensorzero-proxy-configurations/lunarwing-proxy.py` in every proxy tenant's checkout before anything restarts the tenant, then restart through mt-admin (see [`../ops/MULTITENANCY-PRODUCTION.md`](../ops/MULTITENANCY-PRODUCTION.md)).
 
 Use the worker lifecycle commands for one worker rather than restarting the entire tenant when possible:
 
