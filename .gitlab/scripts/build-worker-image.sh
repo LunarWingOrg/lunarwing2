@@ -46,17 +46,45 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         image_name=worker-opencode2
         context=opencode2.4lunarwing
         dockerfile_dir=opencode2.4lunarwing
+        # WI#357 exposure-policy inputs executed by the build (CY-4
+        # precedent: build-executed scripts must hash into worker-inputs):
+        # the wrapper is installed over the binary path, the assert runs
+        # against the lane + built binary, and the compile-out patch runs
+        # against the upstream checkout; their self-tests execute in-image.
         input_files='opencode2.4lunarwing/Dockerfile
+opencode2.4lunarwing/entrypoint.sh
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts
 opencode2.4lunarwing/scripts/sdk_surface_assert.ts
 opencode2.4lunarwing/scripts/opencode_task_executor.ts
-opencode2.4lunarwing/scripts/opencode_task_executor_test.ts'
+opencode2.4lunarwing/scripts/opencode_task_executor_test.ts
+opencode2.4lunarwing/scripts/opencode-exposure-guard.sh
+opencode2.4lunarwing/scripts/exposure_policy_assert.py
+opencode2.4lunarwing/scripts/exposure_policy_assert_test.py
+opencode2.4lunarwing/scripts/entrypoint_config_test.py
+opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
+opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
         source_ref=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
+        # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
+        # the in-image --image-filesystem assert against the installed wrapper.
+        # Detects accidental drift; an adversarial Dockerfile can still defeat
+        # it. Out-of-band image verification remains a WI#357 follow-up (GW-3).
+        wrapper_file="$CI_PROJECT_DIR/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
+        wrapper_anchor=$(sha256sum < "$wrapper_file") || {
+            echo "cannot hash $wrapper_file" >&2; exit 1;
+        }
+        wrapper_anchor=${wrapper_anchor%% *}
+        case "$wrapper_anchor" in
+            *[!0-9a-f]*) echo "invalid wrapper sha256 for $wrapper_file" >&2; exit 1 ;;
+        esac
+        [ "${#wrapper_anchor}" -eq 64 ] || {
+            echo "invalid wrapper sha256 for $wrapper_file" >&2; exit 1;
+        }
         build_args="OPENCODE_VERSION=v2.0.24
 OPENCODE_REF=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
 WITH_TOOLCHAINS=false
+LUNARWING_WRAPPER_SHA256=$wrapper_anchor
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
     kimi)
@@ -66,8 +94,8 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='kimicode4lunarwing/Dockerfile
 kimicode4lunarwing/scripts/package-lock.json
 kimicode4lunarwing/kimi-cli/package-lock.json'
-        source_ref=2.1.1
-        build_args="KIMI_CODE_VERSION=2.1.1
+        source_ref=2.2.0
+        build_args="KIMI_CODE_VERSION=2.2.0
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;

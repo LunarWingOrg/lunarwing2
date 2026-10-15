@@ -14,7 +14,7 @@ default_model = "tensorzero/FrontierCODEK"
 # Print mode (kimi -p) forces the auto permission policy regardless of this
 # value; it stays "auto" so an interactive TUI fallback never stalls on an
 # approval prompt (WI#195). Dangerous-command enforcement lives in the
-# PreToolUse hook below (WI#206): live-verified against 2.0.2; the 2.1.1
+# PreToolUse hook below (WI#206): live-verified against 2.0.2; the 2.2.0
 # contract gate runs during the worker image build. In the verified behavior,
 # the upstream dangerous_command_guard is skipped entirely in auto mode, so
 # the hook — which fires before permission checks in every mode — is the
