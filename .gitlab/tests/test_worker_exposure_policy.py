@@ -91,7 +91,13 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             EXECUTOR_RULESET, encoding="utf-8"
         )
 
-    def run_guard(self, root: pathlib.Path, *, without_git: bool = False) -> subprocess.CompletedProcess:
+    def run_guard(
+        self,
+        root: pathlib.Path,
+        *,
+        without_git: bool = False,
+        env_extra: dict | None = None,
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         if without_git:
             # The ci-config image (python:3.12-slim-bookworm) has no git; the
@@ -114,7 +120,7 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             ["bash", str(root / ".gitlab" / "scripts" / SCRIPT.name)],
             capture_output=True,
             text=True,
-            env=env,
+            env=env | (env_extra or {}),
             cwd=root,
             timeout=120,
         )
@@ -596,6 +602,41 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         result = self.run_guard(self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
         dockerfile.write_text(original, encoding="utf-8")
+
+    def test_dockerfile_continuation_glue_matches_buildkits_space_or_tab(self):
+        # Run-112 HD-1: GZ-1's acceptance class was bash's locale-dependent
+        # [[:space:]] — wider than BuildKit's space-or-tab even in the C
+        # locale (VT, FF, CR are folded into the join while BuildKit keeps
+        # the byte) and wider again under C.UTF-8 (U+3000 et al. accepted as
+        # glue). VT/FF/CR anywhere in a line are now refused outright, and
+        # the glue test accepts spaces and tabs only, so the U+3000 spelling
+        # is refused under every locale with the GZ-1 message.
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_bytes()
+        assertion = FILESYSTEM_ASSERTION.encode()
+        for name, payload, reason in (
+            ("vt-glue", b"RUN echo a\x0b\\\nb\n",
+             "vertical tab, form feed or carriage return byte (run-112 HD-1)"),
+            ("ff-glue", b"RUN echo a\x0c\\\nb\n",
+             "vertical tab, form feed or carriage return byte (run-112 HD-1)"),
+            ("cr-glue", b"RUN echo a\x0d\\\nb\n",
+             "vertical tab, form feed or carriage return byte (run-112 HD-1)"),
+            ("u3000-glue", "LABEL probe=a\u3000\\\nb=c\n".encode(),
+             "continuation backslash must be preceded by whitespace"),
+        ):
+            with self.subTest(name=name):
+                dockerfile.write_bytes(original.replace(
+                    assertion, payload + assertion, 1
+                ))
+                result = self.run_guard(
+                    self.root,
+                    # The official python CI images set LANG=C.UTF-8, so the
+                    # U+3000 class gap only reproduced under that locale.
+                    env_extra={"LC_ALL": "C.UTF-8"},
+                )
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(reason, result.stderr)
+        dockerfile.write_bytes(original)
 
     def test_dockerfile_heredocs_cannot_swallow_assertion(self):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
