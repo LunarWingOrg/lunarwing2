@@ -705,12 +705,13 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`2.1.1` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
+`2.2.0` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
 `0.43.0` → `0.43.1` → `2.0.2` earlier in the v2.1.2.0/v2.1.3.0 cycle, then
 `2.0.2` → `2.1.1` on 2026-09-26 for checklist item #2, adopting npm `latest`
-again; engine requirement unchanged at `node >=22.19.0`, satisfied by the
+again, and `2.1.1` → `2.2.0` on 2026-10-15 for the v2.1.6.0 checklist item #4,
+again npm `latest`; engine requirement unchanged at `node >=22.19.0`, satisfied by the
 pinned node 22 base; the 2.x behavior changes the worker cares about are the
-headless permission-contract findings below, verified on 2.0.x — the 2.1.1
+headless permission-contract findings below, verified on 2.0.x — the 2.2.0
 live CLI contract gate (`kimi_cli_contract_test.ts`) runs during the worker
 Dockerfile build and still needs a protected candidate build to verify it).
 An override without a matching reviewed lock fails closed. The pinned version is baked
