@@ -454,10 +454,14 @@ INITEOF
 # first python3 under the fixed /usr/local/bin:/usr/bin:/bin search path wins.
 # `type -P` (not `command -v`) so a `python3` shell function in the caller's
 # environment (exported via BASH_FUNC_python3%% or defined through BASH_ENV)
-# cannot resolve to the bare word and fail the allowlist fleet-wide (HU-1);
-# it also never reads bash's hash table. The result is allowlisted to plain
-# path characters so it can never carry shell syntax — and so bash 5.2+
-# patsub_replacement has nothing to expand (HF-4). Any failure fails closed
+# cannot resolve to the bare word and fail the allowlist fleet-wide (HU-1).
+# `type -P` does consult bash's hash table; it is the temporary PATH=
+# assignment that flushes the table before the lookup, so a stale hashed
+# python3 in the caller cannot reach the result either (pinned by the HF-1
+# shadow-PATH test and the hash-entry pin in the transition harness). The
+# result is allowlisted to plain path characters so it can never carry shell
+# syntax — and so bash 5.2+ patsub_replacement has nothing to expand (HF-4).
+# Any failure fails closed
 # (the caller treats the unit as unsafe) and is not memoized, so a transient
 # PATH problem recovers on the next call.
 # The resolution is memoized per process (HF-2), keyed on the override value

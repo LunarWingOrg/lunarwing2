@@ -433,14 +433,28 @@ JSON
   # BASH_FUNC_python3%% or defined through BASH_ENV) must not reach the
   # resolver — `command -v` reports it as the bare word, which the
   # absolute-path allowlist refuses, flipping every guarded OpenRC operation
-  # to 125 fleet-wide; `type -P` ignores functions and the hash table. Clear
-  # the memo and the verdict cache so the resolution really re-runs here.
+  # to 125 fleet-wide; `type -P` ignores functions (the hash table is flushed
+  # by the PATH= prefix, pinned separately below). Clear the memo and the
+  # verdict cache so the resolution really re-runs here.
   ( python3() { :; }
     _OPENRC_PROXY_PYTHON3_RESOLVED=""
     _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
     _OPENRC_PROXY_UNIT_SAFE_CACHE=()
     openrc_proxy_unit_is_safe "$safe_unit" ) \
     || fail 'a python3 shell function in the caller flipped the safe verdict'
+  # IC-1 (run-125): `type -P` DOES read bash's hash table; what keeps a stale
+  # hashed python3 out of the resolution is the temporary PATH= assignment,
+  # which flushes the table before the lookup. Pin that directly: a hash
+  # entry pointing at a fake interpreter must not flip the safe verdict.
+  mkdir -p "$fixture/pyhash"
+  { echo '#!/bin/sh'; echo 'exit 0'; } >"$fixture/pyhash/python3"
+  chmod 0755 "$fixture/pyhash/python3"
+  ( hash -p "$fixture/pyhash/python3" python3
+    _OPENRC_PROXY_PYTHON3_RESOLVED=""
+    _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+    _OPENRC_PROXY_UNIT_SAFE_CACHE=()
+    openrc_proxy_unit_is_safe "$safe_unit" ) \
+    || fail 'a stale python3 hash entry in the caller flipped the safe verdict'
   # HF-1 override: LUNARWING_MT_PROXY_PYTHON3 pins the interpreter for both
   # sides. A unit rendered under the override is accepted while the override
   # is set and refused once it is unset (the documented one-time refusal);

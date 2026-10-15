@@ -616,11 +616,12 @@ interpreter through one PATH-independent helper — the
 characters — so the two cannot drift apart and the calling process's PATH
 (a venv, sudo's `secure_path`, a pyenv shim) cannot flip a verdict or
 ping-pong the units between spellings. The override lives only in the
-calling process's environment and nothing persists it: health-fleet cron,
-the watchdog, onboarding verify and `sudo` under `env_reset` do not carry
-it, and any render without it switches the spelling back (archiving the
-override-rendered units) — prefer re-rendering to the canonical spelling
-over carrying an override. Units rendered before this pinning carried the
+calling process's environment and nothing persists it: `sudo` under
+`env_reset` strips it, cron and timer launchers start without it, and the
+onboarder (run via sudo) never sees it — any guarded mt-admin call made
+without it refuses the differently-spelled units, and any render without it
+switches the spelling back (archiving the override-rendered units) — prefer
+re-rendering to the canonical spelling over carrying an override. Units rendered before this pinning carried the
 caller's python3 spelling; units whose interpreter spelling differs from
 the canonical one are refused until re-rendered — run `render-units
 --all-proxies` to re-render them under the canonical interpreter
