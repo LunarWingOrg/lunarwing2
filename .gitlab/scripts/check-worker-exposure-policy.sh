@@ -38,6 +38,14 @@ python3 "$lane/scripts/entrypoint_config_test.py" || failed=1
 dockerfile="$lane/Dockerfile"
 dockerfile_code=""
 _join=""
+# Run-112 HD-1: BuildKit's continuation whitespace class is spaces and tabs
+# only. bash's [[:space:]] is wider even in the C locale (VT, FF, CR) and
+# locale-dependent under C.UTF-8 (U+1680, U+2028, U+3000), so the folds and
+# tests below use literal-character bracket expressions over these two
+# variables instead — quoted characters in a bracket expression are literal
+# set members, independent of locale.
+_hd1_spacetab=$' \t'
+_hd1_ctl=$'\x0b\x0c\x0d'
 # Run-110 GX-1: bash's read drops NUL bytes that BuildKit keeps, so a NUL
 # after a trailing backslash, or a NUL-prefixed line inside a continuation,
 # ends an instruction for BuildKit while this loop joins the next one.
@@ -77,6 +85,14 @@ while IFS= read -r _raw || [[ -n "$_raw" ]]; do
     if ! ( export LC_ALL=C; [[ "${_line:0:1}" == [[:print:]] ]] ); then
         fail "Dockerfile line does not start with printable ASCII (run-106 GJ-1): ${_raw}"
     fi
+    # Run-112 HD-1: a VT, FF or CR byte anywhere in a line makes this guard's
+    # whitespace folds and BuildKit's parse diverge (BuildKit keeps the byte;
+    # the guard used to fold it into the [[:space:]] join), and a lone CR also
+    # means a CRLF file this guard never promised to parse. No lane Dockerfile
+    # carries these bytes; refuse them fail-closed.
+    if [[ "$_raw" == *["${_hd1_ctl}"]* ]]; then
+        fail "Dockerfile line contains a vertical tab, form feed or carriage return byte (run-112 HD-1): ${_raw}"
+    fi
     # Run-106 GJ-2: BuildKit does not continue a line ending in an escaped
     # escape token (two backslashes — its lineContinuationRegex requires a
     # single trailing token), while this script joins any backslash-final
@@ -104,12 +120,14 @@ while IFS= read -r _raw || [[ -n "$_raw" ]]; do
         # appends the next line with no separator, while this loop joins with
         # a space — so `SHEL\` + `L [...]` is one SHELL instruction for the
         # builder but the word SHEL here, and `ARG LUNARWING_WRAPPER_\` +
-        # `SHA256=…` hides a protected name from the checks below. Require
-        # whitespace (or nothing) before the continuation backslash.
-        if [[ -z "$_part" || "${_part: -1}" != [[:space:]] ]]; then
+        # `SHA256=…` hides a protected name from the checks below. Require a
+        # space or tab (run-112 HD-1: BuildKit's own class) before the
+        # continuation backslash; a backslash that is the line's whole content
+        # is refused too.
+        if [[ -z "$_part" || "${_part: -1}" != ["${_hd1_spacetab}"] ]]; then
             fail "Dockerfile continuation backslash must be preceded by whitespace (run-111 GZ-1): ${_raw}"
         fi
-        _join+="${_part%"${_part##*[![:space:]]}"} "
+        _join+="${_part%"${_part##*[!"${_hd1_spacetab}"]}"} "
         continue
     fi
     _line="${_join}${_line%"${_line##*[![:space:]]}"}"
