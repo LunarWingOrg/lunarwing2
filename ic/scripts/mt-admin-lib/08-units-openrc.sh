@@ -387,10 +387,10 @@ INITEOF
 # ── OpenRC service units ─────────────────────────────────────────────────────
 
 # Single source of truth for the post-WI#376 proxy unit shape. The renderer
-# substitutes concrete values for the @TOKENS@; the safe-unit check derives
-# strict per-line matches from the same text, so the renderer and the contract
-# cannot drift apart (WI#393 GR-1). Tenant data lives only in the @TOKEN@
-# slots; everything else is fixed scaffolding.
+# and the safe-unit contract both substitute concrete values for the @TOKENS@
+# through _openrc_proxy_unit_body below, so the renderer and the contract
+# render from the same text (WI#393 GR-1/HF-1). Tenant data lives only in the
+# @TOKEN@ slots; everything else is fixed scaffolding.
 _openrc_proxy_unit_template() {
   cat <<'INITEOF'
 #!/sbin/openrc-run
@@ -444,100 +444,135 @@ start_pre() {
 INITEOF
 }
 
-# Escape ERE metacharacters in a literal string. Pure bash: the safe-unit
-# check runs on every OpenRC preflight, so no per-line subprocesses.
-_openrc_re_escape() {
-  local s="$1" out="" c i
-  for ((i = 0; i < ${#s}; i++)); do
-    c="${s:i:1}"
-    case "$c" in
-      '.'|'*'|'^'|'$'|'+'|'?'|'('|')'|'{'|'}'|'|'|'['|']'|'\') out+="\\$c" ;;
-      *) out+="$c" ;;
-    esac
-  done
-  printf '%s' "$out"
-}
-
-# The template with every literal byte ERE-escaped and the @TOKENS@ intact.
-# Cached: the template is fixed at parse time, so escape it once per process.
-_OPENRC_PROXY_UNIT_TEMPLATE_RE=""
-_openrc_proxy_unit_template_re() {
-  if [[ -z "$_OPENRC_PROXY_UNIT_TEMPLATE_RE" ]]; then
-    local template line
-    template="$(_openrc_proxy_unit_template)" || return 1
-    while IFS= read -r line; do
-      _OPENRC_PROXY_UNIT_TEMPLATE_RE+="$(_openrc_re_escape "$line")"$'\n'
-    done <<<"$template"
-    [[ -n "$_OPENRC_PROXY_UNIT_TEMPLATE_RE" ]] || return 1
+# The one python3 spelling both the renderer and the safe-unit contract use
+# (WI#393 HF-1). The unit's interpreter slot must not depend on the calling
+# process's PATH: root login shells, sudo's secure_path, the onboarder's
+# .venv and pyenv shims all resolve python3 differently, and a unit rendered
+# under one spelling but checked under another is refused fleet-wide while
+# the suggested repair re-renders it into the *other* spelling (ping-pong).
+# LUNARWING_MT_PROXY_PYTHON3 pins an interpreter explicitly; otherwise the
+# first python3 under the fixed /usr/local/bin:/usr/bin:/bin search path wins.
+# The result is allowlisted to plain path characters so it can never carry
+# shell syntax — and so bash 5.2+ patsub_replacement has nothing to expand
+# (HF-4). Any failure fails closed (the caller treats the unit as unsafe) and
+# is not memoized, so a transient PATH problem recovers on the next call.
+# The resolution is memoized per process (HF-2), keyed on the override value
+# so a changed LUNARWING_MT_PROXY_PYTHON3 re-resolves instead of going stale.
+_OPENRC_PROXY_PYTHON3_RESOLVED=""
+_OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+_openrc_proxy_python3() {
+  local override="${LUNARWING_MT_PROXY_PYTHON3:-}" pybin
+  if [[ -z "$_OPENRC_PROXY_PYTHON3_RESOLVED" \
+     || "$override" != "$_OPENRC_PROXY_PYTHON3_RESOLVED_FROM" ]]; then
+    if [[ -n "$override" ]]; then
+      pybin="$override"
+    else
+      pybin="$(PATH=/usr/local/bin:/usr/bin:/bin command -v python3)" || return 1
+    fi
+    [[ "$pybin" == /* && "$pybin" =~ ^[A-Za-z0-9._/+-]+$ ]] || return 1
+    _OPENRC_PROXY_PYTHON3_RESOLVED="$pybin"
+    _OPENRC_PROXY_PYTHON3_RESOLVED_FROM="$override"
   fi
-  printf '%s' "$_OPENRC_PROXY_UNIT_TEMPLATE_RE"
+  printf '%s' "$_OPENRC_PROXY_PYTHON3_RESOLVED"
 }
 
-# One ERE fragment per template line for tenant $name: the name is identical
-# in the description/user/group/before slots; the python interpreter, proxy
-# script, runtime/log/env dirs and env-exec launcher are the same canonical
-# paths the renderer writes; only the port stays a shape, because reading the
-# ports registry does not belong in the OpenRC preflight path. Any failure to
-# derive a fragment fails closed (caller treats the unit as unsafe).
-_openrc_proxy_unit_expected_res() {
-  local name="$1" pybin
-  pybin="$(command -v python3)" || return 1
-  [[ -n "$pybin" && "$pybin" == /* ]] || return 1
-  local esc_name esc_pybin esc_bin esc_run esc_log esc_env esc_exec re
-  esc_name="$(_openrc_re_escape "$name")"
-  esc_pybin="$(_openrc_re_escape "$pybin")"
-  esc_bin="$(_openrc_re_escape "$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py")"
-  esc_run="$(_openrc_re_escape "$(tenant_run_dir "$name")")"
-  esc_log="$(_openrc_re_escape "$(tenant_log_dir "$name")")"
-  esc_env="$(_openrc_re_escape "$(tenant_env_dir "$name")")"
-  esc_exec="$(_openrc_re_escape "$OPENRC_ENV_EXEC")"
-  re="$(_openrc_proxy_unit_template_re)" || return 1
-  re="${re//@NAME@/$esc_name}"
-  re="${re//@PYBIN@/$esc_pybin}"
-  re="${re//@PROXYBIN@/$esc_bin}"
-  re="${re//@PORT@/[0-9]+}"
-  re="${re//@RUNDIR@/$esc_run}"
-  re="${re//@LOGDIR@/$esc_log}"
-  re="${re//@ENVDIR@/$esc_env}"
-  re="${re//@ENVEXEC@/$esc_exec}"
-  printf '%s' "$re"
+# The unit body the renderer writes and the safe-unit contract expects, from
+# the single template source above (WI#393 GR-1/HF-1). Shared so both sides
+# substitute identically and cannot drift apart. Every replacement is quoted:
+# with bash 5.2+ patsub_replacement an unquoted & in a value would expand to
+# the matched token, writing a corrupted unit the checker then accepts (HF-4).
+_openrc_proxy_unit_body() {
+  local name="$1" proxy_port="$2" pybin body
+  pybin="$(_openrc_proxy_python3)" || return 1
+  body="$(_openrc_proxy_unit_template)" || return 1
+  body="${body//@NAME@/"$name"}"
+  body="${body//@PYBIN@/"$pybin"}"
+  body="${body//@PROXYBIN@/"$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py"}"
+  body="${body//@PORT@/"$proxy_port"}"
+  body="${body//@RUNDIR@/"$(tenant_run_dir "$name")"}"
+  body="${body//@LOGDIR@/"$(tenant_log_dir "$name")"}"
+  body="${body//@ENVDIR@/"$(tenant_env_dir "$name")"}"
+  body="${body//@ENVEXEC@/"$OPENRC_ENV_EXEC"}"
+  printf '%s\n' "$body"
 }
 
-# The post-WI#376 proxy unit contract: byte-level template equality, not line
-# presence (WI#393 FL-6/GR-1). The installed unit must reproduce the renderer
-# template for its filename's tenant exactly — same lines in the same order
-# and count, tenant name identical in every slot, no NUL/CR bytes, final
-# newline present. Any extra, missing, reordered, or payload-carrying line
-# (a legacy inline --tensorzero flag, command substitution, a backtick, a
-# prepended override, a replaced proxy_command) fails the contract, so a
-# tampered unit is archived before replacement rather than passing on the
-# strength of one safe-looking line. Shared by the preflight guard and the
-# renderer, which archives only installed units that fail this check.
+# Extract the port from an installed unit's proxy_args line for the
+# filename's tenant. The port is the one slot the checker cannot derive on
+# its own: reading the ports registry does not belong in the OpenRC preflight
+# path. The extracted value only feeds the expected-body render, so a wrong
+# or missing extraction fails closed at the byte-for-byte comparison.
+_openrc_proxy_unit_extract_port() {
+  local path="$1" name="$2" line rest port=""
+  # The port shape is ASCII digits only, in every locale (HF-6): a UTF-8
+  # locale's [0-9] range can match non-ASCII digits that Python's int() would
+  # also accept, smuggling a different value past a shape check.
+  local LC_ALL=C
+  local prefix=': "${proxy_args:='"$(tenant_lw_root "$name")"'/tensorzero-proxy-configurations/lunarwing-proxy.py --port '
+  local port_re='^([0123456789]{1,5}) --bind 127[.]0[.]0[.]1 --tensorzero-env[}]"$'
+  local -a lines=()
+  mapfile -t lines <"$path" || return 1
+  for line in "${lines[@]}"; do
+    [[ "$line" == "$prefix"* ]] || continue
+    rest="${line#"$prefix"}"
+    if [[ "$rest" =~ $port_re ]]; then
+      port="${BASH_REMATCH[1]}"
+      break
+    fi
+  done
+  [[ -n "$port" ]] || return 1
+  printf '%s\n' "$port"
+}
+
+# The post-WI#376 proxy unit contract: byte-for-byte equality with a fresh
+# render from the shared template (WI#393 FL-6/GR-1, HF-1/HF-2). The installed
+# unit must reproduce _openrc_proxy_unit_body for its filename's tenant
+# exactly — same bytes in the same order and count, tenant name identical in
+# every slot, the canonical interpreter/renderer paths, the unit's own port.
+# Byte equality also covers NUL/CR bytes, the final newline and trailing
+# lines, so no separate hygiene pass is needed. Any extra, missing, reordered,
+# or payload-carrying content (a legacy inline --tensorzero flag, command
+# substitution, a backtick, a prepended override, a replaced proxy_command)
+# fails the contract, so a tampered unit is archived before replacement rather
+# than passing on the strength of one safe-looking line. Shared by the
+# preflight guard and the renderer, which archives only installed units that
+# fail this check.
+#
+# Verdict cache (HF-2): the guard runs on every OpenRC service operation, so
+# one `status` pass re-checks every installed proxy unit dozens of times.
+# Only safe verdicts are cached, for the life of the process, keyed by path
+# with the unit's dev:inode:mtime(ns):size signature plus the resolved
+# interpreter — any replacement, edit or interpreter-resolution change forces
+# a full re-check, so a cached "safe" can never outlive the bytes and
+# resolution it verified.
+declare -gA _OPENRC_PROXY_UNIT_SAFE_CACHE=()
 openrc_proxy_unit_is_safe() {
-  local path="$1" name
+  local path="$1" name sig port
+  local LC_ALL=C
   [[ -f "$path" && ! -L "$path" ]] || return 1
   name="${path##*/lunarwing-proxy-}"
-  [[ -n "$name" && "$name" == "$(sanitize_name "$name")" ]] || return 1
-  # Byte hygiene first: line comparison cannot be trusted over NUL/CR bytes,
-  # and the renderer always ends the unit with a newline.
-  local raw stripped
-  raw="$(wc -c <"$path")" || return 1
-  [[ "$raw" -gt 0 ]] || return 1
-  stripped="$(tr -d '\000\r' <"$path" | wc -c)" || return 1
-  [[ "$raw" == "$stripped" ]] || return 1
-  [[ "$(tail -c 1 -- "$path" | wc -l)" -eq 1 ]] || return 1
-  local -a expected actual
-  mapfile -t expected < <(_openrc_proxy_unit_expected_res "$name")
-  # The template is never empty, so an empty expected list means the fragment
-  # derivation failed (e.g. no python3 on PATH): fail closed.
-  [[ "${#expected[@]}" -gt 0 ]] || return 1
-  mapfile -t actual <"$path" || return 1
-  [[ "${#actual[@]}" -eq "${#expected[@]}" ]] || return 1
-  local i line_re
-  for ((i = 0; i < ${#expected[@]}; i++)); do
-    line_re="^${expected[$i]}$"
-    [[ "${actual[$i]}" =~ $line_re ]] || return 1
-  done
+  [[ -n "$name" ]] || return 1
+  sig="$(stat -c '%d:%i:%y:%s' -- "$path" 2>/dev/null)" || return 1
+  [[ -n "$sig" ]] || return 1
+  # Warm the interpreter memo with a DIRECT call (no command substitution), so
+  # the resolution survives in this process and the cache comparison below is
+  # subshell-free (HF-2). Subshell callers (e.g. `$(openrc_service_state …)`)
+  # inherit the parent's warm memo and verdict cache at fork time.
+  if [[ -z "$_OPENRC_PROXY_PYTHON3_RESOLVED" \
+     || "${LUNARWING_MT_PROXY_PYTHON3:-}" != "$_OPENRC_PROXY_PYTHON3_RESOLVED_FROM" ]]; then
+    _openrc_proxy_python3 >/dev/null || return 1
+  fi
+  # Fast path: a cache hit costs one stat and no subshells. The fork-heavy
+  # validations (name sanitize, body render, cmp) run only on a miss, and only
+  # a fully verified unit is ever cached, so a hit can only repeat a verdict
+  # this process already proved for these exact bytes under this exact
+  # interpreter resolution.
+  if [[ "${_OPENRC_PROXY_UNIT_SAFE_CACHE[$path]:-}" == "$sig|$_OPENRC_PROXY_PYTHON3_RESOLVED" ]]; then
+    return 0
+  fi
+  [[ "$name" == "$(sanitize_name "$name")" ]] || return 1
+  port="$(_openrc_proxy_unit_extract_port "$path" "$name")" || return 1
+  cmp -s -- "$path" <(_openrc_proxy_unit_body "$name" "$port") || return 1
+  _OPENRC_PROXY_UNIT_SAFE_CACHE[$path]="$sig|$_OPENRC_PROXY_PYTHON3_RESOLVED"
   return 0
 }
 
@@ -668,39 +703,21 @@ backup_openrc_proxy_unit() {
 
 # File-only proxy renderer shared by normal rendering and the fleet migration. The
 # atomic replacement prevents dependency scanning from seeing a partial script.
-# The unit body comes from the single template source the safe-unit contract
-# verifies against (WI#393 GR-1), so a rendered unit always satisfies the
-# preflight guard and template drift fails loudly instead of shipping.
+# The unit body comes from _openrc_proxy_unit_body — the same source the
+# safe-unit contract renders its expected bytes from (WI#393 GR-1/HF-1) — so a
+# freshly rendered unit satisfies the preflight guard under the same
+# interpreter resolution, and template drift fails loudly instead of shipping.
 render_proxy_openrc_unit() {
-  local name="$1" proxy_port proxy_bin env_dir run_dir log_dir path tmp pybin body
+  local name="$1" proxy_port path tmp
   proxy_port="$(ports_get "$name" proxy)" || return 1
-  [[ "$proxy_port" =~ ^[0-9]+$ ]] || die "invalid proxy port for $name"
-  proxy_bin="$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py"
-  env_dir="$(tenant_env_dir "$name")"
-  run_dir="$(tenant_run_dir "$name")"
-  log_dir="$(tenant_log_dir "$name")"
-  pybin="$(command -v python3)" || true
-  [[ -n "$pybin" && "$pybin" == /* ]] \
-    || die "cannot render proxy unit for $name: no python3 on PATH"
+  [[ "$proxy_port" =~ ^[0123456789]{1,5}$ ]] || die "invalid proxy port for $name"
   mkdir -p "$OPENRC_INITD_DIR" || return 1
   path="$OPENRC_INITD_DIR/lunarwing-proxy-${name}"
   [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || die "unsafe installed proxy unit: $path"
   tmp="$(mktemp "$OPENRC_INITD_DIR/.lunarwing-proxy-${name}.XXXXXX")" || return 1
-  body="$(_openrc_proxy_unit_template)" || {
+  if ! _openrc_proxy_unit_body "$name" "$proxy_port" >"$tmp"; then
     rm -f -- "$tmp"
-    return 1
-  }
-  body="${body//@NAME@/$name}"
-  body="${body//@PYBIN@/$pybin}"
-  body="${body//@PROXYBIN@/$proxy_bin}"
-  body="${body//@PORT@/$proxy_port}"
-  body="${body//@RUNDIR@/$run_dir}"
-  body="${body//@LOGDIR@/$log_dir}"
-  body="${body//@ENVDIR@/$env_dir}"
-  body="${body//@ENVEXEC@/$OPENRC_ENV_EXEC}"
-  if ! printf '%s\n' "$body" >"$tmp"; then
-    rm -f -- "$tmp"
-    return 1
+    die "cannot render proxy unit for $name: no python3 interpreter resolves (set LUNARWING_MT_PROXY_PYTHON3 or install python3 under /usr/local/bin:/usr/bin:/bin)"
   fi
   # The archive location is validated on every render, even when this render
   # writes no copy: an archive dir inside init.d could hand OpenRC an
