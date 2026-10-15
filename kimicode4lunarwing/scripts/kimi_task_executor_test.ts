@@ -50,8 +50,9 @@ process.exit(0)
       script = `#!/usr/bin/env node
 const guard = process.env.KIMI_CODE_DANGEROUS_COMMAND_GUARD || "<unset>"
 const reminder = process.env.KIMI_CODE_PERMISSION_MODE_REMINDER || "<unset>"
+const trust = process.env.KIMI_CODE_TRUST_WORKSPACE || "<unset>"
 const messages = [
-  { role: "assistant", content: "guard=" + guard + " reminder=" + reminder },
+  { role: "assistant", content: "guard=" + guard + " reminder=" + reminder + " trust=" + trust },
 ]
 for (const m of messages) {
   process.stdout.write(JSON.stringify(m) + "\\n")
@@ -238,18 +239,20 @@ test("executeTask: task environment cannot disable the dangerous-command guard (
     prompt: "try to disable the guard",
     timeout_ms: 10_000,
     // Attacker-controllable task input attempting to lower the approval
-    // policy for its own run.
+    // policy for its own run — including kimi-code 2.2.0's workspace-trust
+    // switch, which would auto-spawn the repo's .mcp.json servers (WI#411).
     context: {
       environment: {
         KIMI_CODE_DANGEROUS_COMMAND_GUARD: "false",
         KIMI_CODE_PERMISSION_MODE_REMINDER: "1",
+        KIMI_CODE_TRUST_WORKSPACE: "1",
       },
     },
   }
   const { result } = await runExecutor(request, bin)
   assert.ok(result, "result was not emitted")
   assert.equal(result!.status, "success")
-  assert.equal(result!.output, "guard=<unset> reminder=<unset>")
+  assert.equal(result!.output, "guard=<unset> reminder=<unset> trust=<unset>")
 })
 
 test("executeTask: hub-handshake token never reaches the task env (WI#373)", async () => {

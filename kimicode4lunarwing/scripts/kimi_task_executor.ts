@@ -300,6 +300,12 @@ export async function executeTask(
     // attacker-controllable task input, not operator config.
     delete env.KIMI_CODE_DANGEROUS_COMMAND_GUARD
     delete env.KIMI_CODE_PERMISSION_MODE_REMINDER
+    // WI#411: kimi-code 2.2.0 added KIMI_CODE_TRUST_WORKSPACE. A truthy value
+    // ("1", "true", "yes", "on") makes the CLI treat the workspace as trusted
+    // and spawn every MCP server listed in the repo's .mcp.json or
+    // .kimi-code/mcp.json at startup — before any model turn and outside the
+    // WI#206 PreToolUse hook. Task input must never be able to grant that.
+    delete env.KIMI_CODE_TRUST_WORKSPACE
     // WI#373: AGENT_AUTH_TOKEN is the bridge's hub-handshake credential. The
     // task process runs untrusted job code, so it must never inherit the
     // token. Deleted after every merge (process.env spread, task env, extra
