@@ -2,9 +2,12 @@
 
 There is currently **no maintained, production-safe cross-backend importer** from an arbitrary IronClaw/libSQL database into LunarWing's multi-tenant PostgreSQL schema.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** The archived guide,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** The archived guide,
 the three legacy helper scripts, and the recommended fresh-tenant/ETL paths
 were re-checked; the unsupported status and all referenced paths are current.
+The v2.1.6.0 libSQL remote-replica cargo-feature gate (WI#331) does not change
+this guidance: it affects freshly built libSQL-remote binaries, not the
+supported PostgreSQL MT target recommended here.
 
 The previous guide has been archived at [`history/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](history/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md). Do not execute its CSV and SQL snippets against a current tenant. They hardcode an old table/column set, expose a fixed PostgreSQL connection pattern, disable constraints, assume the historical V18 schema, and do not preserve newer user, owner-scope, extension, reflex, document-version, approval-policy, and runtime-exclusion semantics.
 

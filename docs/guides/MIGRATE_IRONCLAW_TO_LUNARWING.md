@@ -2,11 +2,12 @@
 
 This runbook covers a PostgreSQL-backed, single-instance migration. LunarWing retains the IronClaw migration lineage and applies newer Refinery migrations at startup, but a forward migration is not a rollback plan. Test with a cloned database and copied state directory before touching the original instance.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** The migration chain
-(`ic/migrations/`, now through V27), `LUNARWING_BASE_DIR` precedence, service
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** The migration chain
+(`ic/migrations/`, now through V28), `LUNARWING_BASE_DIR` precedence, service
 install paths, and the `lunarwing-agent-v1`-only worker subprotocol (the
 `ironclaw-agent-v1` alias is removed) were re-checked against the current tree;
-no changes were needed.
+the only change was the V27 → V28 migration-chain pointer (V28 revokes
+always-granted secret-deletion authority).
 
 For a multi-tenant target, use [`MIGRATE_IRONCLAW_TO_MT.md`](MIGRATE_IRONCLAW_TO_MT.md) instead.
 

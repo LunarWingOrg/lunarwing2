@@ -3,13 +3,14 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Gentoo + OpenRC** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), and 2026-10-04 (v2.1.5.0).** Package set re-checked against the
+**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Package set re-checked against the
 current mt-admin prerequisite probes (`require_cmd` set: cargo, chcon, curl,
-git, jq, od, passwd, python3, setpriv, sha256sum, tar, taskset, useradd —
-plus podman/docker); no changes were needed (the v2.1.2.0
+flock, git, jq, od, passwd, python3, setpriv, sha256sum, tar, taskset,
+useradd — plus podman/docker); no changes were needed (the v2.1.2.0
 sandbox rework added no new host packages — podman was already required, and
-the v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` reuse existing
-tooling inside the tenant containers).
+the v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` and the
+v2.1.6.0 OpenRC proxy-unit migration and worker-credential work reuse
+existing tooling; `flock` was already listed via `sys-apps/util-linux`).
 
 This list reflects what an actual Gentoo/OpenRC/Podman MT bring-up required. Atoms are Gentoo
 package names; adjust for your profile (e.g. `clang` moved to `llvm-core/` on newer profiles).
