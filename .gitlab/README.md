@@ -245,6 +245,9 @@ the prime suspect, and the fix is the same normalization in the offending
   publishes no shared cache, preserving the protected-cache-writer policy.
   Override `CI_BUN_IMAGE` with a mirror of the pinned digest to avoid
   Docker Hub quotas. Worker image rebuilds remain a separate protected gate.
+  `validate_config.py` pins this lane's script line-for-line (MR !1644
+  review HN-5), so any script edit must update the validator's
+  `WORKER_TS_LANE_SCRIPTS` tuple in the same commit.
 - `worker-kimi-ts`: the kimi worker Node/TS suites (bridge, executor, tool
   proxy relay, MCP shim, runtime, entrypoint/hook policy) via the
   kimicode4lunarwing Dockerfile builder stage's `npm ci --ignore-scripts` +
@@ -253,13 +256,27 @@ the prime suspect, and the fix is the same normalization in the offending
   lacks python3 and the entrypoint config tests bash-run `entrypoint.sh`,
   whose config section embeds python3 heredocs — from the pinned
   `CI_DEBIAN_SNAPSHOT` archive (tied to the Dockerfile `ARG DEBIAN_SNAPSHOT`
-  by `validate_config.py`), not the live deb.debian.org mirror. Runs on every MR/branch
+  by `validate_config.py`), not the live deb.debian.org mirror. That archive
+  is a best-effort, throttled service, so the lane's `apt-get update` runs
+  with `Acquire::Retries=5`/`Acquire::http::Timeout=60`; a snapshot outage
+  still fails this required lane until the service recovers (retry the job).
+  Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
   `validate_config.py` ties to the node FROM digest(s) in
   `kimicode4lunarwing/Dockerfile` (fail-closed, like the bun tie). The
   real-CLI contract lane (`kimi_cli_contract_test`) self-skips here — the
   image carries no kimi binary — so the protected candidate image build
   remains the only place that contract is asserted against the real CLI.
+  Like the opencode lane, the script is pinned line-for-line by
+  `validate_config.py` (`WORKER_TS_LANE_SCRIPTS`, MR !1644 review HN-5):
+  any script edit must update the tuple in the same commit.
+  Both worker TS lanes also have an allowlist of job keywords after
+  `extends` resolution (`WORKER_TS_LANE_KEYS`, MR !1647 review HP-1) and
+  require exactly `tags: ["$CI_LINT_RUNNER_TAG"]`. Job-level `variables`,
+  `parallel` matrices and `hooks` are refused, including inherited entries:
+  they can bypass the pinned script without editing a command. Adding any
+  other keyword (including `timeout`, `retry`, `inherit` or `after_script`)
+  requires reviewing and updating the allowlist in the same commit.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL

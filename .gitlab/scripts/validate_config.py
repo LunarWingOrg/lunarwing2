@@ -457,37 +457,163 @@ def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
             errors.append(f"check-satellite-advisories.sh lost its {fragment} guard")
 
 
-def lane_runs_on_merge_requests(job: object) -> bool:
-    """First-match-wins rules walk for the MR pipeline case (MR !1618 GV-1).
+def merge_ci_hashes(base: dict, overlay: dict) -> dict:
+    """GitLab `extends` merge step: hashes merge key-wise, arrays and
+    scalars are replaced, and the overlay wins on conflicts ("keys from the
+    last member always override anything defined on other levels")."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = merge_ci_hashes(existing, value)
+        else:
+            merged[key] = value
+    return merged
 
-    GitLab evaluates rules in order and the first match decides; a matching
-    rule's `when` decides the outcome. So merely containing an
-    `if: merge_request_event` rule is not proof the lane runs on MRs: the MR
-    rule can carry `when: never`/`when: manual`, the job can set
-    `allow_failure: true` (the lane runs but cannot gate), or an
-    unconditional rule placed before the MR rule shadows it. Walk the rules
-    in order: the MR rule must be the first deciding rule, must not disable
-    or manual the lane, and must not allow failure.
+
+def resolve_extends(job: object, merged: dict, depth: int = 8) -> dict:
+    """Resolve a job's `extends` chain with GitLab merge semantics.
+
+    MR !1627 review HE-1 (R4): a lane extending `.observational-job`
+    inherits `allow_failure: true` and runs but cannot gate, so the
+    validator must see the EFFECTIVE job, not the literal one. Parents are
+    applied in list order so the last listed parent wins on conflicts, and
+    the job's own keys win overall. The depth budget makes cyclic extends
+    chains terminate; a truncated cycle keeps whatever keys it set, which
+    fails closed for the gating keys (they cannot be deleted by a cycle).
     """
     if not isinstance(job, dict):
+        return {}
+    own = {key: value for key, value in job.items() if key != "extends"}
+    extends = job.get("extends")
+    if isinstance(extends, str):
+        names = [extends]
+    elif isinstance(extends, list):
+        names = [name for name in extends if isinstance(name, str)]
+    else:
+        names = []
+    if depth <= 0 or not names:
+        return own
+    inherited: dict = {}
+    for name in names:
+        parent = resolve_extends(merged.get(name), merged, depth - 1)
+        inherited = merge_ci_hashes(inherited, parent)
+    return merge_ci_hashes(inherited, own)
+
+
+AUTOMATIC_WHEN = (None, "on_success", "always")
+
+
+def mr_rule_is_exact(condition: object) -> bool:
+    """True when `condition` is exactly the canonical MR predicate.
+
+    MR !1644 review HN-1: the previous squash-and-compare deleted every
+    whitespace character, including inside the quoted literal, so
+    `"merge_request_event "` (trailing space) and `"merge_request _event"`
+    passed while GitLab compares the literal exactly — on MR pipelines that
+    rule never matches and the trailing `when: never` silently drops the
+    lane. Compare the operands instead: spaces/tabs AROUND the tokens and
+    either quote style are formatting; anything inside the quotes is
+    literal.
+    """
+    if not isinstance(condition, str):
         return False
-    if job.get("allow_failure"):
+    lhs, sep, rhs = condition.partition("==")
+    blank = " " + chr(9)
+    return (
+        sep == "=="
+        and lhs.strip(blank) == "$CI_PIPELINE_SOURCE"
+        and rhs.strip(blank) in ('"merge_request_event"', "'merge_request_event'")
+    )
+
+
+def lane_runs_on_merge_requests(job: object, merged: dict) -> bool:
+    """Exact-predicate first-rule gate for the MR pipeline case.
+
+    MR !1618 review GV-1 walked the rules in order but still matched the
+    `if` by substring; MR !1627 review HE-1 showed eight further shapes
+    pass on the real tree while the lane cannot gate MRs: a job-level
+    `when: manual` (R1), a catch-all shadow rule placed first via
+    `if: $CI_PIPELINE_SOURCE`, `exists:`, or `changes:` (R2), an inverted
+    (`!=`) or `&&`-narrowed MR predicate (R3), and `extends:
+    .observational-job` inheriting `allow_failure: true` (R4). GitLab's
+    first match wins, so the lane gates MRs exactly when the FIRST rule
+    matches MR pipelines and runs them automatically. After resolving
+    `extends`, require: no job-level `allow_failure`, no non-automatic
+    job-level `when`, no `only`/`except`, no non-empty `needs`, and a
+    first rule whose keys are only `if`/`when`/`allow_failure`, whose `if`
+    is exactly the canonical MR predicate (operand-exact per MR !1644
+    review HN-1: only whitespace around the tokens and the quote style may
+    vary), and which runs automatically without rule-level allow_failure.
+    """
+    effective = resolve_extends(job, merged)
+    if not effective:
         return False
-    rules = job.get("rules")
-    if not isinstance(rules, list):
+    if effective.get("allow_failure"):
         return False
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        condition = str(rule.get("if", ""))
-        if "merge_request_event" in condition:
-            if rule.get("when") not in (None, "on_success", "always"):
-                return False
-            return not rule.get("allow_failure")
-        if not any(rule.get(key) for key in ("if", "changes", "exists")):
-            # An unconditional rule shadows every rule below it.
-            return False
-    return False
+    if effective.get("when") not in AUTOMATIC_WHEN:
+        return False
+    if "only" in effective or "except" in effective:
+        return False
+    if effective.get("needs"):
+        return False
+    rules = effective.get("rules")
+    if not isinstance(rules, list) or not rules:
+        return False
+    first = rules[0]
+    if not isinstance(first, dict) or not set(first) <= {"if", "when", "allow_failure"}:
+        return False
+    if not mr_rule_is_exact(first.get("if")):
+        return False
+    if first.get("when") not in AUTOMATIC_WHEN:
+        return False
+    return not first.get("allow_failure")
+
+
+# MR !1644 review HN-5: the effective script of each worker TS lane must
+# equal these lines exactly (compared after extends resolution) — the
+# earlier "fragment starts a segment" pins let the lane be hollowed out
+# with a prepended `exit 0`, a dropped provisioning line, backgrounded or
+# neutralised test commands, or deleted bun test lines. Any deliberate edit
+# to a lane's script in .gitlab/ci/validate.yml must update the tuple in
+# the same commit, which is the point. Each entry pairs the lane's
+# digest-tied image variable with its pinned script lines.
+WORKER_TS_LANE_SCRIPTS = {
+    "worker-kimi-ts": (
+        "$CI_NODE_IMAGE",
+        (
+            "rm -f /etc/apt/sources.list.d/debian.sources",
+            "printf '%s\\n' \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb http://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
+            "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get install -y --no-install-recommends python3",
+            "cd kimicode4lunarwing/scripts",
+            "npm ci --ignore-scripts",
+            "npx tsc -p tsconfig.json",
+            "npm test",
+        ),
+    ),
+    "worker-opencode-ts": (
+        "$CI_BUN_IMAGE",
+        (
+            "cd opencode4lunarwing",
+            "bun install --frozen-lockfile",
+            "bun scripts/path_expand_test.ts",
+            "bun scripts/opencode_result_test.ts",
+            "bun scripts/task_prompt_test.ts",
+            "bun scripts/lunarwing_bridge_test.ts",
+            "bun scripts/opencode_task_executor_test.ts",
+            "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
+        ),
+    ),
+}
+
+# MR !1647 review HP-1: environment variables (including parallel matrices)
+# and pre-clone hooks can bypass an unchanged pinned script. Additional job
+# keywords require an explicit allowlist update alongside the lane change.
+WORKER_TS_LANE_KEYS = frozenset({
+    "stage", "needs", "image", "tags", "rules", "script", "allow_failure",
+    "when", "before_script",
+})
+WORKER_TS_LANE_TAGS = ["$CI_LINT_RUNNER_TAG"]
 
 
 def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
@@ -497,47 +623,49 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
     deleting the whole block or replacing its rules with `when: never`
     passed every gate silently — exactly the regression class GB-2 was
     about. Require each lane to exist, to run on merge_request_event (per
-    the GV-1 first-match rules walk), to use its digest-tied image variable,
-    and to keep its core script fragments (including the kimi lane's
-    python3 provisioning, GH-1, from the pinned Debian snapshot, GV-4).
-    Accepted limit: the fragment check guards against accidental deletion,
-    not an adversarial edit — a `true ||` prefix would still pass it.
+    the HE-1 exact-predicate first-rule gate on the extends-resolved job),
+    to use its digest-tied image variable, and to run exactly its pinned
+    script (MR !1644 review HN-5: the extends-resolved script must equal
+    WORKER_TS_LANE_SCRIPTS line for line, so a prepended `exit 0`, a
+    dropped provisioning line, or a deleted test command fails here). A
+    `before_script`, an image entrypoint override, or a non-empty `needs`
+    could hollow out the lane just as well, so those stay pinned too
+    (HE-2). The kimi lane's pinned commands include the python3
+    provisioning (GH-1) from the pinned Debian snapshot (GV-4) with its apt
+    retry options (HE-4). Only allowlisted job keys may survive extends
+    resolution, and tags must select the lint runner (HP-1); job-level
+    variables, parallel matrices and hooks cannot bypass the script pin.
     """
-    expected = {
-        "worker-kimi-ts": (
-            "$CI_NODE_IMAGE",
-            (
-                "snapshot.debian.org",
-                "apt-get install -y --no-install-recommends python3",
-                "cd kimicode4lunarwing/scripts",
-                "npm ci --ignore-scripts",
-                "npx tsc -p tsconfig.json",
-                "npm test",
-            ),
-        ),
-        "worker-opencode-ts": (
-            "$CI_BUN_IMAGE",
-            (
-                "cd opencode4lunarwing",
-                "bun install --frozen-lockfile",
-                "tsc --noEmit -p scripts/tsconfig.json",
-            ),
-        ),
-    }
-    for job_name, (image_variable, fragments) in expected.items():
+    for job_name, (image_variable, expected_script) in WORKER_TS_LANE_SCRIPTS.items():
         job = merged.get(job_name)
         if not isinstance(job, dict):
             errors.append(f"{job_name} job missing")
             continue
-        if image_name(job.get("image")) != image_variable:
+        effective = resolve_extends(job, merged)
+        unexpected = sorted(set(effective) - WORKER_TS_LANE_KEYS)
+        if unexpected:
+            errors.append(
+                f"{job_name} must not set job keys {unexpected}; job-level "
+                "variables, parallel matrices or hooks can bypass the pinned script"
+            )
+        if effective.get("tags") != WORKER_TS_LANE_TAGS:
+            errors.append(f"{job_name} tags must be exactly {WORKER_TS_LANE_TAGS}")
+        image = effective.get("image")
+        if image_name(image) != image_variable:
             errors.append(f"{job_name} must use the {image_variable} image")
-        if not lane_runs_on_merge_requests(job):
+        entrypoint = image.get("entrypoint") if isinstance(image, dict) else None
+        if entrypoint is not None and entrypoint != [""]:
+            errors.append(f"{job_name} must not override its image entrypoint")
+        if effective.get("before_script"):
+            errors.append(f"{job_name} must not set a before_script")
+        if not lane_runs_on_merge_requests(job, merged):
             errors.append(f"{job_name} must run on merge_request_event")
-        script = job.get("script", [])
-        commands = "\n".join(script if isinstance(script, list) else [str(script)])
-        for fragment in fragments:
-            if fragment not in commands:
-                errors.append(f"{job_name} lost its required script fragment: {fragment}")
+        script = effective.get("script")
+        if not isinstance(script, list) or [str(line) for line in script] != list(expected_script):
+            errors.append(
+                f"{job_name} script must be exactly the pinned commands "
+                f"{list(expected_script)!r} (got {script!r})"
+            )
 
 
 def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
@@ -699,6 +827,17 @@ def validate_worker_versions(errors: list[str]) -> None:
                 f"build-worker-image.sh {worker} source_ref {match.group(1)!r} differs from the "
                 f"Dockerfile {label} canonical declaration"
             )
+
+    # MR !1627 review HE-7: passing DEBIAN_SNAPSHOT as a build-arg here
+    # would override the Dockerfile default at image build time, silently
+    # detaching the CI_DEBIAN_SNAPSHOT tie (which binds only the Dockerfile
+    # ARG default) from the snapshot the published image really builds with.
+    kimi_block = blocks.get("kimi")
+    if kimi_block is not None and "DEBIAN_SNAPSHOT=" in kimi_block:
+        errors.append(
+            "build-worker-image.sh kimi block must not pass DEBIAN_SNAPSHOT as a "
+            "build arg; the CI_DEBIAN_SNAPSHOT tie binds the Dockerfile ARG default"
+        )
 
     for worker, label, dockerfile_text, arg_name in canonical_pins:
         if arg_name not in ("OPENCODE_REF", "PEBBLE_REF"):
@@ -993,7 +1132,12 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
     # the image builds with, not the live deb.debian.org mirror (MR !1618
     # review GV-4). Fail closed like the image ties: a missing/malformed
     # variable, a missing Dockerfile, or a missing/divergent valued
-    # ARG DEBIAN_SNAPSHOT must not silently dissolve the tie.
+    # ARG DEBIAN_SNAPSHOT must not silently dissolve the tie. The ARG match
+    # tolerates Dockerfile-instruction case and indenting and strips quotes
+    # (MR !1627 review HE-3), and every snapshot.debian.org URL in the
+    # Dockerfile must reference ${DEBIAN_SNAPSHOT} itself — a hardcoded
+    # timestamp or a renamed variable would detach the tie from what the
+    # image actually builds with.
     snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append(
@@ -1007,7 +1151,12 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         )
     else:
         dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
-        snapshot_args = re.findall(r"(?m)^ARG\s+DEBIAN_SNAPSHOT=(\S+)$", dockerfile_text)
+        snapshot_args = [
+            match.strip("\"'")
+            for match in re.findall(
+                r"(?m)^\s*(?i:ARG)\s+DEBIAN_SNAPSHOT=(\S+?)\s*$", dockerfile_text
+            )
+        ]
         if not snapshot_args:
             errors.append(
                 "kimicode4lunarwing/Dockerfile has no valued ARG DEBIAN_SNAPSHOT; "
@@ -1017,6 +1166,20 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
             errors.append(
                 "CI_DEBIAN_SNAPSHOT must match the ARG DEBIAN_SNAPSHOT value(s) in "
                 "kimicode4lunarwing/Dockerfile"
+            )
+        hardcoded_snapshots = [
+            stamp
+            for stamp in re.findall(
+                r"snapshot\.debian\.org/archive/[^/\s\"']+/([^/\s\"']+)/",
+                dockerfile_text,
+            )
+            if stamp != "${DEBIAN_SNAPSHOT}"
+        ]
+        if hardcoded_snapshots:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile snapshot.debian.org URLs must use "
+                "${DEBIAN_SNAPSHOT}, not a hardcoded or renamed value: "
+                f"{hardcoded_snapshots}"
             )
 
     literal_images = {
