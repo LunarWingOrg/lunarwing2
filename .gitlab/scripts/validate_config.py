@@ -502,12 +502,29 @@ def resolve_extends(job: object, merged: dict, depth: int = 8) -> dict:
 
 
 AUTOMATIC_WHEN = (None, "on_success", "always")
-MR_RULE_IF = '$CI_PIPELINE_SOURCE=="merge_request_event"'
 
 
-def normalize_rule_if(condition: object) -> str:
-    """Whitespace- and quote-insensitive form of a rules:if predicate."""
-    return re.sub(r"\s+", "", str(condition or "").replace("'", '"'))
+def mr_rule_is_exact(condition: object) -> bool:
+    """True when `condition` is exactly the canonical MR predicate.
+
+    MR !1644 review HN-1: the previous squash-and-compare deleted every
+    whitespace character, including inside the quoted literal, so
+    `"merge_request_event "` (trailing space) and `"merge_request _event"`
+    passed while GitLab compares the literal exactly — on MR pipelines that
+    rule never matches and the trailing `when: never` silently drops the
+    lane. Compare the operands instead: spaces/tabs AROUND the tokens and
+    either quote style are formatting; anything inside the quotes is
+    literal.
+    """
+    if not isinstance(condition, str):
+        return False
+    lhs, sep, rhs = condition.partition("==")
+    blank = " " + chr(9)
+    return (
+        sep == "=="
+        and lhs.strip(blank) == "$CI_PIPELINE_SOURCE"
+        and rhs.strip(blank) in ('"merge_request_event"', "'merge_request_event'")
+    )
 
 
 def lane_runs_on_merge_requests(job: object, merged: dict) -> bool:
@@ -525,8 +542,9 @@ def lane_runs_on_merge_requests(job: object, merged: dict) -> bool:
     `extends`, require: no job-level `allow_failure`, no non-automatic
     job-level `when`, no `only`/`except`, no non-empty `needs`, and a
     first rule whose keys are only `if`/`when`/`allow_failure`, whose `if`
-    normalises to exactly `$CI_PIPELINE_SOURCE == "merge_request_event"`,
-    and which runs automatically without rule-level allow_failure.
+    is exactly the canonical MR predicate (operand-exact per MR !1644
+    review HN-1: only whitespace around the tokens and the quote style may
+    vary), and which runs automatically without rule-level allow_failure.
     """
     effective = resolve_extends(job, merged)
     if not effective:
@@ -545,7 +563,7 @@ def lane_runs_on_merge_requests(job: object, merged: dict) -> bool:
     first = rules[0]
     if not isinstance(first, dict) or not set(first) <= {"if", "when", "allow_failure"}:
         return False
-    if normalize_rule_if(first.get("if")) != MR_RULE_IF:
+    if not mr_rule_is_exact(first.get("if")):
         return False
     if first.get("when") not in AUTOMATIC_WHEN:
         return False

@@ -810,6 +810,33 @@ class WorkerTsLaneTests(unittest.TestCase):
         )
         self.assertEqual(self.errors(merged), [])
 
+    def test_trailing_space_inside_mr_predicate_quotes_is_caught(self):
+        # MR !1644 review HN-1: the squash-and-compare check deleted
+        # whitespace inside the quoted literal, so `"merge_request_event "`
+        # passed while GitLab compares the literal exactly — the rule then
+        # never matches an MR pipeline and the lane silently drops out.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE == "merge_request_event "'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_space_inside_mr_predicate_literal_is_caught(self):
+        # HN-1: same hole, whitespace in the middle of the literal.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE == "merge_request _event"'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_nbsp_inside_mr_predicate_quotes_is_caught(self):
+        # HN-1: a non-breaking space inside the quotes is literal too.
+        merged = self.merged()
+        merged["worker-kimi-ts"]["rules"][0]["if"] = (
+            '$CI_PIPELINE_SOURCE == "merge_request_event "'
+        )
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
     def test_only_except_are_caught(self):
         # HE-1: only/except bypass the rules walk entirely.
         merged = self.merged()
