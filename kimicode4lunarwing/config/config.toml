@@ -51,6 +51,13 @@ api_key = "tensorzero"
 provider = "tensorzero"
 model = "tensorzero::function_name::FrontierCODEK"
 max_context_size = 859000
+# kimi-code 2.2.0 (upstream #4091) sends no max_tokens for an openai-type
+# provider unless the model pins max_output_size; FrontierCODEK runs
+# effort = "high" thinking and its TensorZero variants set no cap of their
+# own, so the 2.1.1 value is pinned explicitly (WI#412). The entrypoint's
+# KIMI_MODEL retarget renames only this table's header, so the key survives
+# a per-tenant override.
+max_output_size = 131072
 capabilities = ["tool_use"]
 
 [thinking]

@@ -410,8 +410,10 @@ re-checked 2026-10-13):
   publishing, verified live under control 9).
 - **kimi (2.1.1):** no server mode, pairing, sharing, or tunnel in the lane;
   `kimi -p` is spawned per task. `telemetry = false` is pinned in
-  `config/config.toml`; the WI#206 fail-closed command guard is the only
-  in-CLI enforcement point and stays mandatory.
+  `config/config.toml`, and so is `max_output_size = 131072` on the baked
+  model table — since 2.2.0 the CLI sends no `max_tokens` for an
+  `openai`-type model without it (WI#412); the WI#206 fail-closed command
+  guard is the only in-CLI enforcement point and stays mandatory.
 - **pebble:** no listeners, pairing, or sharing in upstream
   (nanogpt-community/pebble) — the only `TcpListener` is test code.
   **Finding (widened per run-79 EI-10):** the image has no `USER`
@@ -1015,12 +1017,19 @@ auto-approval:
   `/app/config` and `/app/hooks` are read-only to the runtime user, so a
   task cannot edit its own guard.
 - `entrypoint.sh`: injects the guard + hook into any `KIMI_CONFIG_SOURCE`
-  that lacks them, never exports `KIMI_CODE_DANGEROUS_COMMAND_GUARD`
-  (unsets it), and keeps `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (prompt
-  noise for a fixed-mode worker).
-- `kimi_task_executor.ts`: scrubs `KIMI_CODE_DANGEROUS_COMMAND_GUARD` and
-  `KIMI_CODE_PERMISSION_MODE_REMINDER` from per-task environments, so
-  task-controlled `context.environment` cannot change the approval policy.
+  that lacks them, never exports `KIMI_CODE_DANGEROUS_COMMAND_GUARD` or
+  `KIMI_CODE_TRUST_WORKSPACE` (unsets both in CLI and bridge mode), and
+  keeps `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (prompt noise for a
+  fixed-mode worker). `KIMI_CODE_TRUST_WORKSPACE` is kimi-code 2.2.0's
+  workspace-trust switch: a truthy value (`1`, `true`, `yes`, `on`) makes
+  the CLI spawn every MCP server listed in the repo's `.mcp.json` or
+  `.kimi-code/mcp.json` at startup, before any model turn and outside the
+  hook (WI#411).
+- `kimi_task_executor.ts`: scrubs `KIMI_CODE_DANGEROUS_COMMAND_GUARD`,
+  `KIMI_CODE_PERMISSION_MODE_REMINDER` and `KIMI_CODE_TRUST_WORKSPACE` from
+  per-task environments after every merge, so task-controlled
+  `context.environment` cannot change the approval policy or grant
+  workspace trust.
 - mt-admin no longer mounts the tenant SSH-agent socket into the kimi
   container (both the imperative `podman run` and the Quadlet), adds
   `no-new-privileges`, and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing

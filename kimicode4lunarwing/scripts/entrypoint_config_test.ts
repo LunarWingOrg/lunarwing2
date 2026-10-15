@@ -103,6 +103,7 @@ api_key = ""
 provider = "tensorzero"
 model = "tensorzero::function_name::FrontierCODE"
 max_context_size = 859000
+max_output_size = 131072
 capabilities = ["tool_use"]
 `)
 
@@ -124,6 +125,48 @@ capabilities = ["tool_use"]
   // provider/base_url lines untouched, exactly one model entry renamed
   assert.match(config, /base_url = "http:\/\/tensorzero\.example\.test:3000\/openai\/v1"/)
   assert.equal(config.match(/\[models\./g)?.length, 1)
+  // WI#412: the retarget renames only the table header and model id, so the
+  // output cap pinned on the baked entry survives a per-tenant override.
+  assert.match(config, /^max_output_size = 131072$/m)
+})
+
+test("shipped config pins max_output_size for every model under an openai-type provider (WI#412)", () => {
+  // kimi-code 2.2.0 (upstream #4091) sends no max_tokens for a model without
+  // max_output_size unless the provider type is "kimi"; the lane's provider is
+  // "openai", so a missing cap means each downstream provider's default — the
+  // Engine V2 4096-token failure class for a thinking model. Parse the real
+  // TOML (python3 is provisioned in the lane) rather than regex-matching it.
+  const configPath = fileURLToPath(new URL("../config/config.toml", import.meta.url))
+  const probe = `
+import json, sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    config = tomllib.load(fh)
+providers = config.get("providers", {})
+out = {}
+for alias, table in config.get("models", {}).items():
+    provider = providers.get(table.get("provider", ""), {})
+    out[alias] = {"type": provider.get("type"), "max_output_size": table.get("max_output_size")}
+print(json.dumps(out))
+`
+  const result = spawnSync("python3", ["-I", "-c", probe, configPath], { encoding: "utf8" })
+  assert.equal(result.status, 0, result.stderr)
+  const models: Record<string, { type: string | null; max_output_size: unknown }> = JSON.parse(result.stdout)
+  assert.ok(Object.keys(models).length > 0, "no [models] tables parsed")
+  for (const [alias, info] of Object.entries(models)) {
+    if (info.type !== "openai") continue
+    assert.ok(
+      Number.isInteger(info.max_output_size) && (info.max_output_size as number) > 0,
+      `${alias}: openai-type model without a positive integer max_output_size (WI#412)`,
+    )
+  }
+  assert.equal(models["tensorzero/FrontierCODEK"]?.max_output_size, 131072)
+})
+
+test("entrypoint unsets the workspace-trust switch beside the guard switch in both modes (WI#411)", () => {
+  // kimi-code 2.2.0's KIMI_CODE_TRUST_WORKSPACE auto-spawns a repo's .mcp.json
+  // servers before any model turn, outside the WI#206 hook; neither the CLI
+  // mode nor the bridge mode may inherit it from the container environment.
+  assert.equal(entrypoint.match(/^\s*unset KIMI_CODE_DANGEROUS_COMMAND_GUARD KIMI_CODE_TRUST_WORKSPACE$/gm)?.length, 2)
 })
 
 test("entrypoint CLI mode forces print and stream-json", () => {
