@@ -452,10 +452,14 @@ INITEOF
 # the suggested repair re-renders it into the *other* spelling (ping-pong).
 # LUNARWING_MT_PROXY_PYTHON3 pins an interpreter explicitly; otherwise the
 # first python3 under the fixed /usr/local/bin:/usr/bin:/bin search path wins.
-# The result is allowlisted to plain path characters so it can never carry
-# shell syntax — and so bash 5.2+ patsub_replacement has nothing to expand
-# (HF-4). Any failure fails closed (the caller treats the unit as unsafe) and
-# is not memoized, so a transient PATH problem recovers on the next call.
+# `type -P` (not `command -v`) so a `python3` shell function in the caller's
+# environment (exported via BASH_FUNC_python3%% or defined through BASH_ENV)
+# cannot resolve to the bare word and fail the allowlist fleet-wide (HU-1);
+# it also never reads bash's hash table. The result is allowlisted to plain
+# path characters so it can never carry shell syntax — and so bash 5.2+
+# patsub_replacement has nothing to expand (HF-4). Any failure fails closed
+# (the caller treats the unit as unsafe) and is not memoized, so a transient
+# PATH problem recovers on the next call.
 # The resolution is memoized per process (HF-2), keyed on the override value
 # so a changed LUNARWING_MT_PROXY_PYTHON3 re-resolves instead of going stale.
 _OPENRC_PROXY_PYTHON3_RESOLVED=""
@@ -467,7 +471,7 @@ _openrc_proxy_python3() {
     if [[ -n "$override" ]]; then
       pybin="$override"
     else
-      pybin="$(PATH=/usr/local/bin:/usr/bin:/bin command -v python3)" || return 1
+      pybin="$(PATH=/usr/local/bin:/usr/bin:/bin type -P python3)" || return 1
     fi
     [[ "$pybin" == /* && "$pybin" =~ ^[A-Za-z0-9._/+-]+$ ]] || return 1
     _OPENRC_PROXY_PYTHON3_RESOLVED="$pybin"

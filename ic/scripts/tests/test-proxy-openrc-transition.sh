@@ -410,6 +410,18 @@ JSON
     || fail 'unit rendered under a shadowing PATH failed the guard'
   [[ ! -e "$OPENRC_PROXY_BACKUP_DIR" ]] \
     || fail 'a PATH flip grew the backup archive (ping-pong repair loop)'
+  # HU-1: a `python3` shell function in the caller's environment (exported via
+  # BASH_FUNC_python3%% or defined through BASH_ENV) must not reach the
+  # resolver — `command -v` reports it as the bare word, which the
+  # absolute-path allowlist refuses, flipping every guarded OpenRC operation
+  # to 125 fleet-wide; `type -P` ignores functions and the hash table. Clear
+  # the memo and the verdict cache so the resolution really re-runs here.
+  ( python3() { :; }
+    _OPENRC_PROXY_PYTHON3_RESOLVED=""
+    _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+    _OPENRC_PROXY_UNIT_SAFE_CACHE=()
+    openrc_proxy_unit_is_safe "$safe_unit" ) \
+    || fail 'a python3 shell function in the caller flipped the safe verdict'
   # HF-1 override: LUNARWING_MT_PROXY_PYTHON3 pins the interpreter for both
   # sides. A unit rendered under the override is accepted while the override
   # is set and refused once it is unset (the documented one-time refusal);
