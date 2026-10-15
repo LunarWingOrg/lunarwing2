@@ -221,6 +221,20 @@ async fn send_request(
     })
 }
 
+/// URL with query, fragment, and userinfo removed, for logging. Query-param
+/// credentials injected after validation must not reach host logs (FZ-1 /
+/// WI#395), and neither may caller-supplied userinfo (`validate_url` does
+/// not reject `user:pass@`), so the credentials never ride a log line even
+/// when the upstream preserves the query across redirects (GN-5).
+fn redact_url_for_log(url: &reqwest::Url) -> String {
+    let mut cleaned = url.clone();
+    cleaned.set_query(None);
+    cleaned.set_fragment(None);
+    let _ = cleaned.set_username("");
+    let _ = cleaned.set_password(None);
+    cleaned.to_string()
+}
+
 /// Check whether an IPv4 address falls in a disallowed range (private,
 /// loopback, link-local, multicast, unspecified, or cloud metadata).
 fn is_disallowed_ipv4(v4: &Ipv4Addr) -> bool {
@@ -704,7 +718,7 @@ impl Tool for HttpTool {
 
                     redirects_remaining -= 1;
                     tracing::debug!(
-                        to = %parsed_url,
+                        to = %redact_url_for_log(&parsed_url),
                         hops_left = redirects_remaining,
                         "http tool following redirect"
                     );
@@ -753,7 +767,7 @@ impl Tool for HttpTool {
             && len > max_size
         {
             tracing::warn!(
-                url = %parsed_url,
+                url = %redact_url_for_log(&parsed_url),
                 content_length = len,
                 max = max_size,
                 "Rejected HTTP response: Content-Length exceeds limit"
@@ -833,7 +847,7 @@ impl Tool for HttpTool {
             match convert_html_to_markdown(&body_text, parsed_url.as_str()) {
                 Ok(md) => md,
                 Err(e) => {
-                    tracing::warn!(url = %parsed_url, error = %e, "HTML-to-markdown conversion failed, returning raw HTML");
+                    tracing::warn!(url = %redact_url_for_log(&parsed_url), error = %e, "HTML-to-markdown conversion failed, returning raw HTML");
                     body_text
                 }
             }
@@ -897,6 +911,30 @@ mod tests {
         let tool = HttpTool::new();
         let schema = tool.parameters_schema();
         assert_eq!(schema["properties"]["headers"]["type"], "array");
+    }
+
+    /// FZ-1 / WI#395: log URLs never carry the query (where injected
+    /// credentials live), the fragment, or caller-supplied userinfo (GN-5).
+    #[test]
+    fn test_redact_url_for_log_strips_query_and_fragment() {
+        let url = reqwest::Url::parse("https://api.example.com/v1/d?api_key=secret123#frag")
+            .expect("valid URL");
+        let logged = redact_url_for_log(&url);
+        assert_eq!(logged, "https://api.example.com/v1/d");
+        assert!(!logged.contains("secret123"));
+        assert!(!logged.contains('#'));
+
+        // No query/fragment to begin with: unchanged.
+        let bare = reqwest::Url::parse("https://api.example.com/v1/d").expect("valid URL");
+        assert_eq!(redact_url_for_log(&bare), "https://api.example.com/v1/d");
+
+        // GN-5: caller-supplied userinfo is stripped too.
+        let userinfo =
+            reqwest::Url::parse("https://user:pass@api.example.com/v1/d?api_key=secret123")
+                .expect("valid URL");
+        let logged = redact_url_for_log(&userinfo);
+        assert_eq!(logged, "https://api.example.com/v1/d");
+        assert!(!logged.contains("user:pass"), "{logged}");
     }
 
     #[test]
