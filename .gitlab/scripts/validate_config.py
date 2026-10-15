@@ -800,6 +800,17 @@ def validate_worker_versions(errors: list[str]) -> None:
                 f"Dockerfile {label} canonical declaration"
             )
 
+    # MR !1627 review HE-7: passing DEBIAN_SNAPSHOT as a build-arg here
+    # would override the Dockerfile default at image build time, silently
+    # detaching the CI_DEBIAN_SNAPSHOT tie (which binds only the Dockerfile
+    # ARG default) from the snapshot the published image really builds with.
+    kimi_block = blocks.get("kimi")
+    if kimi_block is not None and "DEBIAN_SNAPSHOT=" in kimi_block:
+        errors.append(
+            "build-worker-image.sh kimi block must not pass DEBIAN_SNAPSHOT as a "
+            "build arg; the CI_DEBIAN_SNAPSHOT tie binds the Dockerfile ARG default"
+        )
+
     for worker, label, dockerfile_text, arg_name in canonical_pins:
         if arg_name not in ("OPENCODE_REF", "PEBBLE_REF"):
             continue

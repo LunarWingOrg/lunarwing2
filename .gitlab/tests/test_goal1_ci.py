@@ -267,6 +267,20 @@ class WorkerVersionPinTests(unittest.TestCase):
         self.build_script.write_text(text[:start] + text[end:], encoding="utf-8")
         self.assertTrue(any("kimi" in error for error in self.errors()))
 
+    def test_kimi_block_must_not_pass_debian_snapshot(self):
+        # MR !1627 review HE-7: a DEBIAN_SNAPSHOT build-arg would override
+        # the Dockerfile default at build time and silently detach the
+        # CI_DEBIAN_SNAPSHOT tie from what the image really builds with.
+        text = self.build_script.read_text(encoding="utf-8")
+        self.build_script.write_text(
+            text.replace(
+                '        build_args="KIMI_CODE_VERSION=2.1.1\n',
+                '        build_args="KIMI_CODE_VERSION=2.1.1\nDEBIAN_SNAPSHOT=20260906T000000Z\n',
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(any("DEBIAN_SNAPSHOT" in error for error in self.errors()))
+
 
 class BunImageTieTests(unittest.TestCase):
     """MR !1552 ER-5 ties CI_BUN_IMAGE to the worker Dockerfile's oven/bun
