@@ -4,7 +4,7 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).**
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-15 (v2.1.6.0).**
 Every referenced mt-admin
 subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 `patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,
@@ -16,7 +16,9 @@ new-tenant `SANDBOX_IMAGE`/`SANDBOX_AUTO_PULL=false` defaults. The 2026-10-01
 repass added the v2.1.4.0 (WI#268) read-only diagnostics verbs `psql` and
 `daemon-pid` (see §8). The 2026-10-14 repass records the v2.1.6.0 (WI#330)
 required tenant LLM endpoint in §3 and the (WI#376) OpenRC
-`render-units --all-proxies` fleet migration command in §8. **Migration note
+`render-units --all-proxies` fleet migration command in §8; the 2026-10-15
+re-check added the (WI#357) `worker-listeners` exposure audit to §8's
+read-only inspection verbs. **Migration note
 (WI#154/155):** `SANDBOX_NETWORK` defaults to `none` everywhere. Existing
 explicit `proxy` settings are preserved (mt-admin renders `none` only when
 unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
@@ -256,9 +258,10 @@ For init-agnostic diagnostics, prefer the read-only inspection verbs over raw `p
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh psql ruffles -c 'SELECT ...'
 sudo ic/scripts/lunarwing-mt-admin.sh daemon-pid ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh worker-listeners ruffles
 ```
 
-`psql` runs inside the tenant's own PostgreSQL container and is for SELECTs and fingerprints only — database rows can be secret-bearing. `daemon-pid` prints the PID of the process that actually loaded the tenant env, validated as tenant-owned (on OpenRC it reads OpenRC's `child_pid` record, never the supervise-daemon pidfile); a non-zero exit means the PID could not be resolved and must be treated as *uninspected*, never as evidence. The original operator procedure and Engine V2 prompt-overlay audit that motivated these verbs are in the [v2.1.4.0 audit record](../ops/history/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md).
+`psql` runs inside the tenant's own PostgreSQL container and is for SELECTs and fingerprints only — database rows can be secret-bearing. `daemon-pid` prints the PID of the process that actually loaded the tenant env, validated as tenant-owned (on OpenRC it reads OpenRC's `child_pid` record, never the supervise-daemon pidfile); a non-zero exit means the PID could not be resolved and must be treated as *uninspected*, never as evidence. `worker-listeners` (v2.1.6.0, WI#357) is the read-only worker-exposure audit: it lists listening sockets inside the tenant's running worker containers from the host side and fails on any bind or published port mapping outside the loopback contract ("workers must never self-expose"; see [`../ops/WORKER-CONTAINERS.md`](../ops/WORKER-CONTAINERS.md)). The original operator procedure and Engine V2 prompt-overlay audit that motivated these verbs are in the [v2.1.4.0 audit record](../ops/history/v2.1.4.0_WORK_ITEM_268_PROMPT_OVERLAY_AUDIT.md).
 
 ## 9. Backup, Restore, Upgrade, and Remove
 
