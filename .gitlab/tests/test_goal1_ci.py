@@ -965,12 +965,15 @@ class WorkerTsLaneTests(unittest.TestCase):
         self.assertEqual(self.errors(merged), [])
 
     def test_extends_self_cycle_still_applies_parent_keys(self):
-        # A cyclic extends chain must terminate (depth-bounded) and still
-        # surface the parent's gating keys.
+        # A cyclic extends chain must terminate (depth-bounded), surface
+        # the parent's gating keys, and — since HP-2/HN-3 — carry the
+        # truncation sentinel so the lane fails closed.
         merged = self.merged()
         merged[".loopy"] = {"extends": ".loopy", "allow_failure": True}
         merged["worker-kimi-ts"]["extends"] = ".loopy"
-        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+        errors = self.errors(merged)
+        self.assertTrue(any("merge_request_event" in error for error in errors))
+        self.assertTrue(any("depth budget" in error for error in errors))
 
     def test_needs_dependency_is_caught(self):
         # HE-1/HE-2: a non-empty needs can hold the lane behind a manual or
@@ -1179,6 +1182,141 @@ class WorkerTsLaneTests(unittest.TestCase):
             if "bun install" not in command
         ]
         self.assertTrue(any("bun install" in error for error in self.errors(merged)))
+
+    def test_reordered_script_lines_are_caught(self):
+        # HP-3: an order-insensitive comparison would accept a reorder, but
+        # the snapshot sources must be rewritten BEFORE apt-get update runs.
+        for job_name in self.merged():
+            with self.subTest(job=job_name):
+                merged = self.merged()
+                script = merged[job_name]["script"]
+                script[0], script[1] = script[1], script[0]
+                self.assertTrue(
+                    any("exactly the pinned commands" in error for error in self.errors(merged))
+                )
+
+    def test_script_as_a_single_string_is_caught(self):
+        # HP-3: GitLab also accepts a string script; dropping the
+        # isinstance(script, list) guard would compare it against the
+        # list. A non-iterable script (e.g. `script: 5`) must fail with a
+        # validator error, not crash the guard-less comparison.
+        for job_name in self.merged():
+            for script in ("\n".join(self.lane(job_name)["script"]), 5):
+                with self.subTest(job=job_name, script=script):
+                    merged = self.merged()
+                    merged[job_name]["script"] = script
+                    self.assertTrue(
+                        any(
+                            "exactly the pinned commands" in error
+                            for error in self.errors(merged)
+                        )
+                    )
+
+    def test_other_variable_in_mr_predicate_is_caught(self):
+        # HP-3: only $CI_PIPELINE_SOURCE is the MR predicate's left
+        # operand; dropping that check accepts any variable compared
+        # against the "merge_request_event" literal.
+        for job_name in self.merged():
+            with self.subTest(job=job_name):
+                merged = self.merged()
+                merged[job_name]["rules"][0] = {
+                    "if": '$CI_MERGE_REQUEST_IID == "merge_request_event"'
+                }
+                self.assertTrue(
+                    any("must run on merge_request_event" in error for error in self.errors(merged))
+                )
+
+    def test_root_file_job_override_is_merged_last(self):
+        # HP-2: GitLab merges the root file OVER the includes, so a root
+        # worker-kimi-ts entry is the effective job. Root-first merging
+        # hid the override behind validate.yml's pinned block.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_override(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded["worker-kimi-ts"] = {"script": ["exit 0"]}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_override),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("worker-kimi-ts script must be exactly the pinned commands", stderr.getvalue())
+
+    def test_root_file_variables_override_is_caught(self):
+        # HP-2: the root file's top-level variables win over the includes
+        # in GitLab; collect_variables must apply the same precedence so a
+        # root-file CI_NODE_IMAGE override fails the digest pin instead of
+        # passing unseen.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_variables(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded.setdefault("variables", {})["CI_NODE_IMAGE"] = (
+                    "docker.io/library/node:22-bookworm-slim"
+                )
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_variables),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("CI_NODE_IMAGE", stderr.getvalue())
+
+    def test_default_before_script_is_caught(self):
+        # HP-2: a default before_script/hooks is inherited by every job —
+        # including both lanes — and shares the pinned script's shell.
+        for key, value in (
+            ("before_script", ["export NODE_OPTIONS=--test-only"]),
+            ("hooks", {"pre_get_sources_script": ["true"]}),
+        ):
+            with self.subTest(key=key):
+                merged = self.merged()
+                merged["default"] = {key: value}
+                self.assertTrue(any(f"default.{key}" in error for error in self.errors(merged)))
+
+    def test_global_lane_bypass_variables_are_caught(self):
+        # Run-121 HP-2 reminder: a top-level NODE_OPTIONS or npm_config_*
+        # reaches every job, including both lanes; npm reads the prefix
+        # case-insensitively.
+        merged = self.merged()
+        merged["variables"] = {"GIT_STRATEGY": "fetch"}
+        self.assertEqual(self.errors(merged), [])
+        for name in ("NODE_OPTIONS", "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL"):
+            with self.subTest(name=name):
+                merged = self.merged()
+                merged["variables"] = {name: "--test-only"}
+                self.assertTrue(
+                    any("top-level variables" in error for error in self.errors(merged))
+                )
+
+    def test_nine_level_extends_chain_is_resolved(self):
+        # HP-2/HN-3: the budget must cover chains deeper than 8; a gating
+        # key on the ninth parent was silently invisible at depth 8.
+        merged = self.merged()
+        merged[".p9"] = {"allow_failure": True}
+        for index in range(8, 0, -1):
+            merged[f".p{index}"] = {"extends": f".p{index + 1}"}
+        merged["worker-kimi-ts"]["extends"] = ".p1"
+        errors = self.errors(merged)
+        self.assertTrue(any("merge_request_event" in error for error in errors))
+        self.assertFalse(any("depth budget" in error for error in errors))
+
+    def test_extends_chain_beyond_budget_fails_closed(self):
+        # HP-2/HN-3: a chain longer than the budget cannot be certified —
+        # the truncation sentinel must fail the lane even though the
+        # dropped parent's gating key is never seen.
+        merged = self.merged()
+        depth = config.EXTENDS_DEPTH_BUDGET + 1
+        merged[f".p{depth}"] = {"allow_failure": True}
+        for index in range(depth - 1, 0, -1):
+            merged[f".p{index}"] = {"extends": f".p{index + 1}"}
+        merged["worker-kimi-ts"]["extends"] = ".p1"
+        self.assertTrue(any("depth budget" in error for error in self.errors(merged)))
 
 
 if __name__ == "__main__":
