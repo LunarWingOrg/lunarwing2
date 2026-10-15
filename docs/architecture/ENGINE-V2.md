@@ -44,11 +44,13 @@ WI#307 non-foreground execution/resume gate and shared discovery/lease
 denylist, the WI#309 resume-lease mission catalog, the WI#311 no-auto-complete
 rule for non-manual missions, the WI#319 pre-2026-07-26
 `Completed`-as-delete caveat in recovery guidance, and the WI#308 mission-verb
-dispatch gate subset (Research-thread refusal, WI#356 Mission lifecycle
-refusal plus the run-107 GM-1 update-field refusal, permission,
-supervision, rate limit, hooks) with its documented
-unsupervised-mission-run scope. Updates
-for 2.1.6.0 include the WI#332 pending-gate liveness rules (listing and the
+dispatch gate subset (Research-thread refusal, permission, supervision, rate
+limit, hooks) with its documented unsupervised-mission-run scope. Updates
+for 2.1.6.0 include the WI#356 Mission-thread bounds on that gate
+(`mission_create`/`mission_delete`/`mission_resume` refused to Mission
+threads, the run-107 GM-1 steering-field limit on a Mission thread's
+`mission_update`, and the fan-out disclosure on the run-spawning approval
+prompts), the WI#332 pending-gate liveness rules (listing and the
 60s sweep drop gates whose thread vanished/left Waiting/changed owner, with
 the authentication-fallback exemption, request-id-checked sweep discards
 protecting replacement gates, and the resolve-time liveness re-check that
