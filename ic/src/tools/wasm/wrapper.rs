@@ -942,9 +942,9 @@ fn guest_content_encoding_is_opaque(headers_json: &str) -> bool {
     };
     map.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("content-encoding")
-            && value
-                .split(',')
-                .any(|token| !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case("identity"))
+            && value.split(',').any(|token| {
+                !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case("identity")
+            })
     })
 }
 
@@ -3828,10 +3828,13 @@ mod tests {
             secret_value: SECRET.to_string(),
             url_prefix: None,
         }];
-        let mut credentialed =
-            StoreData::new(1024 * 1024, capabilities.clone(), HashMap::new(), host_credentials);
-        credentialed.http_interceptor =
-            Some(Arc::clone(&stub) as Arc<dyn HttpInterceptor>);
+        let mut credentialed = StoreData::new(
+            1024 * 1024,
+            capabilities.clone(),
+            HashMap::new(),
+            host_credentials,
+        );
+        credentialed.http_interceptor = Some(Arc::clone(&stub) as Arc<dyn HttpInterceptor>);
 
         let err = credentialed
             .http_request(
@@ -3867,8 +3870,7 @@ mod tests {
         // guest's own Accept-Encoding is forwarded and its compressed
         // answer delivered — the refusal is scoped to credential-injected
         // exchanges.
-        let mut ordinary =
-            StoreData::new(1024 * 1024, capabilities, HashMap::new(), Vec::new());
+        let mut ordinary = StoreData::new(1024 * 1024, capabilities, HashMap::new(), Vec::new());
         ordinary.http_interceptor = Some(Arc::clone(&stub) as Arc<dyn HttpInterceptor>);
 
         let resp = ordinary
@@ -3890,8 +3892,8 @@ mod tests {
 
         let seen = stub.seen.lock().unwrap().pop().unwrap();
         assert!(
-            seen.iter().any(|(k, v)| k.eq_ignore_ascii_case("accept-encoding")
-                && v == "gzip, deflate"),
+            seen.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("accept-encoding") && v == "gzip, deflate"),
             "ordinary exchange must forward the guest's accept-encoding: {seen:?}"
         );
     }
