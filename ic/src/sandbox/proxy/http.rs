@@ -365,6 +365,11 @@ async fn forward_request(
 ) -> std::result::Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let uri = req.uri().clone();
 
+    // Spellings of the injected credential that an upstream may echo back in
+    // a response header (WI#395: an always-HTTPS edge answers plain-HTTP
+    // requests with `301 Location: https://host/path?name=<secret>`).
+    let mut echo_spellings: Vec<String> = Vec::new();
+
     // Enforced egress: per-request client with DNS pinning, no redirect
     // following (redirects re-enter allowlist checks instead of being followed
     // on the host), and no environment proxy settings that could bypass DNS
@@ -379,11 +384,19 @@ async fn forward_request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut builder = client.request(method, uri.to_string());
 
-    // Copy headers (except hop-by-hop headers)
+    // Copy headers (except hop-by-hop headers). Accept-Encoding is held
+    // back: a credential-injected exchange must request an identity-encoded
+    // body so the response can be byte-scrubbed (WI#395 run-111 HA-2);
+    // ordinary requests forward the container's original value.
+    let mut accept_encoding: Option<String> = None;
     for (name, value) in req.headers() {
         if !is_hop_by_hop_header(name.as_str())
             && let Ok(v) = value.to_str()
         {
+            if name.as_str().eq_ignore_ascii_case("accept-encoding") {
+                accept_encoding = Some(v.to_string());
+                continue;
+            }
             builder = builder.header(name.as_str(), v);
         }
     }
@@ -395,6 +408,9 @@ async fn forward_request(
     } = decision
     {
         if let Some(credential) = state.credential_resolver.resolve(&secret_name).await {
+            // The raw spelling covers header/bearer echoes (they embed the
+            // value verbatim); the encoded one covers query echoes.
+            echo_spellings = credential_echo_spellings(&credential);
             builder = match location {
                 CredentialLocation::AuthorizationBearer => {
                     builder.header("Authorization", format!("Bearer {}", credential))
@@ -428,6 +444,18 @@ async fn forward_request(
         }
     }
 
+    if echo_spellings.is_empty() {
+        if let Some(v) = accept_encoding {
+            builder = builder.header("accept-encoding", v);
+        }
+    } else {
+        // WI#395 (run-111 HA-2): a compressed body cannot be byte-scrubbed
+        // for echoed credentials; ask the upstream for identity encoding on
+        // credential-injected exchanges (an opaque Content-Encoding is
+        // refused below rather than forwarded blind).
+        builder = builder.header("accept-encoding", "identity");
+    }
+
     // Copy body
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -453,17 +481,46 @@ async fn forward_request(
             match response.bytes().await {
                 Ok(body) => {
                     let mut resp_builder = Response::builder().status(status.as_u16());
+                    let mut body = body;
 
-                    for (name, value) in headers.iter() {
-                        if !is_hop_by_hop_header(name.as_str()) {
-                            resp_builder = resp_builder.header(name.as_str(), value.as_bytes());
+                    // WI#395 (run-111 HA-2): 3xx bodies echo the redirect
+                    // target URL on common edges (Go, Apache, Express), so a
+                    // credential-injected exchange scrubs the body with the
+                    // same spellings as the headers. A content-encoded body
+                    // cannot be inspected; it is refused rather than
+                    // forwarded with a possible echo blind.
+                    let mut body_scrubbed = false;
+                    if !echo_spellings.is_empty() {
+                        if response_content_encoding_is_opaque(&headers) {
+                            tracing::warn!(
+                                "Proxy: refused content-encoded response body that cannot be scrubbed for echoed credentials"
+                            );
+                            return Ok(error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "Failed to read response".to_string(),
+                            ));
+                        }
+                        if let Some(scrubbed) = scrub_credential_echoes(&body, &echo_spellings) {
+                            tracing::warn!("Proxy: scrubbed echoed credential from response body");
+                            body = Bytes::from(scrubbed);
+                            body_scrubbed = true;
                         }
                     }
+
+                    resp_builder = forward_scrubbed_headers(
+                        resp_builder,
+                        &headers,
+                        &echo_spellings,
+                        body_scrubbed,
+                    );
 
                     Ok(make_response_from_builder(resp_builder, full_body(body)))
                 }
                 Err(e) => {
-                    tracing::error!("Proxy: failed to read response body: {}", e);
+                    // Body-read errors can carry the request URL in their
+                    // Display; strip it before logging (WI#395). The body
+                    // returned to the container stays a fixed generic message.
+                    tracing::error!("Proxy: failed to read response body: {}", e.without_url());
                     Ok(error_response(
                         StatusCode::BAD_GATEWAY,
                         "Failed to read response".to_string(),
@@ -472,6 +529,11 @@ async fn forward_request(
             }
         }
         Err(e) => {
+            // reqwest's Display appends the full request URL; with a QueryParam
+            // injection that URL carries the secret, and both this log line and
+            // the container-visible 502 body would hand it back to untrusted
+            // code (WI#395). Strip the URL before either use.
+            let e = e.without_url();
             tracing::error!("Proxy: request failed: {}", e);
             Ok(error_response(
                 StatusCode::BAD_GATEWAY,
@@ -481,14 +543,224 @@ async fn forward_request(
     }
 }
 
+/// Spellings of an injected credential that an upstream may echo back in a
+/// response header (WI#395): the raw value (header/bearer echoes embed it
+/// verbatim) plus the form-encoded spelling reqwest `.query()` puts on the
+/// wire — an always-HTTPS edge echoes that form in a redirect `Location`.
+fn credential_echo_spellings(credential: &str) -> Vec<String> {
+    let encoded: String = url::form_urlencoded::byte_serialize(credential.as_bytes()).collect();
+    let mut spellings = vec![credential.to_string()];
+    if encoded != credential {
+        spellings.push(encoded);
+    }
+    spellings
+}
+
+/// Replace every credential spelling in `value` with `[REDACTED]`.
+///
+/// Returns the scrubbed bytes only when something was replaced. Works on raw
+/// bytes so non-UTF-8 header values cannot smuggle an echo through.
+fn scrub_credential_echoes(value: &[u8], spellings: &[String]) -> Option<Vec<u8>> {
+    const MARKER: &[u8] = b"[REDACTED]";
+    let mut out = value.to_vec();
+    let mut scrubbed = false;
+    for spelling in spellings {
+        let needle = spelling.as_bytes();
+        let mut search_from = 0;
+        while let Some(offset) = find_subslice(&out[search_from..], needle) {
+            let at = search_from + offset;
+            out.splice(at..at + needle.len(), MARKER.iter().copied());
+            scrubbed = true;
+            search_from = at + MARKER.len();
+        }
+    }
+    scrubbed.then_some(out)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Minimum byte length a credential spelling must have before header
+/// values are scrubbed for it (WI#395 run-111 HA-9): byte-splicing a 1-3
+/// byte sequence corrupts unrelated header values (charset parameters,
+/// dates, lengths) while such a value carries no real secret.
+const MIN_HEADER_SCRUB_LEN: usize = 4;
+
+/// Outcome of scrubbing one forwarded header value (WI#395).
+enum HeaderScrub {
+    /// Nothing matched; forward the value unchanged.
+    Unchanged,
+    /// An exact spelling was spliced out; surrounding text is preserved.
+    Spliced(Vec<u8>),
+    /// A re-encoded echo was detected (run-111 HA-5); the whole value is
+    /// replaced because the exact bytes to remove cannot be identified.
+    Replaced,
+}
+
+/// Scrub echoed credential spellings from one header value.
+///
+/// Exact spellings (raw + form-encoded) are spliced out. Re-encoded echoes
+/// — lowercase hex, double encoding, `+` for space (run-111 HA-5) — are
+/// detected by percent-decoding up to two rounds and replace the whole
+/// value. `spellings[0]` is the raw spelling (see
+/// [`credential_echo_spellings`]).
+fn scrub_header_value(value: &[u8], spellings: &[String]) -> HeaderScrub {
+    let Some(raw) = spellings.first() else {
+        return HeaderScrub::Unchanged;
+    };
+    if raw.len() < MIN_HEADER_SCRUB_LEN {
+        return HeaderScrub::Unchanged;
+    }
+    if let Some(scrubbed) = scrub_credential_echoes(value, spellings) {
+        return HeaderScrub::Spliced(scrubbed);
+    }
+    if value_contains_reencoded_secret(value, raw.as_bytes()) {
+        return HeaderScrub::Replaced;
+    }
+    HeaderScrub::Unchanged
+}
+
+/// Copy upstream headers onto the response builder, scrubbing echoed
+/// credential spellings from values (WI#395). `drop_content_length` forces
+/// the upstream Content-Length to be dropped so hyper re-frames the
+/// response from the actual (possibly scrubbed) body.
+///
+/// Logs name the header only — never the value.
+fn forward_scrubbed_headers(
+    mut builder: hyper::http::response::Builder,
+    headers: &http::HeaderMap,
+    spellings: &[String],
+    drop_content_length: bool,
+) -> hyper::http::response::Builder {
+    for (name, value) in headers.iter() {
+        if is_hop_by_hop_header(name.as_str()) {
+            continue;
+        }
+        if name.as_str().eq_ignore_ascii_case("content-length") {
+            // A spliced marker would corrupt the length; whenever the value
+            // or the body was touched the header is dropped and hyper
+            // re-frames from the body (run-111 HA-2/HA-9).
+            if drop_content_length
+                || !matches!(
+                    scrub_header_value(value.as_bytes(), spellings),
+                    HeaderScrub::Unchanged
+                )
+            {
+                continue;
+            }
+            builder = builder.header(name.as_str(), value.as_bytes());
+            continue;
+        }
+        builder = match scrub_header_value(value.as_bytes(), spellings) {
+            HeaderScrub::Unchanged => builder.header(name.as_str(), value.as_bytes()),
+            HeaderScrub::Spliced(scrubbed) => {
+                tracing::warn!(
+                    "Proxy: scrubbed echoed credential from response header {}",
+                    name
+                );
+                match http::HeaderValue::from_bytes(&scrubbed) {
+                    Ok(v) => builder.header(name.as_str(), v),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Proxy: dropped response header {} whose scrubbed value was not valid HTTP",
+                            name
+                        );
+                        builder
+                    }
+                }
+            }
+            HeaderScrub::Replaced => {
+                tracing::warn!(
+                    "Proxy: replaced response header {} carrying a re-encoded credential echo",
+                    name
+                );
+                builder.header(name.as_str(), "[REDACTED]")
+            }
+        };
+    }
+    builder
+}
+
+/// True when the upstream response body is content-encoded in a way the
+/// proxy cannot byte-scrub (WI#395 run-111 HA-2). Missing, empty and
+/// `identity` encodings are inspectable.
+fn response_content_encoding_is_opaque(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("identity")
+        })
+}
+
+/// Percent-decode `%XX` escapes for one round; `+` is optionally read as a
+/// space (query-string convention). Undecodable escapes pass through
+/// verbatim so partial sequences cannot corrupt the scan.
+fn percent_decode_round(bytes: &[u8], plus_as_space: bool) -> Vec<u8> {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        out.push(if b == b'+' && plus_as_space { b' ' } else { b });
+        i += 1;
+    }
+    out
+}
+
+/// Detect a re-encoded echo of `secret` in `value`: the raw secret appears
+/// after up to two percent-decode rounds, either of which may read `+` as
+/// a space (run-111 HA-5 — lowercase hex, double encoding and form-style
+/// spaces all evade exact two-spelling matching; direct matches are
+/// handled by [`scrub_credential_echoes`]).
+fn value_contains_reencoded_secret(value: &[u8], secret: &[u8]) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    for first_plus_as_space in [false, true] {
+        let once = percent_decode_round(value, first_plus_as_space);
+        if find_subslice(&once, secret).is_some() {
+            return true;
+        }
+        for second_plus_as_space in [false, true] {
+            let twice = percent_decode_round(&once, second_plus_as_space);
+            if find_subslice(&twice, secret).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Build the forwarding HTTP client for one proxied request.
 ///
-/// Advisory mode keeps the historical shared-client semantics (host redirects
-/// are followed transparently). Enforced mode constructs a client that never
-/// follows redirects (they are returned to the container, whose follow-up
-/// request re-enters the allowlist check), ignores environment proxy settings
-/// (so they cannot bypass DNS pinning), and pins every outbound connection to
-/// the previously resolved public addresses.
+/// Both modes use per-request clients that never follow redirects on the
+/// host (a 3xx is returned to the container, whose follow-up request
+/// re-enters the allowlist check) and ignore environment proxy settings
+/// (so they cannot bypass DNS pinning). Enforced mode additionally pins
+/// every outbound connection to the previously resolved public addresses.
 async fn forwarding_client(
     uri: &hyper::Uri,
     public_only: bool,
@@ -595,6 +867,35 @@ mod tests {
     use super::*;
     use crate::sandbox::proxy::allowlist::DomainAllowlist;
     use crate::sandbox::proxy::policy::DefaultPolicyDecider;
+    use crate::secrets::{CredentialLocation, CredentialMapping};
+    use tracing_test::traced_test;
+
+    /// Resolves every secret name to a fixed value (for testing).
+    struct FixedCredentialResolver(String);
+
+    #[async_trait::async_trait]
+    impl CredentialResolver for FixedCredentialResolver {
+        async fn resolve(&self, _name: &str) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// Bind an ephemeral loopback port and keep it bound, accepting and
+    /// dropping every connection, so sends to it fail deterministically (no
+    /// bind/drop/connect TOCTOU with another process grabbing the port).
+    async fn closed_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((conn, _)) = listener.accept().await else {
+                    return;
+                };
+                drop(conn);
+            }
+        });
+        port
+    }
 
     #[tokio::test]
     async fn test_proxy_starts_and_stops() {
@@ -641,6 +942,64 @@ mod tests {
         );
     }
 
+    /// WI#395 (run-111 HA-5/HA-9): exact two-spelling matching misses
+    /// re-encoded echoes (lowercase hex, double encoding); those replace the
+    /// whole value. Short spellings are never spliced — a 1-3 byte "secret"
+    /// would corrupt unrelated header values.
+    #[test]
+    fn test_scrub_header_value_catches_reencoded_echoes() {
+        let secret = "qp+/=re-1a2b";
+        let spellings = credential_echo_spellings(secret);
+
+        // Lowercase-hex percent-encoding of the raw secret (.NET style).
+        let lower: String = secret.bytes().map(|b| format!("%{b:02x}")).collect();
+        let value = format!("https://edge.example/redir?token={lower}");
+        assert!(
+            matches!(
+                scrub_header_value(value.as_bytes(), &spellings),
+                HeaderScrub::Replaced
+            ),
+            "lowercase-hex echo must be detected: {value}"
+        );
+
+        // Double encoding: the form-encoded spelling, percent-encoded again.
+        let encoded: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
+        let double: String = encoded
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        assert!(
+            matches!(
+                scrub_header_value(double.as_bytes(), &spellings),
+                HeaderScrub::Replaced
+            ),
+            "double-encoded echo must be detected: {double}"
+        );
+
+        // A verbatim echo still splices; unrelated values pass through.
+        assert!(matches!(
+            scrub_header_value(format!("Bearer {secret}").as_bytes(), &spellings),
+            HeaderScrub::Spliced(_)
+        ));
+        assert!(matches!(
+            scrub_header_value(b"charset=utf-8", &spellings),
+            HeaderScrub::Unchanged
+        ));
+
+        // HA-9: a 1-3 byte spelling never rewrites unrelated values.
+        let short = credential_echo_spellings("abc");
+        assert!(matches!(
+            scrub_header_value(b"charset=utf-8; q=0.9", &short),
+            HeaderScrub::Unchanged
+        ));
+    }
+
     #[tokio::test]
     async fn enforced_proxy_blocks_allowlisted_loopback_for_http_and_connect() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -682,5 +1041,376 @@ mod tests {
             forwarding_client(&uri, true).await.is_err(),
             "non-public targets never reach a forwarding client"
         );
+    }
+
+    /// WI#395: a container allowed to reach a host with a query-param
+    /// credential mapping can force a send failure (here: a closed port on the
+    /// mapped host) and read the 502 body. Neither the 502 body nor the
+    /// host-side error log may carry the injected secret or its `?<name>=`
+    /// pair (reqwest's Display would otherwise echo the full request URL).
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_send_error_502_omits_injected_query_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-secret-1a2b3c+/==";
+        // reqwest `.query()` form-encodes the value, so the raw SECRET never
+        // appears in the URL-echoing text; the stem does (GN-2).
+        const SECRET_STEM: &str = "qp-secret-1a2b3c";
+        let closed = closed_loopback_port().await;
+
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping {
+            secret_name: "QP_TOKEN".to_string(),
+            location: CredentialLocation::QueryParam {
+                name: "api_key".to_string(),
+            },
+            host_patterns: vec!["127.0.0.1".to_string()],
+            path_patterns: Vec::new(),
+            optional: false,
+        }];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+
+        let proxy = HttpProxy::new(decider, resolver);
+        let addr = proxy.start(0).await.unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{closed}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(
+            !response.contains(SECRET_STEM),
+            "injected secret leaked into the 502 body: {response}"
+        );
+        assert!(
+            !response.contains("api_key="),
+            "credential pair leaked into the 502 body: {response}"
+        );
+
+        // The same failure must not leak through the host-side error log.
+        assert!(logs_contain("Proxy: request failed"));
+        assert!(
+            !logs_contain(SECRET_STEM) && !logs_contain("api_key="),
+            "injected secret leaked into the proxy error log"
+        );
+
+        proxy.stop().await;
+    }
+
+    /// WI#395 (GN-1): the enforced-mode proxy never follows redirects, so an
+    /// upstream 3xx goes back to the container — and a plain-HTTP request to
+    /// an always-HTTPS edge answers `301 Location: https://host/path?name=
+    /// <form-encoded secret>`, handing the injected query credential back.
+    /// Forwarded header values must be scrubbed of both spellings, with the
+    /// warn log naming the header only.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_response_header_echo_of_injected_credential_is_scrubbed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-echo-secret-7a8b9c+/==";
+        const SECRET_STEM: &str = "qp-echo-secret-7a8b9c";
+        let encoded: String = url::form_urlencoded::byte_serialize(SECRET.as_bytes()).collect();
+
+        // Upstream that answers every request with a redirect echoing the
+        // query (Location) plus a raw bearer echo in a second header.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let encoded_echo = encoded.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let encoded_this = encoded_echo.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    // Drain the request head before answering.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        conn.read(&mut buf),
+                    )
+                    .await;
+                    let response = format!(
+                        "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.test/mapped?api_key={encoded_this}\r\nX-Auth-Echo: Bearer {SECRET}\r\nLink: <https://example.test/a?api_key={encoded_this}>; rel=\"first\", <https://example.test/b?api_key={encoded_this}>; rel=\"next\"\r\nX-Api-Key-Echo: {SECRET}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = conn.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping {
+            secret_name: "QP_TOKEN".to_string(),
+            location: CredentialLocation::QueryParam {
+                name: "api_key".to_string(),
+            },
+            host_patterns: vec!["127.0.0.1".to_string()],
+            path_patterns: Vec::new(),
+            optional: false,
+        }];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+
+        let proxy = HttpProxy::new(decider, resolver);
+        let addr = proxy.start(0).await.unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 301"), "{response}");
+        assert!(
+            !response.contains(SECRET_STEM),
+            "echoed secret leaked into forwarded headers: {response}"
+        );
+        assert!(
+            !response.contains(&encoded),
+            "echoed encoded secret leaked into forwarded headers: {response}"
+        );
+        // run-111 HA-6: every echo must be scrubbed, not only the first per
+        // header (the two-link `Link` repeats the query once per link) and
+        // not only proper-substring matches (`X-Api-Key-Echo`'s whole value
+        // is the raw secret). Five echoes are planted: Location, both Link
+        // targets, X-Auth-Echo and X-Api-Key-Echo.
+        let redactions = response.matches("[REDACTED]").count();
+        assert!(
+            redactions >= 5,
+            "expected every planted echo scrubbed (found {redactions}): {response}"
+        );
+        assert!(
+            response.contains("[REDACTED]"),
+            "scrub marker missing from forwarded headers: {response}"
+        );
+        assert!(logs_contain("scrubbed echoed credential"));
+        assert!(
+            !logs_contain(SECRET_STEM) && !logs_contain(&encoded),
+            "echoed secret leaked into the proxy log"
+        );
+
+        proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    /// WI#395 (run-111 HA-2): 3xx response *bodies* echo the redirect
+    /// target URL on common edges (Go `net/http`, Apache, Express), so the
+    /// container could read the injected query credential out of the body
+    /// even with the header scrub in place. The body must be scrubbed with
+    /// the same spellings, the stale upstream Content-Length dropped (hyper
+    /// re-frames), and a body that arrives content-encoded refused rather
+    /// than forwarded blind.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_redirect_body_echo_of_injected_credential_is_scrubbed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-body-secret-3c4d5e+/==";
+        const SECRET_STEM: &str = "qp-body-secret-3c4d5e";
+        let encoded: String = url::form_urlencoded::byte_serialize(SECRET.as_bytes()).collect();
+
+        // Upstream answering with a Go-style redirect whose body echoes the
+        // target URL (the container asked for gzip; the proxy forces
+        // identity on credential-injected exchanges).
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let encoded_echo = encoded.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let encoded_this = encoded_echo.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        conn.read(&mut buf),
+                    )
+                    .await;
+                    let body = format!(
+                        "<a href=\"https://example.test/mapped?api_key={encoded_this}\">Found</a>.\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: https://example.test/mapped?api_key={encoded_this}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = conn.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping {
+            secret_name: "QP_TOKEN".to_string(),
+            location: CredentialLocation::QueryParam {
+                name: "api_key".to_string(),
+            },
+            host_patterns: vec!["127.0.0.1".to_string()],
+            path_patterns: Vec::new(),
+            optional: false,
+        }];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+
+        let proxy = HttpProxy::new(decider, resolver);
+        let addr = proxy.start(0).await.unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 302"), "{response}");
+        let (_, forwarded_body) = response
+            .split_once("\r\n\r\n")
+            .expect("response has a body");
+        assert!(
+            !forwarded_body.contains(SECRET_STEM) && !forwarded_body.contains(&encoded),
+            "echoed secret leaked into the forwarded body: {response}"
+        );
+        assert!(
+            forwarded_body.contains("[REDACTED]"),
+            "scrub marker missing from the forwarded body: {response}"
+        );
+        // The scrubbed body is shorter than the upstream one; a forwarded
+        // stale Content-Length would break framing. hyper re-frames from
+        // the actual body.
+        let content_length = response
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("Content-Length:")
+                    .map(|v| v.trim().to_string())
+            })
+            .unwrap_or_default();
+        let advertised: usize = content_length.parse().unwrap_or(0);
+        assert_eq!(
+            advertised,
+            forwarded_body.len(),
+            "Content-Length must match the scrubbed body: {response}"
+        );
+        assert!(logs_contain(
+            "scrubbed echoed credential from response body"
+        ));
+        assert!(
+            !logs_contain(SECRET_STEM) && !logs_contain(&encoded),
+            "echoed secret leaked into the proxy log"
+        );
+
+        proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    /// WI#395 (run-111 HA-6): a body-read error (upstream promises
+    /// Content-Length: 100, sends 5 bytes, closes) carries the request URL
+    /// in reqwest's Display — including the injected query credential. The
+    /// `without_url()` on the body-read log line must strip it.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_body_read_error_log_omits_injected_query_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-shortbody-9f8e7d+/==";
+        const SECRET_STEM: &str = "qp-shortbody-9f8e7d";
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        conn.read(&mut buf),
+                    )
+                    .await;
+                    // Promise 100 bytes, deliver 5, close: reqwest's
+                    // `bytes()` errors with the URL attached.
+                    let _ = conn
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nSHORT",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping {
+            secret_name: "QP_TOKEN".to_string(),
+            location: CredentialLocation::QueryParam {
+                name: "api_key".to_string(),
+            },
+            host_patterns: vec!["127.0.0.1".to_string()],
+            path_patterns: Vec::new(),
+            optional: false,
+        }];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+
+        let proxy = HttpProxy::new(decider, resolver);
+        let addr = proxy.start(0).await.unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(
+            !response.contains(SECRET_STEM) && !response.contains("api_key="),
+            "injected credential leaked into the 502 body: {response}"
+        );
+        assert!(logs_contain("Proxy: failed to read response body"));
+        assert!(
+            !logs_contain(SECRET_STEM) && !logs_contain("api_key="),
+            "injected credential leaked into the body-read error log"
+        );
+
+        proxy.stop().await;
+        upstream_task.abort();
     }
 }

@@ -355,17 +355,25 @@ impl StoreData {
     /// Prevents credentials from leaking through error messages or logs.
     /// reqwest::Error includes the full URL in its Display output, so any
     /// error from an injected-URL request will contain the raw credential
-    /// unless we scrub it.
+    /// unless we scrub it. Query-param injection URL-encodes the value, so
+    /// the encoded form is scrubbed alongside the raw one (WI#395).
     fn redact_credentials(&self, text: &str) -> String {
         let mut result = text.to_string();
         for (name, value) in &self.credentials {
             if !value.is_empty() {
-                result = result.replace(value, &format!("[REDACTED:{}]", name));
+                let replacement = format!("[REDACTED:{}]", name);
+                result = result.replace(value.as_str(), &replacement);
+                replace_encoded_secret(&mut result, value, &replacement);
             }
         }
         for cred in &self.host_credentials {
             if !cred.secret_value.is_empty() {
-                result = result.replace(&cred.secret_value, "[REDACTED:host_credential]");
+                result = result.replace(cred.secret_value.as_str(), "[REDACTED:host_credential]");
+                replace_encoded_secret(
+                    &mut result,
+                    &cred.secret_value,
+                    "[REDACTED:host_credential]",
+                );
             }
         }
         result
@@ -429,78 +437,84 @@ impl StoreData {
             }
         }
     }
-}
 
-// Provide WASI context for the WASM component.
-// Required because tools are compiled with wasm32-wasip2 target.
-impl WasiView for StoreData {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
+    /// Apply the guest-facing redaction to one HTTP exchange outcome (WI#395).
+    ///
+    /// Called once at the trait boundary so early validator errors — which run
+    /// on the injected URL and can quote injected values in deny reasons
+    /// (GN-6), response headers — which can echo the urlencoded query-param
+    /// credential through a redirect `Location` (GN-7) — and response
+    /// bodies — which echo the redirect target URL on common 3xx edges
+    /// (run-111 HA-3) — are covered alongside send errors. Headers are
+    /// redacted per field before serialization so JSON-escaping cannot hide
+    /// a secret containing `"` or `\` (run-111 HA-8).
+    fn redact_http_outcome_for_guest(
+        &self,
+        outcome: Result<lunarwing::agent::host::HttpResponse, String>,
+    ) -> Result<lunarwing::agent::host::HttpResponse, String> {
+        match outcome {
+            Ok(mut resp) => {
+                resp.body = self.redact_credential_bytes(std::mem::take(&mut resp.body));
+                resp.headers_json = self.redact_headers_json(&resp.headers_json);
+                Ok(resp)
+            }
+            Err(e) => Err(self.redact_credentials(&e)),
         }
     }
-}
 
-fn enforce_response_size(size: u64, max_response_bytes: usize) -> Result<(), String> {
-    if size > max_response_bytes as u64 {
-        return Err(format!(
-            "Response body too large: {} bytes exceeds limit of {} bytes",
-            size, max_response_bytes
-        ));
-    }
-    Ok(())
-}
-
-async fn collect_capped_response_body<S, E>(
-    stream: S,
-    content_length: Option<u64>,
-    max_response_bytes: usize,
-) -> Result<Vec<u8>, String>
-where
-    S: Stream<Item = Result<bytes::Bytes, E>>,
-    E: std::fmt::Display,
-{
-    if let Some(content_length) = content_length {
-        enforce_response_size(content_length, max_response_bytes)?;
-    }
-
-    let mut body = Vec::new();
-    futures::pin_mut!(stream);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Failed to read response body: {e}"))?;
-        let new_size = (body.len() as u64).saturating_add(chunk.len() as u64);
-        enforce_response_size(new_size, max_response_bytes)?;
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-// Implement the generated Host trait from bindgen.
-//
-// This registers all 6 host functions under the `lunarwing:agent/host` namespace:
-// log, now-millis, workspace-read, http-request, secret-exists, tool-invoke
-impl lunarwing::agent::host::Host for StoreData {
-    fn log(&mut self, level: lunarwing::agent::host::LogLevel, message: String) {
-        let log_level = match level {
-            lunarwing::agent::host::LogLevel::Trace => LogLevel::Trace,
-            lunarwing::agent::host::LogLevel::Debug => LogLevel::Debug,
-            lunarwing::agent::host::LogLevel::Info => LogLevel::Info,
-            lunarwing::agent::host::LogLevel::Warn => LogLevel::Warn,
-            lunarwing::agent::host::LogLevel::Error => LogLevel::Error,
+    /// Redact credentials from a serialized headers map at the field level
+    /// (WI#395 run-111 HA-8): a secret containing `"` or `\` is JSON-escaped
+    /// in the serialized form, so string-level replacement can miss it, and a
+    /// blind string replace could even produce invalid JSON. Parsing first
+    /// and redacting each name and value keeps the output valid for any
+    /// secret bytes.
+    fn redact_headers_json(&self, headers_json: &str) -> String {
+        let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+            return self.redact_credentials(headers_json);
         };
-        let _ = self.host_state.log(log_level, message);
+        let redacted: HashMap<String, String> = map
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    self.redact_credentials(&name),
+                    self.redact_credentials(&value),
+                )
+            })
+            .collect();
+        serde_json::to_string(&redacted).unwrap_or_else(|_| self.redact_credentials(headers_json))
     }
 
-    fn now_millis(&mut self) -> u64 {
-        self.host_state.now_millis()
+    /// Byte-level credential scrub for response bodies (WI#395 run-111
+    /// HA-3): bodies are not guaranteed UTF-8, so the raw and urlencoded
+    /// spellings are replaced at the byte level rather than through lossy
+    /// string conversion.
+    fn redact_credential_bytes(&self, mut bytes: Vec<u8>) -> Vec<u8> {
+        for (name, value) in &self.credentials {
+            if !value.is_empty() {
+                let marker = format!("[REDACTED:{name}]").into_bytes();
+                replace_all_bytes(&mut bytes, value.as_bytes(), &marker);
+                let encoded = urlencoding::encode(value).to_string();
+                if encoded != *value {
+                    replace_all_bytes(&mut bytes, encoded.as_bytes(), &marker);
+                }
+            }
+        }
+        for cred in &self.host_credentials {
+            if !cred.secret_value.is_empty() {
+                const MARKER: &[u8] = b"[REDACTED:host_credential]";
+                replace_all_bytes(&mut bytes, cred.secret_value.as_bytes(), MARKER);
+                let encoded = urlencoding::encode(&cred.secret_value).to_string();
+                if encoded != cred.secret_value {
+                    replace_all_bytes(&mut bytes, encoded.as_bytes(), MARKER);
+                }
+            }
+        }
+        bytes
     }
 
-    fn workspace_read(&mut self, path: String) -> Option<String> {
-        self.host_state.workspace_read(&path).ok().flatten()
-    }
-
-    fn http_request(
+    /// Unredacted HTTP exchange implementation; the trait method applies
+    /// [`StoreData::redact_http_outcome_for_guest`] over the outcome.
+    fn http_request_inner(
         &mut self,
         method: String,
         url: String,
@@ -695,16 +709,11 @@ impl lunarwing::agent::host::Host for StoreData {
             // Caller-specified timeout (default 30s, max 5min)
             let timeout_ms = timeout_ms.unwrap_or(30_000).min(300_000) as u64;
             let timeout = Duration::from_millis(timeout_ms);
-            let response = request.timeout(timeout).send().await.map_err(|e| {
-                // Walk the full error chain for the actual root cause
-                let mut chain = format!("HTTP request failed: {}", e);
-                let mut source = std::error::Error::source(&e);
-                while let Some(cause) = source {
-                    chain.push_str(&format!(" -> {}", cause));
-                    source = cause.source();
-                }
-                chain
-            })?;
+            let response = request
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(format_send_error)?;
 
             let status = response.status().as_u16();
             let response_headers: HashMap<String, String> = response
@@ -787,7 +796,143 @@ impl lunarwing::agent::host::Host for StoreData {
         }
 
         // Redact credentials from error messages before returning to WASM
-        result.map_err(|e| self.redact_credentials(&e))
+        // Redaction happens once, at the trait boundary
+        // (redact_http_outcome_for_guest), so early validator errors and
+        // the response headers are covered too.
+        result
+    }
+}
+
+// Provide WASI context for the WASM component.
+// Required because tools are compiled with wasm32-wasip2 target.
+impl WasiView for StoreData {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+fn enforce_response_size(size: u64, max_response_bytes: usize) -> Result<(), String> {
+    if size > max_response_bytes as u64 {
+        return Err(format!(
+            "Response body too large: {} bytes exceeds limit of {} bytes",
+            size, max_response_bytes
+        ));
+    }
+    Ok(())
+}
+
+async fn collect_capped_response_body<S, E>(
+    stream: S,
+    content_length: Option<u64>,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, String>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+    E: std::fmt::Display,
+{
+    if let Some(content_length) = content_length {
+        enforce_response_size(content_length, max_response_bytes)?;
+    }
+
+    let mut body = Vec::new();
+    futures::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read response body: {e}"))?;
+        let new_size = (body.len() as u64).saturating_add(chunk.len() as u64);
+        enforce_response_size(new_size, max_response_bytes)?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Also scrub the URL-encoded form of a secret. Query-param injection
+/// percent-encodes characters like `+`, `/` and `=` (typical of base64
+/// tokens), so a raw-value replace alone leaves the encoded copy intact
+/// (WI#395).
+fn replace_encoded_secret(result: &mut String, value: &str, replacement: &str) {
+    let encoded = urlencoding::encode(value).to_string();
+    if encoded != value {
+        *result = result.replace(encoded.as_str(), replacement);
+    }
+}
+
+/// Replace every occurrence of `needle` in `haystack` with `marker`, at the
+/// byte level (WI#395 run-111 HA-3 — response bodies are not guaranteed
+/// UTF-8, so string-level replacement cannot be used on them).
+fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
+    if needle.is_empty() {
+        return;
+    }
+    let mut search_from = 0;
+    while let Some(offset) = haystack[search_from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let at = search_from + offset;
+        haystack.splice(at..at + needle.len(), marker.iter().copied());
+        search_from = at + marker.len();
+    }
+}
+
+/// Format a reqwest send error without exposing the request URL.
+///
+/// reqwest's Display appends the full URL (`... for url (...)`); for a
+/// query-param credential injection that URL carries the encoded secret, so
+/// it is stripped before walking the error chain (WI#395).
+/// [`StoreData::redact_credentials`] remains a second layer over whatever
+/// text is produced.
+fn format_send_error(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut chain = format!("HTTP request failed: {e}");
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        chain.push_str(&format!(" -> {cause}"));
+        source = cause.source();
+    }
+    chain
+}
+
+// Implement the generated Host trait from bindgen.
+//
+// This registers all 6 host functions under the `lunarwing:agent/host` namespace:
+// log, now-millis, workspace-read, http-request, secret-exists, tool-invoke
+impl lunarwing::agent::host::Host for StoreData {
+    fn log(&mut self, level: lunarwing::agent::host::LogLevel, message: String) {
+        let log_level = match level {
+            lunarwing::agent::host::LogLevel::Trace => LogLevel::Trace,
+            lunarwing::agent::host::LogLevel::Debug => LogLevel::Debug,
+            lunarwing::agent::host::LogLevel::Info => LogLevel::Info,
+            lunarwing::agent::host::LogLevel::Warn => LogLevel::Warn,
+            lunarwing::agent::host::LogLevel::Error => LogLevel::Error,
+        };
+        let _ = self.host_state.log(log_level, message);
+    }
+
+    fn now_millis(&mut self) -> u64 {
+        self.host_state.now_millis()
+    }
+
+    fn workspace_read(&mut self, path: String) -> Option<String> {
+        self.host_state.workspace_read(&path).ok().flatten()
+    }
+
+    fn http_request(
+        &mut self,
+        method: String,
+        url: String,
+        headers_json: String,
+        body: Option<Vec<u8>>,
+        timeout_ms: Option<u32>,
+    ) -> Result<lunarwing::agent::host::HttpResponse, String> {
+        // WI#395: single redaction point for everything the guest sees. Early
+        // validator errors run on the injected URL and can echo injected
+        // values in deny reasons (GN-6); response headers can echo the
+        // urlencoded query-param credential via a redirect `Location` (GN-7).
+        let outcome = self.http_request_inner(method, url, headers_json, body, timeout_ms);
+        self.redact_http_outcome_for_guest(outcome)
     }
 
     fn tool_invoke(&mut self, alias: String, _params_json: String) -> Result<String, String> {
@@ -3286,6 +3431,314 @@ mod tests {
         let redacted = store_data.redact_credentials(text);
         assert!(!redacted.contains("super-secret-token"));
         assert!(redacted.contains("[REDACTED:host_credential]"));
+    }
+
+    /// WI#395: a `+/=`-bearing secret survives a raw-value scrub once it has
+    /// been URL-encoded by query-param injection; both forms must be redacted.
+    #[test]
+    fn test_redact_credentials_scrubs_url_encoded_secrets() {
+        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
+        use std::collections::HashMap;
+
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["api.example.com".to_string()],
+            headers: HashMap::new(),
+            query_params: HashMap::new(),
+            secret_value: "ab+/c=999".to_string(),
+            url_prefix: None,
+        }];
+
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            HashMap::new(),
+            host_credentials,
+        );
+
+        let encoded = urlencoding::encode("ab+/c=999").to_string();
+        assert_ne!(encoded, "ab+/c=999", "precondition: value gets encoded");
+        let text = format!("failed for url (https://api.example.com/d?k={encoded})");
+        let redacted = store_data.redact_credentials(&text);
+        assert!(!redacted.contains("ab+/c=999"), "{redacted}");
+        assert!(!redacted.contains(&encoded), "{redacted}");
+        assert!(redacted.contains("[REDACTED:host_credential]"));
+    }
+
+    /// WI#395 (GN-3): the credentials map (placeholder secrets) gets the same
+    /// URL-encoded scrub as host credentials; deleting the map-arm call alone
+    /// must fail this test.
+    #[test]
+    fn test_redact_credentials_map_scrubs_url_encoded_secrets() {
+        use crate::tools::wasm::wrapper::StoreData;
+        use std::collections::HashMap;
+
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "tok+/en=42".to_string());
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            credentials,
+            Vec::new(),
+        );
+
+        let encoded = urlencoding::encode("tok+/en=42").to_string();
+        assert_ne!(encoded, "tok+/en=42", "precondition: value gets encoded");
+        let text = format!("failed for url (https://api.example.com/d?k={encoded})");
+        let redacted = store_data.redact_credentials(&text);
+        assert!(!redacted.contains("tok+/en=42"), "{redacted}");
+        assert!(!redacted.contains(&encoded), "{redacted}");
+        assert!(redacted.contains("[REDACTED:API_TOKEN]"), "{redacted}");
+    }
+
+    /// WI#395 (GN-6/GN-7): the trait boundary applies one redaction over the
+    /// whole guest-visible outcome — validator errors that quote injected
+    /// values (e.g. an allowlist deny reason carrying the injected URL) and
+    /// response headers that echo the urlencoded query-param credential (a
+    /// redirect `Location`) are both scrubbed.
+    #[test]
+    fn guest_outcome_redaction_covers_validator_errors_and_response_headers() {
+        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
+        use std::collections::HashMap;
+
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["api.example.com".to_string()],
+            headers: HashMap::new(),
+            query_params: HashMap::new(),
+            secret_value: "stem-9z8y7x+/==".to_string(),
+            url_prefix: None,
+        }];
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            HashMap::new(),
+            host_credentials,
+        );
+
+        // GN-6: a deny reason quoting the injected URL.
+        let encoded = urlencoding::encode("stem-9z8y7x+/==").to_string();
+        let deny = format!(
+            "HTTP not allowed: HTTP request not allowed: InvalidUrl(https://api.example.com/d?api_key={encoded})"
+        );
+        let redacted_err = store_data.redact_http_outcome_for_guest(Err(deny));
+        let err_text = redacted_err.unwrap_err();
+        assert!(!err_text.contains("stem-9z8y7x"), "{err_text}");
+        assert!(!err_text.contains(&encoded), "{err_text}");
+        assert!(
+            err_text.contains("[REDACTED:host_credential]"),
+            "{err_text}"
+        );
+
+        // GN-7: an upstream Location echo of the urlencoded secret.
+        let headers_json = format!("{{\"location\":\"https://example.test/d?api_key={encoded}\"}}");
+        let resp = super::lunarwing::agent::host::HttpResponse {
+            status: 301,
+            headers_json,
+            body: Vec::new(),
+        };
+        let redacted = store_data.redact_http_outcome_for_guest(Ok(resp)).unwrap();
+        assert!(
+            !redacted.headers_json.contains("stem-9z8y7x"),
+            "{}",
+            redacted.headers_json
+        );
+        assert!(
+            !redacted.headers_json.contains(&encoded),
+            "{}",
+            redacted.headers_json
+        );
+        assert!(
+            redacted.headers_json.contains("[REDACTED:host_credential]"),
+            "{}",
+            redacted.headers_json
+        );
+    }
+
+    /// WI#395 (run-111 HA-4): the trait-boundary redaction call itself is
+    /// pinned — the GN-6/GN-7 tests call the helper directly, so removing
+    /// the `redact_http_outcome_for_guest` call from `Host::http_request`
+    /// would pass them. A placeholder injected into the URL *path* is quoted
+    /// verbatim in the allowlist deny reason (`PathNotAllowed` carries the
+    /// normalized path), so a real denied request must come back redacted.
+    #[test]
+    fn guest_http_request_redacts_validator_error_at_trait_boundary() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::tools::wasm::capabilities::{Capabilities, EndpointPattern, HttpCapability};
+        use crate::tools::wasm::wrapper::StoreData;
+        use std::collections::HashMap;
+
+        const SECRET: &str = "pathsecret4k3l2m";
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), SECRET.to_string());
+        let capabilities = Capabilities::default().with_http(HttpCapability::new(vec![
+            EndpointPattern::host("api.example.com").with_path_prefix("/allowed/"),
+        ]));
+        let mut store_data = StoreData::new(1024 * 1024, capabilities, credentials, Vec::new());
+
+        // The placeholder lands in the path; the deny reason quotes it.
+        let url = "https://api.example.com/{API_TOKEN}/d".to_string();
+        let err = store_data
+            .http_request("GET".to_string(), url, "{}".to_string(), None, None)
+            .unwrap_err();
+        assert!(
+            err.contains("HTTP not allowed"),
+            "expected an allowlist denial: {err}"
+        );
+        assert!(!err.contains(SECRET), "{err}");
+        assert!(err.contains("[REDACTED:API_TOKEN]"), "{err}");
+    }
+
+    /// WI#395 (run-111 HA-3/HA-8): the response BODY reaches the guest and
+    /// can echo the injected credential — a 3xx body echoes the redirect
+    /// target URL on common edges (Go, Apache, Express). An
+    /// interceptor-driven 302 with the echo in both `Location` and the body
+    /// must come back with both scrubbed, byte-level for the body. The
+    /// secret also contains a double quote: serialized into `headers_json`
+    /// it is JSON-escaped, so only per-field header redaction catches the
+    /// raw echo (HA-8). The URL targets a public IP literal so the
+    /// private-IP guard passes without DNS.
+    #[test]
+    fn guest_http_request_redacts_echoed_credential_in_headers_and_body() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
+        use crate::tools::wasm::capabilities::{Capabilities, EndpointPattern, HttpCapability};
+        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        const SECRET: &str = "guestbody\"7c8d9e+/==";
+        const SECRET_STEM: &str = "guestbody";
+
+        #[derive(Debug)]
+        struct RedirectEcho;
+        #[async_trait::async_trait]
+        impl HttpInterceptor for RedirectEcho {
+            async fn before_request(
+                &self,
+                _request: &HttpExchangeRequest,
+            ) -> Option<HttpExchangeResponse> {
+                let encoded = urlencoding::encode(SECRET).to_string();
+                let location = format!("https://example.test/mapped?api_key={encoded}");
+                Some(HttpExchangeResponse {
+                    status: 302,
+                    headers: vec![
+                        ("location".to_string(), location.clone()),
+                        ("x-auth-echo".to_string(), format!("Bearer {SECRET}")),
+                        ("content-type".to_string(), "text/html".to_string()),
+                    ],
+                    body: format!("<a href=\"{location}\">Found</a>.\n"),
+                })
+            }
+
+            async fn after_response(
+                &self,
+                _request: &HttpExchangeRequest,
+                _response: &HttpExchangeResponse,
+            ) {
+            }
+        }
+
+        let mut query_params = HashMap::new();
+        query_params.insert("api_key".to_string(), SECRET.to_string());
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["93.184.216.34".to_string()],
+            headers: HashMap::new(),
+            query_params,
+            secret_value: SECRET.to_string(),
+            url_prefix: None,
+        }];
+        let capabilities =
+            Capabilities::default().with_http(HttpCapability::new(vec![EndpointPattern::host(
+                "93.184.216.34",
+            )]));
+        let mut store_data =
+            StoreData::new(1024 * 1024, capabilities, HashMap::new(), host_credentials);
+        store_data.http_interceptor = Some(Arc::new(RedirectEcho));
+
+        let resp = store_data
+            .http_request(
+                "GET".to_string(),
+                "https://93.184.216.34/mapped".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(resp.status, 302);
+
+        let encoded = urlencoding::encode(SECRET).to_string();
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(
+            !body.contains(SECRET_STEM) && !body.contains(&encoded),
+            "echoed credential leaked into the guest body: {body}"
+        );
+        assert!(
+            body.contains("[REDACTED:host_credential]"),
+            "scrub marker missing from the guest body: {body}"
+        );
+        assert!(
+            !resp.headers_json.contains(SECRET_STEM) && !resp.headers_json.contains(&encoded),
+            "echoed credential leaked into the guest headers: {}",
+            resp.headers_json
+        );
+        assert!(
+            resp.headers_json.contains("[REDACTED:host_credential]"),
+            "{}",
+            resp.headers_json
+        );
+    }
+
+    /// WI#395: a send failure must not echo the request URL (which carries an
+    /// injected query-param credential) back to the WASM tool. The raw error
+    /// Display would append `for url (...)`; `format_send_error` strips it.
+    #[tokio::test]
+    async fn send_error_chain_omits_credential_bearing_url() {
+        use crate::tools::wasm::wrapper::format_send_error;
+
+        // Ephemeral loopback port kept bound with accept-and-drop: the send
+        // fails deterministically (no bind/drop/connect TOCTOU) and the error
+        // still carries the request URL.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let closed_guard = tokio::spawn(async move {
+            loop {
+                let Ok((conn, _)) = listener.accept().await else {
+                    return;
+                };
+                drop(conn);
+            }
+        });
+
+        let secret = "wasm-secret-4d5e6f+/=";
+        // The URL encodes the value, so the raw secret never appears in the
+        // error text; the stem does (GN-2). Derived from the fixture rather
+        // than spelled out: a second literal trips secret-detection (run-111
+        // HA-1).
+        let secret_stem = secret.trim_end_matches(['+', '/', '=']);
+        let encoded = urlencoding::encode(secret).to_string();
+        let url = format!("http://127.0.0.1:{port}/d?api_key={encoded}");
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap_err();
+
+        // Precondition: the unfixed Display output carries the URL.
+        assert!(
+            error.to_string().contains("for url"),
+            "precondition failed: {}",
+            error
+        );
+
+        let formatted = format_send_error(error);
+        assert!(formatted.starts_with("HTTP request failed:"), "{formatted}");
+        assert!(!formatted.contains(secret_stem), "{formatted}");
+        assert!(!formatted.contains(&encoded), "{formatted}");
+        assert!(!formatted.contains("api_key="), "{formatted}");
+        closed_guard.abort();
     }
 
     #[tokio::test]
