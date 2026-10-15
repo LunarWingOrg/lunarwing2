@@ -163,7 +163,9 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > 2.1.6.0 cycle (`bash tests/run-all.sh --list` still registers the same 19
 > suites, verified live). No self-heal pipeline script changed this cycle;
 > the release's WI#376 mt-admin hardening (init detection, OpenRC stop/units,
-> restore probe) lives in `ic/scripts/mt-admin-lib/`, not the host health
+> restore probe) lives in `ic/scripts/mt-admin-lib/` (plus an EQ-3 refusal
+> gate beside legacy OpenRC proxy units in `ic/scripts/enable-health-fleet.sh`,
+> the standalone fleet enabler), not the host health
 > pipeline, and is documented in `SELF_HEAL_DEPLOYMENT_WIRING.md`. The
 > audit's detection/remedy table still describes the self-heal pipeline
 > itself.
