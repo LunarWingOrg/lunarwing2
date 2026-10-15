@@ -770,31 +770,7 @@ impl StoreData {
                 .await
                 .map_err(format_send_error)?;
 
-            let status = response.status().as_u16();
-            let response_headers = guest_response_headers(response.headers());
-            let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
-
-            // Stream body so absent or inaccurate Content-Length cannot bypass the cap.
-            let content_length = response.content_length();
-            let body = collect_capped_response_body(
-                response.bytes_stream(),
-                content_length,
-                max_response_bytes,
-            )
-            .await?;
-
-            // Leak detection on response body
-            if let Ok(body_str) = std::str::from_utf8(&body) {
-                leak_detector
-                    .scan_and_clean(body_str)
-                    .map_err(|e| format!("Potential secret leak in response: {}", e))?;
-            }
-
-            Ok(lunarwing::agent::host::HttpResponse {
-                status,
-                headers_json,
-                body,
-            })
+            collect_guest_http_response(response, max_response_bytes, &leak_detector).await
         });
 
         // Notify the interceptor about the completed response (recording mode).
@@ -869,6 +845,36 @@ fn enforce_response_size(size: u64, max_response_bytes: usize) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+/// Shared live-response handling, also exercised by the loopback HTTP tests.
+async fn collect_guest_http_response(
+    response: reqwest::Response,
+    max_response_bytes: usize,
+    leak_detector: &LeakDetector,
+) -> Result<lunarwing::agent::host::HttpResponse, String> {
+    let status = response.status().as_u16();
+    let response_headers = guest_response_headers(response.headers());
+    let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
+
+    // Stream body so absent or inaccurate Content-Length cannot bypass the cap.
+    let content_length = response.content_length();
+    let body =
+        collect_capped_response_body(response.bytes_stream(), content_length, max_response_bytes)
+            .await?;
+
+    // Leak detection on response body
+    if let Ok(body_str) = std::str::from_utf8(&body) {
+        leak_detector
+            .scan_and_clean(body_str)
+            .map_err(|e| format!("Potential secret leak in response: {}", e))?;
+    }
+
+    Ok(lunarwing::agent::host::HttpResponse {
+        status,
+        headers_json,
+        body,
+    })
 }
 
 async fn collect_capped_response_body<S, E>(
@@ -3964,6 +3970,16 @@ mod tests {
                 true,
             ),
             (
+                encoded_response(
+                    &[
+                        ("content-encoding", "gzip"),
+                        ("content-encoding", "identity"),
+                    ],
+                    "opaque",
+                ),
+                true,
+            ),
+            (
                 encoded_response(&[("Transfer-Encoding", "Chunked, ")], "plain"),
                 false,
             ),
@@ -3979,6 +3995,16 @@ mod tests {
                 encoded_response(
                     &[
                         ("Transfer-Encoding", "gzip"),
+                        ("transfer-encoding", "chunked"),
+                    ],
+                    "opaque",
+                ),
+                true,
+            ),
+            (
+                encoded_response(
+                    &[
+                        ("transfer-encoding", "gzip"),
                         ("transfer-encoding", "chunked"),
                     ],
                     "opaque",
@@ -4057,8 +4083,8 @@ mod tests {
     async fn reqwest_response_codings_survive_collection_and_are_refused() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Real reqwest/hyper parsing: duplicate fields and obs-text must
-        // reach the same collector as live wrapper responses. No DNS/TLS.
+        // Real reqwest/hyper parsing through the production response handler:
+        // duplicate fields and obs-text must survive collection. No DNS/TLS.
         for (headers, wire_body) in [
             (
                 b"Content-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: 6\r\n"
@@ -4100,19 +4126,17 @@ mod tests {
                 .send()
                 .await
                 .unwrap();
-            let headers_json =
-                serde_json::to_string(&super::guest_response_headers(response.headers())).unwrap();
-            let body = response.bytes().await.unwrap().to_vec();
+            let response =
+                super::collect_guest_http_response(response, 6, &super::LeakDetector::new())
+                    .await
+                    .unwrap();
             server.await.unwrap();
-            assert_eq!(body, b"opaque", "hyper only removes chunk framing");
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"opaque", "hyper only removes chunk framing");
             let (mut store, _) = encoding_test_store(Vec::new());
             store.last_http_exchange_had_credentials = true;
             let err = store
-                .redact_http_outcome_for_guest(Ok(super::lunarwing::agent::host::HttpResponse {
-                    status: 200,
-                    headers_json,
-                    body,
-                }))
+                .redact_http_outcome_for_guest(Ok(response))
                 .unwrap_err();
             assert!(err.contains("encoded body cannot be inspected"), "{err}");
         }
