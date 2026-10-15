@@ -284,12 +284,18 @@ Enforced controls (opencode2 lane unless noted):
    refusal, and NUL bytes are refused outright (bash `read` drops them,
    BuildKit keeps them). Either one used to make the guard join the next
    instruction into a `LABEL` while BuildKit ran it on its own. Run-111 GZ-1:
-   a continuation backslash must be preceded by whitespace (or be the line's
-   whole content) — BuildKit keeps the character before the backslash and
-   appends the next line with no separator, so `SHEL\` + `L [...]` used to
+   a continuation backslash must be preceded by a space or tab — a backslash
+   that is the line's whole content is refused too — because BuildKit keeps
+   the character before the backslash and appends the next line with no
+   separator, so `SHEL\` + `L [...]` used to
    reach the guard as the word `SHEL` (never matching the SHELL refusal) and
    `ARG LUNARWING_WRAPPER_\` + `SHA256=…` hid a protected name from the
    literal checks, while BuildKit parsed each pair as one instruction.
+   Run-112 HD-1 narrows the accepted class to BuildKit's own (space/tab
+   only, via literal bracket expressions that no locale widens) and refuses
+   any line carrying a VT, FF or CR byte outright — bash's `[[:space:]]` is
+   wider than BuildKit's even in the C locale and locale-dependent under
+   C.UTF-8 (U+3000 et al. were accepted as glue there).
    GW-3 refuses `SHELL`, any instruction naming
    `LUNARWING_WRAPPER_SHA256`, `LUNARWING_REAL_OPENCODE` or `OPENCODE_BIN`
    except the exact `ARG LUNARWING_WRAPPER_SHA256=`, and ENV keys that are
