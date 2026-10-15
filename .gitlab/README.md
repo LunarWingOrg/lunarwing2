@@ -277,6 +277,17 @@ the prime suspect, and the fix is the same normalization in the offending
   they can bypass the pinned script without editing a command. Adding any
   other keyword (including `timeout`, `retry`, `inherit` or `after_script`)
   requires reviewing and updating the allowlist in the same commit.
+  The same bypasses are refused when they arrive outside the job block
+  (MR !1647 review HP-2): the validator merges the CI files the way GitLab
+  does — includes in order, the root file last with a deep merge — so a
+  root-file entry for a lane (or a root-file `CI_NODE_IMAGE`/`CI_BUN_IMAGE`
+  variable override, which likewise fails the digest pins) cannot replace
+  the checked definition unseen; an inherited `default.before_script` or
+  `default.hooks` is refused; and a top-level `NODE_OPTIONS`/`npm_config_*`
+  variable is refused because it reaches every job and can neutralise the
+  pinned script from the environment. `extends` chains resolve up to a
+  depth budget of 11; a longer chain or a cycle fails closed instead of
+  being certified from the keys visible at truncation.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL
