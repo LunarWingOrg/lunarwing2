@@ -352,6 +352,36 @@ _openrc_restart() {
     _sh_timeout rc-service "$svc" restart
 }
 
+# WI#410: runtime re-check of the WI#376 EQ-3 migration-window guard.
+# ic/scripts/enable-health-fleet.sh refuses to ARM this root cron while an
+# unsafe legacy proxy unit is installed, but that check is arming-time only:
+# a pre-migration unit can reappear (or an interrupted render-units can leave
+# one behind) after the cron is armed, and the next root tick would then drive
+# rc-service against it — status probes here, and restarts through
+# _openrc_restart — with no gate. main() re-checks the installed units as data
+# before anything else and dies with the same remediation. The contract mirrors
+# mt-admin's openrc_proxy_unit_is_safe (ic/scripts/mt-admin-lib/08-units-openrc.sh)
+# and health-openrc.sh's copy — keep the three in sync. Cheap by construction:
+# one glob plus one grep per installed proxy unit, once per tick.
+OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
+openrc_proxy_unit_is_safe() {
+    local path="$1"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    grep -Eq \
+        '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"
+}
+
+# Echo the first installed lunarwing-proxy-* unit that fails the safe-unit
+# contract, exiting 1; rc 0 with empty output means the fleet is safe to drive.
+first_unsafe_openrc_proxy_unit() {
+    local path
+    for path in "$OPENRC_INITD_DIR"/lunarwing-proxy-*; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        openrc_proxy_unit_is_safe "$path" || { printf '%s' "$path"; return 1; }
+    done
+    return 0
+}
+
 _launchd_active() {
     local label="$1"
     launchctl list 2>/dev/null | grep -q "$label"
@@ -972,6 +1002,17 @@ find_latest_report() {
 # HARNESS_ENTRY_POINT
 
 main() {
+    # WI#410: re-check the WI#376 safe-unit guard on EVERY root-cron tick, not
+    # only at arming time (ic/scripts/enable-health-fleet.sh). Fail closed
+    # before any probe, restart, or state mutation: die() leaves the lock,
+    # state, and escalation bookkeeping untouched and no rc-service runs.
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        local offender=""
+        offender="$(first_unsafe_openrc_proxy_unit)" || {
+            die "unsafe legacy proxy unit ${offender} installed; refusing to probe or restart services as root; run: ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies"
+        }
+    fi
+
     local report="$REPORT_FILE"
     local now_epoch; now_epoch="$(date +%s)"
 
