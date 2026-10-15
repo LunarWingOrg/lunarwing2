@@ -533,7 +533,17 @@ class DebianSnapshotTieTests(unittest.TestCase):
         return errors
 
     def test_matching_snapshot_passes(self):
-        self.write_dockerfile(f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from())
+        # The realistic builder-stage shape: valued ARG, bare redeclaration,
+        # and RUN lines referencing ${DEBIAN_SNAPSHOT} (HE-3 pass-side pin).
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "ARG DEBIAN_SNAPSHOT\n"
+            + "RUN printf '%s\\n' \\\n"
+            + '      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" \\\n'
+            + '      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bookworm-security main" \\\n'
+            + "      > /etc/apt/sources.list\n"
+        )
         self.assertEqual(self.errors(), [])
 
     def test_snapshot_mismatch_is_caught(self):
@@ -564,6 +574,63 @@ class DebianSnapshotTieTests(unittest.TestCase):
             + self.node_from()
         )
         self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+
+    def test_lowercase_arg_instruction_is_caught(self):
+        # MR !1627 review HE-3: Dockerfile instructions are case-insensitive,
+        # so a lowercase stage-level `arg` still steers the build.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "arg DEBIAN_SNAPSHOT=20270101T000000Z\n"
+        )
+        self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+        # …while a lowercase ARG carrying the correct value must pass.
+        self.write_dockerfile(f"arg DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from())
+        self.assertEqual(self.errors(), [])
+
+    def test_indented_arg_is_caught(self):
+        # HE-3: an indented divergent ARG was invisible to the column-0 match.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "  ARG DEBIAN_SNAPSHOT=20270101T000000Z\n"
+        )
+        self.assertTrue(any("CI_DEBIAN_SNAPSHOT must match" in error for error in self.errors()))
+
+    def test_quoted_arg_value_passes(self):
+        # HE-3: a quoted correct value must not false-error as a mismatch.
+        self.write_dockerfile(
+            f'ARG DEBIAN_SNAPSHOT="{self.SNAPSHOT}"\n' + self.node_from()
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_hardcoded_snapshot_url_is_caught(self):
+        # HE-3: the tie checked the ARG value but not its use — a RUN that
+        # hardcodes a snapshot timestamp builds from it regardless of the
+        # ARG, even when the hardcoded timestamp equals the pinned value.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + f'"deb http://snapshot.debian.org/archive/debian/{self.SNAPSHOT}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
+        )
+
+    def test_renamed_snapshot_variable_is_caught(self):
+        # HE-3: a URL referencing a different variable is equally detached.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOTS}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
+        )
 
 
 class WorkerTsLaneTests(unittest.TestCase):

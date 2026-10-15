@@ -1093,7 +1093,12 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
     # the image builds with, not the live deb.debian.org mirror (MR !1618
     # review GV-4). Fail closed like the image ties: a missing/malformed
     # variable, a missing Dockerfile, or a missing/divergent valued
-    # ARG DEBIAN_SNAPSHOT must not silently dissolve the tie.
+    # ARG DEBIAN_SNAPSHOT must not silently dissolve the tie. The ARG match
+    # tolerates Dockerfile-instruction case and indenting and strips quotes
+    # (MR !1627 review HE-3), and every snapshot.debian.org URL in the
+    # Dockerfile must reference ${DEBIAN_SNAPSHOT} itself — a hardcoded
+    # timestamp or a renamed variable would detach the tie from what the
+    # image actually builds with.
     snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append(
@@ -1107,7 +1112,12 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         )
     else:
         dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
-        snapshot_args = re.findall(r"(?m)^ARG\s+DEBIAN_SNAPSHOT=(\S+)$", dockerfile_text)
+        snapshot_args = [
+            match.strip("\"'")
+            for match in re.findall(
+                r"(?m)^\s*(?i:ARG)\s+DEBIAN_SNAPSHOT=(\S+?)\s*$", dockerfile_text
+            )
+        ]
         if not snapshot_args:
             errors.append(
                 "kimicode4lunarwing/Dockerfile has no valued ARG DEBIAN_SNAPSHOT; "
@@ -1117,6 +1127,20 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
             errors.append(
                 "CI_DEBIAN_SNAPSHOT must match the ARG DEBIAN_SNAPSHOT value(s) in "
                 "kimicode4lunarwing/Dockerfile"
+            )
+        hardcoded_snapshots = [
+            stamp
+            for stamp in re.findall(
+                r"snapshot\.debian\.org/archive/[^/\s\"']+/([^/\s\"']+)/",
+                dockerfile_text,
+            )
+            if stamp != "${DEBIAN_SNAPSHOT}"
+        ]
+        if hardcoded_snapshots:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile snapshot.debian.org URLs must use "
+                "${DEBIAN_SNAPSHOT}, not a hardcoded or renamed value: "
+                f"{hardcoded_snapshots}"
             )
 
     literal_images = {
