@@ -41,7 +41,7 @@ bash ic/scripts/create-tenant.sh --help
 
 The default full flow calls MT admin to add the tenant, ensures the WASM toolchain when requested, builds the selected components, starts the tenant, verifies health, and prints WeeChat setup instructions. Use `--yes` only after reviewing the printed plan.
 
-Since v2.1.6.0 (WI#330) a tenant LLM endpoint is required and there is no built-in default: pass `--tensorzero-url <url>` (upstream for the per-tenant proxy) or `--llm-base-url <url>` (direct endpoint), or export `LUNARWING_MT_TENSORZERO_URL`; without one, `add-tenant` refuses before any tenant state exists.
+Since v2.1.6.0 (WI#330) a tenant LLM endpoint is required and there is no built-in default: pass `--tensorzero-url <url>` (the wrapper never passes `--enable-proxy`, so the daemon dials this TensorZero gateway directly at its `/openai/v1` surface) or `--llm-base-url <url>` (direct endpoint), or export the wrapper's own `TENSORZERO_URL`/`LLM_BASE_URL` env overrides, or export the mt-admin fleet `LUNARWING_MT_TENSORZERO_URL`/`LUNARWING_MT_LLM_BASE_URL`; without one, `add-tenant` refuses before any tenant state exists.
 
 Do not use retired Nanocode flags. The script rejects `--nanocode`, `--with-nanocode`, and `--no-nanocode`; Pebble is the supported external worker.
 

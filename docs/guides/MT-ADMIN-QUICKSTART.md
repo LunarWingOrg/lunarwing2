@@ -99,11 +99,14 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap
 Since v2.1.6.0 (WI#330) `add-tenant` requires an explicit tenant LLM endpoint
 and there is **no built-in default**: pass `--tensorzero-url <url>` (or set the
 fleet `LUNARWING_MT_TENSORZERO_URL`) for the proxy path, or
-`--llm-base-url <url>` for a direct non-proxy endpoint. A missing endpoint
+`--llm-base-url <url>` (or set the fleet `LUNARWING_MT_LLM_BASE_URL`) for a
+direct non-proxy endpoint. A missing endpoint
 aborts provisioning before any tenant state exists; host-loopback and overlay
 MagicDNS addresses are rejected for workers (they are unreachable from worker
-containers), and worker images refuse to start on the baked `.invalid`
-placeholder, naming the environment variable to fix. `upgrade-tenant` backfills
+containers), a rendered env never carries the baked `.invalid` placeholder
+(mt-admin dies at render time when an enabled worker has no container-reachable
+URL), and a hand-started container without `<WORKER>_BASE_URL` refuses to start
+on the placeholder naming the environment variable to fix. `upgrade-tenant` backfills
 an inheritable endpoint for every enabled worker before rebuilding, so managed
 tenants do not need per-worker `configure-*` calls.
 

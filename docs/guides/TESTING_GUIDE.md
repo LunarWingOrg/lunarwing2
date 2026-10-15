@@ -83,7 +83,7 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] Sandbox policy behavior matches the active runtime (`SANDBOX_RUNTIME` auto/podman/docker) and network mode (`SANDBOX_NETWORK` none/proxy-enforced/proxy). Default is `none` (no egress); `proxy-enforced` keeps `--network none` and reaches only the validating allowlist proxy through a per-execution Unix-socket relay; `proxy` is the legacy advisory mode.
 - [ ] HTTP requests obey URL validation, private-address policy, redirects, and capability allowlists.
 - [ ] Memory read, write, tree, and hybrid search preserve workspace semantics.
-- [ ] **Daily-log backup generation cap** (v2.1.6.0, WI#335) — against one day log, drive nine agent `memory_write` replaces (cap is `MAX_DAILY_LOG_BACKUP_GENERATIONS = 8` plus the rolling `.bak`): the ninth fails closed as a `NotAuthorized` refusal naming the retained generations, nothing is written, no generation is lost, and appends still work; an operator replace through the web memory editor or CLI still succeeds on the same saturated day (see `ic/src/workspace/README.md`).
+- [ ] **Daily-log backup generation cap** (v2.1.6.0, WI#335) — seed the day log, then drive agent `memory_write` replaces (cap is `MAX_DAILY_LOG_BACKUP_GENERATIONS = 8` numbered generations plus the rolling `.bak`): the first nine succeed (the ninth fills `.bak.8`) and the tenth fails closed as a `NotAuthorized` refusal naming the retained generations, nothing is written, no generation is lost, and appends still work; an operator replace through the web memory editor or CLI still succeeds on the same saturated day (see `ic/src/workspace/README.md`).
 - [ ] Secret list/delete operations never return secret values.
 - [ ] Install, authenticate, activate, deactivate, update, and remove a disposable tool.
 - [ ] Install and invoke a WASM tool with host-injected credentials.
@@ -122,7 +122,7 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Verify systemd user-manager behavior on systemd hosts.
 - [ ] Verify OpenRC service rendering and lifecycle on a Gentoo/OpenRC host, or record the tier as deferred.
 - [ ] Start, stop, restart, build, and remove the disposable tenant through MT admin.
-- [ ] **Required tenant LLM endpoint** (v2.1.6.0, WI#330) — `add-tenant` without `--tensorzero-url`/`LUNARWING_MT_TENSORZERO_URL`/`--llm-base-url` aborts before creating tenant state; `--enable-proxy` without an upstream aborts; worker envs carry a real endpoint or the baked `.invalid` placeholder, and a worker container refuses to start on the placeholder naming the variable to fix; `upgrade-tenant` backfills an inheritable endpoint for enabled workers before rebuilding (see `MT-ADMIN-QUICKSTART.md` §3).
+- [ ] **Required tenant LLM endpoint** (v2.1.6.0, WI#330) — with both fleet vars (`LUNARWING_MT_TENSORZERO_URL`, `LUNARWING_MT_LLM_BASE_URL`) unset, `add-tenant` without `--tensorzero-url`/`--llm-base-url` aborts before creating tenant state; `--enable-proxy` without an upstream aborts; a rendered worker env never carries the baked `.invalid` placeholder (the render dies naming the fix), while a hand-started worker container without `<WORKER>_BASE_URL` refuses to start on the baked `.invalid` config naming the variable to fix; `upgrade-tenant` backfills an inheritable endpoint for enabled workers before rebuilding (see `MT-ADMIN-QUICKSTART.md` §3).
 - [ ] Confirm host health discovery uses the tenant port registry rather than a hardcoded single-node port.
 
 ## Security and Recovery
