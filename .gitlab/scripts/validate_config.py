@@ -87,8 +87,13 @@ def image_name(image: object) -> str | None:
 
 
 def collect_variables(configs: list[tuple[pathlib.Path, dict]]) -> dict[str, str]:
+    """Collect top-level `variables` with GitLab's precedence: includes
+    apply in order and the root file (configs[0]) wins overall. The
+    previous root-first order let a root-file override (e.g. an unpinned
+    CI_NODE_IMAGE) go unseen here while GitLab used the root value
+    (MR !1647 review HP-2)."""
     variables: dict[str, str] = {}
-    for _path, config in configs:
+    for _path, config in [*configs[1:], *configs[:1]]:
         declared = config.get("variables")
         if not isinstance(declared, dict):
             continue
@@ -471,16 +476,29 @@ def merge_ci_hashes(base: dict, overlay: dict) -> dict:
     return merged
 
 
-def resolve_extends(job: object, merged: dict, depth: int = 8) -> dict:
+# MR !1647 review HP-2/HN-3: the depth budget must fail CLOSED. Truncation
+# used to keep whatever keys were visible at the budget, so a gating key on
+# a parent deeper than the budget (or hidden by a cycle) passed silently;
+# truncation now marks the result with a sentinel key that the lane gates
+# refuse. The budget exceeds any legitimate chain depth.
+EXTENDS_DEPTH_BUDGET = 11
+EXTENDS_TRUNCATED_KEY = "extends_truncated"
+
+
+def resolve_extends(
+    job: object, merged: dict, depth: int = EXTENDS_DEPTH_BUDGET
+) -> dict:
     """Resolve a job's `extends` chain with GitLab merge semantics.
 
     MR !1627 review HE-1 (R4): a lane extending `.observational-job`
     inherits `allow_failure: true` and runs but cannot gate, so the
     validator must see the EFFECTIVE job, not the literal one. Parents are
     applied in list order so the last listed parent wins on conflicts, and
-    the job's own keys win overall. The depth budget makes cyclic extends
-    chains terminate; a truncated cycle keeps whatever keys it set, which
-    fails closed for the gating keys (they cannot be deleted by a cycle).
+    the job's own keys win overall. The depth budget terminates cyclic or
+    over-long extends chains; a truncated resolution carries the
+    EXTENDS_TRUNCATED_KEY sentinel (propagated up through the merge) so the
+    lane gates refuse the job instead of certifying only the keys visible
+    at truncation (MR !1647 review HP-2/HN-3).
     """
     if not isinstance(job, dict):
         return {}
@@ -492,8 +510,10 @@ def resolve_extends(job: object, merged: dict, depth: int = 8) -> dict:
         names = [name for name in extends if isinstance(name, str)]
     else:
         names = []
-    if depth <= 0 or not names:
+    if not names:
         return own
+    if depth <= 0:
+        return {**own, EXTENDS_TRUNCATED_KEY: True}
     inherited: dict = {}
     for name in names:
         parent = resolve_extends(merged.get(name), merged, depth - 1)
@@ -545,9 +565,14 @@ def lane_runs_on_merge_requests(job: object, merged: dict) -> bool:
     is exactly the canonical MR predicate (operand-exact per MR !1644
     review HN-1: only whitespace around the tokens and the quote style may
     vary), and which runs automatically without rule-level allow_failure.
+    An extends chain exceeding the depth budget carries the
+    EXTENDS_TRUNCATED_KEY sentinel and fails closed (MR !1647 review
+    HP-2/HN-3).
     """
     effective = resolve_extends(job, merged)
     if not effective:
+        return False
+    if effective.get(EXTENDS_TRUNCATED_KEY):
         return False
     if effective.get("allow_failure"):
         return False
@@ -616,6 +641,23 @@ WORKER_TS_LANE_KEYS = frozenset({
 WORKER_TS_LANE_TAGS = ["$CI_LINT_RUNNER_TAG"]
 
 
+def lane_bypass_variable(name: object) -> bool:
+    """True for variables that can neutralise a worker TS lane's pinned
+    script purely from the job environment.
+
+    MR !1647 review (run-121 HP-2 reminder): a top-level `variables:`
+    entry reaches every job including both lanes. NODE_OPTIONS makes node
+    skip every test (`--test-skip-pattern=.`) or exit immediately
+    (`--import=data:...`), and npm reads `npm_config_*` case-insensitively
+    (`npm_config_script_shell=/bin/true` turns `npm test` into a no-op). No
+    equivalent bun test-skip/exec variable is known; the job-key allowlist
+    remains the bun lane's primary defense.
+    """
+    if not isinstance(name, str):
+        return False
+    return name == "NODE_OPTIONS" or name.lower().startswith("npm_config_")
+
+
 def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
     """Both worker TS lanes must exist and keep their MR-pipeline wiring.
 
@@ -635,14 +677,43 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
     retry options (HE-4). Only allowlisted job keys may survive extends
     resolution, and tags must select the lint runner (HP-1); job-level
     variables, parallel matrices and hooks cannot bypass the script pin.
+    The same bypasses are refused when they arrive through the merged
+    top-level blocks instead of the job: a `default.before_script` /
+    `default.hooks` entry is inherited by both lanes, and a global
+    NODE_OPTIONS / npm_config_* variable reaches every job (MR !1647
+    review HP-2). An extends chain beyond the depth budget fails closed
+    via EXTENDS_TRUNCATED_KEY.
     """
+    default_block = merged.get("default")
+    if isinstance(default_block, dict):
+        for key in ("before_script", "hooks"):
+            if default_block.get(key):
+                errors.append(
+                    f"default.{key} is inherited by the worker TS lanes and can "
+                    "bypass the pinned script; remove it from the default block"
+                )
+    top_variables = merged.get("variables")
+    if isinstance(top_variables, dict):
+        bypass = sorted(key for key in top_variables if lane_bypass_variable(key))
+        if bypass:
+            errors.append(
+                f"top-level variables must not set {bypass}; a global "
+                "NODE_OPTIONS/npm_config_* reaches both worker TS lanes and "
+                "neutralises the pinned script without editing it"
+            )
     for job_name, (image_variable, expected_script) in WORKER_TS_LANE_SCRIPTS.items():
         job = merged.get(job_name)
         if not isinstance(job, dict):
             errors.append(f"{job_name} job missing")
             continue
         effective = resolve_extends(job, merged)
-        unexpected = sorted(set(effective) - WORKER_TS_LANE_KEYS)
+        if effective.get(EXTENDS_TRUNCATED_KEY):
+            errors.append(
+                f"{job_name} extends chain exceeds the validation depth "
+                f"budget ({EXTENDS_DEPTH_BUDGET}); refusing to certify a "
+                "partially resolved job"
+            )
+        unexpected = sorted(set(effective) - WORKER_TS_LANE_KEYS - {EXTENDS_TRUNCATED_KEY})
         if unexpected:
             errors.append(
                 f"{job_name} must not set job keys {unexpected}; job-level "
@@ -1306,9 +1377,17 @@ def main() -> int:
 
     defaults_path = ROOT / ".gitlab" / "ci" / "defaults.yml"
     defaults = load_yaml(defaults_path)
+    # GitLab deep-merges the includes in order and then merges the root
+    # file over them — the root always wins. The previous root-first
+    # shallow update() let a root-file entry for a pinned job override the
+    # include's definition while the validators below kept checking the
+    # include's block (MR !1647 review HP-2). On the real tree no top-level
+    # key is defined in two files, so this reorder leaves the merged view
+    # identical.
     merged_config: dict = {}
-    for _path, config in loaded_configs:
-        merged_config.update(config)
+    for _path, config in loaded_configs[1:]:
+        merged_config = merge_ci_hashes(merged_config, config)
+    merged_config = merge_ci_hashes(merged_config, loaded_configs[0][1])
     validate_cargo_profiles(defaults, errors)
     validate_release_gates(merged_config, defaults, errors)
     validate_worker_publication(merged_config, errors)
