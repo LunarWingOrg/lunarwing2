@@ -615,11 +615,17 @@ interpreter through one PATH-independent helper — the
 `python3` under `/usr/local/bin:/usr/bin:/bin`, allowlisted to plain path
 characters — so the two cannot drift apart and the calling process's PATH
 (a venv, sudo's `secure_path`, a pyenv shim) cannot flip a verdict or
-ping-pong the units between spellings. Units rendered before this pinning
-carried the caller's python3 spelling; on the first guarded operation they
-are **refused once** — run `render-units --all-proxies` to re-render them
-under the canonical interpreter (or set `LUNARWING_MT_PROXY_PYTHON3` to
-the existing spelling). Any
+ping-pong the units between spellings. The override lives only in the
+calling process's environment and nothing persists it: health-fleet cron,
+the watchdog, onboarding verify and `sudo` under `env_reset` do not carry
+it, and any render without it switches the spelling back (archiving the
+override-rendered units) — prefer re-rendering to the canonical spelling
+over carrying an override. Units rendered before this pinning carried the
+caller's python3 spelling; units whose interpreter spelling differs from
+the canonical one are refused until re-rendered — run `render-units
+--all-proxies` to re-render them under the canonical interpreter
+(`upgrade-tenant` does this automatically via `render_all_openrc_proxy_units`
+in `upgrade_tenant_locked`, `04-tenant-lifecycle.sh`). Any
 extra, missing, reordered, or payload-carrying line — a legacy inline
 `--tensorzero <url>` flag, command substitution, a backtick, a prepended
 override, a replaced `proxy_command` — fails the contract, and the unit
