@@ -227,7 +227,11 @@ candidate job — the scan can only succeed after a candidate publishes
   lacks python3 and the entrypoint config tests bash-run `entrypoint.sh`,
   whose config section embeds python3 heredocs — from the pinned
   `CI_DEBIAN_SNAPSHOT` archive (tied to the Dockerfile `ARG DEBIAN_SNAPSHOT`
-  by `validate_config.py`), not the live deb.debian.org mirror. Runs on every MR/branch
+  by `validate_config.py`), not the live deb.debian.org mirror. That archive
+  is a best-effort, throttled service, so the lane's `apt-get update` runs
+  with `Acquire::Retries=5`/`Acquire::http::Timeout=60`; a snapshot outage
+  still fails this required lane until the service recovers (retry the job).
+  Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
   `validate_config.py` ties to the node FROM digest(s) in
   `kimicode4lunarwing/Dockerfile` (fail-closed, like the bun tie). The
