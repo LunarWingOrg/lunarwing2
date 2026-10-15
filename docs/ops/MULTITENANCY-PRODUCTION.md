@@ -609,8 +609,10 @@ tenant name identical in the description/user/group/`before` slots, the
 canonical renderer paths (python interpreter, tenant proxy script,
 run/log/env dirs, env-exec launcher), a numeric port, no NUL/CR bytes,
 and a final newline. Renderer and contract render from one shared body
-source in `mt-admin-lib/08-units-openrc.sh` and resolve the python
-interpreter through one PATH-independent helper — the
+source, `ic-infrastructure-health-check/openrc-proxy-unit-contract.sh`
+(sourced by mt-admin from the repo and by the root health cron from its
+installed copy — WI#410), and resolve the python interpreter through one
+PATH-independent helper — the
 `LUNARWING_MT_PROXY_PYTHON3` override when set, otherwise the first
 `python3` under `/usr/local/bin:/usr/bin:/bin`, allowlisted to plain path
 characters — so the two cannot drift apart and the calling process's PATH
@@ -672,6 +674,40 @@ stopped state only as exit **1** with stdout `stopped` (and the active state
 only as exit **0** with stdout `active`). `export-tenant.sh` and
 `import-tenant.sh --resume` enforce exactly that pairing and refuse anything
 else as unverifiable (WI#393 FL-5).
+
+**Runtime re-check in the root health cron (WI#410):** the arming-time
+refusal in `ic/scripts/enable-health-fleet.sh` covers only the moment the
+cron is installed — a legacy proxy unit that reappears afterwards (or an
+interrupted `render-units` that leaves one behind) would otherwise be
+driven by the next root-cron tick with no gate. Both root-executed health
+scripts therefore re-check the same safe-unit contract at the top of every
+tick, before any `rc-service` invocation:
+`ic-infrastructure-health-check/health-openrc.sh` fails closed with a
+critical JSON report (empty `.metrics.services`, so self-heal gains no
+restart target from it) naming the offending unit and the fleet
+migration, and `ic-infrastructure-health-check/lunarwing-self-heal.sh`
+(OpenRC hosts only) refuses before any probe, restart, or state mutation
+with the same `render-units --all-proxies` remediation. Because
+`HEALTHCHECK_NOTIFY` is off on MT hosts and the refusal report carries no
+restart target, self-heal's refusal itself **pages**: an
+`ESCALATE target=openrc-proxy-units` line in `actions.log` and one
+notification per `SELF_HEAL_ESCALATE_COOLDOWN` (default 3600 s) through
+the normal escalation path, with no lock taken and no state written.
+The blast radius is deliberately fleet-wide, like mt-admin's own
+preflight: one offending unit blanks **all** OpenRC probing and **all**
+self-heal remediation on the host, every tick, until the sweep succeeds
+(the health report shows `openrc: critical` with no services, and the
+metrics exporter shows `lunarwing_health_status{component="openrc"} 2`).
+For a stale unit of a removed tenant the sweep itself stops
+(`unregistered proxy unit … move it outside init.d`), so move that file
+out by hand first, then run the sweep. The contract is not a copy: both
+scripts source mt-admin's own `openrc_proxy_unit_is_safe` from
+`openrc-proxy-unit-contract.sh` in the installed health lib
+(`/usr/local/lib/lunarwing-health`, synced by `add-tenant`,
+`upgrade-tenant` and `enable-health-fleet.sh`); a template change reaches
+the cron at the next sync, and until then the cron refuses re-rendered
+units (and pages) rather than accepting them. A health-lib copy without
+the library refuses the same way.
 
 The patched `upgrade-tenant` performs the same fleet neutralization before
 backup/service probes even with `--skip-render` (`--skip-render` skips

@@ -7,14 +7,63 @@
 set -euo pipefail
 
 # Init-script directory. Overridable so the test suite can point at a fake
-# /etc/init.d without touching the host.
-INITD_DIR="${INITD_DIR:-/etc/init.d}"
+# /etc/init.d without touching the host; LUNARWING_MT_OPENRC_INITD_DIR is
+# mt-admin's (and lunarwing-self-heal.sh's) name for the same override
+# (WI#410 ID-7).
+INITD_DIR="${INITD_DIR:-${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}}"
 
 # Per-unit status-probe timeout (seconds). A container unit's status() shells out
 # to `podman inspect` as the tenant; with no bound, one wedged tenant could eat
 # the orchestrator's whole component budget (a single `timeout 30` around this
 # script) and blank remediation for EVERY tenant. 0 disables the wrapper.
 STATUS_TIMEOUT="${HEALTH_OPENRC_STATUS_TIMEOUT:-8}"
+
+# WI#410: runtime re-check of the WI#376 EQ-3 migration-window guard.
+# ic/scripts/enable-health-fleet.sh refuses to ARM this root cron while an
+# unsafe legacy proxy unit is installed, but that check is arming-time only:
+# a pre-migration unit can reappear (or an interrupted render-units can leave
+# one behind) after the cron is armed, and the next root tick would then drive
+# `rc-service` against it with no gate. Inspect the installed units as data
+# BEFORE any rc-service invocation and fail closed with the same remediation.
+# The contract is mt-admin's own openrc_proxy_unit_is_safe — byte-for-byte
+# equality with a fresh render from the shared template — sourced from
+# openrc-proxy-unit-contract.sh beside this script: one implementation for
+# the renderer, mt-admin's preflight guard and this cron (WI#410 ID-2). The
+# installed copy is refreshed by every health-lib sync (add-tenant,
+# upgrade-tenant, enable-health-fleet.sh), so a template change reaches this
+# guard at the next sync; until then re-rendered units are refused (and
+# self-heal pages), never accepted. One stat, one render and one cmp per
+# installed proxy unit, once per tick.
+OPENRC_PROXY_CONTRACT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/openrc-proxy-unit-contract.sh"
+
+# Fail closed without touching OpenRC: emit a valid critical report that names
+# the fleet migration. No services are probed and none are remediated (the
+# report carries an empty .metrics.services), so self-heal has no restart
+# target from this refusal; the page comes from self-heal's own guard, which
+# escalates once per cooldown (WI#410 ID-1). One offender blanks ALL OpenRC
+# probing on this host until the sweep succeeds — the same fleet-wide posture
+# as mt-admin's preflight (WI#410 ID-5).
+refuse_openrc_tick() {                                                  # <issue>
+  jq -n --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" --arg issue "$1" '{
+    component: "openrc",
+    status: "critical",
+    timestamp: $ts,
+    metrics: { services: [] },
+    issues: [$issue]
+  }'
+  exit 2
+}
+
+if [ ! -f "$OPENRC_PROXY_CONTRACT" ] || [ -L "$OPENRC_PROXY_CONTRACT" ]; then
+  refuse_openrc_tick "openrc-proxy-unit-contract.sh is missing beside health-openrc.sh; refusing to invoke rc-service as root without the WI#376 safe-unit contract (WI#410); re-sync the health lib: ic/scripts/lunarwing-mt-admin.sh upgrade-tenant <tenant> (or ic/scripts/enable-health-fleet.sh)"
+fi
+# shellcheck source=openrc-proxy-unit-contract.sh
+. "$OPENRC_PROXY_CONTRACT"
+
+UNSAFE_PROXY_UNIT="$(first_unsafe_openrc_proxy_unit "$INITD_DIR")" || true
+if [ -n "$UNSAFE_PROXY_UNIT" ]; then
+  refuse_openrc_tick "unsafe legacy proxy unit $UNSAFE_PROXY_UNIT installed; refusing to invoke rc-service as root (WI#410); run: ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies (a stale unit of a removed tenant must first be moved outside init.d by hand)"
+fi
 
 # Services to check (override via env: SERVICES="xmpp-bridge lunarwing").
 # Auto-discovers multi-tenant services from $INITD_DIR when no override is set.

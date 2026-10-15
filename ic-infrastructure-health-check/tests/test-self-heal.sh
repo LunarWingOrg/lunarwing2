@@ -13,6 +13,12 @@
 set -uo pipefail
 # shellcheck source=tests/lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+# WI#410 ID-2: the guard demands byte-for-byte equality with mt-admin's render,
+# so realistic lunarwing-proxy-* fixtures are rendered from the shared contract
+# library the script sources. <sb> <tenant>
+# shellcheck source=../openrc-proxy-unit-contract.sh
+source "$(dirname "$SH")/openrc-proxy-unit-contract.sh"
+mk_proxy_unit() { _openrc_proxy_unit_body "$2" 21001 >"$1/initd/lunarwing-proxy-$2"; chmod +x "$1/initd/lunarwing-proxy-$2"; }
 
 # ── A: jq-precedence regression + target selection (grace=1) ────────────────
 A="$(sb)"; report "$A" '{components:[
@@ -117,5 +123,104 @@ assert_range "$I2_next" "$((I2_started + 200))" "$((I2_finished + 200))" "I2: --
 I3="$(sb)"; mk_mockbin "$I3"; svc_down "$I3" lunarwing; svc_stuck "$I3" lunarwing; report "$I3" "$GW"
 run_chaos "$I3" systemd SELF_HEAL_GRACE_CHECKS=1 -- --verify-health false >/dev/null
 assert_eq "$(state_of "$I3" '.lunarwing.retries')" "1" "I3: --verify-health false skips health-check (is-active only)"
+
+# ── J: WI#410 runtime safe-unit guard (OpenRC migration window) ──────────────
+# An unsafe legacy proxy unit must refuse the WHOLE root-cron tick — no probe,
+# no restart, no state mutation — while a rendered (safe) unit keeps normal
+# remediation and the guard never fires under systemd.
+J="$(sb)"; mkdir -p "$J/initd"
+printf ': "${proxy_args:=/opt/x/lunarwing-proxy.py --port 21001 --tensorzero http://tz.example/tz?tok=abc}"\n' \
+  > "$J/initd/lunarwing-proxy-acme"; chmod +x "$J/initd/lunarwing-proxy-acme"
+report "$J" '{components:[{component:"openrc",status:"degraded",metrics:{services:[{name:"lunarwing-summer",status:"critical"}]}}]}'
+oJ="$(run_raw "$J" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$J/initd" \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$J/report.json" --backoff 0)"; RC=$?
+assert_contains "$oJ" "unsafe legacy proxy unit"          "J1: legacy proxy unit refuses the tick"
+assert_contains "$oJ" "render-units --all-proxies"        "J1: refusal names the remediation"
+assert_absent   "$oJ" "rc-service"                        "J1: no rc-service probe or restart runs"
+assert_absent   "$oJ" "RESTART"                           "J1: tick aborted before any remediation"
+assert_eq "$RC" 1 "J1: exit 1 (fail closed)"
+assert_eq "$(state_of "$J")" "" "J1: no state written"
+
+J2="$(sb)"; mkdir -p "$J2/initd"
+mk_proxy_unit "$J2" acme
+report "$J2" '{components:[{component:"openrc",status:"degraded",metrics:{services:[{name:"lunarwing-summer",status:"critical"}]}}]}'
+oJ2="$(run_dry "$J2" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$J2/initd" \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oJ2" "rc-service lunarwing-summer restart" "J2: safe rendered proxy unit keeps normal remediation"
+
+J3="$(sb)"; mkdir -p "$J3/initd"
+printf ': "${proxy_args:=/opt/x/lunarwing-proxy.py --port 21001 --tensorzero http://tz.example/tz?tok=abc}"\n' \
+  > "$J3/initd/lunarwing-proxy-acme"; chmod +x "$J3/initd/lunarwing-proxy-acme"
+report "$J3" "$GW"
+oJ3="$(run_dry "$J3" LUNARWING_SERVICE_MANAGER=systemd LUNARWING_MT_OPENRC_INITD_DIR="$J3/initd" \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oJ3" "would run: systemctl restart lunarwing" "J3: guard is OpenRC-only (systemd tick unaffected)"
+
+# Unit level (src_fn): the helper reports the first offender — a symlinked
+# proxy unit fails the contract even when its target is a safe rendered unit.
+J4="$(sb)"; mkdir -p "$J4/initd"
+mk_proxy_unit "$J4" ok
+assert_eq "$(src_fn LUNARWING_MT_OPENRC_INITD_DIR="$J4/initd" -- first_unsafe_openrc_proxy_unit "$J4/initd")" "" \
+  "J4: rendered safe units pass the guard"
+# J5's link target is a same-name unit that would pass as a regular file, so
+# the refusal pins the `! -L` check itself (run-126 ID-3 shape).
+mkdir -p "$J4/outside"; _openrc_proxy_unit_body link 21001 >"$J4/outside/lunarwing-proxy-link"; chmod +x "$J4/outside/lunarwing-proxy-link"
+ln -s "$J4/outside/lunarwing-proxy-link" "$J4/initd/lunarwing-proxy-link"
+assert_eq "$(src_fn LUNARWING_MT_OPENRC_INITD_DIR="$J4/initd" -- first_unsafe_openrc_proxy_unit "$J4/initd")" \
+  "$J4/initd/lunarwing-proxy-link" "J5: symlinked proxy unit is the first offender"
+
+# ── J6: WI#410 ID-1 — a persisting refusal pages once per cooldown ──────────
+# HEALTHCHECK_NOTIFY is false on MT hosts and the health report carries no
+# restart target, so the refusal itself must escalate: one page, a durable
+# ESCALATE line in actions.log, no state.json, and a second tick inside the
+# cooldown is deferred — still exit 1, still no rc-service.
+J6="$(sb)"; mkdir -p "$J6/initd" "$J6/bin"
+printf ': "${proxy_args:=/opt/x/lunarwing-proxy.py --port 21001 --tensorzero http://tz.example/tz?tok=abc}"\n' \
+  > "$J6/initd/lunarwing-proxy-acme"; chmod +x "$J6/initd/lunarwing-proxy-acme"
+printf '#!/usr/bin/env bash\necho "notified $1" >>"%s/pages"\nexit 0\n' "$J6" > "$J6/bin/notify"; chmod +x "$J6/bin/notify"
+report "$J6" '{components:[{component:"openrc",status:"degraded",metrics:{services:[{name:"lunarwing-summer",status:"critical"}]}}]}'
+oJ6="$(run_raw "$J6" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$J6/initd" \
+  SELF_HEAL_NOTIFY_SCRIPT="$J6/bin/notify" SELF_HEAL_ESCALATE_COOLDOWN=3600 \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$J6/report.json" --backoff 0)"; RC=$?
+assert_eq "$RC" 1 "J6: refusal exits 1"
+assert_contains "$oJ6" "unsafe legacy proxy unit"            "J6: refusal names the unit"
+assert_contains "$oJ6" "ESCALATING: openrc-proxy-units"      "J6: refusal escalates"
+assert_eq "$(wc -l <"$J6/pages" 2>/dev/null | tr -d ' ')" "1" "J6: exactly one page sent"
+assert_contains "$(cat "$J6/self-heal/actions.log" 2>/dev/null)" "ESCALATE target=openrc-proxy-units" "J6: durable ESCALATE line in actions.log"
+assert_eq "$(state_of "$J6")" "" "J6: still no state.json"
+assert_absent   "$oJ6" "rc-service"                          "J6: no rc-service around the page"
+oJ6b="$(run_raw "$J6" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$J6/initd" \
+  SELF_HEAL_NOTIFY_SCRIPT="$J6/bin/notify" SELF_HEAL_ESCALATE_COOLDOWN=3600 \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false -- --report "$J6/report.json" --backoff 0)"; RC=$?
+assert_eq "$RC" 1 "J6: second tick still refuses"
+assert_contains "$oJ6b" "COOLDOWN: page for openrc-proxy-units deferred" "J6: second tick is cooldown-deferred"
+assert_eq "$(wc -l <"$J6/pages" | tr -d ' ')" "1" "J6: no second page inside the cooldown"
+assert_eq "$(state_of "$J6")" "" "J6: second tick writes no state.json either"
+
+# ── J7: WI#410 ID-2 — a missing contract library is itself a refusal ────────
+# A hand-copied lunarwing-self-heal.sh without openrc-proxy-unit-contract.sh
+# beside it must not probe or restart anything as root; it pages like J6.
+J7="$(sb)"; mkdir -p "$J7/copy" "$J7/initd"; cp "$SH" "$J7/copy/lunarwing-self-heal.sh"
+report "$J7" '{components:[{component:"openrc",status:"degraded",metrics:{services:[{name:"lunarwing-summer",status:"critical"}]}}]}'
+oJ7="$(env LUNARWING_BASE_DIR="$J7" SELF_HEAL_STATE_DIR="$J7/self-heal" GOTIFY_TOKEN='' \
+  LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$J7/initd" SELF_HEAL_VERIFY_HEALTH=false \
+  "$J7/copy/lunarwing-self-heal.sh" --report "$J7/report.json" --backoff 0 2>&1)"; RC=$?
+assert_eq "$RC" 1 "J7: missing library refuses (exit 1)"
+assert_contains "$oJ7" "openrc-proxy-unit-contract.sh is missing" "J7: refusal names the library and the re-sync"
+assert_contains "$oJ7" "ESCALATING: openrc-proxy-units"          "J7: missing library pages"
+assert_absent   "$oJ7" "rc-service"                              "J7: no rc-service without the contract"
+assert_eq "$(state_of "$J7")" "" "J7: no state written"
+
+# ── J8: WI#410 ID-2 — the cron contract is mt-admin's byte-for-byte contract ─
+# The safe flag line plus a payload (accepted by the retired presence grep,
+# refused by mt-admin) refuses the whole tick here as well.
+J8="$(sb)"; mkdir -p "$J8/initd"
+mk_proxy_unit "$J8" acme
+echo 'start_post() { cp /root/.ssh/id_ed25519 /tmp/x; }' >>"$J8/initd/lunarwing-proxy-acme"
+report "$J8" '{components:[{component:"openrc",status:"degraded",metrics:{services:[{name:"lunarwing-summer",status:"critical"}]}}]}'
+oJ8="$(run_dry "$J8" LUNARWING_SERVICE_MANAGER=openrc LUNARWING_MT_OPENRC_INITD_DIR="$J8/initd" \
+  SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oJ8" "unsafe legacy proxy unit"   "J8: safe line plus payload refuses the tick"
+assert_absent   "$oJ8" "rc-service"                 "J8: no rc-service past a payload-carrying unit"
 
 finish
