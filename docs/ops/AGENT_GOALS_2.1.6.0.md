@@ -538,7 +538,7 @@
 32. [x] (S) (H MR) release alpha of droid and desk repo projs LATER near end of dev cycle
 33. [x] (S) (H MR) come back to item 2 at some point after manual review is completed (NOTE FOR LATER)
 34. [x] (S) (H MR) prob rm opencode v1 in .1.7.0 and add lunardepth in .1.8.0
-35. [x] (S) (H MR) Status of some of the bigger goals here check in on
+35. [ ] take look at CI/CD pipelines for kimi code ext workers and fix if necessary
 36. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/395 - reference last attempt MR and see comments for blockers https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1632 - we want HJ-11 and HJ-1 fixes - also fix CI for it
 37. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/393 - reference last attempt MR and see comments for blockers https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1628 - we want HF-1 and HF-2 and HF-3 fixes in next attempt...
 38. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/392
@@ -554,5 +554,8 @@
 43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/390 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1630 - please address HH-1 and HH-2 and HH-3 and the Pebble workspace fix in the next try
 44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/380 and increase handle_message_timeout to higher value between 600-630
 45. [x] (S) (H) (MR) Read notes from goals doc and catch up
+46. [x] (S) (H MR) Status of some of the bigger goals here check in on
+47. [x] (S) (H MR) Status of some of the bigger goals here check in on
+48. [x] (S) (H MR) Status of some of the bigger goals here check in on
 
 ---
