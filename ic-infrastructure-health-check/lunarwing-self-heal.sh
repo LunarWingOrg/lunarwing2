@@ -359,27 +359,36 @@ _openrc_restart() {
 # one behind) after the cron is armed, and the next root tick would then drive
 # rc-service against it — status probes here, and restarts through
 # _openrc_restart — with no gate. main() re-checks the installed units as data
-# before anything else and dies with the same remediation. The contract mirrors
-# mt-admin's openrc_proxy_unit_is_safe (ic/scripts/mt-admin-lib/08-units-openrc.sh)
-# and health-openrc.sh's copy — keep the three in sync. Cheap by construction:
-# one glob plus one grep per installed proxy unit, once per tick.
-OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
-openrc_proxy_unit_is_safe() {
-    local path="$1"
-    [[ -f "$path" && ! -L "$path" ]] || return 1
-    grep -Eq \
-        '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"
-}
+# before anything else and refuses with the same remediation. The contract is
+# mt-admin's own openrc_proxy_unit_is_safe, sourced from
+# openrc-proxy-unit-contract.sh beside this script (one implementation for
+# the renderer, mt-admin's preflight guard, health-openrc.sh and this script;
+# WI#410 ID-2 — see health-openrc.sh for the sync note). A missing library is
+# itself a refusal: this script never drives rc-service as root unguarded.
+# LUNARWING_MT_OPENRC_INITD_DIR is mt-admin's override name; INITD_DIR
+# (health-openrc.sh's) is accepted as an alias (WI#410 ID-7).
+OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-${INITD_DIR:-/etc/init.d}}"
+OPENRC_PROXY_CONTRACT="$SCRIPT_DIR/openrc-proxy-unit-contract.sh"
+OPENRC_PROXY_CONTRACT_MISSING=true
+if [[ -f "$OPENRC_PROXY_CONTRACT" && ! -L "$OPENRC_PROXY_CONTRACT" ]]; then
+    # shellcheck source=openrc-proxy-unit-contract.sh
+    source "$OPENRC_PROXY_CONTRACT"
+    OPENRC_PROXY_CONTRACT_MISSING=false
+fi
 
-# Echo the first installed lunarwing-proxy-* unit that fails the safe-unit
-# contract, exiting 1; rc 0 with empty output means the fleet is safe to drive.
-first_unsafe_openrc_proxy_unit() {
-    local path
-    for path in "$OPENRC_INITD_DIR"/lunarwing-proxy-*; do
-        [[ -e "$path" || -L "$path" ]] || continue
-        openrc_proxy_unit_is_safe "$path" || { printf '%s' "$path"; return 1; }
-    done
-    return 0
+# WI#410 ID-1: a persisting refusal must page. HEALTHCHECK_NOTIFY is false on
+# MT hosts and health-openrc.sh's critical report carries no restart target,
+# so without this nothing would page while one bad unit blanks all OpenRC
+# probing and remediation fleet-wide, every tick, indefinitely. Page once per
+# ESCALATE_COOLDOWN through the existing escalation path (a durable ESCALATE
+# line in actions.log, the cooldown stamp, the notifier), then fail closed:
+# exit 1, no lock taken, state.json never written (mkdir -p only — not
+# ensure_state_dir, which seeds state.json).
+refuse_openrc_tick() {                                       # <message> <reason>
+    log "FATAL: $1"
+    mkdir -p "$SELF_HEAL_STATE_DIR"
+    escalate_service "openrc-proxy-units" 0 "$2" || true
+    exit 1
 }
 
 _launchd_active() {
@@ -1004,12 +1013,15 @@ find_latest_report() {
 main() {
     # WI#410: re-check the WI#376 safe-unit guard on EVERY root-cron tick, not
     # only at arming time (ic/scripts/enable-health-fleet.sh). Fail closed
-    # before any probe, restart, or state mutation: die() leaves the lock,
-    # state, and escalation bookkeeping untouched and no rc-service runs.
+    # before any probe, restart, or state mutation: refuse_openrc_tick pages
+    # (ID-1), takes no lock, writes no state, and no rc-service runs.
     if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        if [[ "$OPENRC_PROXY_CONTRACT_MISSING" == true ]]; then
+            refuse_openrc_tick "openrc-proxy-unit-contract.sh is missing beside lunarwing-self-heal.sh; refusing to probe or restart services as root without the WI#376 safe-unit contract (WI#410); re-sync the health lib: ic/scripts/lunarwing-mt-admin.sh upgrade-tenant <tenant> (or ic/scripts/enable-health-fleet.sh)" "contract_missing"
+        fi
         local offender=""
-        offender="$(first_unsafe_openrc_proxy_unit)" || {
-            die "unsafe legacy proxy unit ${offender} installed; refusing to probe or restart services as root; run: ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies"
+        offender="$(first_unsafe_openrc_proxy_unit "$OPENRC_INITD_DIR")" || {
+            refuse_openrc_tick "unsafe legacy proxy unit ${offender} installed; refusing to probe or restart services as root (WI#410); run: ic/scripts/lunarwing-mt-admin.sh render-units --all-proxies (a stale unit of a removed tenant must first be moved outside init.d by hand)" "unsafe_proxy_unit:${offender##*/}"
         }
     fi
 

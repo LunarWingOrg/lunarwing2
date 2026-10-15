@@ -23,6 +23,12 @@ HAVE_TIMEOUT=1; command -v timeout >/dev/null 2>&1 || HAVE_TIMEOUT=0
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/health-openrc-test.XXXXXX")"
 trap 'rm -rf "$ROOT"' EXIT
 
+# WI#410 ID-2: the guard demands byte-for-byte equality with mt-admin's render,
+# so realistic lunarwing-proxy-* fixtures are rendered from the same shared
+# contract library the script sources (one implementation, no fixture drift).
+# shellcheck source=../openrc-proxy-unit-contract.sh
+source "$(dirname "$HC")/openrc-proxy-unit-contract.sh"
+
 pass=0; fail=0
 ok()  { printf 'PASS: %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf 'FAIL: %s\n      %s\n' "$1" "$2"; fail=$((fail + 1)); }
@@ -71,15 +77,15 @@ MOCK
   printf '%s' "$s"
 }
 
-# A rendered (post-WI#376) proxy unit body: the fixed flag line with no tenant
-# data. health-openrc.sh's WI#410 runtime guard refuses to drive rc-service past
-# any lunarwing-proxy-* unit that does not carry this contract, so realistic
-# fixtures under that name must include it.
-SAFE_PROXY_UNIT_LINE=': "${proxy_args:=/opt/lunarwing/tensorzero-proxy-configurations/lunarwing-proxy.py --port 21001 --bind 127.0.0.1 --tensorzero-env}"'
+# A rendered (post-WI#376) proxy unit body for <tenant>: mt-admin's own
+# render from the shared template. health-openrc.sh's WI#410 runtime guard
+# refuses to drive rc-service past any lunarwing-proxy-* unit that is not
+# byte-for-byte this render, so realistic fixtures under that name must be it.
+mk_proxy_body() { _openrc_proxy_unit_body "$1" 21001; }                # <tenant>
 
 mk_unit() {                                                             # <s> <name>
   case "$2" in
-    lunarwing-proxy-*) printf '%s\n' "$SAFE_PROXY_UNIT_LINE" >"$1/initd/$2" ;;
+    lunarwing-proxy-*) mk_proxy_body "${2#lunarwing-proxy-}" >"$1/initd/$2" ;;
     *)                 : >"$1/initd/$2" ;;
   esac
   chmod +x "$1/initd/$2"
@@ -475,6 +481,9 @@ run_hc "$s" RC_CALLS="$s/rc-calls"
 assert_json "$OUT" "S24: refusal emits valid JSON"
 assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S24: refusal reports critical"
 assert_eq "$(jq -r '.metrics.services | length' <<<"$OUT")" "0" "S24: no services probed (no self-heal targets)"
+if jq -e '.metrics | has("services")' >/dev/null <<<"$OUT"; then
+  ok "S24: report carries an explicit .metrics.services key"
+else bad "S24: report carries an explicit .metrics.services key" "metrics: $(jq -c '.metrics' <<<"$OUT")"; fi
 if jq -r '.issues[]?' <<<"$OUT" | grep -qF "render-units --all-proxies"; then
   ok "S24: issue names the render-units remediation"
 else bad "S24: issue names the render-units remediation" "issues: $(jq -c '.issues' <<<"$OUT")"; fi
@@ -487,9 +496,13 @@ if [ ! -s "$s/rc-calls" ]; then
 else bad "S24: zero rc-service invocations" "calls: $(cat "$s/rc-calls")"; fi
 
 # ── S25: WI#410 runtime guard — a symlinked proxy unit also refuses ──────────
+# The link target is a same-name unit that would pass the contract as a regular
+# file (the realistic WI#376 shape: a unit parked outside init.d and linked
+# back), so this refusal pins the `! -L` check itself, not the body check.
 s="$(new_scenario)"
 mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
-ln -s "$s/initd/lunarwing-acme" "$s/initd/lunarwing-proxy-acme"
+mkdir -p "$s/outside"; mk_proxy_body acme >"$s/outside/lunarwing-proxy-acme"; chmod +x "$s/outside/lunarwing-proxy-acme"
+ln -s "$s/outside/lunarwing-proxy-acme" "$s/initd/lunarwing-proxy-acme"
 run_hc "$s" RC_CALLS="$s/rc-calls"
 assert_json "$OUT" "S25: symlink refusal emits valid JSON"
 assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S25: symlink refusal reports critical"
@@ -509,6 +522,65 @@ assert_eq "$RC" 0 "S26: exit 0"
 if grep -qF -- "lunarwing-proxy-acme status" "$s/rc-calls" 2>/dev/null; then
   ok "S26: rc-service actually drove the safe unit"
 else bad "S26: rc-service actually drove the safe unit" "calls: $(cat "$s/rc-calls" 2>/dev/null)"; fi
+
+# ── S27: WI#410 ID-2 — the cron contract is mt-admin's byte-for-byte contract ─
+# A unit carrying the safe flag line plus a payload (what the retired presence
+# grep accepted while mt-admin refused it) must refuse here too, before any
+# rc-service call; so must a unit rendered for a different tenant name.
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;       fix_set "$s" lunarwing-acme       " * status: started" 0
+mk_unit "$s" lunarwing-proxy-acme; fix_set "$s" lunarwing-proxy-acme " * status: started" 0
+echo 'start_post() { cp /root/.ssh/id_ed25519 /tmp/x; }' >>"$s/initd/lunarwing-proxy-acme"
+run_hc "$s" RC_CALLS="$s/rc-calls"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S27: safe line plus payload refuses"
+assert_eq "$RC" 2 "S27: exit 2"
+if [ ! -s "$s/rc-calls" ]; then
+  ok "S27: zero rc-service invocations"
+else bad "S27: zero rc-service invocations" "calls: $(cat "$s/rc-calls")"; fi
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+mk_proxy_body other >"$s/initd/lunarwing-proxy-acme"; chmod +x "$s/initd/lunarwing-proxy-acme"
+run_hc "$s" RC_CALLS="$s/rc-calls"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S27: unit rendered for another tenant name refuses"
+assert_eq "$RC" 2 "S27: exit 2 (wrong tenant)"
+
+# ── S28: WI#410 ID-2 — a missing contract library is itself a refusal ────────
+# A hand-copied health-openrc.sh without openrc-proxy-unit-contract.sh beside
+# it must not fall back to driving rc-service unguarded.
+s="$(new_scenario)"; mkdir -p "$s/copy"; cp "$HC" "$s/copy/health-openrc.sh"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+OUT="$(env PATH="$s/bin:$PATH" INITD_DIR="$s/initd" RUNLEVELS_DIR="$s/runlevels" RC_FIX="$s/fix" \
+    HEALTH_OPENRC_CRON_DIRS="$s/crondirs" SERVICES='' RC_CALLS="$s/rc-calls" bash "$s/copy/health-openrc.sh" 2>&1)"
+RC=$?
+assert_json "$OUT" "S28: missing-library refusal emits valid JSON"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S28: missing-library refusal reports critical"
+if jq -r '.issues[]?' <<<"$OUT" | grep -qF "openrc-proxy-unit-contract.sh"; then
+  ok "S28: issue names the missing library and the re-sync"
+else bad "S28: issue names the missing library and the re-sync" "issues: $(jq -c '.issues' <<<"$OUT")"; fi
+assert_eq "$RC" 2 "S28: exit 2"
+if [ ! -s "$s/rc-calls" ]; then
+  ok "S28: zero rc-service invocations"
+else bad "S28: zero rc-service invocations" "calls: $(cat "$s/rc-calls")"; fi
+
+# ── S29: WI#410 ID-2 — the cron's layout fallback matches mt-admin's layout ──
+# Outside mt-admin the shared library renders with its own tenant-layout
+# fallbacks; a unit written with mt-admin's literal paths (/home/<tenant>/
+# lunarwing/{tensorzero-proxy-configurations,run,logs,env} and the fixed
+# env-exec launcher) must therefore pass. If the fallbacks ever diverge from
+# 00-common.sh this fails closed here first, not on a live host.
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+pybin="$(_openrc_proxy_python3)"
+_openrc_proxy_unit_template \
+  | sed -e 's|@NAME@|acme|g' -e 's|@PORT@|21001|g' -e "s|@PYBIN@|$pybin|g" \
+        -e 's|@PROXYBIN@|/home/acme/lunarwing/tensorzero-proxy-configurations/lunarwing-proxy.py|g' \
+        -e 's|@RUNDIR@|/home/acme/lunarwing/run|g' -e 's|@LOGDIR@|/home/acme/lunarwing/logs|g' \
+        -e 's|@ENVDIR@|/home/acme/lunarwing/env|g' -e 's|@ENVEXEC@|/usr/local/libexec/lunarwing-openrc-env-exec|g' \
+  >"$s/initd/lunarwing-proxy-acme"; chmod +x "$s/initd/lunarwing-proxy-acme"
+fix_set "$s" lunarwing-proxy-acme " * status: started" 0
+run_hc "$s" RC_CALLS="$s/rc-calls"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S29: literal mt-admin layout passes the cron guard"
+assert_eq "$(svc_field "$OUT" lunarwing-proxy-acme status)" "healthy" "S29: literal-layout proxy unit probed"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
