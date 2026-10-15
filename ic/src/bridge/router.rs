@@ -470,12 +470,18 @@ async fn persist_and_notify_thread_gate(
 
     // WI#308 (run-33 AQ-2): mission runs execute unsupervised by
     // construction, so the prompt approving a run-spawning verb must say
-    // what the human is really authorizing.
+    // what the human is really authorizing. WI#356 (run-40 BF-1): the
+    // prompt must also disclose the fan-out — the spawned thread may steer
+    // any of the owner's missions, not just the one that spawned it.
+    // Run-107 GM-1: the steering a Mission thread's update may do is
+    // narrowed to goal/focus/criteria/retry fields — cadence, webhook
+    // secret, budget, rename and notification-channel changes stay
+    // foreground-only — so the disclosure names the remaining reach.
     let description = if crate::bridge::effect_adapter::MISSION_RUN_SPAWNING_ACTION_NAMES
         .contains(&action_name.as_str())
     {
         format!(
-            "Tool '{}' requires {} (gate: {gate_name}). Approved mission runs execute unsupervised: the spawned mission threads do not pause for approval.",
+            "Tool '{}' requires {} (gate: {gate_name}). Approved mission runs execute unsupervised: the spawned mission threads do not pause for approval and may steer any of your missions (fire, pause, resume, goal/focus updates) without asking.",
             action_name,
             resume_kind.kind_name()
         )
@@ -9382,6 +9388,15 @@ pub(crate) mod tests {
             "run-spawning approvals must disclose unsupervised runs: {}",
             pending[0].description
         );
+        // WI#356 (run-40 BF-1): the prompt must also disclose the fan-out —
+        // the spawned thread may steer any of the owner's missions.
+        assert!(
+            pending[0]
+                .description
+                .contains("may steer any of your missions"),
+            "run-spawning approvals must disclose the fan-out: {}",
+            pending[0].description
+        );
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
             .await
@@ -9414,6 +9429,62 @@ pub(crate) mod tests {
             }
             other => panic!("expected ApprovalNeeded, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_spawning_gate_prompts_disclose_mission_fanout() {
+        // WI#356 (run-40 BF-1): every run-spawning verb's approval prompt
+        // discloses that the approved run is unsupervised and may steer any
+        // of the owner's missions; a non-run-spawning verb keeps the plain
+        // description.
+        use crate::testing::StubChannel;
+
+        async fn gate_description_for(action_name: &str) -> String {
+            let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+            let (stub, _tx) = StubChannel::new("xmpp");
+            manager.add(Box::new(stub)).await;
+            let store = Arc::new(TestStore::new());
+            let state = make_expected_test_state(store);
+            let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+            let outcome = ThreadOutcome::GatePaused {
+                gate_name: "approval".into(),
+                action_name: action_name.into(),
+                call_id: format!("call-{action_name}"),
+                parameters: serde_json::json!({"name": "digest"}),
+                resume_kind: lunarwing_engine::ResumeKind::Approval {
+                    allow_always: false,
+                },
+                resume_output: None,
+            };
+            persist_and_notify_thread_gate(
+                &manager,
+                &state,
+                &message,
+                lunarwing_engine::ConversationId::new(),
+                lunarwing_engine::ThreadId::new(),
+                outcome,
+            )
+            .await
+            .expect("mission gate should be persisted and announced");
+            let pending = state.pending_gates.list_for_user("alice").await;
+            assert_eq!(pending.len(), 1, "{action_name}: one gate persisted");
+            pending[0].description.clone()
+        }
+
+        for verb in crate::bridge::effect_adapter::MISSION_RUN_SPAWNING_ACTION_NAMES {
+            let description = gate_description_for(verb).await;
+            assert!(
+                description.contains("unsupervised")
+                    && description.contains("may steer any of your missions"),
+                "{verb} approval must disclose the unsupervised fan-out: {description}"
+            );
+        }
+
+        let plain = gate_description_for("mission_pause").await;
+        assert!(
+            !plain.contains("unsupervised"),
+            "a non-run-spawning verb keeps the plain description: {plain}"
+        );
     }
 
     // ── Phase 5: scoped control routing ──────────────────────────
