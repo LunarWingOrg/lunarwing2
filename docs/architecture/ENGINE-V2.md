@@ -938,13 +938,18 @@ replaces the whole `pending_shutdown_interruption` value and drops the
 newer entries (those fires keep their `INTERRUPTED` entry and dedup
 release but are never retried). A re-upgrade's boot sweep resolves each
 surviving interruption stamp younger than 24 hours
-(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) through the WI#338 scan-time
-parity checks — the stamped thread must be a Mission-type thread of the
-mission's own project and owner (unless the mission is shared) and listed
-in the mission's `thread_history`; a mismatch clears the stamp
-record-only, and the same checks guard the retry-marker sweep and the
-recoverable-thread resume — record-only beyond that — and emits every owed outcome
-notice it finds, with no age bound. The
+(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) — record-only beyond that — and
+emits every owed outcome notice it finds, with no age bound. Each stamp
+first passes the WI#338 scan-time parity checks: the stamped thread must
+be a Mission-type thread of the mission's own project and owner (unless
+the mission is shared) and listed in the mission's `thread_history`; a
+mismatch clears the stamp silently (a warn log only — no approach-history
+entry, retry marker or notice), and the retry-marker sweep and the
+recoverable-thread resume skip history threads that fail the same
+project/owner checks. These checks stop partial forgeries (only the stamp
+or `thread_history` edited) and store corruption, not a forger who
+rewrites the whole `mission.json` (`user_id`, `project_id`,
+`thread_history`); WI#322 is the fix. The
 upgrade direction has its own wrinkle: every live retry marker written by
 a build before WI#276 (pre-v2.1.5.0) deserializes with `notified: false`
 (the field is newer than those markers), so the first boot after the
@@ -1241,7 +1246,8 @@ update that switches to a Webhook cadence from another cadence, changes
 the path, or adds a usable
 secret to a dormant claim, and on resume
 (AO-1); the claim check and the save are serialized by the shared
-mission create lock (`_claim_guard`) on every claim-making transition —
+`mission_create_lock` (held as `_create_guard` in create and
+`_claim_guard` in update/resume) on every claim-making transition —
 create, update, and resume alike — so two racing transitions cannot both
 pass the check and both save (CJ-4); updates that leave the claim untouched are not re-checked (a
 same-path re-set is deliberately not checked), so
