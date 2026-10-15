@@ -992,8 +992,15 @@ mod tests {
             HeaderScrub::Unchanged
         ));
 
-        // HA-9: a 1-3 byte spelling never rewrites unrelated values.
-        let short = credential_echo_spellings("abc");
+        // HA-9 (run-114 HJ-4): a 1-3 byte spelling never rewrites unrelated
+        // values — "utf" DOES occur in "charset=utf-8", so dropping the
+        // guard would splice it and fail this pin (the previous "abc"
+        // fixture never occurred in the value and pinned nothing).
+        let short = credential_echo_spellings("utf");
+        assert!(matches!(
+            scrub_header_value(b"charset=utf-8", &short),
+            HeaderScrub::Unchanged
+        ));
         assert!(matches!(
             scrub_header_value(b"charset=utf-8; q=0.9", &short),
             HeaderScrub::Unchanged
@@ -1326,6 +1333,122 @@ mod tests {
         assert!(
             !logs_contain(SECRET_STEM) && !logs_contain(&encoded),
             "echoed secret leaked into the proxy log"
+        );
+
+        proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    /// WI#395 (run-114 HJ-3): pin the forced-identity request and the
+    /// opaque-encoding 502 on a credential-injected exchange — a stubborn
+    /// gzip upstream that reports the `Accept-Encoding` it received. The
+    /// container asks for gzip; the proxy must send `identity` and refuse
+    /// the gzip body rather than forward it blind. Pins two previously
+    /// untested branches: forwarding the container's own Accept-Encoding,
+    /// and disabling the opaque-encoding refusal.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_credential_exchange_forces_identity_and_refuses_compressed_body() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-gzip-secret-4b5c6d+/==";
+        const SECRET_STEM: &str = "qp-gzip-secret-4b5c6d";
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let received: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let recorder = Arc::clone(&received);
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let recorder = Arc::clone(&recorder);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        conn.read(&mut buf),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let accept_encoding = head.lines().find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("accept-encoding:")
+                            .map(|v| v.trim().to_string())
+                    });
+                    if let Some(v) = accept_encoding {
+                        *recorder.lock().unwrap() = Some(v);
+                    }
+                    // Gzip magic + opaque payload, regardless of what the
+                    // proxy asked for (a stubborn upstream).
+                    let body: &[u8] = b"\x1f\x8b\x08opaque-gzip-bytes";
+                    let mut out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(body);
+                    let _ = conn.write_all(&out).await;
+                });
+            }
+        });
+
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping {
+            secret_name: "QP_TOKEN".to_string(),
+            location: CredentialLocation::QueryParam {
+                name: "api_key".to_string(),
+            },
+            host_patterns: vec!["127.0.0.1".to_string()],
+            path_patterns: Vec::new(),
+            optional: false,
+        }];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+
+        let proxy = HttpProxy::new(decider, resolver);
+        let addr = proxy.start(0).await.unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n\r\n"
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 502"), "{text}");
+        assert!(
+            !response.windows(2).any(|w| w == b"\x1f\x8b"),
+            "gzip magic must not reach the container: {text}"
+        );
+        assert!(
+            !text.contains(SECRET_STEM) && !text.contains("api_key="),
+            "injected credential leaked into the refusal: {text}"
+        );
+        assert_eq!(
+            received.lock().unwrap().as_deref(),
+            Some("identity"),
+            "the proxy must request identity on the credential-injected exchange"
+        );
+        assert!(logs_contain(
+            "refused content-encoded response body that cannot be scrubbed"
+        ));
+        assert!(
+            !logs_contain(SECRET_STEM) && !logs_contain("api_key="),
+            "injected credential leaked into the proxy log"
         );
 
         proxy.stop().await;

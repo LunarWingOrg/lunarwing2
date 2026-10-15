@@ -302,6 +302,13 @@ struct StoreData {
     /// Empty until the daemon populates it at startup (after the bridge is built),
     /// so tools created before the bridge still see it at run time.
     ssh_bridge: Arc<std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::bridge::ssh::SSHBridge>>>>,
+    /// Whether the most recent `http_request_inner` exchange had a credential
+    /// injected (placeholder substitution or host-credential match). Read by
+    /// [`StoreData::redact_http_outcome_for_guest`] to scope the
+    /// compressed-response refusal to credential-injected exchanges (WI#395
+    /// run-114 HJ-1); ordinary guests may still ask for and receive an
+    /// encoding they decode themselves.
+    last_http_exchange_had_credentials: bool,
 }
 
 impl StoreData {
@@ -325,6 +332,7 @@ impl StoreData {
             http_runtime: None,
             http_interceptor: None,
             ssh_bridge: Arc::new(std::sync::OnceLock::new()),
+            last_http_exchange_had_credentials: false,
         }
     }
 
@@ -382,13 +390,17 @@ impl StoreData {
     /// Inject pre-resolved host credentials into the request.
     ///
     /// Matches the URL host against each resolved credential's host_patterns.
-    /// Matching credentials have their headers merged and query params appended.
+    /// Matching credentials have their headers merged and query params
+    /// appended. Returns whether any credential was applied (WI#395
+    /// run-114 HJ-1: credential-injected exchanges force identity
+    /// encoding).
     fn inject_host_credentials(
         &self,
         url_host: &str,
         headers: &mut HashMap<String, String>,
         url: &mut String,
-    ) {
+    ) -> bool {
+        let mut applied = false;
         for cred in &self.host_credentials {
             let matches = cred
                 .host_patterns
@@ -410,6 +422,7 @@ impl StoreData {
             for (key, value) in &cred.headers {
                 headers.insert(key.clone(), value.clone());
             }
+            applied = true;
 
             // Append query parameters to URL (insert before fragment if present)
             if !cred.query_params.is_empty() {
@@ -436,6 +449,7 @@ impl StoreData {
                 }
             }
         }
+        applied
     }
 
     /// Apply the guest-facing redaction to one HTTP exchange outcome (WI#395).
@@ -448,12 +462,34 @@ impl StoreData {
     /// (run-111 HA-3) — are covered alongside send errors. Headers are
     /// redacted per field before serialization so JSON-escaping cannot hide
     /// a secret containing `"` or `\` (run-111 HA-8).
+    ///
+    /// A credential-injected exchange additionally refuses a
+    /// content-encoded response body (run-114 HJ-1): the wrapper's reqwest
+    /// build has no decompression features, so an encoded body reaches the
+    /// byte-level scrub as opaque bytes the scrub cannot inspect — and the
+    /// guest, which chose `Accept-Encoding`, could decode an echo itself.
+    /// The wrapper forces `accept-encoding: identity` on those requests;
+    /// a non-identity `Content-Encoding` in the answer is refused rather
+    /// than forwarded blind. The refusal lives here so the interceptor
+    /// test path pins it end to end.
     fn redact_http_outcome_for_guest(
         &self,
         outcome: Result<lunarwing::agent::host::HttpResponse, String>,
     ) -> Result<lunarwing::agent::host::HttpResponse, String> {
         match outcome {
             Ok(mut resp) => {
+                if self.last_http_exchange_had_credentials
+                    && !resp.body.is_empty()
+                    && guest_content_encoding_is_opaque(&resp.headers_json)
+                {
+                    tracing::warn!(
+                        "WASM http_request: refused content-encoded response body that cannot be scrubbed for echoed credentials"
+                    );
+                    return Err(
+                        "HTTP response refused: content-encoded body cannot be inspected for echoed credentials"
+                            .to_string(),
+                    );
+                }
                 resp.body = self.redact_credential_bytes(std::mem::take(&mut resp.body));
                 resp.headers_json = self.redact_headers_json(&resp.headers_json);
                 Ok(resp)
@@ -524,6 +560,8 @@ impl StoreData {
     ) -> Result<lunarwing::agent::host::HttpResponse, String> {
         // Inject credentials into URL (e.g., replace {XMPP_PASSWORD})
         let injected_url = self.inject_credentials(&url, "url");
+        let url_placeholder_injected = injected_url != *url;
+        self.last_http_exchange_had_credentials = url_placeholder_injected;
         enforce_scoped_http_target(&injected_url, self.scoped_http_prefix.as_deref())?;
 
         // Check HTTP allowlist
@@ -561,22 +599,38 @@ impl StoreData {
                 .map_err(|e| format!("Potential secret leak in body blocked: {}", e))?;
         }
 
+        let mut header_placeholder_injected = false;
         let mut headers: HashMap<String, String> = raw_headers
             .into_iter()
             .map(|(k, v)| {
-                (
-                    k.clone(),
-                    self.inject_credentials(&v, &format!("header:{}", k)),
-                )
+                let injected = self.inject_credentials(&v, &format!("header:{}", k));
+                header_placeholder_injected |= injected != v;
+                (k, injected)
             })
             .collect();
+        self.last_http_exchange_had_credentials |= header_placeholder_injected;
 
         let mut url = injected_url;
 
         // Inject pre-resolved host credentials (Bearer tokens, API keys, etc.)
         // based on the request's target host.
         if let Some(host) = extract_host_from_url(&url) {
-            self.inject_host_credentials(&host, &mut headers, &mut url);
+            self.last_http_exchange_had_credentials |=
+                self.inject_host_credentials(&host, &mut headers, &mut url);
+        }
+
+        // WI#395 (run-114 HJ-1): a compressed response body reaches the
+        // byte-level scrub as opaque bytes this build cannot decompress,
+        // and the guest — which chose `Accept-Encoding` — could decode an
+        // echo itself. Credential-injected exchanges therefore ask for
+        // identity only, replacing every guest spelling of the header
+        // (a naive insert would leave both spellings and reqwest sends
+        // both). Ordinary requests keep the guest's value. The answer's
+        // `Content-Encoding` is refused in `redact_http_outcome_for_guest`
+        // if it is not identity.
+        if self.last_http_exchange_had_credentials {
+            headers.retain(|k, _| !k.eq_ignore_ascii_case("accept-encoding"));
+            headers.insert("accept-encoding".to_string(), "identity".to_string());
         }
         let bypass_proxy = url::Url::parse(&url).is_ok_and(|parsed| {
             is_local_service_url(&parsed)
@@ -875,6 +929,23 @@ fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
         haystack.splice(at..at + needle.len(), marker.iter().copied());
         search_from = at + marker.len();
     }
+}
+
+/// True when the serialized response header map declares a body encoding the
+/// wrapper cannot byte-scrub (WI#395 run-114 HJ-1). Missing, empty and
+/// `identity` encodings are inspectable. Every `Content-Encoding` field is
+/// considered (case-insensitive name), values are split on commas, and a
+/// token that is not `identity` makes the body opaque.
+fn guest_content_encoding_is_opaque(headers_json: &str) -> bool {
+    let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+        return false;
+    };
+    map.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-encoding")
+            && value
+                .split(',')
+                .any(|token| !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case("identity"))
+    })
 }
 
 /// Format a reqwest send error without exposing the request URL.
@@ -3684,6 +3755,144 @@ mod tests {
             resp.headers_json.contains("[REDACTED:host_credential]"),
             "{}",
             resp.headers_json
+        );
+    }
+
+    /// WI#395 (run-114 HJ-1): the guest chooses `Accept-Encoding` and the
+    /// wrapper's reqwest build has no decompression features, so a
+    /// compressed response body reaches the byte-level scrub as opaque
+    /// bytes it cannot inspect — while the guest, which asked for the
+    /// encoding, can decode an echoed credential itself. A
+    /// credential-injected exchange must send exactly one
+    /// `accept-encoding: identity` (replacing every guest spelling) and
+    /// refuse a non-identity `Content-Encoding` answer; an ordinary
+    /// exchange keeps the guest's own header and answer untouched.
+    #[test]
+    fn guest_http_request_forces_identity_and_refuses_compressed_body() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
+        use crate::tools::wasm::capabilities::{Capabilities, EndpointPattern, HttpCapability};
+        use crate::tools::wasm::wrapper::{ResolvedHostCredential, StoreData};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        const SECRET: &str = "gzipguestsecret6j7k8l+/==";
+
+        #[derive(Debug)]
+        struct GzipStub {
+            seen: Mutex<Vec<Vec<(String, String)>>>,
+        }
+        #[async_trait::async_trait]
+        impl HttpInterceptor for GzipStub {
+            async fn before_request(
+                &self,
+                request: &HttpExchangeRequest,
+            ) -> Option<HttpExchangeResponse> {
+                self.seen.lock().unwrap().push(request.headers.clone());
+                // Gzip magic + opaque payload: what a stubborn upstream
+                // answers regardless of the Accept-Encoding it received.
+                Some(HttpExchangeResponse {
+                    status: 200,
+                    headers: vec![
+                        ("content-encoding".to_string(), "gzip".to_string()),
+                        ("content-type".to_string(), "application/json".to_string()),
+                    ],
+                    body: "\u{1f}\u{8b}opaque-gzip-bytes".to_string(),
+                })
+            }
+
+            async fn after_response(
+                &self,
+                _request: &HttpExchangeRequest,
+                _response: &HttpExchangeResponse,
+            ) {
+            }
+        }
+
+        let stub = Arc::new(GzipStub {
+            seen: Mutex::new(Vec::new()),
+        });
+        let capabilities =
+            Capabilities::default().with_http(HttpCapability::new(vec![EndpointPattern::host(
+                "93.184.216.34",
+            )]));
+
+        // Credential-injected exchange: the host credential forces identity
+        // and the gzip answer is refused at the trait boundary.
+        let mut query_params = HashMap::new();
+        query_params.insert("api_key".to_string(), SECRET.to_string());
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["93.184.216.34".to_string()],
+            headers: HashMap::new(),
+            query_params,
+            secret_value: SECRET.to_string(),
+            url_prefix: None,
+        }];
+        let mut credentialed =
+            StoreData::new(1024 * 1024, capabilities.clone(), HashMap::new(), host_credentials);
+        credentialed.http_interceptor =
+            Some(Arc::clone(&stub) as Arc<dyn HttpInterceptor>);
+
+        let err = credentialed
+            .http_request(
+                "GET".to_string(),
+                "https://93.184.216.34/mapped".to_string(),
+                "{\"Accept-Encoding\":\"gzip, deflate\",\"X-Custom\":\"keep\"}".to_string(),
+                None,
+                None,
+            )
+            .expect_err("compressed body on a credential-injected exchange must be refused");
+        assert!(
+            err.contains("content-encoded body cannot be inspected"),
+            "unexpected refusal reason: {err}"
+        );
+
+        let seen = stub.seen.lock().unwrap().pop().unwrap();
+        let accept_encoding: Vec<&(String, String)> = seen
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+            .collect();
+        assert_eq!(
+            accept_encoding.len(),
+            1,
+            "expected exactly one accept-encoding spelling sent: {seen:?}"
+        );
+        assert_eq!(accept_encoding[0].1, "identity", "{seen:?}");
+        assert!(
+            seen.iter().any(|(k, v)| k == "X-Custom" && v == "keep"),
+            "forcing identity must not drop unrelated headers: {seen:?}"
+        );
+
+        // Ordinary exchange (no credential configured for this host): the
+        // guest's own Accept-Encoding is forwarded and its compressed
+        // answer delivered — the refusal is scoped to credential-injected
+        // exchanges.
+        let mut ordinary =
+            StoreData::new(1024 * 1024, capabilities, HashMap::new(), Vec::new());
+        ordinary.http_interceptor = Some(Arc::clone(&stub) as Arc<dyn HttpInterceptor>);
+
+        let resp = ordinary
+            .http_request(
+                "GET".to_string(),
+                "https://93.184.216.34/mapped".to_string(),
+                "{\"Accept-Encoding\":\"gzip, deflate\"}".to_string(),
+                None,
+                None,
+            )
+            .expect("an ordinary compressed exchange is the guest's own choice");
+        assert_eq!(resp.status, 200);
+        assert!(
+            resp.headers_json.contains("gzip"),
+            "ordinary exchange keeps its content-encoding: {}",
+            resp.headers_json
+        );
+        assert!(!resp.body.is_empty());
+
+        let seen = stub.seen.lock().unwrap().pop().unwrap();
+        assert!(
+            seen.iter().any(|(k, v)| k.eq_ignore_ascii_case("accept-encoding")
+                && v == "gzip, deflate"),
+            "ordinary exchange must forward the guest's accept-encoding: {seen:?}"
         );
     }
 

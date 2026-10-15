@@ -406,22 +406,30 @@ redirect-hop debug lines included).
 Forwarded response headers are also scrubbed: an upstream can echo the
 injected credential back to the container (an always-HTTPS edge answering a
 plain-HTTP request with `301 Location: https://host/path?name=<form-encoded
-secret>`), so every spelling of the injected credential — raw and
-form-encoded — is replaced with `[REDACTED]` in header values before they
-reach the container, with a host-side warn naming the header only (WI#395).
-Re-encoded echoes that evade exact two-spelling matching (lowercase hex,
-double percent-encoding, `+` read as a space) are detected by
+secret>`), so the raw and form-encoded spellings of the injected credential
+are replaced with `[REDACTED]` in header values before they reach the
+container, with a host-side warn naming the header only (WI#395).
+Re-encoded echoes that evade that exact two-spelling matching (lowercase
+hex, double percent-encoding, `+` read as a space) are detected by
 percent-decoding up to two rounds and replace the whole header value;
 spellings shorter than 4 bytes are never spliced into header values (a
 1-3 byte "secret" corrupts unrelated headers for no security gain), and
-`Content-Length` is dropped rather than rewritten.
+`Content-Length` is dropped rather than rewritten. Re-encodings outside
+those two percent-decode rounds (base64, HTML numeric entities, JSON `/`
+escapes) are not detected — a recorded residual on WI#395.
 
 Response *bodies* are scrubbed too (WI#395): 3xx bodies echo the redirect
 target URL on common edges (Go `net/http`, Apache, Express), so a
 credential-injected exchange requests `Accept-Encoding: identity`,
-byte-scrubs the body with the same spellings, drops the stale upstream
-`Content-Length` (hyper re-frames), and refuses — with 502 — a body that
-arrives `Content-Encoding`-compressed, because it cannot be inspected.
+byte-scrubs the body, drops the stale upstream `Content-Length` (hyper
+re-frames), and refuses — with 502 — a body that arrives
+`Content-Encoding`-compressed, because it cannot be inspected. Unlike
+headers, the body scrub matches only the raw and form-encoded spellings
+exactly; re-encoded body echoes (e.g. a double-encoded `redirect_to`
+parameter carried inside a 3xx body) are not detected — a recorded
+residual on WI#395. Range/If-Range requests are forwarded, so an upstream
+that splits an echo across multipart range boundaries can evade the exact
+match the same way (same residual).
 
 ### Bind Address
 
@@ -552,6 +560,17 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    before serialization — a secret containing `"` or `\` is JSON-escaped in
    the serialized form and would slip past string-level replacement — and
    bodies are scrubbed at the byte level (bodies are not guaranteed UTF-8).
+   Because the guest chooses `Accept-Encoding` and this build cannot
+   decompress, a credential-injected exchange sends exactly one
+   `accept-encoding: identity` (replacing every guest spelling) and a
+   non-identity `Content-Encoding` answer is refused instead of forwarded —
+   the guest asked for the encoding and could decode an echoed credential
+   itself; ordinary exchanges keep the guest's own header and answer.
+   Residuals, recorded on WI#395: re-encoded echo spellings beyond the
+   exact raw/urlencoded pair are not detected in wrapper bodies (headers
+   get the two-round percent-decode check; bodies and wrapper-side
+   re-encodings do not), and the response leak detector skips bodies that
+   are not valid UTF-8.
    **Reference:** `src/tools/wasm/wrapper.rs` —
    `StoreData::redact_http_outcome_for_guest`
 
