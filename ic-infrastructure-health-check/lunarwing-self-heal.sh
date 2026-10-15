@@ -567,17 +567,21 @@ compute_backoff() {
     if ! [[ "$attempt" =~ ^[0-9]+$ ]] || [[ "$attempt" -le 0 ]]; then
         printf '0'; return 0
     fi
-    # Hard cap: services escalated and idling for weeks would otherwise run a
-    # huge exponentiation loop. Defensive only — practical attempts are <10.
-    if [[ "$attempt" -gt 20 ]]; then
-        printf '%s' "${max:-3600}"
-        return 0
-    fi
+    # WI#377: declare and validate the cap BEFORE the attempt>20 short-cut.
+    # It used to expand ${max:-3600} ahead of `local max=...`, so a custom
+    # BACKOFF_MAX was silently ignored exactly in the deep-retry regime where
+    # it matters (and an invalid one was never reported there).
     local base="${BACKOFF_BASE:-60}"
     local max="${BACKOFF_MAX:-3600}"
     if ! [[ "$base" =~ ^[0-9]+$ ]] || ! [[ "$max" =~ ^[0-9]+$ ]]; then
         log "WARNING: invalid backoff config base=$base max=$max; falling back to 0"
         printf '0'; return 0
+    fi
+    # Hard cap: services escalated and idling for weeks would otherwise run a
+    # huge exponentiation loop. Defensive only — practical attempts are <10.
+    if [[ "$attempt" -gt 20 ]]; then
+        printf '%s' "$max"
+        return 0
     fi
 
     # BASE * 2^(attempt-1), capped at MAX (cap inside the loop to avoid overflow).
