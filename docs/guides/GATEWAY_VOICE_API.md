@@ -12,9 +12,7 @@ loopback-only `VOICE_SERVICE_URL` invariants, default sidecar port (8090), the
 the speed-scaled estimate), and the integration test were re-checked against
 `ic/src/channels/web/voice.rs` and `ic/tests/voice_gateway_integration.rs`;
 no changes were needed (the v2.1.4.0 WI#264 admission-bound sidecar work is
-covered in `projects/voice-sidecar/README.md`, not the gateway surface; the
-WI#380 audio-side timeout work is still open and touches the sidecar, not
-these gateway endpoints).
+covered in `projects/voice-sidecar/README.md`, not the gateway surface).
 
 ## Canonical Documentation
 
