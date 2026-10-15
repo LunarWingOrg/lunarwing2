@@ -16,11 +16,17 @@
 $EDITOR config/config.toml
 ```
 
-Then rebuild:
+Then rebuild and restart the tenants that run it:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker --no-cache
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
 ```
+
+`start-tenant` recreates the kimi container whenever the tenant-store image ID
+differs from the one the container was created from, so the rebuilt config
+reaches a running tenant on OpenRC and systemd alike without removing the
+container by hand (see "Rebuilt image rollout" in `docs/ops/WORKER-CONTAINERS.md`).
 
 **Note (WI#330):** the baked `base_url` is a placeholder
 (`http://set-kimi-base-url.invalid/openai/v1`) that `entrypoint.sh` refuses

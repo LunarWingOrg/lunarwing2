@@ -1091,6 +1091,46 @@ build_all() {
   done <<< "$names"
 }
 
+# Run git against a worker build's source root, retrying as the directory's
+# owner when the invoking account (root) is refused by git's dubious-ownership
+# check — the shape shared_worker_source_root already uses for tenant checkouts.
+# Usage: _worker_source_git <source-root> <git args...>
+_worker_source_git() {
+  local root="$1"; shift
+  local out owner
+  if out="$(git -C "$root" "$@" 2>/dev/null)"; then
+    printf '%s' "$out"
+    return 0
+  fi
+  owner="$(stat -c %U "$root" 2>/dev/null)" || return 1
+  [[ -n "$owner" && "$owner" != "$(id -un)" ]] || return 1
+  # `cd /`: sudo keeps the caller's cwd, which the owner may not be able to
+  # enter (see _ctr).
+  ( cd / && exec sudo -u "$owner" git -C "$root" "$@" 2>/dev/null )
+}
+
+# Source revision for a worker image's org.opencontainers.image.revision label.
+# Every worker Dockerfile declares ARG SOURCE_REVISION=unknown and CI's
+# build-worker-image.sh passes $CI_COMMIT_SHA, but mt-admin builds passed
+# nothing, so an image built here could not be traced to a commit afterwards
+# (nobody could say which target the promoted kimi 2.2.0 image came from).
+# Uncommitted or untracked changes under the worker directory append -dirty so
+# the label never claims a commit the image does not match; "unknown" when the
+# root is not a readable git checkout.
+# Usage: _worker_source_revision <source-root> <worker-subdir>
+_worker_source_revision() {
+  local root="$1" subdir="$2" revision dirty
+  revision="$(_worker_source_git "$root" rev-parse --verify HEAD)" || revision=""
+  if ! [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'unknown'
+    return 0
+  fi
+  # An unreadable status also marks the build dirty: unverified is not clean.
+  dirty="$(_worker_source_git "$root" status --porcelain --untracked-files=all -- "$subdir")" || dirty="unverified"
+  [[ -z "$dirty" ]] || revision="${revision}-dirty"
+  printf '%s' "$revision"
+}
+
 build_pebble_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
@@ -1102,7 +1142,10 @@ build_pebble_worker() {
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
-  say "building pebble worker Docker image [$toolchain_desc] ..."
+  local source_revision
+  source_revision="$(_worker_source_revision "$LUNARWING_ROOT" pebble4lunarwing)"
+  local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
+  say "building pebble worker Docker image [$toolchain_desc] (source revision: $source_revision) ..."
   local cache_flag=""
   [[ "$no_cache" == "true" ]] && cache_flag="--no-cache"
 
@@ -1120,10 +1163,10 @@ build_pebble_worker() {
     # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
-    podman build $cache_flag "${toolchain_args[@]}" --network=host --format docker -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   else
-    docker build $cache_flag "${toolchain_args[@]}" -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   fi
 
@@ -1147,7 +1190,7 @@ build_pebble_worker() {
     "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
   fi
 
-  say "pebble worker image built: lunarwing-worker-pebble:latest [$toolchain_desc]"
+  say "pebble worker image built: lunarwing-worker-pebble:latest [$toolchain_desc] (revision $source_revision)"
 }
 
 build_opencode_worker() {
@@ -1162,7 +1205,10 @@ build_opencode_worker() {
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
-  say "building opencode worker Docker image [$toolchain_desc] ..."
+  local source_revision
+  source_revision="$(_worker_source_revision "$source_root" opencode4lunarwing)"
+  local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
+  say "building opencode worker Docker image [$toolchain_desc] (source revision: $source_revision) ..."
 
   local -a cache_args=()
   [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
@@ -1182,14 +1228,14 @@ build_opencode_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" --network=host --format docker -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t lunarwing-worker-opencode:latest "$opencode_dir" \
       || die "opencode worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" -t lunarwing-worker-opencode:latest "$opencode_dir" \
       || die "opencode worker image build failed"
   fi
 
-  say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc]"
+  say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc] (revision $source_revision)"
 }
 
 build_opencode2_worker() {
@@ -1204,7 +1250,10 @@ build_opencode2_worker() {
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
-  say "building opencode2 worker Docker image [$toolchain_desc] ..."
+  local source_revision
+  source_revision="$(_worker_source_revision "$source_root" opencode2.4lunarwing)"
+  local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
+  say "building opencode2 worker Docker image [$toolchain_desc] (source revision: $source_revision) ..."
 
   local -a cache_args=()
   [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
@@ -1232,14 +1281,14 @@ build_opencode2_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
       || die "opencode2 worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
       || die "opencode2 worker image build failed"
   fi
 
-  say "opencode2 worker image built: lunarwing-worker-opencode2:latest [$toolchain_desc]"
+  say "opencode2 worker image built: lunarwing-worker-opencode2:latest [$toolchain_desc] (revision $source_revision)"
 }
 
 build_kimi_worker() {
@@ -1257,7 +1306,10 @@ build_kimi_worker() {
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
   local version_desc="Dockerfile default"
   [[ -z "$kimi_code_version" ]] || version_desc="$kimi_code_version"
-  say "building kimi worker Docker image [$toolchain_desc] (kimi-code version: ${version_desc}) ..."
+  local source_revision
+  source_revision="$(_worker_source_revision "$source_root" kimicode4lunarwing)"
+  local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
+  say "building kimi worker Docker image [$toolchain_desc] (kimi-code version: ${version_desc}, source revision: $source_revision) ..."
 
   local -a cache_args=()
   [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
@@ -1277,14 +1329,14 @@ build_kimi_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" --network=host --format docker -t lunarwing-worker-kimi:latest "$kimi_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" --network=host --format docker -t lunarwing-worker-kimi:latest "$kimi_dir" \
       || die "kimi worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" -t lunarwing-worker-kimi:latest "$kimi_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" -t lunarwing-worker-kimi:latest "$kimi_dir" \
       || die "kimi worker image build failed"
   fi
 
-  say "kimi worker image built: lunarwing-worker-kimi:latest [$toolchain_desc]"
+  say "kimi worker image built: lunarwing-worker-kimi:latest [$toolchain_desc] (revision $source_revision)"
 }
 
 # ── WASM install ─────────────────────────────────────────────────────────────
