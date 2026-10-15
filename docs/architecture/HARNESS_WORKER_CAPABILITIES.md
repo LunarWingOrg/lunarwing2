@@ -3,8 +3,10 @@
 Status: implemented in v2.1.6.0. Owner: `ic/src/orchestrator/harness.rs`.
 Re-checked 2026-10-14 for the v2.1.6.0 docs pass: the only harness.rs
 changes after the EE-doc update (`f084624a1`) were a `cargo fmt`
-normalization and the run-84 ET-3 test-only repairs (a `#[cfg(test)]`
-find-counter probe for the EE-1 guard plus its comment fix) — no
+normalization and the run-84 ET-3 test-only repairs (the `#[cfg(test)]`
+find-counter probe pinning the EE-1 guard, the suffixed EE-3 offset-1/2
+test blobs, and the new `redactor_contains_secret_folds_compact_json_escapes`
+pin) — no
 production behavior change; the capability contract, redaction coverage,
 write-back pipeline, and WI#383 residual list below are current (the
 residual list refreshed from the WI's run-84 state, which added EE-14 and
@@ -281,8 +283,9 @@ cannot be listed).
   the proper shape is one per-job `aho-corasick` automaton over the folded
   text that must also cover the DIRECT list (raw values, raw multi-line
   lines, per-line wrap pieces; a per-event leaf cap alone does not bound
-  the cost) (the widened EE-1 betterment); partial/truncated prints of large
-  encodings leak near-wholly (EE-2 — needs that automaton with
+  the cost) (the widened EE-1 betterment); partial/truncated prints leak
+  near-wholly above the 4096-char arming cap and, at non-canonical widths,
+  below it too (EE-2 — needs that automaton with
   aligned chunks); line-prefixed views (`read_file`, `cat -n`) defeat
   folding (EE-7); the raw value is never fold-matched (EE-8); both
   fold-free passes — the `scrub_folded` fast path (encoded forms) and the
