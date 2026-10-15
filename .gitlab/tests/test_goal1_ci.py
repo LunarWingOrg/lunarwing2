@@ -1318,6 +1318,229 @@ class WorkerTsLaneTests(unittest.TestCase):
         merged["worker-kimi-ts"]["extends"] = ".p1"
         self.assertTrue(any("depth budget" in error for error in self.errors(merged)))
 
+    def test_global_variables_outside_allowlist_are_caught(self):
+        # MR !1658 review IA-5: a name denylist cannot enumerate every
+        # variable that hollows a lane out (BUN_OPTIONS preloads a file
+        # before bun's main script; PATH and GIT_CHECKOUT need one more
+        # artifact), so every global variable must be allowlisted.
+        merged = self.merged()
+        merged["variables"] = {name: "x" for name in config.GLOBAL_VARIABLE_ALLOWLIST}
+        self.assertEqual(self.errors(merged), [])
+        for name in ("BUN_OPTIONS", "PATH", "GIT_CHECKOUT", "SOME_NEW_VARIABLE"):
+            with self.subTest(name=name):
+                merged = self.merged()
+                merged["variables"] = {name: "x"}
+                self.assertTrue(
+                    any("GLOBAL_VARIABLE_ALLOWLIST" in error for error in self.errors(merged))
+                )
+
+    def test_workflow_rule_variables_are_caught(self):
+        # IA-1: workflow:rules:variables become pipeline-wide variables on
+        # the pipelines the rule matches, overriding same-named globals, so
+        # a NODE_OPTIONS or an unpinned CI_NODE_IMAGE there reaches both
+        # lanes while their scripts and the global variables stay pinned.
+        for variables in (
+            {"NODE_OPTIONS": "--import=data:text/javascript,process.exit(0)"},
+            {"CI_NODE_IMAGE": "docker.io/library/node:22-bookworm-slim"},
+        ):
+            with self.subTest(variables=variables):
+                merged = self.merged()
+                merged["workflow"] = {
+                    "rules": [
+                        {
+                            "if": '$CI_PIPELINE_SOURCE == "merge_request_event"',
+                            "variables": variables,
+                        },
+                    ]
+                }
+                self.assertTrue(
+                    any(
+                        "workflow:rules must not set variables" in error
+                        for error in self.errors(merged)
+                    )
+                )
+
+    def test_deprecated_global_before_script_is_caught(self):
+        # IA-3: the deprecated top-level before_script is still honoured by
+        # GitLab (equivalent to default:before_script) and inherited by
+        # both lanes, which define none.
+        merged = self.merged()
+        merged["before_script"] = ["exit 0"]
+        self.assertTrue(
+            any("top-level before_script" in error for error in self.errors(merged))
+        )
+
+    def test_lane_rule_variables_are_caught(self):
+        # IA-6: rules:variables on any lane rule reach the pinned script on
+        # the pipelines that rule matches (push and tag pipelines too, not
+        # only the first, MR rule).
+        for job_name in self.merged():
+            for index in (0, 1):
+                with self.subTest(job=job_name, rule=index):
+                    merged = self.merged()
+                    merged[job_name]["rules"][index]["variables"] = {
+                        "NODE_OPTIONS": "--test-only"
+                    }
+                    self.assertTrue(
+                        any(
+                            f"{job_name} rules must not set variables" in error
+                            for error in self.errors(merged)
+                        )
+                    )
+
+    def test_hash_form_root_image_variable_is_caught(self):
+        # IA-2: GitLab's `value:`/`description:` hash form defines the same
+        # variable; the root file is merged last, so a hash-form override
+        # of a pinned image variable must fail the digest pin exactly like
+        # the string form in test_root_file_variables_override_is_caught.
+        self.assertEqual(
+            config.collect_variables(
+                [
+                    (
+                        ROOT / "x.yml",
+                        {
+                            "variables": {
+                                "A": {"value": "v", "description": "d"},
+                                "B": "w",
+                                "C": {"description": "no value"},
+                            }
+                        },
+                    )
+                ]
+            ),
+            {"A": "v", "B": "w"},
+        )
+        original_load_yaml = config.load_yaml
+
+        def load_with_hash_form(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded.setdefault("variables", {})["CI_NODE_IMAGE"] = {
+                    "value": "docker.io/library/node:22-bookworm-slim",
+                    "description": "unpinned",
+                }
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_hash_form),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("CI_NODE_IMAGE", stderr.getvalue())
+
+    def test_nested_and_conditional_includes_are_caught(self):
+        # IA-4/IA-7: GitLab merges includes declared inside included files
+        # and honours include:rules on root entries; the validator reads
+        # exactly the seven root entries, so both shapes are refused.
+        original_load_yaml = config.load_yaml
+
+        def load_with_nested_include(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab" / "ci" / "containers.yml":
+                loaded = {"include": [{"local": "/.gitlab/ci/evil.yml"}], **loaded}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_nested_include),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("containers.yml must not include further files", stderr.getvalue())
+
+        def load_with_conditional_include(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                for item in loaded["include"]:
+                    if item.get("local") == "/.gitlab/ci/validate.yml":
+                        item["rules"] = [{"if": '$CI_PIPELINE_SOURCE == "push"'}]
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_conditional_include),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("root include entries must be plain local includes", stderr.getvalue())
+
+    def test_root_workflow_override_is_checked(self):
+        # IA-1: a root-file `workflow:` replaces the include's rules array
+        # in GitLab; the workflow check must read the merged view, not
+        # workflow.yml alone.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_workflow(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded["workflow"] = {"rules": [{"if": "$CI_COMMIT_BRANCH"}]}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_workflow),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("workflow must enable MR pipelines", stderr.getvalue())
+
+    def test_root_default_is_deep_merged_over_include_default(self):
+        # Pins the deep merge (IA-8 mutant M2): a harmless root `default:`
+        # key must not hide an include-level default.before_script by
+        # replacing the whole block.
+        original_load_yaml = config.load_yaml
+
+        def load_with_split_default(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab" / "ci" / "defaults.yml":
+                loaded.setdefault("default", {})["before_script"] = ["exit 0"]
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded["default"] = {"interruptible": True}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_split_default),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("default.before_script", stderr.getvalue())
+
+    def test_later_include_overrides_earlier_include(self):
+        # Pins the include order (IA-8 mutant M4): containers.yml comes
+        # after validate.yml, so its worker-kimi-ts entry is the effective
+        # job; merging in reverse would certify validate.yml's pinned block.
+        original_load_yaml = config.load_yaml
+
+        def load_with_later_override(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab" / "ci" / "containers.yml":
+                loaded["worker-kimi-ts"] = {"script": ["exit 0"]}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_later_override),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn(
+            "worker-kimi-ts script must be exactly the pinned commands", stderr.getvalue()
+        )
+
+    def test_extends_parent_image_keys_are_deep_merged(self):
+        # Pins the recursive merge (IA-8 mutant M18): nested hashes merge
+        # key-wise at every level, so a job's partial `image:` hash keeps
+        # the parent's name while overriding the entrypoint.
+        self.assertEqual(
+            config.merge_ci_hashes({"a": {"b": {"c": 1}}}, {"a": {"b": {"d": 2}}}),
+            {"a": {"b": {"c": 1, "d": 2}}},
+        )
+        merged = self.merged()
+        merged[".base"] = {"image": {"name": "$CI_NODE_IMAGE", "entrypoint": [""]}}
+        merged["worker-kimi-ts"]["extends"] = ".base"
+        merged["worker-kimi-ts"]["image"] = {"entrypoint": ["/bin/sh"]}
+        effective = config.resolve_extends(merged["worker-kimi-ts"], merged)
+        self.assertEqual(
+            effective["image"], {"name": "$CI_NODE_IMAGE", "entrypoint": ["/bin/sh"]}
+        )
+        self.assertTrue(any("entrypoint" in error for error in self.errors(merged)))
+
 
 if __name__ == "__main__":
     unittest.main()
