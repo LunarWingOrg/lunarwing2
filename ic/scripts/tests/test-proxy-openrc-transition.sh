@@ -313,6 +313,71 @@ MATRIX
     || fail 'symlink-to-script refusal did not name the reason'
 )
 
+# FL-6 (WI#393, run-107 GR-1/GR-3): openrc_proxy_unit_is_safe is template
+# equality, not presence — every line of the installed unit must reproduce
+# the renderer template for the filename's tenant, in the same order and
+# count, with no extra, missing, or payload-carrying content. The fixture is
+# rendered by the REAL renderer (rollout-style registry/home/exec stubs) so
+# the pins bind the contract itself, and renderer/template drift fails here
+# instead of passing a hand-written excerpt.
+(
+  export PORTS_REGISTRY="$fixture/ports.json"
+  export OPENRC_PROXY_BACKUP_DIR="$fixture/backup-units"
+  cat >"$PORTS_REGISTRY" <<'JSON'
+{"tenants":{"alice":{"enable_proxy":true,"ports":{"proxy":23104}}}}
+JSON
+  tenant_home() { printf '%s/%s' "$fixture" "$1"; }
+  install_openrc_env_exec() { :; }
+  render_proxy_openrc_unit alice || fail 'could not render the fixture unit'
+  safe_unit="$OPENRC_INITD_DIR/lunarwing-proxy-alice"
+  openrc_proxy_unit_is_safe "$safe_unit" \
+    || fail 'a genuine renderer output failed the safe-unit contract'
+  # EQ-4 under equality: re-rendering a conformant unit must not archive it.
+  render_proxy_openrc_unit alice || fail 're-render of a safe unit failed'
+  [[ ! -e "$OPENRC_PROXY_BACKUP_DIR" ]] \
+    || fail 're-rendering a safe unit grew the backup archive'
+  # Negatives — none of these trip the old three-pattern denylist; the
+  # equality contract must catch every one (GR-1 matrix classes).
+  for payload in \
+    'proxy_command=/tmp/evil' \
+    ': "${proxy_command:=/tmp/evil}"' \
+    'command_user="root:root"' \
+    ': "${proxy_args:=/tmp/evil.py --tensorzero=http://fixture.invalid/x}"' \
+    'start_pre() { /tmp/evil; }' \
+    'proxy_note="$(id)"' \
+    'proxy_note=`id`'
+  do
+    cp "$safe_unit" "$fixture/extra-proxy-unit"
+    printf '%s\n' "$payload" >>"$fixture/extra-proxy-unit"
+    if openrc_proxy_unit_is_safe "$fixture/extra-proxy-unit"; then
+      fail "safe-template-plus-extra-content unit classified safe: $payload"
+    fi
+  done
+  # A same-line-count substitution naming a foreign tenant, and a truncated
+  # unit, fail equality without tripping any denylist pattern.
+  sed 's/before lunarwing-alice/before lunarwing-other/' "$safe_unit" \
+    >"$fixture/foreign-unit"
+  if openrc_proxy_unit_is_safe "$fixture/foreign-unit"; then
+    fail 'a unit pointing at a foreign tenant classified safe'
+  fi
+  head -n -3 "$safe_unit" >"$fixture/truncated-unit"
+  if openrc_proxy_unit_is_safe "$fixture/truncated-unit"; then
+    fail 'a truncated unit classified safe'
+  fi
+  # The preflight guard is the boundary that keeps OpenRC from sourcing an
+  # installed unit: it must accept the genuine render and refuse the same
+  # unit once extra content rides along (it is the only proxy unit here).
+  require_safe_openrc_proxy_units \
+    || fail 'a genuine renderer output failed the preflight guard'
+  printf '%s\n' 'proxy_note=`id`' >>"$safe_unit"
+  rc=0
+  ( require_safe_openrc_proxy_units ) >"$fixture/refused.log" 2>&1 || rc=$?
+  [[ "$rc" == 125 ]] || fail 'safe-render-plus-payload unit passed the preflight guard'
+  grep -Fq 'render-units --all-proxies' "$fixture/refused.log" \
+    || fail 'preflight refusal omitted the repair command'
+  rm -f -- "$safe_unit"
+)
+
 # FL-4 (M3): enable-health-fleet sources mt-admin directly, bypassing main's
 # preflight, so it carries its own proxy-unit guard — a legacy unit must
 # refuse before the root health cron is armed in the migration window. The id

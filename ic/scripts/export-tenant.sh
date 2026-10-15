@@ -552,23 +552,43 @@ else
 fi
 DARKIRC_PIN_DIR=""
 PARTIAL_BUNDLE=""
-trap 'rm -rf "$WORK" "${DARKIRC_PIN_DIR:-}"; [[ -z "${PARTIAL_BUNDLE:-}" ]] || rm -f -- "$PARTIAL_BUNDLE"' EXIT
+# FL-5/GR-2 stderr capture must live OUTSIDE $WORK: in a real export $WORK is
+# the bundle staging directory, so a scratch file there would leak into the
+# bundle and fail the importer's top-level-entry validation.
+WRITERS_ERRF="$(mktemp)"
+trap 'rm -rf "$WORK" "${DARKIRC_PIN_DIR:-}"; [[ -z "${PARTIAL_BUNDLE:-}" ]] || rm -f -- "$PARTIAL_BUNDLE"; rm -f -- "$WRITERS_ERRF"' EXIT
 chmod 0700 "$WORK"
 
 # ---- 1. quiesce the writers (consistent + final snapshot) --------------------
 banner "1/6  Quiesce tenant writers"
+# FL-5 (WI#393): the writers-active arm's contract is 0:active / 1:stopped /
+# 2:unknown, but its precondition failures (root, usage, registry, name, lock
+# dir) also exit 1 — the exit code alone cannot say "stopped". Require the rc
+# AND the stdout state word together so an error is never misread as a
+# quiesced tenant (which would let a snapshot race live writers).
 writers_active() {
-  local rc=0
-  "$MT" writers-active "$TENANT" >/dev/null 2>&1 || rc=$?
-  case "$rc" in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) die "mt-admin writers-active failed for '$TENANT' (rc=$rc)" ;;
+  local rc=0 out="" err=""
+  : >"$WRITERS_ERRF"
+  out="$("$MT" writers-active "$TENANT" 2>"$WRITERS_ERRF")" || rc=$?
+  # The refusal must carry the arm's stderr cause (root/usage/registry errors,
+  # the EQ-1 refusal with its render-units repair text) — otherwise operators
+  # stall on a bare rc (WI#393 GR-2). Bounded so a pathological subprocess
+  # cannot flood the terminal; multi-line stdout stays refused by the *) arm.
+  err="$(head -c 1000 "$WRITERS_ERRF" 2>/dev/null || true)"
+  case "$rc:$out" in
+    0:active) return 0 ;;
+    1:stopped) return 1 ;;
+    *) die "mt-admin writers-active could not confirm writer state for '$TENANT' (rc=$rc${err:+: $err})" ;;
   esac
 }
 if $NO_QUIESCE; then
-  if ! $DRY_RUN && writers_active; then die "--no-quiesce given but '$TENANT' still has active writers — stop them first for a consistent snapshot"; fi
-  note "--no-quiesce: verified tenant writers are already stopped"
+  if $DRY_RUN; then
+    note "--no-quiesce: [dry-run] would verify tenant writers are already stopped"
+  elif writers_active; then
+    die "--no-quiesce given but '$TENANT' still has active writers — stop them first for a consistent snapshot"
+  else
+    note "--no-quiesce: verified tenant writers are already stopped"
+  fi
 else
   run "$MT" stop-writers "$TENANT"
   if ! $DRY_RUN && writers_active; then

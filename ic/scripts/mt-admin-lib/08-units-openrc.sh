@@ -386,14 +386,159 @@ INITEOF
 
 # ── OpenRC service units ─────────────────────────────────────────────────────
 
-# The post-WI#376 proxy unit contract: one fixed flag line carrying no tenant
-# data. Shared by the preflight guard and the renderer, which archives only
-# installed units that fail this check.
+# Single source of truth for the post-WI#376 proxy unit shape. The renderer
+# substitutes concrete values for the @TOKENS@; the safe-unit check derives
+# strict per-line matches from the same text, so the renderer and the contract
+# cannot drift apart (WI#393 GR-1). Tenant data lives only in the @TOKEN@
+# slots; everything else is fixed scaffolding.
+_openrc_proxy_unit_template() {
+  cat <<'INITEOF'
+#!/sbin/openrc-run
+
+description="LunarWing TensorZero proxy (@NAME@)"
+
+: "${proxy_command:=@PYBIN@}"
+: "${proxy_args:=@PROXYBIN@ --port @PORT@ --bind 127.0.0.1 --tensorzero-env}"
+: "${proxy_user:=@NAME@}"
+: "${proxy_group:=@NAME@}"
+: "${proxy_pidfile:=@RUNDIR@/proxy.pid}"
+: "${proxy_runtime_dir:=@RUNDIR@}"
+: "${proxy_log_dir:=@LOGDIR@}"
+: "${proxy_output_log:=${proxy_log_dir}/proxy.log}"
+: "${proxy_error_log:=${proxy_log_dir}/proxy.err}"
+: "${proxy_env_file:=@ENVDIR@/proxy.env}"
+: "${proxy_openrc_env_exec:=@ENVEXEC@}"
+: "${proxy_umask:=0077}"
+: "${proxy_respawn_delay:=5}"
+: "${proxy_respawn_max:=5}"
+: "${proxy_respawn_period:=60}"
+: "${proxy_retry:=SIGTERM/30/KILL/5}"
+
+command="${proxy_openrc_env_exec}"
+command_args="--env-file ${proxy_env_file} -- ${proxy_command} ${proxy_args}"
+command_user="${proxy_user}:${proxy_group}"
+pidfile="${proxy_pidfile}"
+supervisor="supervise-daemon"
+retry="${proxy_retry}"
+respawn_delay="${proxy_respawn_delay}"
+respawn_max="${proxy_respawn_max}"
+respawn_period="${proxy_respawn_period}"
+output_log="${proxy_output_log}"
+error_log="${proxy_error_log}"
+required_files="${proxy_openrc_env_exec} ${proxy_command} ${proxy_env_file}"
+
+depend() {
+    need net
+    use dns
+    after firewall
+    before lunarwing-@NAME@
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o "${proxy_user}:${proxy_group}" "${proxy_runtime_dir}"
+    checkpath -d -m 0750 -o "${proxy_user}:${proxy_group}" "${proxy_log_dir}"
+    checkpath -f -m 0640 -o "${proxy_user}:${proxy_group}" "${output_log}"
+    checkpath -f -m 0640 -o "${proxy_user}:${proxy_group}" "${error_log}"
+    umask "${proxy_umask}"
+}
+INITEOF
+}
+
+# Escape ERE metacharacters in a literal string. Pure bash: the safe-unit
+# check runs on every OpenRC preflight, so no per-line subprocesses.
+_openrc_re_escape() {
+  local s="$1" out="" c i
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      '.'|'*'|'^'|'$'|'+'|'?'|'('|')'|'{'|'}'|'|'|'['|']'|'\') out+="\\$c" ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# The template with every literal byte ERE-escaped and the @TOKENS@ intact.
+# Cached: the template is fixed at parse time, so escape it once per process.
+_OPENRC_PROXY_UNIT_TEMPLATE_RE=""
+_openrc_proxy_unit_template_re() {
+  if [[ -z "$_OPENRC_PROXY_UNIT_TEMPLATE_RE" ]]; then
+    local template line
+    template="$(_openrc_proxy_unit_template)" || return 1
+    while IFS= read -r line; do
+      _OPENRC_PROXY_UNIT_TEMPLATE_RE+="$(_openrc_re_escape "$line")"$'\n'
+    done <<<"$template"
+    [[ -n "$_OPENRC_PROXY_UNIT_TEMPLATE_RE" ]] || return 1
+  fi
+  printf '%s' "$_OPENRC_PROXY_UNIT_TEMPLATE_RE"
+}
+
+# One ERE fragment per template line for tenant $name: the name is identical
+# in the description/user/group/before slots; the python interpreter, proxy
+# script, runtime/log/env dirs and env-exec launcher are the same canonical
+# paths the renderer writes; only the port stays a shape, because reading the
+# ports registry does not belong in the OpenRC preflight path. Any failure to
+# derive a fragment fails closed (caller treats the unit as unsafe).
+_openrc_proxy_unit_expected_res() {
+  local name="$1" pybin
+  pybin="$(command -v python3)" || return 1
+  [[ -n "$pybin" && "$pybin" == /* ]] || return 1
+  local esc_name esc_pybin esc_bin esc_run esc_log esc_env esc_exec re
+  esc_name="$(_openrc_re_escape "$name")"
+  esc_pybin="$(_openrc_re_escape "$pybin")"
+  esc_bin="$(_openrc_re_escape "$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py")"
+  esc_run="$(_openrc_re_escape "$(tenant_run_dir "$name")")"
+  esc_log="$(_openrc_re_escape "$(tenant_log_dir "$name")")"
+  esc_env="$(_openrc_re_escape "$(tenant_env_dir "$name")")"
+  esc_exec="$(_openrc_re_escape "$OPENRC_ENV_EXEC")"
+  re="$(_openrc_proxy_unit_template_re)" || return 1
+  re="${re//@NAME@/$esc_name}"
+  re="${re//@PYBIN@/$esc_pybin}"
+  re="${re//@PROXYBIN@/$esc_bin}"
+  re="${re//@PORT@/[0-9]+}"
+  re="${re//@RUNDIR@/$esc_run}"
+  re="${re//@LOGDIR@/$esc_log}"
+  re="${re//@ENVDIR@/$esc_env}"
+  re="${re//@ENVEXEC@/$esc_exec}"
+  printf '%s' "$re"
+}
+
+# The post-WI#376 proxy unit contract: byte-level template equality, not line
+# presence (WI#393 FL-6/GR-1). The installed unit must reproduce the renderer
+# template for its filename's tenant exactly — same lines in the same order
+# and count, tenant name identical in every slot, no NUL/CR bytes, final
+# newline present. Any extra, missing, reordered, or payload-carrying line
+# (a legacy inline --tensorzero flag, command substitution, a backtick, a
+# prepended override, a replaced proxy_command) fails the contract, so a
+# tampered unit is archived before replacement rather than passing on the
+# strength of one safe-looking line. Shared by the preflight guard and the
+# renderer, which archives only installed units that fail this check.
 openrc_proxy_unit_is_safe() {
-  local path="$1"
+  local path="$1" name
   [[ -f "$path" && ! -L "$path" ]] || return 1
-  grep -Eq \
-    '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"
+  name="${path##*/lunarwing-proxy-}"
+  [[ -n "$name" && "$name" == "$(sanitize_name "$name")" ]] || return 1
+  # Byte hygiene first: line comparison cannot be trusted over NUL/CR bytes,
+  # and the renderer always ends the unit with a newline.
+  local raw stripped
+  raw="$(wc -c <"$path")" || return 1
+  [[ "$raw" -gt 0 ]] || return 1
+  stripped="$(tr -d '\000\r' <"$path" | wc -c)" || return 1
+  [[ "$raw" == "$stripped" ]] || return 1
+  [[ "$(tail -c 1 -- "$path" | wc -l)" -eq 1 ]] || return 1
+  local -a expected actual
+  mapfile -t expected < <(_openrc_proxy_unit_expected_res "$name")
+  # The template is never empty, so an empty expected list means the fragment
+  # derivation failed (e.g. no python3 on PATH): fail closed.
+  [[ "${#expected[@]}" -gt 0 ]] || return 1
+  mapfile -t actual <"$path" || return 1
+  [[ "${#actual[@]}" -eq "${#expected[@]}" ]] || return 1
+  local i line_re
+  for ((i = 0; i < ${#expected[@]}; i++)); do
+    line_re="^${expected[$i]}$"
+    [[ "${actual[$i]}" =~ $line_re ]] || return 1
+  done
+  return 0
 }
 
 # A dependency-cache rebuild can source every init script, even for a command
@@ -523,69 +668,37 @@ backup_openrc_proxy_unit() {
 
 # File-only proxy renderer shared by normal rendering and the fleet migration. The
 # atomic replacement prevents dependency scanning from seeing a partial script.
+# The unit body comes from the single template source the safe-unit contract
+# verifies against (WI#393 GR-1), so a rendered unit always satisfies the
+# preflight guard and template drift fails loudly instead of shipping.
 render_proxy_openrc_unit() {
-  local name="$1" proxy_port proxy_bin env_dir run_dir log_dir path tmp
+  local name="$1" proxy_port proxy_bin env_dir run_dir log_dir path tmp pybin body
   proxy_port="$(ports_get "$name" proxy)" || return 1
   [[ "$proxy_port" =~ ^[0-9]+$ ]] || die "invalid proxy port for $name"
   proxy_bin="$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py"
   env_dir="$(tenant_env_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
   log_dir="$(tenant_log_dir "$name")"
+  pybin="$(command -v python3)" || true
+  [[ -n "$pybin" && "$pybin" == /* ]] \
+    || die "cannot render proxy unit for $name: no python3 on PATH"
   mkdir -p "$OPENRC_INITD_DIR" || return 1
   path="$OPENRC_INITD_DIR/lunarwing-proxy-${name}"
   [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || die "unsafe installed proxy unit: $path"
   tmp="$(mktemp "$OPENRC_INITD_DIR/.lunarwing-proxy-${name}.XXXXXX")" || return 1
-  if ! cat >"$tmp" <<INITEOF
-#!/sbin/openrc-run
-
-description="LunarWing TensorZero proxy ($name)"
-
-: "\${proxy_command:=$(command -v python3)}"
-: "\${proxy_args:=$proxy_bin --port $proxy_port --bind 127.0.0.1 --tensorzero-env}"
-: "\${proxy_user:=$name}"
-: "\${proxy_group:=$name}"
-: "\${proxy_pidfile:=$run_dir/proxy.pid}"
-: "\${proxy_runtime_dir:=$run_dir}"
-: "\${proxy_log_dir:=$log_dir}"
-: "\${proxy_output_log:=\${proxy_log_dir}/proxy.log}"
-: "\${proxy_error_log:=\${proxy_log_dir}/proxy.err}"
-: "\${proxy_env_file:=$env_dir/proxy.env}"
-: "\${proxy_openrc_env_exec:=$OPENRC_ENV_EXEC}"
-: "\${proxy_umask:=0077}"
-: "\${proxy_respawn_delay:=5}"
-: "\${proxy_respawn_max:=5}"
-: "\${proxy_respawn_period:=60}"
-: "\${proxy_retry:=SIGTERM/30/KILL/5}"
-
-command="\${proxy_openrc_env_exec}"
-command_args="--env-file \${proxy_env_file} -- \${proxy_command} \${proxy_args}"
-command_user="\${proxy_user}:\${proxy_group}"
-pidfile="\${proxy_pidfile}"
-supervisor="supervise-daemon"
-retry="\${proxy_retry}"
-respawn_delay="\${proxy_respawn_delay}"
-respawn_max="\${proxy_respawn_max}"
-respawn_period="\${proxy_respawn_period}"
-output_log="\${proxy_output_log}"
-error_log="\${proxy_error_log}"
-required_files="\${proxy_openrc_env_exec} \${proxy_command} \${proxy_env_file}"
-
-depend() {
-    need net
-    use dns
-    after firewall
-    before lunarwing-${name}
-}
-
-start_pre() {
-    checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_runtime_dir}"
-    checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_log_dir}"
-    checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${output_log}"
-    checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${error_log}"
-    umask "\${proxy_umask}"
-}
-INITEOF
-  then
+  body="$(_openrc_proxy_unit_template)" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  body="${body//@NAME@/$name}"
+  body="${body//@PYBIN@/$pybin}"
+  body="${body//@PROXYBIN@/$proxy_bin}"
+  body="${body//@PORT@/$proxy_port}"
+  body="${body//@RUNDIR@/$run_dir}"
+  body="${body//@LOGDIR@/$log_dir}"
+  body="${body//@ENVDIR@/$env_dir}"
+  body="${body//@ENVEXEC@/$OPENRC_ENV_EXEC}"
+  if ! printf '%s\n' "$body" >"$tmp"; then
     rm -f -- "$tmp"
     return 1
   fi
