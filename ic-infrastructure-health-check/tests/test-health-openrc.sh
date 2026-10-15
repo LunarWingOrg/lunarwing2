@@ -37,6 +37,9 @@ new_scenario() {
   cat >"$s/bin/rc-service" <<'MOCK'
 #!/usr/bin/env bash
 # Mock OpenRC rc-service: honours $INITD_DIR for --exists and $RC_FIX for status.
+# Every invocation is recorded to $RC_CALLS when set (WI#410 guard scenarios
+# assert the refusal happens before ANY rc-service call).
+[ -n "${RC_CALLS:-}" ] && echo "$*" >>"$RC_CALLS"
 INITD_DIR="${INITD_DIR:-/etc/init.d}"; FIX="${RC_FIX:-}"
 if [ "${1:-}" = "--exists" ]; then
   [ -x "$INITD_DIR/${2:-}" ] && exit 0 || exit 1
@@ -68,7 +71,19 @@ MOCK
   printf '%s' "$s"
 }
 
-mk_unit() { : >"$1/initd/$2"; chmod +x "$1/initd/$2"; }                  # <s> <name>
+# A rendered (post-WI#376) proxy unit body: the fixed flag line with no tenant
+# data. health-openrc.sh's WI#410 runtime guard refuses to drive rc-service past
+# any lunarwing-proxy-* unit that does not carry this contract, so realistic
+# fixtures under that name must include it.
+SAFE_PROXY_UNIT_LINE=': "${proxy_args:=/opt/lunarwing/tensorzero-proxy-configurations/lunarwing-proxy.py --port 21001 --bind 127.0.0.1 --tensorzero-env}"'
+
+mk_unit() {                                                             # <s> <name>
+  case "$2" in
+    lunarwing-proxy-*) printf '%s\n' "$SAFE_PROXY_UNIT_LINE" >"$1/initd/$2" ;;
+    *)                 : >"$1/initd/$2" ;;
+  esac
+  chmod +x "$1/initd/$2"
+}
 # Mark a unit as enabled in the default runlevel — i.e. the tenant was start-ed
 # (start-tenant `rc-update add`s the primary daemon). <s> <name>
 enable_unit() { : >"$1/runlevels/default/$2"; }
@@ -446,6 +461,54 @@ if [[ "$HAVE_TIMEOUT" -eq 1 ]]; then
 else
   echo "SKIP: S23 slow-fleet deadline test (no 'timeout' binary)"
 fi
+
+# ── S24: WI#410 runtime guard — unsafe legacy proxy unit refuses before rc-service ──
+# The arming-time gate (enable-health-fleet.sh) is not enough: a pre-migration
+# unit that reappears after the cron is armed must make the very next root tick
+# fail closed. A legacy unit carries an interpolated --tensorzero URL instead of
+# the fixed flag line, so the safe-unit contract rejects it.
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+printf ': "${proxy_args:=/opt/x/lunarwing-proxy.py --port 21001 --tensorzero http://tz.example/tz?tok=abc}"\n' \
+  >"$s/initd/lunarwing-proxy-acme"; chmod +x "$s/initd/lunarwing-proxy-acme"
+run_hc "$s" RC_CALLS="$s/rc-calls"
+assert_json "$OUT" "S24: refusal emits valid JSON"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S24: refusal reports critical"
+assert_eq "$(jq -r '.metrics.services | length' <<<"$OUT")" "0" "S24: no services probed (no self-heal targets)"
+if jq -r '.issues[]?' <<<"$OUT" | grep -qF "render-units --all-proxies"; then
+  ok "S24: issue names the render-units remediation"
+else bad "S24: issue names the render-units remediation" "issues: $(jq -c '.issues' <<<"$OUT")"; fi
+if jq -r '.issues[]?' <<<"$OUT" | grep -qF "lunarwing-proxy-acme"; then
+  ok "S24: issue names the offending unit"
+else bad "S24: issue names the offending unit" "issues: $(jq -c '.issues' <<<"$OUT")"; fi
+assert_eq "$RC" 2 "S24: exit 2"
+if [ ! -s "$s/rc-calls" ]; then
+  ok "S24: zero rc-service invocations"
+else bad "S24: zero rc-service invocations" "calls: $(cat "$s/rc-calls")"; fi
+
+# ── S25: WI#410 runtime guard — a symlinked proxy unit also refuses ──────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+ln -s "$s/initd/lunarwing-acme" "$s/initd/lunarwing-proxy-acme"
+run_hc "$s" RC_CALLS="$s/rc-calls"
+assert_json "$OUT" "S25: symlink refusal emits valid JSON"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S25: symlink refusal reports critical"
+assert_eq "$RC" 2 "S25: exit 2"
+if [ ! -s "$s/rc-calls" ]; then
+  ok "S25: zero rc-service invocations"
+else bad "S25: zero rc-service invocations" "calls: $(cat "$s/rc-calls")"; fi
+
+# ── S26: WI#410 runtime guard — rendered (safe) proxy units are still probed ──
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;       fix_set "$s" lunarwing-acme       " * status: started" 0
+mk_unit "$s" lunarwing-proxy-acme; fix_set "$s" lunarwing-proxy-acme " * status: started" 0
+run_hc "$s" RC_CALLS="$s/rc-calls"
+assert_eq "$(svc_field "$OUT" lunarwing-proxy-acme status)" "healthy" "S26: safe proxy unit probed normally"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S26: overall healthy"
+assert_eq "$RC" 0 "S26: exit 0"
+if grep -qF -- "lunarwing-proxy-acme status" "$s/rc-calls" 2>/dev/null; then
+  ok "S26: rc-service actually drove the safe unit"
+else bad "S26: rc-service actually drove the safe unit" "calls: $(cat "$s/rc-calls" 2>/dev/null)"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
