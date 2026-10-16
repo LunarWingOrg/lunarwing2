@@ -1634,7 +1634,8 @@ prepare_worker_workspace() {
 # the tenant could not already reach; on rootful hosts (docker default, or
 # LUNARWING_MT_ROOTLESS=false) the pebble image has no USER and runs as host
 # root with --restart unless-stopped — closing that lane needs either a
-# tenant-uid --user or a root-owned bind parent, tracked in WI#422. The pebble workspace is tenant-owned 0700; 0777 was never load-bearing.
+# tenant-uid --user or a root-owned bind parent, tracked in WI#422.
+# The pebble workspace is tenant-owned 0700; 0777 was never load-bearing.
 prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
   local name="$1" lw_root workspace_dir
   lw_root="$(tenant_lw_root "$name")"
