@@ -1126,7 +1126,8 @@ arm_tenant_knowledge_seed() {  # <tenant>
   # WI#390: append through the tenant-side writer — root never opens the
   # tenant-writable env file, and the commit lands tenant-owned at mode 600.
   printf '\n# One-shot knowledge seed from the synced Study Notes checkout (new tenants only)\nKNOWLEDGE_SEED_FROM_STUDY_MCP=1\n' \
-    | _tenant_env_append "$name" "$env_path"
+    | _tenant_env_append "$name" "$env_path" \
+    || die "could not safely update $env_path"
 }
 
 set_tenant_knowledge_sync() {  # <tenant> <true|false>

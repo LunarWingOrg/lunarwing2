@@ -2643,65 +2643,65 @@ patch_tenant_coordination_env() {
   coord_admin_token="$(_env_existing "$env_path" COORD_ADMIN_TOKEN)"
   [[ -n "$coord_admin_token" ]] || coord_admin_token="$(generate_token)"
   if ! grep -q '^COORD_ENABLED=' "$env_path"; then
-    printf '\n# Multi-agent coordination (disabled until channels are configured explicitly)\nCOORD_ENABLED=false\n' | _tenant_env_append "$name" "$env_path"
+    printf '\n# Multi-agent coordination (disabled until channels are configured explicitly)\nCOORD_ENABLED=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ENABLED=false to $env_path"
   fi
   if ! grep -q '^COORD_AGENT_ID=' "$env_path"; then
-    printf 'COORD_AGENT_ID=%s\n' "$name" | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_AGENT_ID=%s\n' "$name" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_AGENT_ID=$name to $env_path"
   fi
   if ! grep -q '^COORD_CHANNELS=' "$env_path"; then
-    printf 'COORD_CHANNELS=\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_CHANNELS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_CHANNELS to $env_path"
   fi
   if ! grep -q '^COORD_AGENT_ALIASES=' "$env_path"; then
-    printf 'COORD_AGENT_ALIASES=\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_AGENT_ALIASES=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_AGENT_ALIASES to $env_path"
   fi
   if ! grep -q '^COORD_RESPONDER_ROSTER=' "$env_path"; then
-    printf 'COORD_RESPONDER_ROSTER=\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_RESPONDER_ROSTER=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_RESPONDER_ROSTER to $env_path"
   fi
   if ! grep -q '^COORD_KNOWLEDGE_SHARE=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_SHARE=false\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_KNOWLEDGE_SHARE=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_SHARE=false to $env_path"
   fi
   if ! grep -q '^COORD_KNOWLEDGE_PUBLISH=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_PUBLISH=false\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_KNOWLEDGE_PUBLISH=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_PUBLISH=false to $env_path"
   fi
   if ! grep -q '^COORD_KNOWLEDGE_PUBLISHERS=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_PUBLISHERS=\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_KNOWLEDGE_PUBLISHERS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_PUBLISHERS= (empty allowlist) to $env_path"
   fi
   if ! grep -q '^COORD_KNOWLEDGE_MAX_PER_HOUR=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_MAX_PER_HOUR=30\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_KNOWLEDGE_MAX_PER_HOUR=30\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_MAX_PER_HOUR=30 to $env_path"
   fi
   if ! grep -q '^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300 to $env_path"
   fi
   if ! grep -q '^COORD_KNOWLEDGE_MIN_CHARS=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_MIN_CHARS=12\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_KNOWLEDGE_MIN_CHARS=12\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_MIN_CHARS=12 to $env_path"
   fi
   if ! grep -q '^COORD_ADMIN_USERS=' "$env_path"; then
-    printf 'COORD_ADMIN_USERS=\n' | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_ADMIN_USERS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_USERS to $env_path"
   fi
   if grep -q '^COORD_ADMIN_TOKEN=$' "$env_path"; then
-    _tenant_env_sed "$name" "$env_path" "s/^COORD_ADMIN_TOKEN=$/COORD_ADMIN_TOKEN=$coord_admin_token/"
+    _tenant_env_sed "$name" "$env_path" "s/^COORD_ADMIN_TOKEN=$/COORD_ADMIN_TOKEN=$coord_admin_token/" || die "could not safely update $env_path"
     say "repaired empty COORD_ADMIN_TOKEN in $env_path"
   elif ! grep -q '^COORD_ADMIN_TOKEN=' "$env_path"; then
-    printf 'COORD_ADMIN_TOKEN=%s\n' "$coord_admin_token" | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_ADMIN_TOKEN=%s\n' "$coord_admin_token" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_TOKEN to $env_path"
   fi
   if grep -q '^COORD_ADMIN_PORT=$' "$env_path"; then
-    _tenant_env_sed "$name" "$env_path" "s/^COORD_ADMIN_PORT=$/COORD_ADMIN_PORT=$coord_admin_port/"
+    _tenant_env_sed "$name" "$env_path" "s/^COORD_ADMIN_PORT=$/COORD_ADMIN_PORT=$coord_admin_port/" || die "could not safely update $env_path"
     say "repaired empty COORD_ADMIN_PORT=$coord_admin_port in $env_path"
   elif ! grep -q '^COORD_ADMIN_PORT=' "$env_path"; then
-    printf 'COORD_ADMIN_PORT=%s\n' "$coord_admin_port" | _tenant_env_append "$name" "$env_path"
+    printf 'COORD_ADMIN_PORT=%s\n' "$coord_admin_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_PORT=$coord_admin_port to $env_path"
   fi
 }
@@ -2732,7 +2732,7 @@ backfill_tenant_worker_base_urls() {  # <tenant>
     [[ -z "$(_read_env_value "$env_path" "$key")" ]] || continue
     [[ -n "$derived" ]] \
       || die "tenant '$name' has the $worker worker enabled but no container-reachable LLM endpoint to inherit (LLM_BASE_URL is unset/loopback and proxy.env has no usable TENSORZERO_URL). Set one explicitly: $0 configure-$worker $name --base-url <url>"
-    printf '%s=%s\n%s_SOURCE=inherited\n' "$key" "$(_quote_env_value "$derived")" "$key" | _tenant_env_append "$name" "$env_path"
+    printf '%s=%s\n%s_SOURCE=inherited\n' "$key" "$(_quote_env_value "$derived")" "$key" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added $key (inherited from the tenant's LLM endpoint) to $env_path"
   done
 }
@@ -2754,7 +2754,7 @@ patch_tenant_env() {
   if grep -q '^LUNARWING_OWNER_ID=' "$env_path"; then
     say "LUNARWING_OWNER_ID already set in $env_path (skipping)"
   else
-    printf '\n# Runtime identity (DB scope — must match tenant name)\nLUNARWING_OWNER_ID=%s\n' "$name" | _tenant_env_append "$name" "$env_path"
+    printf '\n# Runtime identity (DB scope — must match tenant name)\nLUNARWING_OWNER_ID=%s\n' "$name" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added LUNARWING_OWNER_ID=$name to $env_path"
     # Auto-migrate existing DB data from 'default' scope to the tenant's scope
     # so the daemon doesn't lose access to conversations, memory, and settings.
@@ -2770,7 +2770,7 @@ patch_tenant_env() {
   if grep -q '^ORCHESTRATOR_PORT=' "$env_path"; then
     say "ORCHESTRATOR_PORT already set in $env_path (skipping)"
   else
-    printf '\n# Orchestrator (sandbox container callback)\nORCHESTRATOR_PORT=%s\n' "$orchestrator_port" | _tenant_env_append "$name" "$env_path"
+    printf '\n# Orchestrator (sandbox container callback)\nORCHESTRATOR_PORT=%s\n' "$orchestrator_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added ORCHESTRATOR_PORT=$orchestrator_port to $env_path"
   fi
 
@@ -2780,7 +2780,7 @@ patch_tenant_env() {
     if grep -q '^PEBBLE_WSS_PORT=' "$env_path"; then
       say "PEBBLE_WSS_PORT already set in $env_path (skipping)"
     else
-      printf '\n# Pebble worker (WebSocket port for agent communication)\nPEBBLE_WSS_PORT=%s\n' "$pebble_wss_port" | _tenant_env_append "$name" "$env_path"
+      printf '\n# Pebble worker (WebSocket port for agent communication)\nPEBBLE_WSS_PORT=%s\n' "$pebble_wss_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added PEBBLE_WSS_PORT=$pebble_wss_port to $env_path"
     fi
   fi
@@ -2791,7 +2791,7 @@ patch_tenant_env() {
     if grep -q '^OPENCODE_WSS_PORT=' "$env_path"; then
       say "OPENCODE_WSS_PORT already set in $env_path (skipping)"
     else
-      printf '\n# Opencode worker (WebSocket port for agent communication)\nOPENCODE_WSS_PORT=%s\n' "$opencode_wss_port" | _tenant_env_append "$name" "$env_path"
+      printf '\n# Opencode worker (WebSocket port for agent communication)\nOPENCODE_WSS_PORT=%s\n' "$opencode_wss_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added OPENCODE_WSS_PORT=$opencode_wss_port to $env_path"
     fi
   fi
@@ -2802,7 +2802,7 @@ patch_tenant_env() {
     if grep -q '^KIMI_WSS_PORT=' "$env_path"; then
       say "KIMI_WSS_PORT already set in $env_path (skipping)"
     else
-      printf '\n# Kimi worker (WebSocket port for agent communication)\nKIMI_WSS_PORT=%s\n' "$kimi_wss_port" | _tenant_env_append "$name" "$env_path"
+      printf '\n# Kimi worker (WebSocket port for agent communication)\nKIMI_WSS_PORT=%s\n' "$kimi_wss_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added KIMI_WSS_PORT=$kimi_wss_port to $env_path"
     fi
   fi
@@ -2813,7 +2813,7 @@ patch_tenant_env() {
     if grep -q '^OPENCODE2_WSS_PORT=' "$env_path"; then
       say "OPENCODE2_WSS_PORT already set in $env_path (skipping)"
     else
-      printf '\n# OpenCode 2 worker (WebSocket port for agent communication)\nOPENCODE2_WSS_PORT=%s\n' "$opencode2_wss_port" | _tenant_env_append "$name" "$env_path"
+      printf '\n# OpenCode 2 worker (WebSocket port for agent communication)\nOPENCODE2_WSS_PORT=%s\n' "$opencode2_wss_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added OPENCODE2_WSS_PORT=$opencode2_wss_port to $env_path"
     fi
   fi
@@ -2824,7 +2824,7 @@ patch_tenant_env() {
     if grep -q '^WEECHAT_ADAPTER_PORT=' "$env_path"; then
       say "WEECHAT_ADAPTER_PORT already set in $env_path (skipping)"
     else
-      printf '\n# WeeChat adapter (local HTTP adapter bridging WeeChat WS relay to WASM)\nWEECHAT_ADAPTER_PORT=%s\n' "$weechat_adapter_port" | _tenant_env_append "$name" "$env_path"
+      printf '\n# WeeChat adapter (local HTTP adapter bridging WeeChat WS relay to WASM)\nWEECHAT_ADAPTER_PORT=%s\n' "$weechat_adapter_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added WEECHAT_ADAPTER_PORT=$weechat_adapter_port to $env_path"
     fi
     # WS_ADAPTER_URL is the full adapter URL consumed by the in-process WASM
@@ -2833,7 +2833,7 @@ patch_tenant_env() {
     if grep -q '^WS_ADAPTER_URL=' "$env_path"; then
       say "WS_ADAPTER_URL already set in $env_path (skipping)"
     else
-      printf 'WS_ADAPTER_URL=http://127.0.0.1:%s\n' "$weechat_adapter_port" | _tenant_env_append "$name" "$env_path"
+      printf 'WS_ADAPTER_URL=http://127.0.0.1:%s\n' "$weechat_adapter_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added WS_ADAPTER_URL=http://127.0.0.1:$weechat_adapter_port to $env_path"
     fi
   fi
@@ -2844,7 +2844,7 @@ patch_tenant_env() {
     if grep -q '^RELAY_URL=' "$env_path"; then
       say "RELAY_URL already set in $env_path (skipping)"
     else
-      printf '\n# WeeChat relay URL consumed by the in-process WASM channel\nRELAY_URL=http://127.0.0.1:%s\n' "$weechat_port" | _tenant_env_append "$name" "$env_path"
+      printf '\n# WeeChat relay URL consumed by the in-process WASM channel\nRELAY_URL=http://127.0.0.1:%s\n' "$weechat_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added RELAY_URL=http://127.0.0.1:$weechat_port to $env_path"
     fi
   fi
@@ -2858,7 +2858,7 @@ patch_tenant_env() {
       if grep -q '^DARKIRC_ADAPTER_URL=' "$env_path"; then
         say "DARKIRC_ADAPTER_URL already set in $env_path (skipping)"
       else
-        printf '\nDARKIRC_ADAPTER_URL=http://127.0.0.1:%s\n' "$darkirc_adapter_port" | _tenant_env_append "$name" "$env_path"
+        printf '\nDARKIRC_ADAPTER_URL=http://127.0.0.1:%s\n' "$darkirc_adapter_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
         say "added DARKIRC_ADAPTER_URL=http://127.0.0.1:$darkirc_adapter_port to $env_path"
       fi
       if grep -q '^DARKIRC_ADAPTER_SECRET=' "$env_path"; then
@@ -2866,7 +2866,7 @@ patch_tenant_env() {
       else
         local darkirc_adapter_secret
         darkirc_adapter_secret="$(generate_token | cut -c1-32)"
-        printf 'DARKIRC_ADAPTER_SECRET=%s\n' "$darkirc_adapter_secret" | _tenant_env_append "$name" "$env_path"
+        printf 'DARKIRC_ADAPTER_SECRET=%s\n' "$darkirc_adapter_secret" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
         say "added DARKIRC_ADAPTER_SECRET to $env_path"
       fi
       write_tenant_darkirc_adapter_env "$name"
@@ -2882,11 +2882,18 @@ patch_tenant_env() {
 
   # Wire supported external workers into config.toml so
   # existing tenants get create_job(mode: ...) routing without a hand-edited
-  # config file.
-  ensure_external_worker_config "$name" "pebble" "pebble_wss"
-  ensure_external_worker_config "$name" "opencode" "opencode_wss"
-  ensure_external_worker_config "$name" "kimi" "kimi_wss"
-  ensure_external_worker_config "$name" "opencode2" "opencode2_wss"
+  # config file. WI#390 (review HH-2): a refused tenant-side write must abort
+  # the patch here — under the lifecycle lock's suppressed errexit an
+  # unchecked non-zero return would be swallowed and the tenant would start
+  # without its worker config.
+  ensure_external_worker_config "$name" "pebble" "pebble_wss" \
+    || die "could not safely write the pebble external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "opencode" "opencode_wss" \
+    || die "could not safely write the opencode external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "kimi" "kimi_wss" \
+    || die "could not safely write the kimi external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "opencode2" "opencode2_wss" \
+    || die "could not safely write the opencode2 external-worker config for tenant '$name'"
 }
 
 extract_host_from_url() {
