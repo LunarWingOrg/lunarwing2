@@ -1625,10 +1625,17 @@ prepare_worker_workspace() {
 # old root `mkdir -p` + `chown` + `chmod 777` let a tenant replace the directory
 # with a symlink and have root chown/chmod the symlink's target. Create and
 # tighten the directory AS the tenant instead, and refuse a symlinked or
-# foreign-owned path so the bind mount can never be redirected at an arbitrary
-# host directory. The pebble image runs as container root — the tenant uid on
-# rootless podman, and mode-bypassing host root on rootful podman — so a
-# tenant-owned 0700 directory suffices; 0777 was never load-bearing.
+# foreign-owned path here. SCOPE LIMIT (run-130 review, IG-2): this check holds
+# only at container CREATE/render time — podman/docker re-resolves the bind
+# source at EVERY container start, and neither the existing-container branch
+# nor the OpenRC unit's start re-runs this check, so a tenant who swaps the
+# directory for a symlink afterwards still redirects the mount. On rootless
+# podman the container runs as the tenant uid, so the redirect grants nothing
+# the tenant could not already reach; on rootful hosts (docker default, or
+# LUNARWING_MT_ROOTLESS=false) the pebble image has no USER and runs as host
+# root with --restart unless-stopped — closing that lane needs either a
+# tenant-uid --user or a root-owned bind parent, tracked in the WI filed from
+# IG-2. The pebble workspace is tenant-owned 0700; 0777 was never load-bearing.
 prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
   local name="$1" lw_root workspace_dir
   lw_root="$(tenant_lw_root "$name")"
