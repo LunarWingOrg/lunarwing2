@@ -1273,7 +1273,15 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
     # (MR !1627 review HE-3), and every snapshot.debian.org URL in the
     # Dockerfile must reference ${DEBIAN_SNAPSHOT} itself — a hardcoded
     # timestamp or a renamed variable would detach the tie from what the
-    # image actually builds with.
+    # image actually builds with. The tie must also see the variants that
+    # steer the build around the ARG (MR !1644 review HN-6): every line
+    # mentioning DEBIAN_SNAPSHOT must be a plain ARG declaration or carry
+    # the token inside a snapshot URL (an ENV after the ARG wins over it, a
+    # RUN-level shell assignment re-points the RUN's URLs, a multi-name ARG
+    # hides from the valued-ARG match, and shell substitution is not a
+    # literal reference), and every apt `deb` source line must point at
+    # snapshot.debian.org, so a builder moved back to the live mirror is
+    # caught too. The host match is case-insensitive in both rules.
     snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append(
@@ -1306,7 +1314,7 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         hardcoded_snapshots = [
             stamp
             for stamp in re.findall(
-                r"snapshot\.debian\.org/archive/[^/\s\"']+/([^/\s\"']+)/",
+                r"(?i:snapshot\.debian\.org)/archive/[^/\s\"']+/([^/\s\"']+)/",
                 dockerfile_text,
             )
             if stamp != "${DEBIAN_SNAPSHOT}"
@@ -1316,6 +1324,40 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                 "kimicode4lunarwing/Dockerfile snapshot.debian.org URLs must use "
                 "${DEBIAN_SNAPSHOT}, not a hardcoded or renamed value: "
                 f"{hardcoded_snapshots}"
+            )
+        # MR !1644 review HN-6: every DEBIAN_SNAPSHOT mention must be a
+        # plain ARG declaration or a literal ${DEBIAN_SNAPSHOT} inside a
+        # snapshot URL; every apt deb source must be a snapshot URL.
+        snapshot_arg_line = re.compile(r"^\s*(?i:ARG)\s+DEBIAN_SNAPSHOT(?:=\S+)?\s*$")
+        snapshot_url_reference = re.compile(
+            r"(?i:snapshot\.debian\.org)/archive/[^/\s\"']+/\$\{DEBIAN_SNAPSHOT\}(?:[/\s]|$)"
+        )
+        stray_references = [
+            line.strip()
+            for line in dockerfile_text.splitlines()
+            if "DEBIAN_SNAPSHOT" in line
+            and not snapshot_arg_line.match(line)
+            and not snapshot_url_reference.search(line)
+        ]
+        if stray_references:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile DEBIAN_SNAPSHOT references must be "
+                "ARG declarations or ${DEBIAN_SNAPSHOT} snapshot URLs: "
+                f"{stray_references}"
+            )
+        deb_source = re.compile(r"(?:^|[\"'\s])deb\s+https?://")
+        snapshot_source = re.compile(
+            r"deb\s+https?://snapshot\.debian\.org/archive/", re.IGNORECASE
+        )
+        non_snapshot_sources = [
+            line.strip()
+            for line in dockerfile_text.splitlines()
+            if deb_source.search(line) and not snapshot_source.search(line)
+        ]
+        if non_snapshot_sources:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile apt deb sources must use "
+                f"snapshot.debian.org: {non_snapshot_sources}"
             )
 
     literal_images = {

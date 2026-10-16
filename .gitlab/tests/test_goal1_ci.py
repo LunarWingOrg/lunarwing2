@@ -647,6 +647,84 @@ class DebianSnapshotTieTests(unittest.TestCase):
             any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
         )
 
+    def test_env_override_after_arg_is_caught(self):
+        # MR !1644 review HN-6: ENV overrides ARG at build time, so an ENV
+        # after the builder's ARG silently detaches the tie from the image.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + f"ENV DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+        )
+        self.assertTrue(
+            any("DEBIAN_SNAPSHOT references" in error for error in self.errors())
+        )
+
+    def test_run_level_snapshot_assignment_is_caught(self):
+        # HN-6: a RUN-level shell assignment re-points that RUN's URLs
+        # without touching the ARG the tie binds.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN set -eu; DEBIAN_SNAPSHOT=20261001T000000Z; apt-get update\n"
+        )
+        self.assertTrue(
+            any("DEBIAN_SNAPSHOT references" in error for error in self.errors())
+        )
+
+    def test_multi_name_arg_is_caught(self):
+        # HN-6: a multi-name ARG line hides the pin from the valued-ARG match.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + f"ARG OTHER=1 DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+        )
+        self.assertTrue(
+            any("DEBIAN_SNAPSHOT references" in error for error in self.errors())
+        )
+
+    def test_shell_substituted_snapshot_url_is_caught(self):
+        # HN-6: a URL assembled with shell substitution is not a literal
+        # ${DEBIAN_SNAPSHOT} reference.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb http://snapshot.debian.org/archive/debian/$(echo ${DEBIAN_SNAPSHOT})/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("DEBIAN_SNAPSHOT references" in error for error in self.errors())
+        )
+
+    def test_uppercase_snapshot_host_hardcoded_stamp_is_caught(self):
+        # HN-6: the host match is case-insensitive, so an upper-case
+        # SNAPSHOT.debian.org URL cannot smuggle a hardcoded timestamp past
+        # the tie.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + f'"deb http://SNAPSHOT.debian.org/archive/debian/{self.SNAPSHOT}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
+        )
+
+    def test_live_mirror_deb_source_is_caught(self):
+        # HN-6: a builder moved back to the live deb.debian.org mirror made
+        # the tie vacuous — every apt deb source must be a snapshot URL.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb http://deb.debian.org/debian bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
 
 class WorkerTsLaneTests(unittest.TestCase):
     """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
