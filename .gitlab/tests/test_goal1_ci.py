@@ -1026,6 +1026,52 @@ class DebianSnapshotTieTests(unittest.TestCase):
         )
         self.assertEqual(self.errors(), [])
 
+    def test_live_mirror_beside_a_snapshot_source_is_caught(self):
+        # MR !1680 review IP-2 (A9): the per-line check excused the whole
+        # line once one source was a snapshot, so one RUN line could carry
+        # the pinned snapshot AND a live mirror.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN echo 'deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main' > /a.list "
+            + "&& echo 'deb http://deb.debian.org/debian bookworm main' >> /a.list\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
+    def test_other_apt_schemes_and_spellings_are_caught(self):
+        # MR !1680 review IP-2 (A3-A8): the tie only accepted https?://
+        # immediately after a case-sensitive `deb`. apt also honours
+        # mirror+http, tor+https and file:, the instruction keyword is
+        # case-insensitive, deb822 field names are case-insensitive, and a
+        # printf-escaped newline separates tokens in the written file.
+        newline = chr(92) + "n"
+        shapes = {
+            "mirror+http": "RUN echo 'deb mirror+http://deb.debian.org/debian bookworm main' > /a.list\n",
+            "tor+https": "RUN echo 'deb tor+https://deb.debian.org/debian bookworm main' > /a.list\n",
+            "file:": "RUN echo 'deb [trusted=yes] file:/opt/repo ./' > /a.list\n",
+            "uppercase DEB": "RUN echo 'DEB http://deb.debian.org/debian bookworm main' > /a.list\n",
+            "lowercase deb822 uris:": "RUN echo 'uris: http://deb.debian.org/debian' >> /a.sources\n",
+            "printf deb822": (
+                "RUN printf 'Types: deb" + newline + "URIs: http://deb.debian.org/debian"
+                + newline + "Suites: bookworm' > /a.sources\n"
+            ),
+            "deb822 snapshot plus live": (
+                "RUN echo 'URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/"
+                " http://deb.debian.org/debian' >> /a.sources\n"
+            ),
+        }
+        for shape, line in shapes.items():
+            with self.subTest(shape=shape):
+                self.write_dockerfile(
+                    f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n" + self.node_from() + line
+                )
+                self.assertTrue(
+                    any("apt deb sources" in error for error in self.errors()),
+                    f"{shape} produced no apt-source error",
+                )
+
 
 class YamlParseErrorTests(unittest.TestCase):
     """MR !1647 review HP-5: a `!reference` tag anywhere in the CI YAML made
@@ -1082,9 +1128,10 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
     MR !1665 review IF-1/IF-2: the same applies one level down (rule-level
     allow_failure, replaced rules, a job-level when, a deleted or retagged
     gate, a job/rule-level runner tag variable), so the fixture models the
-    real shape — .rust-job carrying the pinned tag, .full-validation-context
-    carrying the if-rules plus a final when: never, each gate extending
-    both."""
+    real shape — .rust-job carrying the pinned tag and the pinned bootstrap
+    before_script, .full-validation-context carrying the if-rules plus a
+    final when: never, each gate extending both and running exactly its
+    pinned script (MR !1680 review IP-1)."""
 
     GATES = (
         "cargo-deny",
@@ -1095,14 +1142,17 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
 
     def merged(self) -> dict:
         return {
-            ".rust-job": {"tags": ["$CI_RUST_RUNNER_TAG"]},
+            ".rust-job": {
+                "tags": ["$CI_RUST_RUNNER_TAG"],
+                "before_script": list(config.ADVISORY_GATE_BEFORE_SCRIPT),
+            },
             ".full-validation-context": {
                 "rules": [{"if": "$CI_COMMIT_BRANCH"}, {"when": "never"}]
             },
             **{
                 name: {
                     "extends": [".rust-job", ".full-validation-context"],
-                    "script": ["bash .gitlab/scripts/check.sh"],
+                    "script": list(config.ADVISORY_GATE_SCRIPTS[name]),
                 }
                 for name in self.GATES
             },
@@ -1233,10 +1283,72 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
 
     def test_benign_job_variables_pass(self):
         # Only the runner tag names are refused at job/rule level; other
-        # job-level variables (the real tree sets several) stay fine.
+        # job-level variables on a non-gate job (the real tree sets several)
+        # stay fine.
+        merged = self.merged()
+        merged["worker-scan-lane"] = {"variables": {"TRIVY_NO_PROGRESS": "true"}}
+        self.assertEqual(self.errors(merged), [])
+        # MR !1680 review IP-1: the gates themselves carry NO job-level
+        # variables — a variable can hollow out a gate, so the same benign
+        # variable on a gate is refused by the key-set pin.
         merged = self.merged()
         merged["cargo-deny"]["variables"] = {"TRIVY_NO_PROGRESS": "true"}
-        self.assertEqual(self.errors(merged), [])
+        self.assertTrue(
+            any(
+                "cargo-deny must not carry job keys" in error
+                for error in self.errors(merged)
+            )
+        )
+
+    def test_gate_that_never_runs_its_checker_is_caught(self):
+        # MR !1680 review IP-1 (run-135): a gate that never runs its checker
+        # is as optional as an allow_failure one. 4 gates x 6 shapes, each
+        # left the head's mention-only script pin green (probes Q1-Q5).
+        for job_name in self.GATES:
+            checker = config.ADVISORY_GATE_SCRIPTS[job_name][-1]
+            shapes = {
+                "job before_script exit 0": lambda merged, name: merged[name].update(
+                    {"before_script": ["exit 0"]}
+                ),
+                "exit 0 as first script line": lambda merged, name: merged[name].update(
+                    {"script": ["exit 0", *config.ADVISORY_GATE_SCRIPTS[name]]}
+                ),
+                "checker || true": lambda merged, name: merged[name].update(
+                    {
+                        "script": [
+                            *config.ADVISORY_GATE_SCRIPTS[name][:-1],
+                            f"{checker} || true",
+                        ]
+                    }
+                ),
+                "echoed checker": lambda merged, name: merged[name].update(
+                    {
+                        "script": [
+                            *config.ADVISORY_GATE_SCRIPTS[name][:-1],
+                            f"echo {checker}",
+                        ]
+                    }
+                ),
+                "template before_script exit 0": lambda merged, name: merged[
+                    ".rust-job"
+                ].update(
+                    {"before_script": [*config.ADVISORY_GATE_BEFORE_SCRIPT, "exit 0"]}
+                ),
+                "job-level hooks": lambda merged, name: merged[name].update(
+                    {"hooks": {"pre_get_sources_script": ["exit 0"]}}
+                ),
+            }
+            for shape, mutate in shapes.items():
+                with self.subTest(job=job_name, shape=shape):
+                    merged = self.merged()
+                    mutate(merged, job_name)
+                    self.assertTrue(
+                        any(
+                            error.startswith(f"{job_name} ")
+                            for error in self.errors(merged)
+                        ),
+                        f"{job_name} / {shape} produced no gate-named error",
+                    )
 
     def test_root_file_cargo_deny_override_is_caught(self):
         # IA-9: the review's exact probe — one root-file line makes the
