@@ -310,7 +310,17 @@ the prime suspect, and the fix is the same normalization in the offending
   plus the final `when: never`), set no job-level `when`, and run on exactly
   the pinned runner tag — a rule-level `allow_failure`, a replaced rules
   list, a deleted gate, or a retag all fail the same way (MR !1665 review
-  IF-1). `secret-history` is the marked, deliberate exception while
+  IF-1). Each gate's extends-resolved `script` and `before_script` are
+  pinned exactly too, and only a fixed key set (`after_script`,
+  `before_script`, `cache`, `image`, `needs`, `rules`, `script`, `stage`,
+  `tags`) may survive extends resolution — a gate that never runs its
+  checker (`exit 0` in the script or the job's or `.rust-job`'s
+  `before_script`, `|| true` on the wrapper, an echoed wrapper name) is as
+  optional as an `allow_failure` one, and job-level `variables`, `hooks`,
+  `inherit`, `parallel` or `timeout` can hollow it out just as well, so a
+  deliberate gate or `.rust-job` bootstrap change updates the pinned tuples
+  in the same commit (MR !1680 review IP-1). `secret-history` is the marked,
+  deliberate exception while
   historical findings are triaged. Three limits of the YAML validator
   remain, by design: it cannot see repo files the pinned scripts still
   honour — a project `.npmrc`, a `bunfig.toml` `preload`, or the
@@ -321,16 +331,22 @@ the prime suspect, and the fix is the same normalization in the offending
   the pinned images to the project registry for Docker Hub quota) and
   invisible to a static tie (MR !1644 review HN-7); and a `sed`-style
   rewrite of the stamp inside `/etc/apt/sources.list` that never names
-  `DEBIAN_SNAPSHOT` is invisible to any line-based rule (MR !1665 review
-  IF-4). What the tie does cover is every in-repo build entrypoint: a
+  `DEBIAN_SNAPSHOT` — or a source URL built from variables — is invisible
+  to any line-based rule (MR !1665 review IF-4, MR !1680 review IP-2); the
+  structural backstop would be an in-image assertion after the apt step,
+  which runs only at the protected image build. What the tie does cover is every in-repo build entrypoint: a
   `DEBIAN_SNAPSHOT` build-arg or env reference in `build-worker-image.sh`,
   mt-admin's `05-tenant-build.sh`, `tests/docker-compose.test.yml`, or
   `kimicode4lunarwing/docker-compose.yml` is refused, and every
   `DEBIAN_SNAPSHOT` mention in `kimicode4lunarwing/Dockerfile` must be a
   plain `ARG` declaration or a `${DEBIAN_SNAPSHOT}` snapshot URL, with every
-  apt source — `deb`/`deb-src` with or without a bracketed options list,
-  and deb822 `URIs:` lines — pointing at snapshot.debian.org (MR !1644
-  review HN-6, broadened by MR !1665 review IF-3).
+  apt source URI on every line — `deb`/`deb-src` with or without a
+  bracketed options list under any apt URL scheme (`http(s)`,
+  `mirror+http`, `tor+https`, `file:`), and every URI of a deb822 `URIs:`
+  field — matched case-insensitively (printf-escaped separators included)
+  and pointing at snapshot.debian.org, so one line carrying a snapshot
+  source beside a live mirror fails too (MR !1644
+  review HN-6, broadened by MR !1665 review IF-3 and MR !1680 review IP-2).
   YAML the validator cannot parse at all (e.g. a `!reference` tag, which
   `yaml.safe_load` rejects) fails closed with a clean one-line error naming
   the file, not a traceback (MR !1647 review HP-5).
