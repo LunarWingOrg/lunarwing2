@@ -36,7 +36,7 @@ urlencoding = { version = "2", optional = true }
 # Leak detection for the B-3 publish path (defense-in-depth before sending skill
 # bodies to the registry). Sibling workspace crate.
 lunarwing_safety = { path = "../lunarwing_safety", version = "2.1.6", optional = true }
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9.0.4", default-features = false, features = ["deflate"], optional = true }
 
 # Optional (registry feature — tempfile needed for dev-dep in tests, but also
 # the registry module itself uses no extra deps beyond tokio::fs)
