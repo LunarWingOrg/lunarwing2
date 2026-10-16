@@ -208,7 +208,9 @@ impl AgentConfig {
             auto_approve_tools: true,
             default_timezone: "UTC".to_string(),
             max_tokens_per_job: 0,
-            handle_message_timeout: Duration::from_secs(630),
+            handle_message_timeout: Duration::from_secs(
+                crate::settings::AgentSettings::default().handle_message_timeout_secs,
+            ),
             self_repair_op_timeout: Duration::from_secs(60),
             session_prune_timeout: Duration::from_secs(30),
             pending_gate_expiry_secs: 1800,
@@ -358,6 +360,20 @@ fn agent_env_key_warning(key: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WI#380: the test-rig config must track the production default like the
+    /// scheduler and dispatcher helpers, independently of environment overrides.
+    #[cfg(feature = "libsql")]
+    #[test]
+    fn for_testing_handle_message_timeout_matches_production_default() {
+        assert_eq!(
+            AgentConfig::for_testing().handle_message_timeout,
+            Duration::from_secs(
+                crate::settings::AgentSettings::default().handle_message_timeout_secs
+            ),
+            "AgentConfig::for_testing drifted from the production handle_message_timeout default"
+        );
+    }
 
     #[test]
     fn approval_env_diagnostics_distinguish_aliases_typos_and_other_services() {
