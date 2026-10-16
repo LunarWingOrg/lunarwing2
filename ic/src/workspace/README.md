@@ -231,37 +231,49 @@ every backup emits a `lunarwing::safety` warn audit line naming the path, the
 prior byte count and the backup path. Most prompt-visible files keep a single
 rolling slot, overwritten on each replace; daily logs additionally retain up
 to eight earlier generations — before the slot is overwritten, its content
-rolls aside to the first free `backups/daily/<date>.md.bak.<n>`. At the cap
-the first generation of the day stays pinned and the second-oldest
-generation is discarded instead, with an audit line carrying its byte count
-and blake3 fingerprint so forensics can say what was lost. The pin is
-positional, not evidential (WI#335): `.1` holds the content that preceded
-the day's first *backed-up* replace in that scope — the first backup is
-taken only when the prior content is non-empty and differs, and layer writes
-keep their own chain — which is the poison's predecessor only when the
-poison arrived in that first backed-up replace; any earlier backed-up
-replace that day puts the poison in `.2+`. Letting the discard branch run
-from the agent lane would
-therefore let a steered agent evict the poisoned generation with a handful
-of ordinary replaces, so the memory tool's replace lanes (`daily_log`,
-explicit `daily/*.md` paths, and the layer route) fail closed once the cap
-exists: the replace is refused with a classified error before anything is
-discarded or shifted, telling the agent to hand the replace to the operator.
-The decision is made inside the rotation itself, so a racing replace cannot
-slip past a pre-check (the concurrent-probe race between two replaces is the
-accepted WI#288 T-6 residual, unchanged by WI#335). Operator routes
-(`Workspace::write` / `Workspace::write_to_layer` via web/CLI) intentionally
-keep rotating and discarding at the cap — an operator may always replace a
-saturated day's log. Repeated same-day replaces through those routes never
-silently discard a recent version without the fingerprinted audit line, and
-retained storage stays bounded. A replace retried after a crash between the
-backup and the replace commit grows no duplicate generation. On operator
-lanes backup and rotation failures are logged and never block the write
-itself. The fail-closed agent lanes are the exception, and not only at the
-cap: with the guard armed, *any* rotation or `.bak`-write failure aborts the
-replace, because proceeding would overwrite the rolling slot — exactly where
-the poison sits right after it lands — without a proven backup (the cap
-refusal above is the agent-visible face of the same contract). Backups are
+rolls aside to the first free `backups/daily/<date>.md.bak.<n>`, and a
+successful roll-aside emits its own audit line naming the numbered slot and
+the rolled byte count (WI#336). At the cap the first generation of the day
+stays pinned and the second-oldest generation is discarded instead, with an
+audit line carrying its byte count and the first 128 bits of its blake3
+fingerprint — emitted before the destructive shift begins, so the line
+records the generation marked for discard even when the shift then fails (a
+failure before the first slot write leaves it intact) (WI#336). Fingerprints
+in these audit lines are 128-bit prefixes (32 hex chars) because the
+daemon's production log scrubber redacts any standalone 64-hex value as a
+possible gateway token; the prefix matches no scrubber shape and reaches
+every log sink intact (WI#336 run-115 HL-1). The pin is positional, not
+evidential (WI#335): `.1` holds the content that preceded the day's first
+*backed-up* replace in that scope — the first backup is taken only when the
+prior content is non-empty and differs, and layer writes keep their own
+chain — which is the poison's predecessor only when the poison arrived in
+that first backed-up replace; any earlier backed-up replace that day puts
+the poison in `.2+`. Letting the discard branch run from the agent lane
+would therefore let a steered agent evict the poisoned generation with a
+handful of ordinary replaces, so the memory tool's replace lanes
+(`daily_log`, explicit `daily/*.md` paths, and the layer route) fail closed
+once the cap exists: the replace is refused with a classified error before
+anything is discarded or shifted, telling the agent to hand the replace to
+the operator. The decision is made inside the rotation itself, so a racing
+replace cannot slip past a pre-check (the concurrent-probe race between two
+replaces is the accepted WI#288 T-6 residual, unchanged by WI#335). Operator
+routes (`Workspace::write` / `Workspace::write_to_layer` via web/CLI)
+intentionally keep rotating and discarding at the cap — an operator may
+always replace a saturated day's log. Repeated same-day replaces through
+those routes never silently discard a recent version without the
+fingerprinted audit line, and retained storage stays bounded. A replace
+retried after a crash between the backup and the replace commit grows no
+duplicate generation. On operator lanes backup and rotation failures are
+logged and never block the write itself; a daily-log rotation that fails
+after the slot was read additionally fingerprints (byte count + the first
+128 bits of blake3) the un-rotated rolling-slot content before the overwrite
+destroys it, while a failure reading the slot itself has nothing to
+fingerprint (WI#336 GP-1, run-115 HL-2). The fail-closed agent lanes are the
+exception, and not only at the cap: with the guard armed, *any* rotation or
+`.bak`-write failure aborts the replace, because proceeding would overwrite
+the rolling slot — exactly where the poison sits right after it lands —
+without a proven backup (the cap refusal above is the agent-visible face of
+the same contract). Backups are
 retrievable by exact-path `read()` and visible in `list()`, but are stored
 with an empty chunk projection so they never enter the search index. Because
 they can hold quarantined injection content and are the recovery evidence
