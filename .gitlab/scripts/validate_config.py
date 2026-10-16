@@ -1048,9 +1048,14 @@ def validate_worker_input_manifest(errors: list[str]) -> None:
         block = blocks.get(worker)
         if block is None:
             continue  # validate_worker_versions already reports the missing block
-        for entry in worker_input_files(block):
-            if not entry:
-                continue
+        entries = [entry for entry in worker_input_files(block) if entry]
+        if not entries:
+            errors.append(
+                f"build-worker-image.sh {worker} block must declare a non-empty "
+                "input_files manifest"
+            )
+            continue
+        for entry in entries:
             if safe_relative_path(entry) is None:
                 errors.append(
                     f"build-worker-image.sh {worker} input {entry!r} is not a "
