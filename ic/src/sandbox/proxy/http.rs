@@ -451,8 +451,8 @@ async fn forward_request(
     } else {
         // WI#395 (run-111 HA-2): a compressed body cannot be byte-scrubbed
         // for echoed credentials; ask the upstream for identity encoding on
-        // credential-injected exchanges (an opaque Content-Encoding is
-        // refused below rather than forwarded blind).
+        // credential-injected exchanges (an opaque content or transfer
+        // coding is refused below rather than forwarded blind).
         builder = builder.header("accept-encoding", "identity");
     }
 
@@ -486,12 +486,12 @@ async fn forward_request(
                     // WI#395 (run-111 HA-2): 3xx bodies echo the redirect
                     // target URL on common edges (Go, Apache, Express), so a
                     // credential-injected exchange scrubs the body with the
-                    // same spellings as the headers. A content-encoded body
-                    // cannot be inspected; it is refused rather than
-                    // forwarded with a possible echo blind.
+                    // same spellings as the headers. A body whose content or
+                    // transfer coding is not inspectable is refused rather
+                    // than forwarded with a possible echo blind.
                     let mut body_scrubbed = false;
                     if !echo_spellings.is_empty() {
-                        if response_content_encoding_is_opaque(&headers) {
+                        if response_body_coding_is_opaque(&headers) {
                             tracing::warn!(
                                 "Proxy: refused content-encoded response body that cannot be scrubbed for echoed credentials"
                             );
@@ -687,17 +687,32 @@ fn forward_scrubbed_headers(
     builder
 }
 
-/// True when the upstream response body is content-encoded in a way the
-/// proxy cannot byte-scrub (WI#395 run-111 HA-2). Missing, empty and
-/// `identity` encodings are inspectable.
-fn response_content_encoding_is_opaque(headers: &http::HeaderMap) -> bool {
+/// True when the upstream response body is encoded in a way the proxy
+/// cannot byte-scrub (WI#395 run-111 HA-2, WI#419 KH-1). Missing, empty
+/// and `identity` content codings are inspectable, and so are `chunked`
+/// transfer codings (hyper removes that framing but no other). Every
+/// `Content-Encoding` / `Transfer-Encoding` field is checked — a duplicate
+/// field cannot hide a coding behind an `identity` first field — with each
+/// comma-separated token checked individually, and an unreadable value
+/// counts as opaque rather than fail-open.
+fn response_body_coding_is_opaque(headers: &http::HeaderMap) -> bool {
+    fn field_is_opaque(value: &http::HeaderValue, allowed: &str) -> bool {
+        match value.to_str() {
+            Ok(v) => v.split(',').any(|token| {
+                let token = token.trim();
+                !token.is_empty() && !token.eq_ignore_ascii_case(allowed)
+            }),
+            Err(_) => true,
+        }
+    }
     headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            let v = v.trim();
-            !v.is_empty() && !v.eq_ignore_ascii_case("identity")
-        })
+        .get_all("content-encoding")
+        .iter()
+        .any(|v| field_is_opaque(v, "identity"))
+        || headers
+            .get_all("transfer-encoding")
+            .iter()
+            .any(|v| field_is_opaque(v, "chunked"))
 }
 
 /// Percent-decode `%XX` escapes for one round; `+` is optionally read as a
