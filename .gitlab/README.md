@@ -295,6 +295,25 @@ the prime suspect, and the fix is the same normalization in the offending
   includes are merged by GitLab but invisible here. `extends` chains resolve
   up to a depth budget of 11; a longer chain or a cycle fails closed instead
   of being certified from the keys visible at truncation.
+- `worker-opencode2-ts`: the opencode2 worker's dependency-free Bun suites
+  (`path_expand_test.ts`, `task_prompt_test.ts`, `opencode_result_test.ts`).
+  The executor suite needs the image's built `@opencode/client` and stays
+  gated at the (protected) worker image build. Runs on the same digest-pinned
+  `CI_BUN_IMAGE` as the v1 lane on every MR/branch push and protected release
+  tag, and is pinned by the same `WORKER_TS_LANE_SCRIPTS` machinery (WI#375
+  DR-3), so a script edit must update the tuple in the same commit.
+- `worker-pebble-rust`: the pebble worker's Rust suite via
+  `bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --manifest-path
+  ../pebble4lunarwing/Cargo.toml`, resolving under ic's vendored context on
+  every MR/branch push and protected release tag (previously gated only at
+  the protected image build; WI#375 DR-3). The lane extends `.rust-job` for
+  the toolchain bootstrap and pull-only cache; `validate_pebble_rust_lane`
+  pins the extends, the resolved `$CI_RUST_IMAGE` image and
+  `$CI_RUST_RUNNER_TAG` tag, the merge_request_event rule, and the exact
+  script, and refuses job-level `variables`/`hooks`/`parallel`/
+  `before_script`/`after_script`/`image`/`tags` overrides of the audited
+  template. Any script edit must update `PEBBLE_RUST_LANE_SCRIPT` in the same
+  commit.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL
