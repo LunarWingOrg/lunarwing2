@@ -846,9 +846,26 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
 # pinned script; the job's own keys are limited to the wiring keys so a
 # job-level before_script/after_script (replacing the audited bootstrap),
 # image/tags override, variables, hooks, or a parallel matrix is refused.
+# The same holds at the template level (MR !1669 review IK-8): the resolved
+# job may carry only the audited .rust-job keys, and its inherited
+# before_script must equal the pinned bootstrap line for line.
 PEBBLE_RUST_LANE_JOB_KEYS = frozenset({
     "stage", "needs", "extends", "rules", "script", "allow_failure", "when",
 })
+# Keys allowed to survive extends resolution (the .rust-job template keys
+# plus the job's own wiring keys), and the exact inherited bootstrap: a
+# template-level variables/hooks/inherit/parallel entry or a before_script
+# `exit 0` would hollow the lane out just like a job-level override (MR
+# !1669 review IK-8). A deliberate change to .rust-job's bootstrap must
+# update PEBBLE_RUST_LANE_BEFORE_SCRIPT in the same commit.
+PEBBLE_RUST_LANE_EFFECTIVE_KEYS = PEBBLE_RUST_LANE_JOB_KEYS | frozenset({
+    "image", "tags", "before_script", "after_script", "cache",
+})
+PEBBLE_RUST_LANE_BEFORE_SCRIPT = (
+    'df -h "$CI_PROJECT_DIR"',
+    "bash .gitlab/scripts/bootstrap-rust.sh",
+    "bash .gitlab/scripts/bootstrap-sccache.sh",
+)
 PEBBLE_RUST_LANE_SCRIPT = (
     "bash .gitlab/scripts/cargo-ci.sh test -j2 --locked "
     "--manifest-path ../pebble4lunarwing/Cargo.toml",
@@ -878,6 +895,23 @@ def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
             f"worker-pebble-rust extends chain exceeds the validation depth "
             f"budget ({EXTENDS_DEPTH_BUDGET}); refusing to certify a "
             "partially resolved job"
+        )
+    inherited = sorted(
+        set(effective) - PEBBLE_RUST_LANE_EFFECTIVE_KEYS - {EXTENDS_TRUNCATED_KEY}
+    )
+    if inherited:
+        errors.append(
+            f"worker-pebble-rust must not inherit job keys {inherited}; "
+            "template-level variables, hooks, inherit or parallel can bypass "
+            "the pinned script"
+        )
+    before_script = effective.get("before_script")
+    if not isinstance(before_script, list) or [
+        str(line) for line in before_script
+    ] != list(PEBBLE_RUST_LANE_BEFORE_SCRIPT):
+        errors.append(
+            "worker-pebble-rust before_script must be exactly the pinned "
+            f".rust-job bootstrap {list(PEBBLE_RUST_LANE_BEFORE_SCRIPT)!r}"
         )
     if image_name(effective.get("image")) != "$CI_RUST_IMAGE":
         errors.append("worker-pebble-rust must resolve to the $CI_RUST_IMAGE image")

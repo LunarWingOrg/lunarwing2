@@ -1888,6 +1888,30 @@ class PebbleRustLaneTests(unittest.TestCase):
         merged[".rust-job"]["tags"] = ["$CI_LINT_RUNNER_TAG"]
         self.assertTrue(any("CI_RUST_RUNNER_TAG" in error for error in self.errors(merged)))
 
+    def test_template_bootstrap_exit_0_is_caught(self):
+        # MR !1669 review IK-8: .rust-job is shared — an `exit 0` appended to
+        # its before_script ends the job green before the pinned script runs.
+        merged = self.merged()
+        merged[".rust-job"]["before_script"].append("exit 0")
+        self.assertTrue(any("before_script" in error for error in self.errors(merged)))
+
+    def test_template_level_bypass_keys_are_caught(self):
+        # MR !1669 review IK-8: template-level variables/hooks/inherit/
+        # parallel survive extends resolution and bypass the pinned script.
+        for key, value in (
+            ("variables", {"RUSTC_WRAPPER": "/bin/true"}),
+            ("hooks", {"pre_get_sources_script": ["echo x"]}),
+            ("inherit", {"variables": False}),
+            ("parallel", {"matrix": [{"RUSTFLAGS": ["--cfg x"]}]}),
+        ):
+            with self.subTest(key=key):
+                merged = self.merged()
+                merged[".rust-job"][key] = value
+                self.assertTrue(
+                    any(f"'{key}'" in error for error in self.errors(merged)),
+                    self.errors(merged),
+                )
+
     def test_never_rules_are_caught(self):
         merged = self.merged()
         merged["worker-pebble-rust"]["rules"] = [{"when": "never"}]
