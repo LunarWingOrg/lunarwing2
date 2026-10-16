@@ -76,12 +76,43 @@ missing on this host. The health pipeline then reported
 
 ## Build record (build-tenant)
 
-```bash
-sudo bash ic/scripts/lunarwing-mt-admin.sh build-tenant soarin \
-  --with-wasm --with-pebble --with-kimi --with-opencode2 --with-toolchains
-```
+First pass (`--with-wasm --with-pebble --with-kimi --with-opencode2
+--with-toolchains`, tmux, `BUILD_EXIT=0`):
 
-(running — results recorded below once complete)
+- Daemon release binary `ic/target/release/lunarwing` (110 MB) + xmpp-bridge
+  built from the tenant clone (branch `sweetiebot/kimi-72-20261016-2205`).
+- Worker images, all **fat (Rust/Go/C++ toolchains)**, in the admin (root)
+  podman store:
+  - `lunarwing-worker-pebble:latest` — 2.33 GB (source revision `7a0bff1af`)
+  - `lunarwing-worker-kimi:latest` — 2.68 GB (source revision `962c08065`)
+  - `lunarwing-worker-opencode2:latest` — 2.9 GB (source revision `962c08065`)
+  (pebble builds from the live checkout, kimi/opencode2 from the tenant clone —
+  both are the same worker-source tree; the branch's extra commits touch only
+  docs and mt-admin.)
+- **WASM lane skipped on the first pass** — see anomaly A1 (noexec `/tmp`
+  killed the tenant rustup install). Fixed, then a second
+  `build-tenant soarin --with-wasm` pass completed `WASM_EXIT=0`:
+  - channels: `multica`, `weechat`, `xmpp` installed (`darkirc` correctly
+    skipped — tenant darkirc disabled)
+  - tools: `cavepony-tool`, `gitlab-tool`, `gotify-tool`, `llm-context-tool`,
+    `multica-bridge-tool`, `ssh-tool`, `vision-analyze-tool`,
+    `voice-transcribe-tool`, `web-search-tool`
+  - weechat caps patched to the tenant's relay/adapter ports; ssh-tool
+    allowlist `["127.0.0.1"]`
+
+### In-image pins verified (items 4, 52, 53 — WI#324/WI#411/WI#412)
+
+Against the freshly built `lunarwing-worker-kimi:latest`:
+
+- `@moonshot-ai/kimi-code` pinned at **2.2.0** (`/opt/kimi-cli/package.json`).
+- `config/config.toml` pins **`max_output_size = 131072`** on the
+  FrontierCODEK model (with the rationale comment) — the config-side AC of the
+  maintainer's rebuild note; this image was built from a tree far past
+  `766b7c91e`.
+- The WI#411 scrub is present: both `entrypoint.sh` modes
+  `unset KIMI_CODE_DANGEROUS_COMMAND_GUARD KIMI_CODE_TRUST_WORKSPACE`, and
+  `kimi_task_executor.ts` deletes `KIMI_CODE_TRUST_WORKSPACE` after every env
+  merge.
 
 ## Runtime verification
 
