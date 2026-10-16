@@ -2282,6 +2282,20 @@ mod tests {
         .await
         .unwrap(); // safety: test
         assert!(!exited, "closed command channel must end the tick");
+        // MR !1669 review IK-7: the tick recorded its own dispatched link as
+        // the mission's last job before the closed channel was observed; that
+        // link (not the pre-seeded stand-in) is the one the shutdown cancel
+        // must reach.
+        let in_flight = last
+            .lock()
+            .unwrap() // safety: test
+            .expect("tick recorded its in-flight link"); // safety: test
+        assert_ne!(in_flight, last_job);
+        assert_eq!(
+            manager.cancel_reason_for_test(in_flight).await,
+            Some(CancelReason::Shutdown),
+            "closed command channel must route a shutdown cancel to the in-flight link"
+        );
     }
 
     /// WI#375 DR-6: `load_last_tick_job` must reject a garbage pointer, a

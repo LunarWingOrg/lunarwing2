@@ -10,9 +10,11 @@
 //! Test-support only; integration tests in `ic/tests/` import the crate as a
 //! regular dependency, so this module is always compiled (same shape as
 //! `channels::web::test_helpers`). The delegation bodies are a mechanical
-//! listing of the `Database` sub-trait surface; the compiler enforces
-//! completeness (a new trait method with no delegation entry fails to
-//! compile `RecordingDb: Database`).
+//! listing of the `Database` sub-trait surface. The compiler enforces
+//! completeness only for REQUIRED methods — a new trait method with a
+//! provided (default) body silently runs the default instead of delegating
+//! (MR !1669 review IK-9), so provided methods are listed here too; when the
+//! trait grows a provided method, add the matching entry deliberately.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -181,6 +183,7 @@ delegate_database! {
         list_conversation_messages( &self, conversation_id: Uuid, ) -> Result<Vec<ConversationMessage>, DatabaseError>;
         conversation_belongs_to_user( &self, conversation_id: Uuid, user_id: &str, ) -> Result<bool, DatabaseError>;
         get_conversation_source_channel( &self, conversation_id: Uuid, ) -> Result<Option<String>, DatabaseError>;
+        get_or_create_scoped_conversation( &self, channel: &str, user_id: &str, scope: &str, ) -> Result<Uuid, DatabaseError>;
     }
 
     JobStore {
@@ -276,6 +279,10 @@ delegate_database! {
         list_versions( &self, document_id: Uuid, limit: i64, ) -> Result<Vec<crate::workspace::VersionSummary>, crate::error::WorkspaceError>;
         get_latest_version_number( &self, document_id: Uuid, ) -> Result<Option<i32>, crate::error::WorkspaceError>;
         prune_versions( &self, document_id: Uuid, keep_count: i32, ) -> Result<u64, crate::error::WorkspaceError>;
+        hybrid_search_multi( &self, user_ids: &[String], agent_id: Option<Uuid>, query: &str, embedding: Option<&[f32]>, config: &SearchConfig, ) -> Result<Vec<SearchResult>, WorkspaceError>;
+        list_all_paths_multi( &self, user_ids: &[String], agent_id: Option<Uuid>, ) -> Result<Vec<String>, WorkspaceError>;
+        get_document_by_path_multi( &self, user_ids: &[String], agent_id: Option<Uuid>, path: &str, ) -> Result<MemoryDocument, WorkspaceError>;
+        list_directory_multi( &self, user_ids: &[String], agent_id: Option<Uuid>, directory: &str, ) -> Result<Vec<WorkspaceEntry>, WorkspaceError>;
     }
 
     UserStore {
@@ -319,5 +326,30 @@ delegate_database! {
         prune_stale_reflex_patterns( &self, stale_after_days: i32, dry_run: bool, ) -> Result<Vec<ReflexPatternRecord>, DatabaseError>;
         update_reflex_pattern_embedding( &self, user_id: &str, normalized_pattern: &str, embedding: &[f32], model: &str, ) -> Result<(), DatabaseError>;
         semantic_search_reflex_patterns( &self, user_id: &str, query_embedding: &[f32], limit: i32, ) -> Result<Vec<(ReflexPatternRecord, f64)>, DatabaseError>;
+        bump_reflex_pattern_match( &self, user_id: &str, normalized_pattern: &str, ) -> Result<(), DatabaseError>;
+    }
+}
+
+#[cfg(all(test, feature = "libsql"))]
+mod tests {
+    use super::*;
+
+    /// WI#375 DR-2 / MR !1669 review IK-6: an attempt is recorded even when
+    /// the inner write fails (no agent_jobs row, so the job_events FK refuses
+    /// it). Without this positive control an empty attempt list could also
+    /// mean "the recorder never records", which would make the no-orphan pin
+    /// vacuous.
+    #[tokio::test]
+    async fn records_save_job_event_attempts_even_when_inner_write_fails() {
+        let (inner, _dir) = crate::testing::test_db().await;
+        let recording = RecordingDb::new(inner);
+        let orphan = Uuid::new_v4();
+        let _ = recording
+            .save_job_event(orphan, "cron_reentry", &serde_json::json!({}))
+            .await;
+        assert_eq!(
+            recording.job_event_attempts(),
+            vec![(orphan, "cron_reentry".to_string())]
+        );
     }
 }
