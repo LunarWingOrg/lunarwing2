@@ -1962,7 +1962,7 @@ mod tests {
         let job_id = Uuid::new_v4();
         cm.register_sandbox_job(job_id, "owner", "tick", "pending cancel")
             .await
-            .unwrap();
+            .unwrap(); // safety: test
         let (shutdown, mut receiver) = broadcast::channel(1);
         let reentry = prepare_reentry(
             &ctx,
@@ -1981,11 +1981,11 @@ mod tests {
             _ = &mut reentry => panic!("must wait for the active link"),
             _ = std::future::ready(()) => {}
         }
-        shutdown.send(()).unwrap();
+        shutdown.send(()).unwrap(); // safety: test
         assert!(
             tokio::time::timeout(Duration::from_secs(1), reentry)
                 .await
-                .unwrap()
+                .unwrap() // safety: test
                 .is_none()
         );
     }
@@ -2026,8 +2026,8 @@ mod tests {
             commands
                 .send(CronCommand::Pause(CronCommandOrigin::OwnerTool))
                 .await
-                .unwrap();
-            shutdown.send(()).unwrap();
+                .unwrap(); // safety: test
+            shutdown.send(()).unwrap(); // safety: test
             assert!(matches!(
                 next_wake(Duration::ZERO, &mut rx, &mut shutdown_rx).await,
                 Some(Wake::Command(CronCommand::Pause(_)))
@@ -2058,8 +2058,8 @@ mod tests {
             commands
                 .send(CronCommand::Resume(CronCommandOrigin::OwnerTool))
                 .await
-                .unwrap();
-            shutdown.send(()).unwrap();
+                .unwrap(); // safety: test
+            shutdown.send(()).unwrap(); // safety: test
             assert!(paused_turn(&ctx, &mut state, &pause, &mut rx, &mut shutdown_rx).await);
             assert!(!state.paused);
             assert!(!paused_turn(&ctx, &mut state, &pause, &mut rx, &mut shutdown_rx).await);
@@ -2100,12 +2100,12 @@ mod tests {
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(6), tick)
                 .await
-                .unwrap(),
+                .unwrap(), // safety: test
             Some(TickEnd::Resolved)
         ));
         // DN-6: reserve failed before persist, so no job row may exist and no
         // last-job pointer may have been recorded.
-        assert!(store.list_sandbox_jobs().await.unwrap().is_empty());
+        assert!(store.list_sandbox_jobs().await.unwrap().is_empty()); // safety: test
         assert!(last_tick_job(&ctx).is_none());
     }
 
@@ -2245,5 +2245,128 @@ mod tests {
         let ctx = build_task_context("u", None, HashMap::new(), Vec::new(), HashMap::new());
         let json = serde_json::to_value(&ctx).expect("serialize");
         assert!(json.get("cron_tick").is_none());
+    }
+
+    /// WI#375 DR-6: a closed owner-command channel is the supervisor's
+    /// shutdown signal mid-tick — `drive_tick` must stop promptly (and route
+    /// a shutdown cancel to the in-flight link on the way out) instead of
+    /// driving the chain on with no way to receive commands.
+    #[tokio::test]
+    async fn drive_tick_exits_promptly_when_command_channel_closes() {
+        let cm = Arc::new(crate::context::ContextManager::new(4));
+        let (events, _) = broadcast::channel(8);
+        let worker = ExternalWorkerConfig::default();
+        let manager =
+            Arc::new(ExternalWorkerManager::new(vec![worker.clone()]).with_event_deps(events, cm));
+        let cron = test_cron();
+        // Stand in for the in-flight chain link the closed channel must
+        // cancel: a reserved (never started) task on the same worker.
+        let last_job = Uuid::new_v4();
+        manager
+            .reserve_task(last_job, &worker.name, "owner")
+            .await
+            .unwrap(); // safety: test
+        let last = Arc::new(std::sync::Mutex::new(Some(last_job)));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let pause = Arc::new(AtomicBool::new(false));
+        let mut state = MissionState::default();
+        let (_shutdown, mut shutdown_rx) = broadcast::channel(1);
+        let (commands, mut rx) = mpsc::channel(2);
+        // Dropping the only sender closes the channel: the supervisor owner
+        // is gone, so the tick must end rather than run unsupervised.
+        drop(commands);
+        let exited = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_tick(&ctx, &mut state, &pause, 1, &mut rx, &mut shutdown_rx),
+        )
+        .await
+        .unwrap(); // safety: test
+        assert!(!exited, "closed command channel must end the tick");
+    }
+
+    /// WI#375 DR-6: `load_last_tick_job` must reject a garbage pointer, a
+    /// deleted (or never persisted) job row, and a job owned by someone else
+    /// — none of them may anchor post-restart lifecycle events (the
+    /// `job_events.job_id` FK would also dangle).
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn load_last_tick_job_rejects_invalid_or_foreign_anchors() {
+        let (db, _dir) = crate::testing::test_db().await;
+        let key = "cron-mission:pr-digest:last-job";
+
+        // No pointer recorded yet.
+        assert!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest")
+                .await
+                .is_none()
+        );
+
+        // A garbage pointer cannot parse as a job id.
+        db.set_setting("owner", key, &serde_json::json!("not-a-uuid"))
+            .await
+            .unwrap(); // safety: test
+        assert!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest")
+                .await
+                .is_none()
+        );
+
+        // A well-formed id whose row was deleted (or never existed).
+        let missing = Uuid::new_v4();
+        db.set_setting("owner", key, &serde_json::json!(missing))
+            .await
+            .unwrap(); // safety: test
+        assert!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest")
+                .await
+                .is_none()
+        );
+
+        // A real job row owned by someone else.
+        let foreign = Uuid::new_v4();
+        db.save_sandbox_job(&test_job_record(foreign, "other"))
+            .await
+            .unwrap(); // safety: test
+        db.set_setting("owner", key, &serde_json::json!(foreign))
+            .await
+            .unwrap(); // safety: test
+        assert!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest")
+                .await
+                .is_none()
+        );
+
+        // A real job row owned by the mission owner anchors again.
+        let owned = Uuid::new_v4();
+        db.save_sandbox_job(&test_job_record(owned, "owner"))
+            .await
+            .unwrap(); // safety: test
+        db.set_setting("owner", key, &serde_json::json!(owned))
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(
+            load_last_tick_job(Some(&db), "owner", "pr-digest").await,
+            Some(owned)
+        );
+    }
+
+    /// Minimal sandbox-job row for the `load_last_tick_job` anchor tests.
+    #[cfg(feature = "libsql")]
+    fn test_job_record(id: Uuid, user_id: &str) -> SandboxJobRecord {
+        let now = Utc::now();
+        SandboxJobRecord {
+            id,
+            task: "tick".to_string(),
+            status: "running".to_string(),
+            user_id: user_id.to_string(),
+            project_dir: "missions/pr-digest".to_string(),
+            success: None,
+            failure_reason: None,
+            created_at: now,
+            started_at: Some(now),
+            completed_at: None,
+            credential_grants_json: "[]".to_string(),
+            job_mode: "external:mock".to_string(),
+        }
     }
 }
