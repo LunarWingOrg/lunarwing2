@@ -443,9 +443,12 @@ _tenant_env_sed() {  # <tenant> <env_file> <sed-expression>
 # root-private snapshot. The tenant-side writers still re-read the live file at
 # commit time, so a post-snapshot swap fails closed there. A missing path
 # snapshots as empty (first-render shape); an unreadable or dangling one dies.
-# Caller must rm the printed snapshot on every path that does not die first.
-_snapshot_tenant_env() {  # <tenant> <env_file> — prints the snapshot path
+# The result is delivered through a nameref (never a command substitution) so
+# the die stays fatal under a caller's suppressed errexit. The caller must rm
+# the snapshot on every path that does not die first.
+_snapshot_tenant_env() {  # <tenant> <env_file> <out_var>
   local name="$1" path="$2" snapshot
+  local -n _snapshot_out="$3"
   snapshot="$(mktemp)" || die "could not snapshot $path"
   if [[ -e "$path" || -L "$path" ]]; then
     if ! tenant_cat "$name" "$path" >"$snapshot"; then
@@ -453,7 +456,7 @@ _snapshot_tenant_env() {  # <tenant> <env_file> — prints the snapshot path
       die "could not read $path as tenant '$name'"
     fi
   fi
-  printf '%s\n' "$snapshot"
+  _snapshot_out="$snapshot"
 }
 
 _quote_env_value() {  # <one-line value>
@@ -1091,9 +1094,9 @@ write_tenant_lunarwing_env() {
   # before the snapshot by design: XMPP_JID is a non-secret identifier, and a
   # foreign symlink dies on this snapshot before any value is rendered.
   local env_snapshot vision_snapshot voice_snapshot
-  env_snapshot="$(_snapshot_tenant_env "$name" "$path")"
-  vision_snapshot="$(_snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/vision.env")"
-  voice_snapshot="$(_snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/voice.env")"
+  _snapshot_tenant_env "$name" "$path" env_snapshot
+  _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/vision.env" vision_snapshot
+  _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/voice.env" voice_snapshot
 
   # Idempotent on re-run (F4-A/F4-B): PRESERVE existing secrets when lunarwing.env
   # already exists. Regenerating SECRETS_MASTER_KEY would permanently orphan the
@@ -1669,7 +1672,7 @@ write_tenant_bridge_env() {
   # symlink and this writer would then render the other tenant's XMPP
   # credentials into this tenant's bridge env.
   local lunarwing_snapshot
-  lunarwing_snapshot="$(_snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/lunarwing.env")"
+  _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/lunarwing.env" lunarwing_snapshot
   bridge_token="$(_read_env_value "$lunarwing_snapshot" XMPP_BRIDGE_TOKEN)"
   [[ -n "$bridge_token" ]] || bridge_token="$(generate_token | cut -c1-32)"
 
@@ -2704,7 +2707,7 @@ patch_tenant_coordination_env() {
   # root's reads would follow it and the appends below would write the other
   # tenant's COORD_ADMIN_TOKEN/COORD_ADMIN_PORT into this tenant's env.
   local env_snapshot
-  env_snapshot="$(_snapshot_tenant_env "$name" "$env_path")"
+  _snapshot_tenant_env "$name" "$env_path" env_snapshot
   coord_admin_port="$(_env_existing "$env_snapshot" COORD_ADMIN_PORT)"
   if [[ -z "$coord_admin_port" ]]; then
     coord_admin_port="$(ports_get "$name" coord_admin || true)"
@@ -2796,13 +2799,13 @@ backfill_tenant_worker_base_urls() {  # <tenant>
   # symlink present for the read window is unreadable to the tenant-side cat
   # and dies instead of writing another tenant's endpoints into this env.
   local env_snapshot proxy_snapshot
-  env_snapshot="$(_snapshot_tenant_env "$name" "$env_path")"
+  _snapshot_tenant_env "$name" "$env_path" env_snapshot
   llm_base_url="$(_read_env_value "$env_snapshot" LLM_BASE_URL)"
   tensorzero_url=""
   proxy_env="$(tenant_env_dir "$name")/proxy.env"
   proxy_snapshot=""
   if [[ -e "$proxy_env" || -L "$proxy_env" ]]; then
-    proxy_snapshot="$(_snapshot_tenant_env "$name" "$proxy_env")"
+    _snapshot_tenant_env "$name" "$proxy_env" proxy_snapshot
     tensorzero_url="$(_read_env_value "$proxy_snapshot" TENSORZERO_URL)"
   fi
   derived="$(derive_worker_llm_base_url "$llm_base_url" "$tensorzero_url" || true)"

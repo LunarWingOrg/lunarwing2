@@ -417,7 +417,7 @@ write_tenant_vision_env() {
   # cross-tenant symlink and this render would write the other tenant's
   # LUNARWING_AUTH_TOKEN into this tenant's vision.env.
   local vision_snapshot
-  vision_snapshot="$(_snapshot_tenant_env "$name" "$env_path")"
+  _snapshot_tenant_env "$name" "$env_path" vision_snapshot
   local token
   token="$(_env_existing "$vision_snapshot" LUNARWING_AUTH_TOKEN)"
   token="${token:-$(generate_token)}"
@@ -481,7 +481,7 @@ write_tenant_voice_env() {
   # into this tenant's voice.env. The per-key presence checks below carry no
   # value across, and every commit re-validates the live path tenant-side.
   local voice_snapshot
-  voice_snapshot="$(_snapshot_tenant_env "$name" "$env_path")"
+  _snapshot_tenant_env "$name" "$env_path" voice_snapshot
   token="$(_env_existing "$voice_snapshot" VOICE_AUTH_TOKEN)"
   rm -f -- "$voice_snapshot"
   token="${token:-$(generate_token)}"
