@@ -580,7 +580,8 @@ add_tenant() {
   say ""
 
   say "--- Generating environment files ---"
-  write_tenant_vision_env "$name" >/dev/null
+  write_tenant_vision_env "$name" >/dev/null \
+    || die "could not safely write the vision env for tenant '$name'"
   write_tenant_voice_env "$name" >/dev/null
   write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$opencode2_model" "$opencode2_base_url"
   write_tenant_bridge_env "$name" "$xmpp_jid" "$xmpp_password" "$xmpp_allow_from"
@@ -596,11 +597,19 @@ add_tenant() {
       say "DarkIRC config deferred until build-darkirc installs the attested helper"
     fi
   fi
-  write_tenant_gotify_config "$name" "$gotify_url" "$gotify_title"
-  ensure_external_worker_config "$name" "pebble" "pebble_wss"
-  ensure_external_worker_config "$name" "opencode" "opencode_wss"
-  ensure_external_worker_config "$name" "kimi" "kimi_wss"
-  ensure_external_worker_config "$name" "opencode2" "opencode2_wss"
+  write_tenant_gotify_config "$name" "$gotify_url" "$gotify_title" \
+    || die "could not safely write the gotify config for tenant '$name'"
+  # WI#390 (review HH-2): a refused tenant-side write must abort the add here,
+  # under the lifecycle lock's suppressed errexit, not surface at the worker's
+  # first call.
+  ensure_external_worker_config "$name" "pebble" "pebble_wss" \
+    || die "could not safely write the pebble external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "opencode" "opencode_wss" \
+    || die "could not safely write the opencode external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "kimi" "kimi_wss" \
+    || die "could not safely write the kimi external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "opencode2" "opencode2_wss" \
+    || die "could not safely write the opencode2 external-worker config for tenant '$name'"
 
   # WeeChat relay auto-bootstrap: write a dedicated minimal weechat.env, then
   # attempt a one-shot relay configuration. Non-fatal: a degraded WeeChat setup
@@ -628,7 +637,8 @@ add_tenant() {
   # Enabled by default; opt out with --no-ssh or LUNARWING_MT_SSH_ENABLED=false.
   if [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]]; then
     say "--- Provisioning SSH harness ---"
-    ensure_ssh_config "$name"
+    ensure_ssh_config "$name" \
+      || die "could not safely write the SSH host config for tenant '$name'"
     provision_tenant_ssh_key "$name"
     warn_if_sshd_unreachable "$name"
   else

@@ -805,12 +805,20 @@ call_order_log="$MT_FIXTURE/call_order.log"
 # Override stubs to track execution order
 start_tenant_postgres() { echo "postgres" >>"$call_order_log"; }
 clone_tenant_repo()    { :; }
-create_tenant_user()   { :; }
+# The real create_tenant_user makes the tenant env dir tenant-owned 0700 before
+# any writer runs (05-tenant-build.sh); the WI#390 tenant-side writer refuses a
+# group- or other-accessible parent, so a bare no-op stub here makes
+# write_tenant_voice_env's refusal die fire mid add_tenant.
+create_tenant_user() {
+  mkdir -p "$(tenant_env_dir "$1")"
+  chmod 0700 "$(tenant_env_dir "$1")"
+}
 warn_if_adapter_deps_missing() { :; }
 write_tenant_vision_env() { :; }
 write_tenant_lunarwing_env() {
   echo "env-created" >>"$call_order_log"
   mkdir -p "$(tenant_env_dir "$1")"
+  chmod 0700 "$(tenant_env_dir "$1")"
   printf 'SANDBOX_IMAGE=%s\n' "${sandbox_image_fixture:-lunarwing-sandbox:latest}" \
     >"$(tenant_env_dir "$1")/lunarwing.env"
 }

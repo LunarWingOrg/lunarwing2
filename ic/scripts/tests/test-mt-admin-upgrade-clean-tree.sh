@@ -63,6 +63,10 @@ git -C "$repo" push -q origin HEAD:refs/heads/checkout-failure
 
 printf 'build-regenerated lock\n' >"$lockfile"
 mkdir -p "$repo/env" "$repo/opencode-workspace" "$repo/state"
+# The tenant-side atomic writer (WI#390) requires a tenant-private (0700) env
+# dir for its 'private' parent policy, matching create_tenant_user on a real
+# provision; the bare mkdir above lands at the umask default (0755).
+chmod 0700 "$repo/env"
 # WI#330: the fixture tenant has opencode+kimi enabled (see tenant_worker_enabled
 # below), and upgrade-tenant now backfills missing worker LLM base URLs before
 # rebuilding images — give it a derivable tenant endpoint to inherit.
