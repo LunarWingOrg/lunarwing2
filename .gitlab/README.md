@@ -257,8 +257,9 @@ the prime suspect, and the fix is the same normalization in the offending
   whose config section embeds python3 heredocs — from the pinned
   `CI_DEBIAN_SNAPSHOT` archive (tied to the Dockerfile `ARG DEBIAN_SNAPSHOT`
   by `validate_config.py`), not the live deb.debian.org mirror. That archive
-  is a best-effort, throttled service, so the lane's `apt-get update` runs
-  with `Acquire::Retries=5`/`Acquire::http::Timeout=60`; a snapshot outage
+  is a best-effort, throttled service, so the lane's `apt-get update` and
+  `apt-get install` both run with
+  `Acquire::Retries=5`/`Acquire::http::Timeout=60`; a snapshot outage
   still fails this required lane until the service recovers (retry the job).
   Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
@@ -294,7 +295,45 @@ the prime suspect, and the fix is the same normalization in the offending
   that do not themselves `include` anything, because nested or conditional
   includes are merged by GitLab but invisible here. `extends` chains resolve
   up to a depth budget of 11; a longer chain or a cycle fails closed instead
-  of being certified from the keys visible at truncation.
+  of being certified from the keys visible at truncation. The runner tag
+  variables' values are pinned too (`EXPECTED_RUNNER_TAGS`, MR !1658 review
+  IA-9): an override of `CI_LINT_RUNNER_TAG`/`CI_RUST_RUNNER_TAG` reroutes
+  the pinned jobs to another runner with the `tags:` lists untouched, so a
+  deliberate runner change edits `defaults.yml` and the validator table in
+  the same commit — and no job may name a runner tag variable in a job-level
+  or rule-level `variables:` block either, since that overrides the pinned
+  value for just that job (MR !1665 review IF-2). The release audit's
+  advisory gates (`cargo-deny`, `satellite-advisory-sweep`,
+  `lockfile-only-advisory-guard`, `default-graph-advisory-guard`) must not
+  be `allow_failure` at any level: each gate must exist, carry exactly
+  `.full-validation-context`'s rules (whose entries may carry only `if`,
+  plus the final `when: never`), set no job-level `when`, and run on exactly
+  the pinned runner tag — a rule-level `allow_failure`, a replaced rules
+  list, a deleted gate, or a retag all fail the same way (MR !1665 review
+  IF-1). `secret-history` is the marked, deliberate exception while
+  historical findings are triaged. Three limits of the YAML validator
+  remain, by design: it cannot see repo files the pinned scripts still
+  honour — a project `.npmrc`, a `bunfig.toml` `preload`, or the
+  `package.json` `test` script in the worker script directories stay trust
+  surface reviewed in the diff, not pinned here (MR !1658 review IA-9);
+  project-, group- or pipeline-level overrides of the `CI_*` variables
+  themselves are allowed (the `defaults.yml` comment documents mirroring
+  the pinned images to the project registry for Docker Hub quota) and
+  invisible to a static tie (MR !1644 review HN-7); and a `sed`-style
+  rewrite of the stamp inside `/etc/apt/sources.list` that never names
+  `DEBIAN_SNAPSHOT` is invisible to any line-based rule (MR !1665 review
+  IF-4). What the tie does cover is every in-repo build entrypoint: a
+  `DEBIAN_SNAPSHOT` build-arg or env reference in `build-worker-image.sh`,
+  mt-admin's `05-tenant-build.sh`, `tests/docker-compose.test.yml`, or
+  `kimicode4lunarwing/docker-compose.yml` is refused, and every
+  `DEBIAN_SNAPSHOT` mention in `kimicode4lunarwing/Dockerfile` must be a
+  plain `ARG` declaration or a `${DEBIAN_SNAPSHOT}` snapshot URL, with every
+  apt source — `deb`/`deb-src` with or without a bracketed options list,
+  and deb822 `URIs:` lines — pointing at snapshot.debian.org (MR !1644
+  review HN-6, broadened by MR !1665 review IF-3).
+  YAML the validator cannot parse at all (e.g. a `!reference` tag, which
+  `yaml.safe_load` rejects) fails closed with a clean one-line error naming
+  the file, not a traceback (MR !1647 review HP-5).
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL

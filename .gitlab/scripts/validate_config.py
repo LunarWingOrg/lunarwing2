@@ -90,8 +90,15 @@ VARIABLE_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][
 
 
 def load_yaml(path: pathlib.Path) -> dict:
-    with path.open(encoding="utf-8") as stream:
-        loaded = yaml.safe_load(stream)
+    try:
+        with path.open(encoding="utf-8") as stream:
+            loaded = yaml.safe_load(stream)
+    except yaml.YAMLError as error:
+        # MR !1647 review HP-5: custom tags such as `!reference` make
+        # yaml.safe_load raise a ConstructorError — fail closed with a clean
+        # one-line error (via cli()), not a traceback.
+        detail = getattr(error, "problem", None) or str(error).splitlines()[0]
+        raise ValueError(f"{path.relative_to(ROOT)}: cannot parse YAML: {detail}") from None
     if not isinstance(loaded, dict):
         raise ValueError(f"{path.relative_to(ROOT)} must contain a YAML mapping")
     return loaded
@@ -451,6 +458,102 @@ def validate_cargo_deny_gate(merged: dict, errors: list[str]) -> None:
             errors.append(f"cargo-deny-check.sh lost its {fragment} guard")
 
 
+# MR !1665 review IF-1: the release audit's advisory gates. Each must
+# exist, carry exactly .full-validation-context's rules and the pinned
+# runner tag, and set no job-level `when` — one rule-level
+# `allow_failure: true` (GitLab's documented rules:allow_failure), a
+# `rules: [{when: never}]` replacement, or a retag makes a gate optional,
+# unreachable, or rerouted while every script pin stays green.
+ADVISORY_GATE_JOBS = (
+    "cargo-deny",
+    "satellite-advisory-sweep",
+    "lockfile-only-advisory-guard",
+    "default-graph-advisory-guard",
+)
+
+
+def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> None:
+    """The release audit's advisory gates must not be allowed to fail.
+
+    MR !1658 review IA-9: a root-file (or direct) job-level
+    `allow_failure: true` turns a red advisory gate advisory-only with a
+    one-line diff, and the gates' own script pins here do not notice.
+    MR !1665 review IF-1: the same holds one level down — a rule-level
+    `allow_failure`, a replaced rules list (even `rules: [{when: never}]`),
+    a job-level `when`, or a missing job each leaves the guard green while
+    the gate cannot block, so each gate must exist and its extends-resolved
+    rules must be exactly .full-validation-context's. The template's own
+    rules may carry only `if` (plus the final `when: never`), so the
+    equality check cannot inherit a hollowed-out template. The resolved
+    tags must be exactly ['$CI_RUST_RUNNER_TAG'] (IF-2): a retagged gate
+    runs on an unpinned runner. secret-history is deliberately
+    allow_failure while historical findings are triaged and is NOT in this
+    set — making another gate optional must stay as visible as that marked
+    exception. Any non-false allow_failure value (including the exit_codes
+    hash form) counts.
+
+    MR !1665 review IF-2: the EXPECTED_RUNNER_TAGS pin in
+    validate_lane_environment_routes covers only the merged top-level
+    value; a job-level (or rule-level) `variables:` entry overrides it for
+    that job and reroutes the pinned jobs while the top-level pin stays
+    green, so no job may name a runner tag variable in any variables
+    scope."""
+    template = resolve_extends(merged.get(".full-validation-context"), merged)
+    template_rules = template.get("rules")
+    if not isinstance(template_rules, list) or not template_rules:
+        errors.append(".full-validation-context must define rules")
+        template_rules = None
+    else:
+        for rule in template_rules:
+            if not isinstance(rule, dict) or not (
+                set(rule) == {"if"} or rule == {"when": "never"}
+            ):
+                errors.append(
+                    ".full-validation-context rules may carry only `if` (and a "
+                    f"final `when: never`): {rule!r}"
+                )
+    for job_name in ADVISORY_GATE_JOBS:
+        job = merged.get(job_name)
+        if not isinstance(job, dict):
+            errors.append(
+                f"{job_name} is missing; every release-audit advisory gate "
+                "must exist"
+            )
+            continue
+        effective = resolve_extends(job, merged)
+        if effective.get("allow_failure"):
+            errors.append(
+                f"{job_name} must not set allow_failure; an advisory gate whose "
+                "failure is optional cannot gate the release audit"
+            )
+        if "when" in effective:
+            errors.append(f"{job_name} must not set a job-level when")
+        if template_rules is not None and effective.get("rules") != template_rules:
+            errors.append(
+                f"{job_name} rules must be exactly .full-validation-context's "
+                "(no rule-level allow_failure, when or variables)"
+            )
+        if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
+            errors.append(f"{job_name} tags must be exactly ['$CI_RUST_RUNNER_TAG']")
+    for job_name, job in merged.items():  # IF-2: runner-tag variables at job or rule level
+        if not isinstance(job, dict) or job_name.startswith("."):
+            continue
+        effective = resolve_extends(job, merged)
+        scopes = [effective.get("variables")]
+        rules = effective.get("rules")
+        if isinstance(rules, list):
+            scopes.extend(rule.get("variables") for rule in rules if isinstance(rule, dict))
+        for scope in scopes:
+            if isinstance(scope, dict) and any(
+                name in EXPECTED_RUNNER_TAGS for name in scope
+            ):
+                errors.append(
+                    f"{job_name} must not override a runner tag variable; "
+                    "EXPECTED_RUNNER_TAGS pins the routing for every job"
+                )
+                break
+
+
 def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
     """The satellite sweep keeps the release audit reproducible (A5).
 
@@ -634,7 +737,7 @@ WORKER_TS_LANE_SCRIPTS = {
         (
             "rm -f /etc/apt/sources.list.d/debian.sources",
             "printf '%s\\n' \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb http://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
-            "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get install -y --no-install-recommends python3",
+            "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends python3",
             "cd kimicode4lunarwing/scripts",
             "npm ci --ignore-scripts",
             "npx tsc -p tsconfig.json",
@@ -682,6 +785,17 @@ GLOBAL_VARIABLE_ALLOWLIST = frozenset({
     "SCCACHE_CACHE_SIZE", "SCCACHE_DIR",
 })
 
+# MR !1658 review IA-9: the worker TS lanes (and every lint/rust job)
+# select their runner through these tag variables. A root-file or
+# later-include override reroutes the pinned jobs to a different runner
+# while the tags lists and the variables allowlist stay clean, so the
+# resolved values are pinned here; a deliberate runner change edits
+# defaults.yml and this table in the same commit.
+EXPECTED_RUNNER_TAGS = {
+    "CI_LINT_RUNNER_TAG": "lint",
+    "CI_RUST_RUNNER_TAG": "rust-x86_64",
+}
+
 
 def lane_bypass_variable(name: object) -> bool:
     """True for variables that can neutralise a worker TS lane's pinned
@@ -712,7 +826,10 @@ def validate_lane_environment_routes(merged: dict, errors: list[str]) -> None:
     `workflow:rules` variables become pipeline-wide variables (overriding
     same-named globals) on the pipelines the rule matches, so a NODE_OPTIONS
     or an unpinned CI_NODE_IMAGE there bypasses both the script pin and the
-    digest pins while the global `variables:` block stays clean."""
+    digest pins while the global `variables:` block stays clean. The runner
+    tag variables must also resolve to their pinned values (MR !1658 review
+    IA-9): an override reroutes the lanes to another runner with the tags
+    lists themselves untouched."""
     default_block = merged.get("default")
     if isinstance(default_block, dict):
         for key in ("before_script", "hooks"):
@@ -736,6 +853,17 @@ def validate_lane_environment_routes(merged: dict, errors: list[str]) -> None:
             errors.append(
                 f"top-level variables must not set {bypass}; global variables "
                 "reach both worker TS lanes (GLOBAL_VARIABLE_ALLOWLIST)"
+            )
+    for name, expected in EXPECTED_RUNNER_TAGS.items():
+        value = top_variables.get(name) if isinstance(top_variables, dict) else None
+        if isinstance(value, dict):  # GitLab's hash form (value:/description:)
+            value = value.get("value")
+        if value != expected:
+            errors.append(
+                f"top-level {name} must be {expected!r} (got {value!r}); the "
+                "runner tag variables route the worker TS lanes and every "
+                "pinned job to their runner, so an override must update "
+                "EXPECTED_RUNNER_TAGS in the same commit (MR !1658 review IA-9)"
             )
     workflow = merged.get("workflow")
     workflow_rules = workflow.get("rules") if isinstance(workflow, dict) else None
@@ -983,16 +1111,38 @@ def validate_worker_versions(errors: list[str]) -> None:
                 f"Dockerfile {label} canonical declaration"
             )
 
-    # MR !1627 review HE-7: passing DEBIAN_SNAPSHOT as a build-arg here
-    # would override the Dockerfile default at image build time, silently
-    # detaching the CI_DEBIAN_SNAPSHOT tie (which binds only the Dockerfile
+    # MR !1627 review HE-7, broadened by MR !1644 review HN-7: a
+    # DEBIAN_SNAPSHOT build-arg or env override at image build time silently
+    # detaches the CI_DEBIAN_SNAPSHOT tie (which binds only the Dockerfile
     # ARG default) from the snapshot the published image really builds with.
-    kimi_block = blocks.get("kimi")
-    if kimi_block is not None and "DEBIAN_SNAPSHOT=" in kimi_block:
-        errors.append(
-            "build-worker-image.sh kimi block must not pass DEBIAN_SNAPSHOT as a "
-            "build arg; the CI_DEBIAN_SNAPSHOT tie binds the Dockerfile ARG default"
-        )
+    # The guard covered one case block of one file; it now refuses the token
+    # in every worker-image build entrypoint — the whole
+    # build-worker-image.sh (shared post-case build_args and build_image()
+    # included), mt-admin's tenant build, the harness compose file, and the
+    # kimi worker's own docker-compose.yml, whose build.args take the same
+    # override (MR !1665 review IF-3).
+    for label, path in (
+        ("build-worker-image.sh", WORKER_BUILD_SCRIPT),
+        (
+            "ic/scripts/mt-admin-lib/05-tenant-build.sh",
+            ROOT / "ic" / "scripts" / "mt-admin-lib" / "05-tenant-build.sh",
+        ),
+        ("tests/docker-compose.test.yml", ROOT / "tests" / "docker-compose.test.yml"),
+        (
+            "kimicode4lunarwing/docker-compose.yml",
+            ROOT / "kimicode4lunarwing" / "docker-compose.yml",
+        ),
+    ):
+        if not path.is_file():
+            errors.append(
+                f"{label} missing; cannot guard against a DEBIAN_SNAPSHOT build override"
+            )
+        elif "DEBIAN_SNAPSHOT" in path.read_text(encoding="utf-8"):
+            errors.append(
+                f"{label} must not reference DEBIAN_SNAPSHOT; a build-arg or env "
+                "override at image build time would detach the CI_DEBIAN_SNAPSHOT "
+                "tie from the Dockerfile ARG default"
+            )
 
     for worker, label, dockerfile_text, arg_name in canonical_pins:
         if arg_name not in ("OPENCODE_REF", "PEBBLE_REF"):
@@ -1384,7 +1534,15 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
     # (MR !1627 review HE-3), and every snapshot.debian.org URL in the
     # Dockerfile must reference ${DEBIAN_SNAPSHOT} itself — a hardcoded
     # timestamp or a renamed variable would detach the tie from what the
-    # image actually builds with.
+    # image actually builds with. The tie must also see the variants that
+    # steer the build around the ARG (MR !1644 review HN-6): every line
+    # mentioning DEBIAN_SNAPSHOT must be a plain ARG declaration or carry
+    # the token inside a snapshot URL (an ENV after the ARG wins over it, a
+    # RUN-level shell assignment re-points the RUN's URLs, a multi-name ARG
+    # hides from the valued-ARG match, and shell substitution is not a
+    # literal reference), and every apt `deb` source line must point at
+    # snapshot.debian.org, so a builder moved back to the live mirror is
+    # caught too. The host match is case-insensitive in both rules.
     snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append(
@@ -1417,7 +1575,7 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         hardcoded_snapshots = [
             stamp
             for stamp in re.findall(
-                r"snapshot\.debian\.org/archive/[^/\s\"']+/([^/\s\"']+)/",
+                r"(?i:snapshot\.debian\.org)/archive/[^/\s\"']+/([^/\s\"']+)/",
                 dockerfile_text,
             )
             if stamp != "${DEBIAN_SNAPSHOT}"
@@ -1427,6 +1585,49 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                 "kimicode4lunarwing/Dockerfile snapshot.debian.org URLs must use "
                 "${DEBIAN_SNAPSHOT}, not a hardcoded or renamed value: "
                 f"{hardcoded_snapshots}"
+            )
+        # MR !1644 review HN-6: every DEBIAN_SNAPSHOT mention must be a
+        # plain ARG declaration or a literal ${DEBIAN_SNAPSHOT} inside a
+        # snapshot URL; every apt deb source must be a snapshot URL.
+        snapshot_arg_line = re.compile(r"^\s*(?i:ARG)\s+DEBIAN_SNAPSHOT(?:=\S+)?\s*$")
+        snapshot_url_reference = re.compile(
+            r"(?i:snapshot\.debian\.org)/archive/[^/\s\"']+/\$\{DEBIAN_SNAPSHOT\}(?:[/\s]|$)"
+        )
+        stray_references = [
+            line.strip()
+            for line in dockerfile_text.splitlines()
+            if "DEBIAN_SNAPSHOT" in line
+            and not snapshot_arg_line.match(line)
+            and not snapshot_url_reference.search(line)
+        ]
+        if stray_references:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile DEBIAN_SNAPSHOT references must be "
+                "ARG declarations or ${DEBIAN_SNAPSHOT} snapshot URLs: "
+                f"{stray_references}"
+            )
+        # MR !1665 review IF-3: the source rule must also see the one-line
+        # shapes that add a live mirror without touching the pinned lines —
+        # a bracketed options list between `deb`/`deb-src` and the URL
+        # (`deb [trusted=yes] http://…`), and deb822 `URIs:` lines (the
+        # Dockerfile deletes debian.sources, but a RUN can write a new one).
+        deb_source = re.compile(
+            r"(?:^|[\"'\s])(?:deb(?:-src)?\s+(?:\[[^\]]*\]\s*)?|URIs:\s*)https?://"
+        )
+        snapshot_source = re.compile(
+            r"(?:deb(?:-src)?\s+(?:\[[^\]]*\]\s*)?|URIs:\s*)"
+            r"https?://snapshot\.debian\.org/archive/",
+            re.IGNORECASE,
+        )
+        non_snapshot_sources = [
+            line.strip()
+            for line in dockerfile_text.splitlines()
+            if deb_source.search(line) and not snapshot_source.search(line)
+        ]
+        if non_snapshot_sources:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile apt deb sources must use "
+                f"snapshot.debian.org: {non_snapshot_sources}"
             )
 
     literal_images = {
@@ -1597,6 +1798,7 @@ def main() -> int:
     validate_cavepony_version(merged_config, errors)
     validate_cargo_deny_gate(merged_config, errors)
     validate_satellite_advisory_sweep(merged_config, errors)
+    validate_advisory_gates_not_optional(merged_config, errors)
     validate_worker_ts_lanes(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
     validate_worker_versions(errors)
@@ -1718,5 +1920,16 @@ def main() -> int:
     return 0
 
 
+def cli() -> int:
+    """main() plus one clean error path for unreadable/unsupported YAML
+    (MR !1647 review HP-5): a ValueError from load_yaml reports the file and
+    the parser's problem on one ERROR line instead of a traceback."""
+    try:
+        return main()
+    except ValueError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

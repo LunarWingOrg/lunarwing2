@@ -180,6 +180,19 @@ class WorkerVersionPinTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.kimi_lock = kimi_lock
+        # HN-7 fixtures: the DEBIAN_SNAPSHOT build-override guard also reads
+        # the mt-admin tenant build script and the harness compose file.
+        mt_admin_build = self.root / "ic/scripts/mt-admin-lib/05-tenant-build.sh"
+        mt_admin_build.parent.mkdir(parents=True)
+        mt_admin_build.write_text("# tenant image builds\n", encoding="utf-8")
+        harness_compose = self.root / "tests/docker-compose.test.yml"
+        harness_compose.parent.mkdir(parents=True)
+        harness_compose.write_text("services: {}\n", encoding="utf-8")
+        # IF-3 fixture: the kimi worker's own compose file is the fourth
+        # guarded build entrypoint (MR !1665 review).
+        kimi_compose = self.root / "kimicode4lunarwing/docker-compose.yml"
+        kimi_compose.parent.mkdir(parents=True)
+        kimi_compose.write_text("services: {}\n", encoding="utf-8")
         self.write_build_script(
             pebble_ref=self.PEBBLE_REF,
             opencode_ref=self.OPENCODE_REF,
@@ -281,6 +294,53 @@ class WorkerVersionPinTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertTrue(any("DEBIAN_SNAPSHOT" in error for error in self.errors()))
+
+    def test_snapshot_token_outside_the_kimi_block_is_caught(self):
+        # MR !1644 review HN-7: the guard covered one block of one file — a
+        # build-arg in the shared post-case build_args or inside
+        # build_image() passed unseen; the whole file is now guarded.
+        text = self.build_script.read_text(encoding="utf-8")
+        self.build_script.write_text(
+            text + '    build_args="$build_args\nDEBIAN_SNAPSHOT=20260906T000000Z"\n',
+            encoding="utf-8",
+        )
+        self.assertTrue(any("DEBIAN_SNAPSHOT" in error for error in self.errors()))
+
+    def test_snapshot_token_in_mt_admin_build_is_caught(self):
+        # HN-7: mt-admin builds the tenant worker images too, so its build
+        # script is guarded the same way.
+        path = self.root / "ic/scripts/mt-admin-lib/05-tenant-build.sh"
+        path.write_text(
+            'podman build --build-arg DEBIAN_SNAPSHOT=20260906T000000Z kimi\n',
+            encoding="utf-8",
+        )
+        self.assertTrue(any("05-tenant-build.sh" in error for error in self.errors()))
+
+    def test_snapshot_token_in_harness_compose_is_caught(self):
+        # HN-7: the harness compose file is the third build entrypoint.
+        path = self.root / "tests/docker-compose.test.yml"
+        path.write_text(
+            "services:\n  kimi:\n    build:\n      args:\n        DEBIAN_SNAPSHOT: x\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(any("docker-compose.test.yml" in error for error in self.errors()))
+
+    def test_snapshot_token_in_kimi_compose_is_caught(self):
+        # MR !1665 review IF-3 (P8): the kimi worker's own docker-compose.yml
+        # builds the image with build.args — a DEBIAN_SNAPSHOT entry there is
+        # the same build-time override the HN-7 guard exists to refuse.
+        path = self.root / "kimicode4lunarwing/docker-compose.yml"
+        path.write_text(
+            "services:\n  lunarwing-worker:\n    build:\n      args:\n"
+            "        DEBIAN_SNAPSHOT: 20200101T000000Z\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(any("kimicode4lunarwing/docker-compose.yml" in error for error in self.errors()))
+
+    def test_missing_build_entrypoint_fails_closed(self):
+        # HN-7: a vanished build entrypoint must error, not skip the guard.
+        (self.root / "ic/scripts/mt-admin-lib/05-tenant-build.sh").unlink()
+        self.assertTrue(any("05-tenant-build.sh missing" in error for error in self.errors()))
 
 
 class WorkerInputManifestTests(unittest.TestCase):
@@ -832,6 +892,370 @@ class DebianSnapshotTieTests(unittest.TestCase):
             any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
         )
 
+    def test_env_override_after_arg_is_caught(self):
+        # MR !1644 review HN-6: ENV overrides ARG at build time, so an ENV
+        # after the builder's ARG silently detaches the tie from the image.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + f"ENV DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+        )
+        self.assertTrue(
+            any("DEBIAN_SNAPSHOT references" in error for error in self.errors())
+        )
+
+    def test_run_level_snapshot_assignment_is_caught(self):
+        # HN-6: a RUN-level shell assignment re-points that RUN's URLs
+        # without touching the ARG the tie binds.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN set -eu; DEBIAN_SNAPSHOT=20261001T000000Z; apt-get update\n"
+        )
+        self.assertTrue(
+            any("DEBIAN_SNAPSHOT references" in error for error in self.errors())
+        )
+
+    def test_multi_name_arg_is_caught(self):
+        # HN-6: a multi-name ARG line hides the pin from the valued-ARG match.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + f"ARG OTHER=1 DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+        )
+        self.assertTrue(
+            any("DEBIAN_SNAPSHOT references" in error for error in self.errors())
+        )
+
+    def test_shell_substituted_snapshot_url_is_caught(self):
+        # HN-6: a URL assembled with shell substitution is not a literal
+        # ${DEBIAN_SNAPSHOT} reference.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb http://snapshot.debian.org/archive/debian/$(echo ${DEBIAN_SNAPSHOT})/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("DEBIAN_SNAPSHOT references" in error for error in self.errors())
+        )
+
+    def test_uppercase_snapshot_host_hardcoded_stamp_is_caught(self):
+        # HN-6: the host match is case-insensitive, so an upper-case
+        # SNAPSHOT.debian.org URL cannot smuggle a hardcoded timestamp past
+        # the tie.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + f'"deb http://SNAPSHOT.debian.org/archive/debian/{self.SNAPSHOT}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("must use ${DEBIAN_SNAPSHOT}" in error for error in self.errors())
+        )
+
+    def test_live_mirror_deb_source_is_caught(self):
+        # HN-6: a builder moved back to the live deb.debian.org mirror made
+        # the tie vacuous — every apt deb source must be a snapshot URL.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb http://deb.debian.org/debian bookworm main" '
+            + "> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
+    def test_bracketed_option_list_source_is_caught(self):
+        # MR !1665 review IF-3 (P6): the rule matched only `deb` followed
+        # directly by the URL, so an options list smuggled the live mirror
+        # past it.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN echo 'deb [trusted=yes] http://deb.debian.org/debian bookworm main' "
+            + ">> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
+    def test_deb_src_source_is_caught(self):
+        # IF-3: a deb-src entry is an apt source too.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN echo 'deb-src http://deb.debian.org/debian bookworm main' "
+            + ">> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
+    def test_deb822_uris_source_is_caught(self):
+        # IF-3: the Dockerfile deletes debian.sources, but a RUN can write a
+        # new deb822 stanza — its URIs line is an apt source.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' 'Types: deb' "
+            + "'URIs: http://deb.debian.org/debian' 'Suites: bookworm' "
+            + "> /etc/apt/sources.list.d/debian.sources\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
+    def test_snapshot_sources_with_option_lists_and_deb822_pass(self):
+        # IF-3 pass-side pin: the same shapes pointing at the pinned snapshot
+        # must stay clean, and a ${DEBIAN_SNAPSHOT} reference inside a
+        # bracketed or deb822 URL still counts as a literal reference.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb [arch=amd64] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+            + "RUN printf '%s\\n' 'Types: deb deb-src' "
+            + "'URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/' "
+            + "'Suites: bookworm' > /etc/apt/sources.list.d/debian.sources\n"
+        )
+        self.assertEqual(self.errors(), [])
+
+
+class YamlParseErrorTests(unittest.TestCase):
+    """MR !1647 review HP-5: a `!reference` tag anywhere in the CI YAML made
+    yaml.safe_load raise a ConstructorError traceback — fail-closed (rc 1)
+    but unreadable. The validator now reports one clean ERROR line."""
+
+    def test_load_yaml_reports_unsupported_tags_cleanly(self):
+        temporary = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temporary.cleanup)
+        probe = pathlib.Path(temporary.name) / "probe.yml"
+        probe.write_text("job:\n  script: !reference [build, script]\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            config.load_yaml(probe)
+        message = str(caught.exception)
+        self.assertIn("probe.yml: cannot parse YAML", message)
+        self.assertIn("!reference", message)
+
+    def test_load_yaml_still_requires_a_mapping(self):
+        temporary = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temporary.cleanup)
+        probe = pathlib.Path(temporary.name) / "probe.yml"
+        probe.write_text("- just\n- a\n- list\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            config.load_yaml(probe)
+        self.assertIn("must contain a YAML mapping", str(caught.exception))
+
+    def test_cli_returns_a_clean_error_without_a_traceback(self):
+        original_load_yaml = config.load_yaml
+
+        # Drive cli() with load_yaml raising the real ValueError shape.
+        def raising_load_yaml(path):
+            if path == ROOT / ".gitlab" / "ci" / "validate.yml":
+                raise ValueError(
+                    ".gitlab/ci/validate.yml: cannot parse YAML: could not "
+                    "determine a constructor for the tag '!reference'"
+                )
+            return original_load_yaml(path)
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=raising_load_yaml),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.cli(), 1)
+        output = stderr.getvalue()
+        self.assertIn("ERROR: .gitlab/ci/validate.yml: cannot parse YAML", output)
+        self.assertIn("!reference", output)
+        self.assertNotIn("Traceback", output)
+
+
+class AdvisoryGateOptionalTests(unittest.TestCase):
+    """MR !1658 review IA-9: the release audit's advisory gates must not be
+    allow_failure — a root-file `cargo-deny: {allow_failure: true}` turned
+    the gate advisory-only while every script pin here stayed green.
+    MR !1665 review IF-1/IF-2: the same applies one level down (rule-level
+    allow_failure, replaced rules, a job-level when, a deleted or retagged
+    gate, a job/rule-level runner tag variable), so the fixture models the
+    real shape — .rust-job carrying the pinned tag, .full-validation-context
+    carrying the if-rules plus a final when: never, each gate extending
+    both."""
+
+    GATES = (
+        "cargo-deny",
+        "satellite-advisory-sweep",
+        "lockfile-only-advisory-guard",
+        "default-graph-advisory-guard",
+    )
+
+    def merged(self) -> dict:
+        return {
+            ".rust-job": {"tags": ["$CI_RUST_RUNNER_TAG"]},
+            ".full-validation-context": {
+                "rules": [{"if": "$CI_COMMIT_BRANCH"}, {"when": "never"}]
+            },
+            **{
+                name: {
+                    "extends": [".rust-job", ".full-validation-context"],
+                    "script": ["bash .gitlab/scripts/check.sh"],
+                }
+                for name in self.GATES
+            },
+        }
+
+    def errors(self, merged: dict) -> list[str]:
+        errors: list[str] = []
+        config.validate_advisory_gates_not_optional(merged, errors)
+        return errors
+
+    def test_real_shape_passes(self):
+        self.assertEqual(self.errors(self.merged()), [])
+
+    def test_allow_failure_is_caught_on_every_gate(self):
+        for job_name in self.GATES:
+            for value in (True, {"exit_codes": [1]}):
+                with self.subTest(job=job_name, value=value):
+                    merged = self.merged()
+                    merged[job_name]["allow_failure"] = value
+                    self.assertTrue(
+                        any(
+                            f"{job_name} must not set allow_failure" in error
+                            for error in self.errors(merged)
+                        )
+                    )
+
+    def test_inherited_allow_failure_is_caught(self):
+        # The extends-resolved job is checked: .observational-job carries
+        # allow_failure: true (defaults.yml), so extending it is refused too.
+        merged = self.merged()
+        merged[".observational-job"] = {"allow_failure": True}
+        merged["cargo-deny"]["extends"].append(".observational-job")
+        self.assertTrue(
+            any("cargo-deny must not set allow_failure" in error for error in self.errors(merged))
+        )
+
+    def test_gate_shape_variants_are_caught(self):
+        # MR !1665 review IF-1/IF-2: each of the 4 gates x 5 shapes left the
+        # head's job-level-only guard green (the review's P1-P5 probes).
+        for job_name in self.GATES:
+            with self.subTest(job=job_name, shape="rule-level allow_failure"):
+                merged = self.merged()
+                rules = copy.deepcopy(merged[".full-validation-context"]["rules"])
+                for rule in rules:
+                    if "if" in rule:
+                        rule["allow_failure"] = True
+                merged[job_name]["rules"] = rules
+                self.assertTrue(
+                    any(
+                        f"{job_name} rules must be exactly" in error
+                        for error in self.errors(merged)
+                    )
+                )
+            with self.subTest(job=job_name, shape="rules replaced with when: never"):
+                merged = self.merged()
+                merged[job_name]["rules"] = [{"when": "never"}]
+                self.assertTrue(
+                    any(
+                        f"{job_name} rules must be exactly" in error
+                        for error in self.errors(merged)
+                    )
+                )
+            with self.subTest(job=job_name, shape="gate deleted"):
+                merged = self.merged()
+                del merged[job_name]
+                self.assertTrue(
+                    any(
+                        f"{job_name} is missing" in error
+                        for error in self.errors(merged)
+                    )
+                )
+            with self.subTest(job=job_name, shape="retagged"):
+                merged = self.merged()
+                merged[job_name]["tags"] = ["untrusted-shell"]
+                self.assertTrue(
+                    any(
+                        f"{job_name} tags must be exactly" in error
+                        for error in self.errors(merged)
+                    )
+                )
+            with self.subTest(job=job_name, shape="job-level runner variable"):
+                merged = self.merged()
+                merged[job_name]["variables"] = {"CI_RUST_RUNNER_TAG": "untrusted-shell"}
+                self.assertTrue(
+                    any(
+                        f"{job_name} must not override a runner tag variable" in error
+                        for error in self.errors(merged)
+                    )
+                )
+
+    def test_job_level_when_is_caught(self):
+        merged = self.merged()
+        merged["cargo-deny"]["when"] = "manual"
+        self.assertTrue(
+            any("cargo-deny must not set a job-level when" in error for error in self.errors(merged))
+        )
+
+    def test_template_rule_carrying_more_than_if_is_caught(self):
+        merged = self.merged()
+        merged[".full-validation-context"]["rules"][0]["allow_failure"] = True
+        errors = self.errors(merged)
+        self.assertTrue(
+            any(".full-validation-context rules may carry only `if`" in error for error in errors)
+        )
+
+    def test_template_without_rules_fails_closed(self):
+        merged = self.merged()
+        del merged[".full-validation-context"]["rules"]
+        self.assertTrue(
+            any(".full-validation-context must define rules" in error for error in self.errors(merged))
+        )
+
+    def test_rule_level_runner_tag_variable_is_caught(self):
+        # IF-2: a rules:variables entry also overrides the pipeline variable
+        # for the job that matches the rule — pinned on a non-gate job so
+        # only the variable refusal fires.
+        merged = self.merged()
+        merged["some-job"] = {
+            "script": ["true"],
+            "rules": [
+                {"if": "$CI_COMMIT_BRANCH", "variables": {"CI_LINT_RUNNER_TAG": "untrusted-shell"}}
+            ],
+        }
+        errors = self.errors(merged)
+        self.assertTrue(
+            any("some-job must not override a runner tag variable" in error for error in errors)
+        )
+
+    def test_benign_job_variables_pass(self):
+        # Only the runner tag names are refused at job/rule level; other
+        # job-level variables (the real tree sets several) stay fine.
+        merged = self.merged()
+        merged["cargo-deny"]["variables"] = {"TRIVY_NO_PROGRESS": "true"}
+        self.assertEqual(self.errors(merged), [])
+
+    def test_root_file_cargo_deny_override_is_caught(self):
+        # IA-9: the review's exact probe — one root-file line makes the
+        # release audit's gate advisory-only.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_override(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded["cargo-deny"] = {"allow_failure": True}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_override),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("cargo-deny must not set allow_failure", stderr.getvalue())
+
 
 class WorkerTsLaneTests(unittest.TestCase):
     """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
@@ -839,6 +1263,8 @@ class WorkerTsLaneTests(unittest.TestCase):
     review HN-5) the exact script, taken from config.WORKER_TS_LANE_SCRIPTS
     so the fixtures always match the pinned tuple; the real-tree binding is
     main() running this validator over the checked-in validate.yml."""
+
+    LANES = ("worker-kimi-ts", "worker-opencode-ts")
 
     def lane(self, job_name: str) -> dict:
         image_variable, script = config.WORKER_TS_LANE_SCRIPTS[job_name]
@@ -855,8 +1281,17 @@ class WorkerTsLaneTests(unittest.TestCase):
             "script": list(script),
         }
 
+    def variables(self, extra: dict | None = None) -> dict:
+        # The canonical runner tag values (IA-9): every top-level variables
+        # fixture must carry them so the tag pin sees the real-tree shape.
+        values = {"CI_LINT_RUNNER_TAG": "lint", "CI_RUST_RUNNER_TAG": "rust-x86_64"}
+        if extra:
+            values.update(extra)
+        return values
+
     def merged(self) -> dict:
         return {
+            "variables": self.variables(),
             "worker-kimi-ts": self.lane("worker-kimi-ts"),
             "worker-opencode-ts": self.lane("worker-opencode-ts"),
         }
@@ -879,7 +1314,7 @@ class WorkerTsLaneTests(unittest.TestCase):
             ("parallel", {"matrix": [{"NODE_OPTIONS": ["--test-only"]}]}),
             ("hooks", {"pre_get_sources_script": ["git config --global core.hooksPath /tmp/hooks"]}),
         )
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for key, value in overrides:
                 for inherited in (False, True):
                     with self.subTest(job=job_name, key=key, value=value, inherited=inherited):
@@ -898,7 +1333,7 @@ class WorkerTsLaneTests(unittest.TestCase):
     def test_other_job_keywords_require_review(self):
         # The allowlist deliberately requires review even for currently
         # harmless values; it is not a blacklist of known variable names.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for key, value in (
                 ("variables", {}), ("variables", None), ("hooks", {}),
                 ("after_script", ["true"]), ("timeout", "1m"),
@@ -913,7 +1348,7 @@ class WorkerTsLaneTests(unittest.TestCase):
                     ))
 
     def test_runner_tags_must_match_in_both_lanes(self):
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for override in (
                 {}, {"tags": None}, {"tags": []},
                 {"tags": ["unavailable-runner"]},
@@ -937,7 +1372,7 @@ class WorkerTsLaneTests(unittest.TestCase):
     def test_allowed_job_keys_can_be_inherited(self):
         # Inspect the resolved job, not the raw `extends` keyword; allowed
         # defaults and the canonical runner tag remain valid in a parent.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             with self.subTest(job=job_name):
                 merged = self.merged()
                 merged[".worker-template"] = merged[job_name]
@@ -949,7 +1384,7 @@ class WorkerTsLaneTests(unittest.TestCase):
 
     def test_main_rejects_job_level_execution_override(self):
         original_load_yaml = config.load_yaml
-        for job_name in self.merged():
+        for job_name in self.LANES:
             with self.subTest(job=job_name):
                 def load_with_override(path):
                     loaded = original_load_yaml(path)
@@ -1309,11 +1744,21 @@ class WorkerTsLaneTests(unittest.TestCase):
         self.assertEqual(self.errors(merged), [])
 
     def test_missing_apt_retries_are_caught(self):
-        # HE-4: reverting the snapshot fetch to a retry-less apt-get update
-        # drops the pinned provisioning fragment.
+        # HE-4/HN-8: reverting the snapshot fetches to retry-less apt-get
+        # drops the pinned provisioning fragment — on update and install
+        # together, or on the install half alone.
         merged = self.merged()
         merged["worker-kimi-ts"]["script"] = [
             command.replace(" -o Acquire::Retries=5 -o Acquire::http::Timeout=60", "")
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("Acquire::Retries" in error for error in self.errors(merged)))
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command.replace(
+                "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install",
+                "apt-get install",
+            )
             for command in merged["worker-kimi-ts"]["script"]
         ]
         self.assertTrue(any("Acquire::Retries" in error for error in self.errors(merged)))
@@ -1371,7 +1816,7 @@ class WorkerTsLaneTests(unittest.TestCase):
     def test_reordered_script_lines_are_caught(self):
         # HP-3: an order-insensitive comparison would accept a reorder, but
         # the snapshot sources must be rewritten BEFORE apt-get update runs.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             with self.subTest(job=job_name):
                 merged = self.merged()
                 script = merged[job_name]["script"]
@@ -1385,7 +1830,7 @@ class WorkerTsLaneTests(unittest.TestCase):
         # isinstance(script, list) guard would compare it against the
         # list. A non-iterable script (e.g. `script: 5`) must fail with a
         # validator error, not crash the guard-less comparison.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for script in ("\n".join(self.lane(job_name)["script"]), 5):
                 with self.subTest(job=job_name, script=script):
                     merged = self.merged()
@@ -1401,7 +1846,7 @@ class WorkerTsLaneTests(unittest.TestCase):
         # HP-3: only $CI_PIPELINE_SOURCE is the MR predicate's left
         # operand; dropping that check accepts any variable compared
         # against the "merge_request_event" literal.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             with self.subTest(job=job_name):
                 merged = self.merged()
                 merged[job_name]["rules"][0] = {
@@ -1469,15 +1914,49 @@ class WorkerTsLaneTests(unittest.TestCase):
         # reaches every job, including both lanes; npm reads the prefix
         # case-insensitively.
         merged = self.merged()
-        merged["variables"] = {"GIT_STRATEGY": "fetch"}
+        merged["variables"] = self.variables({"GIT_STRATEGY": "fetch"})
         self.assertEqual(self.errors(merged), [])
         for name in ("NODE_OPTIONS", "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL"):
             with self.subTest(name=name):
                 merged = self.merged()
-                merged["variables"] = {name: "--test-only"}
+                merged["variables"] = self.variables({name: "--test-only"})
                 self.assertTrue(
                     any("top-level variables" in error for error in self.errors(merged))
                 )
+
+    def test_runner_tag_variable_override_is_caught(self):
+        # MR !1658 review IA-9: the lanes select their runner through
+        # $CI_LINT_RUNNER_TAG; a variable override reroutes every pinned
+        # lint job with the tags lists themselves untouched.
+        for name, value in (
+            ("CI_LINT_RUNNER_TAG", "other-runner"),
+            ("CI_RUST_RUNNER_TAG", "other-runner"),
+            ("CI_LINT_RUNNER_TAG", {"value": "other-runner", "description": "hash form"}),
+        ):
+            with self.subTest(name=name, value=value):
+                merged = self.merged()
+                merged["variables"][name] = value
+                self.assertTrue(
+                    any(f"top-level {name}" in error for error in self.errors(merged))
+                )
+
+    def test_root_file_runner_tag_override_is_caught(self):
+        # IA-9: the review's probe — a root-file variables entry reroutes
+        # the lanes with validate.yml untouched.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_tag_override(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded.setdefault("variables", {})["CI_LINT_RUNNER_TAG"] = "other-runner"
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_tag_override),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("CI_LINT_RUNNER_TAG", stderr.getvalue())
 
     def test_nine_level_extends_chain_is_resolved(self):
         # HP-2/HN-3: the budget must cover chains deeper than 8; a gating
@@ -1490,6 +1969,33 @@ class WorkerTsLaneTests(unittest.TestCase):
         errors = self.errors(merged)
         self.assertTrue(any("merge_request_event" in error for error in errors))
         self.assertFalse(any("depth budget" in error for error in errors))
+
+    def test_extends_chain_at_the_budget_boundary_is_resolved(self):
+        # IA-8 (mutant M16): the budget is exactly EXTENDS_DEPTH_BUDGET —
+        # moving the leaf check below the depth check silently cut it to
+        # ten. A chain of exactly the budgeted depth must still resolve.
+        merged = self.merged()
+        depth = config.EXTENDS_DEPTH_BUDGET
+        merged[f".p{depth}"] = {"allow_failure": True}
+        for index in range(depth - 1, 0, -1):
+            merged[f".p{index}"] = {"extends": f".p{index + 1}"}
+        merged["worker-kimi-ts"]["extends"] = ".p1"
+        errors = self.errors(merged)
+        self.assertTrue(any("merge_request_event" in error for error in errors))
+        self.assertFalse(any("depth budget" in error for error in errors))
+
+    def test_lane_bypass_variable_prefix_and_case(self):
+        # IA-8 (mutant M10): the predicate matches the whole npm_config_*
+        # family case-insensitively (npm lowercases every npm_config_<x>
+        # into its config), not just npm_config_script_shell.
+        for name in ("NODE_OPTIONS", "npm_config_script_shell", "npm_config_foo",
+                     "NPM_CONFIG_SCRIPT_SHELL", "NPM_CONFIG_FOO"):
+            with self.subTest(name=name, expected=True):
+                self.assertTrue(config.lane_bypass_variable(name))
+        for name in ("node_options", "NODE_OPTIONSS", "npm_configurations",
+                     "npm_config", "BUN_OPTIONS", None, 5):
+            with self.subTest(name=name, expected=False):
+                self.assertFalse(config.lane_bypass_variable(name))
 
     def test_extends_chain_beyond_budget_fails_closed(self):
         # HP-2/HN-3: a chain longer than the budget cannot be certified —
@@ -1509,12 +2015,18 @@ class WorkerTsLaneTests(unittest.TestCase):
         # before bun's main script; PATH and GIT_CHECKOUT need one more
         # artifact), so every global variable must be allowlisted.
         merged = self.merged()
-        merged["variables"] = {name: "x" for name in config.GLOBAL_VARIABLE_ALLOWLIST}
+        merged["variables"] = self.variables(
+            {
+                name: "x"
+                for name in config.GLOBAL_VARIABLE_ALLOWLIST
+                if name not in config.EXPECTED_RUNNER_TAGS
+            }
+        )
         self.assertEqual(self.errors(merged), [])
         for name in ("BUN_OPTIONS", "PATH", "GIT_CHECKOUT", "SOME_NEW_VARIABLE"):
             with self.subTest(name=name):
                 merged = self.merged()
-                merged["variables"] = {name: "x"}
+                merged["variables"] = self.variables({name: "x"})
                 self.assertTrue(
                     any("GLOBAL_VARIABLE_ALLOWLIST" in error for error in self.errors(merged))
                 )
@@ -1559,7 +2071,7 @@ class WorkerTsLaneTests(unittest.TestCase):
         # IA-6: rules:variables on any lane rule reach the pinned script on
         # the pipelines that rule matches (push and tag pipelines too, not
         # only the first, MR rule).
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for index in (0, 1):
                 with self.subTest(job=job_name, rule=index):
                     merged = self.merged()
