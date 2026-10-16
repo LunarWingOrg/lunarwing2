@@ -53,6 +53,22 @@ FULL_VALIDATION_JOBS = (
     "satellite-advisory-sweep",
 )
 WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
+# Fixed build-read inputs of the kimi worker image build (the Dockerfile
+# cross-checks kimi-cli/package.json, npm-ci's both package dirs, tsc reads
+# tsconfig.json, and the in-build test gate reads entrypoint.sh, hooks/ and
+# config/). validate_worker_input_manifest requires all of them plus every
+# on-disk kimicode4lunarwing/scripts/*.ts.
+KIMI_BUILD_INPUT_CORE = (
+    "kimicode4lunarwing/Dockerfile",
+    "kimicode4lunarwing/entrypoint.sh",
+    "kimicode4lunarwing/config/config.toml",
+    "kimicode4lunarwing/hooks/headless_command_guard.mjs",
+    "kimicode4lunarwing/kimi-cli/package.json",
+    "kimicode4lunarwing/kimi-cli/package-lock.json",
+    "kimicode4lunarwing/scripts/package.json",
+    "kimicode4lunarwing/scripts/package-lock.json",
+    "kimicode4lunarwing/scripts/tsconfig.json",
+)
 EXPECTED_INCLUDES = [
     "/.gitlab/ci/workflow.yml",
     "/.gitlab/ci/defaults.yml",
@@ -1001,6 +1017,68 @@ def validate_worker_versions(errors: list[str]) -> None:
             )
 
 
+def worker_input_files(block: str) -> list[str]:
+    """Extract a worker case block's input_files list (quoted multi-line or
+    bare single-line form)."""
+    match = re.search(r"(?m)^        input_files='([^']*)'$", block)
+    if match is not None:
+        return match.group(1).split("\n")
+    match = re.search(r"(?m)^        input_files=(\S+)$", block)
+    if match is not None:
+        return [match.group(1)]
+    return []
+
+
+def validate_worker_input_manifest(errors: list[str]) -> None:
+    """The worker-inputs manifest is the promotion evidence of what went
+    into a candidate image (CY-4: build-executed scripts must hash into it).
+
+    Every listed entry must be a safe relative path that exists under the
+    repo root — a missing file would otherwise only fail at the manual
+    protected candidate build (sha256sum under `set -eu`). For kimi, whose
+    Dockerfile builder stage compiles and runs every `scripts/*.ts` via its
+    in-build test gate, the manifest must additionally cover the fixed
+    build-read set and every on-disk scripts/*.ts, so the Dockerfile's
+    `COPY scripts/*.ts` glob cannot silently outgrow the recorded inputs.
+    The on-disk glob reads the working tree; CI checkouts are clean, so an
+    untracked scratch .ts only ever fails a local run."""
+    build_script = WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
+    blocks = worker_case_blocks(build_script)
+    for worker in WORKER_NAMES:
+        block = blocks.get(worker)
+        if block is None:
+            continue  # validate_worker_versions already reports the missing block
+        for entry in worker_input_files(block):
+            if not entry:
+                continue
+            if safe_relative_path(entry) is None:
+                errors.append(
+                    f"build-worker-image.sh {worker} input {entry!r} is not a "
+                    "safe relative path"
+                )
+            elif not (ROOT / entry).is_file():
+                errors.append(
+                    f"build-worker-image.sh {worker} input {entry!r} does not exist"
+                )
+    kimi_block = blocks.get("kimi")
+    if kimi_block is None:
+        return
+    kimi_inputs = set(worker_input_files(kimi_block))
+    for required in KIMI_BUILD_INPUT_CORE:
+        if required not in kimi_inputs:
+            errors.append(
+                f"kimi worker-inputs manifest omits build-read input {required!r}"
+            )
+    scripts_dir = ROOT / "kimicode4lunarwing" / "scripts"
+    for source in sorted(scripts_dir.glob("*.ts")):
+        relative = source.relative_to(ROOT).as_posix()
+        if relative not in kimi_inputs:
+            errors.append(
+                f"kimi worker-inputs manifest omits {relative!r}; the Dockerfile's "
+                "COPY scripts/*.ts makes every bridge source a build input"
+            )
+
+
 def collect_tracked_lockfiles() -> set[str]:
     tracked = set()
     for lockfile in ROOT.glob("**/Cargo.lock"):
@@ -1489,6 +1567,7 @@ def main() -> int:
     validate_worker_ts_lanes(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
     validate_worker_versions(errors)
+    validate_worker_input_manifest(errors)
     validate_deliverables_manifest(merged_config, errors)
     validate_ci_tool_image_pins(merged_config, merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
