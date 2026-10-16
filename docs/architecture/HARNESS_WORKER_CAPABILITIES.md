@@ -1,6 +1,16 @@
 # Harness Worker Capabilities (WI#326)
 
 Status: implemented in v2.1.6.0. Owner: `ic/src/orchestrator/harness.rs`.
+Re-checked 2026-10-14 for the v2.1.6.0 docs pass: the only harness.rs
+changes after the EE-doc update (`f084624a1`) were a `cargo fmt`
+normalization and the run-84 ET-3 test-only repairs (the `#[cfg(test)]`
+find-counter probe pinning the EE-1 guard, the suffixed EE-3 offset-1/2
+test blobs, and the new `redactor_contains_secret_folds_compact_json_escapes`
+pin) — no
+production behavior change; the capability contract, redaction coverage,
+write-back pipeline, and WI#383 residual list below are current (the
+residual list refreshed from the WI's run-84 state, which added EE-14 and
+the widened EE-1 betterment and corrected EE-9's both-passes shape).
 
 The conventional LunarWing Docker worker can run in **harness mode**
 (`create_job` with `mode: "harness"`), adding three optional capability
@@ -268,16 +278,29 @@ cannot be listed).
   remaining preparation/cleanup orphans;
   no promotion deadline; remaining synchronous filesystem cleanup on async
   tasks; and stronger delivery, sparse-file and persisted-insert tests.
-- !1548 run-78 residuals (WI#383): partial/truncated prints of large
-  encodings leak near-wholly (EE-2 — needs the per-job automaton with
+- !1548 run-78 residuals (WI#383): per-event scrubbing runs synchronously
+  inside the async `/event` handler — beyond the landed needle-length guard
+  the proper shape is one per-job `aho-corasick` automaton over the folded
+  text that must also cover the DIRECT list (raw values, raw multi-line
+  lines, per-line wrap pieces; a per-event leaf cap alone does not bound
+  the cost) (the widened EE-1 betterment); partial/truncated prints leak
+  near-wholly above the 4096-char arming cap and, at non-canonical widths,
+  below it too (EE-2 — needs that automaton with
   aligned chunks); line-prefixed views (`read_file`, `cat -n`) defeat
-  folding (EE-7); the raw value is never fold-matched (EE-8); the direct
-  pass does not merge overlapping values in fold-free text (EE-9 residual);
+  folding (EE-7); the raw value is never fold-matched (EE-8); both
+  fold-free passes — the `scrub_folded` fast path (encoded forms) and the
+  direct pass (raw values) — still replace sequentially, so the
+  non-overlapping tail of a second secret sharing a substring can survive
+  in fold-free text (EE-9 residual);
   an event body uploaded slowly past a token revoke is persisted
   daemon-side without the value scrub (EE-10); a per-line variant can split
   a JSON escape and leave malformed scrubbed text for the model (EE-11); a
   `wait=true` timeout during `Finalizing` reports `failed` while promotion
-  continues and leaks the handle (EE-12, under EA-5).
+  continues and leaks the handle (EE-12, under EA-5); and EA-1 detection
+  uses LunarWing's own effective uid rather than the runtime owner's, with
+  a `tcp://` `DOCKER_HOST` resolving bind paths on the remote host — every
+  such case fails closed, never a leak (EE-14, added by the run-84 ET-5
+  reconciliation).
 - External-worker (opencode/pebble) secrets mounting — this WI covers the
   conventional harness only.
 - Concurrent-edit conflict policy: promotion snapshots the replaced content

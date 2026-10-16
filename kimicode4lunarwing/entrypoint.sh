@@ -265,7 +265,9 @@ case "$MODE" in
     # by upstream, and the PreToolUse hook enforces fail-closed denials. The
     # mode reminder stays off: it is prompt noise for a fixed-mode worker.
     export KIMI_CODE_PERMISSION_MODE_REMINDER="${KIMI_CODE_PERMISSION_MODE_REMINDER:-0}"
-    unset KIMI_CODE_DANGEROUS_COMMAND_GUARD
+    # WI#411: kimi-code 2.2.0's KIMI_CODE_TRUST_WORKSPACE auto-spawns a repo's
+    # .mcp.json servers before any model turn, outside the hook — never inherit it.
+    unset KIMI_CODE_DANGEROUS_COMMAND_GUARD KIMI_CODE_TRUST_WORKSPACE
     # WI#373: the prompt runs untrusted agent code — never inherit the
     # bridge's hub-handshake credential.
     exec env -u AGENT_AUTH_TOKEN kimi -p "$*" --output-format stream-json
@@ -284,7 +286,9 @@ case "$MODE" in
     # by upstream, and the PreToolUse hook enforces fail-closed denials. The
     # mode reminder stays off: it is prompt noise for a fixed-mode worker.
     export KIMI_CODE_PERMISSION_MODE_REMINDER="${KIMI_CODE_PERMISSION_MODE_REMINDER:-0}"
-    unset KIMI_CODE_DANGEROUS_COMMAND_GUARD
+    # WI#411: kimi-code 2.2.0's KIMI_CODE_TRUST_WORKSPACE auto-spawns a repo's
+    # .mcp.json servers before any model turn, outside the hook — never inherit it.
+    unset KIMI_CODE_DANGEROUS_COMMAND_GUARD KIMI_CODE_TRUST_WORKSPACE
 
     node /app/scripts/lunarwing_bridge.js &
     BRIDGE_PID=$!

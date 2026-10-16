@@ -86,14 +86,19 @@ pub fn extract_text(data: &[u8], mime: &str, filename: Option<&str>) -> Result<S
 }
 
 /// Read a zip entry into a string with configurable decompressed size limits.
-fn bounded_read_zip_entry_with_limits(
-    file: &mut zip::read::ZipFile<'_>,
+fn bounded_read_zip_entry_with_limits<R: Read + ?Sized>(
+    file: &mut zip::read::ZipFile<'_, R>,
     total_decompressed: &mut u64,
     max_entry: u64,
     max_total: u64,
 ) -> Result<String, ExtractionError> {
     let entry_size = file.size();
-    let entry_name = file.name().to_string();
+    // zip 9 decodes the stored entry name on demand and can fail on a
+    // malformed name; the name is only used for diagnostics here.
+    let entry_name = file
+        .name()
+        .map(|name| name.into_owned())
+        .unwrap_or_else(|_| String::from("<undecodable entry name>"));
 
     if entry_size > max_entry {
         return Err(ExtractionError::EntryTooLarge {
@@ -141,8 +146,8 @@ fn bounded_read_zip_entry_with_limits(
 }
 
 /// Read a zip entry into a string with default decompressed size limits.
-fn bounded_read_zip_entry(
-    file: &mut zip::read::ZipFile<'_>,
+fn bounded_read_zip_entry<R: Read + ?Sized>(
+    file: &mut zip::read::ZipFile<'_, R>,
     total_decompressed: &mut u64,
 ) -> Result<String, ExtractionError> {
     bounded_read_zip_entry_with_limits(
@@ -172,9 +177,10 @@ fn extract_pptx(data: &[u8]) -> Result<String, String> {
     let mut slide_names: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
-            let name = file.name().to_string();
+            // An entry whose stored name does not decode cannot be a slide.
+            let Ok(name) = file.name() else { continue };
             if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
-                slide_names.push(name);
+                slide_names.push(name.into_owned());
             }
         }
     }
@@ -223,9 +229,10 @@ fn extract_xlsx(data: &[u8]) -> Result<String, String> {
     let mut sheet_names: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i) {
-            let name = file.name().to_string();
+            // An entry whose stored name does not decode cannot be a sheet.
+            let Ok(name) = file.name() else { continue };
             if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
-                sheet_names.push(name);
+                sheet_names.push(name.into_owned());
             }
         }
     }

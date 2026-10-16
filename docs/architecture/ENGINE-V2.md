@@ -3,7 +3,7 @@
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
 **Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
-(v2.1.5.0).** Module map, gate types,
+(v2.1.5.0); re-checked 2026-10-14 (v2.1.6.0).** Module map, gate types,
 mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
 re-checked against the current tree, including the landed WI#227 sealed step
 records; updates for 2.1.1.0 include the
@@ -44,10 +44,27 @@ WI#307 non-foreground execution/resume gate and shared discovery/lease
 denylist, the WI#309 resume-lease mission catalog, the WI#311 no-auto-complete
 rule for non-manual missions, the WI#319 pre-2026-07-26
 `Completed`-as-delete caveat in recovery guidance, and the WI#308 mission-verb
-dispatch gate subset (Research-thread refusal, WI#356 Mission lifecycle
-refusal plus the run-107 GM-1 update-field refusal, permission,
-supervision, rate limit, hooks) with its documented
-unsupervised-mission-run scope.
+dispatch gate subset (Research-thread refusal, permission, supervision, rate
+limit, hooks) with its documented unsupervised-mission-run scope. Updates
+for 2.1.6.0 include the WI#356 Mission-thread bounds on that gate
+(`mission_create`/`mission_delete`/`mission_resume` refused to Mission
+threads, the run-107 GM-1 steering-field limit on a Mission thread's
+`mission_update`, and the fan-out disclosure on the run-spawning approval
+prompts), the WI#332 pending-gate liveness rules (listing and the
+60s sweep drop gates whose thread vanished/left Waiting/changed owner, with
+the authentication-fallback exemption, request-id-checked sweep discards
+protecting replacement gates, and the resolve-time liveness re-check that
+fails closed), the WI#337/WI#339/WI#341 shutdown-interruption resolution
+work (parity-checked stamp resolution, the per-thread interruption-stamp
+map, per-mission/per-stamp sweep isolation, marker-persists-before-notice
+ordering with acknowledged notices, the 24h stamp-age bound, and the
+WI#394 stuck-key residual), the WI#338 scan-time parity checks as defense
+in depth (full `mission.json` forges remain out of scope until WI#322),
+and the WI#359 webhook/rate-limit hardening (the usable-secret predicate
+so an empty/whitespace stored secret never authenticates a fire, the
+serialized webhook claim check-then-save across create/update/resume, the
+shared recursive credential-key redaction over summaries/events/http
+surfaces, and the corrected aggregate/stop-bucket limiter wording).
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
@@ -278,8 +295,8 @@ Follow-ups that still
 cut head-only: `shrink_context_for_model_recovery`'s per-message cut after a
 context_overflow recovery (the model again sees `{items: [...` with no
 cursor), the stored-result preview in `ic/src/agent/thread_ops.rs:999-1009`,
-the Engine v2 500-byte preview in `ic/src/bridge/router.rs:3751-3772` built
-from the 1000-byte event preview in `lunarwing_engine/src/types/event.rs:74-87`,
+the Engine v2 500-byte preview in `ic/src/bridge/router.rs:3975-3994` built
+from the 1000-byte event preview in `lunarwing_engine/src/types/event.rs:226-241`,
 shell capture (64 KiB), SSH capture (1 MiB), and sandbox stdout/stderr caps.
 Also follow up the v1 earlier-turn 1000-byte tool-result cut in
 `ic/src/agent/session.rs:533-545` ([WI#351](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351): a later
@@ -923,9 +940,18 @@ replaces the whole `pending_shutdown_interruption` value and drops the
 newer entries (those fires keep their `INTERRUPTED` entry and dedup
 release but are never retried). A re-upgrade's boot sweep resolves each
 surviving interruption stamp younger than 24 hours
-(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) through the usual ownership and
-parity guards — record-only beyond that — and emits every owed outcome
-notice it finds, with no age bound. The
+(`MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE`) — record-only beyond that — and
+emits every owed outcome notice it finds, with no age bound. Each stamp
+first passes the WI#338 scan-time parity checks: the stamped thread must
+be a Mission-type thread of the mission's own project and owner (unless
+the mission is shared) and listed in the mission's `thread_history`; a
+mismatch clears the stamp silently (a warn log only — no approach-history
+entry, retry marker or notice), and the retry-marker sweep and the
+recoverable-thread resume skip history threads that fail the same
+project/owner checks. These checks stop partial forgeries (only the stamp
+or `thread_history` edited) and store corruption, not a forger who
+rewrites the whole `mission.json` (`user_id`, `project_id`,
+`thread_history`); WI#322 is the fix. The
 upgrade direction has its own wrinkle: every live retry marker written by
 a build before WI#276 (pre-v2.1.5.0) deserializes with `notified: false`
 (the field is newer than those markers), so the first boot after the
@@ -1221,12 +1247,20 @@ create, on an
 update that switches to a Webhook cadence from another cadence, changes
 the path, or adds a usable
 secret to a dormant claim, and on resume
-(AO-1); updates that leave the claim untouched are not re-checked (a
+(AO-1); the claim check and the save are serialized by the shared
+`mission_create_lock` (held as `_create_guard` in create and
+`_claim_guard` in update/resume) on every claim-making transition —
+create, update, and resume alike — so two racing transitions cannot both
+pass the check and both save (CJ-4); updates that leave the claim untouched are not re-checked (a
 same-path re-set is deliberately not checked), so
 under a legacy two-owner conflict either owner can still rotate a leaked
 secret — but a dormant row's owner cannot lower a budget or make any other
 update without first supplying a usable secret, because validation rejects
-the row otherwise (WI#359 CO-3). Dormant (secret-less or unpresentable
+the row otherwise (WI#359 CO-3) — "usable" here and everywhere above is
+the shared `usable_webhook_secret` predicate in
+`lunarwing_engine::types::mission` (non-empty, no leading/trailing
+whitespace, visible ASCII with an interior HTAB allowed — values httparse
+trims or `HeaderValue` rejects can never arrive on the wire). Dormant (secret-less or unpresentable
 whitespace/non-visible-ASCII secret) non-terminal rows still block other
 users' claims on their path (WI#359 CO-3); startup logs a warning for
 every legacy multi-owner path it re-activates (WI#359); two conflicting

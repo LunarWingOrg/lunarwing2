@@ -386,15 +386,18 @@ INITEOF
 
 # ── OpenRC service units ─────────────────────────────────────────────────────
 
-# The post-WI#376 proxy unit contract: one fixed flag line carrying no tenant
-# data. Shared by the preflight guard and the renderer, which archives only
-# installed units that fail this check.
-openrc_proxy_unit_is_safe() {
-  local path="$1"
-  [[ -f "$path" && ! -L "$path" ]] || return 1
-  grep -Eq \
-    '^: "\$\{proxy_args:=[/a-zA-Z0-9_.-]+/lunarwing-proxy[.]py --port [0-9]+ --bind 127[.]0[.]0[.]1 --tensorzero-env\}"$' "$path"
-}
+# The post-WI#376 proxy unit contract — template, interpreter resolver, body
+# renderer, port extractor and the byte-for-byte safe-unit checker with its
+# verdict cache — is ONE file shared with the root health cron:
+# ic-infrastructure-health-check/openrc-proxy-unit-contract.sh (WI#393
+# GR-1/HF-1 for the renderer/contract pairing, WI#410 ID-2 for the cron).
+# mt-admin sources it from the repo; health-openrc.sh and
+# lunarwing-self-heal.sh source the copy ensure_health_pipeline installs
+# beside them, so the renderer, this preflight guard and the cron guard
+# cannot drift apart. The tenant layout helpers (00-common.sh) are defined
+# before this point, so the library's fallbacks are not used by mt-admin.
+# shellcheck source=../../../ic-infrastructure-health-check/openrc-proxy-unit-contract.sh
+source "${HEALTH_SRC_DIR:?}/openrc-proxy-unit-contract.sh"
 
 # A dependency-cache rebuild can source every init script, even for a command
 # addressing a different tenant. Inspect files as data before invoking OpenRC.
@@ -523,71 +526,21 @@ backup_openrc_proxy_unit() {
 
 # File-only proxy renderer shared by normal rendering and the fleet migration. The
 # atomic replacement prevents dependency scanning from seeing a partial script.
+# The unit body comes from _openrc_proxy_unit_body — the same source the
+# safe-unit contract renders its expected bytes from (WI#393 GR-1/HF-1) — so a
+# freshly rendered unit satisfies the preflight guard under the same
+# interpreter resolution, and template drift fails loudly instead of shipping.
 render_proxy_openrc_unit() {
-  local name="$1" proxy_port proxy_bin env_dir run_dir log_dir path tmp
+  local name="$1" proxy_port path tmp
   proxy_port="$(ports_get "$name" proxy)" || return 1
-  [[ "$proxy_port" =~ ^[0-9]+$ ]] || die "invalid proxy port for $name"
-  proxy_bin="$(tenant_lw_root "$name")/tensorzero-proxy-configurations/lunarwing-proxy.py"
-  env_dir="$(tenant_env_dir "$name")"
-  run_dir="$(tenant_run_dir "$name")"
-  log_dir="$(tenant_log_dir "$name")"
+  [[ "$proxy_port" =~ ^[0123456789]{1,5}$ ]] || die "invalid proxy port for $name"
   mkdir -p "$OPENRC_INITD_DIR" || return 1
   path="$OPENRC_INITD_DIR/lunarwing-proxy-${name}"
   [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || die "unsafe installed proxy unit: $path"
   tmp="$(mktemp "$OPENRC_INITD_DIR/.lunarwing-proxy-${name}.XXXXXX")" || return 1
-  if ! cat >"$tmp" <<INITEOF
-#!/sbin/openrc-run
-
-description="LunarWing TensorZero proxy ($name)"
-
-: "\${proxy_command:=$(command -v python3)}"
-: "\${proxy_args:=$proxy_bin --port $proxy_port --bind 127.0.0.1 --tensorzero-env}"
-: "\${proxy_user:=$name}"
-: "\${proxy_group:=$name}"
-: "\${proxy_pidfile:=$run_dir/proxy.pid}"
-: "\${proxy_runtime_dir:=$run_dir}"
-: "\${proxy_log_dir:=$log_dir}"
-: "\${proxy_output_log:=\${proxy_log_dir}/proxy.log}"
-: "\${proxy_error_log:=\${proxy_log_dir}/proxy.err}"
-: "\${proxy_env_file:=$env_dir/proxy.env}"
-: "\${proxy_openrc_env_exec:=$OPENRC_ENV_EXEC}"
-: "\${proxy_umask:=0077}"
-: "\${proxy_respawn_delay:=5}"
-: "\${proxy_respawn_max:=5}"
-: "\${proxy_respawn_period:=60}"
-: "\${proxy_retry:=SIGTERM/30/KILL/5}"
-
-command="\${proxy_openrc_env_exec}"
-command_args="--env-file \${proxy_env_file} -- \${proxy_command} \${proxy_args}"
-command_user="\${proxy_user}:\${proxy_group}"
-pidfile="\${proxy_pidfile}"
-supervisor="supervise-daemon"
-retry="\${proxy_retry}"
-respawn_delay="\${proxy_respawn_delay}"
-respawn_max="\${proxy_respawn_max}"
-respawn_period="\${proxy_respawn_period}"
-output_log="\${proxy_output_log}"
-error_log="\${proxy_error_log}"
-required_files="\${proxy_openrc_env_exec} \${proxy_command} \${proxy_env_file}"
-
-depend() {
-    need net
-    use dns
-    after firewall
-    before lunarwing-${name}
-}
-
-start_pre() {
-    checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_runtime_dir}"
-    checkpath -d -m 0750 -o "\${proxy_user}:\${proxy_group}" "\${proxy_log_dir}"
-    checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${output_log}"
-    checkpath -f -m 0640 -o "\${proxy_user}:\${proxy_group}" "\${error_log}"
-    umask "\${proxy_umask}"
-}
-INITEOF
-  then
+  if ! _openrc_proxy_unit_body "$name" "$proxy_port" >"$tmp"; then
     rm -f -- "$tmp"
-    return 1
+    die "cannot render proxy unit for $name: no python3 interpreter resolves (set LUNARWING_MT_PROXY_PYTHON3 or install python3 under /usr/local/bin:/usr/bin:/bin)"
   fi
   # The archive location is validated on every render, even when this render
   # writes no copy: an archive dir inside init.d could hand OpenRC an

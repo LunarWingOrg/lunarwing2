@@ -16,11 +16,17 @@
 $EDITOR config/config.toml
 ```
 
-Then rebuild:
+Then rebuild and restart the tenants that run it:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker --no-cache
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
 ```
+
+`start-tenant` recreates the kimi container whenever the tenant-store image ID
+differs from the one the container was created from, so the rebuilt config
+reaches a running tenant on OpenRC and systemd alike without removing the
+container by hand (see "Rebuilt image rollout" in `docs/ops/WORKER-CONTAINERS.md`).
 
 **Note (WI#330):** the baked `base_url` is a placeholder
 (`http://set-kimi-base-url.invalid/openai/v1`) that `entrypoint.sh` refuses
@@ -56,6 +62,8 @@ This sets `KIMI_API_KEY` in the tenant's `lunarwing.env`, which `entrypoint.sh` 
 
 1. **Baked defaults** (in `config/config.toml`, applied to *every* tenant at boot unless overridden).
 2. **Per-tenant overrides** (via `KIMI_MODEL` / `KIMI_BASE_URL` / `KIMI_API_KEY` env vars, set by `configure-kimi`).
+
+**Keep `max_output_size` on every model table under an `openai`-type provider** (FrontierCODEK: `131072`). Since kimi-code 2.2.0 the CLI sends no `max_tokens` for such a model unless the table pins `max_output_size`, so a missing key means each downstream provider's default cap — the Engine V2 4096-token truncation class for a high-effort thinking model (WI#412). The `KIMI_MODEL` retarget renames only the table header, so the key survives an override, and `scripts/entrypoint_config_test.ts` fails the lane if any such table drops it.
 
 **Priority**: if `KIMI_MODEL`, `KIMI_BASE_URL`, or `KIMI_API_KEY` is set:
 → read baked config, apply overrides, write to `$KIMI_CODE_HOME/config.toml`

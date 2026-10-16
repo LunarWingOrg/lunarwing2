@@ -108,5 +108,61 @@ assert_contains "selected and present worker image reports present" "$tenant_sta
 assert_contains "unselected worker image is not a false missing" "$tenant_status" \
   "lunarwing-worker-opencode:latest: not selected for tenant"
 
+# HF-2 (WI#393): the safe-unit guard runs on every OpenRC service operation,
+# so one status pass re-checks every installed proxy unit once per service —
+# the !1628 per-line-regex check cost ~50x a presence grep and pushed a
+# 5-tenant `mt-admin status` past the onboarding verifier's 30 s budget. The
+# contract is now one fresh body render + one byte comparison per unit, with
+# verdicts cached per process by stat signature. Pin it with a 20-unit fleet:
+# a cold pass renders each unit body exactly once, a warm pass renders none,
+# and both passes together stay well under the verifier budget. The call
+# counts are the deterministic pins; the wall budget only bounds the
+# per-check fork storm.
+(
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  export OPENRC_INITD_DIR="$fixture/init.d"
+  export OPENRC_CONFD_DIR="$fixture/conf.d"
+  export OPENRC_PROXY_BACKUP_DIR="$fixture/backup-units"
+  export PORTS_REGISTRY="$fixture/ports.json"
+  mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR"
+  printf '{"tenants":{}}' >"$PORTS_REGISTRY"
+  tenant_home() { printf '%s/%s' "$fixture" "$1"; }
+  install_openrc_env_exec() { :; }
+  tenants=()
+  for i in $(seq 0 19); do tenants+=("t$(printf '%02d' "$i")"); done
+  ports_get() { local idx="${1#t}"; printf '%d\n' "$((23100 + 10#$idx))"; }
+  for t in "${tenants[@]}"; do
+    render_proxy_openrc_unit "$t" || exit 1
+  done
+  # Count expected-body renders through a wrapper (file append survives the
+  # checker's process-substitution subshells).
+  body_calls="$fixture/body-calls"
+  : >"$body_calls"
+  eval "_hf2_orig_body$(declare -f _openrc_proxy_unit_body | sed '1s/^_openrc_proxy_unit_body//')"
+  _openrc_proxy_unit_body() { printf 'x\n' >>"$body_calls"; _hf2_orig_body "$@"; }
+  start="$EPOCHREALTIME"
+  status_tenant t00 >/dev/null || exit 1
+  cold_calls="$(wc -l <"$body_calls")"
+  : >"$body_calls"
+  status_tenant t00 >/dev/null || exit 1
+  end="$EPOCHREALTIME"
+  warm_calls="$(wc -l <"$body_calls")"
+  [[ "$cold_calls" == 20 ]] || {
+    printf 'FAIL: cold 20-unit status rendered %s expected bodies, want 20 (verdict cache broken)\n' "$cold_calls"
+    exit 1
+  }
+  [[ "$warm_calls" == 0 ]] || {
+    printf 'FAIL: warm 20-unit status rendered %s expected bodies, want 0 (verdict cache broken)\n' "$warm_calls"
+    exit 1
+  }
+  elapsed_ms="$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%d", (e - s) * 1000}')"
+  [[ "$elapsed_ms" -lt 15000 ]] || {
+    printf 'FAIL: two 20-unit fleet status passes took %s ms (budget 15000)\n' "$elapsed_ms"
+    exit 1
+  }
+  printf 'PASS: HF-2 20-unit fleet status cold=20 renders warm=0 renders, %s ms for both passes\n' "$elapsed_ms"
+)
+
 (( failures == 0 )) || exit 1
 printf 'ALL TESTS PASSED\n'

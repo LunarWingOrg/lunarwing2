@@ -398,6 +398,28 @@ else
   fail "import rejects unsupported manifest keys"
 fi
 
+echo "=== import's EXIT trap never deletes an inherited WRITERS_ERRF (HF-5) ==="
+# import-tenant.sh assigns WRITERS_ERRF only on the --resume path, but its
+# EXIT trap rm -f's it on every exit: an inherited value (e.g. via sudo -E)
+# would be deleted as root on any early failure. The unsafe-manifest bundle
+# dies after the trap is installed, so the victim file must survive.
+hf5_victim="$tmp/hf5-victim-file"
+printf 'do not delete\n' >"$hf5_victim"
+set +e
+WRITERS_ERRF="$hf5_victim" \
+  PATH="$tmp/bin:$PATH" \
+  LUNARWING_PORTS_REGISTRY="$tmp/ports.json" \
+  KAWARIMI_TEST_WORK="$tmp" \
+  bash "$tmp/scripts/import-tenant.sh" "$tmp/unsafe-manifest.tar" --dry-run --yes \
+  >/dev/null 2>&1
+hf5_status=$?
+set -e
+if [[ "$hf5_status" -ne 0 && -f "$hf5_victim" && "$(cat "$hf5_victim")" == "do not delete" ]]; then
+  pass "import EXIT trap leaves an inherited WRITERS_ERRF untouched (HF-5)"
+else
+  fail "import EXIT trap leaves an inherited WRITERS_ERRF untouched (HF-5)"
+fi
+
 mkdir -p "$tmp/unsafe-link"
 cp "$tmp/bundle-src/meta.txt" "$tmp/bundle-src/manifest-lunarwing.env" "$tmp/unsafe-link/"
 ln -s /etc/passwd "$tmp/unsafe-link/db.dump"
@@ -539,7 +561,17 @@ case "${1:-}" in
     : >"${KAWARIMI_TEST_WORK:?}/systemctl-called"
     exit 0
     ;;
-  writers-active) exit 1 ;;
+  writers-active)
+    # FL-5: a precondition-failure mode that exits 1 exactly like "stopped"
+    # but carries no stdout state word (the die() shape the real arm's
+    # require_root/usage/registry/name/lock-dir checks produce).
+    if [[ "${KAWARIMI_FL5_WRITERS_ERROR:-}" == 1 ]]; then
+      printf 'error: must run as root\n' >&2
+      exit 1
+    fi
+    printf 'stopped\n'
+    exit 1
+    ;;
 esac
 exit 0
 MT
@@ -662,6 +694,47 @@ else
 fi
 sed -i '/^XMPP_PASSWORD=/d' "$tmp/export-home/alpha/lunarwing/env/lunarwing.env"
 rm -f "$tmp/export-home/alpha/lunarwing/env/xmpp-bridge.env"
+
+echo "=== export refuses a writers-active error (FL-5, WI#393) ==="
+# The writers-active arm's precondition failures (root, usage, registry, name,
+# lock dir) share exit 1 with "stopped". Export must require rc 1 AND the
+# stdout state word: an rc-1 error is unknown, never a quiesced tenant. Both
+# call sites are pinned: the stop-then-verify path and --no-quiesce.
+for fl5_mode in quiesce no-quiesce; do
+  fl5_out_dir="$tmp/export-out-fl5-$fl5_mode"
+  mkdir -m 700 "$fl5_out_dir"
+  fl5_args=(--out-dir "$fl5_out_dir")
+  [[ "$fl5_mode" == no-quiesce ]] && fl5_args+=(--no-quiesce)
+  set +e
+  fl5_output="$(
+    PATH="$tmp/export-bin:$PATH" \
+    KAWARIMI_TEST_WORK="$tmp" \
+    LUNARWING_MT_ADMIN="$tmp/export-mt-admin.sh" \
+    LUNARWING_PORTS_REGISTRY="$tmp/export-ports.json" \
+    KAWARIMI_FL5_WRITERS_ERROR=1 \
+    KAWARIMI_PASS='valid-export-passphrase' \
+    bash "$EXPORT_SRC" alpha "${fl5_args[@]}" 2>&1
+  )"
+  fl5_status=$?
+  set -e
+  if [[ "$fl5_status" -ne 0 && "$fl5_output" == *"could not confirm writer state"* ]]; then
+    pass "export refuses a writers-active error instead of reading it as stopped ($fl5_mode, FL-5)"
+  else
+    fail "export refuses a writers-active error instead of reading it as stopped ($fl5_mode, FL-5)"
+    printf '%s\n' "$fl5_output"
+  fi
+  if compgen -G "$fl5_out_dir/*-migrate-*" >/dev/null; then
+    fail "writers-active error still produced a migration bundle ($fl5_mode, FL-5)"
+  else
+    pass "writers-active error produced no migration bundle ($fl5_mode, FL-5)"
+  fi
+  # GR-2: the refusal must carry the arm's stderr cause, not a bare rc.
+  if [[ "$fl5_output" == *"must run as root"* ]]; then
+    pass "export refusal carries the writers-active stderr cause ($fl5_mode, GR-2)"
+  else
+    fail "export refusal carries the writers-active stderr cause ($fl5_mode, GR-2)"
+  fi
+done
 
 # Equivalent credentials with different env quoting must compare by value.
 # Command-looking password bytes stay data, including through encrypted import.

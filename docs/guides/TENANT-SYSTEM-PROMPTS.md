@@ -4,9 +4,11 @@ Available in v2.1.4.0 (WI#220). Open the tenant's web gateway, authenticate,
 and select **Settings → System Prompt**. The displayed **Workspace scope** is
 the database scope selected by your token, not necessarily the OS account name.
 
-**Re-checked 2026-10-01 (v2.1.4.0) and 2026-10-04 (v2.1.5.0):** written with the goal-9 implementation
+**Re-checked 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0):** written with the goal-9 implementation
 and re-verified against the unchanged prompt-editor handlers, workspace
-preview composition, and Engine V2 initialization snapshot; no changes needed.
+preview composition, and Engine V2 initialization snapshot; no changes needed
+(the routes still resolve in the gateway's web channel and
+`system_prompt_for_context_tz` is still the preview entry point).
 
 ## Editing
 

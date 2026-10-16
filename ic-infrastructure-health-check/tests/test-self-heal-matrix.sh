@@ -341,6 +341,13 @@ assert_range "$(src_fn SELF_HEAL_BACKOFF_BASE=40000 SELF_HEAL_BACKOFF_MAX=100000
 assert_eq "$(src_fn -- compute_backoff abc)" "0" "F7: non-numeric attempt → 0"
 assert_eq "$(src_fn -- compute_backoff 0)"   "0" "F7: zero attempt → 0"
 assert_eq "$(src_fn -- compute_backoff -4)"  "0" "F7: negative attempt → 0"
+# WI#377: the attempt>20 short-cut must honour a custom BACKOFF_MAX (it used to
+# expand ${max:-3600} before `local max` existed, returning 3600 regardless),
+# and an invalid cap must be reported there too instead of silently yielding
+# the default.
+assert_eq "$(src_fn SELF_HEAL_BACKOFF_MAX=60 -- compute_backoff 21)" "60" "F8: attempt=21 honours BACKOFF_MAX=60 (WI#377)"
+assert_eq "$(src_fn SELF_HEAL_BACKOFF_MAX=60 -- compute_backoff 25)" "60" "F8: attempt=25 honours BACKOFF_MAX=60 (WI#377)"
+assert_eq "$(src_fn SELF_HEAL_BACKOFF_MAX=abc -- compute_backoff 25)" "0" "F8: invalid BACKOFF_MAX above the loop cap falls back to 0 (WI#377)"
 
 # F3 — backoff gate: now < next_attempt_at → BACKOFF logged, no restart.
 f3="$(sb)"; report "$f3" "$GW"

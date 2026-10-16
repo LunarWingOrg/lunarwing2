@@ -136,6 +136,10 @@ _ensure_body() {
     }
     _BODY="$ROOT/self-heal-body.sh"
     sed '/^# HARNESS_ENTRY_POINT$/,$d' "$SH" > "$_BODY"
+    # The body sources openrc-proxy-unit-contract.sh from its own directory
+    # (WI#410 ID-2); the extracted copy lives in the sandbox, so install the
+    # library beside it (a copy, not a symlink: the script refuses symlinks).
+    cp -f "$(dirname "$SH")/openrc-proxy-unit-contract.sh" "$ROOT/openrc-proxy-unit-contract.sh"
     if [[ ! -s "$_BODY" ]] || ! grep -qE '^compute_backoff\(\)' "$_BODY"; then
         echo "FATAL: src_fn: extracted body looks wrong (empty, or missing" \
              "compute_backoff) — check lib.sh:_ensure_body against $SH" >&2
