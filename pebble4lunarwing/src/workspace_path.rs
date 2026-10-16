@@ -430,20 +430,23 @@ mod tests {
         let outside = temp_root("cron-swap-outside");
         let link = root.join("missions");
         std::fs::create_dir(&link).expect("create missions dir");
-        // Attacker: alternate `missions` between a symlink to the outside
-        // dir and a real dir as fast as possible until killed.
-        let mut attacker = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "while :; do \
-                 rm -rf '{link}' 2>/dev/null; ln -s '{outside}' '{link}' 2>/dev/null; \
-                 rm -rf '{link}' 2>/dev/null; mkdir '{link}' 2>/dev/null; \
-                 done",
-                link = link.display(),
-                outside = outside.display(),
-            ))
-            .spawn()
-            .expect("spawn swap attacker");
+        // Attacker thread (MR !1669 review IK-5): alternate `missions`
+        // between a symlink to the outside dir and a real dir as fast as
+        // possible until stopped — a forked `sh` manages only a handful of
+        // swaps over the whole loop, so the O_NOFOLLOW-removal mutant
+        // survived; the in-process thread contests most iterations.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attacker = {
+            let (stop, link, outside) = (stop.clone(), link.clone(), outside.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::fs::remove_dir_all(&link).ok();
+                    std::os::unix::fs::symlink(&outside, &link).ok();
+                    std::fs::remove_file(&link).ok();
+                    std::fs::create_dir(&link).ok();
+                }
+            })
+        };
         let context = crate::protocol::TaskContext {
             project_dir: Some("missions/x".to_string()),
             cron_tick: Some(serde_json::json!({"event":"cron.tick"})),
@@ -473,8 +476,8 @@ mod tests {
                 }
             }
         }
-        attacker.kill().ok();
-        attacker.wait().ok();
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().ok();
         assert!(
             succeeded > 0,
             "harness never completed a bootstrap — vacuous"
@@ -488,6 +491,58 @@ mod tests {
         );
         std::fs::remove_dir_all(root).ok();
         std::fs::remove_dir_all(outside).ok();
+    }
+
+    /// WI#375 DS-1 / MR !1669 review IK-3: an in-root redirect raced between
+    /// the descriptor walk and the path re-resolve must be refused. The decoy
+    /// already contains "x", so without the dev/ino compare a raced resolve
+    /// returns root/decoy/x. Runs until the race window is hit once (a
+    /// redirected success or the DS-1 refusal) or the time budget runs out.
+    #[test]
+    fn cron_bootstrap_refuses_in_root_redirect_raced_after_walk() {
+        let root = temp_root("cron-ds1-race")
+            .canonicalize()
+            .expect("canonical root");
+        let link = root.join("missions");
+        let decoy = root.join("decoy");
+        std::fs::create_dir(&link).expect("create missions dir");
+        std::fs::create_dir_all(decoy.join("x")).expect("create decoy/x");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attacker = {
+            let (stop, link, decoy) = (stop.clone(), link.clone(), decoy.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::fs::remove_dir_all(&link).ok();
+                    std::os::unix::fs::symlink(&decoy, &link).ok();
+                    std::fs::remove_file(&link).ok();
+                    std::fs::create_dir(&link).ok();
+                }
+            })
+        };
+        let context = crate::protocol::TaskContext {
+            project_dir: Some("missions/x".to_string()),
+            cron_tick: Some(serde_json::json!({"event":"cron.tick"})),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut redirected = Vec::new();
+        let mut refused = 0u32;
+        while std::time::Instant::now() < deadline && redirected.is_empty() && refused == 0 {
+            match resolve_task_workspace(&context, &root) {
+                Ok(resolved) if resolved.starts_with(&decoy) => redirected.push(resolved),
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("resolved path changed") => refused += 1,
+                Err(_) => {}
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().ok();
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            redirected.is_empty(),
+            "in-root redirect returned: {redirected:?}"
+        );
+        assert!(refused > 0, "race window never hit within the time budget");
     }
 
     #[test]
