@@ -9584,6 +9584,92 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn http_gate_prompt_redacts_credentials_without_a_registry_tool() {
+        // Run-131 IM-4: the no-registry-tool fallback branch of
+        // `persist_and_notify_thread_gate` (e.g. an extension unloaded
+        // mid-gate) must still apply the http surface instead of cloning raw
+        // parameters. Same shape as `http_gate_prompt_redacts_credentials`
+        // but with no `http` tool registered.
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("xmpp");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+        let conversation_id = lunarwing_engine::ConversationId::new();
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let header_secret = "fallback-header-secret";
+        let query_secret = "fallback-query-secret";
+        let outcome = ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "http".into(),
+            call_id: "call-http-unregistered".into(),
+            parameters: serde_json::json!({
+                "method": "GET",
+                "url": format!("https://api.example.com/data?api_key={query_secret}&page=2"),
+                "headers": {"Authorization": format!("Bearer {header_secret}")},
+            }),
+            resume_kind: lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            resume_output: None,
+        };
+
+        let result = persist_and_notify_thread_gate(
+            &manager,
+            &state,
+            &message,
+            conversation_id,
+            thread_id,
+            outcome,
+        )
+        .await
+        .expect("http gate should be persisted and announced");
+        assert_eq!(result, Some(String::new()));
+
+        let pending = state.pending_gates.list_for_user("alice").await;
+        assert_eq!(pending.len(), 1);
+        // The persisted gate keeps the real parameters for execution…
+        assert!(
+            pending[0].parameters["url"]
+                .as_str()
+                .expect("url")
+                .contains(query_secret)
+        );
+        // …while the display copy is redacted even with no registry tool.
+        let display = pending[0]
+            .display_parameters
+            .clone()
+            .expect("display parameters");
+        let display_serialized = display.to_string();
+        assert!(
+            !display_serialized.contains(header_secret),
+            "header credential leaked: {display_serialized}"
+        );
+        assert!(
+            !display_serialized.contains(query_secret),
+            "query credential leaked: {display_serialized}"
+        );
+        assert!(
+            display["url"].as_str().expect("url").contains("page=2"),
+            "safe query param dropped: {display_serialized}"
+        );
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            StatusUpdate::ApprovalNeeded { parameters, .. } => {
+                assert!(!parameters.to_string().contains(header_secret));
+                assert!(!parameters.to_string().contains(query_secret));
+            }
+            other => panic!("expected ApprovalNeeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn run_spawning_gate_prompts_disclose_mission_fanout() {
         // WI#356 (run-40 BF-1): every run-spawning verb's approval prompt
         // discloses that the approved run is unsupervised and may steer any
