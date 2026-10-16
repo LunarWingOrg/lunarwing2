@@ -1145,6 +1145,8 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
             ".rust-job": {
                 "tags": ["$CI_RUST_RUNNER_TAG"],
                 "before_script": list(config.ADVISORY_GATE_BEFORE_SCRIPT),
+                "image": copy.deepcopy(config.ADVISORY_GATE_PINNED_VALUES["image"]),
+                "cache": copy.deepcopy(config.ADVISORY_GATE_PINNED_VALUES["cache"]),
             },
             ".full-validation-context": {
                 "rules": [{"if": "$CI_COMMIT_BRANCH"}, {"when": "never"}]
@@ -1153,6 +1155,7 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
                 name: {
                     "extends": [".rust-job", ".full-validation-context"],
                     "script": list(config.ADVISORY_GATE_SCRIPTS[name]),
+                    "needs": copy.deepcopy(config.ADVISORY_GATE_PINNED_VALUES["needs"]),
                 }
                 for name in self.GATES
             },
@@ -1165,6 +1168,27 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
 
     def test_real_shape_passes(self):
         self.assertEqual(self.errors(self.merged()), [])
+
+    def test_gate_inputs_are_pinned(self):
+        # IU-1: string-form needs imports both artifacts and dotenv; other
+        # jobs, images or caches can replace the checker without editing it.
+        shapes = (
+            ("needs", ["cargo-metadata"]),
+            ("needs", [*config.ADVISORY_GATE_PINNED_VALUES["needs"], "hollow-prep"]),
+            ("image", {"name": "docker.io/attacker/rust@sha256:" + "a" * 64}),
+            ("cache", [*config.ADVISORY_GATE_PINNED_VALUES["cache"], {
+                "key": "hollow-checkers", "paths": [".gitlab/scripts/"], "policy": "pull",
+            }]),
+        )
+        for job_name in self.GATES:
+            for key, value in shapes:
+                with self.subTest(job=job_name, key=key, value=value):
+                    merged = self.merged()
+                    merged[job_name][key] = copy.deepcopy(value)
+                    self.assertTrue(any(
+                        error.startswith(f"{job_name} {key} must be exactly")
+                        for error in self.errors(merged)
+                    ))
 
     def test_allow_failure_is_caught_on_every_gate(self):
         for job_name in self.GATES:
@@ -1367,6 +1391,122 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
         ):
             self.assertEqual(config.main(), 1)
         self.assertIn("cargo-deny must not set allow_failure", stderr.getvalue())
+
+
+class CacheTrustTests(unittest.TestCase):
+    """IU-3: exercise cache policy against the actual merged CI definitions."""
+
+    def setUp(self):
+        self.merged = {}
+        for include in config.EXPECTED_INCLUDES:
+            self.merged = config.merge_ci_hashes(
+                self.merged, config.load_yaml(ROOT / include.lstrip("/"))
+            )
+        self.merged = config.merge_ci_hashes(self.merged, config.load_yaml(config.ROOT_CONFIG))
+
+    def errors(self, merged):
+        errors = []
+        config.validate_cache_trust(merged, errors)
+        return errors
+
+    def test_real_cache_policy_passes(self):
+        self.assertEqual(self.errors(self.merged), [])
+
+    def test_validation_jobs_cannot_write_caches(self):
+        for name in ("rust-check-postgres", "rust-check-libsql", "rust-test-lib"):
+            for policy in ("push", "pull-push", "$CACHE_POLICY", None):
+                with self.subTest(job=name, policy=policy):
+                    merged = copy.deepcopy(self.merged)
+                    cache = {"key": "rust-1.96.1-sccache", "paths": [".ci-cache/sccache/"]}
+                    if policy is not None:
+                        cache["policy"] = policy
+                    merged[name]["cache"] = cache
+                    self.assertIn(
+                        f"{name} validation caches must be fixed pull-only", self.errors(merged)
+                    )
+
+    def test_inherited_writer_is_caught_on_the_effective_job(self):
+        self.merged[".extra-cache"] = {"cache": {
+            "key": "rust-1.96.1-sccache", "paths": [".ci-cache/sccache/"], "policy": "push",
+        }}
+        self.merged["rust-check-postgres"]["extends"].append(".extra-cache")
+        self.assertIn(
+            "rust-check-postgres validation caches must be fixed pull-only",
+            self.errors(self.merged),
+        )
+
+    def test_default_and_deprecated_global_writers_are_caught(self):
+        cache = {"key": "shared", "paths": [".ci-cache/sccache/"], "policy": "push"}
+        self.merged["default"]["cache"] = cache
+        self.assertIn("default validation caches must be fixed pull-only", self.errors(self.merged))
+        del self.merged["default"]["cache"]
+        self.merged["cache"] = cache
+        self.assertIn(
+            "top-level cache is not allowed; declare caches on job templates",
+            self.errors(self.merged),
+        )
+
+    def test_cache_namespaces_cannot_be_unprotected(self):
+        for name in (".rust-job", "rust-cache-refresh"):
+            for value in (True, "$UNPROTECT_CACHE"):
+                with self.subTest(job=name, value=value):
+                    merged = copy.deepcopy(self.merged)
+                    merged[name]["cache"][-1]["unprotect"] = value
+                    self.assertIn(
+                        f"{name} must not use cache:unprotect; keep protected caches separate",
+                        self.errors(merged),
+                    )
+
+    def test_writer_predicate_cannot_add_an_mr_route(self):
+        # These still contain every fragment the old substring guard required.
+        condition = self.merged["rust-cache-refresh"]["rules"][0]["if"]
+        for bypass in (
+            condition + ' || $CI_PIPELINE_SOURCE == "merge_request_event"',
+            condition.replace(" && ", " || "),
+        ):
+            with self.subTest(condition=bypass):
+                merged = copy.deepcopy(self.merged)
+                merged["rust-cache-refresh"]["rules"][0]["if"] = bypass
+                merged["rust-check-default"]["rules"][0]["if"] = bypass
+                self.assertIn(
+                    "rust-cache-refresh rules must be exactly the protected default-branch push gate",
+                    self.errors(merged),
+                )
+
+    def test_writer_variables_cannot_spoof_the_push_context(self):
+        self.merged["rust-cache-refresh"]["variables"] = {"CI_PIPELINE_SOURCE": "push"}
+        self.assertIn(
+            "rust-cache-refresh must not override variables used by its protected push gate",
+            self.errors(self.merged),
+        )
+
+    def test_writer_must_exist_with_fixed_policies(self):
+        for policy in ("pull", "$CACHE_POLICY"):
+            with self.subTest(policy=policy):
+                merged = copy.deepcopy(self.merged)
+                merged["rust-cache-refresh"]["cache"][-1]["policy"] = policy
+                self.assertIn(
+                    "rust-cache-refresh must declare fixed pull-push caches", self.errors(merged)
+                )
+        del self.merged["rust-cache-refresh"]
+        self.assertIn(
+            "rust-cache-refresh must declare fixed pull-push caches", self.errors(self.merged)
+        )
+
+    def test_truncated_cache_inheritance_fails_closed(self):
+        self.merged["cache-probe"] = {"extends": ".cache-parent-0", "script": ["true"]}
+        for index in range(config.EXTENDS_DEPTH_BUDGET + 1):
+            self.merged[f".cache-parent-{index}"] = {"extends": f".cache-parent-{index + 1}"}
+        self.assertIn(
+            "cache-probe cache trust cannot validate a truncated extends chain",
+            self.errors(self.merged),
+        )
+
+    def test_validation_can_disable_caching(self):
+        for value in ([], None):
+            with self.subTest(cache=value):
+                self.merged["rust-check-postgres"]["cache"] = value
+                self.assertEqual(self.errors(self.merged), [])
 
 
 class WorkerTsLaneTests(unittest.TestCase):

@@ -4,7 +4,8 @@ cargo-deny:
     - .full-validation-context
   stage: security
   needs:
-    - cargo-metadata
+    - job: cargo-metadata
+      artifacts: false
   script:
     - bash .gitlab/scripts/install-cargo-deny.sh
     - bash .gitlab/scripts/cargo-deny-check.sh
@@ -18,7 +19,8 @@ satellite-advisory-sweep:
     - .full-validation-context
   stage: security
   needs:
-    - cargo-metadata
+    - job: cargo-metadata
+      artifacts: false
   script:
     - bash .gitlab/scripts/install-cargo-deny.sh
     - bash .gitlab/scripts/check-satellite-advisories.sh
@@ -32,7 +34,8 @@ lockfile-only-advisory-guard:
     - .full-validation-context
   stage: security
   needs:
-    - cargo-metadata
+    - job: cargo-metadata
+      artifacts: false
   script:
     - bash .gitlab/scripts/check-lockfile-only-advisories.sh
 
@@ -48,7 +51,8 @@ default-graph-advisory-guard:
     - .full-validation-context
   stage: security
   needs:
-    - cargo-metadata
+    - job: cargo-metadata
+      artifacts: false
   script:
     - bash .gitlab/scripts/check-default-graph-advisories.sh
 

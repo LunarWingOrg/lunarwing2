@@ -319,8 +319,12 @@ the prime suspect, and the fix is the same normalization in the offending
   optional as an `allow_failure` one, and job-level `variables`, `hooks`,
   `inherit`, `parallel` or `timeout` can hollow it out just as well, so a
   deliberate gate or `.rust-job` bootstrap change updates the pinned tuples
-  in the same commit (MR !1680 review IP-1). `secret-history` is the marked,
-  deliberate exception while
+  in the same commit (MR !1680 review IP-1). The allowed inputs are also
+  pinned by `ADVISORY_GATE_PINNED_VALUES`: the `$CI_RUST_IMAGE` image, the
+  exact pull-only Rust caches, and only `cargo-metadata` with
+  `artifacts: false` — blocking both checkout-overwriting artifacts and
+  higher-precedence dotenv variables from upstream jobs (MR !1688, IU-1).
+  `secret-history` is the marked, deliberate exception while
   historical findings are triaged. Three limits of the YAML validator
   remain, by design: it cannot see repo files the pinned scripts still
   honour — a project `.npmrc`, a `bunfig.toml` `preload`, or the
@@ -580,6 +584,28 @@ without allowing merge-request jobs to write caches. Rust jobs report
 before/after disk use, target/cache sizes, and sccache statistics. Cache only
 the dependency paths declared in `defaults.yml`; do not add `target/`, tenant
 data, environment files, or credentials.
+
+The cache policy validator checks merged, extends-resolved definitions:
+validation caches must have literal `policy: pull` (including inherited and
+default caches), `cache:unprotect` is forbidden, and the sole writer's rules
+must match the protected default-branch push predicate exactly, with no
+job-variable overrides. Push-only, implicit `pull-push`, variable policies,
+and an extra MR condition on the writer are refused (MR !1688, IU-3).
+
+`bootstrap-sccache.sh` verifies the pinned SHA256 of the sccache **binary**
+before accepting a cache hit or executing a new installation, in addition to
+verifying the release archive. A matching `--version` string is not trusted.
+Rejected cached binaries are removed before downloading, and a failed binary
+check removes the installation so `after_script` cannot execute it. Verified
+cache hits stay offline; rejected entries require a verified download (IU-2).
+
+**Compiler-cache trust limit (IU-3):** the binary pin does not authenticate
+compiled objects in `.ci-cache/sccache/`. The checked-in pipeline permits
+writes only from `rust-cache-refresh` on protected default-branch pushes;
+MRs and unprotected target branches read only. This still trusts the cache
+backend, protected writers, and GitLab's separate protected/non-protected
+cache setting above, which the YAML validator cannot verify. Discard caches
+produced under weaker policies before relying on cached test results.
 
 ### Worker scheduling and pipeline latency
 

@@ -504,6 +504,30 @@ ADVISORY_GATE_EFFECTIVE_KEYS = frozenset({
     "script", "stage", "tags",
 })
 
+# Run-137 IU-1: artifacts can replace checkers or supply dotenv variables
+# outside GLOBAL_VARIABLE_ALLOWLIST. Pin the allowed inputs as well as keys:
+# no upstream artifacts or dotenv, exactly the Rust image and pull-only caches.
+ADVISORY_GATE_PINNED_VALUES = {
+    "image": {"name": "$CI_RUST_IMAGE"},
+    "needs": [{"job": "cargo-metadata", "artifacts": False}],
+    "cache": [
+        {
+            "key": {"prefix": "rust-1.96.1-dependencies", "files": ["ic/Cargo.lock"]},
+            "paths": [
+                ".ci-cache/cargo/registry/index/",
+                ".ci-cache/cargo/registry/cache/",
+                ".ci-cache/cargo/git/db/",
+            ],
+            "policy": "pull",
+        },
+        {
+            "key": "rust-1.96.1-sccache",
+            "paths": [".ci-cache/bin/", ".ci-cache/sccache/"],
+            "policy": "pull",
+        },
+    ],
+}
+
 
 def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> None:
     """The release audit's advisory gates must not be allowed to fail.
@@ -588,6 +612,9 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
                 f"{job_name} before_script must be exactly the pinned .rust-job "
                 f"bootstrap {ADVISORY_GATE_BEFORE_SCRIPT!r}"
             )
+        for key, expected in ADVISORY_GATE_PINNED_VALUES.items():
+            if effective.get(key) != expected:
+                errors.append(f"{job_name} {key} must be exactly {expected!r}")
         unexpected = sorted(set(effective) - ADVISORY_GATE_EFFECTIVE_KEYS)
         if unexpected:
             errors.append(
@@ -1049,52 +1076,68 @@ def cache_policies(job: object) -> list[str]:
     return [str(entry.get("policy", "pull-push")) for entry in entries if isinstance(entry, dict)]
 
 
-def validate_cache_trust(merged: dict, defaults: dict, errors: list[str]) -> None:
+CACHE_REFRESH_CONDITION = (
+    '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH '
+    '&& $CI_COMMIT_REF_PROTECTED == "true"'
+)
+
+
+def validate_cache_trust(merged: dict, errors: list[str]) -> None:
+    """IU-3: validation jobs only read caches; one protected push job writes.
+
+    Check the merged, extends-resolved jobs, including push-only, implicit
+    pull-push and variable policies. A substring in the writer's rule is not
+    sufficient: an OR branch could also enable it in an MR pipeline.
+    """
     for template_name in (".python-job", ".rust-job", ".rust-msrv-job"):
-        policies = cache_policies(defaults.get(template_name))
+        policies = cache_policies(resolve_extends(merged.get(template_name), merged))
         if not policies or any(policy != "pull" for policy in policies):
             errors.append(f"{template_name} validation caches must be fixed pull-only")
 
-    writers = {
-        name
-        for name, job in merged.items()
-        if isinstance(job, dict) and "pull-push" in cache_policies(job)
-    }
-    if writers != {"rust-cache-refresh"}:
-        errors.append(f"unexpected writable cache jobs: {sorted(writers)}")
-    refresh = merged.get("rust-cache-refresh", {})
-    active_rules = [
-        rule
-        for rule in refresh.get("rules", [])
-        if isinstance(rule, dict) and rule.get("when") != "never"
-    ] if isinstance(refresh, dict) else []
-    if len(active_rules) != 1:
-        errors.append("rust-cache-refresh must have one active rule")
-    else:
-        condition = str(active_rules[0].get("if", ""))
-        required = (
-            'CI_PIPELINE_SOURCE == "push"',
-            "CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH",
-            'CI_COMMIT_REF_PROTECTED == "true"',
-        )
-        if any(fragment not in condition for fragment in required):
-            errors.append("rust-cache-refresh must require a protected default-branch push")
-        # Exactly one default-feature check per context, while retaining the
-        # literal pull-only cache policy on untrusted validation jobs.
-        check = merged.get("rust-check-default", {})
-        if check.get("rules") != [
-            {"if": condition, "when": "never"}, {"when": "on_success"}
-        ]:
-            errors.append("rust-check-default must complement the protected cache writer")
-        if check.get("script") != refresh.get("script"):
-            errors.append("the cache writer must perform the same default-feature check")
-        if refresh.get("needs") != ["cargo-metadata"]:
-            errors.append("rust-cache-refresh must check directly after cargo-metadata")
-        for name in ("rust-test-lib", "cavepony-wasm"):
-            needs = merged.get(name, {}).get("needs", [])
-            for producer in ("rust-check-default", "rust-cache-refresh"):
-                if {"job": producer, "artifacts": False, "optional": True} not in needs:
-                    errors.append(f"{name} must wait for whichever default check is present")
+    if merged.get("cache"):
+        errors.append("top-level cache is not allowed; declare caches on job templates")
+    for name, job in merged.items():
+        if not isinstance(job, dict):
+            continue
+        effective = resolve_extends(job, merged)
+        if effective.get(EXTENDS_TRUNCATED_KEY):
+            errors.append(f"{name} cache trust cannot validate a truncated extends chain")
+        if name != "rust-cache-refresh" and any(
+            policy != "pull" for policy in cache_policies(effective)
+        ):
+            errors.append(f"{name} validation caches must be fixed pull-only")
+        cache = effective.get("cache", [])
+        entries = cache if isinstance(cache, list) else [cache]
+        if any(
+            isinstance(entry, dict) and entry.get("unprotect", False) is not False
+            for entry in entries
+        ):
+            errors.append(f"{name} must not use cache:unprotect; keep protected caches separate")
+
+    refresh = resolve_extends(merged.get("rust-cache-refresh"), merged)
+    policies = cache_policies(refresh)
+    if not policies or any(policy != "pull-push" for policy in policies):
+        errors.append("rust-cache-refresh must declare fixed pull-push caches")
+    if refresh.get("rules") != [{"if": CACHE_REFRESH_CONDITION}, {"when": "never"}]:
+        errors.append("rust-cache-refresh rules must be exactly the protected default-branch push gate")
+    if refresh.get("variables"):
+        errors.append("rust-cache-refresh must not override variables used by its protected push gate")
+    # Exactly one default-feature check per context, while retaining the
+    # literal pull-only cache policy on untrusted validation jobs.
+    check = resolve_extends(merged.get("rust-check-default"), merged)
+    if check.get("rules") != [
+        {"if": CACHE_REFRESH_CONDITION, "when": "never"}, {"when": "on_success"}
+    ]:
+        errors.append("rust-check-default must complement the protected cache writer")
+    if check.get("script") != refresh.get("script"):
+        errors.append("the cache writer must perform the same default-feature check")
+    if refresh.get("needs") != ["cargo-metadata"]:
+        errors.append("rust-cache-refresh must check directly after cargo-metadata")
+    for name in ("rust-test-lib", "cavepony-wasm"):
+        needs = resolve_extends(merged.get(name), merged).get("needs", [])
+        for producer in ("rust-check-default", "rust-cache-refresh"):
+            if {"job": producer, "artifacts": False, "optional": True} not in needs:
+                errors.append(f"{name} must wait for whichever default check is present")
 
 
 def extract_arg_default(text: str, arg: str) -> str | None:
@@ -1872,7 +1915,7 @@ def main() -> int:
     validate_satellite_advisory_sweep(merged_config, errors)
     validate_advisory_gates_not_optional(merged_config, errors)
     validate_worker_ts_lanes(merged_config, errors)
-    validate_cache_trust(merged_config, defaults, errors)
+    validate_cache_trust(merged_config, errors)
     validate_worker_versions(errors)
     validate_worker_input_manifest(errors)
     validate_deliverables_manifest(merged_config, errors)
