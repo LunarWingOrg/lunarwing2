@@ -970,6 +970,62 @@ class DebianSnapshotTieTests(unittest.TestCase):
             any("apt deb sources" in error for error in self.errors())
         )
 
+    def test_bracketed_option_list_source_is_caught(self):
+        # MR !1665 review IF-3 (P6): the rule matched only `deb` followed
+        # directly by the URL, so an options list smuggled the live mirror
+        # past it.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN echo 'deb [trusted=yes] http://deb.debian.org/debian bookworm main' "
+            + ">> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
+    def test_deb_src_source_is_caught(self):
+        # IF-3: a deb-src entry is an apt source too.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN echo 'deb-src http://deb.debian.org/debian bookworm main' "
+            + ">> /etc/apt/sources.list\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
+    def test_deb822_uris_source_is_caught(self):
+        # IF-3: the Dockerfile deletes debian.sources, but a RUN can write a
+        # new deb822 stanza — its URIs line is an apt source.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' 'Types: deb' "
+            + "'URIs: http://deb.debian.org/debian' 'Suites: bookworm' "
+            + "> /etc/apt/sources.list.d/debian.sources\n"
+        )
+        self.assertTrue(
+            any("apt deb sources" in error for error in self.errors())
+        )
+
+    def test_snapshot_sources_with_option_lists_and_deb822_pass(self):
+        # IF-3 pass-side pin: the same shapes pointing at the pinned snapshot
+        # must stay clean, and a ${DEBIAN_SNAPSHOT} reference inside a
+        # bracketed or deb822 URL still counts as a literal reference.
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN printf '%s\\n' "
+            + '"deb [arch=amd64] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" '
+            + "> /etc/apt/sources.list\n"
+            + "RUN printf '%s\\n' 'Types: deb deb-src' "
+            + "'URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/' "
+            + "'Suites: bookworm' > /etc/apt/sources.list.d/debian.sources\n"
+        )
+        self.assertEqual(self.errors(), [])
+
 
 class YamlParseErrorTests(unittest.TestCase):
     """MR !1647 review HP-5: a `!reference` tag anywhere in the CI YAML made

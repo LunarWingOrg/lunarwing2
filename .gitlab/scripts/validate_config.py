@@ -1606,9 +1606,18 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                 "ARG declarations or ${DEBIAN_SNAPSHOT} snapshot URLs: "
                 f"{stray_references}"
             )
-        deb_source = re.compile(r"(?:^|[\"'\s])deb\s+https?://")
+        # MR !1665 review IF-3: the source rule must also see the one-line
+        # shapes that add a live mirror without touching the pinned lines —
+        # a bracketed options list between `deb`/`deb-src` and the URL
+        # (`deb [trusted=yes] http://…`), and deb822 `URIs:` lines (the
+        # Dockerfile deletes debian.sources, but a RUN can write a new one).
+        deb_source = re.compile(
+            r"(?:^|[\"'\s])(?:deb(?:-src)?\s+(?:\[[^\]]*\]\s*)?|URIs:\s*)https?://"
+        )
         snapshot_source = re.compile(
-            r"deb\s+https?://snapshot\.debian\.org/archive/", re.IGNORECASE
+            r"(?:deb(?:-src)?\s+(?:\[[^\]]*\]\s*)?|URIs:\s*)"
+            r"https?://snapshot\.debian\.org/archive/",
+            re.IGNORECASE,
         )
         non_snapshot_sources = [
             line.strip()
