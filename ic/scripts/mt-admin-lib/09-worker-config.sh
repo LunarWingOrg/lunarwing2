@@ -1630,9 +1630,9 @@ prepare_worker_workspace() {
 # rootless podman, and mode-bypassing host root on rootful podman — so a
 # tenant-owned 0700 directory suffices; 0777 was never load-bearing.
 prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
-  local name="$1" workspace_dir tenant_uid
-  workspace_dir="$(tenant_lw_root "$name")/pebble-workspace"
-  tenant_uid="$(id -u "$name")" || return 1
+  local name="$1" lw_root workspace_dir
+  lw_root="$(tenant_lw_root "$name")"
+  workspace_dir="$lw_root/pebble-workspace"
   if [[ "$(id -un)" == "$name" ]]; then
     mkdir -p "$workspace_dir" || return 1
   else
@@ -1642,8 +1642,15 @@ prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
     printf 'error: pebble workspace is not a plain directory: %s\n' "$workspace_dir" >&2
     return 1
   fi
-  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" != "$tenant_uid" ]]; then
-    printf 'error: pebble workspace not owned by tenant %q: %s\n' "$name" "$workspace_dir" >&2
+  # Ownership is checked against the tenant root dir — provisioned
+  # tenant-owned by create_tenant_user — rather than by resolving the
+  # account's uid, so the check also holds for fixture tenants with no
+  # passwd entry. stat follows a symlinked lw_root on purpose: a tenant who
+  # points ~/lunarwing at other storage keeps working as long as the target
+  # stays tenant-owned.
+  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" \
+      != "$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)" ]]; then
+    printf 'error: pebble workspace not owned like the tenant root: %s\n' "$workspace_dir" >&2
     return 1
   fi
   # chmod as the tenant: chmod follows symlinks, and root has no business
