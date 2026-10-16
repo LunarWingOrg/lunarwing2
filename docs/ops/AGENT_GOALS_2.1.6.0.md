@@ -734,7 +734,7 @@
 45. [x] (S) (H) (MR) Read notes from goals doc and catch up
 46. [x] (S) (H MR) Status of some of the bigger goals here check in on
 47. [x] (S) Reserved for later
-48. [x] (S) Reserved for later
+48. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/418
 49. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/402 - last rejected attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1667 - please see comments on MR and address findings
 50. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/408 - last attempt - see comments on closed MR and address https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1673 - next
 51. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/410
@@ -754,7 +754,7 @@
     - DONE 2026-10-15 (maintainer session, branch `paseo/kimi-52-53-20261015-1845`, together with item 52): `kimicode4lunarwing/config/config.toml` pins `max_output_size = 131072` on `[models."tensorzero/FrontierCODEK"]` with the rationale as a comment (the value 2.1.1 sent; the TensorZero FrontierCODEK variants set no cap of their own). `entrypoint_config_test.ts` gains a TOML-parsing pin (python3 `tomllib`, provisioned in the lane): every `[models.*]` table whose provider is `type = "openai"` must carry a positive integer `max_output_size`, and FrontierCODEK's must be 131072; the existing `KIMI_MODEL` retarget test now carries the key in its source and asserts it survives the header rename (the entrypoint's rewriter edits text, so comments and keys survive). `HOWTOCHANGECONFIG.md` and `WORKER-CONTAINERS.md` record the rule.
     - **Request capture (AC3, offline):** the repo-pinned CLI (`kimi-cli/` lockfile, `@moonshot-ai/kimi-code` 2.2.0) run under `unshare -rn` (loopback only) against a capture server with the lane config: with the pin every `POST /openai/v1/chat/completions` carries `"max_tokens": 131072` (8/8 retry attempts); with the key removed none carries `max_tokens` or `max_completion_tokens` (0/8). Not verified on a tenant or candidate image (none built from this tree yet): the request-side half of the AC is shown, and output length follows from the gateway honouring `max_tokens`. **Maintainer confirmation 2026-10-15:** the promoted 2.2.0 image predates this fix (last AC unmet as written); rebuild from `766b7c91e` or later and recreate the containers, then AC3 can be closed on a tenant.
     - **Verification:** lane suite 87/87; mutant: dropping the key from `config.toml` fails exactly the new pin.
-54. [x] (S) Reserved for later
+54. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/419
 55. [ ] repass of 40th goal - update release notes to be more current and correct small outdated pieces of info
 
 ---
