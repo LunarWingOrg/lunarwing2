@@ -432,6 +432,30 @@ _tenant_env_sed() {  # <tenant> <env_file> <sed-expression>
   return "$rc"
 }
 
+# Read-side counterpart of the tenant-side writers (WI#390, review IG-1): root
+# must never resolve a tenant-writable path for its VALUE reads either. A
+# symlink present for the read window hands root another tenant's env, and the
+# patch/render then writes those values (COORD_ADMIN_TOKEN, GATEWAY_AUTH_TOKEN,
+# SECRETS_MASTER_KEY, XMPP_PASSWORD, KIMI_API_KEY, …) back into the tenant's
+# own file. Snapshot the file once AS THE TENANT — a foreign 0600 file in a
+# 0700 dir is unreadable to the tenant-side read, so a cross-tenant symlink
+# dies here instead of leaking — and point every value/presence read at the
+# root-private snapshot. The tenant-side writers still re-read the live file at
+# commit time, so a post-snapshot swap fails closed there. A missing path
+# snapshots as empty (first-render shape); an unreadable or dangling one dies.
+# Caller must rm the printed snapshot on every path that does not die first.
+_snapshot_tenant_env() {  # <tenant> <env_file> — prints the snapshot path
+  local name="$1" path="$2" snapshot
+  snapshot="$(mktemp)" || die "could not snapshot $path"
+  if [[ -e "$path" || -L "$path" ]]; then
+    if ! tenant_cat "$name" "$path" >"$snapshot"; then
+      rm -f -- "$snapshot"
+      die "could not read $path as tenant '$name'"
+    fi
+  fi
+  printf '%s\n' "$snapshot"
+}
+
 _quote_env_value() {  # <one-line value>
   local value="$1"
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
@@ -2635,75 +2659,84 @@ patch_tenant_coordination_env() {
   # symlinks, so a root chmod here could rewrite an attacker-chosen
   # file's mode (WI#390).
   tenant_chmod "$name" 0600 "$env_path"
-  coord_admin_port="$(_env_existing "$env_path" COORD_ADMIN_PORT)"
+  # WI#390 (review IG-1): every value/presence read below comes from ONE
+  # snapshot taken as the tenant — never from root resolving the live
+  # tenant-writable path. A cross-tenant symlink present for the read window
+  # is unreadable to the tenant-side cat and dies here; without the snapshot,
+  # root's reads would follow it and the appends below would write the other
+  # tenant's COORD_ADMIN_TOKEN/COORD_ADMIN_PORT into this tenant's env.
+  local env_snapshot
+  env_snapshot="$(_snapshot_tenant_env "$name" "$env_path")"
+  coord_admin_port="$(_env_existing "$env_snapshot" COORD_ADMIN_PORT)"
   if [[ -z "$coord_admin_port" ]]; then
     coord_admin_port="$(ports_get "$name" coord_admin || true)"
     [[ -n "$coord_admin_port" ]] || die "coordination admin port missing for tenant '$name'"
   fi
-  coord_admin_token="$(_env_existing "$env_path" COORD_ADMIN_TOKEN)"
+  coord_admin_token="$(_env_existing "$env_snapshot" COORD_ADMIN_TOKEN)"
   [[ -n "$coord_admin_token" ]] || coord_admin_token="$(generate_token)"
-  if ! grep -q '^COORD_ENABLED=' "$env_path"; then
+  if ! grep -q '^COORD_ENABLED=' "$env_snapshot"; then
     printf '\n# Multi-agent coordination (disabled until channels are configured explicitly)\nCOORD_ENABLED=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ENABLED=false to $env_path"
   fi
-  if ! grep -q '^COORD_AGENT_ID=' "$env_path"; then
+  if ! grep -q '^COORD_AGENT_ID=' "$env_snapshot"; then
     printf 'COORD_AGENT_ID=%s\n' "$name" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_AGENT_ID=$name to $env_path"
   fi
-  if ! grep -q '^COORD_CHANNELS=' "$env_path"; then
+  if ! grep -q '^COORD_CHANNELS=' "$env_snapshot"; then
     printf 'COORD_CHANNELS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_CHANNELS to $env_path"
   fi
-  if ! grep -q '^COORD_AGENT_ALIASES=' "$env_path"; then
+  if ! grep -q '^COORD_AGENT_ALIASES=' "$env_snapshot"; then
     printf 'COORD_AGENT_ALIASES=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_AGENT_ALIASES to $env_path"
   fi
-  if ! grep -q '^COORD_RESPONDER_ROSTER=' "$env_path"; then
+  if ! grep -q '^COORD_RESPONDER_ROSTER=' "$env_snapshot"; then
     printf 'COORD_RESPONDER_ROSTER=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_RESPONDER_ROSTER to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_SHARE=' "$env_path"; then
+  if ! grep -q '^COORD_KNOWLEDGE_SHARE=' "$env_snapshot"; then
     printf 'COORD_KNOWLEDGE_SHARE=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_SHARE=false to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_PUBLISH=' "$env_path"; then
+  if ! grep -q '^COORD_KNOWLEDGE_PUBLISH=' "$env_snapshot"; then
     printf 'COORD_KNOWLEDGE_PUBLISH=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_PUBLISH=false to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_PUBLISHERS=' "$env_path"; then
+  if ! grep -q '^COORD_KNOWLEDGE_PUBLISHERS=' "$env_snapshot"; then
     printf 'COORD_KNOWLEDGE_PUBLISHERS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_PUBLISHERS= (empty allowlist) to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_MAX_PER_HOUR=' "$env_path"; then
+  if ! grep -q '^COORD_KNOWLEDGE_MAX_PER_HOUR=' "$env_snapshot"; then
     printf 'COORD_KNOWLEDGE_MAX_PER_HOUR=30\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_MAX_PER_HOUR=30 to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=' "$env_path"; then
+  if ! grep -q '^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=' "$env_snapshot"; then
     printf 'COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300 to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_MIN_CHARS=' "$env_path"; then
+  if ! grep -q '^COORD_KNOWLEDGE_MIN_CHARS=' "$env_snapshot"; then
     printf 'COORD_KNOWLEDGE_MIN_CHARS=12\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_MIN_CHARS=12 to $env_path"
   fi
-  if ! grep -q '^COORD_ADMIN_USERS=' "$env_path"; then
+  if ! grep -q '^COORD_ADMIN_USERS=' "$env_snapshot"; then
     printf 'COORD_ADMIN_USERS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_USERS to $env_path"
   fi
-  if grep -q '^COORD_ADMIN_TOKEN=$' "$env_path"; then
+  if grep -q '^COORD_ADMIN_TOKEN=$' "$env_snapshot"; then
     _tenant_env_sed "$name" "$env_path" "s/^COORD_ADMIN_TOKEN=$/COORD_ADMIN_TOKEN=$coord_admin_token/" || die "could not safely update $env_path"
     say "repaired empty COORD_ADMIN_TOKEN in $env_path"
-  elif ! grep -q '^COORD_ADMIN_TOKEN=' "$env_path"; then
+  elif ! grep -q '^COORD_ADMIN_TOKEN=' "$env_snapshot"; then
     printf 'COORD_ADMIN_TOKEN=%s\n' "$coord_admin_token" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_TOKEN to $env_path"
   fi
-  if grep -q '^COORD_ADMIN_PORT=$' "$env_path"; then
+  if grep -q '^COORD_ADMIN_PORT=$' "$env_snapshot"; then
     _tenant_env_sed "$name" "$env_path" "s/^COORD_ADMIN_PORT=$/COORD_ADMIN_PORT=$coord_admin_port/" || die "could not safely update $env_path"
     say "repaired empty COORD_ADMIN_PORT=$coord_admin_port in $env_path"
-  elif ! grep -q '^COORD_ADMIN_PORT=' "$env_path"; then
+  elif ! grep -q '^COORD_ADMIN_PORT=' "$env_snapshot"; then
     printf 'COORD_ADMIN_PORT=%s\n' "$coord_admin_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_PORT=$coord_admin_port to $env_path"
   fi
+  rm -f -- "$env_snapshot"
 }
 
 # WI#330: backfill the LLM base URL of every ENABLED external worker whose
@@ -2720,21 +2753,32 @@ backfill_tenant_worker_base_urls() {  # <tenant>
   local env_path proxy_env llm_base_url tensorzero_url derived
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path"
-  llm_base_url="$(_read_env_value "$env_path" LLM_BASE_URL)"
+  # WI#390 (review IG-1): endpoint values are read from tenant-side snapshots,
+  # never from root resolving the tenant-writable paths — a cross-tenant
+  # symlink present for the read window is unreadable to the tenant-side cat
+  # and dies instead of writing another tenant's endpoints into this env.
+  local env_snapshot proxy_snapshot
+  env_snapshot="$(_snapshot_tenant_env "$name" "$env_path")"
+  llm_base_url="$(_read_env_value "$env_snapshot" LLM_BASE_URL)"
   tensorzero_url=""
   proxy_env="$(tenant_env_dir "$name")/proxy.env"
-  [[ ! -f "$proxy_env" ]] || tensorzero_url="$(_read_env_value "$proxy_env" TENSORZERO_URL)"
+  proxy_snapshot=""
+  if [[ -e "$proxy_env" || -L "$proxy_env" ]]; then
+    proxy_snapshot="$(_snapshot_tenant_env "$name" "$proxy_env")"
+    tensorzero_url="$(_read_env_value "$proxy_snapshot" TENSORZERO_URL)"
+  fi
   derived="$(derive_worker_llm_base_url "$llm_base_url" "$tensorzero_url" || true)"
   local worker key
   for worker in opencode kimi opencode2; do
     key="$(printf '%s_BASE_URL' "${worker^^}")"
     tenant_worker_enabled "$name" "$worker" || continue
-    [[ -z "$(_read_env_value "$env_path" "$key")" ]] || continue
+    [[ -z "$(_read_env_value "$env_snapshot" "$key")" ]] || continue
     [[ -n "$derived" ]] \
-      || die "tenant '$name' has the $worker worker enabled but no container-reachable LLM endpoint to inherit (LLM_BASE_URL is unset/loopback and proxy.env has no usable TENSORZERO_URL). Set one explicitly: $0 configure-$worker $name --base-url <url>"
-    printf '%s=%s\n%s_SOURCE=inherited\n' "$key" "$(_quote_env_value "$derived")" "$key" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
+      || { rm -f -- "$env_snapshot" ${proxy_snapshot:+"$proxy_snapshot"}; die "tenant '$name' has the $worker worker enabled but no container-reachable LLM endpoint to inherit (LLM_BASE_URL is unset/loopback and proxy.env has no usable TENSORZERO_URL). Set one explicitly: $0 configure-$worker $name --base-url <url>"; }
+    printf '%s=%s\n%s_SOURCE=inherited\n' "$key" "$(_quote_env_value "$derived")" "$key" | _tenant_env_append "$name" "$env_path" || { rm -f -- "$env_snapshot" ${proxy_snapshot:+"$proxy_snapshot"}; die "could not safely update $env_path"; }
     say "added $key (inherited from the tenant's LLM endpoint) to $env_path"
   done
+  rm -f -- "$env_snapshot" ${proxy_snapshot:+"$proxy_snapshot"}
 }
 
 patch_tenant_env() {
