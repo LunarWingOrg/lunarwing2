@@ -412,8 +412,14 @@ write_tenant_vision_env() {
   local env_dir env_path
   env_dir="$(tenant_env_dir "$name")"
   env_path="$env_dir/vision.env"
+  # WI#390 (review IG-1): the preserved token comes from ONE snapshot read as
+  # the tenant — root resolving the live tenant-writable path would follow a
+  # cross-tenant symlink and this render would write the other tenant's
+  # LUNARWING_AUTH_TOKEN into this tenant's vision.env.
+  local vision_snapshot
+  vision_snapshot="$(_snapshot_tenant_env "$name" "$env_path")"
   local token
-  token="$(_env_existing "$env_path" LUNARWING_AUTH_TOKEN)"
+  token="$(_env_existing "$vision_snapshot" LUNARWING_AUTH_TOKEN)"
   token="${token:-$(generate_token)}"
   # Resolve VL backend URL: explicit override wins, else fleet default.
   # Empty (LUNARWING_MT_VL_URL= and DEFAULT_VL_URL unset) = no VL line written;
@@ -426,8 +432,9 @@ write_tenant_vision_env() {
   # symlink there cannot redirect the write onto an attacker-chosen path. The
   # explicit returns keep the refusal fatal even when errexit is suppressed
   # (e.g. a caller's || fallback list).
+  local rc=0
   if [[ -n "$vl_url" ]]; then
-    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600 || return 1
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600 || rc=1
 LUNARWING_AUTH_TOKEN=$token
 OCR_PORT=$VISION_SIDECAR_INTERNAL_PORT
 OCR_HEALTH_PORT=$VISION_SIDECAR_HEALTH_PORT
@@ -435,12 +442,14 @@ VL_URL=$vl_url
 VL_MODEL=qwen3-vl
 ENVEOF
   else
-    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600 || return 1
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600 || rc=1
 LUNARWING_AUTH_TOKEN=$token
 OCR_PORT=$VISION_SIDECAR_INTERNAL_PORT
 OCR_HEALTH_PORT=$VISION_SIDECAR_HEALTH_PORT
 ENVEOF
   fi
+  rm -f -- "$vision_snapshot"
+  [[ "$rc" -eq 0 ]] || return 1
   printf '%s' "$token"
 }
 
@@ -465,7 +474,16 @@ write_tenant_voice_env() {
       || die "could not create LunarVoice environment file: $env_path"
   fi
 
-  token="$(_env_existing "$env_path" VOICE_AUTH_TOKEN)"
+  # WI#390 (review IG-1): the preserved token comes from ONE snapshot read as
+  # the tenant, taken after the symlink refusal above — root resolving the
+  # live tenant-writable path in the window before the _env_set commits would
+  # follow a cross-tenant swap and write the other tenant's VOICE_AUTH_TOKEN
+  # into this tenant's voice.env. The per-key presence checks below carry no
+  # value across, and every commit re-validates the live path tenant-side.
+  local voice_snapshot
+  voice_snapshot="$(_snapshot_tenant_env "$name" "$env_path")"
+  token="$(_env_existing "$voice_snapshot" VOICE_AUTH_TOKEN)"
+  rm -f -- "$voice_snapshot"
   token="${token:-$(generate_token)}"
   enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_voice // false' "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$enabled" == true ]] || enabled=false

@@ -1077,6 +1077,24 @@ write_tenant_lunarwing_env() {
   state_dir="$(tenant_state_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
 
+  # WI#390 (review IG-1): every existing-value read below comes from ONE
+  # root-private snapshot per file, taken as the tenant — never from root
+  # resolving the live tenant-writable path. A cross-tenant symlink present
+  # for the read window is unreadable to the tenant-side cat and dies here;
+  # without the snapshot, root's reads would follow it and this render would
+  # write the other tenant's GATEWAY_AUTH_TOKEN / SECRETS_MASTER_KEY /
+  # XMPP_PASSWORD / KIMI_API_KEY / … back into this tenant's env. vision.env
+  # and voice.env are the same tenant-writable class (their tokens are carried
+  # into this render) and are snapshotted the same way. The commit at the end
+  # still re-validates the live path in write_tenant_file_atomic, so a
+  # post-snapshot swap fails closed there. resolve_tenant_xmpp_jid above runs
+  # before the snapshot by design: XMPP_JID is a non-secret identifier, and a
+  # foreign symlink dies on this snapshot before any value is rendered.
+  local env_snapshot vision_snapshot voice_snapshot
+  env_snapshot="$(_snapshot_tenant_env "$name" "$path")"
+  vision_snapshot="$(_snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/vision.env")"
+  voice_snapshot="$(_snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/voice.env")"
+
   # Idempotent on re-run (F4-A/F4-B): PRESERVE existing secrets when lunarwing.env
   # already exists. Regenerating SECRETS_MASTER_KEY would permanently orphan the
   # tenant's encrypted DB secrets (it is the AES-256-GCM vault key); rotating the
@@ -1087,47 +1105,47 @@ write_tenant_lunarwing_env() {
   local coord_knowledge_share coord_knowledge_publish coord_knowledge_publishers coord_knowledge_max_per_hour coord_knowledge_global_max_per_hour coord_knowledge_min_chars
   local study_notes_home study_notes_state_home study_notes_allow_write knowledge_seed_flag
   local knowledge_sync_enabled knowledge_sync_cadence knowledge_sync_max_records knowledge_sync_max_bytes
-  gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
+  gateway_token="$(_env_existing "$env_snapshot" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   # Per-worker credential for the external-worker WebSocket handshake. External
   # workers run `WS_ROLE=server` and validate an inbound bearer on the upgrade;
   # the daemon presents the same value as `auth_token`. This must NOT be the
   # gateway bearer: the worker never calls the gateway API, and the value is
   # readable via `podman inspect` / tenant-readable unit files, so reusing the
   # gateway token handed a contained lane the tenant's full API surface (WI#205).
-  worker_token="$(_env_existing "$path" WORKER_AUTH_TOKEN)";     worker_token="${worker_token:-$(generate_token)}"
-  bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
-  relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
-  secrets_key="$(_env_existing "$path" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
-  webhook_secret="$(_env_existing "$path" HTTP_WEBHOOK_SECRET)"; webhook_secret="${webhook_secret:-$(generate_token)}"
-  ssh_api_token="$(_env_existing "$path" SSH_API_TOKEN)";       ssh_api_token="${ssh_api_token:-$(generate_token)}"
-  coord_enabled="$(_env_existing "$path" COORD_ENABLED)"; coord_enabled="${coord_enabled:-false}"
-  coord_agent_id="$(_env_existing "$path" COORD_AGENT_ID)"; coord_agent_id="${coord_agent_id:-$name}"
-  coord_agent_aliases="$(_env_existing "$path" COORD_AGENT_ALIASES)"
-  coord_responder_roster="$(_env_existing "$path" COORD_RESPONDER_ROSTER)"
-  coord_channels="$(_env_existing "$path" COORD_CHANNELS)"
-  coord_knowledge_share="$(_env_existing "$path" COORD_KNOWLEDGE_SHARE)"; coord_knowledge_share="${coord_knowledge_share:-false}"
-  coord_knowledge_publish="$(_env_existing "$path" COORD_KNOWLEDGE_PUBLISH)"; coord_knowledge_publish="${coord_knowledge_publish:-false}"
-  coord_knowledge_publishers="$(_env_existing "$path" COORD_KNOWLEDGE_PUBLISHERS)"; coord_knowledge_publishers="${coord_knowledge_publishers:-}"
-  coord_knowledge_max_per_hour="$(_env_existing "$path" COORD_KNOWLEDGE_MAX_PER_HOUR)"; coord_knowledge_max_per_hour="${coord_knowledge_max_per_hour:-30}"
-  coord_knowledge_global_max_per_hour="$(_env_existing "$path" COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)"; coord_knowledge_global_max_per_hour="${coord_knowledge_global_max_per_hour:-300}"
-  coord_knowledge_min_chars="$(_env_existing "$path" COORD_KNOWLEDGE_MIN_CHARS)"; coord_knowledge_min_chars="${coord_knowledge_min_chars:-12}"
-  coord_admin_users="$(_env_existing "$path" COORD_ADMIN_USERS)"
-  coord_admin_token="$(_env_existing "$path" COORD_ADMIN_TOKEN)"; coord_admin_token="${coord_admin_token:-$(generate_token)}"
-  coord_admin_port="$(_env_existing "$path" COORD_ADMIN_PORT)"
+  worker_token="$(_env_existing "$env_snapshot" WORKER_AUTH_TOKEN)";     worker_token="${worker_token:-$(generate_token)}"
+  bridge_token="$(_env_existing "$env_snapshot" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
+  relay_password="$(_env_existing "$env_snapshot" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
+  secrets_key="$(_env_existing "$env_snapshot" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
+  webhook_secret="$(_env_existing "$env_snapshot" HTTP_WEBHOOK_SECRET)"; webhook_secret="${webhook_secret:-$(generate_token)}"
+  ssh_api_token="$(_env_existing "$env_snapshot" SSH_API_TOKEN)";       ssh_api_token="${ssh_api_token:-$(generate_token)}"
+  coord_enabled="$(_env_existing "$env_snapshot" COORD_ENABLED)"; coord_enabled="${coord_enabled:-false}"
+  coord_agent_id="$(_env_existing "$env_snapshot" COORD_AGENT_ID)"; coord_agent_id="${coord_agent_id:-$name}"
+  coord_agent_aliases="$(_env_existing "$env_snapshot" COORD_AGENT_ALIASES)"
+  coord_responder_roster="$(_env_existing "$env_snapshot" COORD_RESPONDER_ROSTER)"
+  coord_channels="$(_env_existing "$env_snapshot" COORD_CHANNELS)"
+  coord_knowledge_share="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_SHARE)"; coord_knowledge_share="${coord_knowledge_share:-false}"
+  coord_knowledge_publish="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_PUBLISH)"; coord_knowledge_publish="${coord_knowledge_publish:-false}"
+  coord_knowledge_publishers="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_PUBLISHERS)"; coord_knowledge_publishers="${coord_knowledge_publishers:-}"
+  coord_knowledge_max_per_hour="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_MAX_PER_HOUR)"; coord_knowledge_max_per_hour="${coord_knowledge_max_per_hour:-30}"
+  coord_knowledge_global_max_per_hour="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)"; coord_knowledge_global_max_per_hour="${coord_knowledge_global_max_per_hour:-300}"
+  coord_knowledge_min_chars="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_MIN_CHARS)"; coord_knowledge_min_chars="${coord_knowledge_min_chars:-12}"
+  coord_admin_users="$(_env_existing "$env_snapshot" COORD_ADMIN_USERS)"
+  coord_admin_token="$(_env_existing "$env_snapshot" COORD_ADMIN_TOKEN)"; coord_admin_token="${coord_admin_token:-$(generate_token)}"
+  coord_admin_port="$(_env_existing "$env_snapshot" COORD_ADMIN_PORT)"
   if [[ -z "$coord_admin_port" ]]; then
     coord_admin_port="$(ports_get "$name" coord_admin || true)"
     [[ -n "$coord_admin_port" ]] || die "coordination admin port missing for tenant '$name'"
   fi
   if tenant_darkirc_enabled "$name"; then
-    darkirc_adapter_secret="$(_env_existing "$path" DARKIRC_ADAPTER_SECRET)"
+    darkirc_adapter_secret="$(_env_existing "$env_snapshot" DARKIRC_ADAPTER_SECRET)"
   fi
   # XMPP password: an explicit --xmpp-password wins; else preserve an existing one;
   # else mint a fresh one (first-time provision).
-  [[ -n "$xmpp_password" ]] || { xmpp_password="$(_env_existing "$path" XMPP_PASSWORD)"; xmpp_password="${xmpp_password:-$(generate_token | cut -c1-32)}"; }
-  [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
-  [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$path" KIMI_MODEL)"
-  [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$path" KIMI_API_KEY)"
-  [[ -n "$opencode2_model" ]]    || opencode2_model="$(_env_existing "$path" OPENCODE2_MODEL)"
+  [[ -n "$xmpp_password" ]] || { xmpp_password="$(_env_existing "$env_snapshot" XMPP_PASSWORD)"; xmpp_password="${xmpp_password:-$(generate_token | cut -c1-32)}"; }
+  [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$env_snapshot" OPENCODE_MODEL)"
+  [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$env_snapshot" KIMI_MODEL)"
+  [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$env_snapshot" KIMI_API_KEY)"
+  [[ -n "$opencode2_model" ]]    || opencode2_model="$(_env_existing "$env_snapshot" OPENCODE2_MODEL)"
   # WI#330: the worker images ship a placeholder LLM endpoint their entrypoints
   # refuse to run, so an unset worker base URL can no longer fall through to a
   # baked default. Each worker URL resolves as: explicit per-worker flag >
@@ -1136,26 +1154,26 @@ write_tenant_lunarwing_env() {
   local worker_llm_base_default
   worker_llm_base_default="$(derive_worker_llm_base_url "$llm_base_url" "$tensorzero_url" || true)"
   local opencode_base_url_source kimi_base_url_source opencode2_base_url_source
-  _resolve_worker_base_url "$path" OPENCODE_BASE_URL "$opencode_base_url" "$worker_llm_base_default" opencode_base_url opencode_base_url_source
-  _resolve_worker_base_url "$path" KIMI_BASE_URL "$kimi_base_url" "$worker_llm_base_default" kimi_base_url kimi_base_url_source
-  _resolve_worker_base_url "$path" OPENCODE2_BASE_URL "$opencode2_base_url" "$worker_llm_base_default" opencode2_base_url opencode2_base_url_source
+  _resolve_worker_base_url "$env_snapshot" OPENCODE_BASE_URL "$opencode_base_url" "$worker_llm_base_default" opencode_base_url opencode_base_url_source
+  _resolve_worker_base_url "$env_snapshot" KIMI_BASE_URL "$kimi_base_url" "$worker_llm_base_default" kimi_base_url kimi_base_url_source
+  _resolve_worker_base_url "$env_snapshot" OPENCODE2_BASE_URL "$opencode2_base_url" "$worker_llm_base_default" opencode2_base_url opencode2_base_url_source
   _require_enabled_worker_url "$name" opencode OPENCODE_BASE_URL "$opencode_base_url"
   _require_enabled_worker_url "$name" kimi KIMI_BASE_URL "$kimi_base_url"
   _require_enabled_worker_url "$name" opencode2 OPENCODE2_BASE_URL "$opencode2_base_url"
-  study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
-  study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
-  study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
+  study_notes_home="$(_env_existing "$env_snapshot" LW2STUDYMCP_HOME)"
+  study_notes_state_home="$(_env_existing "$env_snapshot" LW2STUDYMCP_STATE_HOME)"
+  study_notes_allow_write="$(_env_existing "$env_snapshot" LW2STUDYMCP_ALLOW_WRITE)"
   # One-shot knowledge seed: carry the flag only when it already exists (set
   # solely on the add-tenant path), so upgraded pre-seed tenants stay unarmed.
-  knowledge_seed_flag="$(_env_existing "$path" KNOWLEDGE_SEED_FROM_STUDY_MCP)"
-  knowledge_sync_enabled="$(_env_existing "$path" KNOWLEDGE_SYNC_ENABLED)"
-  knowledge_sync_cadence="$(_env_existing "$path" KNOWLEDGE_SYNC_CADENCE_HOURS)"
-  knowledge_sync_max_records="$(_env_existing "$path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)"
-  knowledge_sync_max_bytes="$(_env_existing "$path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)"
+  knowledge_seed_flag="$(_env_existing "$env_snapshot" KNOWLEDGE_SEED_FROM_STUDY_MCP)"
+  knowledge_sync_enabled="$(_env_existing "$env_snapshot" KNOWLEDGE_SYNC_ENABLED)"
+  knowledge_sync_cadence="$(_env_existing "$env_snapshot" KNOWLEDGE_SYNC_CADENCE_HOURS)"
+  knowledge_sync_max_records="$(_env_existing "$env_snapshot" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)"
+  knowledge_sync_max_bytes="$(_env_existing "$env_snapshot" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)"
   local vision_mode vision_external_url vision_token_existing
   vision_mode="$(tenant_vision_mode "$name")"
   vision_external_url="$(tenant_vision_external_url "$name")"
-  vision_token_existing="$(_env_existing "$path" VISION_AUTH_TOKEN)"
+  vision_token_existing="$(_env_existing "$env_snapshot" VISION_AUTH_TOKEN)"
   if [[ "$vision_mode" == external ]]; then
     vision_external_url="$(_normalize_external_vision_url "$vision_external_url")" \
       || die "stored external LunarVision URL is invalid for tenant '$name'"
@@ -1164,21 +1182,21 @@ write_tenant_lunarwing_env() {
   fi
 
   local transcription_enabled transcription_provider transcription_model voice_enabled
-  voice_enabled="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_ENABLED)"
+  voice_enabled="$(_env_existing "$voice_snapshot" VOICE_ENABLED)"
   voice_enabled="${voice_enabled:-false}"
-  transcription_enabled="$(_env_existing "$path" TRANSCRIPTION_ENABLED)"
+  transcription_enabled="$(_env_existing "$env_snapshot" TRANSCRIPTION_ENABLED)"
   transcription_enabled="${transcription_enabled:-$voice_enabled}"
-  transcription_provider="$(_env_existing "$path" TRANSCRIPTION_PROVIDER)"
+  transcription_provider="$(_env_existing "$env_snapshot" TRANSCRIPTION_PROVIDER)"
   transcription_provider="${transcription_provider:-lunarvoice}"
-  transcription_model="$(_env_existing "$path" TRANSCRIPTION_MODEL)"
+  transcription_model="$(_env_existing "$env_snapshot" TRANSCRIPTION_MODEL)"
   transcription_model="${transcription_model:-whisper-tiny}"
   # LLM circuit breaker: fleet defaults (open after 5 fully-retried failures,
   # probe again after 15s — WI#239). These are tunables, so preserve an
   # operator's per-tenant override across re-provision rather than clobbering
   # it.
   local cb_threshold cb_recovery
-  cb_threshold="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-5}"
-  cb_recovery="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
+  cb_threshold="$(_env_existing "$env_snapshot" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-5}"
+  cb_recovery="$(_env_existing "$env_snapshot" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
   pg_password="$(tenant_pg_password "$name")"
@@ -1204,22 +1222,22 @@ write_tenant_lunarwing_env() {
   if [[ -n "$llm_model" ]]; then
     llm_model_effective="$llm_model"
   else
-    llm_model_effective="$(_env_existing "$path" LLM_MODEL)"
+    llm_model_effective="$(_env_existing "$env_snapshot" LLM_MODEL)"
     llm_model_effective="${llm_model_effective:-tensorzero::function_name::lunarwing}"
   fi
   if [[ -n "$gateway_host" ]]; then
     gateway_host_effective="$gateway_host"
   else
-    gateway_host_effective="$(_env_existing "$path" GATEWAY_HOST)"
+    gateway_host_effective="$(_env_existing "$env_snapshot" GATEWAY_HOST)"
     gateway_host_effective="${gateway_host_effective:-127.0.0.1}"
   fi
-  mascot_enabled="$(_env_existing "$path" MASCOT_ENABLED)"
+  mascot_enabled="$(_env_existing "$env_snapshot" MASCOT_ENABLED)"
   mascot_enabled="${mascot_enabled:-false}"
   if [[ -n "$xmpp_allow_from" ]]; then
     xmpp_allow_from_effective="$(build_xmpp_allow_from "$xmpp_jid" "$xmpp_allow_from")"
   else
     # Preserve an existing list; allow the local user to DM on first write.
-    xmpp_allow_from_effective="$(_env_existing "$path" XMPP_ALLOW_FROM)"
+    xmpp_allow_from_effective="$(_env_existing "$env_snapshot" XMPP_ALLOW_FROM)"
     xmpp_allow_from_effective="${xmpp_allow_from_effective:-user@xmpp.localhost}"
   fi
 
@@ -1228,12 +1246,12 @@ write_tenant_lunarwing_env() {
   # across upgrade/rebuild/re-render — never clobber an operator's setting;
   # only a first write (or an absent key) falls back to the defaults.
   local engine_v2 engine_v2_channels orchestrator_self_modify
-  engine_v2="$(_env_existing "$path" ENGINE_V2)"; engine_v2="${engine_v2:-true}"
-  engine_v2_channels="$(_env_existing "$path" ENGINE_V2_CHANNELS)"
+  engine_v2="$(_env_existing "$env_snapshot" ENGINE_V2)"; engine_v2="${engine_v2:-true}"
+  engine_v2_channels="$(_env_existing "$env_snapshot" ENGINE_V2_CHANNELS)"
   engine_v2_channels="${engine_v2_channels:-xmpp,weechat,darkirc}"
   # WI#282: new tenants opt into stored orchestrator and prompt-overlay updates.
   # Preserve an explicit operator opt-out across add-tenant re-renders.
-  orchestrator_self_modify="$(_env_existing "$path" ORCHESTRATOR_SELF_MODIFY)"
+  orchestrator_self_modify="$(_env_existing "$env_snapshot" ORCHESTRATOR_SELF_MODIFY)"
   orchestrator_self_modify="${orchestrator_self_modify:-true}"
 
   # Sandbox egress (WI#154): multi-tenant hosts run worker WSS ports, tenant
@@ -1244,7 +1262,7 @@ write_tenant_lunarwing_env() {
   # SANDBOX_NETWORK=proxy is preserved on re-render (explicit opt-in for
   # tenants that genuinely need allowlisted web access).
   local sandbox_network
-  sandbox_network="$(_env_existing "$path" SANDBOX_NETWORK)"
+  sandbox_network="$(_env_existing "$env_snapshot" SANDBOX_NETWORK)"
   sandbox_network="${sandbox_network:-none}"
 
   # Generic sandbox defaults (WI#223): MT tenants pin the runtime and image so
@@ -1256,16 +1274,16 @@ write_tenant_lunarwing_env() {
   # re-render; the daemon still falls back podman->docker when SANDBOX_RUNTIME
   # names a binary the host lacks.
   local sandbox_runtime sandbox_image sandbox_auto_pull
-  sandbox_runtime="$(_env_existing "$path" SANDBOX_RUNTIME)"
+  sandbox_runtime="$(_env_existing "$env_snapshot" SANDBOX_RUNTIME)"
   sandbox_runtime="${sandbox_runtime:-podman}"
-  sandbox_image="$(_env_existing "$path" SANDBOX_IMAGE)"
+  sandbox_image="$(_env_existing "$env_snapshot" SANDBOX_IMAGE)"
   sandbox_image="${sandbox_image:-lunarwing-sandbox:latest}"
-  sandbox_auto_pull="$(_env_existing "$path" SANDBOX_AUTO_PULL)"
+  sandbox_auto_pull="$(_env_existing "$env_snapshot" SANDBOX_AUTO_PULL)"
   sandbox_auto_pull="${sandbox_auto_pull:-false}"
   # Sandbox-visible daemon log (WI#287): info caps the copy at INFO; an
   # operator-set off or debug is preserved on re-render.
   local sandbox_tenant_logs
-  sandbox_tenant_logs="$(_env_existing "$path" SANDBOX_TENANT_LOGS)"
+  sandbox_tenant_logs="$(_env_existing "$env_snapshot" SANDBOX_TENANT_LOGS)"
   sandbox_tenant_logs="${sandbox_tenant_logs:-info}"
 
   # Sensible new-tenant defaults (WI#239): each of these is written into the
@@ -1278,35 +1296,35 @@ write_tenant_lunarwing_env() {
   local sandbox_policy sandbox_allow_full_access
   local engine_v2_model_recovery_attempts engine_v2_model_recovery_total_attempts engine_v2_tool_async_timeout_secs
   local skill_self_improvement skill_prune_quarantine_days reflex_compiler_enabled
-  llm_turn_budget="$(_env_existing "$path" LLM_TURN_BUDGET_SECS)";                llm_turn_budget="${llm_turn_budget:-599}"
-  llm_request_timeout="$(_env_existing "$path" LLM_REQUEST_TIMEOUT_SECS)";        llm_request_timeout="${llm_request_timeout:-2599}"
-  allow_local_tools="$(_env_existing "$path" ALLOW_LOCAL_TOOLS)";                 allow_local_tools="${allow_local_tools:-false}"
+  llm_turn_budget="$(_env_existing "$env_snapshot" LLM_TURN_BUDGET_SECS)";                llm_turn_budget="${llm_turn_budget:-599}"
+  llm_request_timeout="$(_env_existing "$env_snapshot" LLM_REQUEST_TIMEOUT_SECS)";        llm_request_timeout="${llm_request_timeout:-2599}"
+  allow_local_tools="$(_env_existing "$env_snapshot" ALLOW_LOCAL_TOOLS)";                 allow_local_tools="${allow_local_tools:-false}"
   # Migrate the legacy key on re-render, but prefer the canonical setting when
   # both exist. Only write the canonical key so an operator override survives.
-  auto_approve_tools="$(_env_existing "$path" AGENT_AUTO_APPROVE_TOOLS)"
+  auto_approve_tools="$(_env_existing "$env_snapshot" AGENT_AUTO_APPROVE_TOOLS)"
   if [[ -z "$auto_approve_tools" ]]; then
-    auto_approve_tools="$(_env_existing "$path" AUTO_APPROVE_TOOLS)"
+    auto_approve_tools="$(_env_existing "$env_snapshot" AUTO_APPROVE_TOOLS)"
   fi
   auto_approve_tools="${auto_approve_tools:-false}"
-  agent_max_tool_iterations="$(_env_existing "$path" AGENT_MAX_TOOL_ITERATIONS)"; agent_max_tool_iterations="${agent_max_tool_iterations:-99}"
-  sandbox_policy="$(_env_existing "$path" SANDBOX_POLICY)";                       sandbox_policy="${sandbox_policy:-workspace_write}"
-  sandbox_allow_full_access="$(_env_existing "$path" SANDBOX_ALLOW_FULL_ACCESS)"; sandbox_allow_full_access="${sandbox_allow_full_access:-false}"
-  engine_v2_model_recovery_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_ATTEMPTS)"
+  agent_max_tool_iterations="$(_env_existing "$env_snapshot" AGENT_MAX_TOOL_ITERATIONS)"; agent_max_tool_iterations="${agent_max_tool_iterations:-99}"
+  sandbox_policy="$(_env_existing "$env_snapshot" SANDBOX_POLICY)";                       sandbox_policy="${sandbox_policy:-workspace_write}"
+  sandbox_allow_full_access="$(_env_existing "$env_snapshot" SANDBOX_ALLOW_FULL_ACCESS)"; sandbox_allow_full_access="${sandbox_allow_full_access:-false}"
+  engine_v2_model_recovery_attempts="$(_env_existing "$env_snapshot" ENGINE_V2_MODEL_RECOVERY_ATTEMPTS)"
   engine_v2_model_recovery_attempts="${engine_v2_model_recovery_attempts:-2}"
-  engine_v2_model_recovery_total_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)"
+  engine_v2_model_recovery_total_attempts="$(_env_existing "$env_snapshot" ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)"
   engine_v2_model_recovery_total_attempts="${engine_v2_model_recovery_total_attempts:-2}"
-  engine_v2_max_output_tokens="$(_env_existing "$path" ENGINE_V2_MAX_OUTPUT_TOKENS)"
+  engine_v2_max_output_tokens="$(_env_existing "$env_snapshot" ENGINE_V2_MAX_OUTPUT_TOKENS)"
   engine_v2_max_output_tokens="${engine_v2_max_output_tokens:-8192}"
-  engine_v2_tool_async_timeout_secs="$(_env_existing "$path" ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS)"
+  engine_v2_tool_async_timeout_secs="$(_env_existing "$env_snapshot" ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS)"
   engine_v2_tool_async_timeout_secs="${engine_v2_tool_async_timeout_secs:-7999}"
-  skill_self_improvement="$(_env_existing "$path" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
-  skill_prune_quarantine_days="$(_env_existing "$path" SKILL_PRUNE_QUARANTINE_DAYS)"
+  skill_self_improvement="$(_env_existing "$env_snapshot" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
+  skill_prune_quarantine_days="$(_env_existing "$env_snapshot" SKILL_PRUNE_QUARANTINE_DAYS)"
   skill_prune_quarantine_days="${skill_prune_quarantine_days:-15}"
-  reflex_compiler_enabled="$(_env_existing "$path" REFLEX_COMPILER_ENABLED)";     reflex_compiler_enabled="${reflex_compiler_enabled:-false}"
+  reflex_compiler_enabled="$(_env_existing "$env_snapshot" REFLEX_COMPILER_ENABLED)";     reflex_compiler_enabled="${reflex_compiler_enabled:-false}"
   # WI#291: operator cap on tool-calling rounds per lightweight routine run.
   # The daemon default (3) left a digest routine no round for its final send.
   local routines_lightweight_max_iterations
-  routines_lightweight_max_iterations="$(_env_existing "$path" ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS)"
+  routines_lightweight_max_iterations="$(_env_existing "$env_snapshot" ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS)"
   routines_lightweight_max_iterations="${routines_lightweight_max_iterations:-6}"
 
   # WI#390: stage the full render in a root-private file, then commit it
@@ -1553,7 +1571,7 @@ ENVEOF
     vision_token="$vision_token_existing"
   else
     vision_service_url="http://127.0.0.1:${vision_port}"
-    vision_token="$(_env_existing "$(tenant_env_dir "$name")/vision.env" LUNARWING_AUTH_TOKEN)"
+    vision_token="$(_env_existing "$vision_snapshot" LUNARWING_AUTH_TOKEN)"
     vision_token="${vision_token:-$(generate_token)}"
   fi
   if [[ -n "$vision_port" ]]; then
@@ -1569,11 +1587,11 @@ ENVEOF
   local voice_port voice_token voice_max_tts_secs voice_req_timeout
   voice_port="$(ports_get "$name" voice_service)" || true
   if [[ -n "$voice_port" ]]; then
-    voice_token="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_AUTH_TOKEN)"
+    voice_token="$(_env_existing "$voice_snapshot" VOICE_AUTH_TOKEN)"
     voice_token="${voice_token:-$(generate_token)}"
-    voice_max_tts_secs="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_MAX_TTS_AUDIO_SECS)"
+    voice_max_tts_secs="$(_env_existing "$voice_snapshot" VOICE_MAX_TTS_AUDIO_SECS)"
     voice_max_tts_secs="${voice_max_tts_secs:-300}"
-    voice_req_timeout="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_REQUEST_TIMEOUT_SECS)"
+    voice_req_timeout="$(_env_existing "$voice_snapshot" VOICE_REQUEST_TIMEOUT_SECS)"
     voice_req_timeout="${voice_req_timeout:-120}"
     printf '\nVOICE_SERVICE_URL=http://127.0.0.1:%s\nVOICE_AUTH_TOKEN=%s\nVOICE_MAX_TTS_AUDIO_SECS=%s\nVOICE_REQUEST_TIMEOUT_SECS=%s\n' \
       "$voice_port" "$voice_token" "$voice_max_tts_secs" "$voice_req_timeout" >> "$staged_env"
@@ -1623,10 +1641,10 @@ ENVEOF
       || printf 'KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=%s\n' "$knowledge_sync_max_bytes" >> "$staged_env"
   fi
   if ! write_tenant_file_atomic "$name" "$path" 600 <"$staged_env"; then
-    rm -f -- "$staged_env"
+    rm -f -- "$staged_env" "$env_snapshot" "$vision_snapshot" "$voice_snapshot"
     die "could not safely write tenant env: $path"
   fi
-  rm -f -- "$staged_env"
+  rm -f -- "$staged_env" "$env_snapshot" "$vision_snapshot" "$voice_snapshot"
   say "wrote: $path"
 }
 
@@ -1645,11 +1663,18 @@ write_tenant_bridge_env() {
 
   local state_dir bridge_token
   state_dir="$(tenant_state_dir "$name")"
-  bridge_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_BRIDGE_TOKEN)"
+  # WI#390 (review IG-1): XMPP_BRIDGE_TOKEN / XMPP_PASSWORD / XMPP_ALLOW_FROM
+  # come from one snapshot of lunarwing.env read as the tenant — root
+  # resolving the live tenant-writable path would follow a cross-tenant
+  # symlink and this writer would then render the other tenant's XMPP
+  # credentials into this tenant's bridge env.
+  local lunarwing_snapshot
+  lunarwing_snapshot="$(_snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/lunarwing.env")"
+  bridge_token="$(_read_env_value "$lunarwing_snapshot" XMPP_BRIDGE_TOKEN)"
   [[ -n "$bridge_token" ]] || bridge_token="$(generate_token | cut -c1-32)"
 
   local xmpp_pass_val
-  xmpp_pass_val="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_PASSWORD)"
+  xmpp_pass_val="$(_read_env_value "$lunarwing_snapshot" XMPP_PASSWORD)"
   [[ -n "$xmpp_pass_val" ]] || xmpp_pass_val="${xmpp_password:-$(generate_token | cut -c1-32)}"
 
   # Idempotent XMPP allow-from JSON: an explicit flag wins; else re-derive from
@@ -1660,7 +1685,7 @@ write_tenant_bridge_env() {
     xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "$xmpp_jid" "$xmpp_allow_from")"
   else
     local daemon_csv
-    daemon_csv="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_ALLOW_FROM)"
+    daemon_csv="$(_read_env_value "$lunarwing_snapshot" XMPP_ALLOW_FROM)"
     # Do not prepend the agent JID: the daemon list may deliberately contain
     # only user@xmpp.localhost (or a custom operator-set allowlist).
     xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "" "${daemon_csv:-user@xmpp.localhost}")"
@@ -1669,7 +1694,7 @@ write_tenant_bridge_env() {
   # WI#390: write as the tenant through the atomic writer — root never opens
   # xmpp-bridge.env inside the tenant-writable env dir (see proxy.env). The
   # explicit || die keeps the refusal fatal even when errexit is suppressed.
-  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600 || die "could not safely write $path"
+  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600 || { rm -f -- "$lunarwing_snapshot"; die "could not safely write $path"; }
 LUNARWING_BASE_DIR=$state_dir
 IRONCLAW_BASE_DIR=$state_dir
 XMPP_BRIDGE_BIND=127.0.0.1:${bridge_port}
@@ -1689,6 +1714,7 @@ XMPP_ALLOW_PLAINTEXT_FALLBACK=true
 XMPP_RESOURCE=$name
 XMPP_BRIDGE_WAIT_SECONDS=15
 ENVEOF
+  rm -f -- "$lunarwing_snapshot"
   say "wrote: $path"
 }
 
