@@ -1362,6 +1362,85 @@ mod tests {
         upstream_task.abort();
     }
 
+    /// WI#419 (KH-1): the opaque-body check must read every coding field,
+    /// split comma-joined tokens, and fail closed on unreadable values.
+    /// An `identity` first field must not clear a coding hidden in a later
+    /// field (the old `get()` read only the first), and transfer codings
+    /// other than `chunked` are opaque.
+    #[test]
+    fn response_body_coding_is_opaque_checks_all_fields() {
+        use http::{HeaderMap, HeaderValue};
+
+        fn with_codings(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.append(*name, HeaderValue::from_str(value).unwrap());
+            }
+            headers
+        }
+
+        assert!(!response_body_coding_is_opaque(&HeaderMap::new()));
+        assert!(!response_body_coding_is_opaque(&with_codings(&[(
+            "content-encoding",
+            "identity"
+        ),])));
+        assert!(!response_body_coding_is_opaque(&with_codings(&[
+            ("content-encoding", "identity"),
+            ("transfer-encoding", "chunked"),
+        ])));
+        // Whitespace-only values carry no coding.
+        assert!(!response_body_coding_is_opaque(&with_codings(&[(
+            "content-encoding",
+            "  "
+        ),])));
+
+        // Duplicate fields in either order, and comma-joined tokens.
+        for pairs in [
+            &[
+                ("content-encoding", "identity"),
+                ("content-encoding", "gzip"),
+            ][..],
+            &[
+                ("content-encoding", "gzip"),
+                ("content-encoding", "identity"),
+            ][..],
+            &[
+                ("content-encoding", "identity, gzip"),
+                ("content-encoding", "identity"),
+            ][..],
+        ] {
+            assert!(
+                response_body_coding_is_opaque(&with_codings(pairs)),
+                "{pairs:?}"
+            );
+        }
+
+        // Transfer codings other than chunked, in any position or field.
+        for pairs in [
+            &[("transfer-encoding", "gzip, chunked")][..],
+            &[("transfer-encoding", "chunked, gzip")][..],
+            &[("transfer-encoding", "identity")][..],
+            &[
+                ("transfer-encoding", "chunked"),
+                ("transfer-encoding", "gzip"),
+            ][..],
+        ] {
+            assert!(
+                response_body_coding_is_opaque(&with_codings(pairs)),
+                "{pairs:?}"
+            );
+        }
+
+        // An unreadable value is opaque, even beside an identity field.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "content-encoding",
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        headers.append("content-encoding", HeaderValue::from_static("identity"));
+        assert!(response_body_coding_is_opaque(&headers));
+    }
+
     /// WI#395 (run-114 HJ-3): pin the forced-identity request and the
     /// opaque-encoding 502 on a credential-injected exchange — a stubborn
     /// gzip upstream that reports the `Accept-Encoding` it received. The
@@ -1472,6 +1551,185 @@ mod tests {
         assert!(
             !logs_contain(SECRET_STEM) && !logs_contain("api_key="),
             "injected credential leaked into the proxy log"
+        );
+
+        proxy.stop().await;
+        upstream_task.abort();
+    }
+
+    /// WI#419 (KH-1 / run-114 HJ-5): pin the refusal shapes the old
+    /// first-field check missed on a credential-injected exchange — a
+    /// duplicate `Content-Encoding: identity` + `Content-Encoding: gzip`
+    /// answer with a gzip body, a `Transfer-Encoding: gzip, chunked`
+    /// answer (hyper removes only the chunk framing), and an unreadable
+    /// (non-UTF-8) `Content-Encoding` value. Each must answer 502 with no
+    /// gzip bytes and no credential spellings reaching the container.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_credential_exchange_refuses_duplicate_transfer_and_unreadable_codings() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-multicoding-8e1d4f+/==";
+        const SECRET_STEM: &str = "qp-multicoding-8e1d4f";
+        const GZIP_BODY: &[u8] = b"\x1f\x8b\x08echo-gzip-bytes";
+
+        let mut duplicate_ce = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Encoding: identity\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            GZIP_BODY.len()
+        )
+        .into_bytes();
+        duplicate_ce.extend_from_slice(GZIP_BODY);
+
+        let mut transfer_coded =
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"
+                .to_vec();
+        transfer_coded.extend_from_slice(format!("{:x}\r\n", GZIP_BODY.len()).as_bytes());
+        transfer_coded.extend_from_slice(GZIP_BODY);
+        transfer_coded.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let mut unreadable_ce =
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Encoding: \xff\r\nContent-Length: "
+                .to_vec();
+        unreadable_ce.extend_from_slice(GZIP_BODY.len().to_string().as_bytes());
+        unreadable_ce.extend_from_slice(b"\r\n\r\n");
+        unreadable_ce.extend_from_slice(GZIP_BODY);
+
+        for upstream_answer in [duplicate_ce, transfer_coded, unreadable_ce] {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_port = upstream.local_addr().unwrap().port();
+            let answer = upstream_answer.clone();
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = upstream.accept().await else {
+                        return;
+                    };
+                    let answer = answer.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 8192];
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            conn.read(&mut buf),
+                        )
+                        .await;
+                        let _ = conn.write_all(&answer).await;
+                    });
+                }
+            });
+
+            let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+            let mappings = vec![CredentialMapping {
+                secret_name: "QP_TOKEN".to_string(),
+                location: CredentialLocation::QueryParam {
+                    name: "api_key".to_string(),
+                },
+                host_patterns: vec!["127.0.0.1".to_string()],
+                path_patterns: Vec::new(),
+                optional: false,
+            }];
+            let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+            let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+
+            let proxy = HttpProxy::new(decider, resolver);
+            let addr = proxy.start(0).await.unwrap();
+
+            let request = format!(
+                "GET http://127.0.0.1:{upstream_port}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"
+            );
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.read_to_end(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let text = String::from_utf8_lossy(&response);
+            assert!(text.starts_with("HTTP/1.1 502"), "{text}");
+            assert!(
+                !response.windows(2).any(|w| w == b"\x1f\x8b"),
+                "gzip magic must not reach the container: {text}"
+            );
+            assert!(
+                !text.contains(SECRET_STEM) && !text.contains("api_key="),
+                "injected credential leaked into the refusal: {text}"
+            );
+
+            proxy.stop().await;
+            upstream_task.abort();
+        }
+        assert!(logs_contain(
+            "refused content-encoded response body that cannot be scrubbed"
+        ));
+        assert!(
+            !logs_contain(SECRET_STEM) && !logs_contain("api_key="),
+            "injected credential leaked into the proxy log"
+        );
+    }
+
+    /// WI#419: without an injected credential there is nothing to scrub,
+    /// so an ordinary exchange keeps the upstream's encoding untouched —
+    /// even the duplicate-field and gzip shape the credentialed path
+    /// refuses. The refusal is scoped to credential-injected exchanges.
+    #[tokio::test]
+    async fn proxy_ordinary_exchange_forwards_coded_body_untouched() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const GZIP_BODY: &[u8] = b"\x1f\x8b\x08plain-gzip-bytes";
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let mut answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            GZIP_BODY.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(GZIP_BODY);
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = upstream.accept().await else {
+                    return;
+                };
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        conn.read(&mut buf),
+                    )
+                    .await;
+                    let _ = conn.write_all(&answer).await;
+                });
+            }
+        });
+
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, vec![]));
+        let proxy = HttpProxy::new(decider, Arc::new(NoCredentialResolver));
+        let addr = proxy.start(0).await.unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/plain HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("Content-Encoding: gzip"), "{text}");
+        assert!(
+            response.windows(2).any(|w| w == b"\x1f\x8b"),
+            "the ordinary exchange must keep its gzip body: {text}"
         );
 
         proxy.stop().await;
