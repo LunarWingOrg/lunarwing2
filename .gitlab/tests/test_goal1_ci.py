@@ -776,6 +776,8 @@ class WorkerTsLaneTests(unittest.TestCase):
     so the fixtures always match the pinned tuple; the real-tree binding is
     main() running this validator over the checked-in validate.yml."""
 
+    LANES = ("worker-kimi-ts", "worker-opencode-ts")
+
     def lane(self, job_name: str) -> dict:
         image_variable, script = config.WORKER_TS_LANE_SCRIPTS[job_name]
         return {
@@ -791,8 +793,17 @@ class WorkerTsLaneTests(unittest.TestCase):
             "script": list(script),
         }
 
+    def variables(self, extra: dict | None = None) -> dict:
+        # The canonical runner tag values (IA-9): every top-level variables
+        # fixture must carry them so the tag pin sees the real-tree shape.
+        values = {"CI_LINT_RUNNER_TAG": "lint", "CI_RUST_RUNNER_TAG": "rust-x86_64"}
+        if extra:
+            values.update(extra)
+        return values
+
     def merged(self) -> dict:
         return {
+            "variables": self.variables(),
             "worker-kimi-ts": self.lane("worker-kimi-ts"),
             "worker-opencode-ts": self.lane("worker-opencode-ts"),
         }
@@ -815,7 +826,7 @@ class WorkerTsLaneTests(unittest.TestCase):
             ("parallel", {"matrix": [{"NODE_OPTIONS": ["--test-only"]}]}),
             ("hooks", {"pre_get_sources_script": ["git config --global core.hooksPath /tmp/hooks"]}),
         )
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for key, value in overrides:
                 for inherited in (False, True):
                     with self.subTest(job=job_name, key=key, value=value, inherited=inherited):
@@ -834,7 +845,7 @@ class WorkerTsLaneTests(unittest.TestCase):
     def test_other_job_keywords_require_review(self):
         # The allowlist deliberately requires review even for currently
         # harmless values; it is not a blacklist of known variable names.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for key, value in (
                 ("variables", {}), ("variables", None), ("hooks", {}),
                 ("after_script", ["true"]), ("timeout", "1m"),
@@ -849,7 +860,7 @@ class WorkerTsLaneTests(unittest.TestCase):
                     ))
 
     def test_runner_tags_must_match_in_both_lanes(self):
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for override in (
                 {}, {"tags": None}, {"tags": []},
                 {"tags": ["unavailable-runner"]},
@@ -873,7 +884,7 @@ class WorkerTsLaneTests(unittest.TestCase):
     def test_allowed_job_keys_can_be_inherited(self):
         # Inspect the resolved job, not the raw `extends` keyword; allowed
         # defaults and the canonical runner tag remain valid in a parent.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             with self.subTest(job=job_name):
                 merged = self.merged()
                 merged[".worker-template"] = merged[job_name]
@@ -885,7 +896,7 @@ class WorkerTsLaneTests(unittest.TestCase):
 
     def test_main_rejects_job_level_execution_override(self):
         original_load_yaml = config.load_yaml
-        for job_name in self.merged():
+        for job_name in self.LANES:
             with self.subTest(job=job_name):
                 def load_with_override(path):
                     loaded = original_load_yaml(path)
@@ -1317,7 +1328,7 @@ class WorkerTsLaneTests(unittest.TestCase):
     def test_reordered_script_lines_are_caught(self):
         # HP-3: an order-insensitive comparison would accept a reorder, but
         # the snapshot sources must be rewritten BEFORE apt-get update runs.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             with self.subTest(job=job_name):
                 merged = self.merged()
                 script = merged[job_name]["script"]
@@ -1331,7 +1342,7 @@ class WorkerTsLaneTests(unittest.TestCase):
         # isinstance(script, list) guard would compare it against the
         # list. A non-iterable script (e.g. `script: 5`) must fail with a
         # validator error, not crash the guard-less comparison.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for script in ("\n".join(self.lane(job_name)["script"]), 5):
                 with self.subTest(job=job_name, script=script):
                     merged = self.merged()
@@ -1347,7 +1358,7 @@ class WorkerTsLaneTests(unittest.TestCase):
         # HP-3: only $CI_PIPELINE_SOURCE is the MR predicate's left
         # operand; dropping that check accepts any variable compared
         # against the "merge_request_event" literal.
-        for job_name in self.merged():
+        for job_name in self.LANES:
             with self.subTest(job=job_name):
                 merged = self.merged()
                 merged[job_name]["rules"][0] = {
@@ -1415,15 +1426,49 @@ class WorkerTsLaneTests(unittest.TestCase):
         # reaches every job, including both lanes; npm reads the prefix
         # case-insensitively.
         merged = self.merged()
-        merged["variables"] = {"GIT_STRATEGY": "fetch"}
+        merged["variables"] = self.variables({"GIT_STRATEGY": "fetch"})
         self.assertEqual(self.errors(merged), [])
         for name in ("NODE_OPTIONS", "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL"):
             with self.subTest(name=name):
                 merged = self.merged()
-                merged["variables"] = {name: "--test-only"}
+                merged["variables"] = self.variables({name: "--test-only"})
                 self.assertTrue(
                     any("top-level variables" in error for error in self.errors(merged))
                 )
+
+    def test_runner_tag_variable_override_is_caught(self):
+        # MR !1658 review IA-9: the lanes select their runner through
+        # $CI_LINT_RUNNER_TAG; a variable override reroutes every pinned
+        # lint job with the tags lists themselves untouched.
+        for name, value in (
+            ("CI_LINT_RUNNER_TAG", "other-runner"),
+            ("CI_RUST_RUNNER_TAG", "other-runner"),
+            ("CI_LINT_RUNNER_TAG", {"value": "other-runner", "description": "hash form"}),
+        ):
+            with self.subTest(name=name, value=value):
+                merged = self.merged()
+                merged["variables"][name] = value
+                self.assertTrue(
+                    any(f"top-level {name}" in error for error in self.errors(merged))
+                )
+
+    def test_root_file_runner_tag_override_is_caught(self):
+        # IA-9: the review's probe — a root-file variables entry reroutes
+        # the lanes with validate.yml untouched.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_tag_override(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded.setdefault("variables", {})["CI_LINT_RUNNER_TAG"] = "other-runner"
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_tag_override),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("CI_LINT_RUNNER_TAG", stderr.getvalue())
 
     def test_nine_level_extends_chain_is_resolved(self):
         # HP-2/HN-3: the budget must cover chains deeper than 8; a gating
@@ -1455,12 +1500,18 @@ class WorkerTsLaneTests(unittest.TestCase):
         # before bun's main script; PATH and GIT_CHECKOUT need one more
         # artifact), so every global variable must be allowlisted.
         merged = self.merged()
-        merged["variables"] = {name: "x" for name in config.GLOBAL_VARIABLE_ALLOWLIST}
+        merged["variables"] = self.variables(
+            {
+                name: "x"
+                for name in config.GLOBAL_VARIABLE_ALLOWLIST
+                if name not in config.EXPECTED_RUNNER_TAGS
+            }
+        )
         self.assertEqual(self.errors(merged), [])
         for name in ("BUN_OPTIONS", "PATH", "GIT_CHECKOUT", "SOME_NEW_VARIABLE"):
             with self.subTest(name=name):
                 merged = self.merged()
-                merged["variables"] = {name: "x"}
+                merged["variables"] = self.variables({name: "x"})
                 self.assertTrue(
                     any("GLOBAL_VARIABLE_ALLOWLIST" in error for error in self.errors(merged))
                 )
@@ -1505,7 +1556,7 @@ class WorkerTsLaneTests(unittest.TestCase):
         # IA-6: rules:variables on any lane rule reach the pinned script on
         # the pipelines that rule matches (push and tag pipelines too, not
         # only the first, MR rule).
-        for job_name in self.merged():
+        for job_name in self.LANES:
             for index in (0, 1):
                 with self.subTest(job=job_name, rule=index):
                     merged = self.merged()

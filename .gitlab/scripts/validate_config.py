@@ -663,6 +663,17 @@ GLOBAL_VARIABLE_ALLOWLIST = frozenset({
     "SCCACHE_CACHE_SIZE", "SCCACHE_DIR",
 })
 
+# MR !1658 review IA-9: the worker TS lanes (and every lint/rust job)
+# select their runner through these tag variables. A root-file or
+# later-include override reroutes the pinned jobs to a different runner
+# while the tags lists and the variables allowlist stay clean, so the
+# resolved values are pinned here; a deliberate runner change edits
+# defaults.yml and this table in the same commit.
+EXPECTED_RUNNER_TAGS = {
+    "CI_LINT_RUNNER_TAG": "lint",
+    "CI_RUST_RUNNER_TAG": "rust-x86_64",
+}
+
 
 def lane_bypass_variable(name: object) -> bool:
     """True for variables that can neutralise a worker TS lane's pinned
@@ -693,7 +704,10 @@ def validate_lane_environment_routes(merged: dict, errors: list[str]) -> None:
     `workflow:rules` variables become pipeline-wide variables (overriding
     same-named globals) on the pipelines the rule matches, so a NODE_OPTIONS
     or an unpinned CI_NODE_IMAGE there bypasses both the script pin and the
-    digest pins while the global `variables:` block stays clean."""
+    digest pins while the global `variables:` block stays clean. The runner
+    tag variables must also resolve to their pinned values (MR !1658 review
+    IA-9): an override reroutes the lanes to another runner with the tags
+    lists themselves untouched."""
     default_block = merged.get("default")
     if isinstance(default_block, dict):
         for key in ("before_script", "hooks"):
@@ -717,6 +731,17 @@ def validate_lane_environment_routes(merged: dict, errors: list[str]) -> None:
             errors.append(
                 f"top-level variables must not set {bypass}; global variables "
                 "reach both worker TS lanes (GLOBAL_VARIABLE_ALLOWLIST)"
+            )
+    for name, expected in EXPECTED_RUNNER_TAGS.items():
+        value = top_variables.get(name) if isinstance(top_variables, dict) else None
+        if isinstance(value, dict):  # GitLab's hash form (value:/description:)
+            value = value.get("value")
+        if value != expected:
+            errors.append(
+                f"top-level {name} must be {expected!r} (got {value!r}); the "
+                "runner tag variables route the worker TS lanes and every "
+                "pinned job to their runner, so an override must update "
+                "EXPECTED_RUNNER_TAGS in the same commit (MR !1658 review IA-9)"
             )
     workflow = merged.get("workflow")
     workflow_rules = workflow.get("rules") if isinstance(workflow, dict) else None
