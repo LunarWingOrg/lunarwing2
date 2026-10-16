@@ -1345,6 +1345,15 @@ impl ExternalWorkerManager {
             .await
     }
 
+    /// Test hook: the cancel reason signalled on an active handle, if any.
+    #[cfg(test)]
+    pub(crate) async fn cancel_reason_for_test(&self, job_id: Uuid) -> Option<CancelReason> {
+        let handles = self.active_handles.read().await;
+        handles
+            .get(&job_id)
+            .and_then(|handle| *handle.cancel_tx.borrow())
+    }
+
     /// Cancel with an explicit reason (WI#325): the persisted record and
     /// `job_events` distinguish supervisor cancels from owner cancels.
     pub async fn cancel_task_with_reason(&self, job_id: Uuid, reason: CancelReason) -> bool {

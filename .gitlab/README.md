@@ -263,7 +263,10 @@ the prime suspect, and the fix is the same normalization in the offending
   Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
   `validate_config.py` ties to the node FROM digest(s) in
-  `kimicode4lunarwing/Dockerfile` (fail-closed, like the bun tie). The
+  `kimicode4lunarwing/Dockerfile` (fail-closed, like the bun tie). The tie
+  follows the FROM repository's last path segment, so `docker.io/node`, a
+  mirror path and the bare `node` spelling are all cross-checked while a
+  `nodejs`-style name still fails closed (MR !1669 review IK-1). The
   real-CLI contract lane (`kimi_cli_contract_test`) self-skips here — the
   image carries no kimi binary — so the protected candidate image build
   remains the only place that contract is asserted against the real CLI.
@@ -295,6 +298,33 @@ the prime suspect, and the fix is the same normalization in the offending
   includes are merged by GitLab but invisible here. `extends` chains resolve
   up to a depth budget of 11; a longer chain or a cycle fails closed instead
   of being certified from the keys visible at truncation.
+- `worker-opencode2-ts`: the opencode2 worker's dependency-free Bun suites
+  (`path_expand_test.ts`, `task_prompt_test.ts`, `opencode_result_test.ts`).
+  The executor suite needs the image's built `@opencode/client` and stays
+  gated at the (protected) worker image build. Runs on the same digest-pinned
+  `CI_BUN_IMAGE` as the v1 lane on every MR/branch push and protected release
+  tag, and is pinned by the same `WORKER_TS_LANE_SCRIPTS` machinery (WI#375
+  DR-3), so a script edit must update the tuple in the same commit. The
+  `CI_BUN_IMAGE` tie cross-checks both `opencode4lunarwing/Dockerfile` and
+  `opencode2.4lunarwing/Dockerfile` (MR !1669 review IK-2), so a drifted bun
+  digest in either worker image fails `ci-config`.
+- `worker-pebble-rust`: the pebble worker's Rust suite via
+  `bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --manifest-path
+  ../pebble4lunarwing/Cargo.toml`, resolving under ic's vendored context on
+  every MR/branch push and protected release tag (previously gated only at
+  the protected image build; WI#375 DR-3). The lane extends `.rust-job` for
+  the toolchain bootstrap and pull-only cache; `validate_pebble_rust_lane`
+  pins the extends, the resolved `$CI_RUST_IMAGE` image and
+  `$CI_RUST_RUNNER_TAG` tag, the merge_request_event rule, and the exact
+  script, and refuses job-level `variables`/`hooks`/`parallel`/
+  `before_script`/`after_script`/`image`/`tags` overrides of the audited
+  template. The same holds at the template level (MR !1669 review IK-8): the
+  extends-resolved job may carry only the audited `.rust-job` keys, and its
+  inherited `before_script` must equal the pinned bootstrap line for line —
+  a template `variables`/`hooks`/`inherit`/`parallel` entry or an `exit 0`
+  appended to the shared bootstrap would otherwise hollow the lane out. Any
+  script edit must update `PEBBLE_RUST_LANE_SCRIPT` (and a deliberate
+  bootstrap change `PEBBLE_RUST_LANE_BEFORE_SCRIPT`) in the same commit.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL
