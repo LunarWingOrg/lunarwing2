@@ -1118,7 +1118,9 @@ def validate_worker_versions(errors: list[str]) -> None:
     # The guard covered one case block of one file; it now refuses the token
     # in every worker-image build entrypoint — the whole
     # build-worker-image.sh (shared post-case build_args and build_image()
-    # included), mt-admin's tenant build, and the harness compose file.
+    # included), mt-admin's tenant build, the harness compose file, and the
+    # kimi worker's own docker-compose.yml, whose build.args take the same
+    # override (MR !1665 review IF-3).
     for label, path in (
         ("build-worker-image.sh", WORKER_BUILD_SCRIPT),
         (
@@ -1126,6 +1128,10 @@ def validate_worker_versions(errors: list[str]) -> None:
             ROOT / "ic" / "scripts" / "mt-admin-lib" / "05-tenant-build.sh",
         ),
         ("tests/docker-compose.test.yml", ROOT / "tests" / "docker-compose.test.yml"),
+        (
+            "kimicode4lunarwing/docker-compose.yml",
+            ROOT / "kimicode4lunarwing" / "docker-compose.yml",
+        ),
     ):
         if not path.is_file():
             errors.append(

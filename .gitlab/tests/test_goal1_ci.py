@@ -188,6 +188,11 @@ class WorkerVersionPinTests(unittest.TestCase):
         harness_compose = self.root / "tests/docker-compose.test.yml"
         harness_compose.parent.mkdir(parents=True)
         harness_compose.write_text("services: {}\n", encoding="utf-8")
+        # IF-3 fixture: the kimi worker's own compose file is the fourth
+        # guarded build entrypoint (MR !1665 review).
+        kimi_compose = self.root / "kimicode4lunarwing/docker-compose.yml"
+        kimi_compose.parent.mkdir(parents=True)
+        kimi_compose.write_text("services: {}\n", encoding="utf-8")
         self.write_build_script(
             pebble_ref=self.PEBBLE_REF,
             opencode_ref=self.OPENCODE_REF,
@@ -319,6 +324,18 @@ class WorkerVersionPinTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertTrue(any("docker-compose.test.yml" in error for error in self.errors()))
+
+    def test_snapshot_token_in_kimi_compose_is_caught(self):
+        # MR !1665 review IF-3 (P8): the kimi worker's own docker-compose.yml
+        # builds the image with build.args — a DEBIAN_SNAPSHOT entry there is
+        # the same build-time override the HN-7 guard exists to refuse.
+        path = self.root / "kimicode4lunarwing/docker-compose.yml"
+        path.write_text(
+            "services:\n  lunarwing-worker:\n    build:\n      args:\n"
+            "        DEBIAN_SNAPSHOT: 20200101T000000Z\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(any("kimicode4lunarwing/docker-compose.yml" in error for error in self.errors()))
 
     def test_missing_build_entrypoint_fails_closed(self):
         # HN-7: a vanished build entrypoint must error, not skip the guard.
