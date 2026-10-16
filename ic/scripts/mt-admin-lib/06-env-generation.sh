@@ -366,7 +366,17 @@ write_tenant_file_atomic() {  # <tenant> <file> [mode] [private|owned-parent]
   [[ "$(id -un)" != "$name" ]] || drop=()
   [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "invalid tenant file mode"
   [[ "$parent_policy" == private || "$parent_policy" == owned-parent ]] || return 1
-  darkirc_path_components_safe "$target" || die "unsafe tenant file path: $target"
+  # Walk the ANCESTOR components here (a symlinked or non-absolute parent path
+  # is a hard die — the caller's target directory shape is already hostile).
+  # The final component's own symlink check belongs to the tenant-side writer's
+  # `! -L` refusal (exit 73) so callers holding a failure contract (rc 2 in the
+  # worker-config upgrade helpers, || die elsewhere) see a refusal instead of a
+  # bare process abort (WI#390, review IG-3).
+  local target_parent="${target%/*}"
+  [[ "$target" == /* && "$target_parent" != "$target" && -n "$target_parent" ]] \
+    || die "unsafe tenant file path: $target"
+  darkirc_path_components_safe "$target_parent" \
+    || die "unsafe tenant file path: $target"
   "${drop[@]}" env -i PATH="/usr/bin:/bin" \
     TARGET_PATH="$target" TARGET_MODE="$mode" PARENT_POLICY="$parent_policy" bash -c '
       set -euo pipefail
