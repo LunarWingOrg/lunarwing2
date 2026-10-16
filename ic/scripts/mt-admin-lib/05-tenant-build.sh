@@ -135,10 +135,13 @@ ensure_tenant_wasm_toolchain() {
   repo="$(tenant_repo "$name" 2>/dev/null || true)"
   [[ -n "$repo" && -d "$repo" ]] && repo_cd="cd '$repo' && "
 
-  # Install rustup for tenant user if not already present
+  # Install rustup for tenant user if not already present. rustup-init is
+  # staged under TMPDIR; on hosts mounting /tmp noexec it dies with "Cannot
+  # execute ... rustup-init", so stage it in an exec-guaranteed dir under the
+  # tenant home instead.
   if ! sudo -u "$name" bash -c "${cargo_src} command -v rustup" &>/dev/null; then
     say "installing rustup for $name ..."
-    sudo -u "$name" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y' \
+    sudo -u "$name" bash -c 'mkdir -p "$HOME/tmp" && curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | TMPDIR="$HOME/tmp" sh -s -- -y' \
       || { say "WARNING: rustup installation failed for $name" >&2; }
   fi
 
