@@ -283,6 +283,191 @@ class WorkerVersionPinTests(unittest.TestCase):
         self.assertTrue(any("DEBIAN_SNAPSHOT" in error for error in self.errors()))
 
 
+class WorkerInputManifestTests(unittest.TestCase):
+    """Item 35: the kimi worker-inputs manifest must cover every build-read
+    input (CY-4 precedent — the builder stage compiles and executes every
+    scripts/*.ts and the in-build test gate reads entrypoint.sh, hooks/ and
+    config/), and every listed entry in every lane must be a safe relative
+    path that exists under the repo root, so a stale or escaping entry fails
+    at ci-config time instead of the manual protected candidate build."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.kimi_files = sorted(config.KIMI_BUILD_INPUT_CORE) + [
+            "kimicode4lunarwing/scripts/lunarwing_bridge.ts",
+            "kimicode4lunarwing/scripts/lunarwing_bridge_test.ts",
+        ]
+        for relative in self.kimi_files:
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("placeholder\n", encoding="utf-8")
+        pebble_dockerfile = self.root / "pebble4lunarwing/Dockerfile"
+        pebble_dockerfile.parent.mkdir(parents=True, exist_ok=True)
+        pebble_dockerfile.write_text("FROM scratch\n", encoding="utf-8")
+        self.build_script = self.root / "build-worker-image.sh"
+        self.write_build_script(kimi_files=self.kimi_files)
+
+    def write_build_script(self, *, kimi_files, pebble_files=("pebble4lunarwing/Dockerfile",)):
+        kimi_list = "\n".join(kimi_files)
+        pebble_list = "\n".join(pebble_files)
+        self.build_script.write_text(
+            "case \"$1\" in\n"
+            "    pebble)\n"
+            f"        input_files='{pebble_list}'\n"
+            "        ;;\n"
+            "    kimi)\n"
+            f"        input_files='{kimi_list}'\n"
+            "        ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+
+    def errors(self):
+        errors = []
+        with mock.patch.multiple(
+            config, WORKER_BUILD_SCRIPT=self.build_script, ROOT=self.root
+        ):
+            config.validate_worker_input_manifest(errors)
+        return errors
+
+    def test_complete_manifest_passes(self):
+        self.assertEqual(self.errors(), [])
+
+    def test_missing_listed_file_is_caught(self):
+        (self.root / "pebble4lunarwing/Dockerfile").unlink()
+        self.assertTrue(
+            any("pebble" in error and "does not exist" in error for error in self.errors())
+        )
+
+    def test_unsafe_input_path_is_caught(self):
+        self.write_build_script(kimi_files=self.kimi_files, pebble_files=("../outside",))
+        self.assertTrue(
+            any("pebble" in error and "safe relative" in error for error in self.errors())
+        )
+
+    def test_lane_without_input_files_is_caught(self):
+        self.build_script.write_text(
+            "case \"$1\" in\n"
+            "    pebble)\n"
+            "        source_ref=abc\n"
+            "        ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            any("pebble" in error and "input_files" in error for error in self.errors())
+        )
+
+    def test_kimi_core_input_omission_is_caught(self):
+        reduced = [f for f in self.kimi_files if not f.endswith("entrypoint.sh")]
+        self.write_build_script(kimi_files=reduced)
+        self.assertTrue(
+            any(
+                "omits build-read input" in error and "entrypoint.sh" in error
+                for error in self.errors()
+            )
+        )
+
+    def test_kimi_runtime_input_omissions_are_caught(self):
+        # IL-1: literal paths keep this independent of the core tuple used
+        # by the fixture; dropping either required entry must fail this pin.
+        for filename in ("health_server.py", "agent_comm_protocol.json"):
+            with self.subTest(filename=filename):
+                relative = f"kimicode4lunarwing/{filename}"
+                self.write_build_script(
+                    kimi_files=[path for path in self.kimi_files if path != relative]
+                )
+                self.assertTrue(any(
+                    "omits build-read input" in error and relative in error
+                    for error in self.errors()
+                ))
+
+    def test_second_input_files_assignment_is_caught(self):
+        # IL-3: the shell uses the last assignment, even though the parser
+        # can still see the complete first list. Prefixes/+= count too.
+        before, after = self.build_script.read_text(encoding="utf-8").rsplit(
+            "        ;;", 1
+        )
+        for assignment in (
+            "input_files=kimicode4lunarwing/Dockerfile",
+            "input_files='kimicode4lunarwing/Dockerfile'",
+            'input_files="kimicode4lunarwing/Dockerfile"',
+            "export input_files=kimicode4lunarwing/Dockerfile",
+            "declare -x input_files=kimicode4lunarwing/Dockerfile",
+            "readonly input_files=kimicode4lunarwing/Dockerfile",
+            "input_files+=x",
+            "export input_files+=x",
+        ):
+            with self.subTest(assignment=assignment):
+                self.build_script.write_text(
+                    f"{before}        {assignment}\n        ;;{after}", encoding="utf-8"
+                )
+                self.assertTrue(any(
+                    "kimi block" in error and "exactly once" in error
+                    for error in self.errors()
+                ))
+
+    def test_input_files_assignment_outside_worker_blocks_is_caught(self):
+        original = self.build_script.read_text(encoding="utf-8")
+        assignment = "input_files=kimicode4lunarwing/Dockerfile\n"
+        for text in (assignment + original, original + assignment):
+            with self.subTest(text=text):
+                self.build_script.write_text(text, encoding="utf-8")
+                self.assertTrue(any("exactly once" in error for error in self.errors()))
+
+    def test_assignment_counts_cannot_balance_across_workers(self):
+        # A global count alone would miss a duplicate in kimi balanced by a
+        # missing declaration in pebble. Check each block independently.
+        text = self.build_script.read_text(encoding="utf-8").replace(
+            "        input_files='pebble4lunarwing/Dockerfile'\n", ""
+        ).replace(
+            "    kimi)\n", "    kimi)\n        input_files=kimicode4lunarwing/Dockerfile\n"
+        )
+        self.build_script.write_text(text, encoding="utf-8")
+        errors = self.errors()
+        for worker in ("pebble", "kimi"):
+            with self.subTest(worker=worker):
+                self.assertTrue(any(
+                    f"{worker} block" in error and "exactly once" in error for error in errors
+                ))
+
+    def test_commented_input_files_assignments_are_ignored(self):
+        text = self.build_script.read_text(encoding="utf-8").replace(
+            "    kimi)\n",
+            "    kimi)\n        # input_files=old\n        # export input_files+=old\n",
+        )
+        self.build_script.write_text(text, encoding="utf-8")
+        self.assertEqual(self.errors(), [])
+
+    def test_unlisted_kimi_bridge_source_is_caught(self):
+        # A new scripts/*.ts appears on disk (the Dockerfile's COPY glob picks
+        # it up) but never joins the manifest.
+        new_source = self.root / "kimicode4lunarwing/scripts/new_bridge.ts"
+        new_source.write_text("// placeholder\n", encoding="utf-8")
+        self.assertTrue(any("new_bridge.ts" in error for error in self.errors()))
+
+    def test_missing_kimi_block_defers_to_the_version_check(self):
+        self.build_script.write_text(
+            "case \"$1\" in\n"
+            "    pebble)\n"
+            "        input_files='pebble4lunarwing/Dockerfile'\n"
+            "        ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_real_manifest_matches_the_real_tree(self):
+        # Binds the check to the checked-in build script and worker tree, so
+        # a build-worker-image.sh edit without a manifest update fails here
+        # (and in ci-config via main()).
+        errors = []
+        config.validate_worker_input_manifest(errors)
+        self.assertEqual(errors, [])
+
+
 class BunImageTieTests(unittest.TestCase):
     """MR !1552 ER-5 ties CI_BUN_IMAGE to the worker Dockerfile's oven/bun
     FROM digest(s); MR !1566 EZ-3 makes that cross-check fail closed."""

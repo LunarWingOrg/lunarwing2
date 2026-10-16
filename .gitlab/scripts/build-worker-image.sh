@@ -91,9 +91,44 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         image_name=worker-kimi
         context=kimicode4lunarwing
         dockerfile_dir=kimicode4lunarwing
+        # CY-4 precedent (see the opencode2 block): build-read inputs hash
+        # into worker-inputs. The builder stage npm-ci's scripts/, compiles
+        # and executes every scripts/*.ts, and the in-build test gate reads
+        # entrypoint.sh, hooks/ and config/; the CLI install cross-checks
+        # kimi-cli/package.json against KIMI_CODE_VERSION. Runtime COPYs also
+        # ship health_server.py and agent_comm_protocol.json (IL-1).
+        # The Dockerfile's `COPY scripts/*.ts` glob means a new bridge source
+        # must join this list in the same commit (validate_config.py enforces it).
         input_files='kimicode4lunarwing/Dockerfile
+kimicode4lunarwing/entrypoint.sh
+kimicode4lunarwing/health_server.py
+kimicode4lunarwing/agent_comm_protocol.json
+kimicode4lunarwing/config/config.toml
+kimicode4lunarwing/hooks/headless_command_guard.mjs
+kimicode4lunarwing/kimi-cli/package.json
+kimicode4lunarwing/kimi-cli/package-lock.json
+kimicode4lunarwing/scripts/package.json
 kimicode4lunarwing/scripts/package-lock.json
-kimicode4lunarwing/kimi-cli/package-lock.json'
+kimicode4lunarwing/scripts/tsconfig.json
+kimicode4lunarwing/scripts/entrypoint_config_test.ts
+kimicode4lunarwing/scripts/headless_command_guard_test.ts
+kimicode4lunarwing/scripts/kimi_cli_contract_test.ts
+kimicode4lunarwing/scripts/kimi_result.ts
+kimicode4lunarwing/scripts/kimi_result_test.ts
+kimicode4lunarwing/scripts/kimi_task_executor.ts
+kimicode4lunarwing/scripts/kimi_task_executor_test.ts
+kimicode4lunarwing/scripts/lunarwing_bridge.ts
+kimicode4lunarwing/scripts/lunarwing_bridge_test.ts
+kimicode4lunarwing/scripts/lunarwing_mcp_server.ts
+kimicode4lunarwing/scripts/lunarwing_mcp_server_test.ts
+kimicode4lunarwing/scripts/lunarwing_runtime.ts
+kimicode4lunarwing/scripts/lunarwing_runtime_test.ts
+kimicode4lunarwing/scripts/lunarwing_tool_proxy.ts
+kimicode4lunarwing/scripts/lunarwing_tool_proxy_test.ts
+kimicode4lunarwing/scripts/path_expand_test.ts
+kimicode4lunarwing/scripts/smoke_test.ts
+kimicode4lunarwing/scripts/task_prompt_test.ts
+kimicode4lunarwing/scripts/workspace_path.ts'
         source_ref=2.2.0
         build_args="KIMI_CODE_VERSION=2.2.0
 WITH_TOOLCHAINS=false
