@@ -7,9 +7,13 @@ ignore = [
     # Baseline clearing decisions are owned by work item WI#331
     # (https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331);
     # WI#304 was closed without a migration, so do not reference it as a
-    # clearing owner. Clearing work that outlives WI#331 is split into open
+    # clearing owner. WI#331 and WI#409 are now both closed as well; the
+    # libsql 0.6.0 legacy-chain clearing they left open is tracked by
+    # WI#418 (rustls-webpki 0.102 / h2 0.3.27 / rustls 0.22.4 entries
+    # below). Clearing work that outlives WI#331 is split into open
     # follow-ups cited per entry: WI#367 (libsignal-protocol off
-    # failure/rental) and WI#368 (rsa policy / upstream tracking). Re-verify
+    # failure/rental), WI#368 (rsa policy / upstream tracking), and WI#418
+    # (libsql legacy chain). Re-verify
     # each exposure note at every release. Decision record:
     # docs/ops/v2.1.6.0_WI331_ADVISORY_CLEARING.md. Audit trails:
     # docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md (v2.1.6.0),
@@ -38,10 +42,10 @@ ignore = [
     # postgres-only builds do not contain it. The ignores remain required
     # because CI's cargo-deny gate queries --workspace --all-features, which
     # enables the opt-in feature.
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 CRL distributionPoint matching; pinned by libsql 0.6.0 legacy chain; libsql 0.9.30/0.10.0-pre.4 still pull hyper-rustls ^0.25; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name-constraint bypass; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 CRL parsing panic; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 CRL distributionPoint matching; pinned by libsql 0.6.0 legacy chain; libsql 0.9.30/0.10.0-pre.4 still pull hyper-rustls ^0.25; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10); clearing owner WI#418 (WI#331 closed 2026-10-12 with the feature-gate mitigation, not a chain clearing)" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10); clearing owner WI#418" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name-constraint bypass; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10); clearing owner WI#418" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 CRL parsing panic; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10); clearing owner WI#418" },
 
     # WI#409 (2026-10-14): the modern rustls line is upgraded to 0.23.46,
     # fixing RUSTSEC-2026-0346/0347/0348/0349. No patched 0.22 release exists.
@@ -51,11 +55,12 @@ ignore = [
     # it. No custom ClientSessionStore logs session values in our sources
     # (0346); 0349 concerns unauthenticated key-exchange hints in the session
     # store, not certificate authentication. Accept the legacy chain only.
-    # Decision/clearing owner: WI#409, extending the WI#331 mitigation.
+    # Decision record: WI#409 (closed 2026-10-15), extending the WI#331
+    # mitigation; clearing owner: WI#418.
     # The default-graph guard pins 0.22.4 out of shipped builds; the rustls
     # version floor below prevents ID-keyed ignores masking a 0.23 downgrade.
-    { id = "RUSTSEC-2026-0346", reason = "rustls 0.22.4 session-value Debug exposes TLS secrets; libsql 0.6.0 legacy chain, no 0.22-line patch; no custom ClientSessionStore in LunarWing sources; exposure accepted only for opt-in libsql-remote-replica builds under WI#331 feature gate; modern line fixed at 0.23.46; decision/clearing owner WI#409 (verified 2026-10-14)" },
-    { id = "RUSTSEC-2026-0349", reason = "rustls 0.22.4 unauthenticated ServerHello key-exchange hint caching; same libsql 0.6.0 legacy chain, no 0.22-line patch; exposure accepted only for opt-in libsql-remote-replica builds under WI#331 feature gate, default/postgres-only builds exclude it; modern line fixed at 0.23.46; decision/clearing owner WI#409 (verified 2026-10-14)" },
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.22.4 session-value Debug exposes TLS secrets; libsql 0.6.0 legacy chain, no 0.22-line patch; no custom ClientSessionStore in LunarWing sources; exposure accepted only for opt-in libsql-remote-replica builds under WI#331 feature gate; modern line fixed at 0.23.46; decision record WI#409 (verified 2026-10-14), clearing owner WI#418" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.22.4 unauthenticated ServerHello key-exchange hint caching; same libsql 0.6.0 legacy chain, no 0.22-line patch; exposure accepted only for opt-in libsql-remote-replica builds under WI#331 feature gate, default/postgres-only builds exclude it; modern line fixed at 0.23.46; decision record WI#409 (verified 2026-10-14), clearing owner WI#418" },
 
     # failure crate — vendored libsignal-protocol path dep only.
     # failure 0.1.8 is the final release (EOL); clearing requires porting
@@ -99,7 +104,7 @@ ignore = [
     # default and postgres-only builds do not contain it, and the
     # default-feature graph is pinned clean by
     # .gitlab/scripts/check-default-graph-advisories.sh.
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.20; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10)" },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.20; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#331 decision record (re-verified 2026-10-10); clearing owner WI#418" },
 
     # rental — unmaintained (informational, no vulnerability). Only visible
     # since the gate widened to --workspace --all-features (v2.1.5.0, MR
