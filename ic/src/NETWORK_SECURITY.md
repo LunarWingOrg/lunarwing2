@@ -422,8 +422,13 @@ Response *bodies* are scrubbed too (WI#395): 3xx bodies echo the redirect
 target URL on common edges (Go `net/http`, Apache, Express), so a
 credential-injected exchange requests `Accept-Encoding: identity`,
 byte-scrubs the body, drops the stale upstream `Content-Length` (hyper
-re-frames), and refuses — with 502 — a body that arrives
-`Content-Encoding`-compressed, because it cannot be inspected. Unlike
+re-frames), and refuses — with 502 — a body whose coding it cannot inspect
+(WI#419): every `Content-Encoding` and `Transfer-Encoding` field is
+checked — a duplicate field cannot hide a coding behind an `identity`
+first field — with each comma-joined token checked individually, and only
+`identity` content codings and `chunked` transfer codings (hyper removes
+that framing but no other) pass; an unreadable coding value is refused
+too. Unlike
 headers, the body scrub matches only the raw and form-encoded spellings
 exactly; re-encoded body echoes (e.g. a double-encoded `redirect_to`
 parameter carried inside a 3xx body) are not detected — a recorded
