@@ -853,6 +853,108 @@ fi
 # redirects, which would follow them.
 rm -f "$MT_FIXTURE/env/lunarwing.env" "$MT_FIXTURE/env/xmpp-bridge.env" "$MT_FIXTURE/env/proxy.env"
 
+echo "=== WI#390 (HH-5): 02-containers/09-worker-config symlink pins ==="
+
+# 02-containers.sh: the vision env writer must refuse a symlinked vision.env
+# (previously nothing in this harness pinned anything in 02-containers.sh).
+ln -s "$sensitive" "$MT_FIXTURE/env/vision.env"
+if ( write_tenant_vision_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: vision env writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "vision.env symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+rm -f "$MT_FIXTURE/env/vision.env"
+
+# 09-worker-config.sh: the external-worker config writer must refuse a
+# symlinked config.toml in the tenant state dir.
+printf 'WORKER_AUTH_TOKEN=fixture-worker-token\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/state/config.toml"
+if ( ensure_external_worker_config fixture-tenant pebble pebble_wss ) >/dev/null 2>&1; then
+  echo "  FAIL: external-worker config writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "config.toml symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+rm -f "$MT_FIXTURE/state/config.toml"
+# Clean control: a plain absent config.toml gets the worker block, proving the
+# refusal above came from the symlink and not from an unrelated early failure.
+if ( ensure_external_worker_config fixture-tenant pebble pebble_wss ) >/dev/null 2>&1; then
+  assert_eq "external-worker config written for a clean target" \
+    "$(grep -c 'name = "pebble"' "$MT_FIXTURE/state/config.toml")" "1"
+else
+  echo "  FAIL: external-worker config refused a clean target"; failures=$((failures + 1))
+fi
+rm -f "$MT_FIXTURE/state/config.toml"
+
+# 09-worker-config.sh (HH-4): prepare_pebble_workspace must refuse a symlinked
+# workspace and leave it in place — no root chown/chmod may follow it. The
+# helper resolves the tenant uid, so run it as the invoking user (the harness's
+# fixture-tenant is not a real account; tenant_lw_root is stubbed anyway).
+hh4_tenant="$(id -un)"
+mkdir -p "$MT_FIXTURE/real-workspace-victim"
+ln -s "$MT_FIXTURE/real-workspace-victim" "$MT_FIXTURE/pebble-workspace"
+if ( prepare_pebble_workspace "$hh4_tenant" ) >/dev/null 2>&1; then
+  echo "  FAIL: prepare_pebble_workspace accepted a symlinked workspace"; failures=$((failures + 1))
+else
+  echo "  PASS: prepare_pebble_workspace refuses a symlinked workspace"
+fi
+assert_eq "pebble workspace symlink left in place" \
+  "$(if [[ -L "$MT_FIXTURE/pebble-workspace" ]]; then echo symlink; else echo replaced; fi)" "symlink"
+rm -f "$MT_FIXTURE/pebble-workspace"
+# Clean control: an absent workspace is created tenant-private (0700, no 0777).
+ws_out="$(prepare_pebble_workspace "$hh4_tenant")" || ws_out=""
+assert_eq "pebble workspace created at the tenant path" "$ws_out" "$MT_FIXTURE/pebble-workspace"
+assert_eq "pebble workspace is tenant-private (0700)" \
+  "$(stat -c %a "$MT_FIXTURE/pebble-workspace")" "700"
+
+echo "=== WI#390 (HH-2): refused pipe-form write aborts under suppressed errexit ==="
+
+# Production runs add_tenant/upgrade_tenant through the lifecycle lock as
+# `"$@" || result=$?`, which disables errexit for the whole body: a refused
+# _tenant_env_append must rely on its `|| die` to abort. With lunarwing.env
+# symlinked away, patch_tenant_coordination_env's first append is refused; the
+# die must fire BEFORE the matching "added ..." say and make the body non-zero
+# (dropping the || die lets every append fail open and the body complete).
+# Pre-populate every coordination key except COORD_CHANNELS, so the ONLY write
+# patch_tenant_coordination_env attempts is the COORD_CHANNELS append — the pin
+# is then sensitive to a dropped || die on that site (the function otherwise
+# dies on its first append and never reaches a later mutated one).
+cat >"$sensitive" <<'SENS'
+DO-NOT-TRUNCATE
+COORD_ENABLED=false
+COORD_AGENT_ID=fixture-tenant
+COORD_AGENT_ALIASES=
+COORD_RESPONDER_ROSTER=
+COORD_KNOWLEDGE_SHARE=false
+COORD_KNOWLEDGE_PUBLISH=false
+COORD_KNOWLEDGE_PUBLISHERS=
+COORD_KNOWLEDGE_MAX_PER_HOUR=30
+COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300
+COORD_KNOWLEDGE_MIN_CHARS=12
+COORD_ADMIN_USERS=
+COORD_ADMIN_TOKEN=fixture-token
+COORD_ADMIN_PORT=20009
+SENS
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/lunarwing.env"
+: >"$MT_FIXTURE/say.log"
+real_say="$(declare -f say)"
+say() { printf '%s\n' "$*" >>"$MT_FIXTURE/say.log"; }
+hh2_result=0
+( patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) >/dev/null 2>&1 \
+  || hh2_result=$?
+eval "$real_say"
+if [[ "$hh2_result" -eq 0 ]]; then
+  echo "  FAIL: refused pipe-form write returned 0 under suppressed errexit"; failures=$((failures + 1))
+elif grep -q 'COORD_CHANNELS' "$MT_FIXTURE/say.log"; then
+  echo "  FAIL: body printed 'added COORD_CHANNELS' past a refused pipe-form write under suppressed errexit"
+  failures=$((failures + 1))
+else
+  echo "  PASS: refused pipe-form write aborts the body under suppressed errexit"
+fi
+assert_eq "suppressed-errexit refusal preserves symlink target" "$(head -1 "$sensitive")" "DO-NOT-TRUNCATE"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
 echo "=== write_tenant_bridge_env fixture tests ==="
 
 # The bridge writer reads XMPP_BRIDGE_TOKEN / XMPP_PASSWORD from the daemon env.
