@@ -9507,9 +9507,7 @@ pub(crate) mod tests {
                 "url": format!("https://api.example.com/data?api_key={query_secret}&page=2"),
                 "headers": {"Authorization": bearer},
             }),
-            resume_kind: lunarwing_engine::ResumeKind::Approval {
-                allow_always: true,
-            },
+            resume_kind: lunarwing_engine::ResumeKind::Approval { allow_always: true },
             resume_output: None,
         };
 
@@ -9551,10 +9549,7 @@ pub(crate) mod tests {
         );
         assert_eq!(display["headers"]["Authorization"], "[REDACTED]");
         assert!(
-            display["url"]
-                .as_str()
-                .expect("url")
-                .contains("page=2"),
+            display["url"].as_str().expect("url").contains("page=2"),
             "safe query param dropped: {display_serialized}"
         );
 

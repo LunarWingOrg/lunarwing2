@@ -5874,10 +5874,7 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert_eq!(hook_params["headers"]["Authorization"], "[REDACTED]");
         assert_eq!(hook_params["headers"]["Accept"], "text/html");
         assert!(
-            hook_params["url"]
-                .as_str()
-                .expect("url")
-                .contains("page=2"),
+            hook_params["url"].as_str().expect("url").contains("page=2"),
             "safe query param dropped: {serialized}"
         );
     }

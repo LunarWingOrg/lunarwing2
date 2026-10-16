@@ -1203,7 +1203,10 @@ mod tests {
         let redacted = redact_display_params("http", &params, &[]);
         let serialized = redacted.to_string();
         for leaked in ["raw-key", "raw-token", "body-secret", "user:pass"] {
-            assert!(!serialized.contains(leaked), "{leaked} leaked: {serialized}");
+            assert!(
+                !serialized.contains(leaked),
+                "{leaked} leaked: {serialized}"
+            );
         }
         assert_eq!(redacted["headers"]["Authorization"], "[REDACTED]");
         assert_eq!(redacted["headers"]["Accept"], "text/html");
@@ -1213,7 +1216,10 @@ mod tests {
             redacted["url"]
         );
         assert!(
-            redacted["body"].as_str().expect("body").contains("[REDACTED]"),
+            redacted["body"]
+                .as_str()
+                .expect("body")
+                .contains("[REDACTED]"),
             "body credential kept: {}",
             redacted["body"]
         );
