@@ -463,9 +463,14 @@ async fn persist_and_notify_thread_gate(
         // a positional `_args[0]` payload is covered too.
         lunarwing_safety::redact_credential_params(&parameters)
     } else if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
-        crate::tools::redact_params(&parameters, tool.sensitive_params())
+        // WI#392 (FI-5): http/web_fetch declare no sensitive_params, so the
+        // approval prompt also needs the shared http-surface redaction
+        // (credential headers, URL query credentials, body credentials).
+        crate::tools::redact_display_params(&action_name, &parameters, tool.sensitive_params())
     } else {
-        parameters.clone()
+        // No registry tool (e.g. an extension unloaded mid-gate): the http
+        // surface still applies, so raw http credentials never display.
+        crate::tools::redact_display_params(&action_name, &parameters, &[])
     };
 
     // WI#308 (run-33 AQ-2): mission runs execute unsupervised by
@@ -825,7 +830,15 @@ async fn execute_pending_gate_action(
                 .tools()
                 .get(&action_name)
                 .await
-                .map(|tool| crate::tools::redact_params(&parameters, tool.sensitive_params()));
+                // WI#392 (FI-5): http/web_fetch declare no sensitive_params;
+                // the re-gated prompt needs the shared http-surface redaction.
+                .map(|tool| {
+                    crate::tools::redact_display_params(
+                        &action_name,
+                        &parameters,
+                        tool.sensitive_params(),
+                    )
+                });
             let pending_gate = PendingGate {
                 request_id: uuid::Uuid::new_v4(),
                 gate_name,
@@ -9427,6 +9440,149 @@ pub(crate) mod tests {
                 assert_eq!(parameters["webhook_secret"], "[REDACTED]");
                 assert!(!parameters.to_string().contains(secret));
                 assert!(!allow_always);
+            }
+            other => panic!("expected ApprovalNeeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_gate_prompt_redacts_credentials() {
+        // WI#392 (FI-5): the approval prompt's display_parameters used only
+        // the tool's sensitive_params — empty for http — so raw
+        // `Authorization` headers and `?api_key=…` URLs reached channels and
+        // the web UI even though the persisted event was redacted.
+        use crate::testing::StubChannel;
+        use futures::StreamExt;
+
+        struct GateHttpTool;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for GateHttpTool {
+            fn name(&self) -> &str {
+                "http"
+            }
+            fn description(&self) -> &str {
+                "test double for the http surface"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+                _: &crate::context::JobContext,
+            ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+                unreachable!("a gated tool must never execute in this test")
+            }
+        }
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("xmpp");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        let store = Arc::new(TestStore::new());
+        let mut state = make_expected_test_state(store);
+        state
+            .effect_adapter
+            .tools()
+            .register_sync(Arc::new(GateHttpTool));
+        let sse = Arc::new(SseManager::new());
+        let mut events = sse
+            .subscribe_raw(Some("alice".to_string()))
+            .expect("SSE subscription should be available");
+        state.sse = Some(sse);
+
+        let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+        let conversation_id = lunarwing_engine::ConversationId::new();
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let header_secret = "prompt-header-secret";
+        let query_secret = "prompt-query-secret";
+        let bearer = format!("Bearer {header_secret}");
+        let outcome = ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "http".into(),
+            call_id: "call-http".into(),
+            parameters: serde_json::json!({
+                "method": "GET",
+                "url": format!("https://api.example.com/data?api_key={query_secret}&page=2"),
+                "headers": {"Authorization": bearer},
+            }),
+            resume_kind: lunarwing_engine::ResumeKind::Approval {
+                allow_always: true,
+            },
+            resume_output: None,
+        };
+
+        let result = persist_and_notify_thread_gate(
+            &manager,
+            &state,
+            &message,
+            conversation_id,
+            thread_id,
+            outcome,
+        )
+        .await
+        .expect("http gate should be persisted and announced");
+        assert_eq!(result, Some(String::new()));
+
+        let pending = state.pending_gates.list_for_user("alice").await;
+        assert_eq!(pending.len(), 1);
+        // The persisted gate keeps the real parameters for execution…
+        assert_eq!(pending[0].parameters["headers"]["Authorization"], bearer);
+        assert!(
+            pending[0].parameters["url"]
+                .as_str()
+                .expect("url")
+                .contains(query_secret)
+        );
+        // …while every display surface is redacted.
+        let display = pending[0]
+            .display_parameters
+            .clone()
+            .expect("display parameters");
+        let display_serialized = display.to_string();
+        assert!(
+            !display_serialized.contains(header_secret),
+            "header credential leaked: {display_serialized}"
+        );
+        assert!(
+            !display_serialized.contains(query_secret),
+            "query credential leaked: {display_serialized}"
+        );
+        assert_eq!(display["headers"]["Authorization"], "[REDACTED]");
+        assert!(
+            display["url"]
+                .as_str()
+                .expect("url")
+                .contains("page=2"),
+            "safe query param dropped: {display_serialized}"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("GateRequired should be broadcast")
+            .expect("SSE stream should remain open");
+        match event {
+            crate::channels::web::types::SseEvent::GateRequired {
+                ref parameters,
+                ref tool_name,
+                ..
+            } => {
+                assert_eq!(tool_name, "http");
+                assert!(parameters.contains("[REDACTED]"), "{parameters}");
+                assert!(!parameters.contains(header_secret), "{parameters}");
+                assert!(!parameters.contains(query_secret), "{parameters}");
+            }
+            other => panic!("expected GateRequired, got {other:?}"),
+        }
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            StatusUpdate::ApprovalNeeded { parameters, .. } => {
+                assert_eq!(parameters["headers"]["Authorization"], "[REDACTED]");
+                assert!(!parameters.to_string().contains(header_secret));
+                assert!(!parameters.to_string().contains(query_secret));
             }
             other => panic!("expected ApprovalNeeded, got {other:?}"),
         }
