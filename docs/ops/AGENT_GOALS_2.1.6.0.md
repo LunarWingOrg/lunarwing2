@@ -755,5 +755,6 @@
     - **Request capture (AC3, offline):** the repo-pinned CLI (`kimi-cli/` lockfile, `@moonshot-ai/kimi-code` 2.2.0) run under `unshare -rn` (loopback only) against a capture server with the lane config: with the pin every `POST /openai/v1/chat/completions` carries `"max_tokens": 131072` (8/8 retry attempts); with the key removed none carries `max_tokens` or `max_completion_tokens` (0/8). Not verified on a tenant or candidate image (none built from this tree yet): the request-side half of the AC is shown, and output length follows from the gateway honouring `max_tokens`. **Maintainer confirmation 2026-10-15:** the promoted 2.2.0 image predates this fix (last AC unmet as written); rebuild from `766b7c91e` or later and recreate the containers, then AC3 can be closed on a tenant.
     - **Verification:** lane suite 87/87; mutant: dropping the key from `config.toml` fails exactly the new pin.
 54. [x] (S) Reserved for later
+55. [ ] repass of 40th goal - update release notes to be more current and correct small outdated pieces of info
 
 ---
