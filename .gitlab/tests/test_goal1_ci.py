@@ -180,6 +180,14 @@ class WorkerVersionPinTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.kimi_lock = kimi_lock
+        # HN-7 fixtures: the DEBIAN_SNAPSHOT build-override guard also reads
+        # the mt-admin tenant build script and the harness compose file.
+        mt_admin_build = self.root / "ic/scripts/mt-admin-lib/05-tenant-build.sh"
+        mt_admin_build.parent.mkdir(parents=True)
+        mt_admin_build.write_text("# tenant image builds\n", encoding="utf-8")
+        harness_compose = self.root / "tests/docker-compose.test.yml"
+        harness_compose.parent.mkdir(parents=True)
+        harness_compose.write_text("services: {}\n", encoding="utf-8")
         self.write_build_script(
             pebble_ref=self.PEBBLE_REF,
             opencode_ref=self.OPENCODE_REF,
@@ -281,6 +289,41 @@ class WorkerVersionPinTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertTrue(any("DEBIAN_SNAPSHOT" in error for error in self.errors()))
+
+    def test_snapshot_token_outside_the_kimi_block_is_caught(self):
+        # MR !1644 review HN-7: the guard covered one block of one file — a
+        # build-arg in the shared post-case build_args or inside
+        # build_image() passed unseen; the whole file is now guarded.
+        text = self.build_script.read_text(encoding="utf-8")
+        self.build_script.write_text(
+            text + '    build_args="$build_args\nDEBIAN_SNAPSHOT=20260906T000000Z"\n',
+            encoding="utf-8",
+        )
+        self.assertTrue(any("DEBIAN_SNAPSHOT" in error for error in self.errors()))
+
+    def test_snapshot_token_in_mt_admin_build_is_caught(self):
+        # HN-7: mt-admin builds the tenant worker images too, so its build
+        # script is guarded the same way.
+        path = self.root / "ic/scripts/mt-admin-lib/05-tenant-build.sh"
+        path.write_text(
+            'podman build --build-arg DEBIAN_SNAPSHOT=20260906T000000Z kimi\n',
+            encoding="utf-8",
+        )
+        self.assertTrue(any("05-tenant-build.sh" in error for error in self.errors()))
+
+    def test_snapshot_token_in_harness_compose_is_caught(self):
+        # HN-7: the harness compose file is the third build entrypoint.
+        path = self.root / "tests/docker-compose.test.yml"
+        path.write_text(
+            "services:\n  kimi:\n    build:\n      args:\n        DEBIAN_SNAPSHOT: x\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(any("docker-compose.test.yml" in error for error in self.errors()))
+
+    def test_missing_build_entrypoint_fails_closed(self):
+        # HN-7: a vanished build entrypoint must error, not skip the guard.
+        (self.root / "ic/scripts/mt-admin-lib/05-tenant-build.sh").unlink()
+        self.assertTrue(any("05-tenant-build.sh missing" in error for error in self.errors()))
 
 
 class BunImageTieTests(unittest.TestCase):

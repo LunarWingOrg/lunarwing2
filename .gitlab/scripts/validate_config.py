@@ -964,16 +964,32 @@ def validate_worker_versions(errors: list[str]) -> None:
                 f"Dockerfile {label} canonical declaration"
             )
 
-    # MR !1627 review HE-7: passing DEBIAN_SNAPSHOT as a build-arg here
-    # would override the Dockerfile default at image build time, silently
-    # detaching the CI_DEBIAN_SNAPSHOT tie (which binds only the Dockerfile
+    # MR !1627 review HE-7, broadened by MR !1644 review HN-7: a
+    # DEBIAN_SNAPSHOT build-arg or env override at image build time silently
+    # detaches the CI_DEBIAN_SNAPSHOT tie (which binds only the Dockerfile
     # ARG default) from the snapshot the published image really builds with.
-    kimi_block = blocks.get("kimi")
-    if kimi_block is not None and "DEBIAN_SNAPSHOT=" in kimi_block:
-        errors.append(
-            "build-worker-image.sh kimi block must not pass DEBIAN_SNAPSHOT as a "
-            "build arg; the CI_DEBIAN_SNAPSHOT tie binds the Dockerfile ARG default"
-        )
+    # The guard covered one case block of one file; it now refuses the token
+    # in every worker-image build entrypoint — the whole
+    # build-worker-image.sh (shared post-case build_args and build_image()
+    # included), mt-admin's tenant build, and the harness compose file.
+    for label, path in (
+        ("build-worker-image.sh", WORKER_BUILD_SCRIPT),
+        (
+            "ic/scripts/mt-admin-lib/05-tenant-build.sh",
+            ROOT / "ic" / "scripts" / "mt-admin-lib" / "05-tenant-build.sh",
+        ),
+        ("tests/docker-compose.test.yml", ROOT / "tests" / "docker-compose.test.yml"),
+    ):
+        if not path.is_file():
+            errors.append(
+                f"{label} missing; cannot guard against a DEBIAN_SNAPSHOT build override"
+            )
+        elif "DEBIAN_SNAPSHOT" in path.read_text(encoding="utf-8"):
+            errors.append(
+                f"{label} must not reference DEBIAN_SNAPSHOT; a build-arg or env "
+                "override at image build time would detach the CI_DEBIAN_SNAPSHOT "
+                "tie from the Dockerfile ARG default"
+            )
 
     for worker, label, dockerfile_text, arg_name in canonical_pins:
         if arg_name not in ("OPENCODE_REF", "PEBBLE_REF"):
