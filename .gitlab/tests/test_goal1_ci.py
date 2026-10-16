@@ -1595,6 +1595,33 @@ class WorkerTsLaneTests(unittest.TestCase):
         self.assertTrue(any("merge_request_event" in error for error in errors))
         self.assertFalse(any("depth budget" in error for error in errors))
 
+    def test_extends_chain_at_the_budget_boundary_is_resolved(self):
+        # IA-8 (mutant M16): the budget is exactly EXTENDS_DEPTH_BUDGET —
+        # moving the leaf check below the depth check silently cut it to
+        # ten. A chain of exactly the budgeted depth must still resolve.
+        merged = self.merged()
+        depth = config.EXTENDS_DEPTH_BUDGET
+        merged[f".p{depth}"] = {"allow_failure": True}
+        for index in range(depth - 1, 0, -1):
+            merged[f".p{index}"] = {"extends": f".p{index + 1}"}
+        merged["worker-kimi-ts"]["extends"] = ".p1"
+        errors = self.errors(merged)
+        self.assertTrue(any("merge_request_event" in error for error in errors))
+        self.assertFalse(any("depth budget" in error for error in errors))
+
+    def test_lane_bypass_variable_prefix_and_case(self):
+        # IA-8 (mutant M10): the predicate matches the whole npm_config_*
+        # family case-insensitively (npm lowercases every npm_config_<x>
+        # into its config), not just npm_config_script_shell.
+        for name in ("NODE_OPTIONS", "npm_config_script_shell", "npm_config_foo",
+                     "NPM_CONFIG_SCRIPT_SHELL", "NPM_CONFIG_FOO"):
+            with self.subTest(name=name, expected=True):
+                self.assertTrue(config.lane_bypass_variable(name))
+        for name in ("node_options", "NODE_OPTIONSS", "npm_configurations",
+                     "npm_config", "BUN_OPTIONS", None, 5):
+            with self.subTest(name=name, expected=False):
+                self.assertFalse(config.lane_bypass_variable(name))
+
     def test_extends_chain_beyond_budget_fails_closed(self):
         # HP-2/HN-3: a chain longer than the budget cannot be certified —
         # the truncation sentinel must fail the lane even though the
