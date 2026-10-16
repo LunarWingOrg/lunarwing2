@@ -1373,6 +1373,13 @@ mod tests {
 
     use super::{check_auth_required, prompt_context_from_chat_messages};
 
+    /// WI#380 / goals item 44: test agents use the production
+    /// `handle_message_timeout` default (the same value `AgentConfig::resolve`
+    /// derives from `AgentSettings`) instead of a hard-coded shorter value.
+    fn test_handle_message_timeout() -> Duration {
+        Duration::from_secs(crate::settings::AgentSettings::default().handle_message_timeout_secs)
+    }
+
     #[test]
     fn delegated_prompt_context_contains_only_visible_chat_roles() {
         let mut tool_call_message = crate::llm::ChatMessage::assistant("private tool reasoning");
@@ -1498,7 +1505,7 @@ mod tests {
                 auto_approve_tools: false,
                 default_timezone: "UTC".to_string(),
                 max_tokens_per_job: 0,
-                handle_message_timeout: Duration::from_secs(400),
+                handle_message_timeout: test_handle_message_timeout(),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
                 pending_gate_expiry_secs: 1800,
@@ -2403,7 +2410,7 @@ mod tests {
                 auto_approve_tools: true,
                 default_timezone: "UTC".to_string(),
                 max_tokens_per_job: 0,
-                handle_message_timeout: Duration::from_secs(400),
+                handle_message_timeout: test_handle_message_timeout(),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
                 pending_gate_expiry_secs: 1800,
@@ -2540,7 +2547,7 @@ mod tests {
                     auto_approve_tools: true,
                     default_timezone: "UTC".to_string(),
                     max_tokens_per_job: 0,
-                    handle_message_timeout: Duration::from_secs(400),
+                    handle_message_timeout: test_handle_message_timeout(),
                     self_repair_op_timeout: Duration::from_secs(60),
                     session_prune_timeout: Duration::from_secs(30),
                     pending_gate_expiry_secs: 1800,
