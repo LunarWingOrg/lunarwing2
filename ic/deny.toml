@@ -162,6 +162,17 @@ deny = [
     { name = "h2", version = ">=0.4.0, <0.4.19" },
     { name = "rustls", version = ">=0.23.0, <0.23.46" },
     { name = "rustls-webpki", version = ">=0.103.0, <0.103.15" },
+    # WI#418 (IS-1): ID-keyed ignores also suppress findings for other
+    # affected copies. Permit only the three accepted legacy pins below
+    # the modern lines; a new dependency must not inherit the acceptance.
+    { name = "h2", version = "<0.3.27" },
+    { name = "h2", version = ">0.3.27, <0.4.0" },
+    { name = "rustls", version = "<0.22.4" },
+    { name = "rustls", version = ">0.22.4, <0.23.0" },
+    { name = "rustls-webpki", version = "<0.102.8" },
+    { name = "rustls-webpki", version = ">0.102.8, <0.103.0" },
+    # Only libsql may depend directly on this legacy TLS-chain root.
+    { name = "hyper-rustls", version = "=0.25.0", wrappers = ["libsql"] },
 ]
 
 [sources]

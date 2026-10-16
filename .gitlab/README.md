@@ -371,12 +371,20 @@ the prime suspect, and the fix is the same normalization in the offending
   `satellite-advisory-sweep` runs
   `.gitlab/scripts/check-satellite-advisories.sh`, which discovers every
   tracked `Cargo.lock` via `git ls-files` and applies the pinned cargo-deny
-  `check advisories` with the shared `ic/deny.toml` policy to each manifest
-  root (bans/licenses/sources stay owned by the ic workspace gate), and
+  `check advisories bans` with the shared `ic/deny.toml` policy to each manifest
+  root (licenses/sources stay owned by the ic workspace gate), and
   `lockfile-only-advisory-guard` runs
   `.gitlab/scripts/check-lockfile-only-advisories.sh` for pins cargo-deny
   cannot see (per-entry `absent`/`no-dev` modes; an entry whose crate leaves
   the lockfile fails as stale).
+- WI#418 scopes the libSQL advisory acceptances with bans: only the exact
+  legacy h2/rustls/webpki pins may remain below the modern version floors,
+  and only libsql may depend directly on hyper-rustls 0.25.0. The
+  `default-graph-advisory-guard` also rejects literal `libsql-remote-replica`
+  or `--all-features` flags in the four shipped daemon build paths, and fails
+  if a listed path disappears. This textual check is supplemented by a
+  per-release review of effective flags and newly added build paths; it
+  cannot resolve variable indirection.
 - Rust concurrency is host-managed: memory-constrained runners restrict eligible
   jobs and concurrent compiles; larger hosts can accept parallel work.
 - CI parallelism is intentional: `-j2` (libSQL `-j1`) caps peak memory within
