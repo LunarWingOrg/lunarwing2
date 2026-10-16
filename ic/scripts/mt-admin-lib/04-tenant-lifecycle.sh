@@ -582,7 +582,8 @@ add_tenant() {
   say "--- Generating environment files ---"
   write_tenant_vision_env "$name" >/dev/null \
     || die "could not safely write the vision env for tenant '$name'"
-  write_tenant_voice_env "$name" >/dev/null
+  write_tenant_voice_env "$name" >/dev/null \
+    || die "could not safely write the voice env for tenant '$name'"
   write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$opencode2_model" "$opencode2_base_url"
   write_tenant_bridge_env "$name" "$xmpp_jid" "$xmpp_password" "$xmpp_allow_from"
   if [[ "$enable_proxy" == "true" ]]; then
@@ -590,7 +591,8 @@ add_tenant() {
   fi
   if [[ "$enable_darkirc" == "true" ]]; then
     ensure_darkirc_scope_id "$name" >/dev/null
-    write_tenant_darkirc_adapter_env "$name"
+    write_tenant_darkirc_adapter_env "$name" \
+      || die "could not safely write the DarkIRC adapter env for tenant '$name'"
     if darkirc_resolve_release; then
       generate_darkirc_config "$name"
     else

@@ -1755,16 +1755,23 @@ write_tenant_darkirc_adapter_env() {
     || die "could not safely read DarkIRC adapter secret for tenant '$name'"
   [[ -n "$adapter_secret" ]] || adapter_secret="$(generate_token | cut -c1-32)"
 
+  # WI#390 (review IG-4): stage the render root-private and commit through the
+  # tenant-side atomic writer with a fatal refusal — the previous pipe form
+  # ignored a writer refusal (and both callers ignored the function's return),
+  # so a symlinked target failed open under the lifecycle lock's suppressed
+  # errexit. Staging also honours the writer contract: a fallible producer
+  # never pipes straight in.
+  local staged rc=0
+  staged="$(mktemp)" || die "could not stage the DarkIRC adapter env for tenant '$name'"
   if [[ -f "$TEMPLATES_DIR/darkirc-adapter.env.template" ]]; then
     render_template_content \
       "darkirc-adapter.env.template" \
       "TENANT_NAME=$name" \
       "DARKIRC_IRC_PORT=$darkirc_irc_port" \
       "DARKIRC_ADAPTER_PORT=$adapter_port" \
-      "ADAPTER_SECRET=$adapter_secret" \
-      | write_tenant_file_atomic "$name" "$path" 600
+      "ADAPTER_SECRET=$adapter_secret" >"$staged" || rc=1
   else
-    cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600
+    cat >"$staged" <<ENVEOF
 DARKIRC_HOST=127.0.0.1
 DARKIRC_PORT=$darkirc_irc_port
 DARKIRC_NICK=${name}-bridge
@@ -1776,6 +1783,11 @@ ADAPTER_SECRET=$adapter_secret
 ADAPTER_LOG_LEVEL=INFO
 ENVEOF
   fi
+  if [[ "$rc" -eq 0 ]]; then
+    write_tenant_file_atomic "$name" "$path" 600 <"$staged" || rc=1
+  fi
+  rm -f -- "$staged"
+  [[ "$rc" -eq 0 ]] || die "could not safely write the DarkIRC adapter env for tenant '$name'"
   say "wrote: $path"
   if [[ "$lock_owned" == "true" ]]; then
     darkirc_writer_unlock
@@ -2939,7 +2951,8 @@ patch_tenant_env() {
         printf 'DARKIRC_ADAPTER_SECRET=%s\n' "$darkirc_adapter_secret" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
         say "added DARKIRC_ADAPTER_SECRET to $env_path"
       fi
-      write_tenant_darkirc_adapter_env "$name"
+      write_tenant_darkirc_adapter_env "$name" \
+        || die "could not safely write the DarkIRC adapter env for tenant '$name'"
       if ports_get "$name" darkirc_irc >/dev/null 2>&1; then
         generate_darkirc_config "$name"
       fi
