@@ -1124,11 +1124,21 @@ class WorkerTsLaneTests(unittest.TestCase):
         self.assertEqual(self.errors(merged), [])
 
     def test_missing_apt_retries_are_caught(self):
-        # HE-4: reverting the snapshot fetch to a retry-less apt-get update
-        # drops the pinned provisioning fragment.
+        # HE-4/HN-8: reverting the snapshot fetches to retry-less apt-get
+        # drops the pinned provisioning fragment — on update and install
+        # together, or on the install half alone.
         merged = self.merged()
         merged["worker-kimi-ts"]["script"] = [
             command.replace(" -o Acquire::Retries=5 -o Acquire::http::Timeout=60", "")
+            for command in merged["worker-kimi-ts"]["script"]
+        ]
+        self.assertTrue(any("Acquire::Retries" in error for error in self.errors(merged)))
+        merged = self.merged()
+        merged["worker-kimi-ts"]["script"] = [
+            command.replace(
+                "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install",
+                "apt-get install",
+            )
             for command in merged["worker-kimi-ts"]["script"]
         ]
         self.assertTrue(any("Acquire::Retries" in error for error in self.errors(merged)))
