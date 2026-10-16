@@ -458,32 +458,100 @@ def validate_cargo_deny_gate(merged: dict, errors: list[str]) -> None:
             errors.append(f"cargo-deny-check.sh lost its {fragment} guard")
 
 
+# MR !1665 review IF-1: the release audit's advisory gates. Each must
+# exist, carry exactly .full-validation-context's rules and the pinned
+# runner tag, and set no job-level `when` — one rule-level
+# `allow_failure: true` (GitLab's documented rules:allow_failure), a
+# `rules: [{when: never}]` replacement, or a retag makes a gate optional,
+# unreachable, or rerouted while every script pin stays green.
+ADVISORY_GATE_JOBS = (
+    "cargo-deny",
+    "satellite-advisory-sweep",
+    "lockfile-only-advisory-guard",
+    "default-graph-advisory-guard",
+)
+
+
 def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> None:
     """The release audit's advisory gates must not be allowed to fail.
 
     MR !1658 review IA-9: a root-file (or direct) job-level
     `allow_failure: true` turns a red advisory gate advisory-only with a
     one-line diff, and the gates' own script pins here do not notice.
-    secret-history is deliberately allow_failure while historical findings
-    are triaged and is NOT in this set — making another gate optional must
-    stay as visible as that marked exception. The extends-resolved job is
-    checked, so an inherited allow_failure (e.g. from .observational-job)
-    fails too, and any non-false value (including the exit_codes hash form)
-    counts."""
-    for job_name in (
-        "cargo-deny",
-        "satellite-advisory-sweep",
-        "lockfile-only-advisory-guard",
-        "default-graph-advisory-guard",
-    ):
+    MR !1665 review IF-1: the same holds one level down — a rule-level
+    `allow_failure`, a replaced rules list (even `rules: [{when: never}]`),
+    a job-level `when`, or a missing job each leaves the guard green while
+    the gate cannot block, so each gate must exist and its extends-resolved
+    rules must be exactly .full-validation-context's. The template's own
+    rules may carry only `if` (plus the final `when: never`), so the
+    equality check cannot inherit a hollowed-out template. The resolved
+    tags must be exactly ['$CI_RUST_RUNNER_TAG'] (IF-2): a retagged gate
+    runs on an unpinned runner. secret-history is deliberately
+    allow_failure while historical findings are triaged and is NOT in this
+    set — making another gate optional must stay as visible as that marked
+    exception. Any non-false allow_failure value (including the exit_codes
+    hash form) counts.
+
+    MR !1665 review IF-2: the EXPECTED_RUNNER_TAGS pin in
+    validate_lane_environment_routes covers only the merged top-level
+    value; a job-level (or rule-level) `variables:` entry overrides it for
+    that job and reroutes the pinned jobs while the top-level pin stays
+    green, so no job may name a runner tag variable in any variables
+    scope."""
+    template = resolve_extends(merged.get(".full-validation-context"), merged)
+    template_rules = template.get("rules")
+    if not isinstance(template_rules, list) or not template_rules:
+        errors.append(".full-validation-context must define rules")
+        template_rules = None
+    else:
+        for rule in template_rules:
+            if not isinstance(rule, dict) or not (
+                set(rule) == {"if"} or rule == {"when": "never"}
+            ):
+                errors.append(
+                    ".full-validation-context rules may carry only `if` (and a "
+                    f"final `when: never`): {rule!r}"
+                )
+    for job_name in ADVISORY_GATE_JOBS:
         job = merged.get(job_name)
         if not isinstance(job, dict):
+            errors.append(
+                f"{job_name} is missing; every release-audit advisory gate "
+                "must exist"
+            )
             continue
-        if resolve_extends(job, merged).get("allow_failure"):
+        effective = resolve_extends(job, merged)
+        if effective.get("allow_failure"):
             errors.append(
                 f"{job_name} must not set allow_failure; an advisory gate whose "
                 "failure is optional cannot gate the release audit"
             )
+        if "when" in effective:
+            errors.append(f"{job_name} must not set a job-level when")
+        if template_rules is not None and effective.get("rules") != template_rules:
+            errors.append(
+                f"{job_name} rules must be exactly .full-validation-context's "
+                "(no rule-level allow_failure, when or variables)"
+            )
+        if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
+            errors.append(f"{job_name} tags must be exactly ['$CI_RUST_RUNNER_TAG']")
+    for job_name, job in merged.items():  # IF-2: runner-tag variables at job or rule level
+        if not isinstance(job, dict) or job_name.startswith("."):
+            continue
+        effective = resolve_extends(job, merged)
+        scopes = [effective.get("variables")]
+        rules = effective.get("rules")
+        if isinstance(rules, list):
+            scopes.extend(rule.get("variables") for rule in rules if isinstance(rule, dict))
+        for scope in scopes:
+            if isinstance(scope, dict) and any(
+                name in EXPECTED_RUNNER_TAGS for name in scope
+            ):
+                errors.append(
+                    f"{job_name} must not override a runner tag variable; "
+                    "EXPECTED_RUNNER_TAGS pins the routing for every job"
+                )
+                break
 
 
 def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:

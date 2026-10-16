@@ -1005,7 +1005,13 @@ class YamlParseErrorTests(unittest.TestCase):
 class AdvisoryGateOptionalTests(unittest.TestCase):
     """MR !1658 review IA-9: the release audit's advisory gates must not be
     allow_failure — a root-file `cargo-deny: {allow_failure: true}` turned
-    the gate advisory-only while every script pin here stayed green."""
+    the gate advisory-only while every script pin here stayed green.
+    MR !1665 review IF-1/IF-2: the same applies one level down (rule-level
+    allow_failure, replaced rules, a job-level when, a deleted or retagged
+    gate, a job/rule-level runner tag variable), so the fixture models the
+    real shape — .rust-job carrying the pinned tag, .full-validation-context
+    carrying the if-rules plus a final when: never, each gate extending
+    both."""
 
     GATES = (
         "cargo-deny",
@@ -1015,7 +1021,19 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
     )
 
     def merged(self) -> dict:
-        return {name: {"script": ["bash .gitlab/scripts/check.sh"]} for name in self.GATES}
+        return {
+            ".rust-job": {"tags": ["$CI_RUST_RUNNER_TAG"]},
+            ".full-validation-context": {
+                "rules": [{"if": "$CI_COMMIT_BRANCH"}, {"when": "never"}]
+            },
+            **{
+                name: {
+                    "extends": [".rust-job", ".full-validation-context"],
+                    "script": ["bash .gitlab/scripts/check.sh"],
+                }
+                for name in self.GATES
+            },
+        }
 
     def errors(self, merged: dict) -> list[str]:
         errors: list[str] = []
@@ -1043,10 +1061,109 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
         # allow_failure: true (defaults.yml), so extending it is refused too.
         merged = self.merged()
         merged[".observational-job"] = {"allow_failure": True}
-        merged["cargo-deny"]["extends"] = ".observational-job"
+        merged["cargo-deny"]["extends"].append(".observational-job")
         self.assertTrue(
             any("cargo-deny must not set allow_failure" in error for error in self.errors(merged))
         )
+
+    def test_gate_shape_variants_are_caught(self):
+        # MR !1665 review IF-1/IF-2: each of the 4 gates x 5 shapes left the
+        # head's job-level-only guard green (the review's P1-P5 probes).
+        for job_name in self.GATES:
+            with self.subTest(job=job_name, shape="rule-level allow_failure"):
+                merged = self.merged()
+                rules = copy.deepcopy(merged[".full-validation-context"]["rules"])
+                for rule in rules:
+                    if "if" in rule:
+                        rule["allow_failure"] = True
+                merged[job_name]["rules"] = rules
+                self.assertTrue(
+                    any(
+                        f"{job_name} rules must be exactly" in error
+                        for error in self.errors(merged)
+                    )
+                )
+            with self.subTest(job=job_name, shape="rules replaced with when: never"):
+                merged = self.merged()
+                merged[job_name]["rules"] = [{"when": "never"}]
+                self.assertTrue(
+                    any(
+                        f"{job_name} rules must be exactly" in error
+                        for error in self.errors(merged)
+                    )
+                )
+            with self.subTest(job=job_name, shape="gate deleted"):
+                merged = self.merged()
+                del merged[job_name]
+                self.assertTrue(
+                    any(
+                        f"{job_name} is missing" in error
+                        for error in self.errors(merged)
+                    )
+                )
+            with self.subTest(job=job_name, shape="retagged"):
+                merged = self.merged()
+                merged[job_name]["tags"] = ["untrusted-shell"]
+                self.assertTrue(
+                    any(
+                        f"{job_name} tags must be exactly" in error
+                        for error in self.errors(merged)
+                    )
+                )
+            with self.subTest(job=job_name, shape="job-level runner variable"):
+                merged = self.merged()
+                merged[job_name]["variables"] = {"CI_RUST_RUNNER_TAG": "untrusted-shell"}
+                self.assertTrue(
+                    any(
+                        f"{job_name} must not override a runner tag variable" in error
+                        for error in self.errors(merged)
+                    )
+                )
+
+    def test_job_level_when_is_caught(self):
+        merged = self.merged()
+        merged["cargo-deny"]["when"] = "manual"
+        self.assertTrue(
+            any("cargo-deny must not set a job-level when" in error for error in self.errors(merged))
+        )
+
+    def test_template_rule_carrying_more_than_if_is_caught(self):
+        merged = self.merged()
+        merged[".full-validation-context"]["rules"][0]["allow_failure"] = True
+        errors = self.errors(merged)
+        self.assertTrue(
+            any(".full-validation-context rules may carry only `if`" in error for error in errors)
+        )
+
+    def test_template_without_rules_fails_closed(self):
+        merged = self.merged()
+        del merged[".full-validation-context"]["rules"]
+        self.assertTrue(
+            any(".full-validation-context must define rules" in error for error in self.errors(merged))
+        )
+
+    def test_rule_level_runner_tag_variable_is_caught(self):
+        # IF-2: a rules:variables entry also overrides the pipeline variable
+        # for the job that matches the rule — pinned on a non-gate job so
+        # only the variable refusal fires.
+        merged = self.merged()
+        merged["some-job"] = {
+            "script": ["true"],
+            "rules": [
+                {"if": "$CI_COMMIT_BRANCH", "variables": {"CI_LINT_RUNNER_TAG": "untrusted-shell"}}
+            ],
+        }
+        errors = self.errors(merged)
+        self.assertTrue(
+            any("some-job must not override a runner tag variable" in error for error in errors)
+        )
+
+    def test_benign_job_variables_pass(self):
+        # Only the runner tag names are refused at job/rule level; other
+        # job-level variables (the real tree sets several) stay fine.
+        merged = self.merged()
+        merged["cargo-deny"]["variables"] = {"TRIVY_NO_PROGRESS": "true"}
+        self.assertEqual(self.errors(merged), [])
 
     def test_root_file_cargo_deny_override_is_caught(self):
         # IA-9: the review's exact probe — one root-file line makes the
