@@ -206,13 +206,22 @@ resolve_worker_auth_token() {
 # 1 no change needed, 2 failure.
 upgrade_external_worker_auth_token() {
   local name="$1" worker="$2" config_path="$3" env_path="$4"
-  local awk_status temp_path new_token
+  local awk_status staged_in staged_out new_token
   new_token="$(resolve_worker_auth_token "$env_path")"
   [[ -n "$new_token" ]] || return 1
 
-  if ! temp_path="$(mktemp "${config_path}.tmp.XXXXXX")"; then
+  # WI#390 (review HH-3): never mktemp+redirect+chown as root inside the
+  # tenant-writable state dir — a tenant watching the directory could swap the
+  # temp file for a symlink between mktemp and the write, and the chown would
+  # follow it. Stage root-private outside the tenant tree (read the current
+  # config as the tenant) and commit through the tenant-side atomic writer,
+  # exactly like the fresh-config branch of ensure_external_worker_config.
+  staged_in="$(mktemp)" || return 2
+  if ! tenant_cat "$name" "$config_path" >"$staged_in"; then
+    rm -f -- "$staged_in"
     return 2
   fi
+  staged_out="$(mktemp)" || { rm -f -- "$staged_in"; return 2; }
 
   if awk \
     -v worker="$worker" \
@@ -278,18 +287,17 @@ upgrade_external_worker_auth_token() {
         if (satisfied) exit 42
         if (!changed && !has_token) exit 43
       }
-    ' "$config_path" "$config_path" >"$temp_path"; then
-    if ! chown "$name:$name" "$temp_path" ||
-       ! chmod 600 "$temp_path" ||
-       ! mv -f -- "$temp_path" "$config_path"; then
-      rm -f -- "$temp_path"
+    ' "$staged_in" "$staged_in" >"$staged_out"; then
+    if ! write_tenant_file_atomic "$name" "$config_path" 600 owned-parent <"$staged_out"; then
+      rm -f -- "$staged_in" "$staged_out"
       return 2
     fi
+    rm -f -- "$staged_in" "$staged_out"
     say "scoped worker credential applied for '$worker' (WI#205)"
     return 0
   else
     awk_status=$?
-    rm -f -- "$temp_path"
+    rm -f -- "$staged_in" "$staged_out"
     if [[ "$awk_status" -eq 42 ]]; then
       return 1
     fi
@@ -299,15 +307,22 @@ upgrade_external_worker_auth_token() {
 
 upgrade_external_worker_timeout() {
   local name="$1" worker="$2" config_path="$3"
-  local awk_status temp_path
+  local awk_status staged_in staged_out
   if [[ "$MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS" != "true" ]] ||
      [[ "$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS" == "$LEGACY_EXTERNAL_WORKER_TIMEOUT_MS" ]]; then
     return 1
   fi
 
-  if ! temp_path="$(mktemp "${config_path}.tmp.XXXXXX")"; then
+  # WI#390 (review HH-3): stage root-private outside the tenant-writable state
+  # dir (read as the tenant) and commit through the tenant-side atomic writer —
+  # a root mktemp+redirect+chown in the tenant dir could be redirected onto an
+  # attacker-chosen path by a symlink swapped in between mktemp and the write.
+  staged_in="$(mktemp)" || return 2
+  if ! tenant_cat "$name" "$config_path" >"$staged_in"; then
+    rm -f -- "$staged_in"
     return 2
   fi
+  staged_out="$(mktemp)" || { rm -f -- "$staged_in"; return 2; }
 
   if awk \
     -v worker="$worker" \
@@ -338,18 +353,17 @@ upgrade_external_worker_timeout() {
       }
       { print }
       END { if (!changed) exit 42 }
-    ' "$config_path" >"$temp_path"; then
-    if ! chown "$name:$name" "$temp_path" ||
-       ! chmod 600 "$temp_path" ||
-       ! mv -f -- "$temp_path" "$config_path"; then
-      rm -f -- "$temp_path"
+    ' "$staged_in" >"$staged_out"; then
+    if ! write_tenant_file_atomic "$name" "$config_path" 600 owned-parent <"$staged_out"; then
+      rm -f -- "$staged_in" "$staged_out"
       return 2
     fi
+    rm -f -- "$staged_in" "$staged_out"
     say "upgraded external worker '$worker' timeout to ${DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS}ms"
     return 0
   else
     awk_status=$?
-    rm -f -- "$temp_path"
+    rm -f -- "$staged_in" "$staged_out"
     if [[ "$awk_status" -eq 42 ]]; then
       return 1
     fi
