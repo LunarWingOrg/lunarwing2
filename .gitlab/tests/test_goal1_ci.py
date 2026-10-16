@@ -769,6 +769,54 @@ class DebianSnapshotTieTests(unittest.TestCase):
         )
 
 
+class YamlParseErrorTests(unittest.TestCase):
+    """MR !1647 review HP-5: a `!reference` tag anywhere in the CI YAML made
+    yaml.safe_load raise a ConstructorError traceback — fail-closed (rc 1)
+    but unreadable. The validator now reports one clean ERROR line."""
+
+    def test_load_yaml_reports_unsupported_tags_cleanly(self):
+        temporary = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temporary.cleanup)
+        probe = pathlib.Path(temporary.name) / "probe.yml"
+        probe.write_text("job:\n  script: !reference [build, script]\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            config.load_yaml(probe)
+        message = str(caught.exception)
+        self.assertIn("probe.yml: cannot parse YAML", message)
+        self.assertIn("!reference", message)
+
+    def test_load_yaml_still_requires_a_mapping(self):
+        temporary = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temporary.cleanup)
+        probe = pathlib.Path(temporary.name) / "probe.yml"
+        probe.write_text("- just\n- a\n- list\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            config.load_yaml(probe)
+        self.assertIn("must contain a YAML mapping", str(caught.exception))
+
+    def test_cli_returns_a_clean_error_without_a_traceback(self):
+        original_load_yaml = config.load_yaml
+
+        # Drive cli() with load_yaml raising the real ValueError shape.
+        def raising_load_yaml(path):
+            if path == ROOT / ".gitlab" / "ci" / "validate.yml":
+                raise ValueError(
+                    ".gitlab/ci/validate.yml: cannot parse YAML: could not "
+                    "determine a constructor for the tag '!reference'"
+                )
+            return original_load_yaml(path)
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=raising_load_yaml),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.cli(), 1)
+        output = stderr.getvalue()
+        self.assertIn("ERROR: .gitlab/ci/validate.yml: cannot parse YAML", output)
+        self.assertIn("!reference", output)
+        self.assertNotIn("Traceback", output)
+
+
 class AdvisoryGateOptionalTests(unittest.TestCase):
     """MR !1658 review IA-9: the release audit's advisory gates must not be
     allow_failure — a root-file `cargo-deny: {allow_failure: true}` turned

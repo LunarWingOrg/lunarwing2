@@ -71,8 +71,15 @@ VARIABLE_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][
 
 
 def load_yaml(path: pathlib.Path) -> dict:
-    with path.open(encoding="utf-8") as stream:
-        loaded = yaml.safe_load(stream)
+    try:
+        with path.open(encoding="utf-8") as stream:
+            loaded = yaml.safe_load(stream)
+    except yaml.YAMLError as error:
+        # MR !1647 review HP-5: custom tags such as `!reference` make
+        # yaml.safe_load raise a ConstructorError — fail closed with a clean
+        # one-line error (via cli()), not a traceback.
+        detail = getattr(error, "problem", None) or str(error).splitlines()[0]
+        raise ValueError(f"{path.relative_to(ROOT)}: cannot parse YAML: {detail}") from None
     if not isinstance(loaded, dict):
         raise ValueError(f"{path.relative_to(ROOT)} must contain a YAML mapping")
     return loaded
@@ -1718,5 +1725,16 @@ def main() -> int:
     return 0
 
 
+def cli() -> int:
+    """main() plus one clean error path for unreadable/unsupported YAML
+    (MR !1647 review HP-5): a ValueError from load_yaml reports the file and
+    the parser's problem on one ERROR line instead of a traceback."""
+    try:
+        return main()
+    except ValueError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())
