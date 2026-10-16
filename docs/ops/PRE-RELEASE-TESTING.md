@@ -56,6 +56,7 @@ artifacts. `up` does not build missing binaries.
 cd ic
 export LUNARWING_TEST_PROFILE=release
 export CARGO_BUILD_JOBS=12
+export LUNARWING_TEST_TENSORZERO_URL='http://<gateway-host>:3000'  # required (WI#402)
 scripts/lunarwing-xmpp-test-env.sh init
 taskset -c 0-11 scripts/lunarwing-xmpp-test-env.sh build --with-wasm
 scripts/lunarwing-xmpp-test-env.sh up
@@ -65,7 +66,10 @@ scripts/lunarwing-xmpp-test-env.sh down
 
 Always run `down` after the test, including after a failed `verify`. If only the
 TensorZero proxy check fails, inspect the configured upstream
-`LUNARWING_TEST_TENSORZERO_URL` before diagnosing the local install.
+`LUNARWING_TEST_TENSORZERO_URL` before diagnosing the local install. The harness
+has no built-in gateway default (WI#402): `init`/`up` refuse to bring the env up
+until `LUNARWING_TEST_TENSORZERO_URL` (or `TENSORZERO_URL`) is set, and reuse the
+baked `env/proxy.env` value afterwards.
 
 See [`HARNESS-SINGLE-TENANT.md`](HARNESS-SINGLE-TENANT.md) and
 [`MULTITENANCY-HARNESS.md`](MULTITENANCY-HARNESS.md) for platform-specific and
