@@ -760,5 +760,20 @@
 57. [ ] take care of any pending items from https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/412 - see comments on WORK ITEM as well as the 53rd goal....
 58. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/396
 59. [x] (S) note for me to go over all reserved items and older notes
+60. [x] (S) reservist
+61. [x] (S) reservist
+62. [x] (S) reservist
+63. [x] (S) reservist
+64. [x] (S) reservist
+65. [x] (S) reservist
+66. [x] (S) reservist
+67. [x] (S) reservist
+68. [x] (S) reservist
+69. [x] (S) reservist
+70. [x] (S) reservist
+71. [x] (S) reservist
+72. [ ] (MULTIAGENT GOAL) - set up a TEMPORARY test tenant (with kimicode and opencode2 and pebble external workers enabled with full toolchains enabled) and test out all the latest changes that have landed so far from the goal document - I expect a full report under docs/ops when you are compelted. do not destroy the testing tenant when you have completed. leave it running. do not make it have an "animal name" such that teardown routine will destroy it.... feel free to instead use one of the names defined in https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/273
+73. [ ] (MULTIAGENT GOAL) - set up a TEMPORARY test tenant (with kimicode and opencode2 and pebble external workers enabled with full toolchains enabled) and test out all the latest changes that have landed so far from the goal document - I expect a full report under docs/ops when you are compelted. do not destroy the testing tenant when you have completed. leave it running. do not make it have an "animal name" such that teardown routine will destroy it.... feel free to instead use one of the names defined in https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/273
+74. [ ] (MULTIAGENT GOAL) - set up a TEMPORARY test tenant (with kimicode and opencode2 and pebble external workers enabled with full toolchains enabled) and test out all the latest changes that have landed so far from the goal document - I expect a full report under docs/ops when you are compelted. do not destroy the testing tenant when you have completed. leave it running. do not make it have an "animal name" such that teardown routine will destroy it.... feel free to instead use one of the names defined in https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/273
 
 ---
