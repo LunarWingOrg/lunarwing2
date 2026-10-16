@@ -109,9 +109,13 @@ pub fn header_value_carries_credentials(value: &str) -> bool {
 /// under-redaction leaks credentials into persisted events.
 ///
 /// WI#392 (FI-6): the set was widened from the run-91 miss list (`pwd`,
-/// `pass`, `jwt`, `sessionid`/`session_id`, `sid`, `hmac`, `signing_key`,
-/// `ssh_key`, `encryption_key`, `access_key`, `client_assertion`; `pass`
-/// also covers `passphrase`/`passwd`). Bare `key` stays excluded (the
+/// `jwt`, `sessionid`/`session_id`, `hmac`, `signing_key`, `ssh_key`,
+/// `encryption_key`, `access_key`, `client_assertion`). Run-131 (IM-2)
+/// narrowed `pass`/`sid` back out of the bare substrings — they also occur
+/// inside ordinary words (`side`, `bypass_cache`, `passengers`) — into the
+/// word/end-of-word matching of [`CREDENTIAL_KEY_WORDS`] below; `passw`,
+/// `passphrase`, `passcode`, `passkey` and `sessid` stay plain substrings.
+/// Bare `key` stays excluded (the
 /// `X-Idempotency-Key` false-positive class), as does bare `sig` (the
 /// `insights`/`design` false-positive class); a `mission_*` allowlist of
 /// known non-secret keys would be strictly stronger and remains available
@@ -119,7 +123,10 @@ pub fn header_value_carries_credentials(value: &str) -> bool {
 const CREDENTIAL_KEY_SUBSTRINGS: &[&str] = &[
     "secret",
     "token",
-    "pass",
+    "passw",
+    "passphrase",
+    "passcode",
+    "passkey",
     "apikey",
     "auth",
     "credential",
@@ -130,13 +137,31 @@ const CREDENTIAL_KEY_SUBSTRINGS: &[&str] = &[
     "pwd",
     "jwt",
     "sessionid",
-    "sid",
+    "sessid",
     "hmac",
     "signingkey",
     "sshkey",
     "encryptionkey",
     "accesskey",
     "clientassertion",
+];
+
+/// Short credential names that also occur inside ordinary words (`side`,
+/// `inside`, `consider`; `passenger`, `passport`, `bypass`), so they match
+/// only as a whole word of the key or at the end of one (`sid`, `x_sid`,
+/// `AccountSid`, `connect.sid`, `callsid`; `pass`, `db_pass`, `smtpPass`,
+/// `rootpass`). Run-131 IM-2.
+const CREDENTIAL_KEY_WORDS: &[&str] = &["sid", "pass"];
+
+/// Ordinary words that end in a [`CREDENTIAL_KEY_WORDS`] entry.
+const CREDENTIAL_KEY_WORD_EXCEPTIONS: &[&str] = &[
+    "bypass",
+    "compass",
+    "encompass",
+    "overpass",
+    "surpass",
+    "trespass",
+    "underpass",
 ];
 
 /// Whether a parameter key commonly carries credentials (WI#359, CJ-10).
@@ -146,16 +171,52 @@ const CREDENTIAL_KEY_SUBSTRINGS: &[&str] = &[
 /// [`CREDENTIAL_KEY_SUBSTRINGS`], so `hmac_secret`, `access_token`,
 /// `client_secret`, `private_key`, `refresh_token`, `apiKey`, `jwt`,
 /// `session_id`, `ssh_key`, and fullwidth `ａｐｉ＿ｋｅｙ` all match.
+/// Additionally, the short names in [`CREDENTIAL_KEY_WORDS`] match as a
+/// whole word of the key or at the end of one, minus
+/// [`CREDENTIAL_KEY_WORD_EXCEPTIONS`] (run-131 IM-2).
 pub fn is_credential_param_key(key: &str) -> bool {
-    let normalized: String = key
-        .chars()
-        .map(fold_fullwidth_latin)
+    let folded: Vec<char> = key.chars().map(fold_fullwidth_latin).collect();
+    let normalized: String = folded
+        .iter()
+        .copied()
         .filter(|c| *c != '_' && *c != '-')
         .flat_map(char::to_lowercase)
         .collect();
     CREDENTIAL_KEY_SUBSTRINGS
         .iter()
         .any(|sub| normalized.contains(sub))
+        || key_words(&folded).iter().any(|word| {
+            !CREDENTIAL_KEY_WORD_EXCEPTIONS.contains(&word.as_str())
+                && CREDENTIAL_KEY_WORDS
+                    .iter()
+                    .any(|short| word.ends_with(short))
+        })
+}
+
+/// Split a key into lowercase words at non-alphanumeric characters and at
+/// lower-to-upper camelCase boundaries (`AccountSid` gives `account`, `sid`).
+fn key_words(chars: &[char]) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for &c in chars {
+        if !c.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower {
+            words.push(std::mem::take(&mut current));
+        }
+        prev_lower = c.is_lowercase() || c.is_numeric();
+        current.extend(c.to_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 /// WI#392 (FI-6): fold fullwidth Latin variants (U+FF01..=U+FF5E) to their
@@ -644,6 +705,48 @@ mod tests {
             "\u{FF48}\u{FF4D}\u{FF41}\u{FF43}",                 // ｈｍａｃ
         ] {
             assert!(is_credential_param_key(key), "'{key}' must match");
+        }
+    }
+
+    #[test]
+    fn credential_param_key_short_names_match_only_as_whole_words_or_word_ends() {
+        // Run-131 IM-2: `sid`/`pass` are credential names but also occur
+        // inside ordinary words; an approval prompt must still show them.
+        for key in [
+            "sid",
+            "x_sid",
+            "AccountSid",
+            "connect.sid",
+            "PHPSESSID",
+            "pass",
+            "db_pass",
+            "smtpPass",
+            "passwd",
+            "passcode",
+            "passkey",
+            "passphrase",
+            "rootpass",
+            "callsid",
+        ] {
+            assert!(is_credential_param_key(key), "'{key}' must match");
+        }
+        for key in [
+            "side",
+            "inside",
+            "outside",
+            "consider",
+            "residual",
+            "president",
+            "bypass",
+            "bypass_cache",
+            "compass",
+            "passenger",
+            "passive",
+            "passport",
+            "side_effects_hint",
+            "encompass",
+        ] {
+            assert!(!is_credential_param_key(key), "'{key}' must not match");
         }
     }
 
