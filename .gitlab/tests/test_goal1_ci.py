@@ -769,6 +769,71 @@ class DebianSnapshotTieTests(unittest.TestCase):
         )
 
 
+class AdvisoryGateOptionalTests(unittest.TestCase):
+    """MR !1658 review IA-9: the release audit's advisory gates must not be
+    allow_failure — a root-file `cargo-deny: {allow_failure: true}` turned
+    the gate advisory-only while every script pin here stayed green."""
+
+    GATES = (
+        "cargo-deny",
+        "satellite-advisory-sweep",
+        "lockfile-only-advisory-guard",
+        "default-graph-advisory-guard",
+    )
+
+    def merged(self) -> dict:
+        return {name: {"script": ["bash .gitlab/scripts/check.sh"]} for name in self.GATES}
+
+    def errors(self, merged: dict) -> list[str]:
+        errors: list[str] = []
+        config.validate_advisory_gates_not_optional(merged, errors)
+        return errors
+
+    def test_real_shape_passes(self):
+        self.assertEqual(self.errors(self.merged()), [])
+
+    def test_allow_failure_is_caught_on_every_gate(self):
+        for job_name in self.GATES:
+            for value in (True, {"exit_codes": [1]}):
+                with self.subTest(job=job_name, value=value):
+                    merged = self.merged()
+                    merged[job_name]["allow_failure"] = value
+                    self.assertTrue(
+                        any(
+                            f"{job_name} must not set allow_failure" in error
+                            for error in self.errors(merged)
+                        )
+                    )
+
+    def test_inherited_allow_failure_is_caught(self):
+        # The extends-resolved job is checked: .observational-job carries
+        # allow_failure: true (defaults.yml), so extending it is refused too.
+        merged = self.merged()
+        merged[".observational-job"] = {"allow_failure": True}
+        merged["cargo-deny"]["extends"] = ".observational-job"
+        self.assertTrue(
+            any("cargo-deny must not set allow_failure" in error for error in self.errors(merged))
+        )
+
+    def test_root_file_cargo_deny_override_is_caught(self):
+        # IA-9: the review's exact probe — one root-file line makes the
+        # release audit's gate advisory-only.
+        original_load_yaml = config.load_yaml
+
+        def load_with_root_override(path):
+            loaded = original_load_yaml(path)
+            if path == ROOT / ".gitlab-ci.yml":
+                loaded["cargo-deny"] = {"allow_failure": True}
+            return loaded
+
+        with (
+            mock.patch.object(config, "load_yaml", side_effect=load_with_root_override),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertIn("cargo-deny must not set allow_failure", stderr.getvalue())
+
+
 class WorkerTsLaneTests(unittest.TestCase):
     """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
     the merge_request_event rule, the tied image variable, and (MR !1644

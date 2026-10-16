@@ -432,6 +432,34 @@ def validate_cargo_deny_gate(merged: dict, errors: list[str]) -> None:
             errors.append(f"cargo-deny-check.sh lost its {fragment} guard")
 
 
+def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> None:
+    """The release audit's advisory gates must not be allowed to fail.
+
+    MR !1658 review IA-9: a root-file (or direct) job-level
+    `allow_failure: true` turns a red advisory gate advisory-only with a
+    one-line diff, and the gates' own script pins here do not notice.
+    secret-history is deliberately allow_failure while historical findings
+    are triaged and is NOT in this set — making another gate optional must
+    stay as visible as that marked exception. The extends-resolved job is
+    checked, so an inherited allow_failure (e.g. from .observational-job)
+    fails too, and any non-false value (including the exit_codes hash form)
+    counts."""
+    for job_name in (
+        "cargo-deny",
+        "satellite-advisory-sweep",
+        "lockfile-only-advisory-guard",
+        "default-graph-advisory-guard",
+    ):
+        job = merged.get(job_name)
+        if not isinstance(job, dict):
+            continue
+        if resolve_extends(job, merged).get("allow_failure"):
+            errors.append(
+                f"{job_name} must not set allow_failure; an advisory gate whose "
+                "failure is optional cannot gate the release audit"
+            )
+
+
 def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
     """The satellite sweep keeps the release audit reproducible (A5).
 
@@ -1569,6 +1597,7 @@ def main() -> int:
     validate_cavepony_version(merged_config, errors)
     validate_cargo_deny_gate(merged_config, errors)
     validate_satellite_advisory_sweep(merged_config, errors)
+    validate_advisory_gates_not_optional(merged_config, errors)
     validate_worker_ts_lanes(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
     validate_worker_versions(errors)
