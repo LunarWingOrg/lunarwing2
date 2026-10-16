@@ -438,13 +438,16 @@ render_worker_quadlet() {
   tenant_env_path="$env_dir/lunarwing.env"
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
-  mkdir -p "$workspace_dir"
   if [[ "$worker" == "kimi" || "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
+    mkdir -p "$workspace_dir"
     workspace_dir="$(prepare_worker_workspace "$name" "$worker")"
   else
-    chown "$name:$name" "$workspace_dir"
+    # WI#390 (HH-4): pebble's workspace is created/verified/tightened as the
+    # tenant — root chown/chmod here followed a tenant-planted symlink. The
+    # || die keeps a refusal fatal under suppressed errexit (subshell call).
+    workspace_dir="$(prepare_pebble_workspace "$name")" \
+      || die "unsafe pebble workspace for tenant '$name'"
   fi
-  [[ "$worker" == "kimi" || "$worker" == "opencode" || "$worker" == "opencode2" ]] || chmod 777 "$workspace_dir"
   [[ "$worker" != "kimi" ]] || runtime_env_path="$(write_kimi_runtime_env "$name")"
   [[ -z "$runtime_env_path" ]] \
     || runtime_env_hash="$(sha256sum "$runtime_env_path" | cut -d' ' -f1)"

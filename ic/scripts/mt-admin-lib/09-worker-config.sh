@@ -1621,6 +1621,37 @@ prepare_worker_workspace() {
   printf '%s\n' "$workspace_dir"
 }
 
+# WI#390 (review HH-4): the pebble workspace is tenant-writable scratch, so the
+# old root `mkdir -p` + `chown` + `chmod 777` let a tenant replace the directory
+# with a symlink and have root chown/chmod the symlink's target. Create and
+# tighten the directory AS the tenant instead, and refuse a symlinked or
+# foreign-owned path so the bind mount can never be redirected at an arbitrary
+# host directory. The pebble image runs as container root — the tenant uid on
+# rootless podman, and mode-bypassing host root on rootful podman — so a
+# tenant-owned 0700 directory suffices; 0777 was never load-bearing.
+prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
+  local name="$1" workspace_dir tenant_uid
+  workspace_dir="$(tenant_lw_root "$name")/pebble-workspace"
+  tenant_uid="$(id -u "$name")" || return 1
+  if [[ "$(id -un)" == "$name" ]]; then
+    mkdir -p "$workspace_dir" || return 1
+  else
+    sudo -u "$name" mkdir -p "$workspace_dir" || return 1
+  fi
+  if [[ ! -d "$workspace_dir" || -L "$workspace_dir" ]]; then
+    printf 'error: pebble workspace is not a plain directory: %s\n' "$workspace_dir" >&2
+    return 1
+  fi
+  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" != "$tenant_uid" ]]; then
+    printf 'error: pebble workspace not owned by tenant %q: %s\n' "$name" "$workspace_dir" >&2
+    return 1
+  fi
+  # chmod as the tenant: chmod follows symlinks, and root has no business
+  # touching a mode under a tenant-writable parent (WI#390).
+  tenant_chmod "$name" 0700 "$workspace_dir" || return 1
+  printf '%s\n' "$workspace_dir"
+}
+
 write_kimi_runtime_env() {
   local name="$1" source_path target_path key value staged
   source_path="$(tenant_env_dir "$name")/lunarwing.env"
@@ -1970,10 +2001,12 @@ start_tenant_pebble() {
     fi
 
     local workspace_dir
-    workspace_dir="$(tenant_lw_root "$name")/pebble-workspace"
-    mkdir -p "$workspace_dir"
-    chown "$name:$name" "$workspace_dir"
-    chmod 777 "$workspace_dir"
+    # WI#390 (HH-4): tenant-side create/verify/tighten — no root chown/chmod on
+    # a tenant-writable path. The || die keeps a refusal fatal under the
+    # lifecycle lock's suppressed errexit (the helper runs in a subshell, where
+    # its own die would only kill the subshell).
+    workspace_dir="$(prepare_pebble_workspace "$name")" \
+      || die "unsafe pebble workspace for tenant '$name'"
 
     # HEALTH_PORT=8443 matches the image's baked HEALTHCHECK (in-container).
     # v8: also publish the tenant's dedicated pebble_health port -> container
