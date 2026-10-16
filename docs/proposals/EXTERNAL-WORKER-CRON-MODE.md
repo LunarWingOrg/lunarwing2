@@ -372,8 +372,10 @@ curl --fail -H "Authorization: Bearer $GATEWAY_AUTH_TOKEN" \
   missing-default-dir and traversal/symlink regressions, plus upgrade prerequisites above.
 - **DN-3:** owner-authenticated recovery API, tested with a persisted pause,
   real auth middleware, non-owner/missing/query-token rejection, and ordered status.
-- **DN-1:** terminal wait returns shutdown to the reentry chain; deterministic
-  test delivers shutdown while awaiting a non-terminal job and requires chain exit.
+- **DN-1:** terminal wait returns shutdown to the reentry chain; the
+  deterministic test delivers shutdown while a non-terminal job is awaited and
+  pins that `prepare_reentry` returns `None` (the shutdown propagates out of
+  the bounded wait instead of being swallowed).
 - **DN-4:** persist/reload the last real job id for post-restart audit events;
   store test reads owner pause and post-restart resume back from `job_events`.
 - **DN-6:** only dispatched/persisted links can anchor pause events. A paused
