@@ -489,6 +489,14 @@ class BunImageTieTests(unittest.TestCase):
             f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        # Sibling fixture: the opencode2 bun tie (MR !1669 review IK-2) also
+        # runs here; patch it too so the tests never read the real file
+        # (whose digest happens to equal BUN_DIGEST and would pass silently).
+        self.opencode2_dockerfile = self.root / "Dockerfile.opencode2"
+        self.opencode2_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         pin = f"docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST}"
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
@@ -515,6 +523,7 @@ class BunImageTieTests(unittest.TestCase):
         with mock.patch.multiple(
             config,
             OPENCODE_DOCKERFILE=self.dockerfile,
+            OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.kimi_dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
@@ -541,6 +550,21 @@ class BunImageTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.OTHER_DIGEST} AS runtime\n"
         )
         self.assertTrue(any("CI_BUN_IMAGE digest must match" in error for error in self.errors()))
+
+    def test_opencode2_bun_drift_is_caught(self):
+        # MR !1669 review IK-2: the worker-opencode2-ts lane runs on
+        # CI_BUN_IMAGE, so the opencode2 Dockerfile's bun digest must be
+        # cross-checked too.
+        self.opencode2_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.OTHER_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            any(
+                "CI_BUN_IMAGE digest must match" in error and "opencode2.4lunarwing" in error
+                for error in self.errors()
+            )
+        )
 
     def test_missing_dockerfile_is_caught(self):
         self.assertTrue(any("Dockerfile missing" in error for error in self.errors()))
@@ -581,6 +605,13 @@ class NodeImageTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        # Sibling fixture: the opencode2 bun tie (MR !1669 review IK-2) also
+        # runs here; patch it too so the tests never read the real file.
+        self.opencode2_dockerfile = self.root / "Dockerfile.opencode2"
+        self.opencode2_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
             "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
@@ -608,6 +639,7 @@ class NodeImageTieTests(unittest.TestCase):
         with mock.patch.multiple(
             config,
             OPENCODE_DOCKERFILE=self.opencode_dockerfile,
+            OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
@@ -651,6 +683,25 @@ class NodeImageTieTests(unittest.TestCase):
             f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS runtime\n"
         )
         self.assertTrue(any("CI_NODE_IMAGE digest must match" in error for error in self.errors()))
+
+    def test_short_form_and_mirror_node_from_are_tied(self):
+        # MR !1669 review IK-1: the tie follows the repository's last path
+        # segment, so a drifted runtime stage is caught however the node
+        # image is spelled — docker.io/node, a mirror path, or bare node.
+        for runtime_from in (
+            f"FROM docker.io/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS runtime\n",
+            f"FROM registry.example/mirror/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS runtime\n",
+            f"FROM node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS runtime\n",
+        ):
+            with self.subTest(runtime_from=runtime_from):
+                self.write_dockerfile(
+                    f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n"
+                    + runtime_from
+                )
+                self.assertTrue(
+                    any("CI_NODE_IMAGE digest must match" in error for error in self.errors()),
+                    self.errors(),
+                )
 
     def test_missing_dockerfile_is_caught(self):
         self.assertTrue(any("Dockerfile missing" in error for error in self.errors()))
@@ -699,6 +750,13 @@ class DebianSnapshotTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        # Sibling fixture: the opencode2 bun tie (MR !1669 review IK-2) also
+        # runs here; patch it too so the tests never read the real file.
+        self.opencode2_dockerfile = self.root / "Dockerfile.opencode2"
+        self.opencode2_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
             "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
@@ -727,6 +785,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
         with mock.patch.multiple(
             config,
             OPENCODE_DOCKERFILE=self.opencode_dockerfile,
+            OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)

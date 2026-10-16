@@ -1386,14 +1386,18 @@ def cross_check_image_digest(
         )
         return
     dockerfile_text = dockerfile.read_text(encoding="utf-8")
-    # The package name must be followed by a tag/digest/whitespace boundary:
-    # without it a `library/nodejs`-style image would match a `library/node`
-    # tie and silently stand in for the pinned package.
+    # Tie every FROM whose repository's last path segment is the package's
+    # (any registry or namespace: `docker.io/node`, a mirror path and a bare
+    # `node` all count), followed by a tag/digest/whitespace boundary so a
+    # `nodejs`-style name does not stand in for the pinned package (MR !1669
+    # review IK-1: the previous full-repository match left `docker.io/node`
+    # and mirror-path spellings untied).
+    repository = re.escape(from_package.rsplit("/", 1)[-1])
     from_lines = [
         line.strip()
         for line in dockerfile_text.splitlines()
         if re.match(
-            rf"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?\S*{re.escape(from_package)}[:@\s]",
+            rf"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?(?:\S*/)?{repository}[:@\s]",
             line,
         )
     ]
@@ -1433,11 +1437,16 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
             errors.append(f"{name}={value!r} is not digest-pinned")
 
     # The worker-opencode-ts and worker-opencode2-ts lanes must test with the
-    # same bun content the worker image builds and runs with (MR !1552 review
-    # ER-5).
+    # same bun content the worker images build and run with (MR !1552 review
+    # ER-5; the opencode2 tie was added after MR !1669 review IK-2 found the
+    # lane's image untied).
     cross_check_image_digest(
         variables, "CI_BUN_IMAGE", OPENCODE_DOCKERFILE, "oven/bun",
         "opencode4lunarwing/Dockerfile", errors,
+    )
+    cross_check_image_digest(
+        variables, "CI_BUN_IMAGE", OPENCODE2_DOCKERFILE, "oven/bun",
+        "opencode2.4lunarwing/Dockerfile", errors,
     )
     # The worker-kimi-ts lane must test with the same node content the kimi
     # worker image builds and runs with (MR !1590 review GB-2).
