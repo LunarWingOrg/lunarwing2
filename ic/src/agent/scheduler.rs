@@ -803,7 +803,11 @@ mod tests {
             auto_approve_tools: true,
             default_timezone: "UTC".to_string(),
             max_tokens_per_job,
-            handle_message_timeout: std::time::Duration::from_secs(300),
+            // WI#380: derive from the production settings default so this
+            // helper cannot drift from `AgentConfig::resolve`.
+            handle_message_timeout: std::time::Duration::from_secs(
+                crate::settings::AgentSettings::default().handle_message_timeout_secs,
+            ),
             self_repair_op_timeout: std::time::Duration::from_secs(60),
             session_prune_timeout: std::time::Duration::from_secs(30),
             pending_gate_expiry_secs: 1800,
@@ -834,6 +838,22 @@ mod tests {
                 hooks,
             },
         )
+    }
+
+    /// WI#380 guard: the test helper's `handle_message_timeout` must track the
+    /// production default (`AgentSettings::default().handle_message_timeout_secs`,
+    /// consumed by `AgentConfig::resolve`). Fails if the helper is re-hardcoded
+    /// or the two otherwise drift apart.
+    #[test]
+    fn test_helper_handle_message_timeout_matches_production_default() {
+        let sched = make_test_scheduler(0);
+        assert_eq!(
+            sched.config.handle_message_timeout,
+            std::time::Duration::from_secs(
+                crate::settings::AgentSettings::default().handle_message_timeout_secs
+            ),
+            "make_test_scheduler drifted from the production handle_message_timeout default"
+        );
     }
 
     #[tokio::test]
