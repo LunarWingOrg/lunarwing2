@@ -544,7 +544,12 @@ build executes — CY-4 precedent) hashed into the promotion evidence in
 entry to exist under the repo root and, for the kimi lane, to cover the
 fixed build-read set plus every on-disk `kimicode4lunarwing/scripts/*.ts`
 (the Dockerfile's `COPY scripts/*.ts` glob), so a new bridge source must
-join the list in `build-worker-image.sh` in the same commit.
+join the list in `build-worker-image.sh` in the same commit. The kimi core
+set includes the shipped `health_server.py` and `agent_comm_protocol.json`
+(MR !1670 IL-1). Every worker block must assign `input_files` exactly once,
+with no assignments outside the blocks (IL-3); `export`, `declare`,
+`readonly` and `+=` assignment lines also count, so a later assignment
+cannot replace the checked list before hashing.
 
 The former `rust-compile-16gb` lock serialized heavy Rust work across pipelines:
 for example, pipeline #3812 waited while #3811 ran its backend tests. That lock

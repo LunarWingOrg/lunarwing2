@@ -370,6 +370,77 @@ class WorkerInputManifestTests(unittest.TestCase):
             )
         )
 
+    def test_kimi_runtime_input_omissions_are_caught(self):
+        # IL-1: literal paths keep this independent of the core tuple used
+        # by the fixture; dropping either required entry must fail this pin.
+        for filename in ("health_server.py", "agent_comm_protocol.json"):
+            with self.subTest(filename=filename):
+                relative = f"kimicode4lunarwing/{filename}"
+                self.write_build_script(
+                    kimi_files=[path for path in self.kimi_files if path != relative]
+                )
+                self.assertTrue(any(
+                    "omits build-read input" in error and relative in error
+                    for error in self.errors()
+                ))
+
+    def test_second_input_files_assignment_is_caught(self):
+        # IL-3: the shell uses the last assignment, even though the parser
+        # can still see the complete first list. Prefixes/+= count too.
+        before, after = self.build_script.read_text(encoding="utf-8").rsplit(
+            "        ;;", 1
+        )
+        for assignment in (
+            "input_files=kimicode4lunarwing/Dockerfile",
+            "input_files='kimicode4lunarwing/Dockerfile'",
+            'input_files="kimicode4lunarwing/Dockerfile"',
+            "export input_files=kimicode4lunarwing/Dockerfile",
+            "declare -x input_files=kimicode4lunarwing/Dockerfile",
+            "readonly input_files=kimicode4lunarwing/Dockerfile",
+            "input_files+=x",
+            "export input_files+=x",
+        ):
+            with self.subTest(assignment=assignment):
+                self.build_script.write_text(
+                    f"{before}        {assignment}\n        ;;{after}", encoding="utf-8"
+                )
+                self.assertTrue(any(
+                    "kimi block" in error and "exactly once" in error
+                    for error in self.errors()
+                ))
+
+    def test_input_files_assignment_outside_worker_blocks_is_caught(self):
+        original = self.build_script.read_text(encoding="utf-8")
+        assignment = "input_files=kimicode4lunarwing/Dockerfile\n"
+        for text in (assignment + original, original + assignment):
+            with self.subTest(text=text):
+                self.build_script.write_text(text, encoding="utf-8")
+                self.assertTrue(any("exactly once" in error for error in self.errors()))
+
+    def test_assignment_counts_cannot_balance_across_workers(self):
+        # A global count alone would miss a duplicate in kimi balanced by a
+        # missing declaration in pebble. Check each block independently.
+        text = self.build_script.read_text(encoding="utf-8").replace(
+            "        input_files='pebble4lunarwing/Dockerfile'\n", ""
+        ).replace(
+            "    kimi)\n", "    kimi)\n        input_files=kimicode4lunarwing/Dockerfile\n"
+        )
+        self.build_script.write_text(text, encoding="utf-8")
+        errors = self.errors()
+        for worker in ("pebble", "kimi"):
+            with self.subTest(worker=worker):
+                self.assertTrue(any(
+                    f"{worker} block" in error and "exactly once" in error for error in errors
+                ))
+
+    def test_commented_input_files_assignments_are_ignored(self):
+        text = self.build_script.read_text(encoding="utf-8").replace(
+            "    kimi)\n",
+            "    kimi)\n        # input_files=old\n        # export input_files+=old\n",
+        )
+        self.build_script.write_text(text, encoding="utf-8")
+        self.assertEqual(self.errors(), [])
+
     def test_unlisted_kimi_bridge_source_is_caught(self):
         # A new scripts/*.ts appears on disk (the Dockerfile's COPY glob picks
         # it up) but never joins the manifest.

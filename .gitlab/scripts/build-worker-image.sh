@@ -95,11 +95,14 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # into worker-inputs. The builder stage npm-ci's scripts/, compiles
         # and executes every scripts/*.ts, and the in-build test gate reads
         # entrypoint.sh, hooks/ and config/; the CLI install cross-checks
-        # kimi-cli/package.json against KIMI_CODE_VERSION. The Dockerfile's
-        # `COPY scripts/*.ts` glob means a new bridge source must join this
-        # list in the same commit (validate_config.py enforces it).
+        # kimi-cli/package.json against KIMI_CODE_VERSION. Runtime COPYs also
+        # ship health_server.py and agent_comm_protocol.json (IL-1).
+        # The Dockerfile's `COPY scripts/*.ts` glob means a new bridge source
+        # must join this list in the same commit (validate_config.py enforces it).
         input_files='kimicode4lunarwing/Dockerfile
 kimicode4lunarwing/entrypoint.sh
+kimicode4lunarwing/health_server.py
+kimicode4lunarwing/agent_comm_protocol.json
 kimicode4lunarwing/config/config.toml
 kimicode4lunarwing/hooks/headless_command_guard.mjs
 kimicode4lunarwing/kimi-cli/package.json

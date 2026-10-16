@@ -56,11 +56,14 @@ WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
 # Fixed build-read inputs of the kimi worker image build (the Dockerfile
 # cross-checks kimi-cli/package.json, npm-ci's both package dirs, tsc reads
 # tsconfig.json, and the in-build test gate reads entrypoint.sh, hooks/ and
-# config/). validate_worker_input_manifest requires all of them plus every
+# config/; runtime COPYs also ship the health server and protocol JSON).
+# validate_worker_input_manifest requires all of them plus every
 # on-disk kimicode4lunarwing/scripts/*.ts.
 KIMI_BUILD_INPUT_CORE = (
     "kimicode4lunarwing/Dockerfile",
     "kimicode4lunarwing/entrypoint.sh",
+    "kimicode4lunarwing/health_server.py",
+    "kimicode4lunarwing/agent_comm_protocol.json",
     "kimicode4lunarwing/config/config.toml",
     "kimicode4lunarwing/hooks/headless_command_guard.mjs",
     "kimicode4lunarwing/kimi-cli/package.json",
@@ -1029,25 +1032,50 @@ def worker_input_files(block: str) -> list[str]:
     return []
 
 
+def input_files_assignments(build_script: str) -> int:
+    """Count assignment lines, including export/declare/readonly and +=."""
+    count = 0
+    for line in build_script.splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        head = line.strip().split("=", 1)[0].split()
+        if head and head[-1].rstrip("+") == "input_files":
+            count += 1
+    return count
+
+
 def validate_worker_input_manifest(errors: list[str]) -> None:
     """The worker-inputs manifest is the promotion evidence of what went
     into a candidate image (CY-4: build-executed scripts must hash into it).
 
     Every listed entry must be a safe relative path that exists under the
     repo root — a missing file would otherwise only fail at the manual
-    protected candidate build (sha256sum under `set -eu`). For kimi, whose
-    Dockerfile builder stage compiles and runs every `scripts/*.ts` via its
-    in-build test gate, the manifest must additionally cover the fixed
-    build-read set and every on-disk scripts/*.ts, so the Dockerfile's
+    protected candidate build (sha256sum under `set -eu`). Each worker must
+    assign input_files exactly once, with no assignments outside the worker
+    blocks (IL-3): the shell must hash the same list this check inspects.
+    For kimi, whose Dockerfile builder stage compiles and runs every
+    `scripts/*.ts` via its in-build test gate, the manifest must additionally
+    cover the fixed build-read set and every on-disk scripts/*.ts, so the Dockerfile's
     `COPY scripts/*.ts` glob cannot silently outgrow the recorded inputs.
     The on-disk glob reads the working tree; CI checkouts are clean, so an
     untracked scratch .ts only ever fails a local run."""
     build_script = WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
     blocks = worker_case_blocks(build_script)
+    assignments = input_files_assignments(build_script)
+    if assignments != len(blocks):
+        errors.append(
+            "build-worker-image.sh must assign input_files exactly once per worker "
+            f"block ({len(blocks)}), found {assignments}; a reassignment can change "
+            "the hashed manifest behind this check"
+        )
     for worker in WORKER_NAMES:
         block = blocks.get(worker)
         if block is None:
             continue  # validate_worker_versions already reports the missing block
+        if input_files_assignments(block) != 1:
+            errors.append(
+                f"build-worker-image.sh {worker} block must assign input_files exactly once"
+            )
         entries = [entry for entry in worker_input_files(block) if entry]
         if not entries:
             errors.append(
