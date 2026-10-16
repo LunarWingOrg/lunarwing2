@@ -5435,9 +5435,7 @@ mod runtime_index_tests {
         let version8_fp = &version8_blake3.as_str()[..32];
         assert!(
             captured.contains(fingerprint)
-                && captured.contains(&format!(
-                    " bytes=9 blake3={version8_fp} fail_closed=false"
-                )),
+                && captured.contains(&format!(" bytes=9 blake3={version8_fp} fail_closed=false")),
             "the failed rotation must fingerprint the un-rotated rolling slot: {captured}"
         );
         assert!(
@@ -5536,8 +5534,7 @@ mod runtime_index_tests {
         let one_fp = &one_blake3.as_str()[..32];
         assert!(
             captured.contains("fingerprint of the un-rotated rolling-slot content")
-                && captured
-                    .contains(&format!(" bytes=3 blake3={one_fp} fail_closed=false")),
+                && captured.contains(&format!(" bytes=3 blake3={one_fp} fail_closed=false")),
             "the lost un-rotated content (\"one\") must be fingerprinted: {captured}"
         );
         let scrubbed = crate::tracing_fmt::daemon_log_scrubber().scrub(&captured);
@@ -5659,8 +5656,7 @@ mod runtime_index_tests {
         let version1_fp = &version1_blake3.as_str()[..32];
         assert!(
             captured.contains("discarding the second-oldest generation")
-                && captured
-                    .contains(&format!("discarded_bytes=9 discarded_blake3={version1_fp}")),
+                && captured.contains(&format!("discarded_bytes=9 discarded_blake3={version1_fp}")),
             "the discard line must precede the first slot write: {captured}"
         );
         let version8_blake3 = blake3::hash(b"version 8").to_hex();
