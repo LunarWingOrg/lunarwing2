@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# WI#402: single-node scripts must not bake developer-LAN LLM endpoint defaults.
+# Pins the fail-loud behavior of:
+#   - ic/scripts/setup-instance.sh         (--llm-base-url required)
+#   - ic/scripts/lunarwing-xmpp-test-env.sh (init/bring-up requires
+#     LUNARWING_TEST_TENSORZERO_URL or TENSORZERO_URL, or an existing
+#     proxy.env value; doctor reports NOT CONFIGURED instead of dying)
+#   - ic/scripts/lunarwing_toolcall_diag.py (--host required; the historical
+#     dev-LAN gateway only via an explicit --default)
+# No docker, network, or cargo needed — argument/write-path behavior only.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IC_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SETUP_INSTANCE="$IC_DIR/scripts/setup-instance.sh"
+TEST_ENV="$IC_DIR/scripts/lunarwing-xmpp-test-env.sh"
+DIAG="$IC_DIR/scripts/lunarwing_toolcall_diag.py"
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+failures=0
+
+pass() {
+  echo "  PASS: $1"
+}
+
+fail() {
+  echo "  FAIL: $1"
+  echo "        $2"
+  failures=$((failures + 1))
+}
+
+assert_exit() { # <label> <expected-rc> <actual-rc>
+  if [[ "$2" == "$3" ]]; then
+    pass "$1"
+  else
+    fail "$1" "expected rc=$2, got rc=$3"
+  fi
+}
+
+assert_contains() { # <label> <haystack> <needle>
+  if [[ "$2" == *"$3"* ]]; then
+    pass "$1"
+  else
+    fail "$1" "expected to contain [$3], got: ${2:0:200}"
+  fi
+}
+
+assert_absent() { # <label> <path>
+  if [[ ! -e "$2" ]]; then
+    pass "$1"
+  else
+    fail "$1" "expected $2 to not exist"
+  fi
+}
+
+assert_file_contains() { # <label> <path> <needle>
+  if [[ -f "$2" ]] && grep -qF "$3" "$2"; then
+    pass "$1"
+  else
+    fail "$1" "expected $2 to contain [$3]"
+  fi
+}
+
+echo "=== setup-instance.sh: --llm-base-url is required (WI#402) ==="
+
+out="$(LUNARWING_ONBOARD_LEGACY_OK=1 bash "$SETUP_INSTANCE" \
+  --base-dir "$WORK/si-a" --database libsql 2>&1)"
+rc=$?
+assert_exit "setup-instance dies without --llm-base-url" "1" "$rc"
+assert_contains "error names --llm-base-url" "$out" "--llm-base-url is required"
+assert_absent "no config.toml written on refusal" "$WORK/si-a/config.toml"
+
+out="$(LUNARWING_ONBOARD_LEGACY_OK=1 bash "$SETUP_INSTANCE" \
+  --base-dir "$WORK/si-b" --database libsql \
+  --llm-base-url 'http://127.0.0.1:3002/v1' 2>&1)"
+rc=$?
+assert_exit "setup-instance succeeds with --llm-base-url" "0" "$rc"
+assert_file_contains "config.toml carries the given endpoint" \
+  "$WORK/si-b/config.toml" 'openai_compatible_base_url = "http://127.0.0.1:3002/v1"'
+
+if grep -qF '192.168.1.157' "$SETUP_INSTANCE"; then
+  fail "setup-instance.sh source pin" "dev-LAN literal still present"
+else
+  pass "setup-instance.sh carries no dev-LAN literal"
+fi
+
+echo "=== lunarwing-xmpp-test-env.sh: explicit TensorZero URL at bring-up (WI#402) ==="
+
+ROOT_A="$WORK/env-a"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_A" bash "$TEST_ENV" init 2>&1)"
+rc=$?
+assert_exit "init dies with no knob on a fresh root" "1" "$rc"
+assert_contains "error names LUNARWING_TEST_TENSORZERO_URL" "$out" "LUNARWING_TEST_TENSORZERO_URL"
+assert_absent "no proxy.env written on refusal" "$ROOT_A/env/proxy.env"
+assert_absent "no lunarwing.env written on refusal" "$ROOT_A/env/lunarwing.env"
+
+out="$(env -u TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_A" LUNARWING_TEST_TENSORZERO_URL="http://tz.test:3000" \
+  bash "$TEST_ENV" init 2>&1)"
+rc=$?
+assert_exit "init succeeds with LUNARWING_TEST_TENSORZERO_URL" "0" "$rc"
+assert_file_contains "proxy.env bakes the given URL" "$ROOT_A/env/proxy.env" \
+  "TENSORZERO_URL=http://tz.test:3000"
+assert_file_contains "lunarwing.env still points at the local proxy" \
+  "$ROOT_A/env/lunarwing.env" "LLM_BASE_URL=http://127.0.0.1:3002/v1"
+
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_A" bash "$TEST_ENV" init 2>&1)"
+rc=$?
+assert_exit "re-init without knob reuses the baked proxy.env value" "0" "$rc"
+
+ROOT_B="$WORK/env-b"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_B" TENSORZERO_URL="http://fallback.test:3000" \
+  bash "$TEST_ENV" init 2>&1)"
+rc=$?
+assert_exit "plain TENSORZERO_URL is honored as a fallback" "0" "$rc"
+assert_file_contains "proxy.env bakes the fallback URL" "$ROOT_B/env/proxy.env" \
+  "TENSORZERO_URL=http://fallback.test:3000"
+
+ROOT_C="$WORK/env-c"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_C" bash "$TEST_ENV" doctor 2>&1)"
+rc=$?
+assert_exit "doctor does not die without the knob" "0" "$rc"
+assert_contains "doctor reports the gateway as not configured" "$out" "NOT CONFIGURED"
+
+if grep -qF '192.168.1.157' "$TEST_ENV"; then
+  fail "lunarwing-xmpp-test-env.sh source pin" "dev-LAN literal still present"
+else
+  pass "lunarwing-xmpp-test-env.sh carries no dev-LAN literal"
+fi
+
+echo "=== lunarwing_toolcall_diag.py: --host required, literal behind --default (WI#402) ==="
+
+out="$(python3 "$DIAG" 2>&1)"
+rc=$?
+assert_exit "diag dies without --host" "2" "$rc"
+assert_contains "error names --host" "$out" "--host is required"
+
+out="$(python3 "$DIAG" --host x --default 2>&1)"
+rc=$?
+assert_exit "diag rejects --host with --default" "2" "$rc"
+assert_contains "error names the conflict" "$out" "mutually exclusive"
+
+python3 "$DIAG" --help >/dev/null 2>&1
+rc=$?
+assert_exit "diag --help exits 0" "0" "$rc"
+
+out="$(DIAG_PATH="$DIAG" python3 - <<'PY'
+import importlib.util
+import os
+
+spec = importlib.util.spec_from_file_location("diag", os.environ["DIAG_PATH"])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+a = m.parse_args(["--default"])
+assert a.default is True and a.port == m.GATEWAY_PORT
+assert m.DEFAULT_GATEWAY_HOST == "192.168.1.157"
+
+a = m.parse_args(["--host", "10.0.0.9", "--port", "1234"])
+assert a.host == "10.0.0.9" and a.port == 1234 and a.default is False
+print("parse pins ok")
+PY
+)"
+rc=$?
+assert_exit "diag parse layer resolves --default and --host/--port" "0" "$rc"
+assert_contains "parse pin output" "$out" "parse pins ok"
+
+echo
+if [[ "$failures" -gt 0 ]]; then
+  echo "SINGLE-NODE ENDPOINT DEFAULTS: $failures FAILURES"
+  exit 1
+fi
+echo "SINGLE-NODE ENDPOINT DEFAULTS: ALL CHECKS PASSED"
