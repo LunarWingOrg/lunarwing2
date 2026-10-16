@@ -471,6 +471,39 @@ ADVISORY_GATE_JOBS = (
     "default-graph-advisory-guard",
 )
 
+# Run-135 IP-1 (MR !1680 review): a gate that never runs its checker is as
+# optional as an allow_failure one. `exit 0` before the wrapper (job or
+# template before_script, or the script itself), `|| true`, or an echoed
+# wrapper name all kept the mention-only pins green, so each gate's effective
+# script and bootstrap are pinned exactly and only these keys may survive
+# extends resolution. A deliberate change edits these tuples in the same
+# commit.
+ADVISORY_GATE_SCRIPTS = {
+    "cargo-deny": [
+        "bash .gitlab/scripts/install-cargo-deny.sh",
+        "bash .gitlab/scripts/cargo-deny-check.sh",
+    ],
+    "satellite-advisory-sweep": [
+        "bash .gitlab/scripts/install-cargo-deny.sh",
+        "bash .gitlab/scripts/check-satellite-advisories.sh",
+    ],
+    "lockfile-only-advisory-guard": [
+        "bash .gitlab/scripts/check-lockfile-only-advisories.sh",
+    ],
+    "default-graph-advisory-guard": [
+        "bash .gitlab/scripts/check-default-graph-advisories.sh",
+    ],
+}
+ADVISORY_GATE_BEFORE_SCRIPT = [
+    'df -h "$CI_PROJECT_DIR"',
+    "bash .gitlab/scripts/bootstrap-rust.sh",
+    "bash .gitlab/scripts/bootstrap-sccache.sh",
+]
+ADVISORY_GATE_EFFECTIVE_KEYS = frozenset({
+    "after_script", "before_script", "cache", "image", "needs", "rules",
+    "script", "stage", "tags",
+})
+
 
 def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> None:
     """The release audit's advisory gates must not be allowed to fail.
@@ -497,7 +530,18 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
     value; a job-level (or rule-level) `variables:` entry overrides it for
     that job and reroutes the pinned jobs while the top-level pin stays
     green, so no job may name a runner tag variable in any variables
-    scope."""
+    scope.
+
+    MR !1680 review IP-1 (run-135): a gate that never runs its checker is
+    as optional as an allow_failure one, and the checks above did not see
+    it — `exit 0` as the first script line or in the job's (or the shared
+    .rust-job template's) before_script, `|| true` on the wrapper, or an
+    `echo` of the wrapper name all kept the mention-only pins green. Each
+    gate's effective script and bootstrap are therefore pinned exactly
+    (ADVISORY_GATE_SCRIPTS / ADVISORY_GATE_BEFORE_SCRIPT), and only
+    ADVISORY_GATE_EFFECTIVE_KEYS may survive extends resolution —
+    job-level variables, hooks, inherit, parallel or timeout can hollow
+    out a gate just as well."""
     template = resolve_extends(merged.get(".full-validation-context"), merged)
     template_rules = template.get("rules")
     if not isinstance(template_rules, list) or not template_rules:
@@ -535,6 +579,21 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
             )
         if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
             errors.append(f"{job_name} tags must be exactly ['$CI_RUST_RUNNER_TAG']")
+        if effective.get("script") != ADVISORY_GATE_SCRIPTS[job_name]:
+            errors.append(
+                f"{job_name} script must be exactly {ADVISORY_GATE_SCRIPTS[job_name]!r}"
+            )
+        if effective.get("before_script") != ADVISORY_GATE_BEFORE_SCRIPT:
+            errors.append(
+                f"{job_name} before_script must be exactly the pinned .rust-job "
+                f"bootstrap {ADVISORY_GATE_BEFORE_SCRIPT!r}"
+            )
+        unexpected = sorted(set(effective) - ADVISORY_GATE_EFFECTIVE_KEYS)
+        if unexpected:
+            errors.append(
+                f"{job_name} must not carry job keys {unexpected}; variables, "
+                "hooks, inherit, parallel or timeout can hollow out a gate"
+            )
     for job_name, job in merged.items():  # IF-2: runner-tag variables at job or rule level
         if not isinstance(job, dict) or job_name.startswith("."):
             continue
@@ -1606,23 +1665,36 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                 "ARG declarations or ${DEBIAN_SNAPSHOT} snapshot URLs: "
                 f"{stray_references}"
             )
-        # MR !1665 review IF-3: the source rule must also see the one-line
-        # shapes that add a live mirror without touching the pinned lines —
-        # a bracketed options list between `deb`/`deb-src` and the URL
-        # (`deb [trusted=yes] http://…`), and deb822 `URIs:` lines (the
-        # Dockerfile deletes debian.sources, but a RUN can write a new one).
-        deb_source = re.compile(
-            r"(?:^|[\"'\s])(?:deb(?:-src)?\s+(?:\[[^\]]*\]\s*)?|URIs:\s*)https?://"
-        )
-        snapshot_source = re.compile(
-            r"(?:deb(?:-src)?\s+(?:\[[^\]]*\]\s*)?|URIs:\s*)"
-            r"https?://snapshot\.debian\.org/archive/",
+        # Run-135 IP-2 (MR !1680 review; after MR !1665 review IF-3): every
+        # apt source on a line must be a snapshot source, not just one of
+        # them (a line-level check let one RUN line add a live mirror beside
+        # a snapshot one). Any URL scheme counts (apt's mirror+http,
+        # tor+https, file:), the type and field names are matched
+        # case-insensitively, a literal printf newline or tab separates
+        # tokens, and every URI of a deb822 URIs: field is checked.
+        bs = chr(92)
+        quotes = chr(34) + chr(39)
+        sep = f"(?:{bs}s|{bs}{bs}t)+"
+        boundary = f"(?:^|[{quotes}{bs}s]|{bs}{bs}[nt])"
+        one_line_source = re.compile(
+            f"{boundary}deb(?:-src)?{sep}(?:{bs}[[^{bs}]]*{bs}]{sep})?"
+            f"([a-z][a-z0-9+.-]*:{bs}S*)",
             re.IGNORECASE,
         )
+        deb822_uris = re.compile(f"{boundary}URIs:([^{quotes}]*)", re.IGNORECASE)
+        snapshot_uri = re.compile(
+            f"https?://snapshot{bs}.debian{bs}.org/archive/", re.IGNORECASE
+        )
+
+        def live_sources(line: str) -> list[str]:
+            uris = [found.group(1) for found in one_line_source.finditer(line)]
+            for found in deb822_uris.finditer(line):
+                value = found.group(1).split(bs + "n")[0].replace(bs + "t", " ")
+                uris.extend(value.split() or [""])
+            return [uri for uri in uris if not snapshot_uri.match(uri)]
+
         non_snapshot_sources = [
-            line.strip()
-            for line in dockerfile_text.splitlines()
-            if deb_source.search(line) and not snapshot_source.search(line)
+            line.strip() for line in dockerfile_text.splitlines() if live_sources(line)
         ]
         if non_snapshot_sources:
             errors.append(
