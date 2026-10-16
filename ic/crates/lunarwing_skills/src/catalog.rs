@@ -1169,4 +1169,62 @@ mod tests {
             Some("1.2.3")
         );
     }
+
+    /// Build an in-memory ZIP archive from (entry name, content) pairs,
+    /// deflated like a real registry download. Entry names are stored
+    /// verbatim, so hostile paths reach `decode_download` unchanged.
+    fn zip_archive(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn decode_download_reads_skill_md_and_python_snippets_from_zip() {
+        let archive = zip_archive(&[
+            (
+                "my-skill/SKILL.md",
+                "---\nname: my-skill\n---\n\nDo the thing.\n",
+            ),
+            ("my-skill/scripts/helper.py", "print('hi')\n"),
+            ("my-skill/README.md", "not a snippet\n"),
+        ]);
+        let decoded = decode_download(&archive).unwrap();
+        assert!(decoded.skill_md_content.contains("Do the thing."));
+        assert_eq!(
+            decoded.code_snippet_files,
+            vec![("helper.py".to_string(), "print('hi')\n".to_string())]
+        );
+    }
+
+    #[test]
+    fn decode_download_refuses_parent_dir_entry_paths() {
+        // WI#417: `enclosed_name()` is the only guard between a registry
+        // archive and the caller's path handling, so a zip crate bump must
+        // not quietly change what it rejects.
+        let archive = zip_archive(&[("../evil/SKILL.md", "---\nname: evil\n---\n")]);
+        let err = decode_download(&archive).unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe file path"),
+            "expected the unsafe-path refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_download_treats_absolute_entry_paths_as_relative() {
+        // zip 2 refused an absolute entry name in `enclosed_name()`; zip 9
+        // strips the root and keeps the rest inside the destination. The
+        // catalog never extracts, it reads entries by file name, so the
+        // skill body is still read. Pinned so the next bump cannot change
+        // either outcome unnoticed.
+        let archive = zip_archive(&[("/etc/SKILL.md", "---\nname: abs\n---\n")]);
+        let decoded = decode_download(&archive).unwrap();
+        assert_eq!(decoded.skill_md_content, "---\nname: abs\n---\n");
+        assert!(decoded.code_snippet_files.is_empty());
+    }
 }
