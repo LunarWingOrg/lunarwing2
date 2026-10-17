@@ -6780,7 +6780,9 @@ mod tests {
         }];
         let mut capabilities = ChannelCapabilities::for_channel("test");
         capabilities.tool_capabilities.http =
-            Some(HttpCapability::new(vec![EndpointPattern::host("127.0.0.1")]));
+            Some(HttpCapability::new(vec![EndpointPattern::host(
+                "127.0.0.1",
+            )]));
         let mut store_data = ChannelStoreData::new(
             1024 * 1024,
             "test",
@@ -6820,8 +6822,8 @@ mod tests {
     /// know, so `without_url()` is the layer covering it.
     #[test]
     fn channel_guest_send_error_strips_url() {
-        use super::lunarwing::agent::channel_host::Host as _;
         use super::ChannelStoreData;
+        use super::lunarwing::agent::channel_host::Host as _;
         use crate::tools::wasm::{EndpointPattern, HttpCapability};
         use std::sync::Arc;
 
@@ -6829,7 +6831,9 @@ mod tests {
         credentials.insert("API_TOKEN".to_string(), "P@ss word!".to_string());
         let mut capabilities = ChannelCapabilities::for_channel("test");
         capabilities.tool_capabilities.http =
-            Some(HttpCapability::new(vec![EndpointPattern::host("127.0.0.1")]));
+            Some(HttpCapability::new(vec![EndpointPattern::host(
+                "127.0.0.1",
+            )]));
         let mut store_data = ChannelStoreData::new(
             1024 * 1024,
             "test",
@@ -6919,8 +6923,14 @@ mod tests {
         use super::encoded_spellings;
 
         let spellings = encoded_spellings("P@ss word!");
-        assert!(spellings.contains(&"P%40ss%20word%21".to_string()), "{spellings:?}");
-        assert!(spellings.contains(&"P%40ss+word%21".to_string()), "{spellings:?}");
+        assert!(
+            spellings.contains(&"P%40ss%20word%21".to_string()),
+            "{spellings:?}"
+        );
+        assert!(
+            spellings.contains(&"P%40ss+word%21".to_string()),
+            "{spellings:?}"
+        );
         assert!(!spellings.iter().any(|s| s.is_empty()), "{spellings:?}");
         assert!(
             !spellings.contains(&"P@ss word!".to_string()),
