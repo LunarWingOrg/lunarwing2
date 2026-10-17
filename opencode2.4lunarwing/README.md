@@ -55,7 +55,7 @@ workspace work.
 
 | Area | v1 (`opencode4lunarwing`) | v2 (this worker) |
 |---|---|---|
-| Pin | v1.18.25 (proven) | v2.0.24 (beta in practice) |
+| Pin | v1.18.25 (proven) | v2.0.32 (beta in practice) |
 | Client SDK | `@opencode-ai/sdk/v2/client` | `@opencode/client/promise` |
 | Config file | `config/opencode.json` | `config/opencode2.json` |
 | Config shape | `provider.<id>.{npm,options.baseURL}` | `providers.<id>.{package,settings.baseURL}` |
@@ -65,6 +65,12 @@ workspace work.
 | Container UID | 10001 | 10003 |
 | mt-admin ports | `opencode_wss` / `opencode_health` (extended block) | `opencode2_wss` / `opencode2_health` (dedicated range, registry v17) |
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
+
+WI#427 approves this pin at `843a6c514e606b436a7fe713422ace0a93ad3d61`.
+The build compiles OpenTunnel out; the wrapper refuses service/pairing and
+non-loopback serving, and sharing/self-update stay disabled. See
+`docs/ops/WORKER-CONTAINERS.md` for the bump review, verification and rollout
+record, including the open WI#369 SDK-gate and WI#424 egress follow-ups.
 
 ## Do not configure both lanes on one tenant during the transition
 

@@ -92,7 +92,12 @@ class EntrypointConfigTests(unittest.TestCase):
                 self.assertEqual(json.loads(service.read_text()), {"disabled": True})
                 # Simulate the mutable files left behind by an earlier boot.
                 self.target.write_text('{"share": "auto", "update": "enable"}')
-                service.write_text('{"disabled": false, "hostname": "0.0.0.0"}')
+                # WI#427: v2.0.32 stores remote as a route object and keeps
+                # consent separately; a restart must discard both too.
+                service.write_text(json.dumps({
+                    "disabled": False, "hostname": "0.0.0.0",
+                    "remote": {"route": "0123456789abcdef"}, "remoteAccepted": True,
+                }))
 
     def test_paseo_only_can_edit_the_materialized_config(self) -> None:
         config = self.boot(PASEO_URL="https://paseo.example.test", PASEO_TOKEN="fixture-token")

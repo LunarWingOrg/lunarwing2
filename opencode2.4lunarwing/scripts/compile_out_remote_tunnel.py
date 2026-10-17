@@ -5,12 +5,13 @@ pinned opencode build, fail-closed.
 Runs in the image builder stage against the checked-out upstream tree (same
 style as prepare_reproducible_build.py, which fails the build on drift):
 
-- Pin predates the tunnel (v2.0.24): no module, no references, no
+- Historical pin predates the tunnel (v2.0.24): no module, no references, no
   @opentunnel dependencies — log and pass.
 - Tunnel present (v2.0.26+): packages/cli/src/services/remote-tunnel.ts is
   replaced with a stub that fails closed (run/ensure die; hostname reports
   no tunnel so pairing degrades gracefully). The stub mirrors the v2.0.26
-  export surface; if importers start using anything beyond it, or the module
+  export surface, re-verified at v2.0.32 for WI#427; if importers start using
+  anything beyond it, or the module
   moves/renames (references remain but the expected path is gone), the build
   FAILS rather than silently shipping a live tunnel.
 - After stubbing, no source file may still reference the @opentunnel

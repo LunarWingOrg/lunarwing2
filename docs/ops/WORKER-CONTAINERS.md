@@ -179,13 +179,15 @@ path routes it through the daemon's tunnel. The only legitimate instruction
 channel into a worker is the daemon's job dispatch → the in-container bridge
 → the worker's agent API on loopback.
 
-This policy is why the opencode2 lane is pinned at **v2.0.24**: v2.0.26
+This policy originally held the opencode2 lane at **v2.0.24**: v2.0.26
 bundles OpenTunnel remote access (`packages/cli/src/services/remote-tunnel.ts`,
 `@opentunnel/client` → hosted relay `opentunnel.xyz`, no self-host option,
 anonymous device identity in the agent-writable `$XDG_DATA_HOME/opentunnel`),
 plus `opencode service set remote true` and `opencode pair` surfaces. !1490
-(v2.0.26 bump) must not merge while the guards below are the only thing
-between a prompt-injected task and a public remote-control channel.
+(v2.0.26 bump) was closed. **WI#427 (2026-10-17) records the maintainer's
+completed analysis and approval to cross that boundary at v2.0.32**, through
+the existing compile-out, wrapper, config and image assertions. See the
+v2.0.32 bump entry below for the source review and verification status.
 
 **Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
 wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
@@ -194,12 +196,13 @@ binary stays directly executable by the agent uid, and with egress open a
 compromised agent can fetch an upstream opencode (tunnel included) or run
 `@opentunnel/client` under bun against the loopback server, whatever the
 pin. **Only control 1 (the egress allowlist) holds against a compromised
-agent**; until it lands, a bump past v2.0.24 crosses on compile-out plus
-config alone.
+agent**. The maintainer-approved WI#427 bump deliberately crosses on
+compile-out plus config alone; it does not turn the in-image guards into
+an egress boundary. Control 1 remains open as **WI#424 for 2.1.7.0**.
 
 Enforced controls (opencode2 lane unless noted):
 
-1. **Egress allowlist (DEFERRED, maintainer's call per WI#357):** mt-admin
+1. **Egress allowlist (DEFERRED to WI#424, 2.1.7.0; maintainer's call):** mt-admin
    restricting worker egress to the configured LLM endpoint + git hosts.
    Not yet implemented; it is the only control that also covers future
    phone-home features and `webfetch`/shell exfiltration, and the only one
@@ -350,10 +353,10 @@ Enforced controls (opencode2 lane unless noted):
    runtime `PATH` `opencode` need not hit the wrapper; the entrypoint is
    unaffected (absolute `OPENCODE_BIN`) and the wrapper remains a
    naive-use guard.
-6. **Runtime smoke (DEFERRED to WI#345):** live `service.json`/`opentunnel`
-   dir/listener assertions against a running container belong to the WI#345
-   runtime-smoke suite, which does not exist yet. Control 9 covers the
-   listener half on live tenants.
+6. **Runtime smoke (automated suite DEFERRED to WI#424, 2.1.7.0):** live
+   `service.json`/`opentunnel` dir/listener assertions against a running
+   container are required manually for WI#427 until that suite exists.
+   Control 9 covers the listener half on live tenants.
 7. **Bump checklist (REQUIRED for every worker version bump).** The bump
    entry in this file must record the upstream features that add network
    exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
@@ -362,9 +365,10 @@ Enforced controls (opencode2 lane unless noted):
    these guards cover the *shipped binary*; against a compromised agent
    only control 1 makes the crossing safe (see the gate record above).
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
-   in the builder stage: at v2.0.24 it verifies there is no tunnel surface;
-   at v2.0.26+ it replaces `remote-tunnel.ts` with a fail-closed stub
-   (verified against the real v2.0.26 tree: importers use exactly
+   in the builder stage: the historical v2.0.24 path verifies there is no
+   tunnel surface; at the current v2.0.32 pin it replaces `remote-tunnel.ts`
+   with a fail-closed stub (re-verified against the real v2.0.32 tree for
+   WI#427: importers still use exactly
    `run`/`ensure`/`hostname`). Drift detection scans
    `packages/{cli,server,schema,core}/src` (`*.ts` and `*.tsx`), matches
    any quoted `@opentunnel/*` specifier (static, dynamic `import()`,
@@ -397,8 +401,8 @@ Enforced controls (opencode2 lane unless noted):
 **!1570 deployment note:** rebuild the worker image and recreate existing
 opencode2 containers through mt-admin to receive the protected boot files.
 Restarting a container on an older image does not apply the new ownership or
-startup logic. !1490 remains gated at v2.0.24; the service-config reset is not
-an egress boundary.
+startup logic. !1490 was closed; WI#427 now authorizes the v2.0.32 crossing.
+The service-config reset is not an egress boundary.
 
 Control 11 audit of the other lanes (2026-10-12, against pinned sources;
 re-checked 2026-10-13):
@@ -561,8 +565,8 @@ issue above); v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.24** at reviewed full commit
-`e7a34f09bfd9134dfade5a8ddb843f7030bc9a69`; the v2 bridge uses
+**v2.0.32** at reviewed full commit
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (WI#427); the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -792,6 +796,96 @@ cursor+order page is rejected with `InvalidCursorError` on the real server.
 this pin must run green and be cited on WI#303, and a WI#320-style runtime
 smoke against the candidate image should re-confirm the corrected executor
 paths end-to-end.
+
+### v2.0.32 bump — WI#427 (2026-10-17)
+
+**Authorization:** the maintainer's completed upstream analysis and explicit
+approval are recorded in [WI#427](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/427).
+The tag was independently resolved with `git ls-remote` to
+`843a6c514e606b436a7fe713422ace0a93ad3d61`. Both Dockerfile defaults and the
+CI case block's version/ref/provenance pins move together. The pinned Bun
+1.4.2 image digest and Debian snapshot stay unchanged.
+
+**Exposure inventory (v2.0.25–v2.0.32):** the following implementation
+cross-check supplements that decision, using the pinned source diff from
+`e7a34f09bfd9134dfade5a8ddb843f7030bc9a69`:
+
+| Upstream surface | Worker decision / enforcement |
+|---|---|
+| OpenTunnel remote access (`0d07f915`, `53533fd0`, `19fb8918`): shared device identity, relay routes on random subdomains, reconnect/retry | Compile out `packages/cli/src/services/remote-tunnel.ts`. The three consumers remain `service-config.ts` → `ensure`, `server-process.ts` → `run`, and `commands/handlers/pair.ts` → `hostname`; the existing refusing stub applies unchanged. Both dynamic and type-only `@opentunnel/client/effect` imports disappear. Declared packages stay in the upstream frozen lock; the built-binary marker scan remains mandatory. |
+| `pair --remote`, `--yes` / `-y` consent (`38454c6e`), `service set remote true`; saved `remote: { route }` and `remoteAccepted` | Refused by the existing every-token `pair`/`service` wrapper and session/config denies. Tests explicitly cover remote pairing with non-interactive consent and the boot reset discarding both saved fields. No new listener/pairing CLI command outside the guarded surface was found. |
+| Foreground serve, pairing addresses, remote URL advertisement; web-UI archive/compression changes | Keep explicit loopback serve and per-boot Basic auth. `serve --service` and non-loopback `--hostname` stay refused. Server-backed CLI commands still default to private servers via the boot-time `disabled: true` reset. |
+| Session sharing / publication | `share: "disabled"` remains valid in `packages/schema/src/config.ts`; no additional publication switch was introduced. Keep the baked config and startup protections. |
+| Remote MCP: capability negotiation, query-parameter compatibility and numeric timeouts (`fbf5f164`, `7b5f1bd9`, `a448d5b9`) | Existing explicitly configured outbound MCP clients remain supported. No new worker listener or automatic sharing default; these are not an egress boundary. |
+| Auto-update: WinGet support and install-method detection changes (`d46588fe`, `e5a557ef`, `707de583`, `47e5e715`), embedded release highlights | `update: "disable"` remains valid; no new auto-update key. Keep the pin and root-owned binary. WinGet is outside this Linux image; manual upgrade remains distinct from the disabled automatic policy. |
+| Experimental voice API (`packages/core/src/voice.ts`, `protocol/src/groups/voice.ts`) | Adds authenticated outbound voice-session creation using caller-supplied input and provider credentials, not another listener. The bridge does not call it or provision voice credentials; no startup publication is enabled. WI#424 remains the boundary work for arbitrary outbound use. |
+| External provider credentials and top-level integration/tool policies | Azure CLI credentials become external references and policy support is additive. No new exposure config is enabled by this lane; existing tool denies remain in force. |
+
+**SDK and build compatibility:** the generated promise client's six bridge
+methods remain present, with both stale nested paths absent. Review uses the
+actual `V2Event` union and its members for all eight bridge event names,
+alongside the existing build gate. `session.create/prompt/interrupt`,
+`permission.reply`, `event.subscribe`, and `message.list` retain the shapes
+used by the executor (including cursor paging without `order`). The CLI
+still honors `OPENCODE_CONFIG` and the injected password. `build.ts` changed
+(embedded app archive, plugin runtime bundling, release highlights and native
+architecture verification); its single `bytecode: true` and
+`splitting: true` settings still accept the checked reproducibility patch.
+
+**WI#369 deferral:** this bump proceeds without WI#369, as explicitly
+permitted by WI#427 gate 6. The existing gate still uses syntax-based call
+binding and corpus-wide event-literal matching; it is not a type/payload or
+V2-union proof. The source review and runtime checks for this pin do not
+close those future-drift blind spots. Goals item 64 remains open; goals
+item 2's historical hold is left for the maintainer to repurpose.
+
+**Local verification (2026-10-17):**
+
+- Bun 1.4.2 lane suites (`opencode_task_executor`, `path_expand`,
+  `opencode_result`, `task_prompt`) pass against the pinned client source.
+  The SDK gate reports six methods present, two stale methods absent and
+  eight event names present; a separate source check confirms all eight in
+  the 94-member generated `V2Event` union.
+- All **67 Python lane tests** pass (build profile 3, study-notes config 8,
+  exposure/wrapper 39, boot config 7, compile-out 10).
+- Full local Podman image build passes, including the same-source SDK build,
+  native CLI/version assertion, embedded tests, no-tunnel binary scan and
+  final ownership/mode/installed-wrapper checks. Local image ID:
+  `b38bde73fafb57ff95cdeb999f3d2bdd13b537ebf0325711940cf167fcdbde33`, tagged
+  `localhost/lunarwing-worker-opencode2:wi427`; source label identifies the
+  `be08f8548-wi427-worktree` build, not a committed/reproducibility-verified
+  candidate.
+- In a disposable `--network=none` container, the real websocket entrypoint
+  starts v2.0.32 and completes a WebSocket task through the real server/SDK
+  and a scripted loopback OpenAI-compatible model. API/bridge unauthenticated
+  requests return 401, the planted remote route and consent are reset,
+  effective config reports sharing/self-update disabled, all three wrapper
+  refusal shapes pass, and no OpenTunnel identity is created. This is local
+  integration evidence, not the outstanding real tenant/model job.
+- Repo-wide `.gitlab/tests`: **298 passed, 4 skipped** (the four Pebble
+  `dash` tests require a shell absent on this host), including the worker
+  exposure-policy guard. `ic/scripts/tests/test-mt-admin-opencode2.sh`
+  passes in full; `validate_config.py` and `git diff --check` pass.
+- Evidence: `/tmp/opencode/wi427-build.log`, `wi427-smoke.log`,
+  `wi427-check.log` and `wi427-v2-event-union.log`.
+
+**Remaining acceptance / rollout:** protected `worker-opencode2-candidate` (including
+the uncached whole-image digest comparison) and `worker-opencode2-scan`
+must still pass on the bump commit before promotion; an MR pipeline or
+local binary build does not satisfy those gates. This development host's
+mt-admin reports neither `scootaloo` nor `soarin` in its ports registry, so
+the tenant rollout and a real daemon-dispatched job remain pending on their
+host. Rebuild via `mt-admin build-opencode2-worker`, then
+`restart-tenant scootaloo` / `restart-tenant soarin` to recreate their worker
+containers (!1663). Verify no remote service config or OpenTunnel identity,
+effective sharing disabled, wrapper refusal of `service set remote true`,
+and `worker-listeners <tenant>` clean before driving an opencode2 job.
+
+**Rollback:** preserve each tenant's worker state before its first v2.0.32
+boot. Upstream adds the `project.time_archived` column and migrates Azure
+CLI credential records from OAuth tokens to external credentials. An image
+downgrade alone is not a verified database rollback; restore the matching
+pre-upgrade state with the prior image if rollback is needed.
 
 v2.0.24 bump (2026-10-07, v2.1.5.0 checklist item #2): tag SHA
 `e7a34f09bfd9134dfade5a8ddb843f7030bc9a69` verified live against the
