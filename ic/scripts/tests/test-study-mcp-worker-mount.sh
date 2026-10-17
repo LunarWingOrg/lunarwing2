@@ -62,6 +62,10 @@ mkdir -p \
   "$study_home/agent-notes-by-agent" \
   "$study_home/skills/study-notes" \
   "$(tenant_env_dir test)"
+# The tenant-side atomic writer (WI#390) requires a tenant-private (0700) env
+# dir for its 'private' parent policy, matching create_tenant_user on a real
+# provision; the bare mkdir above lands at the umask default (0755).
+chmod 0700 "$(tenant_env_dir test)"
 touch \
   "$study_home/study_notes_mcp.py" \
   "$study_home/memorydb.py" \
