@@ -557,6 +557,29 @@ pub fn redact_params(params: &serde_json::Value, sensitive: &[&str]) -> serde_js
     redacted
 }
 
+/// Redact a tool call's parameters for display and hook surfaces
+/// (WI#392, FI-5): the tool's declared `sensitive_params` (exact-match,
+/// per-tool contract) plus — for `http`/`web_fetch`, which declare no
+/// sensitive params — the shared http-surface redaction the persisted
+/// `ApprovalRequested` event already gets (credential-like header values,
+/// URL query credentials, string-encoded JSON/form body credentials).
+///
+/// Without the http arm, raw `Authorization` headers and `?api_key=…`
+/// URLs reached the approval prompt, the web UI, and `ToolCall` hook
+/// payloads even though the persisted event was redacted. The display
+/// copy of an `http` call now matches the persisted event exactly.
+pub fn redact_display_params(
+    action_name: &str,
+    params: &serde_json::Value,
+    sensitive: &[&str],
+) -> serde_json::Value {
+    let redacted = redact_params(params, sensitive);
+    if matches!(action_name, "http" | "web_fetch") {
+        return lunarwing_engine::types::event::redact_event_params(action_name, &redacted);
+    }
+    redacted
+}
+
 /// Lenient runtime validation of a tool's `parameters_schema()`.
 ///
 /// Use this function at tool-registration time to catch structural mistakes
@@ -1164,5 +1187,73 @@ mod tests {
             "any",
             ApprovalRequirement::UnlessAutoApproved
         ));
+    }
+
+    #[test]
+    fn redact_display_params_http_blanks_headers_url_and_body_credentials() {
+        // WI#392 (FI-5): the http tool declares no sensitive_params, so the
+        // display/hook copy needs the shared http-surface redaction — the
+        // same redaction the persisted ApprovalRequested event gets.
+        let params = serde_json::json!({
+            "method": "POST",
+            "url": "https://user:pass@api.example.com/data?api_key=raw-key&page=2",
+            "headers": {"Authorization": "Bearer raw-token", "Accept": "text/html"},
+            "body": "{\"client_secret\": \"body-secret\", \"keep\": 1}",
+        });
+        let redacted = redact_display_params("http", &params, &[]);
+        let serialized = redacted.to_string();
+        for leaked in ["raw-key", "raw-token", "body-secret", "user:pass"] {
+            assert!(
+                !serialized.contains(leaked),
+                "{leaked} leaked: {serialized}"
+            );
+        }
+        assert_eq!(redacted["headers"]["Authorization"], "[REDACTED]");
+        assert_eq!(redacted["headers"]["Accept"], "text/html");
+        assert!(
+            redacted["url"].as_str().expect("url").contains("page=2"),
+            "safe query param dropped: {}",
+            redacted["url"]
+        );
+        assert!(
+            redacted["body"]
+                .as_str()
+                .expect("body")
+                .contains("[REDACTED]"),
+            "body credential kept: {}",
+            redacted["body"]
+        );
+        // The input is untouched.
+        assert_eq!(params["headers"]["Authorization"], "Bearer raw-token");
+    }
+
+    #[test]
+    fn redact_display_params_web_fetch_shares_the_http_surface() {
+        let params = serde_json::json!({
+            "url": "https://api.example.com/data?access_token=raw-token",
+        });
+        let redacted = redact_display_params("web_fetch", &params, &[]);
+        assert!(
+            !redacted.to_string().contains("raw-token"),
+            "access_token leaked: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_display_params_non_http_keeps_the_exact_match_contract_only() {
+        // Non-http tools keep the declared sensitive-params contract; the
+        // http surface must not leak into other tools' display copies.
+        let params = serde_json::json!({
+            "command": "echo hi",
+            "token": "declared-secret",
+            "note": "see https://api.example.com/?api_key=untouched",
+        });
+        let redacted = redact_display_params("shell", &params, &["token"]);
+        assert_eq!(redacted["token"], "[REDACTED]");
+        assert_eq!(redacted["command"], "echo hi");
+        assert_eq!(
+            redacted["note"], "see https://api.example.com/?api_key=untouched",
+            "the http surface must not touch a non-http tool: {redacted}"
+        );
     }
 }

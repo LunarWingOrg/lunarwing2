@@ -112,6 +112,15 @@ fn summarize_mission_params(params: &serde_json::Value) -> Option<String> {
 /// record, not the resume path, so it keeps only the redacted copy. The
 /// pending gate holds the raw parameters for the actual resume.
 pub fn redact_event_params(action_name: &str, params: &serde_json::Value) -> serde_json::Value {
+    // Run-131 IM-3: arguments that arrive as one JSON-encoded object string
+    // are coerced to an object before approval and execution
+    // (`prepare_tool_params`), so redact inside the string as well.
+    if let serde_json::Value::String(raw) = params
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw)
+        && parsed.is_object()
+    {
+        return serde_json::Value::String(redact_event_params(action_name, &parsed).to_string());
+    }
     let mut redacted = lunarwing_safety::redact_credential_params(params);
     if matches!(action_name, "http" | "web_fetch") {
         redact_http_surface(&mut redacted);
@@ -531,6 +540,24 @@ mod tests {
         // Non-object params pass through unchanged.
         let scalar = serde_json::json!("webhook_secret");
         assert_eq!(redact_event_params("mission_update", &scalar), scalar);
+    }
+
+    #[test]
+    fn redact_event_params_redacts_inside_json_string_arguments() {
+        // Run-131 IM-3: a JSON-encoded argument object is coerced to an
+        // object before approval and execution, so the copy must not keep
+        // it raw.
+        let raw = serde_json::json!({
+            "method": "POST",
+            "url": "https://api.example.com/x?api_key=string-query-secret&page=2",
+            "headers": {"Authorization": "Bearer string-header-secret"},
+        })
+        .to_string();
+        let redacted = redact_event_params("http", &serde_json::Value::String(raw));
+        let text = redacted.as_str().expect("stays a string");
+        assert!(!text.contains("string-query-secret"), "{text}");
+        assert!(!text.contains("string-header-secret"), "{text}");
+        assert!(text.contains("page=2"), "{text}");
     }
 
     #[test]
