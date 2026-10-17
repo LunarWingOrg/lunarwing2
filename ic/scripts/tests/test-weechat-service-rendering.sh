@@ -364,6 +364,80 @@ else
   failures=$((failures + 1))
 fi
 
+echo "=== OpenRC renderer interpreter resolution (WI#415) ==="
+
+# The weechat unit bakes the one canonical interpreter spelling from the
+# shared PATH-independent resolver, never the calling process's PATH.
+expected_py="$(PATH=/usr/local/bin:/usr/bin:/bin type -P python3)"
+if [[ -z "$expected_py" ]]; then
+  echo "  FAIL: no canonical python3 resolves under /usr/local/bin:/usr/bin:/bin"
+  failures=$((failures + 1))
+else
+if grep -qF "'$expected_py $RELAY_ENV_EXEC --env-file" "$rc_file" \
+  && grep -qF "\"$expected_py $RELAY_ENV_EXEC --env-file" "$rc_file"; then
+  echo "  PASS: OpenRC weechat unit bakes the canonical python3 spelling"
+else
+  echo "  FAIL: OpenRC weechat unit does not bake the canonical python3 spelling"
+  echo "        expected interpreter: [$expected_py]"
+  failures=$((failures + 1))
+fi
+
+# A caller PATH that shadows python3 (venv, pyenv, /usr/local/bin) must not
+# change the rendered bytes.
+mkdir -p "$MT_FIXTURE/pyshadow"
+ln -s "$expected_py" "$MT_FIXTURE/pyshadow/python3"
+( _OPENRC_PROXY_PYTHON3_RESOLVED=""
+  _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+  PATH="$MT_FIXTURE/pyshadow:$PATH"
+  _render_weechat_openrc_unit "render-test" "$openrc_out/shadow-render" ) || true
+if cmp -s "$rc_file" "$openrc_out/shadow-render"; then
+  echo "  PASS: shadow-PATH render is byte-identical"
+else
+  echo "  FAIL: shadow-PATH render is byte-identical"
+  failures=$((failures + 1))
+fi
+
+# A python3 shell function in the caller must not change the rendered bytes
+# (type -P ignores functions; the resolver's PATH= assignment flushes the
+# hash table before the lookup).
+( python3() { :; }
+  _OPENRC_PROXY_PYTHON3_RESOLVED=""
+  _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+  _render_weechat_openrc_unit "render-test" "$openrc_out/func-render" ) || true
+if cmp -s "$rc_file" "$openrc_out/func-render"; then
+  echo "  PASS: python3 shell function render is byte-identical"
+else
+  echo "  FAIL: python3 shell function render is byte-identical"
+  failures=$((failures + 1))
+fi
+
+# The override pins the interpreter spelling for this renderer too.
+( _OPENRC_PROXY_PYTHON3_RESOLVED=""
+  _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+  LUNARWING_MT_PROXY_PYTHON3=/opt/py3/bin/python3 \
+  _render_weechat_openrc_unit "render-test" "$openrc_out/override-render" ) || true
+if grep -qF "'/opt/py3/bin/python3 $RELAY_ENV_EXEC --env-file" "$openrc_out/override-render"; then
+  echo "  PASS: LUNARWING_MT_PROXY_PYTHON3 reaches the weechat unit"
+else
+  echo "  FAIL: LUNARWING_MT_PROXY_PYTHON3 reaches the weechat unit"
+  failures=$((failures + 1))
+fi
+
+# An unresolvable interpreter fails the render closed and writes no file.
+if ( _OPENRC_PROXY_PYTHON3_RESOLVED=""
+     _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+     LUNARWING_MT_PROXY_PYTHON3='relative/python3' \
+     _render_weechat_openrc_unit "render-test" "$openrc_out/refused-render" ) >/dev/null 2>&1; then
+  echo "  FAIL: unresolvable interpreter rendered a weechat unit"
+  failures=$((failures + 1))
+elif [[ -e "$openrc_out/refused-render" ]]; then
+  echo "  FAIL: refused render still wrote a unit file"
+  failures=$((failures + 1))
+else
+  echo "  PASS: unresolvable interpreter fails the render closed"
+fi
+fi
+
 echo "=== OpenRC tenant stop propagation ==="
 
 export OPENRC_INITD_DIR="$openrc_out"
