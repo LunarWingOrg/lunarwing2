@@ -236,6 +236,99 @@ fn build_context_inputs(
     (names, values)
 }
 
+// ── Auto-import pre-injection (WI#364) ──────────────────────
+
+/// Standard library modules available in Monty that the CodeAct preamble
+/// advertises. When LLM-generated code references `module.` without a matching
+/// `import module` in the same block, Monty raises `NameError` because each
+/// `MontyRun` is block-scoped — imports do not carry across blocks. Prompt-level
+/// mitigation has a saturation point (three+ documented occurrences across
+/// threads #12, #16, #22), so the orchestrator pre-injects missing imports
+/// before the code reaches Monty (WI#364 Option 1).
+const AUTO_INJECT_MODULES: &[&str] = &["asyncio", "json", "re", "math", "datetime", "sys"];
+
+/// Check whether `code` already imports `module` (or from-imports from it).
+///
+/// Recognizes `import module`, `import module as ...`, and
+/// `from module import ...` at any indentation level. A comment line like
+/// `# import asyncio` is not a real import, so the scan strips `#`-comment
+/// tails before matching.
+fn already_imports(code: &str, module: &str) -> bool {
+    for line in code.lines() {
+        let stripped = line.split('#').next().unwrap_or(line).trim();
+        if let Some(targets) = stripped.strip_prefix("import ") {
+            // Multi-name form: `import json, re, sys` (Monty supports
+            // multi-module imports).
+            for target in targets.split(',') {
+                let name = target.trim().split_whitespace().next().unwrap_or("");
+                if name == module || name.starts_with(&format!("{module}.")) {
+                    return true;
+                }
+            }
+        }
+        if let Some(from_mod) = stripped.strip_prefix("from ") {
+            let name = from_mod.split_whitespace().next().unwrap_or("");
+            if name == module || name.starts_with(&format!("{module}.")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check whether `code` references `module.` as a dotted access (e.g.
+/// `asyncio.gather`, `json.loads`). The `.` must immediately follow the
+/// module name to avoid matching substrings inside longer identifiers or
+/// string literals that happen to contain the module name.
+fn references_module(code: &str, module: &str) -> bool {
+    let mut remaining = code;
+    while let Some(pos) = remaining.find(module) {
+        // Check the character before the match — must be a word boundary.
+        let before = pos > 0
+            && remaining.as_bytes()[pos - 1].is_ascii_alphanumeric_or_underscore();
+        if before {
+            remaining = &remaining[pos + module.len()..];
+            continue;
+        }
+        // Check the character after — must be '.'.
+        let after_pos = pos + module.len();
+        if after_pos < remaining.len()
+            && remaining.as_bytes()[after_pos] == b'.'
+        {
+            return true;
+        }
+        remaining = &remaining[after_pos];
+    }
+    false
+}
+
+/// Prepend `import` statements for available Monty stdlib modules that the
+/// code references via dotted access but does not itself import.
+///
+/// This removes the burden of import hygiene from the LLM: if the model writes
+/// `asyncio.gather(...)` without `import asyncio`, the host injects it before
+/// execution. Each injected line is a plain `import <module>` so it is visible
+/// in tracebacks and does not change the semantics of already-imported modules.
+/// Only the six Monty-available modules documented in the CodeAct preamble are
+/// candidates (WI#364).
+fn inject_missing_imports(code: &str) -> String {
+    let mut to_inject: Vec<&str> = Vec::new();
+    for &module in AUTO_INJECT_MODULES {
+        if references_module(code, module) && !already_imports(code, module) {
+            to_inject.push(module);
+        }
+    }
+    if to_inject.is_empty() {
+        return code.to_string();
+    }
+    let prefix: String = to_inject
+        .iter()
+        .map(|m| format!("import {m}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{prefix}\n{code}")
+}
+
 // ── Main execution function ─────────────────────────────────
 
 /// Execute a Python code block using Monty.
@@ -395,9 +488,16 @@ async fn execute_code_with_skills_and_action_limit(
         known_actions.insert("__save_memory_doc__".into());
     }
 
+    // WI#364: pre-inject `import` statements for available Monty stdlib
+    // modules that the code references but does not itself import. Each
+    // MontyRun is block-scoped, so a bare `asyncio.gather(...)` without a
+    // same-block import raises NameError; the prompt-level rule saturated
+    // across threads #12/#16/#22, so the host removes the burden.
+    let prepared_code = inject_missing_imports(code);
+
     // Parse and compile (wrap in catch_unwind — Monty 0.0.x can panic)
     let runner = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        MontyRun::new(code.to_string(), "step.py", input_names)
+        MontyRun::new(prepared_code, "step.py", input_names)
     })) {
         Ok(Ok(runner)) => runner,
         Ok(Err(e)) => {
@@ -4026,6 +4126,136 @@ FINAL(str(results[0]))
         assert!(!result.had_error, "stdout: {}", result.stdout);
         assert_eq!(result.final_answer.as_deref(), Some("gathered"));
         assert_eq!(result.action_results.len(), 1);
+    }
+
+    // ── WI#364: auto-import pre-injection ───────────────────
+
+    #[test]
+    fn inject_missing_imports_adds_asyncio_when_referenced() {
+        let code = "results = await asyncio.gather(tool_a(), tool_b())\nFINAL(str(len(results)))";
+        let injected = inject_missing_imports(code);
+        assert!(injected.starts_with("import asyncio\n"));
+        assert!(injected.contains(code));
+    }
+
+    #[test]
+    fn inject_missing_imports_skips_when_already_imported() {
+        let code = "import asyncio\nresults = await asyncio.gather(tool_a())\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "should not re-inject when import exists");
+    }
+
+    #[test]
+    fn inject_missing_imports_skips_from_import() {
+        let code = "from asyncio import gather\nresults = await gather(tool_a())\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "from-import should count as imported");
+    }
+
+    #[test]
+    fn inject_missing_imports_skips_import_alias() {
+        let code = "import asyncio as aio\nresults = await aio.gather(tool_a())\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "aliased import should count as imported");
+    }
+
+    #[test]
+    fn inject_missing_imports_skips_multi_name_import() {
+        // Monty supports `import json, re` — that must count as importing
+        // both modules.
+        let code = "import json, re\ndata = json.loads(text)\nm = re.match(r'\\d+', s)\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "multi-name import should count as imported");
+    }
+
+    #[test]
+    fn inject_missing_imports_skips_commented_import() {
+        // A commented-out import should NOT count — the module is not actually
+        // imported, so the injection is still needed.
+        let code = "# import asyncio\nresults = await asyncio.gather(tool_a())\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert!(
+            injected.starts_with("import asyncio\n"),
+            "commented import should not suppress injection"
+        );
+    }
+
+    #[test]
+    fn inject_missing_imports_injects_multiple_modules() {
+        let code = "data = json.loads(text)\nm = re.match(r'\\d+', s)\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert!(injected.contains("import json"));
+        assert!(injected.contains("import re"));
+        // The injected lines must come before the code body.
+        let prefix_end = injected.find('\n').unwrap_or(injected.len());
+        assert!(injected[..prefix_end].contains("import json"));
+    }
+
+    #[test]
+    fn inject_missing_imports_no_op_when_nothing_referenced() {
+        let code = "x = 1 + 2\nFINAL(str(x))";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "no module references → no injection");
+    }
+
+    #[test]
+    fn inject_missing_imports_does_not_match_substring_in_identifiers() {
+        // `asyncio_utils` is not `asyncio.` — no dot, no match.
+        let code = "asyncio_utils = 42\nFINAL(str(asyncio_utils))";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "substring in identifier should not match");
+    }
+
+    #[test]
+    fn inject_missing_imports_does_not_match_string_literals() {
+        // The word `asyncio` inside a string literal without a dot after it
+        // should not trigger injection. But `asyncio.` inside a string would —
+        // this is an accepted limitation (the scan is simple, not a full parser).
+        let code = "msg = 'using asyncio for parallelism'\nFINAL(msg)";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "bare word in string without dot should not match");
+    }
+
+    #[test]
+    fn inject_missing_imports_handles_indented_import() {
+        let code = "if True:\n    import json\n    data = json.loads(text)\nFINAL(str(data))";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "indented import should count as imported");
+    }
+
+    #[tokio::test]
+    async fn asyncio_gather_without_import_succeeds_via_pre_injection() {
+        // WI#364: the primary scenario — `asyncio.gather` without `import asyncio`
+        // in the same block should work because the host pre-injects the import.
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("echo")],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "echo".into(),
+                    output: serde_json::json!("a"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "echo".into(),
+                    output: serde_json::json!("b"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+        ));
+
+        // No `import asyncio` — the host should inject it.
+        let code = r#"results = await asyncio.gather(echo(), echo())
+FINAL(results[0] + results[1])"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        assert_eq!(result.final_answer.as_deref(), Some("ab"));
+        assert_eq!(result.action_results.len(), 2);
     }
 
     // ── Sandbox security negative tests ────────────────────────
