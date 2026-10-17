@@ -1103,6 +1103,9 @@ write_tenant_lunarwing_env() {
   # post-snapshot swap fails closed there. resolve_tenant_xmpp_jid above runs
   # before the snapshot by design: XMPP_JID is a non-secret identifier, and a
   # foreign symlink dies on this snapshot before any value is rendered.
+  # Known exception (WI#423): tenant_pg_password below still root-reads
+  # pg.secret/lunarwing.env through the live path; that residue is tracked
+  # there rather than claimed covered by this snapshot.
   local env_snapshot vision_snapshot voice_snapshot
   _snapshot_tenant_env "$name" "$path" env_snapshot
   _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/vision.env" vision_snapshot
