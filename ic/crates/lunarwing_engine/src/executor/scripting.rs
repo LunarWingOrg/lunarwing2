@@ -260,7 +260,7 @@ fn already_imports(code: &str, module: &str) -> bool {
             // Multi-name form: `import json, re, sys` (Monty supports
             // multi-module imports).
             for target in targets.split(',') {
-                let name = target.trim().split_whitespace().next().unwrap_or("");
+                let name = target.split_whitespace().next().unwrap_or("");
                 if name == module || name.starts_with(&format!("{module}.")) {
                     return true;
                 }
@@ -284,20 +284,20 @@ fn references_module(code: &str, module: &str) -> bool {
     let mut remaining = code;
     while let Some(pos) = remaining.find(module) {
         // Check the character before the match — must be a word boundary.
-        let before = pos > 0
-            && remaining.as_bytes()[pos - 1].is_ascii_alphanumeric_or_underscore();
+        let before = pos > 0 && {
+            let prev = remaining.as_bytes()[pos - 1];
+            prev.is_ascii_alphanumeric() || prev == b'_'
+        };
         if before {
             remaining = &remaining[pos + module.len()..];
             continue;
         }
         // Check the character after — must be '.'.
         let after_pos = pos + module.len();
-        if after_pos < remaining.len()
-            && remaining.as_bytes()[after_pos] == b'.'
-        {
+        if after_pos < remaining.len() && remaining.as_bytes()[after_pos] == b'.' {
             return true;
         }
-        remaining = &remaining[after_pos];
+        remaining = &remaining[after_pos..];
     }
     false
 }
@@ -4163,7 +4163,8 @@ FINAL(str(results[0]))
     fn inject_missing_imports_skips_multi_name_import() {
         // Monty supports `import json, re` — that must count as importing
         // both modules.
-        let code = "import json, re\ndata = json.loads(text)\nm = re.match(r'\\d+', s)\nFINAL('done')";
+        let code =
+            "import json, re\ndata = json.loads(text)\nm = re.match(r'\\d+', s)\nFINAL('done')";
         let injected = inject_missing_imports(code);
         assert_eq!(injected, code, "multi-name import should count as imported");
     }
@@ -4213,7 +4214,10 @@ FINAL(str(results[0]))
         // this is an accepted limitation (the scan is simple, not a full parser).
         let code = "msg = 'using asyncio for parallelism'\nFINAL(msg)";
         let injected = inject_missing_imports(code);
-        assert_eq!(injected, code, "bare word in string without dot should not match");
+        assert_eq!(
+            injected, code,
+            "bare word in string without dot should not match"
+        );
     }
 
     #[test]
