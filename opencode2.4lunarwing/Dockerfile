@@ -43,6 +43,18 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 WORKDIR /build/opencode
 RUN bun install --frozen-lockfile && bun pm cache rm
 
+# WI#369 compile-time SDK gate: typecheck the bridge's SDK-facing scripts
+# against THIS build's pinned generated @opencode/client types — call
+# argument and event payload shapes (the CY-2 residue the runtime-stage
+# sdk_surface_assert.ts existence/membership gate cannot see). A pinned-SDK
+# argument or payload rename now fails the image build here instead of at
+# runtime. tsgo ships in the monorepo's pinned devDependencies
+# (@typescript/native-preview, see bun.lock) so no new fetch is introduced;
+# --noEmit writes nothing into the layer.
+COPY scripts/ /build/lunarwing/scripts/
+RUN /build/opencode/node_modules/.bin/tsgo --noEmit \
+      -p /build/lunarwing/scripts/tsconfig.sdk-surface.json
+
 WORKDIR /build/opencode/packages/client
 # The bridge imports @opencode/client (promise API) from THIS build's output.
 # Do not hide its errors; the runtime-stage import assertion below turns a
@@ -286,9 +298,9 @@ RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/op
 # (WI#329, WI#369 DF-1). Upstream SDK drift like WI#320 F7
 # (session.message.list / session.permission.reply do not exist; both are
 # top-level groups) or an event rename in the v2 union fails the image build
-# instead of dying at runtime (WI#303). Not covered by these gates: call
-# argument and event payload shapes (WI#369 item 4 residue) — existence and
-# union membership only.
+# instead of dying at runtime (WI#303). Call argument and event payload
+# shapes are covered separately at the builder stage by the tsgo --noEmit
+# gate (WI#369, see tsconfig.sdk-surface.json).
 #
 # Build-time self-tests run under a throwaway HOME rooted in the trap-cleaned
 # TMPDIR: OpenCode 2 appends a timestamped, randomly-IDed line to
