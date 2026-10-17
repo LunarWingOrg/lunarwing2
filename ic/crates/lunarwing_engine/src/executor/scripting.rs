@@ -4253,6 +4253,217 @@ FINAL(str(results[0]))
         assert_eq!(result.action_results.len(), 1);
     }
 
+    // ── WI#364: auto-import pre-injection ───────────────────
+
+    #[test]
+    fn inject_missing_imports_adds_asyncio_when_referenced() {
+        let code = "results = await asyncio.gather(tool_a(), tool_b())\nFINAL(str(len(results)))";
+        let injected = inject_missing_imports(code);
+        assert!(injected.starts_with("import asyncio\n"));
+        assert!(injected.contains(code));
+    }
+
+    #[test]
+    fn inject_missing_imports_skips_when_already_imported() {
+        let code = "import asyncio\nresults = await asyncio.gather(tool_a())\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "should not re-inject when import exists");
+    }
+
+    #[test]
+    fn inject_missing_imports_ignores_from_and_alias_bindings() {
+        // JL-3: `from asyncio import gather` binds `gather` and `import asyncio
+        // as aio` binds `aio`; neither makes `asyncio.` resolvable.
+        for code in [
+            "from asyncio import gather\nr = await asyncio.gather(a())",
+            "import asyncio as aio\nr = await asyncio.gather(a())",
+        ] {
+            let injected = inject_missing_imports(code);
+            assert_eq!(injected.lines().next(), Some("import asyncio"), "{code}");
+        }
+    }
+
+    #[test]
+    fn inject_missing_imports_skips_multi_name_import() {
+        // Monty supports `import json, re` — that must count as importing
+        // both modules.
+        let code =
+            "import json, re\ndata = json.loads(text)\nm = re.match(r'\\d+', s)\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "multi-name import should count as imported");
+    }
+
+    #[test]
+    fn inject_missing_imports_skips_commented_import() {
+        // A commented-out import should NOT count — the module is not actually
+        // imported, so the injection is still needed.
+        let code = "# import asyncio\nresults = await asyncio.gather(tool_a())\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert!(
+            injected.starts_with("import asyncio\n"),
+            "commented import should not suppress injection"
+        );
+    }
+
+    #[test]
+    fn inject_missing_imports_injects_multiple_modules() {
+        let code = "data = json.loads(text)\nm = re.match(r'\\d+', s)\nFINAL('done')";
+        let injected = inject_missing_imports(code);
+        assert!(injected.contains("import json"));
+        assert!(injected.contains("import re"));
+        // The injected lines must come before the code body.
+        let prefix_end = injected.find('\n').unwrap_or(injected.len());
+        assert!(injected[..prefix_end].contains("import json"));
+    }
+
+    #[test]
+    fn inject_missing_imports_no_op_when_nothing_referenced() {
+        let code = "x = 1 + 2\nFINAL(str(x))";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "no module references -> no injection");
+    }
+
+    #[test]
+    fn inject_missing_imports_does_not_match_substring_in_identifiers() {
+        // `asyncio_utils` is not `asyncio.` — no dot, no match.
+        let code = "asyncio_utils = 42\nFINAL(str(asyncio_utils))";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "substring in identifier should not match");
+    }
+
+    #[test]
+    fn inject_missing_imports_respects_the_leading_word_boundary() {
+        // JL-4: a name preceded by an identifier character must not match.
+        assert_eq!(inject_missing_imports("my_asyncio.gather(1)"), "my_asyncio.gather(1)");
+    }
+
+    #[test]
+    fn inject_missing_imports_ignores_names_in_a_comment_tail() {
+        // JL-4: the #-tail strip lets `import os  # , json` count as importing
+        // only os, so `json.` later still needs injection.
+        let injected = inject_missing_imports("import os  # , json\nx = json.dumps(1)");
+        assert_eq!(injected.lines().next(), Some("import json"));
+    }
+
+    #[test]
+    fn inject_missing_imports_does_not_match_string_literals() {
+        // The word `asyncio` inside a string literal without a dot after it
+        // should not trigger injection. But `asyncio.` inside a string would —
+        // this is an accepted limitation (the scan is simple, not a full parser).
+        let code = "msg = 'using asyncio for parallelism'\nFINAL(msg)";
+        let injected = inject_missing_imports(code);
+        assert_eq!(
+            injected, code,
+            "bare word in string without dot should not match"
+        );
+    }
+
+    #[test]
+    fn inject_missing_imports_handles_indented_import() {
+        let code = "if True:\n    import json\n    data = json.loads(text)\nFINAL(str(data))";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "indented import should count as imported");
+    }
+
+    #[test]
+    fn inject_missing_imports_ignores_json_called_as_a_bare_function() {
+        // JL-1: a block that calls the builtin `json` tool as `json(...)` must
+        // not get an injected `import json` — it would rebind the name.
+        let code = "data = await json(operation=\"parse\", data=\"{}\")\nFINAL(str(data))";
+        let injected = inject_missing_imports(code);
+        assert_eq!(injected, code, "json tool call should suppress json injection");
+    }
+
+    #[tokio::test]
+    async fn asyncio_gather_without_import_succeeds_via_pre_injection() {
+        // WI#364: the primary scenario — `asyncio.gather` without `import asyncio`
+        // in the same block should work because the host pre-injects the import.
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("echo")],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "echo".into(),
+                    output: serde_json::json!("a"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "echo".into(),
+                    output: serde_json::json!("b"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+        ));
+
+        // No `import asyncio` — the host should inject it.
+        let code = r#"results = await asyncio.gather(echo(), echo())
+FINAL(results[0] + results[1])"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        assert_eq!(result.final_answer.as_deref(), Some("ab"));
+        assert_eq!(result.action_results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn json_tool_call_survives_a_dotted_json_mention() {
+        // JL-1: a block that calls the builtin `json` tool must not get an
+        // injected `import json`: it would rebind the name to the module.
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("json")],
+            vec![Ok(ActionResult {
+                call_id: String::new(),
+                action_name: "json".into(),
+                output: serde_json::json!("parsed"),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })],
+        ));
+        let code = r#"# use the json tool, not json.loads: the payload is large
+data = await json(operation="parse", data="{}")
+FINAL(str(data))"#;
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        assert_eq!(result.final_answer.as_deref(), Some("parsed"));
+    }
+
+    #[tokio::test]
+    async fn injected_imports_do_not_shift_reported_line_numbers() {
+        // JL-2: a runtime error and a SyntaxError, both on line 2 of the block;
+        // the parser's byte range must be relative to the block too.
+        for (code, expected) in [
+            (
+                "x = json.dumps([1])\ny = 1 / 0",
+                "ZeroDivisionError",
+            ),
+            (
+                "results = await asyncio.gather()\nif x",
+                "byte range 37..37",
+            ),
+        ] {
+            let thread = make_test_thread();
+            let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+            let result = run_code(code, effects, &thread).await.unwrap();
+            assert!(result.had_error, "{code}");
+            assert!(
+                result.stdout.contains(r#"File "step.py", line 2"#),
+                "{}",
+                result.stdout
+            );
+            assert!(
+                !result.stdout.contains(r#"File "step.py", line 3"#),
+                "{}",
+                result.stdout
+            );
+            assert!(result.stdout.contains(expected), "{}", result.stdout);
+        }
+    }
+
     // ── Sandbox security negative tests ────────────────────────
 
     #[tokio::test]
