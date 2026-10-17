@@ -9,6 +9,10 @@
  */
 
 import assert from "node:assert/strict"
+import { mkdtempSync, rmSync } from "node:fs"
+import { connect, type Socket } from "node:net"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 
 import {
@@ -19,8 +23,17 @@ import {
   handleTaskRequest,
   handleTaskPrompt,
   sendReady,
+  toolProxyRelay,
 } from "./lunarwing_bridge.ts"
+import { taskSocketPath } from "./lunarwing_tool_proxy.ts"
 import { createEnvelope, MAX_CONTROL_QUEUE_PER_TASK, type FollowupQueue } from "./lunarwing_runtime.ts"
+
+// WI#324: every handleTaskRequest in this file now starts a per-task relay
+// socket — keep those out of the shared /tmp/lunarwing-tool-proxy default and
+// restore the previous value (JC-1: delete only when originally absent).
+const savedProxyDir = process.env.LUNARWING_TOOL_PROXY_DIR
+const proxyTestDir = mkdtempSync(join(tmpdir(), "bridge-tool-proxy-test-"))
+process.env.LUNARWING_TOOL_PROXY_DIR = proxyTestDir
 
 interface SentFrame {
   type: string
@@ -339,4 +352,108 @@ for (const scenario of ["final-only", "queued-final", "mid-followup-final"] as c
   assert.equal(activeTasks.has(taskId), false)
 }
 
+// WI#324: a task's relay socket is live for exactly the task's lifetime, and
+// hub tool_result/tool_catalog frames arriving through the REAL handleMessage
+// routing resolve the IPC callers (the path the serve-side plugin uses).
+function ipcCall(socketPath: string, request: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const conn: Socket = connect(socketPath)
+    let buffer = ""
+    conn.on("connect", () => conn.write(JSON.stringify(request) + "\n"))
+    conn.on("data", (chunk) => {
+      buffer += chunk.toString("utf8")
+      const newline = buffer.indexOf("\n")
+      if (newline < 0) return
+      conn.destroy()
+      try {
+        resolve(JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>)
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
+    })
+    conn.on("error", reject)
+    setTimeout(() => {
+      conn.destroy()
+      reject(new Error("ipc call timed out"))
+    }, 2_000).unref()
+  })
+}
+
+async function waitForFrame(frames: SentFrame[], type: string): Promise<SentFrame> {
+  const deadline = Date.now() + 2_000
+  for (;;) {
+    const hit = frames.find((frame) => frame.type === type)
+    if (hit) return hit
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${type}`)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+{
+  const a = fakeSocket()
+  const mock = controlledSdk()
+  const taskId = "integration-tool-proxy"
+  const execution = handleTaskRequest(
+    { task_id: taskId, prompt: "build", timeout_ms: 5_000 },
+    a.socket,
+    mock.sdk,
+  )
+  await bounded(mock.turns[0]!.started.promise)
+
+  // The plugin connects to the per-task socket while the task runs.
+  const socketPath = taskSocketPath(taskId)
+  const callPromise = ipcCall(socketPath, {
+    op: "call",
+    call_id: "c-1",
+    name: "memory_read",
+    arguments: { path: "notes/x.md" },
+  })
+  const callFrame = (await waitForFrame(a.frames, "tool_call")).payload as unknown as {
+    task_id: string; call_id: string; name: string
+  }
+  assert.equal(callFrame.task_id, taskId)
+  assert.equal(callFrame.call_id, "c-1")
+  assert.equal(callFrame.name, "memory_read")
+
+  // An unroutable result frame is ignored without disturbing the pending call.
+  await handleMessage(
+    JSON.stringify(createEnvelope("tool_result", { call_id: "nobody", status: "error" })),
+    a.socket,
+  )
+  await handleMessage(
+    JSON.stringify(createEnvelope("tool_result", {
+      call_id: "c-1", status: "success", output: "proxied contents", error: null,
+    })),
+    a.socket,
+  )
+  const callReply = await bounded(callPromise)
+  assert.equal(callReply.ok, true)
+  assert.equal(callReply.output, "proxied contents")
+
+  const listPromise = ipcCall(socketPath, { op: "list" })
+  await waitForFrame(a.frames, "tool_list")
+  await handleMessage(
+    JSON.stringify(createEnvelope("tool_catalog", {
+      tools: [{ name: "memory_read", description: "read", parameters: { type: "object" } }],
+    })),
+    a.socket,
+  )
+  const listReply = await bounded(listPromise)
+  assert.equal(listReply.ok, true)
+  assert.equal((listReply.tools as Array<{ name: string}>)[0]!.name, "memory_read")
+
+  mock.turns[0]!.completed.resolve("DONE")
+  await bounded(execution)
+  const result = a.frames.find((frame) => frame.type === "task_result")!
+  assert.equal(result.payload.status, "success")
+  assert.equal(
+    toolProxyRelay.activeTaskCount,
+    0,
+    "the finally closes the task's relay socket",
+  )
+}
+
+if (savedProxyDir === undefined) delete process.env.LUNARWING_TOOL_PROXY_DIR
+else process.env.LUNARWING_TOOL_PROXY_DIR = savedProxyDir
+rmSync(proxyTestDir, { recursive: true, force: true })
 console.log("lunarwing bridge self-check passed")
