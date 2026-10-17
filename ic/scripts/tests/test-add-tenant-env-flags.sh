@@ -1133,6 +1133,84 @@ eval "$ig4_real_reader"
 DARKIRC_WRITER_LOCK_HELD="$ig4_lock_saved"
 rm -f "$MT_FIXTURE/env/darkirc-adapter.env" "$MT_FIXTURE/env/lunarwing.env"
 
+echo "=== WI#390 (IY-4): configure-* value reads come from a tenant-side snapshot ==="
+
+# The run-130 pass converted the configure-* WRITES but left the READS on the
+# root path (_read_env_value / grep -v against the live lunarwing.env). With
+# lunarwing.env symlinked away (the IG-1 deny stub), each of the four
+# functions must die at the tenant-side snapshot read before writing
+# anything. On the pre-fix shape the reads succeed as root and the refusal
+# comes later from the atomic writer with a different message, so the
+# "could not read ... as tenant" assertion fails when a function's snapshot
+# conversion is reverted.
+iy4_victim="$MT_FIXTURE/iy4-victim.env"
+printf 'GATEWAY_AUTH_TOKEN=B-SECRET-GATEWAY-TOKEN\n' >"$iy4_victim"
+iy4_victim_before="$(cat "$iy4_victim")"
+iy4_real_registry="$(declare -f tenant_exists_in_registry)"
+iy4_real_ctr="$(declare -f _ctr)"
+iy4_real_vsh="$(declare -f validate_study_notes_home)"
+iy4_real_isns="$(declare -f initialize_study_notes_state)"
+iy4_real_vsnta="$(declare -f validate_study_notes_tenant_access)"
+tenant_exists_in_registry() { :; }
+_ctr() { return 1; }
+validate_study_notes_home() { :; }
+initialize_study_notes_state() { :; }
+validate_study_notes_tenant_access() { :; }
+selinuxenabled() { return 1; }  # skip the chcon block in the fixture
+tenant_cat() { ig1_deny_tenant_cat "$@"; }
+
+for iy4_fn in configure_opencode configure_opencode2 configure_kimi; do
+  ln -s "$iy4_victim" "$MT_FIXTURE/env/lunarwing.env"
+  iy4_rc=0
+  iy4_err="$( ( "$iy4_fn" fixture-tenant "iy4-model" "" ) 2>&1 )" || iy4_rc=$?
+  if [[ "$iy4_rc" -eq 0 ]]; then
+    echo "  FAIL: $iy4_fn read a foreign-linked env without dying"; failures=$((failures + 1))
+  elif [[ "$iy4_err" != *"could not read $MT_FIXTURE/env/lunarwing.env as tenant 'fixture-tenant'"* ]]; then
+    echo "  FAIL: $iy4_fn died without the tenant-read refusal: $iy4_err"; failures=$((failures + 1))
+  else
+    echo "  PASS: $iy4_fn dies at the tenant-side snapshot read"
+  fi
+  assert_eq "$iy4_fn refusal leaves the foreign env untouched" \
+    "$(cat "$iy4_victim")" "$iy4_victim_before"
+  rm -f "$MT_FIXTURE/env/lunarwing.env"
+done
+
+ln -s "$iy4_victim" "$MT_FIXTURE/env/lunarwing.env"
+iy4_rc=0
+iy4_err="$( ( configure_study_mcp fixture-tenant /srv/lunarwing/lw2studymcp false ) 2>&1 )" || iy4_rc=$?
+if [[ "$iy4_rc" -eq 0 ]]; then
+  echo "  FAIL: configure_study_mcp read a foreign-linked env without dying"; failures=$((failures + 1))
+elif [[ "$iy4_err" != *"could not read $MT_FIXTURE/env/lunarwing.env as tenant 'fixture-tenant'"* ]]; then
+  echo "  FAIL: configure_study_mcp died without the tenant-read refusal: $iy4_err"; failures=$((failures + 1))
+else
+  echo "  PASS: configure_study_mcp dies at the tenant-side snapshot read"
+fi
+assert_eq "configure_study_mcp refusal leaves the foreign env untouched" \
+  "$(cat "$iy4_victim")" "$iy4_victim_before"
+rm -f "$MT_FIXTURE/env/lunarwing.env" "$iy4_victim"
+
+# Clean controls: a plain lunarwing.env still renders — untouched keys are
+# kept from the snapshot and the new values are written through.
+tenant_cat() { cat -- "$2"; }
+printf 'GATEWAY_AUTH_TOKEN=keep-me\nOPENCODE_MODEL=old-model\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+configure_opencode fixture-tenant "new-model" ""
+assert_eq "configure_opencode writes the new model" "$(envval OPENCODE_MODEL)" "new-model"
+assert_eq "configure_opencode keeps untouched keys" "$(envval GATEWAY_AUTH_TOKEN)" "keep-me"
+configure_study_mcp fixture-tenant /srv/lunarwing/lw2studymcp false
+assert_eq "configure_study_mcp keeps untouched keys" "$(envval GATEWAY_AUTH_TOKEN)" "keep-me"
+assert_eq "configure_study_mcp writes the study home" \
+  "$(envval LW2STUDYMCP_HOME)" "/srv/lunarwing/lw2studymcp"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
+# Restore the stubbed helpers for the remaining sections.
+eval "$iy4_real_registry"
+eval "$iy4_real_ctr"
+eval "$iy4_real_vsh"
+eval "$iy4_real_isns"
+eval "$iy4_real_vsnta"
+unset -f selinuxenabled
+
 echo "=== write_tenant_bridge_env fixture tests ==="
 
 # The bridge writer reads XMPP_BRIDGE_TOKEN / XMPP_PASSWORD from the daemon env.

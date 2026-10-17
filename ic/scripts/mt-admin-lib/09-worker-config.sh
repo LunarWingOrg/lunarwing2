@@ -882,22 +882,28 @@ configure_opencode() {
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+  # WI#390 (IY-4): value reads come from ONE root-private snapshot taken as
+  # the tenant — root never resolves the tenant-writable path, so a symlink
+  # present for the read window dies here instead of leaking another
+  # tenant's env into this tenant's render.
+  local env_snapshot
+  _snapshot_tenant_env "$name" "$env_path" env_snapshot
 
   # Preserve omitted values (configure-opencode2/configure-kimi already do):
   # stripping an unset flag's key used to be harmless while the image baked a
   # reachable default; with the WI#330 placeholder images it bricks the worker.
   local tmp existing_model existing_base_url base_url_source=""
-  existing_model="$(_read_env_value "$env_path" OPENCODE_MODEL)"
-  existing_base_url="$(_read_env_value "$env_path" OPENCODE_BASE_URL)"
+  existing_model="$(_read_env_value "$env_snapshot" OPENCODE_MODEL)"
+  existing_base_url="$(_read_env_value "$env_snapshot" OPENCODE_BASE_URL)"
   [[ -n "$model" ]] || model="$existing_model"
   if [[ -z "$base_url" ]]; then
     base_url="$existing_base_url"
-    base_url_source="$(_read_env_value "$env_path" OPENCODE_BASE_URL_SOURCE)"
+    base_url_source="$(_read_env_value "$env_snapshot" OPENCODE_BASE_URL_SOURCE)"
   fi
   tmp="$(mktemp)"
   # Only an explicit URL becomes operator-owned; a model-only update preserves
   # URL provenance so later renders and exports still handle inheritance.
-  grep -v -e '^OPENCODE_MODEL=' -e '^OPENCODE_BASE_URL=' -e '^OPENCODE_BASE_URL_SOURCE=' "$env_path" >"$tmp" || true
+  grep -v -e '^OPENCODE_MODEL=' -e '^OPENCODE_BASE_URL=' -e '^OPENCODE_BASE_URL_SOURCE=' "$env_snapshot" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'OPENCODE_MODEL=%s\n'    "$model"    >>"$tmp"
   [[ -n "$base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$(_quote_env_value "$base_url")" >>"$tmp"
   [[ "$base_url_source" != inherited ]] || printf 'OPENCODE_BASE_URL_SOURCE=inherited\n' >>"$tmp"
@@ -905,10 +911,10 @@ configure_opencode() {
   # the tenant-writable env file, so a pre-placed or raced symlink at the
   # destination cannot redirect the write onto an attacker-chosen path.
   if ! write_tenant_file_atomic "$name" "$env_path" 600 <"$tmp"; then
-    rm -f -- "$tmp"
+    rm -f -- "$tmp" "$env_snapshot"
     return 1
   fi
-  rm -f "$tmp"
+  rm -f "$tmp" "$env_snapshot"
   say "opencode LLM overrides written to $env_path for tenant '$name'"
 
   local container_name="lunarwing-opencode-$name"
@@ -932,18 +938,22 @@ configure_opencode2() {
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+  # WI#390 (IY-4): value reads come from ONE root-private snapshot taken as
+  # the tenant — see configure_opencode.
+  local env_snapshot
+  _snapshot_tenant_env "$name" "$env_path" env_snapshot
 
   local tmp existing_model existing_base_url base_url_source=""
-  existing_model="$(_read_env_value "$env_path" OPENCODE2_MODEL)"
-  existing_base_url="$(_read_env_value "$env_path" OPENCODE2_BASE_URL)"
+  existing_model="$(_read_env_value "$env_snapshot" OPENCODE2_MODEL)"
+  existing_base_url="$(_read_env_value "$env_snapshot" OPENCODE2_BASE_URL)"
   [[ -n "$model" ]] || model="$existing_model"
   if [[ -z "$base_url" ]]; then
     base_url="$existing_base_url"
-    base_url_source="$(_read_env_value "$env_path" OPENCODE2_BASE_URL_SOURCE)"
+    base_url_source="$(_read_env_value "$env_snapshot" OPENCODE2_BASE_URL_SOURCE)"
   fi
   tmp="$(mktemp)"
   # Only an explicit URL becomes operator-owned (WI#330).
-  grep -v -e '^OPENCODE2_MODEL=' -e '^OPENCODE2_BASE_URL=' -e '^OPENCODE2_BASE_URL_SOURCE=' "$env_path" >"$tmp" || true
+  grep -v -e '^OPENCODE2_MODEL=' -e '^OPENCODE2_BASE_URL=' -e '^OPENCODE2_BASE_URL_SOURCE=' "$env_snapshot" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'OPENCODE2_MODEL=%s\n'    "$model"    >>"$tmp"
   [[ -n "$base_url" ]] && printf 'OPENCODE2_BASE_URL=%s\n' "$(_quote_env_value "$base_url")" >>"$tmp"
   [[ "$base_url_source" != inherited ]] || printf 'OPENCODE2_BASE_URL_SOURCE=inherited\n' >>"$tmp"
@@ -951,10 +961,10 @@ configure_opencode2() {
   # the tenant-writable env file, so a pre-placed or raced symlink at the
   # destination cannot redirect the write onto an attacker-chosen path.
   if ! write_tenant_file_atomic "$name" "$env_path" 600 <"$tmp"; then
-    rm -f -- "$tmp"
+    rm -f -- "$tmp" "$env_snapshot"
     return 1
   fi
-  rm -f "$tmp"
+  rm -f "$tmp" "$env_snapshot"
   say "opencode2 LLM overrides written to $env_path for tenant '$name'"
 
   local container_name="lunarwing-opencode2-$name"
@@ -1099,12 +1109,15 @@ configure_study_mcp() {  # <tenant> <code home> <allow-write bool> [state home]
     fi
   fi
 
-  local env_path tmp
+  local env_path tmp env_snapshot
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+  # WI#390 (IY-4): the carry-over read comes from ONE root-private snapshot
+  # taken as the tenant — see configure_opencode.
+  _snapshot_tenant_env "$name" "$env_path" env_snapshot
   tmp="$(mktemp)"
   grep -vE '^(# Shared .*Study Notes MCP|LW2STUDYMCP_(HOME|STATE_HOME|ALLOW_WRITE)=)' \
-    "$env_path" > "$tmp" || true
+    "$env_snapshot" > "$tmp" || true
   printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
     "$home" >> "$tmp"
   [[ -z "$state_home" ]] \
@@ -1115,10 +1128,10 @@ configure_study_mcp() {  # <tenant> <code home> <allow-write bool> [state home]
   # the tenant-writable env file, so a pre-placed or raced symlink at the
   # destination cannot redirect the write onto an attacker-chosen path.
   if ! write_tenant_file_atomic "$name" "$env_path" 600 <"$tmp"; then
-    rm -f -- "$tmp"
+    rm -f -- "$tmp" "$env_snapshot"
     return 1
   fi
-  rm -f "$tmp"
+  rm -f "$tmp" "$env_snapshot"
 
   say "Study Notes MCP configured for tenant '$name' from $home (write=$allow_write)"
   say "restart tenant to seed core MCP config and recreate opencode worker mount:"
@@ -1710,21 +1723,25 @@ configure_kimi() {
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+  # WI#390 (IY-4): value reads come from ONE root-private snapshot taken as
+  # the tenant — see configure_opencode.
+  local env_snapshot
+  _snapshot_tenant_env "$name" "$env_path" env_snapshot
 
   local tmp existing_model existing_base_url existing_api_key base_url_source=""
-  existing_model="$(_read_env_value "$env_path" KIMI_MODEL)"
-  existing_base_url="$(_read_env_value "$env_path" KIMI_BASE_URL)"
-  existing_api_key="$(_read_env_value "$env_path" KIMI_API_KEY)"
+  existing_model="$(_read_env_value "$env_snapshot" KIMI_MODEL)"
+  existing_base_url="$(_read_env_value "$env_snapshot" KIMI_BASE_URL)"
+  existing_api_key="$(_read_env_value "$env_snapshot" KIMI_API_KEY)"
   [[ -n "$model" ]] || model="$existing_model"
   if [[ -z "$base_url" ]]; then
     base_url="$existing_base_url"
-    base_url_source="$(_read_env_value "$env_path" KIMI_BASE_URL_SOURCE)"
+    base_url_source="$(_read_env_value "$env_snapshot" KIMI_BASE_URL_SOURCE)"
   fi
   [[ -n "$api_key" ]] || api_key="$existing_api_key"
   tmp="$(mktemp)"
   # Model/API-key-only updates retain URL provenance; only --base-url takes
   # ownership of an inherited endpoint (WI#330).
-  grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_BASE_URL_SOURCE=' -e '^KIMI_API_KEY=' "$env_path" >"$tmp" || true
+  grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_BASE_URL_SOURCE=' -e '^KIMI_API_KEY=' "$env_snapshot" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'KIMI_MODEL=%s\n'    "$model"    >>"$tmp"
   [[ -n "$base_url" ]] && printf 'KIMI_BASE_URL=%s\n' "$(_quote_env_value "$base_url")" >>"$tmp"
   [[ "$base_url_source" != inherited ]] || printf 'KIMI_BASE_URL_SOURCE=inherited\n' >>"$tmp"
@@ -1734,10 +1751,10 @@ configure_kimi() {
   # the tenant-writable env file, so a pre-placed or raced symlink at the
   # destination cannot redirect the write onto an attacker-chosen path.
   if ! write_tenant_file_atomic "$name" "$env_path" 600 <"$tmp"; then
-    rm -f -- "$tmp"
+    rm -f -- "$tmp" "$env_snapshot"
     return 1
   fi
-  rm -f "$tmp"
+  rm -f "$tmp" "$env_snapshot"
   say "kimi LLM overrides written to $env_path for tenant '$name'"
 
   local container_name="lunarwing-kimi-$name"
