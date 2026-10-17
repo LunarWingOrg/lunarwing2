@@ -213,11 +213,14 @@ The **kimi** lane ships the worker-side bridge: `lunarwing_tool_proxy.ts`
 (a per-task relay; replies routed by call_id scoped to the owning hub
 socket; task close fails in-flight calls) plus `lunarwing_mcp_server.ts` (a
 thin stdio MCP server registered in `$KIMI_CODE_HOME/mcp.json`), giving the
-agent a native `mcp__lunarwing__*` tool surface. The opencode, opencode2,
-and pebble worker-side bridges remain open, and real-worker acceptance
-evidence waits on the rebuilt kimi image (protected-pipeline/deploy gate) —
-**WI#324 remains open**. Design doc:
-`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
+agent a native `mcp__lunarwing__*` tool surface. First real-worker
+acceptance evidence landed on 2026-10-16: on the multi-worker test tenant
+**soarin**, a real kimi job completed `KIMI_WORKER_OK` over the proxied
+tool path on an image built from the release tree (kimi-code 2.2.0 with the
+WI#411 scrub and WI#412 `max_output_size` pin verified in-image) — full
+report in `docs/ops/ITEM72_TEST_TENANT_SOARIN.md`. The opencode, opencode2,
+and pebble worker-side bridges remain open — **WI#324 remains open**.
+Design doc: `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
 
 ### Cron Missions on External Workers (WI#325)
 
@@ -420,7 +423,7 @@ refused call spends no tokens. `max_threads_per_day` saturates at
 `webhook_secret_applied: false` without becoming a secret-equality oracle.
 WI#359 was closed on 2026-10-14; its remaining residuals (approval
 `display_parameters`, the http `ToolCall` hook payload, predicate depth,
-and the non-agent stop path) ride WI#392.
+and the non-agent stop path) ride WI#392, itself closed on 2026-10-17.
 
 ### Credential Redaction on HTTP Surfaces (WI#359)
 
@@ -638,8 +641,11 @@ the bump, the executor and entrypoint now also scrub
 `KIMI_CODE_TRUST_WORKSPACE` from task environments alongside the existing
 guard variables (WI#411), and the lane config pins `max_output_size =
 131072` on the FrontierCODEK model with a TOML-parsing CI pin, restoring
-the request cap the 2.1.1 line sent (WI#412; verified offline: every
-captured `chat/completions` request carries `max_tokens: 131072`). Both
+the request cap the 2.1.1 line sent (WI#412; verified live on 2026-10-16 on
+tenant scootaloo with the rebuilt image — a real end-to-end job sent
+`max_tokens: 131072` on the wire and completed a full, untruncated
+response, superseding the earlier offline request capture; WI#412 itself
+stays open pending maintainer acceptance). Both
 fixes reach tenants only with a rebuilt/promoted kimi image — see Upgrade
 Notes.
 
@@ -805,8 +811,10 @@ are recorded in the audit doc's 2026-10-16 follow-up.
 
 **Worker proxy scope.** Only the kimi lane ships the worker-side tool-proxy
 bridge in this release; opencode/opencode2/pebble workers have no
-`mcp__lunarwing__*` surface yet. Real-worker acceptance evidence for the
-kimi lane rides the protected image pipeline. The tool grant is ambient for
+`mcp__lunarwing__*` surface yet. First real-worker acceptance evidence for
+the kimi lane landed 2026-10-16 on the test tenant soarin (report:
+`docs/ops/ITEM72_TEST_TENANT_SOARIN.md`); the remaining lanes' bridges are
+still open work. The tool grant is ambient for
 every process in the task (untrusted repo scripts can call the relay), and
 workspace `.mcp.json` files can shadow the `lunarwing` entry — the hub
 stays authoritative on the capability set. `memory_read` grants disclose
