@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-16 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-17 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16)
+**Release date:** TBD (drafted 2026-10-16, refreshed 2026-10-17)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -133,8 +133,10 @@ previous compatibility baseline.
   naive-use guards and build-time controls — an argv-scanning `opencode`
   wrapper, root-owned read-only scripts/config, the OpenTunnel compile-out,
   a byte-identity wrapper anchor, a BuildKit-faithful Dockerfile guard, and
-  the host-side `mt-admin worker-listeners` audit — while the opencode2
-  v2.0.26 bump stays gated.
+  the host-side `mt-admin worker-listeners` audit. WI#357 was closed on
+  2026-10-17, lifting the opencode2 bump gate; the upgrade itself (now
+  targeting v2.0.32) is scheduled as its own task, so this release still
+  ships opencode2 v2.0.24.
 - **Credential echoes scrubbed in the sandbox proxy (WI#395).** Injected
   credentials can no longer ride back out through forwarded response
   headers (raw, form-encoded, re-encoded, or JSON-escaped spellings),
@@ -165,7 +167,7 @@ previous compatibility baseline.
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 | Channel registry | darkirc 0.1.12, multica 0.1.15, weechat 0.2.13, xmpp 0.1.18 |
 | Tool registry | cavepony-tool 0.4.6, gitlab 0.1.9, gotify 0.1.3, llm-context 0.1.4, multica-bridge 0.1.5, ssh 0.1.4, vision-analyze 0.1.6, voice-transcribe 0.1.4, web-search 0.2.5 |
-| External workers | kimi-code `2.2.0` (upgraded from 2.1.1), opencode `v1.18.25`, opencode2 `v2.0.24` (held per WI#357), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls advisories) |
+| External workers | kimi-code `2.2.0` (upgraded from 2.1.1), opencode `v1.18.25`, opencode2 `v2.0.24` (WI#357 gate lifted 2026-10-17; the v2.0.32 upgrade is pending as its own task), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls advisories) |
 | Cargo features | New non-default `libsql-remote-replica` feature gates Turso sync (breaking — see Upgrade Notes) |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
@@ -591,8 +593,11 @@ all-interfaces and inspect-failure findings).
 
 These layers are naive-use guards, **not** a boundary against a compromised
 agent — only the deferred egress allowlist (control 1) is; control 6
-(runtime smoke) is likewise deferred, and WI#357 stays open for the
-maintainer. The opencode2 pin stays v2.0.24 (!1490 remains gated).
+(runtime smoke) is likewise deferred. WI#357 was closed on 2026-10-17,
+lifting the bump gate: the opencode2 upgrade is unblocked and now proceeds
+as its own task (targeting v2.0.32 with a full security report on the new
+"Public HTTPS Tunnel" feature). The opencode2 pin in this release stays
+v2.0.24.
 
 ### Sandbox Proxy Credential-Echo Scrubbing (WI#395)
 
@@ -753,8 +758,9 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    the WI#357 exposure controls and the WI#329 SDK gate, the opencode image
    carries the WI#374 crash-line enrichment and the WI#373 credential
    strip, and the pebble image carries WI#334 and the reviewed-lock rustls
-   upgrade — opencode v1.18.25 and opencode2 v2.0.24 (WI#357 hold) need no
-   version change, but skipping those rebuilds leaves WI#357 undeployed.
+   upgrade — opencode v1.18.25 and opencode2 v2.0.24 keep their pins (the
+   WI#357 gate was lifted 2026-10-17 and the v2.0.32 upgrade is its own
+   pending task), but skipping those rebuilds leaves WI#357 undeployed.
    kimi-code is upgraded to **2.2.0** (an earlier 2.2.0 image promoted
    during the cycle predates the WI#411/WI#412 fixes — rebuild from the
    release tree and recreate the tenant containers; mt-admin now recreates
